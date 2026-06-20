@@ -521,6 +521,24 @@ mod tests {
     }
 
     #[test]
+    fn opencode_from_spec_parses_four_levels() {
+        let spec = "opencode/nvidia/openai/gpt-oss-120b";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.id, "nvidia/openai/gpt-oss-120b");
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
+    fn opencode_from_spec_parses_three_levels() {
+        let spec = "opencode/opencode/big-pickle";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.id, "opencode/big-pickle");
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
     fn from_tier_covers_all_providers() {
         for provider in ProviderKind::iter() {
             if provider.accepts_arbitrary_models() {

@@ -5,23 +5,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
-
 use isahc::config::Configurable;
-use isahc::prelude::ReadResponseExt;
-use isahc::{HttpClient, Request};
+use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StreamResponse,
-    ThinkingConfig,
-};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::{ResolvedAuth, http_client};
+use crate::providers::anthropic::shared;
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -70,20 +66,20 @@ impl CatalogProvider {
         found
     }
 
-    fn build_auth(&self) -> super::ResolvedAuth {
+    fn build_auth(&self) -> ResolvedAuth {
         let api_key = self.resolve_api_key();
         let headers = match self.npm.as_str() {
             "@ai-sdk/anthropic" => vec![("x-api-key".into(), api_key)],
             _ => vec![("authorization".into(), format!("Bearer {api_key}"))],
         };
-        super::ResolvedAuth {
+        ResolvedAuth {
             base_url: self.api.clone(),
             headers,
         }
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogModel {
     limit: Option<CatalogLimits>,
     #[serde(default)]
@@ -92,7 +88,7 @@ struct CatalogModel {
     provider: Option<CatalogShape>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogLimits {
     #[serde(default)]
     context: Option<u32>,
@@ -102,7 +98,7 @@ struct CatalogLimits {
     output: Option<u32>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogCost {
     #[serde(default)]
     input: Option<f64>,
@@ -114,7 +110,7 @@ struct CatalogCost {
     cache_write: Option<f64>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogShape {
     #[serde(default)]
     shape: Option<String>,
@@ -126,40 +122,64 @@ struct CatalogMeta {
     api_format: EndpointType,
     context: u32,
     output: u32,
-    #[allow(dead_code)]
     input_price: f64,
-    #[allow(dead_code)]
     output_price: f64,
-    #[allow(dead_code)]
     cache_read: f64,
-    #[allow(dead_code)]
     cache_write: f64,
 }
 
-#[derive(Clone)]
-struct CatalogRoute {
-    auth: super::ResolvedAuth,
-}
+type ModelWithProvider = (String, String);
 
-impl Default for CatalogMeta {
-    fn default() -> Self {
-        Self {
-            provider_id: String::new(),
-            api_format: EndpointType::ChatCompletions,
-            context: 128_000,
-            output: 64_000,
-            input_price: 0.0,
-            output_price: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-        }
-    }
-}
-
-#[derive(Default)]
 struct CatalogData {
-    entries: HashMap<String, CatalogMeta>,
-    routes: HashMap<String, CatalogRoute>,
+    entries: HashMap<ModelWithProvider, CatalogMeta>,
+    auths: HashMap<String, ResolvedAuth>,
+}
+
+impl CatalogData {
+    fn lookup(&self, key: &str) -> Result<(CatalogMeta, ResolvedAuth), AgentError> {
+        let (provider, model_id) = key.split_once('/').ok_or_else(|| AgentError::Config {
+            message: format!("invalid model key '{key}': expected 'provider/model_id'"),
+        })?;
+        let meta = self
+            .entries
+            .get(&(provider.to_string(), model_id.to_string()))
+            .cloned()
+            .ok_or_else(|| AgentError::Config {
+                message: format!("model '{key}' not found in catalog"),
+            })?;
+        let auth =
+            self.auths
+                .get(&meta.provider_id)
+                .cloned()
+                .ok_or_else(|| AgentError::Config {
+                    message: format!(
+                        "auth for provider '{}' not found in catalog",
+                        meta.provider_id
+                    ),
+                })?;
+        Ok((meta, auth))
+    }
+
+    fn all_models(&self) -> Vec<ModelInfo> {
+        let mut models: Vec<ModelInfo> = self
+            .entries
+            .iter()
+            .map(|((provider, model_id), meta)| ModelInfo {
+                id: format!("{provider}/{model_id}"),
+                context_window: Some(meta.context),
+                max_output_tokens: Some(meta.output),
+                pricing: Some(ModelPricing {
+                    input: meta.input_price,
+                    output: meta.output_price,
+                    cache_read: meta.cache_read,
+                    cache_write: meta.cache_write,
+                    fast: None,
+                }),
+            })
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
 }
 
 static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -175,54 +195,38 @@ pub struct Opencode {
     chat_compat: OpenAiCompatProvider,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
     system_prefix: Option<String>,
-    catalog: OnceLock<HashMap<String, CatalogMeta>>,
-    catalog_routes: OnceLock<HashMap<String, CatalogRoute>>,
     stream_timeout: Duration,
 }
 
+static CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();
+
 impl Opencode {
-    fn ensure_catalog(&self) -> &HashMap<String, CatalogMeta> {
-        self.catalog.get_or_init(|| {
-            let mut data = fetch_catalog().unwrap_or_default();
-
-            // If a dynamic provider resolved auth (e.g. via Lua script), override
-            // the opencode route's auth so env vars aren't required.
-            if let (Some(auth), Some(route)) = (&self.auth, data.routes.get_mut("opencode")) {
-                route.auth = auth.lock().unwrap().clone();
-            }
-
-            let _ = self.catalog_routes.set(data.routes);
-            data.entries
-        })
-    }
-
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        Ok(Self {
-            client: http_client(timeouts),
-            chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
-            auth: None,
-            system_prefix: None,
-            catalog: OnceLock::new(),
-            catalog_routes: OnceLock::new(),
-            stream_timeout: timeouts.stream,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+    fn new_impl(timeouts: super::Timeouts, auth: Option<Arc<Mutex<ResolvedAuth>>>) -> Self {
+        CATALOG.get_or_init(|| Mutex::new(init_catalog_blocking()));
         Self {
             client: http_client(timeouts),
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
-            auth: Some(auth),
+            auth,
             system_prefix: None,
-            catalog: OnceLock::new(),
-            catalog_routes: OnceLock::new(),
             stream_timeout: timeouts.stream,
         }
+    }
+
+    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        Ok(Self::new_impl(timeouts, None))
+    }
+
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+        Self::new_impl(timeouts, Some(auth))
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
         self
+    }
+
+    async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
+        Ok(CATALOG.get().unwrap().lock().unwrap().all_models())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -233,21 +237,25 @@ impl Opencode {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
-        route: &CatalogRoute,
+        auth: &ResolvedAuth,
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         match opts.thinking {
             ThinkingConfig::Off => {}
-            _ => {
-                body["thinking"] = json!({"type": "enabled"});
+            ThinkingConfig::Adaptive => {
+                body["reasoning_effort"] = json!("high");
+            }
+            ThinkingConfig::Budget(n) => {
+                body["reasoning_effort"] = json!(ThinkingConfig::budget_to_effort(n));
             }
         }
         self.chat_compat
-            .do_stream(model, &[], &body, event_tx, &route.auth)
+            .do_stream(model, &[], &body, event_tx, auth)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_catalog_messages(
         &self,
         model: &Model,
@@ -255,20 +263,35 @@ impl Opencode {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
-        route: &CatalogRoute,
+        auth: &ResolvedAuth,
+        opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
-        let body = build_anthropic_body(model, messages, system, tools);
+        let system_blocks = vec![shared::SystemBlock {
+            r#type: "text",
+            text: system,
+            cache_control: Some(shared::EPHEMERAL),
+        }];
+        let mut body = shared::build_request_body_with_system(
+            model,
+            messages,
+            &system_blocks,
+            tools,
+            opts.thinking,
+        );
+        body["model"] = json!(model.id);
+        body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
         let mut rb = Request::builder()
             .method("POST")
             .uri(format!(
                 "{}{}",
-                route.auth.base_url.as_deref().unwrap_or(""),
+                auth.base_url.as_deref().unwrap_or(""),
                 MESSAGES_PATH
             ))
+            .header("user-agent", super::user_agent())
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
-        for (key, value) in &route.auth.headers {
+        for (key, value) in &auth.headers {
             rb = rb.header(key.as_str(), value.as_str());
         }
         let request = rb.body(json_body)?;
@@ -297,36 +320,29 @@ impl Provider for Opencode {
         opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        let catalog = self.ensure_catalog();
-        let meta = catalog.get(&model.id).cloned();
-        let route = meta.as_ref().and_then(|m| {
-            let r = self
-                .catalog_routes
-                .get()
-                .and_then(|routes| routes.get(&m.provider_id).cloned());
-            if r.is_some() {
-                debug!(model = %model.id, provider = %m.provider_id, "model route resolved");
-            } else {
-                debug!(model = %model.id, provider = %m.provider_id, "model route not found");
-            }
-            r
-        });
-        let model_for_stream = model.clone();
-
         Box::pin(async move {
+            let model_for_stream = model.clone();
+
+            let model_id = &model_for_stream.id;
+            let (sub_provider, actual_id) =
+                model_id.split_once('/').unwrap_or(("opencode", model_id));
+
+            let (meta, auth) = {
+                let guard = CATALOG.get().unwrap().lock().unwrap();
+                let (meta, auth) = guard.lookup(&format!("{sub_provider}/{actual_id}"))?;
+                // Dynamic provider auth (e.g. from Lua) overrides the opencode route
+                let auth = match (&self.auth, meta.provider_id.as_str()) {
+                    (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),
+                    _ => auth,
+                };
+                (meta, auth)
+            };
+
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            let (meta, route) = match (meta, route) {
-                (Some(m), Some(r)) => (m, r),
-                _ => {
-                    return Err(AgentError::Config {
-                        message: format!("model '{}' not found in catalog", model_for_stream.id),
-                    });
-                }
-            };
-
             let model = Model {
+                id: actual_id.to_string(),
                 max_output_tokens: meta.output,
                 context_window: meta.context,
                 ..model_for_stream
@@ -335,23 +351,22 @@ impl Provider for Opencode {
             match meta.api_format {
                 EndpointType::ChatCompletions => {
                     self.handle_catalog_chat_completions(
-                        &model, messages, system, tools, event_tx, &route, &opts,
+                        &model, messages, system, tools, event_tx, &auth, &opts,
                     )
                     .await
                 }
                 EndpointType::Messages => {
-                    self.handle_catalog_messages(&model, messages, system, tools, event_tx, &route)
-                        .await
+                    self.handle_catalog_messages(
+                        &model, messages, system, tools, event_tx, &auth, &opts,
+                    )
+                    .await
                 }
             }
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
-        let catalog = self.ensure_catalog();
-        let mut ids: Vec<String> = catalog.keys().cloned().collect();
-        ids.sort();
-        Box::pin(async move { Ok(ids) })
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(self.do_list_models())
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -366,9 +381,14 @@ fn catalog_cache_path() -> Option<PathBuf> {
     Some(dir.join(CATALOG_CACHE_FILE))
 }
 
-fn load_cached_catalog() -> Option<CatalogIndex> {
+async fn load_cached_catalog_async() -> Option<CatalogIndex> {
     let path = catalog_cache_path()?;
-    let meta = fs::metadata(&path).ok()?;
+    let meta = smol::unblock({
+        let path = path.clone();
+        move || fs::metadata(&path)
+    })
+    .await
+    .ok()?;
 
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
@@ -377,34 +397,47 @@ fn load_cached_catalog() -> Option<CatalogIndex> {
         return None;
     }
 
-    let text = fs::read_to_string(&path).ok()?;
+    let text = smol::unblock(move || fs::read_to_string(&path))
+        .await
+        .ok()?;
     let index: CatalogIndex = serde_json::from_str(&text).ok()?;
     debug!("loaded catalog from cache");
     Some(index)
 }
 
-fn save_cached_catalog(index: &CatalogIndex) {
+async fn save_cached_catalog_async(index: &CatalogIndex) {
     let path = match catalog_cache_path() {
         Some(p) => p,
         None => return,
     };
     if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+        let dir = dir.to_path_buf();
+        let _ = smol::unblock(move || fs::create_dir_all(&dir)).await;
     }
-    match serde_json::to_string_pretty(index) {
-        Ok(text) => {
-            if let Err(e) = fs::write(&path, &text) {
-                warn!(error = %e, path = %path.display(), "failed to write catalog cache");
-            } else {
-                debug!(path = %path.display(), "cached catalog");
-            }
+    let text = match serde_json::to_string_pretty(index) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize catalog for cache");
+            return;
         }
-        Err(e) => warn!(error = %e, "failed to serialize catalog for cache"),
-    }
+    };
+    smol::unblock(move || {
+        if let Err(e) = fs::write(&path, &text) {
+            warn!(error = %e, path = %path.display(), "failed to write catalog cache");
+        } else {
+            debug!(path = %path.display(), "cached catalog");
+        }
+    })
+    .await;
 }
 
-fn fetch_remote_catalog(client: &HttpClient) -> Result<CatalogIndex, AgentError> {
-    let mut resp = client.get(CATALOG_URL).map_err(|e| {
+async fn fetch_remote_catalog_async(client: &HttpClient) -> Result<CatalogIndex, AgentError> {
+    let request = Request::builder()
+        .uri(CATALOG_URL)
+        .header("user-agent", super::user_agent())
+        .body(())?;
+
+    let mut resp = client.send_async(request).await.map_err(|e| {
         warn!(error = %e, CATALOG_URL, "failed to fetch catalog");
         AgentError::Config {
             message: format!("failed to fetch catalog from {CATALOG_URL}: {e}"),
@@ -419,7 +452,7 @@ fn fetch_remote_catalog(client: &HttpClient) -> Result<CatalogIndex, AgentError>
         });
     }
 
-    let text = resp.text().map_err(|e| AgentError::Config {
+    let text = resp.text().await.map_err(|e| AgentError::Config {
         message: format!("failed to read catalog response body: {e}"),
     })?;
 
@@ -438,8 +471,8 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
 fn catalog_to_data(index: CatalogIndex) -> CatalogData {
-    let mut entries = HashMap::new();
-    let mut routes = HashMap::new();
+    let mut entries: HashMap<ModelWithProvider, CatalogMeta> = HashMap::new();
+    let mut auths = HashMap::new();
 
     for (provider_id, provider) in &index {
         if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
@@ -485,6 +518,7 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
                 .as_ref()
                 .and_then(|l| l.output)
                 .unwrap_or(64_000);
+
             let cache_read = model_data
                 .cost
                 .as_ref()
@@ -496,8 +530,9 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
                 .and_then(|c| c.cache_write)
                 .unwrap_or(0.0);
 
+            let key = (provider_id.clone(), model_id.clone());
             entries.insert(
-                model_id.clone(),
+                key,
                 CatalogMeta {
                     provider_id: provider_id.clone(),
                     api_format,
@@ -513,7 +548,7 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
         }
 
         if model_count > 0 {
-            routes.insert(provider_id.clone(), CatalogRoute { auth });
+            auths.insert(provider_id.clone(), auth);
             debug!(
                 provider = %provider_id,
                 models = model_count,
@@ -523,193 +558,41 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
         }
     }
 
-    CatalogData { entries, routes }
+    CatalogData { entries, auths }
 }
 
-fn fetch_catalog() -> Result<CatalogData, AgentError> {
-    if let Some(index) = load_cached_catalog() {
-        return Ok(catalog_to_data(index));
+fn init_catalog_blocking() -> CatalogData {
+    // Try cache first (fast, no network)
+    if let Some(index) = smol::block_on(load_cached_catalog_async()) {
+        debug!("using cached catalog");
+        return catalog_to_data(index);
     }
 
+    // Fetch from remote (blocks the current thread)
     let client = isahc::HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
         .low_speed_timeout(1, Duration::from_secs(30))
         .build()
-        .map_err(|e| AgentError::Config {
-            message: format!("failed to build HTTP client for catalog fetch: {e}"),
-        })?;
+        .expect("failed to build catalog HTTP client");
 
-    let index = fetch_remote_catalog(&client)?;
-    save_cached_catalog(&index);
-    Ok(catalog_to_data(index))
-}
-
-// --- Anthropic-format body building ---
-
-pub(crate) fn build_anthropic_body(
-    model: &Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-) -> Value {
-    let wire_messages = convert_to_anthropic_messages(messages);
-    let wire_tools = convert_to_anthropic_tools(tools);
-
-    let system_blocks: Vec<Value> = if system.is_empty() {
-        vec![]
-    } else {
-        vec![json!({"type": "text", "text": system})]
-    };
-
-    let mut body = json!({
-        "model": model.id,
-        "max_tokens": model.max_output_tokens,
-        "stream": true,
-        "messages": wire_messages,
-    });
-    if !system_blocks.is_empty() {
-        body["system"] = json!(system_blocks);
+    match smol::block_on(fetch_remote_catalog_async(&client)) {
+        Ok(index) => {
+            smol::block_on(save_cached_catalog_async(&index));
+            catalog_to_data(index)
+        }
+        Err(e) => {
+            warn!(error = %e, "catalog fetch failed, using empty catalog");
+            CatalogData {
+                entries: HashMap::new(),
+                auths: HashMap::new(),
+            }
+        }
     }
-    if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
-        body["tools"] = wire_tools;
-    }
-    body
-}
-
-pub(crate) fn convert_to_anthropic_messages(messages: &[Message]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            let role = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            let content: Vec<Value> = msg
-                .content
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        json!({"type": "text", "text": text})
-                    }
-                    ContentBlock::Image { source } => {
-                        json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": match source.media_type {
-                                    crate::ImageMediaType::Png => "image/png",
-                                    crate::ImageMediaType::Jpeg => "image/jpeg",
-                                    crate::ImageMediaType::Gif => "image/gif",
-                                    crate::ImageMediaType::Webp => "image/webp",
-                                },
-                                "data": source.data,
-                            }
-                        })
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        json!({
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        })
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": content,
-                            "is_error": is_error,
-                        })
-                    }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        json!({"type": "thinking", "thinking": thinking})
-                    }
-                    ContentBlock::RedactedThinking { data } => {
-                        json!({"type": "redacted_thinking", "data": data})
-                    }
-                })
-                .collect();
-            json!({"role": role, "content": content})
-        })
-        .collect()
-}
-
-pub(crate) fn convert_to_anthropic_tools(tools: &Value) -> Value {
-    let Some(arr) = tools.as_array() else {
-        return tools.clone();
-    };
-    Value::Array(arr.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn convert_to_anthropic_messages_basic() {
-        use crate::types::Message as Msg;
-        let messages = vec![Msg::user("hello".into())];
-        let result = convert_to_anthropic_messages(&messages);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["role"], "user");
-        assert_eq!(result[0]["content"][0]["type"], "text");
-        assert_eq!(result[0]["content"][0]["text"], "hello");
-    }
-
-    #[test]
-    fn convert_to_anthropic_messages_with_tools() {
-        use crate::types::{ContentBlock as CB, Message as Msg, Role};
-        let messages = vec![
-            Msg {
-                role: Role::Assistant,
-                content: vec![
-                    CB::Text {
-                        text: "I'll check".into(),
-                    },
-                    CB::ToolUse {
-                        id: "tc_1".into(),
-                        name: "bash".into(),
-                        input: json!({"cmd": "ls"}),
-                    },
-                ],
-                ..Default::default()
-            },
-            Msg {
-                role: Role::User,
-                content: vec![CB::ToolResult {
-                    tool_use_id: "tc_1".into(),
-                    content: "ok".into(),
-                    is_error: false,
-                }],
-                ..Default::default()
-            },
-        ];
-        let result = convert_to_anthropic_messages(&messages);
-
-        assert_eq!(result[0]["role"], "assistant");
-        assert_eq!(result[0]["content"][0]["text"], "I'll check");
-        assert_eq!(result[0]["content"][1]["type"], "tool_use");
-        assert_eq!(result[0]["content"][1]["id"], "tc_1");
-        assert_eq!(result[1]["role"], "user");
-        assert_eq!(result[1]["content"][0]["type"], "tool_result");
-    }
-
-    #[test]
-    fn build_anthropic_body_includes_system_and_model() {
-        let model = Model::from_spec("opencode/claude-sonnet-4-6").unwrap();
-        let messages = vec![Message::user("hi".into())];
-        let body = build_anthropic_body(&model, &messages, "be helpful", &json!([]));
-
-        assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert_eq!(body["system"][0]["text"], "be helpful");
-        assert_eq!(body["max_tokens"], 128000);
-        assert_eq!(body["stream"], true);
-    }
 
     #[test]
     fn catalog_format_messages_for_anthropic() {
@@ -966,7 +849,7 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec!["MAKI_TEST_OPENCODE_FREE_60924".into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
@@ -974,12 +857,20 @@ mod tests {
         );
 
         let result = catalog_to_data(providers);
-        // Without OPENCODE_API_KEY, "public" is used as default key (auth only),
+        // Without key set, has_api_key is false, so only free models pass
         // but has_api_key is false, so only free models pass
-        assert!(result.entries.contains_key("free-model"));
-        assert!(!result.entries.contains_key("paid-model"));
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "free-model".into()))
+        );
+        assert!(
+            !result
+                .entries
+                .contains_key(&("opencode".into(), "paid-model".into()))
+        );
         // Route should exist
-        assert!(result.routes.contains_key("opencode"));
+        assert!(result.auths.contains_key("opencode"));
     }
 
     #[test]
@@ -1017,21 +908,29 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec!["MAKI_TEST_OPENCODE_ALL_81274".into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
             },
         );
 
-        unsafe { std::env::set_var("OPENCODE_API_KEY", "real-key") };
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_ALL_81274", "real-key") };
         let result = catalog_to_data(providers);
-        unsafe { std::env::remove_var("OPENCODE_API_KEY") };
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_ALL_81274") };
 
-        // With OPENCODE_API_KEY set, has_api_key is true, so all models pass
-        assert!(result.entries.contains_key("free-model"));
-        assert!(result.entries.contains_key("paid-model"));
-        assert!(result.routes.contains_key("opencode"));
+        // With key set, has_api_key is true, so all models pass
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "free-model".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "paid-model".into()))
+        );
+        assert!(result.auths.contains_key("opencode"));
     }
 
     #[test]
@@ -1042,8 +941,8 @@ mod tests {
             CatalogModel {
                 limit: None,
                 cost: Some(CatalogCost {
-                    input: Some(0.5),
-                    output: Some(1.5),
+                    input: Some(0.0),
+                    output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
                 }),
@@ -1081,8 +980,16 @@ mod tests {
         let result = catalog_to_data(providers);
         unsafe { std::env::remove_var("MAKI_TEST_VENDOR_KEY_81274") };
 
-        assert!(result.entries.contains_key("cheap"));
-        assert!(result.entries.contains_key("freebie"));
+        assert!(
+            result
+                .entries
+                .contains_key(&("some-vendor".into(), "cheap".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("some-vendor".into(), "freebie".into()))
+        );
     }
 
     #[test]
@@ -1101,6 +1008,228 @@ mod tests {
 
         let result = catalog_to_data(providers);
         assert!(result.entries.is_empty());
-        assert!(result.routes.is_empty());
+        assert!(result.auths.is_empty());
+    }
+
+    #[test]
+    fn catalog_to_data_handles_model_id_collisions() {
+        let mut models: HashMap<String, CatalogModel> = HashMap::new();
+        models.insert(
+            "shared-model".into(),
+            CatalogModel {
+                limit: Some(CatalogLimits {
+                    context: Some(64_000),
+                    input: Some(64_000),
+                    output: Some(8_000),
+                }),
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+
+        let mut providers = HashMap::new();
+
+        // Provider "opencode" has "shared-model"
+        providers.insert(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec![],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models: models.clone(),
+            },
+        );
+
+        // Provider "other-vendor" also has "shared-model"
+        providers.insert(
+            "other-vendor".into(),
+            CatalogProvider {
+                name: "Other".into(),
+                env: vec!["MAKI_TEST_OTHER_KEY_COLLISION".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://other.api/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_OTHER_KEY_COLLISION", "key") };
+        let result = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_OTHER_KEY_COLLISION") };
+
+        // Both providers' entries are preserved
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "shared-model".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("other-vendor".into(), "shared-model".into()))
+        );
+        assert_eq!(result.entries.len(), 2);
+
+        // lookup prefers the "opencode" provider
+        // lookup expects \"provider/model_id\" format
+        let (meta, _) = result.lookup("opencode/shared-model").unwrap();
+        assert_eq!(meta.provider_id, "opencode");
+    }
+
+    #[test]
+    fn lookup_finds_opencode_own_models() {
+        let mut models = HashMap::new();
+        models.insert(
+            "opus".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models,
+            },
+        );
+
+        let data = catalog_to_data(providers);
+        let (meta, _) = data.lookup("opencode/opus").unwrap();
+        assert_eq!(meta.provider_id, "opencode");
+    }
+
+    #[test]
+    fn lookup_finds_model_id_with_slashes() {
+        let mut models = HashMap::new();
+        models.insert(
+            "openai/gpt-oss-120b".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "nvidia".into(),
+            CatalogProvider {
+                name: "NVIDIA".into(),
+                env: vec!["MAKI_TEST_NVIDIA_KEY_LOOKUP".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://nvapi.xyz/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_NVIDIA_KEY_LOOKUP", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_KEY_LOOKUP") };
+
+        // Entry is stored as ("nvidia", "openai/gpt-oss-120b")
+        let (meta, _) = data.lookup("nvidia/openai/gpt-oss-120b").unwrap();
+        assert_eq!(meta.provider_id, "nvidia");
+    }
+
+    #[test]
+    fn lookup_spec_is_sub_provider_plus_model_id() {
+        // Simulates the stream_message pattern:
+        // lookup key = "{sub_provider}/{model.id}"
+        // e.g. "nvidia/openai/gpt-oss-120b"
+        let mut models = HashMap::new();
+        models.insert(
+            "openai/gpt-oss-120b".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "nvidia".into(),
+            CatalogProvider {
+                name: "NVIDIA".into(),
+                env: vec!["MAKI_TEST_NVIDIA_DIRECT".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://nvapi.xyz/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_NVIDIA_DIRECT", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_DIRECT") };
+
+        // The lookup key constructed by stream_message:
+        // format!("{}/{}", sub_provider, model.id)
+        // = "nvidia/openai/gpt-oss-120b"
+        let key = format!("{}/{}", "nvidia", "openai/gpt-oss-120b");
+        let (meta, _) = data.lookup(&key).unwrap();
+        assert_eq!(meta.provider_id, "nvidia");
+    }
+
+    #[test]
+    fn lookup_nested_model_id_uses_sub_provider_key() {
+        let mut models = HashMap::new();
+        models.insert(
+            "deepseek-ai/DeepSeek-R1".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "fireworks".into(),
+            CatalogProvider {
+                name: "Fireworks".into(),
+                env: vec!["MAKI_TEST_FIREWORKS_DEEP".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://fireworks.ai/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_FIREWORKS_DEEP", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_FIREWORKS_DEEP") };
+
+        // stream_message constructs key as "{sub_provider}/{model.id}"
+        // = "fireworks/deepseek-ai/DeepSeek-R1"
+        let key = format!("{}/{}", "fireworks", "deepseek-ai/DeepSeek-R1");
+        let (meta, _) = data.lookup(&key).unwrap();
+        assert_eq!(meta.provider_id, "fireworks");
     }
 }
