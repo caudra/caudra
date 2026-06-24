@@ -52,6 +52,16 @@ impl History {
         self.messages.is_empty()
     }
 
+    pub fn has_recent_tool_results(&self, depth: usize) -> bool {
+        let msgs = self.as_slice();
+        let start = msgs.len().saturating_sub(depth);
+        msgs[start..].iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        })
+    }
+
     pub fn replace(&mut self, messages: Vec<Message>) {
         self.edit(|msgs| *msgs = messages);
     }
@@ -418,5 +428,40 @@ mod tests {
             })
             .collect();
         assert_eq!(results, ["t1"]);
+    }
+
+    #[test_case(
+        vec![Message::user("go".into())],
+        0
+        ; "no_tool_results"
+    )]
+    #[test_case(
+        vec![
+            Message::user("go".into()),
+            make_tool_result_msg(&["t1"]),
+        ],
+        1
+        ; "recent_tool_result"
+    )]
+    #[test_case(
+        vec![
+            Message::user("old1".into()),
+            Message::user("old2".into()),
+            Message::user("old3".into()),
+            Message::user("old4".into()),
+            Message::user("old5".into()),
+            make_tool_result_msg(&["t1"]),
+        ],
+        1
+        ; "at_depth_boundary"
+    )]
+    fn has_recent_tool_results(messages: Vec<Message>, depth: usize) {
+        let history = History::new(messages);
+        let result = if depth == 0 {
+            history.has_recent_tool_results(0)
+        } else {
+            history.has_recent_tool_results(depth)
+        };
+        assert_eq!(result, depth > 0);
     }
 }

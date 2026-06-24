@@ -159,6 +159,13 @@ impl Chat {
                 self.messages_panel
                     .tool_header_snapshot(&id, snapshot, theme_gen);
             }
+            AgentEvent::Nudge => {
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    "Model stalled after tool calls, nudging...".into(),
+                ));
+            }
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
