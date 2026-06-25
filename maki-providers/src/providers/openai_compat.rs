@@ -66,6 +66,27 @@ impl OpenAiCompatProvider {
         Ok(response.text().await?)
     }
 
+    pub(crate) async fn post_text(
+        &self,
+        auth: &ResolvedAuth,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<String, AgentError> {
+        let mut builder = Request::builder().method("POST").uri(url);
+        for (key, value) in &auth.headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        let request = builder
+            .header("content-type", content_type)
+            .body(body.to_vec())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    }
+
     pub fn build_body(
         &self,
         model: &crate::model::Model,
