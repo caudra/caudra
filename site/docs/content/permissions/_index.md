@@ -115,6 +115,7 @@ When you pick "always allow", the saved scope is generalized so it stays useful 
 
 - **bash**: `cargo test --all` becomes `cargo *`
 - **write/edit/multiedit**: `/path/to/file.rs` becomes `/path/to/**`
+- **MCP tools**: always `*` (per-tool, so allowing `mcp:fetch` won't cover `mcp:exec`)
 - **webfetch/websearch**: always `*`
 
 Deny rules are saved with the exact scope. You denied something specific, so it stays specific.
