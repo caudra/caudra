@@ -212,6 +212,7 @@ impl AgentLoop {
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
+            &slot.model,
         );
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
@@ -280,11 +281,13 @@ impl AgentLoop {
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
+        let slot = self.model_slot.load();
         let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
+            &slot.model,
         );
         self.btw_system.store(Arc::new(system));
     }

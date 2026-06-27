@@ -112,6 +112,7 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
 
 pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
+pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 pub const EDIT_TOOL_NAME: &str = "edit";
 pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
@@ -121,7 +122,6 @@ pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const WRITE_TOOL_NAME: &str = "write";
-pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";

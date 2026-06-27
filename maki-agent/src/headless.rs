@@ -142,7 +142,13 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         params.mcp_handle.as_ref(),
     );
 
-    let system = agent::build_system_prompt(&vars, &mode, &instructions.text, &params.prompt_slots);
+    let system = agent::build_system_prompt(
+        &vars,
+        &mode,
+        &instructions.text,
+        &params.prompt_slots,
+        &params.model,
+    );
 
     let tool_names = extract_tool_names(&tools);
 
@@ -348,6 +354,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &instructions.text,
                         &params.prompt_slots,
+                        &model,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
