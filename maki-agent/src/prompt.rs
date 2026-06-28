@@ -98,15 +98,6 @@ impl Slot {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
-    const ALL: &[Slot] = &[
-        Slot::Identity,
-        Slot::Tone,
-        Slot::ToolUsage,
-        Slot::EfficientTools,
-        Slot::Conventions,
-        Slot::AfterInstructions,
-    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter)]
@@ -205,7 +196,7 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
 /// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
 pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
     let mut out = id.template().to_string();
-    for &slot in Slot::ALL {
+    for slot in Slot::iter() {
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }
     out.replace(INSTRUCTIONS_MARKER, instructions)
