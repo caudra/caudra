@@ -48,6 +48,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
         },
+        Some(Command::Prompt {
+            variant,
+            plan,
+            tools,
+            names,
+        }) => {
+            subcmd::prompt(&variant, plan, tools, names)?;
+        }
         None => {
             tui::run(cli)?;
         }

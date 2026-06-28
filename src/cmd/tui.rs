@@ -154,7 +154,7 @@ pub fn run(cli: Cli) -> Result<()> {
         let fast = config.always_fast && model.supports_fast();
         crate::print::run(
             &model,
-            cli.prompt,
+            cli.initial_prompt,
             cli.output_format,
             cli.verbose,
             config.agent,
@@ -184,7 +184,7 @@ pub fn run(cli: Cli) -> Result<()> {
         } else {
             Model::from_spec(&session.model).unwrap_or(model)
         };
-        let initial_prompt = read_initial_prompt(cli.prompt)?;
+        let initial_prompt = read_initial_prompt(cli.initial_prompt)?;
         let (session_id, exit_code) = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,

@@ -7,6 +7,14 @@ use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 use crate::print::OutputFormat;
 
 #[derive(Clone, ValueEnum, Default)]
+pub enum PromptVariant {
+    #[default]
+    System,
+    Research,
+    General,
+}
+
+#[derive(Clone, ValueEnum, Default)]
 pub enum InputFormat {
     #[default]
     Text,
@@ -140,7 +148,8 @@ pub struct Cli {
     pub thinking_display: Option<String>,
 
     /// Initial prompt (reads stdin if piped)
-    pub prompt: Option<String>,
+    #[arg(value_name = "PROMPT")]
+    pub initial_prompt: Option<String>,
 }
 
 impl Cli {
@@ -209,6 +218,21 @@ pub enum Command {
         /// Skip all permission prompts
         #[arg(long)]
         yolo: bool,
+    },
+    /// Show the rendered system prompt or tool definitions
+    Prompt {
+        /// Prompt variant: system (default), research, general
+        #[arg(value_enum, default_value_t = PromptVariant::System)]
+        variant: PromptVariant,
+        /// Append the plan mode reminder to the system prompt
+        #[arg(long)]
+        plan: bool,
+        /// Show tool definitions (JSON) instead of prompt text
+        #[arg(long)]
+        tools: bool,
+        /// With --tools: show only tool names, one per line
+        #[arg(long, requires = "tools")]
+        names: bool,
     },
     /// Data migration utilities
     Migrate {
