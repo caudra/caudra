@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "maki"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "maki-acp"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "maki-agent"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "arc-swap",
  "async-io",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "dotenvy",
  "inventory",
@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config-macro"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "maki-docgen"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "maki-agent",
  "maki-config",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "maki-highlight"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "serde_json",
  "syntect",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "maki-interpreter"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "monty",
  "serde_json",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -2565,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "maki-markdown"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "fastrand",
  "maki-highlight",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "maki-providers"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "base64",
  "fastrand",
@@ -2602,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "maki-storage"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "etcetera",
  "getrandom 0.3.4",
@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "maki-tool-macro"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "maki-ui"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "arboard",
  "arc-swap",
