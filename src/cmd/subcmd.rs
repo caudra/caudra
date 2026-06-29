@@ -530,6 +530,7 @@ pub fn prompt(
     use maki_agent::prompt::{PromptId, assemble};
     use maki_agent::template;
     use maki_agent::tools::{DescriptionContext, ToolFilter, ToolRegistry};
+    use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
@@ -583,7 +584,13 @@ pub fn prompt(
             } else {
                 maki_agent::AgentMode::Build
             };
-            build_system_prompt(&vars, &mode, &instructions, &slots)
+            let model_spec = config
+                .provider
+                .default_model
+                .as_deref()
+                .unwrap_or("anthropic/claude-sonnet-4-20250514");
+            let model = Model::from_spec(model_spec).context("invalid default model")?;
+            build_system_prompt(&vars, &mode, &instructions, &slots, &model)
         }
         PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
         PromptVariant::General => assemble(PromptId::General, &slots, &instructions),
