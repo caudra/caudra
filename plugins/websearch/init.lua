@@ -71,13 +71,19 @@ maki.api.register_tool({
     local max_lines = (config and config.max_output_lines) or 2000
     local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
 
+    local headers = {
+      ["Content-Type"] = "application/json",
+      ["Accept"] = "application/json, text/event-stream",
+    }
+    local api_key = os.getenv("EXA_API_KEY")
+    if api_key then
+      headers["x-api-key"] = api_key
+    end
+
     local resp, err = maki.net.request(EXA_MCP_ENDPOINT, {
       method = "POST",
       body = payload,
-      headers = {
-        ["Content-Type"] = "application/json",
-        ["Accept"] = "application/json, text/event-stream",
-      },
+      headers = headers,
       timeout = REQUEST_TIMEOUT_SECS,
       max_bytes = max_response,
     })
