@@ -21,5 +21,10 @@ pub(crate) fn create_uv_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
         })?,
     )?;
 
+    t.set(
+        "os_getenv",
+        perms.guard(Env, lua, |_, name: String| Ok(std::env::var(&name).ok()))?,
+    )?;
+
     Ok(t)
 }

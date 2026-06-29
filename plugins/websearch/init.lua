@@ -75,7 +75,7 @@ maki.api.register_tool({
       ["Content-Type"] = "application/json",
       ["Accept"] = "application/json, text/event-stream",
     }
-    local api_key = os.getenv("EXA_API_KEY")
+    local api_key = maki.uv.os_getenv("EXA_API_KEY")
     if api_key then
       headers["x-api-key"] = api_key
     end
