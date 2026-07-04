@@ -210,6 +210,26 @@ impl<T: PickerItem> State<T> {
         self.ensure_visible();
     }
 
+    fn page_up(&mut self) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let step = self.viewport_height.max(1);
+        self.selected = self.selected.saturating_sub(step);
+        self.ensure_visible();
+    }
+
+    fn page_down(&mut self) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let step = self.viewport_height.max(1);
+        self.selected = (self.selected + step).min(len - 1);
+        self.ensure_visible();
+    }
+
     fn move_down(&mut self) {
         let len = self.filtered.len();
         if len == 0 {
@@ -436,6 +456,14 @@ impl<T: PickerItem> ListPicker<T> {
             }
             KeyCode::Down => {
                 s.move_down();
+                PickerAction::Consumed
+            }
+            KeyCode::PageUp => {
+                s.page_up();
+                PickerAction::Consumed
+            }
+            KeyCode::PageDown => {
+                s.page_down();
                 PickerAction::Consumed
             }
             KeyCode::Enter => {
@@ -964,6 +992,40 @@ mod tests {
         assert_eq!(ready_state(&p).selected, 2);
 
         p.handle_key(key(KeyCode::Down));
+        assert_eq!(ready_state(&p).selected, 0);
+    }
+
+    #[test]
+    fn page_down_advances_and_clamps() {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        ready_state_mut(&mut p).viewport_height = 10;
+
+        p.handle_key(key(KeyCode::PageDown));
+        assert_eq!(ready_state(&p).selected, 10);
+
+        for _ in 0..10 {
+            p.handle_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(ready_state(&p).selected, 49);
+    }
+
+    #[test]
+    fn page_up_retreats_and_clamps() {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        let s = ready_state_mut(&mut p);
+        s.viewport_height = 10;
+        s.selected = 25;
+
+        p.handle_key(key(KeyCode::PageUp));
+        assert_eq!(ready_state(&p).selected, 15);
+
+        for _ in 0..5 {
+            p.handle_key(key(KeyCode::PageUp));
+        }
         assert_eq!(ready_state(&p).selected, 0);
     }
 

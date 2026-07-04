@@ -516,6 +516,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt("PageUp", "PageDown"),
+        description: "Scroll page up / down",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete session",
         context: KeybindContext::SessionPicker,
