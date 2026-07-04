@@ -201,7 +201,7 @@ impl App {
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
-        Self {
+        let mut app = Self {
             chats: vec![Chat::new("Main".into(), ui_config)],
             active_chat: 0,
             chat_index: HashMap::new(),
@@ -256,7 +256,10 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
-        }
+        };
+        app.model_picker
+            .set_recents(maki_storage::model::read_recents(&app.storage));
+        app
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -274,6 +277,11 @@ impl App {
     pub(crate) fn update_model(&mut self, model: &Model) {
         self.state.update_model(model);
         persist_model(&self.storage, &self.state.session.model);
+    }
+
+    pub(crate) fn record_recent_model(&mut self, spec: &str) {
+        let recents = maki_storage::model::push_recent(&self.storage, spec);
+        self.model_picker.set_recents(recents);
     }
 
     pub(crate) fn flash(&mut self, msg: String) {

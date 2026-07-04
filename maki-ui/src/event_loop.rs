@@ -549,6 +549,7 @@ impl<'t> EventLoop<'t> {
             Ok(mut new_model) => match from_model(&mut new_model, self.timeouts) {
                 Ok(new_provider) => {
                     self.app.update_model(&new_model);
+                    self.app.record_recent_model(&spec);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
