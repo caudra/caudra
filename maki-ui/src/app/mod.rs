@@ -44,6 +44,7 @@ use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
+use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
@@ -142,6 +143,7 @@ pub struct App {
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
+    pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -165,6 +167,7 @@ pub struct App {
     pub(super) last_esc: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
@@ -220,6 +223,7 @@ impl App {
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
+            usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -242,6 +246,7 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             storage,
+            usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
             shared_tool_outputs: None,
@@ -370,6 +375,10 @@ impl App {
             self.help_modal.scroll(delta);
             return;
         }
+        if self.usage_modal.is_open() {
+            self.usage_modal.scroll(delta);
+            return;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -491,6 +500,11 @@ impl App {
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.usage_modal.is_open() {
+            self.usage_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -1015,6 +1029,13 @@ impl App {
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
+            *self
+                .state
+                .session
+                .meta
+                .usage_by_model
+                .entry(tc.model.clone())
+                .or_default() += tc.usage.into();
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1137,6 +1158,14 @@ impl App {
             "/help" => {
                 self.help_modal.toggle();
                 vec![]
+            }
+            "/usage" => {
+                self.usage_modal.toggle();
+                if self.usage_modal.is_open() {
+                    vec![Action::RefreshUsage]
+                } else {
+                    vec![]
+                }
             }
             "/btw" => {
                 let question = cmd.args.trim().to_string();
@@ -1360,9 +1389,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
+            &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1378,9 +1408,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
+            &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,

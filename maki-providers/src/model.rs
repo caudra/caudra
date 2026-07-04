@@ -7,6 +7,7 @@ use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
 
+use maki_storage::sessions::StoredTokenUsage;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
@@ -358,6 +359,28 @@ pub struct TokenUsage {
     pub cache_creation: u32,
     #[serde(rename = "cache_read_input_tokens")]
     pub cache_read: u32,
+}
+
+impl From<StoredTokenUsage> for TokenUsage {
+    fn from(s: StoredTokenUsage) -> Self {
+        Self {
+            input: s.input,
+            output: s.output,
+            cache_creation: s.cache_creation,
+            cache_read: s.cache_read,
+        }
+    }
+}
+
+impl From<TokenUsage> for StoredTokenUsage {
+    fn from(u: TokenUsage) -> Self {
+        Self {
+            input: u.input,
+            output: u.output,
+            cache_creation: u.cache_creation,
+            cache_read: u.cache_read,
+        }
+    }
 }
 
 impl TokenUsage {

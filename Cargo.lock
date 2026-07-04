@@ -2149,6 +2149,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

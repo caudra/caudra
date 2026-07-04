@@ -522,6 +522,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        description: "Scroll page up / down",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete session",
         context: KeybindContext::SessionPicker,
