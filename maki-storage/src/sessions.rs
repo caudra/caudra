@@ -39,6 +39,40 @@ pub enum SessionError {
     CursorAhead { saved: usize, actual: usize },
 }
 
+/// Per-model token breakdown entry. Mirrors the four usage counters tracked by
+/// the active provider; kept storage-local to avoid a circular dependency on
+/// `maki-providers`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTokenUsage {
+    #[serde(default)]
+    pub input: u32,
+    #[serde(default)]
+    pub output: u32,
+    #[serde(default)]
+    pub cache_creation: u32,
+    #[serde(default)]
+    pub cache_read: u32,
+}
+
+impl StoredTokenUsage {
+    pub fn total_input(&self) -> u32 {
+        self.input + self.cache_read + self.cache_creation
+    }
+
+    pub fn total(&self) -> u32 {
+        self.input + self.output + self.cache_creation + self.cache_read
+    }
+}
+
+impl std::ops::AddAssign for StoredTokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input += rhs.input;
+        self.output += rhs.output;
+        self.cache_creation += rhs.cache_creation;
+        self.cache_read += rhs.cache_read;
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default)]
@@ -63,6 +97,8 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub usage_by_model: HashMap<String, StoredTokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -938,6 +974,50 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.version, SESSION_VERSION);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
+    }
+
+    #[test]
+    fn roundtrip_usage_by_model() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        session.meta.usage_by_model.insert(
+            "claude-sonnet-4".into(),
+            super::StoredTokenUsage {
+                input: 100,
+                output: 20,
+                cache_creation: 5,
+                cache_read: 40,
+            },
+        );
+        session.meta.usage_by_model.insert(
+            "claude-haiku-4".into(),
+            super::StoredTokenUsage {
+                input: 30,
+                output: 10,
+                ..Default::default()
+            },
+        );
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        let sonnet = &loaded.meta.usage_by_model["claude-sonnet-4"];
+        assert_eq!(sonnet.input, 100);
+        assert_eq!(sonnet.output, 20);
+        assert_eq!(sonnet.cache_read, 40);
+        assert_eq!(sonnet.total_input(), 145);
+        assert_eq!(loaded.meta.usage_by_model["claude-haiku-4"].total(), 40);
+    }
+
+    #[test]
+    fn usage_by_model_absent_on_legacy_session() {
+        let json = r#"{"t":"header","v":2,"id":"x","model":"m","cwd":"/","created_at":0}
+{"t":"meta","title":"t","token_usage":null,"updated_at":0}"#;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("x.jsonl");
+        fs::write(&path, json).unwrap();
+        let loaded = TestSession::load_from("x", tmp.path()).unwrap();
+        assert!(loaded.meta.usage_by_model.is_empty());
     }
 
     #[test]
