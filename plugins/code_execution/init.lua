@@ -98,7 +98,10 @@ local function handler(input, ctx)
   })
 
   if err then
-    show(err)
+    if waiting then
+      view:clear()
+    end
+    append_lines(view, err)
     view:finish()
     return { llm_output = err, is_error = true, body = buf }
   end
