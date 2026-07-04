@@ -433,6 +433,28 @@ pub struct StreamResponse {
     pub stop_reason: Option<StopReason>,
 }
 
+/// Provider-reported usage quota, independent of local token accounting. Not every
+/// provider exposes a programmatic quota endpoint; check `Provider::fetch_usage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    /// Subscription/plan level when the provider reports one (e.g. "lite").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    pub limits: Vec<UsageLimit>,
+}
+
+/// A single quota window (e.g. a 5-hour or weekly token quota).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLimit {
+    /// Human-readable label for the window, provided by the provider.
+    pub label: String,
+    /// Usage percentage within the window, 0-100.
+    pub percentage: u32,
+    /// When the window resets, as epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
 
