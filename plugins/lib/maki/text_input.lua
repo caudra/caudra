@@ -385,7 +385,7 @@ function TextInput:handle_key(key)
   local result
   if op then
     result = self[op](self)
-  elseif #key == 1 then
+  elseif (utf8.len(key) or 0) == 1 then
     result = self:insert_char(key)
   else
     return R.IGNORED
