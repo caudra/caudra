@@ -102,7 +102,14 @@ fn setup(
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(&vars, model, config, excluded_tools, mcp_handle);
+    let tools = tool_definitions(
+        &vars,
+        model,
+        config,
+        excluded_tools,
+        mcp_handle,
+        ToolRegistry::native(),
+    );
 
     AgentSetup {
         vars,
@@ -117,10 +124,11 @@ fn tool_definitions(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    registry: &ToolRegistry,
 ) -> Value {
     let filter = ToolFilter::from_config(config, excluded_tools);
     let ctx = DescriptionContext { filter: &filter };
-    let mut tools = ToolRegistry::native().definitions(vars, &ctx, model.supports_tool_examples());
+    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
 
     if let Some(handle) = mcp_handle {
         handle.extend_tools(&mut tools);
@@ -193,6 +201,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    registry: Arc::clone(ToolRegistry::native_arc()),
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -338,6 +347,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.config,
                                 &params.excluded_tools,
                                 params.mcp_handle.as_ref(),
+                                ToolRegistry::native(),
                             );
                             model = new_model;
                         }
@@ -390,6 +400,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        registry: Arc::clone(ToolRegistry::native_arc()),
                     },
                     AgentRunParams {
                         history: &mut history,
