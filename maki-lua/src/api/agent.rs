@@ -61,7 +61,11 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
     let map = maki_providers::model_registry::model_registry()
         .read()
         .unwrap();
-    map.spec_for_tier(ctx.model.provider, effective)
+    ctx.model
+        .dynamic_slug
+        .is_none()
+        .then(|| map.spec_for_tier(ctx.model.provider, effective))
+        .flatten()
         .or_else(|| map.spec_for_tier_any(effective))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)
