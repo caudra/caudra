@@ -151,6 +151,8 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -182,6 +184,17 @@ pub enum MessageKind {
 impl MessageKind {
     fn is_turn(&self) -> bool {
         matches!(self, Self::Turn)
+    }
+}
+
+impl ContentBlock {
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
+        Self::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+            thought_signature: None,
+        }
     }
 }
 
@@ -271,7 +284,9 @@ impl Message {
 
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         })
     }

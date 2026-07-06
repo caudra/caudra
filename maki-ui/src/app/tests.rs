@@ -2210,11 +2210,7 @@ fn build_rewind_app() -> App {
                 ContentBlock::Text {
                     text: "response 1".into(),
                 },
-                ContentBlock::ToolUse {
-                    id: "tool-1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({})),
             ],
             ..Default::default()
         },
@@ -3783,11 +3779,7 @@ const UNFINISHED_TASK_ID: &str = "task-unfinished";
 fn tool_use_msg(id: &str) -> Message {
     Message {
         role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: id.into(),
-            name: "read".into(),
-            input: serde_json::json!({}),
-        }],
+        content: vec![ContentBlock::tool_use(id, "read", serde_json::json!({}))],
         ..Default::default()
     }
 }

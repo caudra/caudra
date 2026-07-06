@@ -817,11 +817,11 @@ mod tests {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: tool_id.into(),
-                    name: tool_name.into(),
-                    input: serde_json::json!({"pattern": "*.nonexistent_test_xyz", "path": "/tmp"}),
-                }],
+                content: vec![ContentBlock::tool_use(
+                    tool_id,
+                    tool_name,
+                    serde_json::json!({"pattern": "*.nonexistent_test_xyz", "path": "/tmp"}),
+                )],
                 ..Default::default()
             },
             usage: TokenUsage::default(),
@@ -833,11 +833,7 @@ mod tests {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: tool_name.into(),
-                    input,
-                }],
+                content: vec![ContentBlock::tool_use("t1", tool_name, input)],
                 ..Default::default()
             },
             usage: TokenUsage::default(),

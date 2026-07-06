@@ -82,7 +82,9 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push((id, name, input));
                         }
                         ContentBlock::ToolResult { .. }
@@ -505,11 +507,7 @@ pub(crate) async fn parse_sse(
                 Value::Object(Default::default())
             }
         };
-        content_blocks.push(ContentBlock::ToolUse {
-            id: acc.call_id,
-            name: acc.name,
-            input,
-        });
+        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
     }
 
     Ok(StreamResponse {
@@ -699,11 +697,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
                     ContentBlock::Text {
                         text: "thinking...".to_string(),
                     },
-                    ContentBlock::ToolUse {
-                        id: "tc_1".to_string(),
-                        name: "bash".to_string(),
-                        input: json!({"command": "ls"}),
-                    },
+                    ContentBlock::tool_use("tc_1", "bash", json!({"command": "ls"})),
                 ],
                 ..Default::default()
             },

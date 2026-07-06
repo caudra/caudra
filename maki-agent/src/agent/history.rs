@@ -215,11 +215,7 @@ mod tests {
             role: Role::Assistant,
             content: ids
                 .iter()
-                .map(|id| ContentBlock::ToolUse {
-                    id: id.to_string(),
-                    name: "read".into(),
-                    input: serde_json::json!({}),
-                })
+                .map(|id| ContentBlock::tool_use(*id, "read", serde_json::json!({})))
                 .collect(),
             ..Default::default()
         }

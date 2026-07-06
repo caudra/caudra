@@ -1573,11 +1573,7 @@ mod tests {
     #[test]
     fn new_seeds_loads_only_from_wire_names_in_history() {
         let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let tool_use = |name: &str| ContentBlock::ToolUse {
-            id: "t".into(),
-            name: name.into(),
-            input: json!({}),
-        };
+        let tool_use = |name: &str| ContentBlock::tool_use("t", name, json!({}));
         let history = vec![Message {
             role: Role::Assistant,
             content: vec![
@@ -1664,11 +1660,7 @@ mod tests {
         let (_inner, session) = setup(vec![entry_with_tools("srv", defs)]);
         let history = vec![Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "t".into(),
-                name: "srv__do__thing".into(),
-                input: json!({}),
-            }],
+            content: vec![ContentBlock::tool_use("t", "srv__do__thing", json!({}))],
             display_text: None,
             ..Default::default()
         }];

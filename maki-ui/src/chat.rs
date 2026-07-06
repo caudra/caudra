@@ -417,7 +417,9 @@ pub fn history_to_display(
                             display
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             let static_name = name.as_str();
                             let reg = ToolRegistry::global();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
@@ -772,11 +774,7 @@ mod tests {
         vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: tool.into(),
-                    input,
-                }],
+                content: vec![ContentBlock::tool_use("t1", tool, input)],
                 ..Default::default()
             },
             Message {
@@ -815,11 +813,7 @@ mod tests {
                     ContentBlock::Text {
                         text: "Sure, let me help.".into(),
                     },
-                    ContentBlock::ToolUse {
-                        id: "t1".into(),
-                        name: "bash".into(),
-                        input: serde_json::json!({"command": "echo hi"}),
-                    },
+                    ContentBlock::tool_use("t1", "bash", serde_json::json!({"command": "echo hi"})),
                 ],
                 ..Default::default()
             },

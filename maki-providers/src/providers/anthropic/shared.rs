@@ -274,11 +274,8 @@ impl EventParser {
                                     name: name.clone(),
                                 })
                                 .await?;
-                            self.content_blocks.push(ContentBlock::ToolUse {
-                                id,
-                                name,
-                                input: Value::Null,
-                            });
+                            self.content_blocks
+                                .push(ContentBlock::tool_use(id, name, Value::Null));
                         }
                     }
                 }

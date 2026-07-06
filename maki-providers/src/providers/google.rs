@@ -356,21 +356,34 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     parts.push(part);
                 }
                 ContentBlock::RedactedThinking { .. } => {}
-                ContentBlock::ToolUse { id: _, name, input } => {
-                    parts.push(json!({
+                ContentBlock::ToolUse {
+                    id: _,
+                    name,
+                    input,
+                    thought_signature,
+                } => {
+                    let mut part = json!({
                         "functionCall": {
                             "name": name,
                             "args": input,
                         }
-                    }));
+                    });
+                    if let Some(sig) = thought_signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => {
-                    let mut response_val = serde_json::from_str(content)
-                        .unwrap_or_else(|_| json!({"result": content}));
+                    let parsed = serde_json::from_str::<Value>(content);
+                    let mut response_val = match parsed {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        Ok(other) => json!({"result": other}),
+                        Err(_) => json!({"result": content}),
+                    };
                     if *is_error {
                         response_val = json!({"error": response_val});
                     }
@@ -482,6 +495,8 @@ struct SsePart {
 struct SseFunctionCall {
     name: String,
     args: Option<Value>,
+    #[serde(default)]
+    thought_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +586,7 @@ async fn parse_sse(
                 if let Some(func_call) = part.function_call {
                     let id = format!("call_{}", func_call.name);
                     let input = func_call.args.unwrap_or_default();
+                    let thought_signature = func_call.thought_signature.or(part.thought_signature);
                     event_tx
                         .send_async(ProviderEvent::ToolUseStart {
                             id: id.clone(),
@@ -581,6 +597,7 @@ async fn parse_sse(
                         id,
                         name: func_call.name,
                         input,
+                        thought_signature,
                     });
                     stop_reason = Some(StopReason::ToolUse);
                 } else if let Some(text) = part.text {
@@ -595,6 +612,7 @@ async fn parse_sse(
                             signature: part.thought_signature,
                         });
                     } else if !text.is_empty() {
+                        // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
                         event_tx
                             .send_async(ProviderEvent::TextDelta { text: text.clone() })
                             .await?;
@@ -760,11 +778,11 @@ mod tests {
         let messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call_1".into(),
-                    name: "read_file".into(),
-                    input: json!({"path": "/tmp/a"}),
-                }],
+                content: vec![ContentBlock::tool_use(
+                    "call_1",
+                    "read_file",
+                    json!({"path": "/tmp/a"}),
+                )],
                 ..Default::default()
             },
             Message {
@@ -782,6 +800,82 @@ mod tests {
         assert_eq!(
             result[1]["parts"][0]["functionResponse"]["name"],
             "read_file"
+        );
+    }
+
+    #[test_case("not json at all", json!({"result": "not json at all"}) ; "non_json_wraps_string")]
+    #[test_case(r#""a json string""#, json!({"result": "a json string"}) ; "json_scalar_wraps")]
+    #[test_case("42", json!({"result": 42}) ; "json_number_wraps")]
+    #[test_case(r#"{"out": "ok"}"#, json!({"out": "ok"}) ; "json_object_passes_through")]
+    fn convert_messages_tool_result_response_is_always_struct(content: &str, expected: Value) {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: content.into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            expected
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_result_error_wraps_response() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "boom".into(),
+                    is_error: true,
+                }],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            json!({"error": {"result": "boom"}})
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_use_preserves_thought_signature() {
+        const SIG: &str = "sig-abc";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "/tmp/a"}),
+                thought_signature: Some(SIG.into()),
+            }],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result[0]["parts"][0]["functionCall"]["name"], "read_file");
+        assert_eq!(result[0]["parts"][0]["thoughtSignature"], SIG);
+        assert!(
+            result[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none()
         );
     }
 
@@ -971,6 +1065,29 @@ mod tests {
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { name, .. } if name == "bash"
+        ));
+    }
+
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}"#
+        ; "part_level"
+    )]
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
+        ; "nested_fallback"
+    )]
+    fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+        const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
+        let payload = format!(
+            r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
+        );
+        let data = format!("data: {payload}\n\n");
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
         ));
     }
 

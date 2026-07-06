@@ -329,7 +329,9 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         ContentBlock::Thinking { thinking, .. } => {
                             reasoning_text.push_str(thinking);
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(json!({
                                 "id": id,
                                 "type": "function",
@@ -677,7 +679,7 @@ pub async fn parse_sse(
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::ToolUse { id, name, input });
+        content_blocks.push(ContentBlock::tool_use(id, name, input));
     }
 
     Ok(StreamResponse {
@@ -804,11 +806,7 @@ data: [DONE]\n";
                     ContentBlock::Text {
                         text: "thinking...".to_string(),
                     },
-                    ContentBlock::ToolUse {
-                        id: "tc_1".to_string(),
-                        name: "bash".to_string(),
-                        input: json!({"command": "ls"}),
-                    },
+                    ContentBlock::tool_use("tc_1", "bash", json!({"command": "ls"})),
                 ],
                 ..Default::default()
             },
@@ -845,11 +843,11 @@ data: [DONE]\n";
             Message::user("list files".to_string()),
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "tc_1".to_string(),
-                    name: "bash".to_string(),
-                    input: json!({"command": "ls"}),
-                }],
+                content: vec![ContentBlock::tool_use(
+                    "tc_1",
+                    "bash",
+                    json!({"command": "ls"}),
+                )],
                 ..Default::default()
             },
         ];
