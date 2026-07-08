@@ -14,6 +14,15 @@ async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: 
             ProviderEvent::TextDelta { text } => AgentEvent::TextDelta { text },
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending { id, name },
+            ProviderEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            } => AgentEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            },
         };
         if event_tx.send(ae).is_err() {
             break;

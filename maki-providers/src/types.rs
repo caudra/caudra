@@ -247,9 +247,21 @@ impl TitleSource for Message {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ProviderEvent {
-    TextDelta { text: String },
-    ThinkingDelta { text: String },
-    ToolUseStart { id: String, name: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    PromptProgress {
+        processed: u32,
+        total: u32,
+        cache: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display, IntoStaticStr)]

@@ -596,6 +596,11 @@ pub enum AgentEvent {
         id: String,
         body: Arc<SharedBuf>,
     },
+    PromptProgress {
+        processed: u32,
+        total: u32,
+        cache: u32,
+    },
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
