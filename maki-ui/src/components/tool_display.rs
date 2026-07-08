@@ -1041,6 +1041,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1335,6 +1336,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1450,6 +1452,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1489,6 +1492,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1738,6 +1742,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1843,6 +1848,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -1990,6 +1996,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         };
         let tl = build_tool_lines(
             &msg,
@@ -2028,6 +2035,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         };
         let tl = build_tool_lines(
             &msg,

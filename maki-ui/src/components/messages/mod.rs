@@ -43,6 +43,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
+const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -67,6 +69,8 @@ pub struct MessagesPanel {
     render_hints: RenderHintsRegistry,
     lua_event_handle: Option<EventHandle>,
     restore_event_tx: Option<EventSender>,
+    show_thinking: bool,
+    thinking_collapsed: bool,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
@@ -111,6 +115,8 @@ impl MessagesPanel {
             render_hints: RenderHintsRegistry::new(),
             lua_event_handle: None,
             restore_event_tx: None,
+            show_thinking: ui_config.show_thinking,
+            thinking_collapsed: !ui_config.show_thinking,
             rebake_requested: HashMap::new(),
         }
     }
@@ -128,7 +134,14 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
-    pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+    pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
+        if !self.show_thinking {
+            for msg in &mut msgs {
+                if matches!(msg.role, DisplayRole::Thinking) {
+                    msg.thinking_collapsed = true;
+                }
+            }
+        }
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
@@ -137,6 +150,7 @@ impl MessagesPanel {
         self.live_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
+        self.thinking_collapsed = !self.show_thinking;
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -437,6 +451,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
+        self.thinking_collapsed = !self.show_thinking;
         self.cancel_in_progress();
     }
 
@@ -629,10 +644,11 @@ impl MessagesPanel {
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
         let Some((_, seg, _seg_start)) = self.cache.segment_at_row(doc_row, width) else {
-            return false;
+            return self.try_toggle_collapsed_thinking(doc_row, width);
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            return false;
+            let msg_idx = seg.msg_index;
+            return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
         if self.has_snapshot(tool_id) {
@@ -727,6 +743,11 @@ impl MessagesPanel {
             || self.show_idle_splash()
             || self.accent.is_animating()
             || !self.live_bufs.is_empty()
+            || self.streaming_thinking_collapsed()
+    }
+
+    fn streaming_thinking_collapsed(&self) -> bool {
+        self.thinking_collapsed && !self.streaming_thinking.is_empty()
     }
 
     fn show_idle_splash(&self) -> bool {
@@ -780,11 +801,29 @@ impl MessagesPanel {
         let cached_count = self.cache.len();
         let spacer_lines: [Line<'static>; 1] = [Line::default()];
         let mut streaming_heights: Vec<u16> = Vec::new();
-        for sc in [&mut self.streaming_thinking, &mut self.streaming_text] {
-            if sc.is_empty() {
-                continue;
+
+        let thinking_collapsed = self.streaming_thinking_collapsed();
+        let collapsed_thinking_lines = if thinking_collapsed {
+            self.build_streaming_collapsed_lines()
+        } else {
+            Vec::new()
+        };
+
+        if thinking_collapsed {
+            if cached_count > 0 || !streaming_heights.is_empty() {
+                streaming_heights.push(1);
             }
-            let lines = sc.render_lines(width);
+            streaming_heights.push(collapsed_thinking_lines.len() as u16);
+        } else if !self.streaming_thinking.is_empty() {
+            let lines = self.streaming_thinking.render_lines(width);
+            if cached_count > 0 || !streaming_heights.is_empty() {
+                streaming_heights.push(1);
+            }
+            streaming_heights.push(wrapped_line_count(lines, width));
+        }
+
+        if !self.streaming_text.is_empty() {
+            let lines = self.streaming_text.render_lines(width);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
@@ -820,7 +859,11 @@ impl MessagesPanel {
         }
 
         let mut height_idx = 0usize;
-        for sc in [&self.streaming_thinking, &self.streaming_text] {
+        let streamed: [(&StreamingContent, bool); 2] = [
+            (&self.streaming_thinking, thinking_collapsed),
+            (&self.streaming_text, false),
+        ];
+        for (sc, collapsed) in streamed {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
                 continue;
             }
@@ -832,7 +875,11 @@ impl MessagesPanel {
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                cursor.render(sc.cached_lines(), h, None, false, frame);
+                if collapsed {
+                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
+                } else {
+                    cursor.render(sc.cached_lines(), h, None, false, frame);
+                }
             }
         }
 
@@ -1116,11 +1163,86 @@ impl MessagesPanel {
     }
 
     fn flush_thinking(&mut self) {
-        if !self.streaming_thinking.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Thinking,
-                self.streaming_thinking.take_all(),
-            ));
+        if self.streaming_thinking.is_empty() {
+            return;
+        }
+        let mut msg =
+            DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
+        msg.thinking_collapsed = self.thinking_collapsed;
+        self.thinking_collapsed = !self.show_thinking;
+        self.messages.push(msg);
+    }
+
+    fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
+        thinking_indicator(self.streaming_thinking.line_count())
+    }
+
+    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
+        thinking_indicator(logical_line_count(text))
+    }
+
+    fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
+        if !self.streaming_thinking_collapsed() {
+            return false;
+        }
+        let cached_height = self.cache.total_height(width);
+        let spacer = if self.cache.len() > 0 { 1 } else { 0 };
+        let thinking_start = cached_height + spacer;
+        let height = self.build_streaming_collapsed_lines().len() as u32;
+        if doc_row >= thinking_start && doc_row < thinking_start + height {
+            self.thinking_collapsed = false;
+            return true;
+        }
+        false
+    }
+
+    fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
+        if self.show_thinking {
+            return false;
+        }
+        let Some(idx) = msg_idx else { return false };
+        let Some(msg) = self.messages.get_mut(idx) else {
+            return false;
+        };
+        if !matches!(msg.role, DisplayRole::Thinking) {
+            return false;
+        }
+        msg.thinking_collapsed = !msg.thinking_collapsed;
+        self.rebuild_thinking_segment(idx, width);
+        true
+    }
+
+    fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
+        let Some((text, collapsed)) = self
+            .messages
+            .get(msg_idx)
+            .map(|m| (m.text.clone(), m.thinking_collapsed))
+        else {
+            return;
+        };
+        let lines = if collapsed {
+            self.build_cached_thinking_indicator(&text)
+        } else {
+            let style = thinking_style();
+            text_to_lines(
+                &text,
+                style.prefix,
+                style.text_style,
+                style.prefix_style,
+                width,
+                None,
+            )
+        };
+        let search_text = format!("thinking> {text}");
+        let seg_idx = self
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none());
+        let Some(seg_idx) = seg_idx else { return };
+        if let Some(seg) = self.cache.get_mut(seg_idx) {
+            seg.set_lines(lines);
+            seg.search_text = search_text;
         }
     }
 
@@ -1321,6 +1443,15 @@ impl MessagesPanel {
                     }
                 }
             } else {
+                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
+                    let text = msg.text.clone();
+                    let lines = self.build_cached_thinking_indicator(&text);
+                    let search_text = format!("thinking> {text}");
+                    self.cache.push_spacer_if_needed();
+                    self.cache
+                        .push(Segment::with_lines(lines, search_text, Some(i)));
+                    continue;
+                }
                 let style = match &msg.role {
                     DisplayRole::User => user_style(),
                     DisplayRole::Assistant => assistant_style(),
@@ -1377,5 +1508,27 @@ impl MessagesPanel {
             }
         }
         self.cache.mark_built(self.messages.len());
+    }
+}
+
+/// Two-line thinking indicator: a header (`thinking> ...`) followed by a
+/// `(N lines) (click to expand)` footer. Shared by the streaming and cached
+/// views when `show_thinking` is off.
+fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    vec![
+        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
+        Line::from(vec![
+            Span::styled(format!("({line_count} lines) "), theme.tool_dim),
+            Span::styled("(click to expand)", theme.thinking),
+        ]),
+    ]
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes().filter(|&b| b == b'\n').count() + 1
     }
 }

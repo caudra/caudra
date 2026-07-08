@@ -1552,3 +1552,194 @@ fn header_snapshot_for_batch_child_stamps_gen() {
 
     assert_eq!(panel.snapshot_gen_of("b1__0"), Some(7), "{HEADER_GEN_MSG}");
 }
+
+#[test]
+fn hide_collapses_streaming_thinking() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    panel
+        .streaming_thinking
+        .set_buffer("line one\nline two\nline three");
+    let terminal = render(&mut panel, 80, 10);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("thinking> ..."),
+        "collapsed view should show hint; got: {text}"
+    );
+    assert!(
+        text.contains("3 lines"),
+        "should show live line counter; got: {text}"
+    );
+    assert!(
+        text.contains("click to expand"),
+        "should hint click-to-expand; got: {text}"
+    );
+    assert!(
+        !text.contains("line one"),
+        "reasoning must stay hidden; got: {text}"
+    );
+}
+
+#[test]
+fn hide_click_expands_streaming_thinking() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    panel.streaming_thinking.set_buffer("secret reasoning");
+    let area = Rect::new(0, 0, 80, 10);
+    render(&mut panel, 80, 10);
+    assert!(
+        panel.handle_click(0, area),
+        "clicking collapsed thinking should toggle expand"
+    );
+    assert!(!panel.thinking_collapsed);
+    let terminal = render(&mut panel, 80, 10);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("secret reasoning"),
+        "expanded view should show reasoning; got: {text}"
+    );
+    assert!(
+        !text.contains("click to expand"),
+        "collapsed hint should not appear after expand; got: {text}"
+    );
+}
+
+#[test]
+fn hide_keeps_cached_thinking_as_indicator() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    panel.thinking_delta("reasoning here");
+    panel.flush();
+    assert!(matches!(
+        panel.last_message_role(),
+        Some(DisplayRole::Thinking)
+    ));
+    let terminal = render(&mut panel, 80, 10);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("thinking> ..."),
+        "cached thinking should persist as an indicator, not hide; got: {text}"
+    );
+    assert!(
+        text.contains("(1 lines)"),
+        "footer always shows the line count; got: {text}"
+    );
+    assert!(
+        text.contains("click to expand"),
+        "footer should hint click-to-expand; got: {text}"
+    );
+    assert!(
+        !text.contains("reasoning here"),
+        "reasoning must stay hidden in the indicator; got: {text}"
+    );
+}
+
+#[test]
+fn full_default_renders_streaming_thinking() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.streaming_thinking.set_buffer("visible reasoning");
+    let terminal = render(&mut panel, 80, 10);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("visible reasoning"),
+        "default config renders reasoning; got: {text}"
+    );
+}
+
+#[test]
+fn hide_cached_thinking_persists_as_indicator() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    let lines: Vec<String> = (1..=7).map(|n| format!("cached line {n}")).collect();
+    panel.thinking_delta(&lines.join("\n"));
+    panel.flush();
+    assert!(matches!(
+        panel.last_message_role(),
+        Some(DisplayRole::Thinking)
+    ));
+    let terminal = render(&mut panel, 80, 12);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("thinking> ..."),
+        "cached thinking should persist as an indicator, not hide; got: {text}"
+    );
+    assert!(text.contains("(7 lines)"), "footer line count; got: {text}");
+    assert!(
+        text.contains("click to expand"),
+        "footer should hint click-to-expand; got: {text}"
+    );
+    assert!(
+        !text.contains("cached line 7"),
+        "reasoning must stay hidden in the indicator; got: {text}"
+    );
+    assert!(
+        !text.contains("cached line 1"),
+        "reasoning must stay hidden in the indicator; got: {text}"
+    );
+}
+
+#[test]
+fn hide_cached_thinking_click_expands() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    panel.thinking_delta("hidden cached reasoning");
+    panel.flush();
+    let area = Rect::new(0, 0, 80, 12);
+    render(&mut panel, 80, 12);
+    assert!(
+        panel.handle_click(0, area),
+        "clicking persisted thinking should toggle expand"
+    );
+    let terminal = render(&mut panel, 80, 12);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("hidden cached reasoning"),
+        "expanded view shows full reasoning; got: {text}"
+    );
+    assert!(
+        !text.contains("click to expand"),
+        "footer should disappear when expanded; got: {text}"
+    );
+}
+
+#[test]
+fn stream_reset_clears_thinking_expand_state() {
+    let mut panel = MessagesPanel::new(UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    });
+    panel.streaming_thinking.set_buffer("secret reasoning");
+    let area = Rect::new(0, 0, 80, 10);
+    render(&mut panel, 80, 10);
+    assert!(
+        panel.handle_click(0, area),
+        "clicking collapsed thinking should toggle expand"
+    );
+    assert!(!panel.thinking_collapsed);
+    panel.stream_reset();
+    assert!(
+        panel.thinking_collapsed,
+        "stream_reset must restore the collapsed default so it does not leak into retries"
+    );
+    panel.streaming_thinking.set_buffer("fresh reasoning");
+    let terminal = render(&mut panel, 80, 10);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("thinking> ..."),
+        "new stream after reset should collapse again; got: {text}"
+    );
+    assert!(
+        !text.contains("fresh reasoning"),
+        "new stream must stay hidden; got: {text}"
+    );
+}

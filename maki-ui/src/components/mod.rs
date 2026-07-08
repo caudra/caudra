@@ -291,6 +291,7 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
+    pub thinking_collapsed: bool,
 }
 
 impl DisplayMessage {
@@ -310,6 +311,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -329,6 +331,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
