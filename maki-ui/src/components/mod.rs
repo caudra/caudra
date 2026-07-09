@@ -15,6 +15,7 @@ pub(crate) mod modal;
 pub(crate) mod model_picker;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
+pub(crate) mod progress_bar;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
