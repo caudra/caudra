@@ -186,6 +186,15 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
+By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
