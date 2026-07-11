@@ -370,12 +370,53 @@ fn handler_state_flows_to_tool_output_and_serde() {
     assert_eq!(parsed.state(), Some(&expected), "state must survive serde");
 }
 
+/// Restores `tool` from `src` and returns the snapshot's concatenated text.
+/// `collect_prompt_slots` blocks on the same request channel, so once it
+/// returns the restore has finished; no sleeps needed.
+fn restore_snapshot_text(
+    src: &str,
+    tool: &str,
+    clicks: Vec<usize>,
+    state: Option<serde_json::Value>,
+) -> String {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source("restore_plugin", src).unwrap();
+    let handle = host.event_handle().expect("event handle available");
+    let (tx, rx) = flume::unbounded();
+
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: "restore_id".to_owned(),
+            output: "ok".to_owned(),
+            input: serde_json::json!({}),
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks,
+            state,
+        },
+        maki_agent::EventSender::new(tx, 0),
+    );
+    let _ = handle.collect_prompt_slots();
+
+    let mut text = String::new();
+    for env in rx.drain() {
+        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+            for line in snapshot.lines.iter() {
+                for span in &line.spans {
+                    text.push_str(&span.text);
+                }
+            }
+        }
+    }
+    text
+}
+
 #[test_case::test_case(true, "n=3 tag=hi" ; "state_present")]
 #[test_case::test_case(false, "no state" ; "state_absent_falls_back")]
 fn restore_reads_persisted_state(with_state: bool, expected: &str) {
     let state = with_state.then(|| serde_json::json!({ "n": 3, "tag": "hi" }));
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "state_restore",
@@ -394,37 +435,44 @@ fn restore_reads_persisted_state(with_state: bool, expected: &str) {
             end
         }})"#,
     );
-    host.load_source("state_restore_plugin", &src).unwrap();
-    let handle = host.event_handle().expect("event handle available");
-    let (tx, rx) = flume::unbounded();
-
-    handle.request_restore(
-        maki_lua::RestoreItem {
-            tool: Arc::from("state_restore"),
-            tool_use_id: "restore_id".to_owned(),
-            output: "ok".to_owned(),
-            input: serde_json::json!({}),
-            is_error: false,
-            tool_output_lines: ToolOutputLines::default(),
-            theme_gen: None,
-            clicks: Vec::new(),
-            state,
-        },
-        maki_agent::EventSender::new(tx, 0),
-    );
-    let _ = handle.collect_prompt_slots();
-
-    let mut text = String::new();
-    for env in rx.drain() {
-        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
-            for line in snapshot.lines.iter() {
-                for span in &line.spans {
-                    text.push_str(&span.text);
-                }
-            }
-        }
-    }
+    let text = restore_snapshot_text(&src, "state_restore", Vec::new(), state);
     assert!(text.contains(expected), "expected {expected:?} in: {text}");
+}
+
+/// Restore used to lose anything drawn via `maki.async.run`: those tasks
+/// landed in the global spawn queue, which runs after the snapshot is
+/// taken. The runtime must run them inline, after the restore fn and after
+/// each replayed click.
+#[test_case::test_case(Vec::new(), "restore async line" ; "restore_async_task_runs_inline")]
+#[test_case::test_case(vec![0], "click async line" ; "click_replay_async_task_runs_inline")]
+fn restore_snapshot_contains_async_run_content(clicks: Vec<usize>, expected: &str) {
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "async_restore",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "ok" end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                buf:line("sync line")
+                maki.async.run(function()
+                    buf:line("restore async line")
+                end)
+                buf:on("click", function()
+                    maki.async.run(function()
+                        buf:line("click async line")
+                    end)
+                end)
+                return buf
+            end
+        }})"#,
+    );
+    let text = restore_snapshot_text(&src, "async_restore", clicks, None);
+    assert!(text.contains("sync line"), "sync content missing: {text}");
+    assert!(
+        text.contains(expected),
+        "async content missing {expected:?}: {text}"
+    );
 }
 
 #[test]

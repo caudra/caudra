@@ -41,34 +41,29 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function apply_highlights(view, hl_lines, ext, prefix)
-  local texts = {}
-  for _, fl in ipairs(hl_lines) do
-    texts[#texts + 1] = fl.text
-  end
+local function apply_highlights(view, lines, ext, prefix)
   local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, opts)
+  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
   if not highlighted then
     return
   end
-  for i, fl in ipairs(hl_lines) do
-    local hl_spans = highlighted[i]
-    if hl_spans then
-      view:update_line(fl.idx, { view.all_lines[fl.idx][1], table.unpack(hl_spans) })
+  for i, hl_spans in ipairs(highlighted) do
+    local plain = view.all_lines[i]
+    if not plain then
+      break
     end
+    view:update_line(i, { plain[1], table.unpack(hl_spans) })
   end
   view:flush()
 end
 
-local function build_file_view(lines, start_line, total_lines, path, ctx, sync, prefix)
+local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = line_nr_fmt(total_lines)
 
-  local hl_lines = {}
   for i, line in ipairs(lines) do
     view:append({ { string.format(nr_fmt, start_line + i - 1), "line_nr" }, { line } })
-    hl_lines[#hl_lines + 1] = { idx = #view.all_lines, text = line }
   end
 
   local trunc_start = start_line + #lines
@@ -88,13 +83,9 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, sync, 
   view:finish()
 
   local ext = path:match("%.([^%.]+)$") or ""
-  if sync then
-    apply_highlights(view, hl_lines, ext, prefix)
-  else
-    maki.async.run(function()
-      apply_highlights(view, hl_lines, ext, prefix)
-    end)
-  end
+  maki.async.run(function()
+    apply_highlights(view, lines, ext, prefix)
+  end)
 
   buf:on("click", function()
     view:toggle()
@@ -174,7 +165,7 @@ local function read_file(path, offset, limit, ctx)
       if #instructions > 0 then
         return {
           llm_output = llm_output,
-          body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
+          body = build_file_view(lines, start, total_lines, path, ctx, prefix),
           annotation = annotation,
           instructions = instructions,
         }
@@ -184,7 +175,7 @@ local function read_file(path, offset, limit, ctx)
 
   return {
     llm_output = llm_output,
-    body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
+    body = build_file_view(lines, start, total_lines, path, ctx, prefix),
     annotation = annotation,
   }
 end
@@ -290,7 +281,7 @@ maki.api.register_tool({
     end
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, input.path or "", ctx, true)
+    return build_file_view(lines, start_line, total_lines, input.path or "", ctx)
   end,
 
   handler = function(input, ctx)

@@ -5,8 +5,9 @@
 -- itself, so any wrapper of the same buf (a batch child's foreign handle)
 -- reaches the same toggle. Expansion is never stored: the UI records
 -- clicked rows and replays them through `restore` in order, so `toggle`
--- must stay deterministic or the replayed view drifts from what the user
--- last saw.
+-- stays a pure flag flip + re-render, deterministic across replays.
+-- Async highlighting goes through `maki.async.run`; during restore the
+-- runtime runs those tasks inline before snapshotting.
 local ToolView = {}
 ToolView.__index = ToolView
 
@@ -17,18 +18,6 @@ end
 local function line_nr_fmt(count)
   local w = math.max(1, math.floor(math.log(count, 10)) + 1)
   return "%" .. w .. "d "
-end
-
-local function build_highlighted_lines(highlighted, fmt, start_idx)
-  local result = {}
-  for idx, hl_line in ipairs(highlighted) do
-    local spans = { format_line_nr(fmt, start_idx + idx - 1) }
-    for _, seg in ipairs(hl_line) do
-      spans[#spans + 1] = seg
-    end
-    result[#result + 1] = spans
-  end
-  return result
 end
 
 function ToolView.new(buf, opts)
@@ -62,7 +51,6 @@ function ToolView:clear()
   self.all_lines = {}
   self.all_skipped = 0
   self.ring_map = {}
-  self._hl = nil
   self:flush()
 end
 
@@ -110,41 +98,33 @@ function ToolView:set_highlight(content, ext)
   if content:sub(-1) == "\n" then
     content = content:sub(1, -2)
   end
+  if content == "" then
+    return false
+  end
   local lines = {}
   for line in (content .. "\n"):gmatch("([^\n]*)\n") do
     lines[#lines + 1] = line
   end
-  if #lines == 0 then
-    return false
-  end
-
-  self._hl = {
-    content = content,
-    ext = ext,
-    line_count = #lines,
-    expanded_done = false,
-  }
 
   local fmt = line_nr_fmt(#lines)
   for idx, line in ipairs(lines) do
     self:append({ format_line_nr(fmt, idx), { line } })
   end
 
-  local visible_count = math.min(#lines, self.max)
-  local visible_start = self.keep == "head" and 1 or (#lines - visible_count + 1)
-  local visible_content = table.concat(lines, "\n", visible_start, visible_start + visible_count - 1)
-
   maki.async.run(function()
-    local highlighted = maki.ui.highlight(visible_content, ext)
+    local highlighted = maki.ui.highlight(content, ext)
     if not highlighted then
       return
     end
-    local hl_lines = build_highlighted_lines(highlighted, fmt, visible_start)
-    self.ring = {}
-    self.ring_start = 1
-    self.ring_count = #hl_lines
-    for i, l in ipairs(hl_lines) do
-      self.ring[i] = l
+    for idx, hl_line in ipairs(highlighted) do
+      if not self.all_lines[idx] then
+        break
+      end
+      local spans = { format_line_nr(fmt, idx) }
+      for _, seg in ipairs(hl_line) do
+        spans[#spans + 1] = seg
+      end
+      self:update_line(idx, spans)
     end
     self:flush()
   end)
@@ -154,26 +134,7 @@ end
 
 function ToolView:toggle()
   self.expanded = not self.expanded
-  if self.expanded and self._hl and not self._hl.expanded_done then
-    self:_highlight_full()
-  else
-    self:flush()
-  end
-end
-
-function ToolView:_highlight_full()
   self:flush()
-  local hl = self._hl
-  maki.async.run(function()
-    local highlighted = maki.ui.highlight(hl.content, hl.ext)
-    if not highlighted then
-      return
-    end
-    hl.expanded_done = true
-    local fmt = line_nr_fmt(hl.line_count)
-    self.all_lines = build_highlighted_lines(highlighted, fmt, 1)
-    self:flush()
-  end)
 end
 
 function ToolView:flush()

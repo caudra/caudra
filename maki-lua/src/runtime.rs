@@ -48,6 +48,10 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Async tasks spawned during restore may spawn further tasks; cap the rounds.
+const RESTORE_SPAWN_ROUNDS: usize = 8;
+/// Keeps a buggy plugin's restore task from freezing the lua loop.
+const RESTORE_ASYNC_DEADLINE: Duration = Duration::from_secs(10);
 const TURN_END_EVENT: &str = "TurnEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
@@ -225,6 +229,9 @@ pub(crate) struct TaskCell {
     /// Forwards live bufs and annotations to a parent
     /// `maki.agent.call_tool(on_live_buf/on_annotation)`.
     pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
+    /// When `Some`, `maki.async.run` tasks queue here instead of the global
+    /// `SpawnQueue` so restore can run them inline before snapshotting.
+    pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
 }
 
 impl TaskCell {
@@ -238,6 +245,7 @@ impl TaskCell {
             live,
             root_buf: None,
             live_sink: None,
+            inline_spawn: None,
         }
     }
 }
@@ -415,9 +423,10 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 }
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
-    let (cancel, live_ctx, live_buf) = match lua.app_data_ref::<TaskHandle>() {
+    let handle = lua.app_data_ref::<TaskHandle>();
+    let (cancel, live_ctx, live_buf) = match &handle {
         Some(h) => {
-            let cell = lock_cell(&h);
+            let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
@@ -434,6 +443,14 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         live_ctx,
         live_buf,
     };
+
+    if let Some(h) = &handle {
+        let mut cell = lock_cell(h);
+        if let Some(inline) = cell.inline_spawn.as_mut() {
+            inline.push(task);
+            return Ok(());
+        }
+    }
 
     let queue = lua
         .app_data_ref::<SpawnQueue>()
@@ -522,6 +539,25 @@ pub(crate) struct PendingAsyncTask {
 
 pub(crate) type SpawnQueue = RefCell<Vec<PendingAsyncTask>>;
 
+async fn run_work_fn(
+    lua: &Lua,
+    work_fn: &RegistryKey,
+    deadline: Option<Instant>,
+) -> Result<LuaValue, mlua::Error> {
+    let func: Function = lua.registry_value(work_fn)?;
+    let fut = lua.create_thread(func)?.into_async::<LuaValue>(())?;
+    match deadline {
+        Some(dl) => {
+            futures_lite::future::race(fut, async {
+                smol::Timer::at(dl).await;
+                Err(mlua::Error::runtime("timeout"))
+            })
+            .await
+        }
+        None => fut.await,
+    }
+}
+
 fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<InflightGate>) {
     let tasks: Vec<PendingAsyncTask> = {
         let Some(queue) = lua.app_data_ref::<SpawnQueue>() else {
@@ -551,23 +587,9 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
                 &lua,
                 TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone()),
             );
-            let run = scope.scope_future(async {
-                let work_fn: Function = lua.registry_value(&task.work_fn)?;
-                let thread = lua.create_thread(work_fn)?;
-                let async_thread = thread.into_async::<LuaValue>(())?;
-                match task.deadline {
-                    Some(dl) => {
-                        futures_lite::future::race(async_thread, async {
-                            smol::Timer::at(dl).await;
-                            Err(mlua::Error::runtime("timeout"))
-                        })
-                        .await
-                    }
-                    None => async_thread.await,
-                }
-            });
-
-            let result = run.await;
+            let result = scope
+                .scope_future(run_work_fn(&lua, &task.work_fn, task.deadline))
+                .await;
             if let Err(e) = &result {
                 tracing::debug!(error = %e, "async.run: task failed");
             }
@@ -1220,6 +1242,7 @@ impl LuaRuntime {
             .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
             .ok()?;
         let scope = TaskScope::new(&self.lua, cell);
+        lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
         let ret = scope
             .scope_future(inner)
             .await
@@ -1227,6 +1250,7 @@ impl LuaRuntime {
                 |e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"),
             )
             .ok()?;
+        self.run_inline_tasks(&scope).await;
 
         if let Some(buf) = crate::api::ui::buf::buf_from_reply(&ret) {
             lock_cell(scope.handle()).root_buf = Some(buf);
@@ -1245,6 +1269,7 @@ impl LuaRuntime {
                     tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
                     break;
                 }
+                self.run_inline_tasks(&scope).await;
             }
         }
 
@@ -1258,6 +1283,33 @@ impl LuaRuntime {
             );
         }
         Some(reply)
+    }
+
+    /// Runs `maki.async.run` tasks queued during restore inline, so their
+    /// buf mutations land before the snapshot is extracted. Tasks may queue
+    /// more tasks, hence the rounds.
+    async fn run_inline_tasks(&self, scope: &TaskScope) {
+        for _ in 0..RESTORE_SPAWN_ROUNDS {
+            let tasks = {
+                let mut cell = lock_cell(scope.handle());
+                match cell.inline_spawn.as_mut() {
+                    Some(queue) if !queue.is_empty() => std::mem::take(queue),
+                    _ => return,
+                }
+            };
+            for task in tasks {
+                if !task.cancel.is_cancelled() {
+                    let deadline = Some(Instant::now() + RESTORE_ASYNC_DEADLINE);
+                    if let Err(e) = scope
+                        .scope_future(run_work_fn(&self.lua, &task.work_fn, deadline))
+                        .await
+                    {
+                        tracing::debug!(error = %e, "restore inline async task failed");
+                    }
+                }
+                self.lua.remove_registry_value(task.work_fn).ok();
+            }
+        }
     }
 
     fn compute_permission_scopes(
@@ -2219,6 +2271,25 @@ mod tests {
             .unwrap();
         let err = enqueue_async_task(&lua, key).unwrap_err();
         assert!(err.to_string().contains(SPAWN_QUEUE_NOT_INIT));
+    }
+
+    #[test]
+    fn enqueue_async_task_routes_to_inline_spawn_when_set() {
+        let lua = enqueue_test_lua();
+        let scope = set_active(&lua, TaskCell::new(CancelToken::none(), None, None));
+        lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
+
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        assert!(
+            lua.app_data_ref::<SpawnQueue>()
+                .unwrap()
+                .borrow()
+                .is_empty(),
+            "task must not reach the global queue"
+        );
+        let cell = lock_cell(scope.handle());
+        assert_eq!(cell.inline_spawn.as_ref().unwrap().len(), 1);
     }
 
     #[test]

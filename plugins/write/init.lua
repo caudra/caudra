@@ -13,55 +13,11 @@ local function write_view_opts(ctx)
   return { max_lines = (tol and tol.write) or 10, keep = "head" }
 end
 
-local function split_lines(content)
-  local lines = {}
-  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
-  if #lines > 0 and lines[#lines] == "" then
-    lines[#lines] = nil
-  end
-  return lines
-end
-
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
-  return "%" .. w .. "d "
-end
-
-local function build_view(lines, path, ctx, sync)
+local function build_view(content, path, ctx)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, write_view_opts(ctx))
-  local nr_fmt = line_nr_fmt(#lines)
-
-  local hl_lines = {}
-  for i, line in ipairs(lines) do
-    view:append({ { string.format(nr_fmt, i), "line_nr" }, { line } })
-    hl_lines[#hl_lines + 1] = { idx = i, text = line }
-  end
+  view:set_highlight(content, path:match("%.([^%.]+)$") or "")
   view:finish()
-
-  local ext = path:match("%.([^%.]+)$") or ""
-  local function do_highlight()
-    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext)
-    if not highlighted then
-      return
-    end
-    for _, fl in ipairs(hl_lines) do
-      local hl_spans = highlighted[fl.idx]
-      if hl_spans then
-        view:update_line(fl.idx, { view.all_lines[fl.idx][1], table.unpack(hl_spans) })
-      end
-    end
-    view:flush()
-  end
-
-  if sync then
-    do_highlight()
-  else
-    maki.async.run(do_highlight)
-  end
-
   buf:on("click", function()
     view:toggle()
   end)
@@ -100,11 +56,11 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, _is_error, ctx)
-    local lines = split_lines(input.content or "")
-    if #lines == 0 then
+    local content = input.content or ""
+    if content == "" then
       return ToolView.restore(output, write_view_opts(ctx))
     end
-    return build_view(lines, input.path or "", ctx, true)
+    return build_view(content, input.path or "", ctx)
   end,
 
   handler = function(input, ctx)
@@ -143,7 +99,7 @@ maki.api.register_tool({
 
     return {
       llm_output = llm_output,
-      body = build_view(split_lines(content), path, ctx),
+      body = build_view(content, path, ctx),
       annotation = annotation,
       written_path = path,
     }

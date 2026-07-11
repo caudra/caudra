@@ -468,6 +468,7 @@ mod tests {
             live: None,
             root_buf: None,
             live_sink: None,
+            inline_spawn: None,
         }))
     }
 

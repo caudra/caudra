@@ -1053,6 +1053,31 @@ case("set_highlight_number_width_scales", function()
   eq(buf.lines[1][1][2], "line_nr")
 end)
 
+case("set_highlight_empty_content_returns_false", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3 })
+  eq(view:set_highlight("", "txt"), false)
+  eq(view:set_highlight("\n", "txt"), false)
+  eq(buf.lines, nil, "nothing flushed for empty content")
+end)
+
+case("set_highlight_toggle_keeps_lines_and_collapses_back", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "head" })
+  eq(view:set_highlight("a\nb\nc\nd\ne", "txt"), true)
+
+  view:toggle()
+  eq(view.expanded, true)
+  eq(#buf.lines, 5, "expanded renders every line")
+  eq(buf.lines[1][2][1], "a")
+  eq(buf.lines[5][2][1], "e")
+
+  view:toggle()
+  eq(view.expanded, false)
+  eq(buf.lines[3][2][1], "c", "collapsed shows the head window")
+  eq(buf.lines[4][1][1], "... (2 lines) (click to expand)")
+end)
+
 local render_lines = ListPicker._render_lines
 
 case("render_lines_string_items_basic", function()
