@@ -1398,6 +1398,26 @@ fn setup_happy_path() {
 }
 
 #[test_case::test_case(
+    r#"maki.setup({ agent = { compaction_buffer = 10000 } })"#,
+    maki_config::CompactionBuffer::Tokens(10_000)
+    ; "compaction_buffer_tokens"
+)]
+#[test_case::test_case(
+    r#"maki.setup({ agent = { compaction_buffer = "15%" } })"#,
+    maki_config::CompactionBuffer::Percent(15)
+    ; "compaction_buffer_percent"
+)]
+fn setup_compaction_buffer(lua_src: &str, expected: maki_config::CompactionBuffer) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(lua_src.to_owned(), "test_init.lua".to_owned(), None)
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.agent.compaction_buffer, Some(expected));
+}
+
+#[test_case::test_case(
     "maki.setup({ ui = { splash_animaton = false } })",
     UNKNOWN_FIELD_ERR
     ; "unknown_field"

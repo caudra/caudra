@@ -97,7 +97,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `bash_timeout_secs` | u64 | `120` | 5 | Bash command timeout (seconds) |
 | `code_execution_timeout_secs` | u64 | `30` | 5 | Code execution timeout (seconds) |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
-| `compaction_buffer` | u32 | `40000` | 1000 | Token buffer reserved during compaction |
+| `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `search_result_limit` | usize | `100` | 10 | Max results from grep/glob searches |
 | `interpreter_max_memory_mb` | usize | `50` | 10 | Memory limit for code interpreter (MB) |
 | `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |

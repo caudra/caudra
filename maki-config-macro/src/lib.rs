@@ -50,6 +50,7 @@ struct StructAttrs {
 struct FieldAttrs {
     skip: bool,
     default: Option<Expr>,
+    default_doc: Option<LitStr>,
     min: Option<Expr>,
     desc: Option<String>,
     key: Option<String>,
@@ -98,6 +99,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
     let mut attrs = FieldAttrs {
         skip: false,
         default: None,
+        default_doc: None,
         min: None,
         desc: None,
         key: None,
@@ -122,6 +124,11 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                         return Err(syn::Error::new(item.key.span(), "default requires a value"));
                     }
                 },
+                "default_doc" => {
+                    if let ConfigAttrValue::Str(lit) = item.value {
+                        attrs.default_doc = Some(lit);
+                    }
+                }
                 "min" => {
                     if let ConfigAttrValue::Expr(expr) = item.value {
                         attrs.min = Some(*expr);
@@ -166,19 +173,11 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("bool field requires default");
             quote! { ConfigValue::Bool(#val) }
         }
-        "u32" => {
-            let val = default.as_ref().expect("u32 field requires default");
-            quote! { ConfigValue::U32(#val) }
+        "u32" | "u64" | "usize" => {
+            let val = default.as_ref().expect("numeric field requires default");
+            quote! { ConfigValue::U64(#val as u64) }
         }
-        "u64" => {
-            let val = default.as_ref().expect("u64 field requires default");
-            quote! { ConfigValue::U64(#val) }
-        }
-        "usize" => {
-            let val = default.as_ref().expect("usize field requires default");
-            quote! { ConfigValue::Usize(#val) }
-        }
-        "String" => quote! { ConfigValue::OptionalString },
+        "String" => quote! { ConfigValue::Str("none") },
         other => panic!("unsupported config type: {other}"),
     }
 }
@@ -231,7 +230,10 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let ty_string = type_to_name(ty);
         let ty_name = attrs.ty_override.as_deref().unwrap_or(&ty_string);
         let desc = attrs.desc.as_deref().unwrap_or("");
-        let default_expr = config_value_expr(ty_name, &attrs.default);
+        let default_expr = match &attrs.default_doc {
+            Some(doc) => quote! { ConfigValue::Str(#doc) },
+            None => config_value_expr(ty_name, &attrs.default),
+        };
         let min_expr = match &attrs.min {
             Some(m) => quote! { Some(#m as u64) },
             None => quote! { None },

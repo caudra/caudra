@@ -1,5 +1,6 @@
 use std::env;
 
+use maki_config::CompactionBuffer;
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
@@ -117,8 +118,10 @@ pub async fn compact(
     Ok(())
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, compaction_buffer: u32) -> bool {
-    let usable = model.context_window.saturating_sub(compaction_buffer);
+pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
+    let usable = model
+        .context_window
+        .saturating_sub(buffer.resolve(model.context_window));
     usage.context_tokens() >= usable
 }
 
@@ -329,6 +332,8 @@ mod tests {
     #[test_case(5_000,   165_000, 10_000,  0,      200_000, true  ; "cached_tokens_count_toward_overflow")]
     #[test_case(100_000, 0,       0,       80_000, 200_000, true  ; "output_tokens_count_toward_overflow")]
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
+    #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
+    #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
@@ -348,6 +353,18 @@ mod tests {
             is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),
             expected
         );
+    }
+
+    #[test_case(CompactionBuffer::Tokens(10_000), 53_999, false ; "explicit_tokens_below")]
+    #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
+    #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
+    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
+        let model = small_context_model(64_000);
+        let usage = TokenUsage {
+            input,
+            ..Default::default()
+        };
+        assert_eq!(is_overflow(&usage, &model, buffer), expected);
     }
 
     #[test]

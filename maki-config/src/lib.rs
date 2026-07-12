@@ -26,7 +26,7 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_CODE_EXECUTION_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
-pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
+pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
@@ -49,6 +49,9 @@ pub const MIN_BASH_TIMEOUT_SECS: u64 = 5;
 pub const MIN_CODE_EXECUTION_TIMEOUT_SECS: u64 = 5;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
+const MAX_COMPACTION_PERCENT: u8 = 99;
+const COMPACTION_BUFFER_EXPECTED: &str =
+    r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
 pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
 pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
@@ -90,20 +93,16 @@ pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_line
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
     Bool(bool),
-    U32(u32),
     U64(u64),
-    Usize(usize),
-    OptionalString,
+    Str(&'static str),
 }
 
 impl ConfigValue {
     pub fn format_default(&self) -> String {
         match self {
             Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            Self::U32(v) => v.to_string(),
             Self::U64(v) => v.to_string(),
-            Self::Usize(v) => v.to_string(),
-            Self::OptionalString => "none".to_string(),
+            Self::Str(s) => (*s).to_string(),
         }
     }
 }
@@ -345,6 +344,74 @@ impl ToolOutputLinesFile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionBuffer {
+    Tokens(u32),
+    Percent(u8),
+}
+
+impl CompactionBuffer {
+    pub fn resolve(self, context_window: u32) -> u32 {
+        match self {
+            Self::Tokens(n) => n,
+            Self::Percent(p) => (u64::from(context_window) * u64::from(p) / 100) as u32,
+        }
+    }
+}
+
+impl Serialize for CompactionBuffer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Tokens(n) => s.serialize_u32(*n),
+            Self::Percent(p) => s.collect_str(&format_args!("{p}%")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionBuffer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct BufferVisitor;
+
+        impl serde::de::Visitor<'_> for BufferVisitor {
+            type Value = CompactionBuffer;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(COMPACTION_BUFFER_EXPECTED)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .ok()
+                    .filter(|n| *n >= MIN_COMPACTION_BUFFER)
+                    .map(CompactionBuffer::Tokens)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "compaction_buffer must be at least {MIN_COMPACTION_BUFFER} tokens"
+                        ))
+                    })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_u64(u64::try_from(v).unwrap_or(0))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                s.strip_suffix('%')
+                    .and_then(|n| n.trim().parse::<u8>().ok())
+                    .filter(|p| (1..=MAX_COMPACTION_PERCENT).contains(p))
+                    .map(CompactionBuffer::Percent)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "invalid compaction_buffer {s:?}: expected {COMPACTION_BUFFER_EXPECTED}"
+                        ))
+                    })
+            }
+        }
+
+        d.deserialize_any(BufferVisitor)
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
@@ -355,7 +422,7 @@ pub struct AgentFileConfig {
     pub bash_timeout_secs: Option<u64>,
     pub code_execution_timeout_secs: Option<u64>,
     pub max_continuation_turns: Option<u32>,
-    pub compaction_buffer: Option<u32>,
+    pub compaction_buffer: Option<CompactionBuffer>,
     pub search_result_limit: Option<usize>,
     pub interpreter_max_memory_mb: Option<usize>,
     pub task_max_concurrent: Option<usize>,
@@ -900,8 +967,8 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
-    #[config(default = DEFAULT_COMPACTION_BUFFER, min = MIN_COMPACTION_BUFFER, desc = "Token buffer reserved during compaction")]
-    pub compaction_buffer: u32,
+    #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
+    pub compaction_buffer: CompactionBuffer,
 
     #[config(default = DEFAULT_SEARCH_RESULT_LIMIT, min = MIN_SEARCH_RESULT_LIMIT, desc = "Max results from grep/glob searches")]
     pub search_result_limit: usize,
@@ -1786,6 +1853,41 @@ mod tests {
 
     fn global_config_dir(dir: &Path) -> PathBuf {
         dir.join(".config/maki")
+    }
+
+    #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]
+    #[test_case("\"20%\"", CompactionBuffer::Percent(20) ; "percent_string")]
+    #[test_case("\" 5 %\"", CompactionBuffer::Percent(5) ; "percent_with_spaces")]
+    fn compaction_buffer_deserializes(json: &str, expected: CompactionBuffer) {
+        let parsed: CompactionBuffer = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test_case("500" ; "tokens_below_min")]
+    #[test_case("-1" ; "negative_tokens")]
+    #[test_case("\"0%\"" ; "zero_percent")]
+    #[test_case("\"100%\"" ; "percent_too_high")]
+    #[test_case("\"abc%\"" ; "non_numeric_percent")]
+    fn compaction_buffer_rejects(json: &str) {
+        assert!(serde_json::from_str::<CompactionBuffer>(json).is_err());
+    }
+
+    #[test_case(CompactionBuffer::Tokens(10_000), 64_000, 10_000 ; "tokens_ignore_window")]
+    #[test_case(CompactionBuffer::Percent(20), 64_000, 12_800 ; "percent_of_window")]
+    fn compaction_buffer_resolves(buffer: CompactionBuffer, window: u32, expected: u32) {
+        assert_eq!(buffer.resolve(window), expected);
+    }
+
+    #[test]
+    fn compaction_buffer_serializes_percent_as_string() {
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Percent(20)).unwrap(),
+            serde_json::json!("20%")
+        );
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Tokens(9_000)).unwrap(),
+            serde_json::json!(9_000)
+        );
     }
 
     #[test]
