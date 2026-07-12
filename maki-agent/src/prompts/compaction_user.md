@@ -18,4 +18,7 @@ Stick to this template:
 
 ## Relevant files / directories
 [Structured list of relevant files that have been read, edited, or created]
+
+## Todo list
+[If a todo list was in use, repeat it here verbatim with each item's current status; it must be kept up to date with todo_write after continuing. Otherwise omit this section]
 ---
