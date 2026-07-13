@@ -3,6 +3,8 @@ local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 
+local SNIPPET_MAX_CHARS = 32
+
 local EDIT_LINES_DESCRIPTION =
   [[Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.]]
 
@@ -239,7 +241,12 @@ maki.api.register_tool({
         local replaced, replace_err =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
         if replace_err then
-          return nil, string.format("edit %d: %s", i - 1, replace_err)
+          local snippet = edit.old_string:match("[^\n]*")
+          local cut = utf8.offset(snippet, SNIPPET_MAX_CHARS + 1)
+          if cut then
+            snippet = snippet:sub(1, cut - 1) .. "…"
+          end
+          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet, replace_err)
         end
         content = replaced
       end
