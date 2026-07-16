@@ -196,6 +196,7 @@ pub(crate) async fn parse_sse(
     let mut lines = reader.lines();
 
     let mut text = String::new();
+    let mut reasoning_text = String::new();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
@@ -398,6 +399,29 @@ pub(crate) async fn parse_sse(
                 }
             }
 
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(delta) = parsed["delta"].as_str()
+                    && !delta.is_empty()
+                {
+                    reasoning_text.push_str(delta);
+                    event_tx
+                        .send_async(ProviderEvent::ThinkingDelta {
+                            text: delta.to_string(),
+                        })
+                        .await?;
+                }
+            }
+
+            "response.reasoning_summary_part.added" => {
+                if !reasoning_text.is_empty() {
+                    reasoning_text.push_str("\n\n");
+                }
+            }
+
             "response.completed" => {
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(v) => v,
@@ -460,6 +484,13 @@ pub(crate) async fn parse_sse(
     }
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+    if !reasoning_text.is_empty() {
+        content_blocks.push(ContentBlock::Thinking {
+            thinking: reasoning_text,
+            signature: None,
+        });
+    }
 
     if !text.is_empty() {
         content_blocks.push(ContentBlock::Text { text });
@@ -712,6 +743,118 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
     }
 
     #[test]
+    fn parse_sse_reasoning_text_delta() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"content\":[],\"encrypted_content\":\"\",\"status\":\"in_progress\"}}\n\
+\n\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\"Let me think\"}\n\
+\n\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\" about this\"}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello world\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
+\n";
+
+            let (resp, events) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert_eq!(resp.usage.input, 90);
+            assert_eq!(resp.usage.output, 20);
+            assert_eq!(resp.usage.cache_read, 10);
+
+            assert_eq!(resp.message.content.len(), 2);
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+            );
+            assert!(
+                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")
+            );
+
+            let thinking_deltas: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(thinking_deltas, vec!["Let me think", " about this"]);
+
+            let text_deltas: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text_deltas, vec!["Hello world"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_reasoning_summary_text_delta() {
+        smol::block_on(async {
+            let sse = "\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"Summary part\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Answer\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+            let (resp, events) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Summary part")
+            );
+
+            let thinking_deltas: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::ThinkingDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(thinking_deltas, vec!["Summary part"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_reasoning_only_no_text() {
+        smol::block_on(async {
+            let sse = "\
+event: response.reasoning_text.delta\n\
+data: {\"delta\":\"Thinking only\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert_eq!(resp.message.content.len(), 1);
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Thinking only")
+            );
+            assert_eq!(resp.usage.output, 5);
+        })
+    }
+
+    #[test]
     fn parse_sse_malformed_tool_json_yields_empty_object() {
         smol::block_on(async {
             let sse = "\
@@ -868,7 +1011,6 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
     #[test]
     fn parse_sse_done_arguments_as_json_object() {
         smol::block_on(async {
-            // llama.cpp may send arguments as a JSON object instead of a string
             let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\
@@ -892,9 +1034,40 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
     }
 
     #[test]
+    fn parse_sse_reasoning_summary_part_added() {
+        smol::block_on(async {
+            let sse = "\
+event: response.reasoning_summary_part.added\n\
+data: {\"id\":\"sp_1\"}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"First part\"}\n\
+\n\
+event: response.reasoning_summary_part.added\n\
+data: {\"id\":\"sp_2\"}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"Second part\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Answer\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+            );
+        })
+    }
+
+    #[test]
     fn parse_sse_delta_arguments_as_json_object() {
         smol::block_on(async {
-            // delta with arguments as JSON object instead of string
             let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"grep\"}}\n\
@@ -921,7 +1094,6 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
     #[test]
     fn parse_sse_done_object_args_overrides_empty_delta() {
         smol::block_on(async {
-            // done event with object args should override empty accumulated deltas
             let sse = "\
 event: response.output_item.added\n\
 data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\"}}\n\
@@ -943,6 +1115,26 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
             assert_eq!(tools[0].2["path"], "foo.rs");
             assert_eq!(tools[0].2["old_string"], "a");
             assert_eq!(tools[0].2["new_string"], "b");
+        })
+    }
+
+    #[test]
+    fn parse_sse_no_reasoning_tokens_in_usage() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert_eq!(resp.usage.input, 60);
+            assert_eq!(resp.usage.output, 10);
+            assert_eq!(resp.usage.cache_read, 40);
         })
     }
 }
