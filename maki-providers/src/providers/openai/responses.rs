@@ -270,7 +270,9 @@ pub(crate) async fn parse_sse(
                     Err(_) => continue,
                 };
                 let item = &parsed["item"];
-                let output_index = parsed["output_index"].as_u64().unwrap_or(0);
+                let output_index = parsed["output_index"]
+                    .as_u64()
+                    .unwrap_or(tool_accumulators.len() as u64);
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
@@ -297,11 +299,12 @@ pub(crate) async fn parse_sse(
                     Err(_) => continue,
                 };
                 if let Some(delta) = parsed["delta"].as_str() {
-                    let output_index = parsed["output_index"].as_u64().unwrap_or(0);
-                    if let Some(acc) = tool_accumulators
-                        .iter_mut()
-                        .find(|a| a.output_index == output_index)
-                    {
+                    let acc = if let Some(idx) = parsed["output_index"].as_u64() {
+                        tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                    } else {
+                        tool_accumulators.last_mut()
+                    };
+                    if let Some(acc) = acc {
                         acc.arguments.push_str(delta);
                     }
                 }
@@ -314,14 +317,17 @@ pub(crate) async fn parse_sse(
                 };
                 let item = &parsed["item"];
                 if item["type"].as_str() == Some("function_call") {
-                    let output_index = parsed["output_index"].as_u64().unwrap_or(0);
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
                     let arguments = item["arguments"].as_str().unwrap_or_default().to_string();
-                    if let Some(acc) = tool_accumulators
-                        .iter_mut()
-                        .find(|acc| acc.output_index == output_index)
-                    {
+                    let acc = if let Some(idx) = parsed["output_index"].as_u64() {
+                        tool_accumulators
+                            .iter_mut()
+                            .find(|acc| acc.output_index == idx)
+                    } else {
+                        tool_accumulators.last_mut()
+                    };
+                    if let Some(acc) = acc {
                         let should_emit_start = acc.name.is_empty() && !name.is_empty();
                         if acc.call_id.is_empty() {
                             acc.call_id = call_id.clone();
@@ -350,7 +356,7 @@ pub(crate) async fn parse_sse(
                                 .await?;
                         }
                         tool_accumulators.push(ToolAccumulator {
-                            output_index,
+                            output_index: tool_accumulators.len() as u64,
                             call_id,
                             name,
                             arguments,
@@ -692,6 +698,103 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "bash");
             assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        })
+    }
+
+    // llama.cpp's /v1/responses endpoint omits output_index in SSE events
+    // (see https://github.com/ggml-org/llama.cpp/issues/20607)
+
+    #[test]
+    fn parse_sse_tool_call_without_output_index() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].0, "c1");
+            assert_eq!(tools[0].1, "bash");
+            assert_eq!(tools[0].2["command"], "ls");
+            assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        })
+    }
+
+    #[test]
+    fn parse_sse_sequential_tool_calls_without_output_index() {
+        smol::block_on(async {
+            // Simulates llama.cpp streaming two sequential tool calls without output_index
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"ls\\\"}\"}}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 2);
+            assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+            assert_eq!(tools[0].2["command"], "ls");
+            assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+            assert_eq!(tools[1].2["path"], "/tmp");
+        })
+    }
+
+    #[test]
+    fn parse_sse_tool_done_without_output_index_updates_last_acc() {
+        smol::block_on(async {
+            // done event without output_index should update the last accumulator
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"glob\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":\"{\\\"pattern\\\": \\\"*.rs\\\"}\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\": \\\"*.rs\\\", \\\"path\\\": \\\"src\\\"}\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "glob");
+            assert_eq!(tools[0].2["pattern"], "*.rs");
+            assert_eq!(tools[0].2["path"], "src");
         })
     }
 }
