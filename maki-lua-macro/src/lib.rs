@@ -18,26 +18,34 @@ use syn::{
     Visibility, parse_macro_input,
 };
 
+fn str_lit(expr: &Expr) -> Option<String> {
+    if let Expr::Lit(l) = expr
+        && let Lit::Str(s) = &l.lit
+    {
+        Some(s.value())
+    } else {
+        None
+    }
+}
+
 fn doc_lines(attrs: &[Attribute]) -> Vec<String> {
     attrs
         .iter()
-        .filter(|a| a.path().is_ident("doc"))
         .filter_map(|a| match &a.meta {
-            Meta::NameValue(nv) => match &nv.value {
-                Expr::Lit(l) => match &l.lit {
-                    Lit::Str(s) => {
-                        let v = s.value();
-                        Some(v.strip_prefix(' ').unwrap_or(&v).to_owned())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
+            Meta::NameValue(nv) if nv.path.is_ident("doc") => {
+                str_lit(&nv.value).map(|v| v.strip_prefix(' ').unwrap_or(&v).to_owned())
+            }
             _ => None,
         })
         .collect()
 }
 
+fn parse_desc(input: ParseStream) -> syn::Result<String> {
+    let attrs = input.call(Attribute::parse_outer)?;
+    Ok(doc_lines(&attrs).join("\n").trim().to_owned())
+}
+
+#[derive(Default)]
 struct ParsedDoc {
     desc: String,
     params: Vec<(String, String, String)>,
@@ -46,18 +54,14 @@ struct ParsedDoc {
 }
 
 fn parse_doc(lines: &[String], span: proc_macro2::Span) -> syn::Result<ParsedDoc> {
-    let mut desc_parts: Vec<&str> = Vec::new();
-    let mut params: Vec<(String, String, String)> = Vec::new();
-    let mut returns = String::new();
-    let mut example = String::new();
-    #[derive(PartialEq)]
-    enum State {
+    enum Section {
         Desc,
         Param,
         Return,
         Example,
     }
-    let mut state = State::Desc;
+    let mut doc = ParsedDoc::default();
+    let mut section = Section::Desc;
     for line in lines {
         if let Some(rest) = line.strip_prefix("@param ") {
             let mut it = rest.splitn(3, ' ');
@@ -72,64 +76,41 @@ fn parse_doc(lines: &[String], span: proc_macro2::Span) -> syn::Result<ParsedDoc
                     format!("malformed @param line: `{line}`"),
                 ));
             }
-            params.push((name.to_owned(), ty.to_owned(), d.to_owned()));
-            state = State::Param;
+            doc.params
+                .push((name.to_owned(), ty.to_owned(), d.to_owned()));
+            section = Section::Param;
         } else if let Some(rest) = line.strip_prefix("@return") {
-            returns = rest.trim_start().to_owned();
-            state = State::Return;
+            doc.returns = rest.trim_start().to_owned();
+            section = Section::Return;
         } else if let Some(rest) = line.strip_prefix("@example") {
-            example = rest.trim_start().to_owned();
-            state = State::Example;
+            doc.example = rest.trim_start().to_owned();
+            section = Section::Example;
         } else {
-            match state {
-                State::Desc => {
-                    if !(desc_parts.is_empty() && line.trim().is_empty()) {
-                        desc_parts.push(line.trim_end());
-                    }
-                }
-                State::Param => {
-                    let d = &mut params.last_mut().unwrap().2;
-                    if !d.is_empty() {
-                        d.push('\n');
-                    }
-                    d.push_str(line.trim_end());
-                }
-                State::Return => {
-                    if !returns.is_empty() {
-                        returns.push('\n');
-                    }
-                    returns.push_str(line.trim_end());
-                }
-                State::Example => {
-                    if !(example.is_empty() && line.trim().is_empty()) {
-                        if !example.is_empty() {
-                            example.push('\n');
-                        }
-                        example.push_str(line.trim_end());
-                    }
-                }
+            let dst = match section {
+                Section::Desc => &mut doc.desc,
+                Section::Param => &mut doc.params.last_mut().unwrap().2,
+                Section::Return => &mut doc.returns,
+                Section::Example => &mut doc.example,
+            };
+            if !dst.is_empty() {
+                dst.push('\n');
             }
+            dst.push_str(line.trim_end());
         }
     }
-    let desc = desc_parts.join("\n");
-    let desc = desc.trim().to_owned();
-    let returns = returns.trim().to_owned();
-    let example = example.trim().to_owned();
-    if desc.is_empty() {
+    for s in [&mut doc.desc, &mut doc.returns, &mut doc.example]
+        .into_iter()
+        .chain(doc.params.iter_mut().map(|p| &mut p.2))
+    {
+        *s = s.trim().to_owned();
+    }
+    if doc.desc.is_empty() {
         return Err(syn::Error::new(
             span,
             "lua_fn requires a doc comment description",
         ));
     }
-    for (_, _, d) in &mut params {
-        *d = d.trim().to_owned();
-    }
-    Ok(ParsedDoc {
-        desc,
-        params,
-        returns,
-        example,
-    })
+    Ok(doc)
 }
 
 fn last_segment_is(ty: &Type, name: &str) -> bool {
@@ -153,27 +134,20 @@ fn parse_lua_fn_args(attr: TokenStream) -> syn::Result<LuaFnArgs> {
     };
     for meta in metas {
         match &meta {
-            Meta::NameValue(nv) if nv.path.is_ident("guard") => match &nv.value {
-                Expr::Path(p) => out.guard = Some(p.path.clone()),
-                _ => {
+            Meta::NameValue(nv) if nv.path.is_ident("guard") => {
+                let Expr::Path(p) = &nv.value else {
                     return Err(syn::Error::new(
                         nv.value.span(),
                         "guard expects a Permission variant",
                     ));
-                }
-            },
-            Meta::NameValue(nv) if nv.path.is_ident("name") => match &nv.value {
-                Expr::Lit(l) => match &l.lit {
-                    Lit::Str(s) => out.name = Some(s.value()),
-                    _ => return Err(syn::Error::new(l.span(), "name expects a string literal")),
-                },
-                _ => {
-                    return Err(syn::Error::new(
-                        nv.value.span(),
-                        "name expects a string literal",
-                    ));
-                }
-            },
+                };
+                out.guard = Some(p.path.clone());
+            }
+            Meta::NameValue(nv) if nv.path.is_ident("name") => {
+                out.name = Some(str_lit(&nv.value).ok_or_else(|| {
+                    syn::Error::new(nv.value.span(), "name expects a string literal")
+                })?);
+            }
             other => return Err(syn::Error::new(other.span(), "unknown lua_fn option")),
         }
     }
@@ -197,12 +171,15 @@ pub fn lua_fn(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2> {
-    let fn_ident = func.sig.ident.clone();
-    let span = fn_ident.span();
-    let is_async = func.sig.asyncness.is_some();
-    let doc = parse_doc(&doc_lines(&func.attrs), span)?;
+struct FnParams {
+    method: Option<(Type, Ident)>,
+    ctx: Vec<(Ident, Type)>,
+    real: Vec<(Ident, Type)>,
+}
 
+fn classify_params(func: &mut ItemFn) -> syn::Result<FnParams> {
+    let span = func.sig.ident.span();
+    let is_async = func.sig.asyncness.is_some();
     let mut inputs = func.sig.inputs.iter_mut();
     let Some(FnArg::Typed(_lua_param)) = inputs.next() else {
         return Err(syn::Error::new(
@@ -210,9 +187,11 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             "first parameter must be the Lua handle",
         ));
     };
-    let mut method: Option<MethodKind> = None;
-    let mut ctx: Vec<(Ident, Type)> = Vec::new();
-    let mut real: Vec<(Ident, Type, bool, bool)> = Vec::new();
+    let mut out = FnParams {
+        method: None,
+        ctx: Vec::new(),
+        real: Vec::new(),
+    };
     for input in inputs {
         let FnArg::Typed(pt) = input else {
             return Err(syn::Error::new(
@@ -231,32 +210,37 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         let ident = pi.ident.clone();
         let ty = (*pt.ty).clone();
         if ident == "this" {
-            if method.is_some() || is_ctx || !ctx.is_empty() || !real.is_empty() {
+            if out.method.is_some() || is_ctx || !out.ctx.is_empty() || !out.real.is_empty() {
                 return Err(syn::Error::new(
                     ident.span(),
                     "`this` must be the single parameter right after the Lua handle",
                 ));
             }
-            method = Some(method_kind(&ty, is_async)?);
-            continue;
-        }
-        if is_ctx {
-            if !real.is_empty() {
+            out.method = Some(method_kind(&ty, is_async)?);
+        } else if is_ctx {
+            if !out.real.is_empty() {
                 return Err(syn::Error::new(
                     ident.span(),
                     "#[ctx] parameters must come before Lua parameters",
                 ));
             }
-            ctx.push((ident, ty));
+            out.ctx.push((ident, ty));
         } else {
-            let optional = last_segment_is(&ty, "Option");
-            let variadic = last_segment_is(&ty, "Variadic");
-            real.push((ident, ty, optional, variadic));
+            out.real.push((ident, ty));
         }
     }
+    Ok(out)
+}
+
+fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2> {
+    let fn_ident = func.sig.ident.clone();
+    let span = fn_ident.span();
+    let is_async = func.sig.asyncness.is_some();
+    let doc = parse_doc(&doc_lines(&func.attrs), span)?;
+    let FnParams { method, ctx, real } = classify_params(func)?;
 
     let documented: Vec<&str> = doc.params.iter().map(|(n, _, _)| n.as_str()).collect();
-    let actual: Vec<String> = real.iter().map(|(i, ..)| i.unraw().to_string()).collect();
+    let actual: Vec<String> = real.iter().map(|(i, _)| i.unraw().to_string()).collect();
     if documented != actual.iter().map(String::as_str).collect::<Vec<_>>() {
         return Err(syn::Error::new(
             span,
@@ -268,11 +252,11 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
 
     let rendered: Vec<String> = real
         .iter()
-        .map(|(ident, _, optional, variadic)| {
+        .map(|(ident, ty)| {
             let ident = ident.unraw();
-            if *variadic {
+            if last_segment_is(ty, "Variadic") {
                 "{...}".to_owned()
-            } else if *optional {
+            } else if last_segment_is(ty, "Option") {
                 format!("{{{ident}?}}")
             } else {
                 format!("{{{ident}}}")
@@ -284,26 +268,16 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     let doc_ident = format_ident!("{fn_ident}__doc");
     let reg_ident = format_ident!("{fn_ident}__register");
 
-    let desc = &doc.desc;
-    let returns = &doc.returns;
-    let example = &doc.example;
+    let ParsedDoc {
+        desc,
+        returns,
+        example,
+        ..
+    } = &doc;
     let param_docs =
         doc.params.iter().zip(&rendered).map(
             |((_, ty, d), name)| quote!(crate::docs::ParamDoc { name: #name, ty: #ty, desc: #d }),
         );
-
-    let ctx_idents: Vec<&Ident> = ctx.iter().map(|(i, _)| i).collect();
-    let ctx_tys: Vec<&Type> = ctx.iter().map(|(_, t)| t).collect();
-    // Fresh binding names so closure params can never shadow the target fn.
-    let arg_idents: Vec<Ident> = (0..real.len()).map(|i| format_ident!("__arg{i}")).collect();
-    let real_tys: Vec<&Type> = real.iter().map(|(_, t, ..)| t).collect();
-
-    let call = quote!(#fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_idents)*));
-    let closure = if real.is_empty() {
-        quote!(move |lua, ()| #call)
-    } else {
-        quote!(move |lua, (#(#arg_idents,)*): (#(#real_tys,)*)| #call)
-    };
     let doc_const = quote! {
         #[allow(non_upper_case_globals)]
         pub(crate) const #doc_ident: crate::docs::FnDoc = crate::docs::FnDoc {
@@ -316,19 +290,21 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         };
     };
 
-    if let Some(kind) = method {
+    let ctx_idents: Vec<&Ident> = ctx.iter().map(|(i, _)| i).collect();
+    let ctx_tys: Vec<&Type> = ctx.iter().map(|(_, t)| t).collect();
+    // Fresh binding names so closure params can never shadow the target fn.
+    let arg_idents: Vec<Ident> = (0..real.len()).map(|i| format_ident!("__arg{i}")).collect();
+    let real_tys: Vec<&Type> = real.iter().map(|(_, t)| t).collect();
+    let arg_pat = quote!((#(#arg_idents,)*): (#(#real_tys,)*));
+
+    if let Some((self_ty, add_fn)) = method {
         if args.guard.is_some() || !ctx.is_empty() {
             return Err(syn::Error::new(
                 span,
                 "guard and #[ctx] are not supported on methods",
             ));
         }
-        let MethodKind { self_ty, add_fn } = kind;
-        let closure = if real.is_empty() {
-            quote!(move |lua, this, ()| #fn_ident(lua, this))
-        } else {
-            quote!(move |lua, this, (#(#arg_idents,)*): (#(#real_tys,)*)| #fn_ident(lua, this #(, #arg_idents)*))
-        };
+        let closure = quote!(move |lua, this, #arg_pat| #fn_ident(lua, this #(, #arg_idents)*));
         return Ok(quote! {
             #func
             #doc_const
@@ -338,6 +314,8 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         });
     }
 
+    let closure =
+        quote!(move |lua, #arg_pat| #fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_idents)*));
     let create = match (&args.guard, is_async) {
         (Some(g), false) => {
             quote!(perms.guard(crate::plugin_permissions::Permission::#g, lua, #closure)?)
@@ -367,12 +345,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     })
 }
 
-struct MethodKind {
-    self_ty: Type,
-    add_fn: Ident,
-}
-
-fn method_kind(ty: &Type, is_async: bool) -> syn::Result<MethodKind> {
+fn method_kind(ty: &Type, is_async: bool) -> syn::Result<(Type, Ident)> {
     let (self_ty, add_fn) = match ty {
         Type::Reference(r) if !is_async => (
             (*r.elem).clone(),
@@ -409,10 +382,7 @@ fn method_kind(ty: &Type, is_async: bool) -> syn::Result<MethodKind> {
             ));
         }
     };
-    Ok(MethodKind {
-        self_ty,
-        add_fn: Ident::new(add_fn, ty.span()),
-    })
+    Ok((self_ty, Ident::new(add_fn, ty.span())))
 }
 
 struct Entry {
@@ -451,6 +421,24 @@ impl Parse for Entry {
     }
 }
 
+fn module_doc(
+    docs_ident: &Ident,
+    lua_name: &LitStr,
+    kind: &Ident,
+    desc: &str,
+    entries: &[Entry],
+) -> TokenStream2 {
+    let doc_idents = entries.iter().map(|e| format_ident!("{}__doc", e.ident));
+    quote! {
+        pub(crate) const #docs_ident: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
+            name: #lua_name,
+            kind: crate::docs::DocKind::#kind,
+            desc: #desc,
+            fns: &[#(#doc_idents),*],
+        };
+    }
+}
+
 struct LuaTableInput {
     desc: String,
     extend: bool,
@@ -464,8 +452,7 @@ struct LuaTableInput {
 
 impl Parse for LuaTableInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let attrs = input.call(Attribute::parse_outer)?;
-        let desc = doc_lines(&attrs).join("\n").trim().to_owned();
+        let desc = parse_desc(input)?;
         let extend = if input.peek(Ident) {
             let kw: Ident = input.parse()?;
             if kw != "extend" {
@@ -519,7 +506,6 @@ impl Parse for LuaTableInput {
 /// `extend` to register into an existing table instead of creating one.
 #[proc_macro]
 pub fn lua_table(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as LuaTableInput);
     let LuaTableInput {
         desc,
         extend,
@@ -529,9 +515,8 @@ pub fn lua_table(input: TokenStream) -> TokenStream {
         params,
         docs_ident,
         entries,
-    } = input;
+    } = parse_macro_input!(input as LuaTableInput);
 
-    let doc_idents = entries.iter().map(|e| format_ident!("{}__doc", e.ident));
     let calls = entries.iter().filter(|e| !e.manual).map(|e| {
         let reg = format_ident!("{}__register", e.ident);
         let forwarded = e.args.iter().map(|arg| {
@@ -548,14 +533,13 @@ pub fn lua_table(input: TokenStream) -> TokenStream {
         quote!(#reg(&t, lua #(, #forwarded)*)?;)
     });
 
-    let docs = quote! {
-        pub(crate) const #docs_ident: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
-            name: #lua_name,
-            kind: crate::docs::DocKind::Table,
-            desc: #desc,
-            fns: &[#(#doc_idents),*],
-        };
-    };
+    let docs = module_doc(
+        &docs_ident,
+        &lua_name,
+        &format_ident!("Table"),
+        &desc,
+        &entries,
+    );
     let body = if extend {
         quote! {
             #vis fn #fn_ident(t: &mlua::Table, lua: &mlua::Lua #(, #params)*) -> mlua::Result<()> {
@@ -588,8 +572,7 @@ struct LuaClassInput {
 
 impl Parse for LuaClassInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let attrs = input.call(Attribute::parse_outer)?;
-        let desc = doc_lines(&attrs).join("\n").trim().to_owned();
+        let desc = parse_desc(input)?;
         let lua_name: LitStr = input.parse()?;
         input.parse::<Token![=>]>()?;
         let self_ty: Type = input.parse()?;
@@ -610,9 +593,9 @@ impl Parse for LuaClassInput {
         }
         let (mut fields, mut extra) = (None, None);
         while !input.is_empty() {
-            if input.peek(Token![,]) {
-                input.parse::<Token![,]>()?;
-                continue;
+            input.parse::<Option<Token![,]>>()?;
+            if input.is_empty() {
+                break;
             }
             let kw: Ident = input.parse()?;
             let target: Ident = input.parse()?;
@@ -652,7 +635,6 @@ pub fn lua_class(input: TokenStream) -> TokenStream {
         extra,
     } = parse_macro_input!(input as LuaClassInput);
 
-    let doc_idents = entries.iter().map(|e| format_ident!("{}__doc", e.ident));
     let calls = entries.iter().filter(|e| !e.manual).map(|e| {
         let reg = format_ident!("{}__register", e.ident);
         quote!(#reg(methods);)
@@ -665,14 +647,16 @@ pub fn lua_class(input: TokenStream) -> TokenStream {
             }
         }
     });
+    let docs = module_doc(
+        &docs_ident,
+        &lua_name,
+        &format_ident!("Class"),
+        &desc,
+        &entries,
+    );
 
     quote! {
-        pub(crate) const #docs_ident: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
-            name: #lua_name,
-            kind: crate::docs::DocKind::Class,
-            desc: #desc,
-            fns: &[#(#doc_idents),*],
-        };
+        #docs
 
         impl mlua::UserData for #self_ty {
             #fields_impl
