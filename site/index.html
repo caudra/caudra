@@ -1505,9 +1505,14 @@ imports = <span class="fn">set</span>()
   name = <span class="st">"standup"</span>,
   description = <span class="st">"Yesterday's commits"</span>,
   handler = <span class="kw">function</span>()
+    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
     <span class="fn">maki.fn.jobstart</span>(
-      <span class="st">"git log --since=yesterday --oneline"</span>,
-      { on_stdout = maki.ui.flash })
+      <span class="st">"git log --since=yesterday --oneline"</span>, {
+        on_stdout = <span class="kw">function</span>(l) <span class="fn">buf:line</span>(l) <span class="kw">end</span>,
+        on_exit = <span class="kw">function</span>()
+          <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
+        <span class="kw">end</span>,
+      })
   <span class="kw">end</span>,
 })
 
