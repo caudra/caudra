@@ -39,6 +39,12 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     if builtin.is_none() && dynamic::display_name(slug).is_none() && !is_custom {
         bail!("unknown provider '{slug}'");
     }
+
+    if builtin.is_none() && dynamic::auth_providers().iter().any(|(s, _)| *s == slug) {
+        dynamic::login(slug)?;
+        return Ok(());
+    }
+
     let mut config = ProvidersConfig::load();
     let def = config.get(slug).cloned();
 
