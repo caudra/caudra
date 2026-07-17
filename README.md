@@ -138,6 +138,8 @@ This will allow you to customize the hell out of maki.
 
 Status: all tools are Lua plugins (in the `./plugins` dir). Little by little we should migrate more functionalities into Lua.
 
+[Lua API reference](https://maki.sh/docs/lua-api/).
+
 ## Example config
 
 [tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
