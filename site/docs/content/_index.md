@@ -3,24 +3,37 @@ title = "Maki Docs"
 sort_by = "weight"
 +++
 
-# Maki
+# Maki Docs
 
-Maki is a terminal-based coding agent. Point it at a codebase, pick an LLM provider, and let it read, edit, search, and run code for you.
+Maki is a terminal coding agent written in Rust. Point it at a codebase, pick an LLM provider, and it reads, edits, searches, and runs code for you while keeping token usage low.
 
-Written in Rust. Built to keep cost and token usage low without losing capability.
+This page is a map of the docs. Skim it once, then jump to what you need.
 
-## Features
+## Start here
 
-- **TUI** built on ratatui with syntax highlighting, inline image rendering, and fuzzy search.
-- **17 built-in tools** for file ops, search, code execution, web access, and more.
-- **Multiple providers.** Anthropic, OpenAI, Z.AI, and a dynamic provider system for plugging in your own.
-- **MCP support.** Connect external tool servers over stdio or HTTP.
-- **Permissions.** Fine-grained allow/deny rules, plus a YOLO mode.
-- **Sub-agents.** Spin up read-only research agents or full-access workers that run in parallel.
-- **Session persistence.** Pick up where you left off, context and permissions intact.
-- **Python sandbox.** A minimal interpreter for running Python snippets safely inside the agent loop.
-- **Code indexing.** Tree-sitter powered file skeletons for 15+ languages, so the model can understand structure without reading every line.
-- **Headless mode.** Run non-interactively with `--print` for scripts and CI. Compatible with Claude Code output format.
-- **ACP server.** Use Maki from your editor (e.g. [Zed](https://zed.dev/)) over the Agent Client Protocol with `maki acp`.
+New to Maki? Two pages get you going:
 
-Ready to try it? Head to the [Quick Start](/docs/quick-start/).
+- [Quick Start](/docs/quick-start/) installs Maki and connects your first provider. Takes a few minutes.
+- [Configuration](/docs/configuration/) covers `init.lua`, the small Lua script where all settings live.
+
+## Everyday use
+
+Answers to the "how do I..." questions once Maki is running:
+
+- [Commands](/docs/commands/): everything behind the `/` palette, from `/model` to `/btw`.
+- [Keybindings](/docs/keybindings/): move around the TUI without touching the mouse.
+- [Tools](/docs/tools/): the full reference for the 20 built-in tools the agent works with.
+- [Permissions](/docs/permissions/): decide what the agent may do on its own and when it must ask you first.
+
+## Connecting things
+
+- [Providers](/docs/providers/): Anthropic, OpenAI, Ollama, and friends, plus the weak, medium, and strong model tiers.
+- [MCP](/docs/mcp/): plug in external tool servers over stdio or HTTP.
+
+## Extending and embedding
+
+- [Lua API](/docs/lua-api/): write plugins in Lua with an API that mirrors Neovim. Generated straight from the source, so it never drifts.
+- [Headless Mode](/docs/headless/): run Maki with `--print` in scripts and CI. Output is Claude Code compatible.
+- [ACP](/docs/acp/): drive Maki from your editor, like [Zed](https://zed.dev/), over the Agent Client Protocol.
+
+Something missing or wrong? Open an issue on [GitHub](https://github.com/tontinton/maki).
