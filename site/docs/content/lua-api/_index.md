@@ -9,13 +9,11 @@ group = "Reference"
 
 Maki plugins are plain Lua files. Everything a plugin can touch lives under
 one global table: `maki`. This page documents every module, function, and
-method. It is generated straight from the source code by `maki-docgen`, so it
-can never drift from what maki actually does.
+method. It is generated straight from the source code by `maki-docgen`.
 
-If you have written Neovim plugins before, you are already halfway there.
-Where a module mirrors Neovim (`maki.fs`, `maki.uv`, `maki.treesitter`,
-`maki.keymap`, `maki.base64`), signatures are kept identical so code can be
-copy-pasted between the two.
+The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
+`maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
+so code can be copy-pasted between the two without too many modifications.
 
 A small plugin looks like this:
 
