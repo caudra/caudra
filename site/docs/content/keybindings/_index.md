@@ -84,7 +84,7 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+D` | Delete session |
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `1/2/3/4` | Set tier (strong/medium/weak/compaction) |
+| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 
 ## Context Inheritance
 
