@@ -10,3 +10,5 @@ Our goal is to let plugin authors have as much freedom as possible, that's why d
 
 Fallible runtime operations return the pair (value, err) and never throw.
 Throwing is reserved for programmer errors, like passing a number where a string belongs.
+
+Tool handlers fail with `{ llm_output = msg, is_error = true }`; a plain string is always success (only `is_error` flags the result as an error to the provider).

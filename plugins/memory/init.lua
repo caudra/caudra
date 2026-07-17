@@ -164,7 +164,7 @@ maki.api.register_tool({
     local cmd = input.command
     local dir, dir_err = resolve_dir(cmd == "view")
     if not dir then
-      return "error: " .. dir_err
+      return { llm_output = "error: " .. dir_err, is_error = true }
     end
 
     local result, err
@@ -172,22 +172,25 @@ maki.api.register_tool({
       result, err = cmd_view(input.path, dir, ctx)
     elseif cmd == "write" then
       if not input.path then
-        return "error: 'path' is required for write"
+        return { llm_output = "error: 'path' is required for write", is_error = true }
       end
       if not input.content then
-        return "error: 'content' is required for write"
+        return { llm_output = "error: 'content' is required for write", is_error = true }
       end
       result, err = cmd_write(input.path, input.content, dir, ctx)
     elseif cmd == "delete" then
       if not input.path then
-        return "error: 'path' is required for delete"
+        return { llm_output = "error: 'path' is required for delete", is_error = true }
       end
       result, err = cmd_delete(input.path, dir)
     else
-      return "error: unknown command '" .. tostring(cmd) .. "'. Valid commands: view, write, delete"
+      return {
+        llm_output = "error: unknown command '" .. tostring(cmd) .. "'. Valid commands: view, write, delete",
+        is_error = true,
+      }
     end
     if err then
-      return "error: " .. err
+      return { llm_output = "error: " .. err, is_error = true }
     end
     return result
   end,

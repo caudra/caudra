@@ -58,7 +58,7 @@ maki.api.register_tool({
   end,
   handler = function(input, ctx)
     if #input.questions == 0 then
-      return "error: at least one question is required"
+      return { llm_output = "error: at least one question is required", is_error = true }
     end
     for _, q in ipairs(input.questions) do
       q.options = q.options or {}

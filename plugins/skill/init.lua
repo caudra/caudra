@@ -113,14 +113,14 @@ maki.api.register_tool({
 
   handler = function(input, ctx)
     if not input.name then
-      return "error: name is required"
+      return { llm_output = "error: name is required", is_error = true }
     end
 
     local skills = discover_skills()
     local skill = skills[input.name]
     if not skill then
       local available = build_skill_list(skills)
-      return NOT_FOUND .. input.name .. available
+      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
     end
 
     local lines = {}

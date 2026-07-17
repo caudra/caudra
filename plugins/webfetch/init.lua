@@ -103,12 +103,12 @@ maki.api.register_tool({
   handler = function(input, ctx)
     local url = input.url
     if not url then
-      return "error: url is required"
+      return { llm_output = "error: url is required", is_error = true }
     end
 
     local fmt = input.format or DEFAULT_FORMAT
     if not VALID_FORMATS[fmt] then
-      return "error: unknown format: " .. tostring(fmt)
+      return { llm_output = "error: unknown format: " .. tostring(fmt), is_error = true }
     end
 
     local config = ctx:config()
@@ -124,16 +124,16 @@ maki.api.register_tool({
       },
     })
     if not resp then
-      return "error: " .. tostring(err)
+      return { llm_output = "error: " .. tostring(err), is_error = true }
     end
 
     if resp.status < 200 or resp.status >= 300 then
-      return "error: HTTP " .. tostring(resp.status)
+      return { llm_output = "error: HTTP " .. tostring(resp.status), is_error = true }
     end
 
     local ct = resp.content_type or ""
     if ct:find("^image/") and not ct:find("svg") then
-      return "error: image content cannot be displayed as text"
+      return { llm_output = "error: image content cannot be displayed as text", is_error = true }
     end
 
     local body = resp.body

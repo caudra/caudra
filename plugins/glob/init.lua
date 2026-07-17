@@ -45,7 +45,7 @@ maki.api.register_tool({
   handler = function(input, ctx)
     local pattern = input.pattern
     if not pattern then
-      return "error: pattern is required"
+      return { llm_output = "error: pattern is required", is_error = true }
     end
 
     local limit = ctx:config("search_result_limit", DEFAULT_SEARCH_LIMIT)
@@ -60,7 +60,7 @@ maki.api.register_tool({
     })
 
     if not files then
-      return "error: " .. err
+      return { llm_output = "error: " .. err, is_error = true }
     end
 
     if #files == 0 then

@@ -235,7 +235,7 @@ maki.api.register_tool({
   handler = function(input, ctx)
     local pattern = input.pattern
     if not pattern then
-      return "error: pattern is required"
+      return { llm_output = "error: pattern is required", is_error = true }
     end
     pattern = pattern:gsub('"$', "")
 
@@ -258,7 +258,7 @@ maki.api.register_tool({
     })
 
     if not entries then
-      return "error: " .. tostring(err)
+      return { llm_output = "error: " .. tostring(err), is_error = true }
     end
 
     if #entries == 0 then

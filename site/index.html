@@ -1491,7 +1491,9 @@ imports = <span class="fn">set</span>()
   handler = <span class="kw">function</span>()
     <span class="kw">local</span> res, err = <span class="fn">maki.net.request</span>(
       <span class="st">"https://ci.internal/runs?branch=main"</span>)
-    <span class="kw">if</span> err <span class="kw">then</span> <span class="kw">return</span> <span class="st">"error: "</span> .. err <span class="kw">end</span>
+    <span class="kw">if</span> err <span class="kw">then</span>
+      <span class="kw">return</span> { llm_output = err, is_error = <span class="kw">true</span> }
+    <span class="kw">end</span>
     <span class="kw">return</span> res.body
   <span class="kw">end</span>,
 })</pre>

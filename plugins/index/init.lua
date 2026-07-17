@@ -176,7 +176,7 @@ Return a compact overview of a source file: imports, type definitions, function 
   handler = function(input, ctx)
     local path = input.path
     if not path then
-      return "error: path is required"
+      return { llm_output = "error: path is required", is_error = true }
     end
 
     local meta = maki.fs.metadata(path)
@@ -204,21 +204,24 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local max_file_size = ctx:config("index_max_file_size", (2 * 1024 * 1024))
     if meta and meta.size > max_file_size then
-      return "error: File too large ("
-        .. meta.size
-        .. " bytes, max "
-        .. max_file_size
-        .. "). Use read with offset/limit instead."
+      return {
+        llm_output = "error: File too large ("
+          .. meta.size
+          .. " bytes, max "
+          .. max_file_size
+          .. "). Use read with offset/limit instead.",
+        is_error = true,
+      }
     end
 
     local source, err = maki.fs.read(path)
     if not source then
-      return "error: " .. err
+      return { llm_output = "error: " .. err, is_error = true }
     end
 
     local skeleton, line_meta = indexer.index_source(source, lang)
     if not skeleton then
-      return "error: " .. tostring(line_meta)
+      return { llm_output = "error: " .. tostring(line_meta), is_error = true }
     end
 
     local ext = indexer.LANG_TO_EXT[lang] or path:match("%.([^%.]+)$") or ""

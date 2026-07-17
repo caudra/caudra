@@ -45,7 +45,7 @@ maki.api.register_tool({
   handler = function(input, ctx)
     local query = input.query
     if not query then
-      return "error: query is required"
+      return { llm_output = "error: query is required", is_error = true }
     end
 
     local num_results = input.num_results or DEFAULT_NUM_RESULTS
@@ -65,7 +65,7 @@ maki.api.register_tool({
       },
     })
     if not payload then
-      return "error: failed to encode request: " .. tostring(encode_err)
+      return { llm_output = "error: failed to encode request: " .. tostring(encode_err), is_error = true }
     end
 
     local config = ctx:config()
@@ -90,17 +90,17 @@ maki.api.register_tool({
       max_bytes = max_response,
     })
     if not resp then
-      return "error: " .. tostring(err)
+      return { llm_output = "error: " .. tostring(err), is_error = true }
     end
 
     if resp.status < 200 or resp.status >= 300 then
       local preview = resp.body:sub(1, 200)
-      return "error: HTTP " .. tostring(resp.status) .. ": " .. preview
+      return { llm_output = "error: HTTP " .. tostring(resp.status) .. ": " .. preview, is_error = true }
     end
 
     local text, parse_err = parse_sse_response(resp.body)
     if not text then
-      return "error: " .. tostring(parse_err)
+      return { llm_output = "error: " .. tostring(parse_err), is_error = true }
     end
 
     local llm_output = truncate(text, max_lines, max_bytes)
