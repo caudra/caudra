@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -298,14 +299,21 @@ pub(crate) async fn parse_sse(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(delta) = parsed["delta"].as_str() {
+                let delta: Cow<'_, str> = if let Some(s) = parsed["delta"].as_str() {
+                    Cow::Borrowed(s)
+                } else if let Some(obj) = parsed["delta"].as_object() {
+                    Cow::Owned(serde_json::to_string(obj).unwrap_or_default())
+                } else {
+                    Cow::Borrowed("")
+                };
+                if !delta.is_empty() {
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
                         tool_accumulators.iter_mut().find(|a| a.output_index == idx)
                     } else {
                         tool_accumulators.last_mut()
                     };
                     if let Some(acc) = acc {
-                        acc.arguments.push_str(delta);
+                        acc.arguments.push_str(&delta);
                     }
                 }
             }
@@ -338,7 +346,13 @@ pub(crate) async fn parse_sse(
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
-                    let arguments = item["arguments"].as_str().unwrap_or_default().to_string();
+                    let arguments = if let Some(s) = item["arguments"].as_str() {
+                        s.to_string()
+                    } else if let Some(obj) = item["arguments"].as_object() {
+                        serde_json::to_string(obj).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
                         tool_accumulators
                             .iter_mut()
@@ -848,6 +862,87 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
                 })
                 .collect();
             assert_eq!(progress, vec![(100, 1000, 50), (500, 1000, 50)]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_done_arguments_as_json_object() {
+        smol::block_on(async {
+            // llama.cpp may send arguments as a JSON object instead of a string
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":{\"path\":\"/tmp/file.txt\"}}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "read");
+            assert_eq!(tools[0].2["path"], "/tmp/file.txt");
+        })
+    }
+
+    #[test]
+    fn parse_sse_delta_arguments_as_json_object() {
+        smol::block_on(async {
+            // delta with arguments as JSON object instead of string
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"grep\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"delta\":{\"pattern\":\"TODO\",\"path\":\"src\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "grep");
+            assert_eq!(tools[0].2["pattern"], "TODO");
+            assert_eq!(tools[0].2["path"], "src");
+        })
+    }
+
+    #[test]
+    fn parse_sse_done_object_args_overrides_empty_delta() {
+        smol::block_on(async {
+            // done event with object args should override empty accumulated deltas
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\"}}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"edit\",\"arguments\":{\"path\":\"foo.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}
+\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "edit");
+            assert_eq!(tools[0].2["path"], "foo.rs");
+            assert_eq!(tools[0].2["old_string"], "a");
+            assert_eq!(tools[0].2["new_string"], "b");
         })
     }
 }
