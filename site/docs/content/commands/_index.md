@@ -34,6 +34,10 @@ Type `/` in the input box to open the command palette.
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 
+## Sessions
+
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar.
+
 ## Custom commands
 
 You can define your own slash commands as Markdown files.

@@ -34,6 +34,15 @@ pub fn generate() -> String {
     }
 
     writeln!(out).unwrap();
+    writeln!(out, "## Sessions").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar."
+    )
+    .unwrap();
+
+    writeln!(out).unwrap();
     writeln!(out, "## Custom commands").unwrap();
     writeln!(out).unwrap();
     writeln!(

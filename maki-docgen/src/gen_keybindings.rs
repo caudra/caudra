@@ -8,6 +8,12 @@ weight = 7
 group = \"Reference\"
 +++";
 
+const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
+    ("Session Picker", "`Ctrl+N`", "New session"),
+    ("Session Picker", "`Ctrl+R`", "Rename session"),
+    ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
+];
+
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
@@ -84,6 +90,10 @@ fn write_context_specific(out: &mut String) {
             kb.context.label(),
             kb.description
         ));
+    }
+
+    for (ctx, key, desc) in LUA_CONTEXT_BINDS {
+        out.push_str(&format!("| {ctx} | {key} | {desc} |\n"));
     }
 }
 
