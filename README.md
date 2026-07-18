@@ -15,6 +15,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 ### User experience
 
 * SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
+* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
 * Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X), or Ctrl-N/P.
@@ -130,15 +131,6 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 More info at the [official docs](http://maki.sh/docs).
 
 > DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
-
-## Extending with Lua
-
-Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by Lua plugins.
-This will allow you to customize the hell out of maki.
-
-Status: all tools are Lua plugins (in the `./plugins` dir). Little by little we should migrate more functionalities into Lua.
-
-[Lua API reference](https://maki.sh/docs/lua-api/).
 
 ## Example config
 
