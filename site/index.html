@@ -902,6 +902,21 @@
       width: 1px;
       background: oklch(32% 0.04 270);
     }
+    .exec-duo {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    .exec-duo .exec-demo {
+      display: flex;
+      flex-direction: column;
+    }
+    .exec-duo .exec-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .exec-duo .exec-pane pre { flex: 1; }
     .exec-pane .kw  { color: #cba6f7; }
     .exec-pane .fn  { color: #89b4fa; }
     .exec-pane .st  { color: #a6e3a1; }
@@ -919,6 +934,7 @@
       .index-divider { width: auto; height: 1px; }
       .exec-body { grid-template-columns: 1fr; }
       .exec-divider { width: auto; height: 1px; }
+      .exec-duo { grid-template-columns: 1fr; }
     }
 
     /* ── BOTTOM SKY ── */
@@ -1480,8 +1496,8 @@ imports = <span class="fn">set</span>()
       <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/maki/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
     </div>
 
-    <div class="exec-demo">
-      <div class="exec-body">
+    <div class="exec-duo">
+      <div class="exec-demo">
         <div class="exec-pane">
           <div class="exec-pane-label">add a ci_status tool: the model checks CI itself</div>
           <pre><span class="fn">maki.api.register_tool</span>({
@@ -1498,7 +1514,8 @@ imports = <span class="fn">set</span>()
   <span class="kw">end</span>,
 })</pre>
         </div>
-        <div class="exec-divider"></div>
+      </div>
+      <div class="exec-demo">
         <div class="exec-pane">
           <div class="exec-pane-label">add /standup: show yesterday's commits</div>
           <pre><span class="fn">maki.api.register_command</span>({
@@ -1514,11 +1531,7 @@ imports = <span class="fn">set</span>()
         <span class="kw">end</span>,
       })
   <span class="kw">end</span>,
-})
-
-<span class="fn">maki.keymap.set</span>(<span class="st">"n"</span>, <span class="st">"&lt;C-y&gt;"</span>, <span class="kw">function</span>()
-  <span class="fn">maki.ui.flash</span>(<span class="st">"hi from lua!"</span>)
-<span class="kw">end</span>)</pre>
+})</pre>
         </div>
       </div>
     </div>
