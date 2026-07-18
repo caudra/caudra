@@ -11,7 +11,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
   BINARY_NAME: maki
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
 
 permissions:
   contents: write
@@ -20,17 +23,13 @@ jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Get tag
-        id: tag
-        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
 
       - name: Create draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          .github/scripts/retry.sh bash -c \
+            'gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes'
 
   build-linux:
     name: Build (${{ matrix.target }})
@@ -58,7 +57,7 @@ jobs:
             alpine:3.21 sh -c '
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
               cargo build --release --target ${{ matrix.target }}
             '
@@ -66,16 +65,14 @@ jobs:
 
       - name: Package
         run: |
-          tag="${{ needs.create-release.outputs.tag }}"
+          tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.create-release.outputs.tag }}" "${{ env.ARCHIVE }}" --repo "$GITHUB_REPOSITORY" --clobber
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -100,7 +97,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ needs.create-release.outputs.tag }}
+          key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -108,7 +105,7 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tag="${{ needs.create-release.outputs.tag }}"
+          tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
@@ -118,26 +115,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          tag="${{ needs.create-release.outputs.tag }}"
+          tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
           7z a "${archive}" "${BINARY_NAME}.exe"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.create-release.outputs.tag }}" "${{ env.ARCHIVE }}" --repo "$GITHUB_REPOSITORY" --clobber
+        shell: bash
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
-  checksums:
-    name: Checksums
-    needs: [create-release, build-linux, build-other]
+  publish:
+    name: Publish Release
+    needs: [build-linux, build-other]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download "${{ needs.create-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir artifacts
+        run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts
 
       - name: Generate checksums
         run: |
@@ -146,16 +142,7 @@ jobs:
           cat ../sha256sums.txt
 
       - name: Upload checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.create-release.outputs.tag }}" sha256sums.txt --repo "$GITHUB_REPOSITORY" --clobber
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" sha256sums.txt --clobber
 
-  publish-release:
-    name: Publish Release
-    needs: [create-release, checksums]
-    runs-on: ubuntu-latest
-    steps:
       - name: Mark release as published
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ needs.create-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: .github/scripts/retry.sh gh release edit "$GITHUB_REF_NAME" --draft=false

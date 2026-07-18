@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
 
 jobs:
   changes:
@@ -76,7 +77,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: sudo apt-get install -y ripgrep
+      - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
       - run: just test
 
   machete:
