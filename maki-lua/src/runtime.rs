@@ -743,6 +743,28 @@ fn spawn_async_task(
     .detach();
 }
 
+/// Barrier for load/clear ops: drains queued `maki.async.run` tasks and
+/// waits for every in-flight task, looping until both are quiescent. A bare
+/// `gate.drain()` is not enough: a click handler that runs during the drain
+/// can enqueue an async job into the spawn queue, which only the dispatcher
+/// loop would spawn - after the barrier already passed.
+async fn drain_barrier(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    spawn_rx: &flume::Receiver<PendingAsyncTask>,
+) {
+    loop {
+        while let Ok(task) = spawn_rx.try_recv() {
+            spawn_async_task(lua, ex, gate, task);
+        }
+        gate.drain().await;
+        if spawn_rx.is_empty() {
+            return;
+        }
+    }
+}
+
 struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
@@ -1985,15 +2007,8 @@ pub fn spawn(
 
             smol::block_on(ex.run(async {
                 loop {
-                    let mut spawned = false;
                     while let Ok(task) = spawn_rx.try_recv() {
                         spawn_async_task(&rt.lua, &ex, &gate, task);
-                        spawned = true;
-                    }
-                    // One yield lets just-spawned tasks take their gate slot
-                    // before a load/clear barrier checks `gate.drain()`.
-                    if spawned {
-                        smol::future::yield_now().await;
                     }
                     // Biased: user-initiated requests (commands, keybinds) jump
                     // ahead of bulk work like session restores so the UI stays
@@ -2028,7 +2043,7 @@ pub fn spawn(
                             permissions,
                             reply,
                         } => {
-                            gate.drain().await;
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, None).await;
                             let _ = reply.send(res);
                         }
@@ -2068,7 +2083,7 @@ pub fn spawn(
                             .detach();
                         }
                         Request::ClearPlugin { plugin, reply } => {
-                            gate.drain().await;
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
@@ -2121,7 +2136,7 @@ pub fn spawn(
                             plugin_dir,
                             reply,
                         } => {
-                            gate.drain().await;
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt.run_init_lua(&source, &source_name, plugin_dir).await;
                             let _ = reply.send(res);
                         }

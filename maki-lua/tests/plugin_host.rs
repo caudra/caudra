@@ -1520,8 +1520,8 @@ fn warm_map_cleared_by_load_source() {
     assert_eq!(body.read()[0].spans[0].text, WARM_INITIAL_LINE);
 }
 
-/// The gate guard is taken at spawn time, so LoadSource's drain barrier
-/// also covers async jobs a warm click enqueues.
+/// LoadSource's drain barrier spawns and awaits queued async jobs, so
+/// jobs a warm click enqueues land before the barrier returns.
 #[test]
 fn warm_click_runs_async_jobs() {
     const WARM_ID: &str = "warm-async-1";
