@@ -1,0 +1,4 @@
+# Luau's aarch64 codegen (mlua `luau-jit`) calls __clear_cache from libgcc,
+# which rustc's `-nodefaultlibs` musl link would otherwise drop.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-lgcc"]
