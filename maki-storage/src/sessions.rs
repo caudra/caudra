@@ -327,15 +327,22 @@ pub trait TitleSource {
     fn first_user_text(&self) -> Option<&str>;
 }
 
+/// A pasted code block bakes `\n` into a title and skews width-based padding
+/// in single-line UI like the picker, so every title entry point calls this.
+pub fn normalize_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
     let first_user_text = messages.iter().find_map(|m| m.first_user_text());
 
     let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
         return DEFAULT_TITLE.into();
     };
+    let text = normalize_title(text);
 
     if text.len() <= MAX_TITLE_LEN {
-        return text.to_string();
+        return text;
     }
 
     let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
@@ -968,7 +975,7 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
         {
             out.push(SessionSummary {
                 id: h.id,
-                title: h.title.clone(),
+                title: normalize_title(&h.title),
                 updated_at: h.updated_at,
             });
         }
@@ -1097,18 +1104,21 @@ where
     U: DeserializeOwned + Default,
     T: DeserializeOwned,
 {
-    if path.extension().is_some_and(|e| e == "jsonl") {
-        let data = fs::read(path).map_err(StorageError::from)?;
-        return load_jsonl(&data, &path.display().to_string());
-    }
     let data = fs::read(path).map_err(StorageError::from)?;
-    let session: Session<M, U, T> = serde_json::from_slice(&data).map_err(StorageError::from)?;
-    if session.version != SESSION_VERSION {
-        return Err(SessionError::VersionMismatch {
-            found: session.version,
-            expected: SESSION_VERSION,
-        });
-    }
+    let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
+        load_jsonl(&data, &path.display().to_string())?
+    } else {
+        let session: Session<M, U, T> =
+            serde_json::from_slice(&data).map_err(StorageError::from)?;
+        if session.version != SESSION_VERSION {
+            return Err(SessionError::VersionMismatch {
+                found: session.version,
+                expected: SESSION_VERSION,
+            });
+        }
+        session
+    };
+    session.title = normalize_title(&session.title);
     Ok(session)
 }
 
@@ -1696,6 +1706,22 @@ mod tests {
         assert_eq!(cache.as_object().unwrap().len(), 1, "deleted entry pruned");
     }
 
+    #[test]
+    fn dirty_persisted_title_normalized_on_list_and_load() {
+        const NORMALIZED: &str = "line one line two";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.messages.push(user_message("hi"));
+        let mut log = SessionLog::create(dir, &s).unwrap();
+        s.title = "line one\n\n\tline two".into();
+        log.append(&s).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].title, NORMALIZED);
+        assert_eq!(TestSession::load_from(s.id, dir).unwrap().title, NORMALIZED);
+    }
+
     #[test_case(Some(b"{ not json".as_slice()) ; "corrupt_cache")]
     #[test_case(None ; "missing_cache")]
     fn list_survives_bad_scan_cache(content: Option<&[u8]>) {
@@ -1759,6 +1785,7 @@ mod tests {
         "This is a very long title that exceeds the sixty character…"
         ; "long_truncates_at_word"
     )]
+    #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]

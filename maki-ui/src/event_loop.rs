@@ -30,7 +30,7 @@ use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::sessions::SessionError;
+use maki_storage::sessions::{SessionError, normalize_title};
 use serde_json::json;
 use tracing::warn;
 
@@ -712,6 +712,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::SetTitle { id, title } => {
+                let title = normalize_title(&title);
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
