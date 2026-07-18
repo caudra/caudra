@@ -28,6 +28,7 @@ require("tests.lang.rust")
 require("tests.lang.scala")
 require("tests.lang.swift")
 require("tests.lang.typescript")
+require("tests.lang.yaml")
 require("tests.lang.zig")
 
 require("tests.helpers").report()
