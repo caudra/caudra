@@ -7,6 +7,8 @@ group = "Getting Started"
 
 # Quick Start
 
+Install Maki, connect a provider, and run your first session. Takes a few minutes.
+
 ## Install
 
 ### Linux / macOS

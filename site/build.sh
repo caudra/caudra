@@ -37,3 +37,62 @@ cp site.webmanifest "$OUT/"
 # 2. Build Zola docs
 cd docs
 zola build -o "../_build/docs"
+cd ..
+
+# 3. Markdown mirrors + llms.txt / llms-full.txt for LLM consumption
+BASE_URL="https://maki.sh"
+
+body() {
+  awk '/^\+\+\+$/{c++; next} c>=2' "$1"
+}
+
+first_paragraph() {
+  body "$1" | awk '
+    /^```/ { fence = !fence; next }
+    fence || /^#/ { next }
+    /^$/ { if (p) exit; next }
+    { printf "%s%s", (p ? " " : ""), $0; p = 1 }
+    END { print "" }
+  '
+}
+
+pages=$(for f in docs/content/*/_index.md; do
+  w=$(sed -n 's/^weight = \([0-9]*\)$/\1/p' "$f")
+  echo "${w:-999} $f"
+done | sort -n | cut -d' ' -f2-)
+
+body docs/content/_index.md > "$OUT/docs/index.md"
+
+summary=$(first_paragraph docs/content/_index.md)
+
+{
+  echo "# Maki"
+  echo
+  echo "> $summary"
+  echo
+  echo "Full documentation in one file: $BASE_URL/llms-full.txt"
+  echo
+  echo "## Docs"
+  echo
+  echo "- [Maki Docs]($BASE_URL/docs/index.md): overview and map of the documentation"
+  for f in $pages; do
+    slug=$(basename "$(dirname "$f")")
+    title=$(sed -n 's/^title = "\(.*\)"$/\1/p' "$f")
+    desc=$(first_paragraph "$f")
+    echo "- [$title]($BASE_URL/docs/$slug/index.md): $desc"
+  done
+} > "$OUT/llms.txt"
+
+{
+  body docs/content/_index.md
+  for f in $pages; do
+    slug=$(basename "$(dirname "$f")")
+    body "$f" > "$OUT/docs/$slug/index.md"
+    echo
+    echo "---"
+    echo
+    body "$f"
+  done
+} > "$OUT/llms-full.txt"
+
+cp "$OUT/llms.txt" "$OUT/llms-full.txt" "$OUT/docs/"
