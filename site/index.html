@@ -694,6 +694,26 @@
       left: 0.55rem;
       color: oklch(75% 0.1 280);
     }
+    .player-hint {
+      margin-top: 0.6rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+    .player-hint button {
+      background: none;
+      border: none;
+      padding: 0;
+      font: inherit;
+      font-weight: 700;
+      color: var(--navy-light);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      cursor: pointer;
+    }
+    .player-hint button:hover {
+      color: var(--deep-navy);
+    }
 
 
     /* ── PROVIDERS ── */
@@ -1254,6 +1274,7 @@
   </div>
 
   <div class="hero-preview">
+    <div class="tui-scale-wrap">
     <div class="tui">
       <div class="tui-titlebar">
         <div class="tui-dot tui-dot-r"></div>
@@ -1286,6 +1307,8 @@
         </div>
       </div>
     </div>
+    </div>
+    <p class="player-hint"><button type="button" id="skip-hint-btn">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
   </div>
   </div>
 </section>
@@ -1870,6 +1893,11 @@ imports = <span class="fn">set</span>()
         if (progressRaf) cancelAnimationFrame(progressRaf);
       });
     });
+  });
+
+  document.getElementById('skip-hint-btn').addEventListener('click', () => {
+    player.seek(67);
+    player.play();
   });
 
   // Start progress updates
