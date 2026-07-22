@@ -534,7 +534,9 @@ impl<'t> EventLoop<'t> {
         let slot_model = self.ctx.model_slot.load();
         let spec = slot_model.model.spec();
         for rt in &mut self.sessions {
-            if rt.app.state.session.model != spec {
+            if rt.app.state.session.model != spec
+                || rt.app.state.model.context_window != slot_model.model.context_window
+            {
                 rt.app.update_model(&slot_model.model);
             }
         }
