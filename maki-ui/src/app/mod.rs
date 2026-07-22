@@ -480,13 +480,6 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
-            return Some(vec![]);
-        }
         None
     }
 
@@ -670,6 +663,14 @@ impl App {
                 }
                 McpPickerAction::Close => vec![],
             });
+        }
+
+        if key::PLAN_TOGGLE.matches(key)
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+        {
+            self.plan_form.toggle();
+            return Some(vec![]);
         }
 
         None
