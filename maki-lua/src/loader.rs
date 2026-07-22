@@ -652,6 +652,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
+            max_args: 0,
         }]);
         let snap = reader.load();
         assert_eq!(snap.commands.len(), 1);

@@ -648,6 +648,14 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 ///   name        (string)   Required. The command name (e.g. "/hello"; a leading
 ///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
+///   max_args    (integer)  Optional. Maximum number of arguments accepted.
+///                          Defaults to 0 (no arguments). Set to -1 for
+///                          unlimited. An "argument" is a whitespace-separated
+///                          word, so max_args = 1 breaks on the first space.
+///                          Handler receives the raw arg string, not a list.
+///                          If the user types more arguments than max_args, the
+///                          command silently stops matching and the input is sent
+///                          to the model as a normal message instead.
 ///   handler     (function) Required. Called when the user runs the command.
 /// @return
 /// @example
@@ -1190,6 +1198,21 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
+    let max_args: i64 = spec
+        .get::<Option<i64>>("max_args")
+        .map_err(|_| mlua::Error::runtime("register_command: 'max_args' must be an integer"))?
+        .unwrap_or(0);
+    let max_args: usize = match max_args {
+        -1 => usize::MAX,
+        n if n >= 0 => n
+            .try_into()
+            .map_err(|_| mlua::Error::runtime("register_command: 'max_args' is too large"))?,
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_command: 'max_args' must be non-negative or -1 for unlimited",
+            ));
+        }
+    };
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1207,6 +1230,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             CommandEntry {
                 handler: handler_key,
                 description,
+                max_args,
             },
         );
     }

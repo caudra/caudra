@@ -253,6 +253,14 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `max_args` (`integer`) Optional. Maximum number of arguments accepted.
+    Defaults to 0 (no arguments). Set to -1 for
+    unlimited. An "argument" is a whitespace-separated
+    word, so max_args = 1 breaks on the first space.
+    Handler receives the raw arg string, not a list.
+    If the user types more arguments than max_args, the
+    command silently stops matching and the input is sent
+    to the model as a normal message instead.
   - `handler` (`function`) Required. Called when the user runs the command.
 
 **Example:**
