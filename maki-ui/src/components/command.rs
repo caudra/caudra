@@ -911,6 +911,40 @@ mod tests {
         ])
     }
 
+    fn synced_with_nargs(input: &str, max_args: usize) -> CommandPalette {
+        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: Arc::from("/rename"),
+            description: Arc::from("Rename the current session"),
+            plugin: Arc::from("sessions"),
+            max_args,
+        }]);
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        p.sync(input);
+        p
+    }
+
+    #[test_case("/rename", usize::MAX, true           ; "nargs_plus_no_args")]
+    #[test_case("/rename ", usize::MAX, true          ; "nargs_plus_trailing_space")]
+    #[test_case("/rename my title", usize::MAX, true  ; "nargs_plus_multi_word")]
+    #[test_case("/rename title", 1, true              ; "nargs_one_single_word")]
+    #[test_case("/rename my title", 1, false          ; "nargs_one_too_many")]
+    #[test_case("/rename", 0, true                    ; "nargs_zero_no_args")]
+    #[test_case("/rename title", 0, false             ; "nargs_zero_with_arg")]
+    fn lua_command_respects_nargs(input: &str, max_args: usize, expect_active: bool) {
+        assert_eq!(
+            synced_with_nargs(input, max_args).is_active(),
+            expect_active
+        );
+    }
+
+    #[test]
+    fn confirm_lua_command_keeps_multi_word_args() {
+        let input = "/rename my new title";
+        let cmd = synced_with_nargs(input, usize::MAX).confirm(input).unwrap();
+        assert_eq!(cmd.name, "/rename");
+        assert_eq!(cmd.args, "my new title");
+    }
+
     fn synced_with_lua(input: &str) -> CommandPalette {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
         p.sync(input);
@@ -998,41 +1032,5 @@ mod tests {
         assert_eq!(updated_lua, 2);
         assert!(p.find_lua_command("/old").is_none());
         assert!(p.find_lua_command("/new1").is_some());
-    }
-
-    #[test]
-    fn lua_command_respects_max_args_zero() {
-        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: Arc::from("/noargs"),
-            description: Arc::from("takes no args"),
-            plugin: Arc::from("p"),
-            max_args: 0,
-        }]);
-        // Without args, command is visible
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader.clone());
-        p.sync("/noargs");
-        assert!(p.is_active());
-
-        // With args, command is filtered out
-        p.sync("/noargs foo");
-        assert!(!p.is_active());
-    }
-
-    #[test]
-    fn lua_command_respects_max_args_one() {
-        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: Arc::from("/onearg"),
-            description: Arc::from("takes one arg"),
-            plugin: Arc::from("p"),
-            max_args: 1,
-        }]);
-        // One arg is fine
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader.clone());
-        p.sync("/onearg foo");
-        assert!(p.is_active());
-
-        // Two args filters it out
-        p.sync("/onearg foo bar");
-        assert!(!p.is_active());
     }
 }

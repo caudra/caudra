@@ -13,7 +13,7 @@ use maki_agent::{
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
+use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
@@ -30,6 +30,14 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
 }
 
 fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
+    build_app_with_lua(dir, writer, LuaCommandReader::empty())
+}
+
+fn build_app_with_lua(
+    dir: StateDir,
+    writer: Arc<StorageWriter>,
+    lua_commands: LuaCommandReader,
+) -> App {
     let model = test_model();
     App::new(
         &model,
@@ -38,7 +46,7 @@ fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
-        LuaCommandReader::empty(),
+        lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
         writer,
@@ -1784,6 +1792,34 @@ fn typed_slash_command_executes() {
     let actions = type_and_submit(&mut app, "/help");
     assert!(actions.is_empty());
     assert!(app.help_modal.is_open());
+}
+
+const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
+const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
+
+/// The palette hides a lua command once the typed words pass its `max_args`,
+/// and a hidden command falls through to `handle_submit`, so a multi word
+/// `nargs` command must still be routed to its plugin.
+#[test]
+fn typed_lua_command_with_args_executes() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_lua(
+        dir.clone(),
+        Arc::new(StorageWriter::new(dir)),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: "/rename".into(),
+            description: "Rename the current session".into(),
+            plugin: "sessions".into(),
+            max_args: usize::MAX,
+        }]),
+    );
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
+
+    let actions = type_and_submit(&mut app, "/rename my title");
+
+    assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
+    assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
 }
 
 #[test]
