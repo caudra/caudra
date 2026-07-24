@@ -207,9 +207,11 @@ impl From<OauthUsage> for ProviderUsage {
 }
 
 /// Reduce a `base_url` to a bare origin, tolerating a trailing `/v1/messages`
-/// (which Anthropic base URLs historically included).
+/// (which Anthropic base URLs historically included) and any query string
+/// (e.g. `?beta=true` from Claude Code style endpoints).
 fn origin(base_url: &str) -> &str {
-    let trimmed = base_url.trim_end_matches('/');
+    let without_query = base_url.split(['?', '#']).next().unwrap_or(base_url);
+    let trimmed = without_query.trim_end_matches('/');
     trimmed.strip_suffix(MESSAGES_PATH).unwrap_or(trimmed)
 }
 
@@ -610,6 +612,7 @@ mod tests {
     #[test_case("https://proxy.example.com/v1/messages/", "https://proxy.example.com" ; "strips_messages_path_with_trailing_slash")]
     #[test_case("https://api.anthropic.com", "https://api.anthropic.com" ; "origin_unchanged")]
     #[test_case("http://localhost:8080/", "http://localhost:8080" ; "trims_trailing_slash")]
+    #[test_case("https://api.anthropic.com/v1/messages?beta=true", "https://api.anthropic.com" ; "strips_query_string")]
     fn origin_normalizes(input: &str, expected: &str) {
         assert_eq!(origin(input), expected);
     }
