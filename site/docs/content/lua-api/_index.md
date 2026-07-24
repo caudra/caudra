@@ -1723,14 +1723,18 @@ if err then print("write failed: " .. err) end
 ### `maki.fs.rm()` {#maki-fs-rm}
 
 ```lua
-maki.fs.rm({path})
+maki.fs.rm({path}, {opts?})
 ```
 
-Delete the file at {path}. Does not remove directories.
+Delete the file, symlink, or directory at {path}.
+Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
+Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
+Symlinks are removed themselves, never followed.
 
 **Parameters:**
 
-- `{path}` (`string`) Path to the file to remove.
+- `{path}` (`string`) Path to the file or directory to remove.
+- `{opts?}` (`table?`) `recursive` (boolean, default false): remove a directory and its contents recursively. `force` (boolean, default false): silently ignore a missing path.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -1739,6 +1743,7 @@ Delete the file at {path}. Does not remove directories.
 ```lua
 local ok, err = maki.fs.rm("temp.txt")
 if err then print("rm failed: " .. err) end
+maki.fs.rm("stale_dir", { recursive = true, force = true })
 ```
 
 ---
