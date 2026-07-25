@@ -256,6 +256,36 @@ impl Model {
         }
     }
 
+    /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
+    /// fireworks, groq, ...). The slug is the catalogue sub-provider key, not a
+    /// builtin; metadata is read once from the models.dev catalog and cached on
+    /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
+    /// catalog lookup.
+    fn from_catalog(
+        slug: &str,
+        model_id: &str,
+        meta: crate::providers::catalog::CatalogMetaView,
+    ) -> Self {
+        Self {
+            id: model_id.to_string(),
+            provider: Arc::from(slug),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            supports_tool_examples_override: None,
+            supports_thinking_override: Some(meta.supports_thinking),
+            supports_vision_override: Some(meta.supports_vision),
+            pricing: ModelPricing {
+                input: meta.input_price,
+                output: meta.output_price,
+                cache_write: meta.cache_write,
+                cache_read: meta.cache_read,
+                fast: None,
+            },
+            max_output_tokens: Some(meta.output),
+            context_window: meta.context,
+        }
+    }
+
     pub fn supports_thinking(&self) -> bool {
         if let Some(thinking) = self.supports_thinking_override {
             return thinking;
@@ -375,7 +405,8 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Precedence: builtin, then dynamic script, then providers.toml custom.
+        // Precedence: builtin, then dynamic script, then providers.toml custom,
+        // then models.dev catalogue sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
         if let Some(manifest) = ManifestRegistry::get(slug) {
@@ -394,6 +425,10 @@ impl Model {
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
             return Ok(model);
+        }
+
+        if let Some(meta) = crate::providers::catalog::model_meta_if_available(slug, model_id) {
+            return Ok(Self::from_catalog(slug, model_id, meta));
         }
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -560,6 +595,16 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
+    }
+
+    #[test]
+    fn from_spec_unknown_catalogue_subprovider_is_unsupported() {
+        // The on-disk models.dev cache may populate the catalog in a
+        // developer's environment, so pick a slug that is likely not in any
+        // catalog and confirm it falls through to the generic
+        // unsupported-provider branch.
+        let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
+        assert!(matches!(err, ModelError::UnsupportedProvider(_)));
     }
 
     #[test]

@@ -64,6 +64,15 @@ enable_free_models = true
 
 The default is `false`."#;
 
+const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
+
+- **Env var**: `OPENCODE_API_KEY`
+- **API**: `https://opencode.ai/zen/go/v1`
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+
+No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
+"#;
+
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -477,6 +486,10 @@ pub fn generate() -> String {
         write_section(&mut out, section);
         let _ = writeln!(out);
     }
+
+    // Opencode Go is catalog-backed (no ProviderKind), so it gets a static
+    // section right after Opencode Zen, which is the last built-in section.
+    let _ = writeln!(out, "{OPENCODE_GO_SECTION}\n");
 
     let _ = writeln!(out, "{MODEL_IDENTIFIERS}\n");
     let _ = writeln!(out, "{}\n", providers_toml_section());

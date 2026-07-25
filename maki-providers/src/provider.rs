@@ -14,6 +14,9 @@ use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
+use crate::providers::catalog::{
+    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
+};
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -66,7 +69,7 @@ impl ProviderKind {
             Self::OpenRouter => "OpenRouter",
             Self::Synthetic => "Synthetic",
             Self::TensorX => "TensorX",
-            Self::Opencode => "Opencode",
+            Self::Opencode => "Opencode Zen",
         }
     }
 
@@ -263,14 +266,34 @@ pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provi
         return kind.create(timeouts);
     }
     if dynamic::display_name(slug).is_some() {
-        dynamic::create(slug, timeouts)
-    } else {
-        crate::providers::custom::create(slug, timeouts)
+        return dynamic::create(slug, timeouts);
     }
+    if crate::providers::custom::base_kind(slug).is_some() {
+        return crate::providers::custom::create(slug, timeouts);
+    }
+    if let Some(catalog) = crate::providers::catalog::try_create(slug, timeouts) {
+        return catalog;
+    }
+    Err(AgentError::Config {
+        message: format!("unknown provider '{slug}'"),
+    })
 }
 
 pub fn provider_available(slug: &str) -> bool {
     provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
+/// Non-blocking variant of [`provider_available`] for offline model discovery:
+/// catalog-backed slugs consult only the already-warm catalog, so a cold cache
+/// reports them unavailable instead of blocking on a network fetch.
+fn provider_available_offline(slug: &str) -> bool {
+    if ProviderKind::from_str(slug).is_ok()
+        || dynamic::display_name(slug).is_some()
+        || crate::providers::custom::base_kind(slug).is_some()
+    {
+        return provider_available(slug);
+    }
+    available_if_warm(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -340,10 +363,12 @@ pub struct ModelBatch {
 
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
+/// Never blocks on catalog download; catalog-backed providers appear only once
+/// the catalog has warmed in the background.
 pub fn available_model_specs() -> Vec<String> {
     let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
         .iter()
-        .filter(|m| provider_available(m.slug))
+        .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
             m.models
                 .iter()
@@ -357,6 +382,26 @@ pub fn available_model_specs() -> Vec<String> {
     for spec in crate::providers::custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
+        }
+    }
+    if let Some(catalog) = catalog_providers_if_available() {
+        for cat in catalog {
+            if ProviderKind::from_str(&cat.slug).is_ok()
+                || dynamic::base_for_slug(&cat.slug).is_some()
+                || crate::providers::custom::base_kind(&cat.slug).is_some()
+                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+            {
+                continue;
+            }
+            if !provider_available(&cat.slug) {
+                continue;
+            }
+            for model_id in cat.models.keys() {
+                let spec = format!("{}/{}", cat.slug, model_id);
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
         }
     }
     specs
@@ -453,6 +498,31 @@ pub async fn fetch_all_models(
         .detach();
     }
 
+    let tx_catalog = tx.clone();
+    smol::spawn(async move {
+        let catalog = smol::unblock(catalog_providers).await;
+        for cat in catalog {
+            if ProviderKind::from_str(&cat.slug).is_ok()
+                || dynamic::base_for_slug(&cat.slug).is_some()
+                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+            {
+                continue;
+            }
+            if !provider_available(&cat.slug) {
+                continue;
+            }
+            let slug = cat.slug;
+            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
+            let _ = tx_catalog
+                .send_async(ModelBatch {
+                    models,
+                    warnings: Vec::new(),
+                })
+                .await;
+        }
+    })
+    .detach();
+
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
     smol::spawn(async move {
@@ -485,5 +555,29 @@ pub async fn fetch_all_models(
     }
     if let Some(done) = on_done {
         done();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_for_slug_unknown_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
+            tmp.path().to_path_buf(),
+        ));
+        let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
+        match result {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("unknown provider"),
+                    "expected 'unknown provider' message, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for unknown provider"),
+        }
     }
 }

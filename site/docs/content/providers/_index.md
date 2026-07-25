@@ -226,7 +226,7 @@ Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
-### Opencode
+### Opencode Zen
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/v1`
@@ -242,6 +242,15 @@ enable_free_models = true
 ```
 
 The default is `false`.
+
+### Opencode Go
+
+- **Env var**: `OPENCODE_API_KEY`
+- **API**: `https://opencode.ai/zen/go/v1`
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+
+No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
+
 
 ## Model Identifiers
 

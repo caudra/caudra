@@ -155,9 +155,14 @@ impl ModelPicker {
                 entries.push(e);
             }
         }
-        let full: Vec<ModelEntry> = specs
+        let mut full: Vec<ModelEntry> = specs
             .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
             .unwrap_or_default();
+        full.sort_by(|a, b| {
+            a.provider_display
+                .cmp(&b.provider_display)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         entries.extend(full);
         let idx = entries
             .iter()
@@ -228,6 +233,10 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         kind.display_name().to_string()
     } else if let Some(name) = dynamic::display_name(provider_str) {
         name.to_string()
+    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
+        info.display_name.clone()
+    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
+        builtin.display_name.to_string()
     } else {
         let config = maki_config::providers::ProvidersConfig::load();
         config.get(provider_str)?;
@@ -250,9 +259,10 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         Ok(m) => m.tier.to_string(),
         Err(_) => String::new(),
     });
+    let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
-        id: model_id.to_string(),
+        id,
         provider_display,
         suffix: None,
         tier,
@@ -343,7 +353,7 @@ mod tests {
     #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
-        p.open("");
+        p.open("anthropic/claude-sonnet-4-20250514");
         let action = p.handle_key(k);
         assert!(
             matches!(&action, ModelPickerAction::AssignTier(s, t)
