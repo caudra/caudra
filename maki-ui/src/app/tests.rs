@@ -527,6 +527,7 @@ fn reset_session_clears_plan() {
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan, PlanState::None);
     assert!(app.queue.is_empty());
+    assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats.len(), 1);
     assert_eq!(app.chats[0].name, "Main");
     assert_eq!(app.active_chat, 0);
@@ -742,6 +743,7 @@ fn turn_complete_accumulates_usage_by_model() {
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
@@ -756,11 +758,24 @@ fn cancel_resets_all_chats_and_indices() {
         "task1",
         None,
     ));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.update(subagent_msg(
+        AgentEvent::LiveToolBuf {
+            id: "sub_t1".into(),
+            body: buf,
+        },
+        "task1",
+        None,
+    ));
 
-    cancel_app(&mut app);
+    let actions = app.handle_cancel();
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert!(!app.task_picker.is_open());
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
     assert!(app.chat_index.is_empty());
+    assert!(!app.is_animating());
 }
 
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
@@ -850,6 +865,104 @@ fn app_with_subagent_id(id: &str) -> App {
 
 fn app_with_subagent() -> App {
     app_with_subagent_id("task1")
+}
+
+#[test]
+fn open_task_picker_refreshes_after_tool_done() {
+    let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
+    assert!(
+        app.task_picker
+            .selected_item()
+            .is_some_and(|entry| entry.chat_index == 0)
+    );
+
+    finish_subagent_task(&mut app, false);
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn open_task_picker_inserts_new_child_without_changing_selection() {
+    let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Down)));
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "new".into() },
+        "task2",
+        Some("build"),
+    ));
+
+    assert_eq!(app.task_picker.item(2).unwrap().name, "build");
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+}
+
+#[test]
+fn filtered_task_picker_enter_selects_entry_chat() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.task_picker.is_open());
+    assert_eq!(app.active_chat, 2);
+}
+
+#[test]
+fn filtered_task_picker_refresh_preserves_selected_chat_identity() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "z".into() },
+        "task3",
+        Some("benchmark"),
+    ));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+}
+
+#[test]
+fn open_task_picker_refreshes_after_subagent_history() {
+    let mut app = app_with_subagent_id("session-abc");
+    open_tasks_picker(&mut app);
+
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: "session-abc".into(),
+        messages: vec![],
+    }));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn closed_task_picker_stays_closed_after_lifecycle_events() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "new".into() },
+        "task2",
+        Some("build"),
+    ));
+    assert!(!app.task_picker.is_open());
 }
 
 #[test]
@@ -2318,12 +2431,258 @@ fn stale_non_terminal_event_does_not_save_session() {
 }
 
 #[test]
-fn error_event_matching_run_id_saves_session() {
+fn parent_done_reconciles_unresolved_children_and_tools() {
     let mut app = streaming_app_with_history();
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: "task1".into(),
+        tool: "task".into(),
+        summary: "research".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.update(subagent_msg(
+        AgentEvent::LiveToolBuf {
+            id: "child-tool".into(),
+            body: buf,
+        },
+        "task1",
+        None,
+    ));
+
+    app.update(done_event());
+
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(
+        app.chats[0]
+            .last_message_text()
+            .contains(MISSING_TOOL_COMPLETION)
+    );
+    assert!(app.state.session.meta.subagents.is_empty());
+    assert_eq!(app.state.session.messages.len(), 2);
+    assert!(app.state.session.tool_outputs.is_empty());
+    assert!(!app.is_animating());
+}
+
+#[test]
+fn parent_error_refreshes_picker_and_persists_only_completed_children() {
+    let mut app = streaming_app_with_history();
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta { text: "one".into() },
+        "task1",
+        "first",
+        "model-a",
+    ));
+    finish_subagent(&mut app, "task1", false);
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta { text: "two".into() },
+        "task2",
+        "second",
+        "model-b",
+    ));
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta {
+            text: "three".into(),
+        },
+        "task3",
+        "third",
+        "model-c",
+    ));
+    finish_subagent(&mut app, "task3", false);
+    open_tasks_picker(&mut app);
+
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(2).unwrap().finished, Some(true));
+    let saved: Vec<_> = app
+        .state
+        .session
+        .meta
+        .subagents
+        .iter()
+        .map(|subagent| {
+            (
+                subagent.tool_use_id.as_str(),
+                subagent.name.as_str(),
+                subagent.model.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        saved,
+        vec![
+            ("task1", "first", Some("model-a")),
+            ("task3", "third", Some("model-c")),
+        ]
+    );
+}
+
+#[test]
+fn reserved_shell_survives_parent_done_until_shell_done() {
+    let mut app = streaming_app_with_history();
+    let id = app.shell.reserve_id();
+
+    app.update(done_event());
+    assert!(app.shell.active_ids().contains(&id));
+
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: id.clone(),
+        command: "true".into(),
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id: id.clone(),
+        command: "true".into(),
+        output: String::new(),
+        is_error: false,
+        visible: false,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&id));
+}
+
+#[test]
+fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
+    let mut app = streaming_app_with_history();
+    let shell_id = app.shell.reserve_id();
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: shell_id.clone(),
+        command: "true".into(),
+    });
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: "agent-tool".into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "provider overloaded".into(),
+    }));
+
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
+
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id: shell_id.clone(),
+        command: "true".into(),
+        output: String::new(),
+        is_error: false,
+        visible: false,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&shell_id));
+}
+
+#[test]
+fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
+    let mut app = streaming_app_with_history();
+    let id = app.shell.reserve_id();
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: id.clone(),
+        command: "true".into(),
+    });
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: id.clone(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+
+    app.update(done_event());
+
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
+}
+
+#[test]
+fn error_event_matching_run_id_saves_session_and_queued_messages() {
+    let mut app = streaming_app_with_history();
+    app.queue_and_notify(queued_msg("next"));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "boom".into(),
+    }));
+
     assert_eq!(app.state.session.messages.len(), 2);
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.queue.is_empty());
+
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+
+    type_and_submit(&mut app, "replacement");
+    app.save_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
+}
+
+#[test]
+fn flush_restored_queue_drops_recovery_snapshot() {
+    let mut app = streaming_app_with_history();
+    app.queue_and_notify(queued_msg("next"));
+    app.update(agent_msg(AgentEvent::Error {
+        message: "boom".into(),
+    }));
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+
+    app.flush_restored_queue();
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.recoverable_queue.is_empty());
+
+    app.queue.clear();
+    app.save_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
 // --- Plan form integration tests ---

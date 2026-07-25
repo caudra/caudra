@@ -170,6 +170,9 @@ impl App {
     /// load/rewind the display is restored before `respawn` swaps the shared
     /// queue, so pushing earlier would fill a queue that is about to die.
     pub(crate) fn flush_restored_queue(&mut self) {
+        // The live queue owns the text from here on, so the recovery
+        // snapshot must stop overriding it on save.
+        self.recoverable_queue.clear();
         for text in std::mem::take(&mut self.state.session.meta.queued_messages) {
             self.queue_and_notify(QueuedMessage {
                 text,
@@ -210,6 +213,8 @@ impl App {
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
         self.run_id += 1;
+        // New work supersedes text held for recovery after an agent error.
+        self.recoverable_queue.clear();
         self.status = Status::Streaming;
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         self.main_chat().show_user_message(display);
