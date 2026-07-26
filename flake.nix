@@ -207,6 +207,7 @@
         {
           default = craneLib.devShell {
             packages = with pkgs; [
+              cargo-machete
               cargo-nextest
               git
               just
