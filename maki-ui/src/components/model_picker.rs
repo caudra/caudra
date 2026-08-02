@@ -17,6 +17,7 @@ use crate::theme;
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
+const FREE_PREFIX: &str = "Free · ";
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -84,12 +85,12 @@ impl PickerItem for ModelEntry {
         Some(&self.tier)
     }
 
-    fn is_highlighted(&self) -> bool {
-        !self.override_tiers.is_empty()
-    }
-
     fn section(&self) -> Option<&str> {
         Some(self.provider_display.as_str())
+    }
+
+    fn is_highlighted(&self) -> bool {
+        !self.override_tiers.is_empty()
     }
 }
 
@@ -295,7 +296,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     };
     let tier = override_label.unwrap_or(tier);
     let tier = if free {
-        format!("Free · {tier}")
+        format!("{FREE_PREFIX}{tier}")
     } else {
         tier
     };
@@ -385,7 +386,7 @@ mod tests {
     fn parse_model_entry_paid_model_not_marked_free() {
         let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
         assert!(
-            !entry.tier.starts_with("Free · "),
+            !entry.tier.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
         );
     }

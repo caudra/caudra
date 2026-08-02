@@ -435,11 +435,13 @@ impl Model {
     }
 
     /// Free public models surfaced through the OpenCode provider (Zen/Go),
-    /// priced at zero input. Mirrors the "Free" badge the OpenCode picker
-    /// shows on these entries.
+    /// using the catalog's definition of free (zero input and output price),
+    /// the same one that gates `enable_free_models`.
+    ///
+    /// Queries the live catalog rather than `self.pricing`, which may not yet
+    /// reflect catalog prices when discovery hasn't seeded the registry.
     pub fn is_free(&self) -> bool {
-        crate::providers::catalog::OPENCODE_FAMILY_SLUGS.contains(&self.provider.as_ref())
-            && self.pricing.input == 0.0
+        crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
     }
 }
 
@@ -613,35 +615,6 @@ mod tests {
         // unsupported-provider branch.
         let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
         assert!(matches!(err, ModelError::UnsupportedProvider(_)));
-    }
-
-    fn model(provider: &str, input_price: f64) -> Model {
-        Model {
-            id: "test".into(),
-            provider: provider.into(),
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            supports_tool_examples_override: None,
-            supports_thinking_override: None,
-            supports_vision_override: None,
-            pricing: ModelPricing {
-                input: input_price,
-                output: 0.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-                fast: None,
-            },
-            max_output_tokens: None,
-            context_window: 0,
-        }
-    }
-
-    #[test_case(model("opencode", 0.0),     true  ; "opencode_zero_input_is_free")]
-    #[test_case(model("opencode-go", 0.0),  true  ; "opencode_go_zero_input_is_free")]
-    #[test_case(model("opencode", 1.4),     false ; "opencode_paid_not_free")]
-    #[test_case(model("anthropic", 0.0),    false ; "non_opencode_zero_not_free")]
-    fn is_free_classification(m: Model, expected: bool) {
-        assert_eq!(m.is_free(), expected);
     }
 
     #[test]

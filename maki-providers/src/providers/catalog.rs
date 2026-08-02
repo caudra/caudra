@@ -764,13 +764,18 @@ impl Provider for CatalogProvider {
 }
 
 #[cfg(test)]
-pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
+pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
     let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(
-        HashMap::new(),
+        index,
         false,
         &state_dir,
         std::collections::HashSet::new(),
     )));
+}
+
+#[cfg(test)]
+pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
+    seed_catalog_for_tests(HashMap::new(), state_dir);
 }
 
 /// Defers catalog resolution to first use so that provider construction
@@ -873,6 +878,15 @@ pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta
     })
 }
 
+/// True when the model is an OpenCode-family catalog entry that is free by
+/// the same [`is_free_model`] definition gating `enable_free_models` (zero
+/// input and output price). Never triggers a fetch.
+pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
+    OPENCODE_FAMILY_SLUGS.contains(&slug)
+        && catalog_provider_if_available(slug)
+            .is_some_and(|data| data.models.get(model_id).is_some_and(is_free_model))
+}
+
 /// Metadata shape `Model::from_spec` consumes when a spec resolves to a catalog
 /// sub-provider. Public so `maki-providers/src/model.rs` can name it without
 /// depending on the opencode-internal `CatalogMeta` struct.
@@ -900,6 +914,7 @@ mod tests {
     use crate::AgentError;
     use crate::provider::Provider;
     use crate::providers::Timeouts;
+    use test_case::test_case;
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1375,6 +1390,56 @@ mod tests {
             opencode.build_auth(&state_dir),
             Authentication::OpenCodeFreeKey(_)
         ));
+    }
+
+    #[test_case("free-model", true; "free_opencode_model_is_free")]
+    #[test_case("paid-output-model", false; "free_input_paid_output_is_not_free")]
+    fn model_is_free_uses_catalog_definition(model_id: &str, expected: bool) {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([
+            (
+                "free-model".into(),
+                CatalogModel {
+                    limit: None,
+                    cost: Some(CatalogCost {
+                        input: Some(0.0),
+                        output: Some(0.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                    provider: None,
+                    ..Default::default()
+                },
+            ),
+            (
+                "paid-output-model".into(),
+                CatalogModel {
+                    limit: None,
+                    cost: Some(CatalogCost {
+                        input: Some(0.0),
+                        output: Some(25.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                    provider: None,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let index: CatalogIndex = HashMap::from([(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = super::Model::from_spec(&format!("opencode/{model_id}")).unwrap();
+        assert_eq!(model.is_free(), expected);
     }
 
     #[test]
