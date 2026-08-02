@@ -84,12 +84,12 @@ impl PickerItem for ModelEntry {
         Some(&self.tier)
     }
 
-    fn section(&self) -> Option<&str> {
-        Some(self.provider_display.as_str())
-    }
-
     fn is_highlighted(&self) -> bool {
         !self.override_tiers.is_empty()
+    }
+
+    fn section(&self) -> Option<&str> {
+        Some(self.provider_display.as_str())
     }
 }
 
@@ -289,10 +289,16 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     .collect();
     let override_label = map.override_tier_label(spec);
     drop(map);
-    let tier = override_label.unwrap_or_else(|| match maki_providers::Model::from_spec(spec) {
-        Ok(m) => m.tier.to_string(),
-        Err(_) => String::new(),
-    });
+    let (tier, free) = match maki_providers::Model::from_spec(spec) {
+        Ok(m) => (m.tier.to_string(), m.is_free()),
+        Err(_) => (String::new(), false),
+    };
+    let tier = override_label.unwrap_or(tier);
+    let tier = if free {
+        format!("Free · {tier}")
+    } else {
+        tier
+    };
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
@@ -373,6 +379,15 @@ mod tests {
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
         assert!(!entry.tier.is_empty());
+    }
+
+    #[test]
+    fn parse_model_entry_paid_model_not_marked_free() {
+        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        assert!(
+            !entry.tier.starts_with("Free · "),
+            "paid anthropic model must not be marked free"
+        );
     }
 
     #[test]

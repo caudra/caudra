@@ -433,6 +433,14 @@ impl Model {
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
+
+    /// Free public models surfaced through the OpenCode provider (Zen/Go),
+    /// priced at zero input. Mirrors the "Free" badge the OpenCode picker
+    /// shows on these entries.
+    pub fn is_free(&self) -> bool {
+        crate::providers::catalog::OPENCODE_FAMILY_SLUGS.contains(&self.provider.as_ref())
+            && self.pricing.input == 0.0
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -605,6 +613,35 @@ mod tests {
         // unsupported-provider branch.
         let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
         assert!(matches!(err, ModelError::UnsupportedProvider(_)));
+    }
+
+    fn model(provider: &str, input_price: f64) -> Model {
+        Model {
+            id: "test".into(),
+            provider: provider.into(),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: ModelPricing {
+                input: input_price,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+                fast: None,
+            },
+            max_output_tokens: None,
+            context_window: 0,
+        }
+    }
+
+    #[test_case(model("opencode", 0.0),     true  ; "opencode_zero_input_is_free")]
+    #[test_case(model("opencode-go", 0.0),  true  ; "opencode_go_zero_input_is_free")]
+    #[test_case(model("opencode", 1.4),     false ; "opencode_paid_not_free")]
+    #[test_case(model("anthropic", 0.0),    false ; "non_opencode_zero_not_free")]
+    fn is_free_classification(m: Model, expected: bool) {
+        assert_eq!(m.is_free(), expected);
     }
 
     #[test]
