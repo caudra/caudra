@@ -67,6 +67,10 @@ pub struct ProviderData {
     pub models: HashMap<String, CatalogMeta>,
 }
 
+fn is_free_model(meta: &CatalogMeta) -> bool {
+    meta.input_price == 0.0 && meta.output_price == 0.0
+}
+
 impl ProviderData {
     pub(crate) fn new(
         slug: String,
@@ -121,7 +125,7 @@ impl ProviderData {
     pub fn build_auth(&self, state_dir: &StateDir) -> Authentication {
         let api_key = match self.resolve_api_key(state_dir) {
             Some(key) => key,
-            None if self.slug == "opencode" => {
+            None if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str()) => {
                 return Authentication::OpenCodeFreeKey(ResolvedAuth {
                     base_url: self.base_url.clone(),
                     headers: self.auth_headers("public"),
@@ -148,7 +152,7 @@ impl ProviderData {
         override_auth: Option<&Arc<Mutex<ResolvedAuth>>>,
         state_dir: &StateDir,
     ) -> Option<ResolvedAuth> {
-        if self.slug == "opencode"
+        if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str())
             && let Some(auth) = override_auth
         {
             return Some(auth.lock().unwrap().clone());
@@ -166,7 +170,7 @@ impl ProviderData {
             .models
             .iter()
             .filter_map(|(model_id, meta)| {
-                let is_free = meta.input_price == 0.0 && meta.output_price == 0.0;
+                let is_free = is_free_model(meta);
                 if is_free && !enable_free_models {
                     return None;
                 }
@@ -602,6 +606,8 @@ fn init_catalog_blocking(
 pub struct CatalogProvider {
     data: ProviderData,
     auth: Arc<Mutex<ResolvedAuth>>,
+    /// Auth came from the no-key public fallback: only free models are usable.
+    free_fallback: bool,
     chat_compat: OpenAiCompatProvider,
     client: HttpClient,
     stream_timeout: Duration,
@@ -613,8 +619,9 @@ impl CatalogProvider {
         state_dir: &StateDir,
         timeouts: Timeouts,
     ) -> Result<Self, AgentError> {
-        let auth = match data.build_auth(state_dir) {
-            Authentication::KeyBased(auth) | Authentication::OpenCodeFreeKey(auth) => auth,
+        let (auth, free_fallback) = match data.build_auth(state_dir) {
+            Authentication::KeyBased(auth) => (auth, false),
+            Authentication::OpenCodeFreeKey(auth) => (auth, true),
             Authentication::NoAuth => {
                 return Err(AgentError::Config {
                     message: format!(
@@ -627,6 +634,7 @@ impl CatalogProvider {
         Ok(Self {
             data,
             auth: Arc::new(Mutex::new(auth)),
+            free_fallback,
             chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
             client: http_client(timeouts),
             stream_timeout: timeouts.stream,
@@ -728,10 +736,12 @@ impl Provider for CatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         let data = self.data.clone();
+        let free_fallback = self.free_fallback;
         Box::pin(async move {
             Ok(data
                 .models
                 .iter()
+                .filter(|(_, meta)| !free_fallback || is_free_model(meta))
                 .map(|(model_id, meta)| ModelInfo {
                     id: model_id.clone(),
                     context_window: Some(meta.context),
@@ -884,10 +894,11 @@ mod tests {
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
     use super::{
-        Authentication, CatalogData, EndpointType, ProviderData, StateDir, available_if_warm,
-        determine_catalog_format,
+        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, StateDir,
+        available_if_warm, determine_catalog_format,
     };
     use crate::AgentError;
+    use crate::provider::Provider;
     use crate::providers::Timeouts;
 
     #[test]
@@ -904,6 +915,68 @@ mod tests {
         };
         let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default());
         assert!(matches!(result, Err(AgentError::Config { .. })));
+    }
+
+    fn opencode_go_provider_data(env_key: &str) -> ProviderData {
+        ProviderData {
+            slug: "opencode-go".into(),
+            display_name: "Opencode Go".into(),
+            env_keys: vec![env_key.into()],
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            npm: "@ai-sdk/openai-compatible".into(),
+            api_format: EndpointType::ChatCompletions,
+            models: HashMap::from([
+                (
+                    "paid-model".into(),
+                    CatalogMeta {
+                        context: 128_000,
+                        output: 64_000,
+                        input_price: 1.0,
+                        output_price: 2.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                        supports_thinking: false,
+                        supports_vision: false,
+                    },
+                ),
+                (
+                    "free-model".into(),
+                    CatalogMeta {
+                        context: 128_000,
+                        output: 64_000,
+                        input_price: 0.0,
+                        output_price: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                        supports_thinking: false,
+                        supports_vision: false,
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn catalog_provider_list_models_free_fallback_hides_paid_models() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
+        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let models = smol::block_on(provider.list_models()).unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["free-model"]);
+    }
+
+    #[test]
+    fn catalog_provider_list_models_with_key_shows_all() {
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
+        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let models = smol::block_on(provider.list_models()).unwrap();
+        let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["free-model", "paid-model"]);
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_KEY_41827") };
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {
