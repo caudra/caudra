@@ -26,6 +26,7 @@ inventory = { workspace = true }
 jiff = { workspace = true }
 getrandom = { workspace = true }
 open = { workspace = true }
+keyring = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

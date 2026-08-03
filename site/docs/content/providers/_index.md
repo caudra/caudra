@@ -121,18 +121,37 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 
 ### Copilot
 
-- **Env var**: `GH_COPILOT_TOKEN` (or run `maki auth login copilot` to import a token from gh)
+- **Env var**: `GH_COPILOT_TOKEN` (or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)
 - **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
 - **Features**: Native Copilot Chat HTTP API with model endpoint discovery
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **gpt-5-mini, gpt-5 mini, claude-haiku-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
-| Medium | **gpt-5.2, gpt-4.1, claude-sonnet-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
-| Strong | **gpt-5.4, gpt-5.3-codex, claude-opus-4.6, grok-code-fast-1** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
-| Strong | claude-opus-4.7 | $0.00 / $0.00 | 264K ctx / 64K out |
+| Weak | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
+| Weak | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
+| Weak | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
+| Weak | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
+| Weak | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
+| Weak | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
+| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
+| Medium | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| Medium | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| Medium | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Medium | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
+| Medium | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
+| Medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+| Medium | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
+| Medium | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
+| Medium | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
+| Strong | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
+| Strong | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
+| Strong | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
+| Strong | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
+| Strong | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
+| Strong | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
+| Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
 
-Defaults: gpt-5-mini (weak), gpt-5.2 (medium), gpt-5.4 (strong)
+Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), claude-opus-5 (strong)
 
 ### Ollama
 

@@ -410,7 +410,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     kind,
                     name: kind.display_name(),
                     auth_line: format!(
-                        "{} (or run `maki auth login copilot` to import a token from gh)",
+                        "{} (or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)",
                         format_auth(kind)
                     ),
                     urls: vec![kind.base_url()],
