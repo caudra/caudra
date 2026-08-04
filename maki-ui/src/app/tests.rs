@@ -2532,6 +2532,7 @@ fn mcp_toggle_dispatches_action() {
                 status: McpServerStatus::Running,
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
+                oauth: None,
             }],
             prompts: vec![],
             pids: vec![],
