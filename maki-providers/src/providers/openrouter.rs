@@ -59,7 +59,7 @@ pub struct OpenRouter {
 
 impl OpenRouter {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::from_env(CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
