@@ -284,6 +284,28 @@ mod tests {
         }
     }
 
+    /// Opencode Zen and Opencode Go come from the fetched catalog and stay
+    /// hidden until the user is authed, so they never join the inventory.
+    const CATALOG_ONLY_SLUGS: &[&str] = &["opencode", "opencode-go"];
+
+    /// The picker lists the inventory, so a manifest without an entry is a
+    /// provider the user cannot reach. OpenRouter shipped that way for months.
+    #[test]
+    fn every_builtin_manifest_has_inventory_entry() {
+        for manifest in BUILTINS {
+            if CATALOG_ONLY_SLUGS.contains(&manifest.slug) {
+                continue;
+            }
+            assert!(
+                inventory::iter::<BuiltInProvider>()
+                    .into_iter()
+                    .any(|b| b.slug == manifest.slug),
+                "manifest {:?} has no BuiltInProvider entry, so it never shows in the picker",
+                manifest.slug,
+            );
+        }
+    }
+
     #[test]
     fn every_builtin_provider_inventory_entry_has_matching_manifest() {
         for builtin in inventory::iter::<BuiltInProvider>() {

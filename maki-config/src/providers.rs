@@ -283,8 +283,8 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
 
 /// Fields a `providers.toml` entry sets that a built-in slug ignores, because
 /// built-ins keep their compiled protocol, model catalog and auth wiring.
-/// Callers decide what counts as built-in (the inventory misses `openrouter`
-/// and `opencode`) and when to report it.
+/// Callers decide what counts as built-in (the inventory misses the `opencode`
+/// slugs) and when to report it.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let mut ignored = Vec::new();
     if def.protocol.is_some() {

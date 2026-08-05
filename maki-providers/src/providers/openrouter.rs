@@ -27,6 +27,18 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "OpenRouter",
 };
 
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "openrouter",
+    display_name: "OpenRouter",
+    protocol: maki_config::providers::Protocol::Openai,
+    default_base_url: "https://openrouter.ai/api/v1",
+    default_api_key_env: "OPENROUTER_API_KEY",
+    default_model: "openrouter/openai/gpt-5.5",
+    plans: None,
+    login_url: Some("https://openrouter.ai/keys"),
+    needs_url: false,
+});
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
 }
