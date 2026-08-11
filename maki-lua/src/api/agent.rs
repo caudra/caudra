@@ -811,7 +811,9 @@ async fn prompt(
     // Only this call's messages count: older turns may hold stale preamble
     // text, and the agent loop's empty-response retry leaves a synthetic
     // "(empty)" assistant marker that must not pass for a real response.
-    let text = s.history.as_slice()[history_len..]
+    // Auto-compaction can shrink the history mid-run, so clamp the start:
+    // after a rewrite the tail is this call's output either way.
+    let text = s.history.as_slice()[history_len.min(s.history.len())..]
         .iter()
         .rfind(|m| matches!(m.role, Role::Assistant))
         .and_then(|m| {
