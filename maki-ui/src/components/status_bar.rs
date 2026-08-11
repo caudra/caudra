@@ -14,7 +14,10 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const TRUNCATE_PREFIX: &str = "..";
+const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 
@@ -157,49 +160,20 @@ impl StatusBar {
                     0
                 };
 
-                // Truncate cwd_branch and model_id when terminal is narrow.
-                // Estimate ctx+labels width at 35, leave 8 for left side.
-                let max_right = area.width.saturating_sub(43);
-                let half = max_right / 2;
-
-                let cwd = if half < 5 {
-                    // Too narrow, just show tail
-                    let s = &self.cwd_branch;
-                    let keep = 5.min(s.len());
-                    s[s.len() - keep..].to_string()
-                } else if (self.cwd_branch.len() as u16) > half {
-                    let keep = (half - 2).max(1) as usize;
-                    format!("..{}", &self.cwd_branch[self.cwd_branch.len() - keep..])
-                } else {
-                    self.cwd_branch.clone()
-                };
-                let model = if half < 5 {
-                    let s = ctx.model_id;
-                    let keep = 5.min(s.len());
-                    s[s.len() - keep..].to_string()
-                } else if (ctx.model_id.len() as u16) > half {
-                    let keep = (half - 2).max(1) as usize;
-                    format!("..{}", &ctx.model_id[ctx.model_id.len() - keep..])
-                } else {
-                    ctx.model_id.to_string()
-                };
-
-                right_spans.push(Span::styled(cwd, theme::current().status_dim));
-                right_spans.push(Span::raw("  "));
-                right_spans.push(Span::styled(model, theme::current().status_dim));
+                let mut rest_spans = Vec::new();
 
                 if let Some(ref label) = ctx.thinking_label {
-                    right_spans.push(Span::styled(
+                    rest_spans.push(Span::styled(
                         format!(" [{label}]"),
                         theme::current().status_dim,
                     ));
                 }
 
                 if ctx.fast {
-                    right_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
+                    rest_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
                 }
                 if ctx.workflow {
-                    right_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
+                    rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
                 }
 
                 let context_text = format!(
@@ -212,7 +186,7 @@ impl StatusBar {
                     Some(cost) => format!("{context_text} ${cost:.3} "),
                     None => format!("{context_text} "),
                 };
-                right_spans.push(Span::styled(
+                rest_spans.push(Span::styled(
                     rest_text,
                     Style::new().fg(theme::current().foreground),
                 ));
@@ -222,11 +196,26 @@ impl StatusBar {
                         " \u{03a3}${:.3} ",
                         ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
                     );
-                    right_spans.push(Span::styled(
+                    rest_spans.push(Span::styled(
                         global_text,
                         Style::new().fg(theme::current().foreground),
                     ));
                 }
+
+                let reserved = left_spans
+                    .iter()
+                    .chain(rest_spans.iter())
+                    .map(Span::width)
+                    .sum::<usize>()
+                    + CWD_MODEL_SEPARATOR.width();
+                let available = (area.width as usize).saturating_sub(reserved);
+                let model = truncate_tail(ctx.model_id, available / 2);
+                let cwd = truncate_tail(&self.cwd_branch, available.saturating_sub(model.width()));
+
+                right_spans.push(Span::styled(cwd, theme::current().status_dim));
+                right_spans.push(Span::raw(CWD_MODEL_SEPARATOR));
+                right_spans.push(Span::styled(model, theme::current().status_dim));
+                right_spans.append(&mut rest_spans);
             }
         }
 
@@ -237,11 +226,9 @@ impl StatusBar {
             ));
         }
 
-        let right_width: u16 = right_spans.iter().map(|s| s.width() as u16).sum();
-        let max_right = area.width.saturating_sub(8);
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(right_width.min(max_right)),
+            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
         ])
         .areas(area);
 
@@ -251,6 +238,24 @@ impl StatusBar {
             right_area,
         );
     }
+}
+
+fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
+    if s.width() <= max_width {
+        return Cow::Borrowed(s);
+    }
+    let budget = max_width.saturating_sub(TRUNCATE_PREFIX.width());
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    Cow::Owned(format!("{TRUNCATE_PREFIX}{}", &s[start..]))
 }
 
 fn collapse_home(path: &str) -> String {
@@ -332,6 +337,16 @@ mod tests {
     #[test_case("/home/user", "/home/user", "~"                           ; "exact_home")]
     fn collapse_home_cases(path: &str, home: &str, expected: &str) {
         assert_eq!(collapse_home_with(path, home), expected);
+    }
+
+    #[test_case("~/projects/maki:main", 30, "~/projects/maki:main" ; "fits_untouched")]
+    #[test_case("~/projects/maki:main", 10, "..aki:main"           ; "ascii_tail")]
+    #[test_case("~/文档/proj:分支", 8, "..j:分支"                  ; "cjk_path_and_branch")]
+    #[test_case("release/🚀-v2", 6, "..-v2"                        ; "emoji_branch")]
+    #[test_case("abc", 2, ".."                                     ; "prefix_only")]
+    #[test_case("", 0, ""                                          ; "empty")]
+    fn truncate_tail_cases(input: &str, max_width: usize, expected: &str) {
+        assert_eq!(truncate_tail(input, max_width), expected);
     }
 
     fn tmp_with_head(content: Option<&str>) -> (TempDir, String) {
