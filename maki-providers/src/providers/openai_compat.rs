@@ -402,34 +402,14 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
+#[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<ContentDelta>,
     reasoning_content: Option<String>,
+    /// vLLM sends `reasoning` instead of `reasoning_content`, and AxonHub
+    /// sends both, so a serde alias would fail on the duplicate field.
+    reasoning: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
-}
-
-/// Custom deserializer: handles both `reasoning_content` (standard) and
-/// `reasoning` (vLLM) as the thinking field, preferring the former when both
-/// are present (AxonHub sends both, causing alias conflicts).
-impl<'de> Deserialize<'de> for ChunkDelta {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            content: Option<ContentDelta>,
-            reasoning_content: Option<String>,
-            reasoning: Option<String>,
-            tool_calls: Option<Vec<ToolCallDelta>>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        Ok(ChunkDelta {
-            content: raw.content,
-            reasoning_content: raw.reasoning_content.or(raw.reasoning),
-            tool_calls: raw.tool_calls,
-        })
-    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -563,8 +543,10 @@ pub async fn parse_sse(
             continue;
         };
 
-        if let Some(reasoning) = delta.reasoning_content
-            && !reasoning.is_empty()
+        if let Some(reasoning) = [delta.reasoning_content, delta.reasoning]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.is_empty())
         {
             reasoning_text.push_str(&reasoning);
             event_tx
@@ -719,6 +701,7 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -815,6 +798,24 @@ data: [DONE]\n";
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);
             assert_eq!(text_deltas, vec!["Hello"]);
+        })
+    }
+
+    #[test_case(r#"{"reasoning_content":"think","reasoning":"ignored"}"#; "prefers_reasoning_content")]
+    #[test_case(r#"{"reasoning":"think"}"#; "reasoning_only")]
+    #[test_case(r#"{"reasoning_content":"","reasoning":"think"}"#; "empty_reasoning_content_falls_back")]
+    fn parse_sse_proxy_reasoning_variants(delta: &str) {
+        smol::block_on(async {
+            let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n");
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "think")
+            );
         })
     }
 
