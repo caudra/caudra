@@ -53,8 +53,13 @@ pub fn resolve_model(
         return Model::from_spec(spec).context("invalid default_model in config");
     }
     auto_detect_model(policy).ok_or_else(|| {
+        let policy_note = if policy.is_restrictive() {
+            "\nnote: an allowed_models/excluded_models policy is active and may exclude every candidate"
+        } else {
+            ""
+        };
         color_eyre::eyre::eyre!(
-            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model\n\nSee https://maki.sh/docs/providers/ for setup instructions"
+            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model{policy_note}\n\nSee https://maki.sh/docs/providers/ for setup instructions"
         )
     })
 }

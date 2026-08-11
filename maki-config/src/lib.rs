@@ -1198,6 +1198,10 @@ impl ModelPolicy {
             })
     }
 
+    pub fn is_restrictive(&self) -> bool {
+        self.has_allowed_models || !self.excluded.is_empty()
+    }
+
     pub fn allows(&self, spec: &str) -> bool {
         (!self.has_allowed_models || self.allowed.is_match(spec)) && !self.excluded.is_match(spec)
     }
