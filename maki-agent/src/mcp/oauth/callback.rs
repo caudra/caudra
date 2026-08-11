@@ -93,6 +93,15 @@ impl CallbackServer {
             let query = path.split('?').nth(1).unwrap_or("");
             let params = parse_query(query);
 
+            // RFC 6749 4.1.2.1: error redirects carry `state` too. Gating
+            // everything on it keeps any local webpage from aborting a
+            // pending flow through the predictable loopback port.
+            let state = params.iter().find(|(k, _)| k == "state");
+            if state.map(|(_, v)| v.as_str()) != Some(expected_state) {
+                let _ = respond(&mut stream, 403, "State mismatch").await;
+                continue;
+            }
+
             if let Some(error) = params.iter().find(|(k, _)| k == "error") {
                 let desc = params
                     .iter()
@@ -103,24 +112,14 @@ impl CallbackServer {
                 return Err(format!("OAuth error: {desc}"));
             }
 
-            let state = params
-                .iter()
-                .find(|(k, _)| k == "state")
-                .map(|(_, v)| v.clone());
-            let code = params
+            let Some(code) = params
                 .iter()
                 .find(|(k, _)| k == "code")
-                .map(|(_, v)| v.clone());
-
-            let (Some(state), Some(code)) = (state, code) else {
-                let _ = respond(&mut stream, 400, "Missing code or state").await;
+                .map(|(_, v)| v.clone())
+            else {
+                let _ = respond(&mut stream, 400, "Missing code").await;
                 continue;
             };
-
-            if state != expected_state {
-                let _ = respond(&mut stream, 403, "State mismatch").await;
-                continue;
-            }
 
             let _ = respond(&mut stream, 200, SUCCESS_HTML).await;
             return Ok(CallbackResult { code });
