@@ -319,6 +319,9 @@ pub(crate) struct TaskCell {
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
+    /// Cleared for delivery scopes: a job may not bind to a scope that dies
+    /// with one event-delivery batch.
+    owns_jobs: bool,
     /// `maki.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
     /// and dropped, so a handler parked in an await still gets to paint the
     /// cancelled state before the host stops waiting for it.
@@ -347,6 +350,7 @@ impl TaskCell {
             inline_spawn: None,
             cancel_hooks: Vec::new(),
             bufs_claim: Weak::new(),
+            owns_jobs: true,
         }
     }
 
@@ -766,6 +770,16 @@ impl TaskScope {
         Self::new(lua, TaskCell::new(CancelToken::none(), None, None))
     }
 
+    /// [`Self::detached`] for event-delivery batches: the scope dies with the
+    /// batch, so a job bound to it would be killed microseconds after its
+    /// callback returns. `job_task_id` returns `None` under it, turning that
+    /// silent kill into a loud `jobstart` error.
+    pub(crate) fn delivery(lua: &Lua) -> Self {
+        let scope = Self::detached(lua);
+        lock_cell(&scope.handle).owns_jobs = false;
+        scope
+    }
+
     pub(crate) fn handle(&self) -> &TaskHandle {
         &self.handle
     }
@@ -905,6 +919,13 @@ pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
 pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     Some(lock_cell(&handle).id)
+}
+
+/// Task id for job ownership; `None` under a delivery scope.
+pub(crate) fn job_task_id(lua: &Lua) -> Option<u64> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let cell = lock_cell(&handle);
+    cell.owns_jobs.then_some(cell.id)
 }
 
 pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
@@ -2451,7 +2472,7 @@ pub fn spawn(
                             store.drain_plugin_events(&mut event_buf);
                         });
                         if !event_buf.is_empty() {
-                            let scope = TaskScope::detached(&lua);
+                            let scope = TaskScope::delivery(&lua);
                             for (job_id, event) in event_buf.drain(..) {
                                 if let Err(e) = deliver_job_event(&lua, job_id, &event) {
                                     tracing::warn!(
@@ -3768,6 +3789,20 @@ mod tests {
             elapsed < KILL_GRACE,
             "dispatch loop must not wait out a grace"
         );
+    }
+
+    #[test]
+    fn delivery_scope_refuses_job_ownership() {
+        let lua = Lua::new();
+
+        let scope = TaskScope::delivery(&lua);
+        assert!(active_task_id(&lua).is_some());
+        assert!(job_task_id(&lua).is_none());
+        drop(scope);
+
+        let scope = TaskScope::detached(&lua);
+        assert_eq!(job_task_id(&lua), active_task_id(&lua));
+        drop(scope);
     }
 
     #[test]

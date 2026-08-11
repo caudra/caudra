@@ -14,7 +14,7 @@ use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
-use crate::runtime::{active_task_id, with_jobs};
+use crate::runtime::{active_task_id, job_task_id, with_jobs};
 
 const READER_BUF_SIZE: usize = 8 * 1024;
 
@@ -379,7 +379,7 @@ fn jobstart(
         .transpose()?
         .flatten();
     let owner = match owner_name.as_deref() {
-        None | Some("task") => active_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
+        None | Some("task") => job_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
             mlua::Error::runtime("jobstart: no active task; use owner = \"plugin\"")
         })?,
         Some("plugin") => JobOwner::Plugin(Arc::clone(&plugin)),
