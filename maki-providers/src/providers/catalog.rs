@@ -618,10 +618,19 @@ impl CatalogProvider {
         data: ProviderData,
         state_dir: &StateDir,
         timeouts: Timeouts,
+        allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
         let (auth, free_fallback) = match data.build_auth(state_dir) {
             Authentication::KeyBased(auth) => (auth, false),
-            Authentication::OpenCodeFreeKey(auth) => (auth, true),
+            Authentication::OpenCodeFreeKey(auth) if allow_free_fallback => (auth, true),
+            Authentication::OpenCodeFreeKey(_) => {
+                return Err(AgentError::Config {
+                    message: format!(
+                        "provider '{}' has no API key; run `maki auth login {}` or set providers.opencode.enable_free_models = true to use its free models",
+                        data.slug, data.slug
+                    ),
+                });
+            }
             Authentication::NoAuth => {
                 return Err(AgentError::Config {
                     message: format!(
@@ -836,7 +845,16 @@ fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, Ag
     let state_dir = StateDir::resolve().map_err(|e| AgentError::Config {
         message: format!("failed to resolve state dir: {e}"),
     })?;
-    CatalogProvider::new(data, &state_dir, timeouts)
+    CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
+}
+
+/// Zen hides free models behind `providers.opencode.enable_free_models`;
+/// the no-key public-token fallback must honor the same opt-in.
+fn free_fallback_allowed() -> bool {
+    SHARED_CATALOG
+        .get()
+        .and_then(|m| m.lock().ok())
+        .is_some_and(|guard| guard.enable_free_models)
 }
 
 /// Try to create a `CatalogProvider` for the given slug. Returns `None` if
@@ -848,7 +866,7 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
         let data = catalog_provider_if_available(slug)?;
         let state_dir = StateDir::resolve().ok()?;
         return Some(
-            CatalogProvider::new(data, &state_dir, timeouts)
+            CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
                 .map(|c| Box::new(c) as Box<dyn Provider>),
         );
     }
@@ -928,7 +946,7 @@ mod tests {
             api_format: EndpointType::ChatCompletions,
             models: HashMap::new(),
         };
-        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default());
+        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
         assert!(matches!(result, Err(AgentError::Config { .. })));
     }
 
@@ -972,10 +990,22 @@ mod tests {
     }
 
     #[test]
+    fn free_fallback_without_opt_in_is_refused() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
+        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false);
+        assert!(matches!(
+            result,
+            Err(AgentError::Config { message }) if message.contains("enable_free_models")
+        ));
+    }
+
+    #[test]
     fn catalog_provider_list_models_free_fallback_hides_paid_models() {
         let (_tmp, state_dir) = temp_state_dir();
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
-        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["free-model"]);
@@ -986,7 +1016,8 @@ mod tests {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
-        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
