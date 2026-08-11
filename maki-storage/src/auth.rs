@@ -40,6 +40,11 @@ pub struct McpAuthData {
     pub client_secret_expires_at: Option<u64>,
     #[serde(default)]
     pub redirect_uri: Option<String>,
+    /// Token endpoint pinned at interactive auth. Silent refresh reuses it
+    /// instead of trusting fresh discovery, so a later-compromised server
+    /// cannot redirect the refresh token and client secret elsewhere.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +178,7 @@ mod tests {
             client_secret: None,
             client_secret_expires_at: None,
             redirect_uri: None,
+            token_endpoint: None,
         }
     }
 

@@ -223,6 +223,7 @@ pub async fn authenticate(
         client_secret: reg.client_secret,
         client_secret_expires_at: reg.client_secret_expires_at,
         redirect_uri: Some(redirect_uri),
+        token_endpoint: Some(auth_server.token_endpoint.clone()),
     };
 
     save_mcp_auth(storage, server_name, &data)
@@ -253,11 +254,21 @@ pub async fn silent_refresh(
     let client = build_http_client(SILENT_REFRESH_HTTP_TIMEOUT)
         .map_err(|e| OAuthError::Other(e.to_string()))?;
 
-    let auth_server = discover_auth_server_for(&client, server_url, None).await?;
+    // Trust the endpoint pinned at interactive auth over fresh discovery: a
+    // later-compromised server must not redirect the refresh token (and any
+    // static client secret) elsewhere. Pre-pin records fall back to discovery.
+    let token_endpoint = match existing.token_endpoint.clone() {
+        Some(pinned) => pinned,
+        None => {
+            discover_auth_server_for(&client, server_url, None)
+                .await?
+                .token_endpoint
+        }
+    };
 
     let new_tokens = token::refresh_token(
         &client,
-        &auth_server.token_endpoint,
+        &token_endpoint,
         &tokens.refresh,
         &existing.client_id,
         existing.client_secret.as_deref(),
