@@ -1492,6 +1492,12 @@ impl App {
             || self.float_mgr.needs_input()
     }
 
+    /// True while `recoverable_queue` holds user text captured at an agent
+    /// error; a background run would wipe it (`start_run` clears the queue).
+    pub(crate) fn holds_recovery_text(&self) -> bool {
+        !self.recoverable_queue.is_empty()
+    }
+
     pub fn has_modal_overlay(&self) -> bool {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }

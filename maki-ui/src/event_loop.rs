@@ -112,17 +112,6 @@ impl SessionStatus {
     }
 }
 
-fn claim_idle_wake(
-    status: SessionStatus,
-    claim: impl FnOnce() -> Vec<Message>,
-) -> Option<Vec<Message>> {
-    if status != SessionStatus::Idle {
-        return None;
-    }
-    let preamble = claim();
-    (!preamble.is_empty()).then_some(preamble)
-}
-
 fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
     leading.append(preamble);
     *preamble = leading;
@@ -143,6 +132,17 @@ struct SessionRuntime {
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    /// A wake may only start a background run when the session is fully
+    /// quiescent. Idle status alone is not enough: restored queue items start
+    /// runs without `start_run` (the app only learns of them via
+    /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
+    /// after an agent error.
+    fn quiescent(&self) -> bool {
+        SessionStatus::of(&self.app) == SessionStatus::Idle
+            && self.handles.queue.is_empty()
+            && !self.app.holds_recovery_text()
     }
 }
 
@@ -674,10 +674,11 @@ impl<'t> EventLoop<'t> {
             .iter()
             .enumerate()
             .filter_map(|(index, runtime)| {
-                claim_idle_wake(SessionStatus::of(&runtime.app), || {
-                    runtime.handles.claim_mailbox_wake()
-                })
-                .map(|preamble| (index, preamble))
+                if !runtime.quiescent() {
+                    return None;
+                }
+                let preamble = runtime.handles.claim_mailbox_wake();
+                (!preamble.is_empty()).then_some((index, preamble))
             })
             .collect();
 
@@ -1228,51 +1229,10 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
-
-    #[test]
-    fn idle_wake_claims_a_non_empty_preamble() {
-        let preamble = claim_idle_wake(SessionStatus::Idle, || {
-            vec![Message::observation(OBSERVATION.into())]
-        })
-        .unwrap();
-
-        assert_eq!(preamble.len(), 1);
-        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
-    }
-
-    #[test]
-    fn idle_without_messages_and_non_idle_sessions_do_not_start() {
-        assert!(claim_idle_wake(SessionStatus::Idle, Vec::new).is_none());
-
-        for status in [SessionStatus::Working, SessionStatus::NeedsInput] {
-            let called = Cell::new(false);
-            let preamble = claim_idle_wake(status, || {
-                called.set(true);
-                vec![Message::observation(OBSERVATION.into())]
-            });
-
-            assert!(preamble.is_none());
-            assert!(!called.get());
-        }
-    }
-
-    #[test]
-    fn wake_arriving_while_working_runs_when_idle() {
-        let id = maki_storage::id::MakiId::generate();
-        let mailbox = maki_agent::SessionMailbox::register(id);
-        maki_agent::SessionMailbox::notify(id, OBSERVATION.into(), true).unwrap();
-
-        assert!(claim_idle_wake(SessionStatus::Working, || mailbox.claim_wake()).is_none());
-        let preamble = claim_idle_wake(SessionStatus::Idle, || mailbox.claim_wake()).unwrap();
-        assert_eq!(preamble.len(), 1);
-        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
-    }
 
     #[test]
     fn shell_results_do_not_replace_existing_preamble() {
