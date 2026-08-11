@@ -519,6 +519,7 @@ impl SessionLog {
         write_full_session(&mut tmp_file, session)?;
         tmp_file.sync_data().map_err(StorageError::from)?;
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
+        crate::sync_parent_dir(&path);
 
         if let Err(e) = remove_legacy_files(dir, session.id) {
             warn!(error = %e, "legacy session files remain after rewrite");

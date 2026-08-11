@@ -76,15 +76,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
         fs::set_permissions(tmp.path(), metadata.permissions())?;
     }
     tmp.as_file().sync_data()?;
-    // `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
-    // File handle closed (Windows can't rename an open file) and `persist()`
-    // doesn't support the fibonacci backoff retry that Windows virus scanners
-    // require. On failure below, we manually clean up the temp file.
-    let (_, tmp_path) = tmp.into_parts();
-    retry_rename(&tmp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        StorageError::Io(e)
-    })
+    persist(tmp, path)
 }
 
 pub(crate) fn atomic_write_permissions(
@@ -100,12 +92,37 @@ pub(crate) fn atomic_write_permissions(
     #[cfg(not(unix))]
     let _ = mode;
     tmp.as_file().sync_all()?;
-    // See `atomic_write` for the `into_parts` tradeoff.
+    persist(tmp, path)
+}
+
+/// `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
+/// File handle closed (Windows can't rename an open file) and tempfile's
+/// `persist()` doesn't support the fibonacci backoff retry that Windows
+/// virus scanners require. On failure, we manually clean up the temp file.
+fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
     let (_, tmp_path) = tmp.into_parts();
     retry_rename(&tmp_path, path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
         StorageError::Io(e)
-    })
+    })?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// A rename is durable only once the directory entry reaches disk; without
+/// this a freshly created file can vanish after power loss even though the
+/// write returned Ok. Best effort: not every filesystem accepts a directory
+/// fsync. Windows gets the same from `MOVEFILE_WRITE_THROUGH` in
+/// `retry_rename`.
+pub(crate) fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(f) = fs::File::open(dir)
+    {
+        let _ = f.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Rename with fibonacci backoff to handle transient `PermissionDenied` from
