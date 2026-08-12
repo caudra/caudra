@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install ruff
+      - run: .github/scripts/retry.sh pip install ruff
       - run: ruff check scripts/
 
   typecheck:
@@ -26,5 +26,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install ty
+      - run: .github/scripts/retry.sh pip install ty
       - run: ty check scripts/

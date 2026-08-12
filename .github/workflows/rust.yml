@@ -46,13 +46,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      STYLUA_VERSION: v2.4.1
     steps:
       - uses: actions/checkout@v4
-      - uses: JohnnyMorganz/stylua-action@v4
-        with:
-          token: ${{ github.token }}
-          version: latest
-          args: --check plugins/
+      - name: Install stylua
+        run: |
+          .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o stylua.zip \
+            "https://github.com/JohnnyMorganz/StyLua/releases/download/${STYLUA_VERSION}/stylua-linux-x86_64.zip"
+          unzip -o stylua.zip stylua
+          rm stylua.zip
+      - run: ./stylua --check plugins/
 
   lint:
     name: Lint
