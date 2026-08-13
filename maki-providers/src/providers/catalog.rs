@@ -424,6 +424,13 @@ pub(crate) fn init_shared_catalog_if_needed() -> &'static Mutex<CatalogData> {
     SHARED_CATALOG.get_or_init(|| Mutex::new(init_catalog_blocking(all_slugs, enable_free)))
 }
 
+/// Loads the models.dev catalog from the on-disk cache, fetching once if the
+/// cache is cold or stale. Blocks, so only call it from startup paths; every
+/// other lookup must stay on the `*_if_available` variants.
+pub fn warm_catalog() {
+    init_shared_catalog_if_needed();
+}
+
 /// Returns the list of all providers in alphabetical order.
 pub fn catalog_providers() -> Vec<ProviderData> {
     let guard = init_shared_catalog_if_needed().lock().unwrap();
