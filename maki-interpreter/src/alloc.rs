@@ -13,21 +13,23 @@
 //! silently missing. Outside a scope each allocation pays one thread-local
 //! read and touches nothing shared.
 //!
-//! The counters are process-wide, so they can only describe one run:
-//! entering a scope rebases the baseline, which would forgive a concurrent
-//! run its whole usage. Scopes therefore serialize on a mutex.
+//! The counters are process-wide, so overlapping runs share one budget:
+//! only the outermost rebases the baseline, and the tightest `max_memory`
+//! wins. Serializing instead would deadlock, because a script suspended in
+//! a `task` call holds its scope while the subagent it waits on starts a
+//! run of its own.
 //!
 //! The accounting is approximate: tool results are allocated on other
 //! threads (never charged) yet often freed inside the scope (refunded), so
 //! a large result grants that much unearned headroom. Good enough as a
 //! guardrail against runaway agent code, not a security boundary. Once
 //! monty ships `set_memory_probe` (pydantic/monty#740) the counter becomes
-//! thread-local and the mutex and rebasing go away.
+//! thread-local and the sharing and rebasing go away.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use monty_types::{BASELINE_MEMORY, LIVE_MEMORY};
 
@@ -87,28 +89,26 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-static SCOPE_LOCK: Mutex<()> = Mutex::new(());
+static ACTIVE_SCOPES: AtomicUsize = AtomicUsize::new(0);
 
-/// Marks the current thread as the interpreter's for the scope's lifetime
-/// and rebases the shared counters so the run starts with zero usage.
-/// Holds [`SCOPE_LOCK`] so only one run at a time feeds the counters.
-pub(crate) struct SandboxScope {
-    _lock: MutexGuard<'static, ()>,
-}
+/// Marks the current thread as the interpreter's for the scope's lifetime.
+/// The first live scope rebases the counters so the run starts from zero;
+/// later ones join its budget rather than forgiving it their usage.
+pub(crate) struct SandboxScope;
 
 impl SandboxScope {
     pub(crate) fn enter() -> Self {
-        let lock = SCOPE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if ACTIVE_SCOPES.fetch_add(1, Relaxed) == 0 {
+            BASELINE_MEMORY.store(LIVE_MEMORY.load(Relaxed), Relaxed);
+        }
         IN_SANDBOX.set(true);
-        BASELINE_MEMORY.store(LIVE_MEMORY.load(Relaxed), Relaxed);
-        SandboxScope { _lock: lock }
+        SandboxScope
     }
 }
 
-/// Clears the flag in the body, before the field-held lock releases, so
-/// this thread stops feeding the counters before the next run rebases them.
 impl Drop for SandboxScope {
     fn drop(&mut self) {
         IN_SANDBOX.set(false);
+        ACTIVE_SCOPES.fetch_sub(1, Relaxed);
     }
 }

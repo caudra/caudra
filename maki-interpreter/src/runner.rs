@@ -246,6 +246,8 @@ mod tests {
     const SMALL_MAX_MEMORY: usize = 2 * 1024 * 1024;
     const OVER_LIMIT_ALLOC: &str = "x = [0] * 10_000_000";
     const MEMORY_ERR_FRAGMENT: &str = "memory";
+    const NESTED_TIMEOUT: Duration = Duration::from_secs(5);
+    const NESTED_DEADLOCK: &str = "nested run deadlocked";
 
     fn default_limits() -> ResourceLimits {
         limits(Duration::from_secs(30), DEFAULT_MAX_MEMORY)
@@ -286,8 +288,8 @@ mod tests {
         assert_memory_error(err);
     }
 
-    /// Without the scope mutex, the second run would rebase the shared
-    /// baseline and forgive the first its whole usage.
+    /// A run that rebased the shared baseline on entry would forgive an
+    /// already running one its whole usage.
     #[test]
     fn concurrent_memory_limited_runs_both_enforce() {
         let spawn = || {
@@ -304,6 +306,26 @@ mod tests {
         for handle in [spawn(), spawn()] {
             assert_memory_error(handle.join().unwrap());
         }
+    }
+
+    /// Shape of workflow mode: a script awaits `task`, and the subagent it
+    /// waits on runs a script of its own. Scopes that serialized would sit
+    /// on each other forever.
+    #[test]
+    fn nested_run_from_a_tool_does_not_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let subagent: ToolFn = Box::new(|_, _, _| {
+                let inner = std::thread::spawn(|| {
+                    run("2 + 3", &empty_tools(), None, default_limits()).unwrap()
+                });
+                Ok(inner.join().unwrap().output.unwrap())
+            });
+            let tools = HashMap::from([("task".to_owned(), subagent)]);
+            let _ = tx.send(run("task()", &tools, None, default_limits()));
+        });
+        let result = rx.recv_timeout(NESTED_TIMEOUT).expect(NESTED_DEADLOCK);
+        assert_eq!(result.unwrap().output, Some(json!(5)));
     }
 
     #[test]
