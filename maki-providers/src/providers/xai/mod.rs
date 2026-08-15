@@ -15,7 +15,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     display_name: "xAI",
     protocol: maki_config::providers::Protocol::Openai,
     default_base_url: "https://api.x.ai/v1",
-    default_api_key_env: "XAI_API_KEY",
+    default_api_key_env: auth::API_KEY_ENV,
     default_model: "xai/grok-4.6",
     plans: None,
     login_url: Some("https://console.x.ai"),

@@ -19,7 +19,7 @@ use super::{auth, catalog};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "xai",
-    api_key_env: "XAI_API_KEY",
+    api_key_env: auth::API_KEY_ENV,
     base_url: "https://api.x.ai/v1",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
