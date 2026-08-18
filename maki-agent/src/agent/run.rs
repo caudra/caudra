@@ -701,6 +701,7 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
+                    Arc::default(),
                 )),
                 session_id: None,
                 mailbox: None,

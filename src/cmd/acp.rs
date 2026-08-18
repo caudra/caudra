@@ -63,5 +63,6 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         prompt_slots: Arc::new(prompt_slots),
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
+        plugin_rules: plugin_host.plugin_rules(),
     })
 }

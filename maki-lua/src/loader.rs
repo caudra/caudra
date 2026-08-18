@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
@@ -124,6 +125,7 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
 
 pub struct PluginHost {
     inner: LuaThread,
+    plugin_rules: Arc<PluginRuleStore>,
 }
 
 impl Drop for PluginHost {
@@ -155,8 +157,19 @@ impl PluginHost {
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
-        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit)?;
-        Ok(Self { inner: lua })
+        let plugin_rules = Arc::new(PluginRuleStore::default());
+        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
+        Ok(Self {
+            inner: lua,
+            plugin_rules,
+        })
+    }
+
+    /// The store that `maki.api.register_permission_rule` writes into. Hand
+    /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
+    /// rules apply to all sessions.
+    pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
+        Arc::clone(&self.plugin_rules)
     }
 
     /// Stop the Lua thread from taking new work without joining it, so the

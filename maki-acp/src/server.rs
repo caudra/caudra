@@ -229,6 +229,7 @@ fn spawn_session(
         append_system_prompt: None,
         workflow: false,
         model_policy: Arc::clone(&params.model_policy),
+        plugin_rules: Arc::clone(&params.plugin_rules),
     })
 }
 
@@ -663,6 +664,7 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
+                Arc::default(),
             )),
             task: smol::spawn(async {}),
         };

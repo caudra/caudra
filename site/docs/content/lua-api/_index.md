@@ -235,6 +235,40 @@ maki.api.register_tool({
 
 ---
 
+### `maki.api.register_permission_rule()` {#maki-api-register_permission_rule}
+
+```lua
+maki.api.register_permission_rule({spec})
+```
+
+Declare an agent permission rule for a native tool. Use it to pre-allow
+(or pre-deny) tool calls on paths your plugin owns, like a storage
+directory outside the working dir, so the user is not prompted for them.
+
+Rules live as long as the plugin is loaded: a reload replaces them, and a
+reload that registers none clears the old ones. User config and session
+deny rules always win over a plugin allow.
+
+**Parameters:**
+
+- `{spec}` (`table`) Rule specification:
+  - `tool` (`string`) Required. Native tool name (e.g. "edit", "write").
+    MCP tools and the "*" wildcard are not allowed.
+  - `scope` (`string`) Required. Scope pattern the rule applies to, e.g.
+    "/abs/dir/**" for a directory subtree.
+  - `effect` (`string`) Optional. "allow" (default) or "deny".
+
+**Example:**
+
+```lua
+maki.api.register_permission_rule({
+  tool = "write",
+  scope = notes_dir .. "/**",
+})
+```
+
+---
+
 ### `maki.api.register_command()` {#maki-api-register_command}
 
 ```lua

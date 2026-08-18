@@ -73,6 +73,7 @@ fn build_app_with_lua(
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            Arc::default(),
         )),
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),

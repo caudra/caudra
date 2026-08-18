@@ -16,6 +16,7 @@ use event_listener::Event;
 
 use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
@@ -33,7 +34,9 @@ use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::slot::SlotStore;
-use crate::api::tool::{LuaTool, PendingTool, PendingTools, PermissionScopeSpec, ToolCallReply};
+use crate::api::tool::{
+    LuaTool, PendingRules, PendingTool, PendingTools, PermissionScopeSpec, ToolCallReply,
+};
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
@@ -1349,6 +1352,7 @@ struct LuaRuntime {
     _watchdog: Watchdog,
     lua: Lua,
     pending: PendingTools,
+    plugin_rules: Arc<PluginRuleStore>,
     plugins: PluginMap,
     live_tasks: LiveTasks,
     warm_tools: WarmTools,
@@ -1372,6 +1376,7 @@ impl LuaRuntime {
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
         jit: bool,
+        plugin_rules: Arc<PluginRuleStore>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let compiler = install_compiler(&lua, jit);
@@ -1438,6 +1443,7 @@ impl LuaRuntime {
             _watchdog: watchdog,
             lua,
             pending,
+            plugin_rules,
             plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
             warm_tools: Rc::new(RefCell::new(VecDeque::new())),
@@ -1746,10 +1752,15 @@ impl LuaRuntime {
         );
         self.discard_pending(stale);
 
+        // Scoped to this load so a failed load simply drops its rules; only a
+        // successful load commits them to the store.
+        let pending_rules: PendingRules = Arc::default();
+
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
         let maki = create_maki_global(
             &self.lua,
             Arc::clone(&self.pending),
+            Arc::clone(&pending_rules),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             permissions,
@@ -1852,6 +1863,8 @@ impl LuaRuntime {
                 )
             })
             .collect();
+        let rules = std::mem::take(&mut *pending_rules.lock().unwrap_or_else(|e| e.into_inner()));
+        self.plugin_rules.replace(&name, rules);
         self.plugins.borrow_mut().insert(name, keys);
 
         Ok(())
@@ -1859,6 +1872,7 @@ impl LuaRuntime {
 
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
+        self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
             let keys = store.clear_plugin(plugin);
@@ -2513,6 +2527,7 @@ pub fn spawn(
     registry: Arc<ToolRegistry>,
     bundled_dirs: &'static [&'static Dir<'static>],
     jit: bool,
+    plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
@@ -2538,6 +2553,7 @@ pub fn spawn(
                 keymap_writer,
                 hint_writer,
                 jit,
+                plugin_rules,
             ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));

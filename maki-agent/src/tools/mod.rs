@@ -460,6 +460,7 @@ pub fn cli_tool_ctx() -> ToolContext {
                 ..Default::default()
             },
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
         None,
@@ -522,6 +523,7 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            Arc::default(),
         ))
     });
 

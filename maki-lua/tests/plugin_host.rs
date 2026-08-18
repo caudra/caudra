@@ -9,7 +9,7 @@ use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
 };
-use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
+use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
@@ -320,6 +320,82 @@ fn unload_round_trip() {
 
     host.unload("unload_test").unwrap();
     assert!(!reg.has("echo_"));
+}
+
+const PERMISSION_RULE_SRC: &str =
+    r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
+const NO_RULE_SRC: &str = "local _ = 1";
+
+#[test]
+fn permission_rule_lands_in_store_and_unload_clears() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("perm_plugin", PERMISSION_RULE_SRC)
+        .unwrap();
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].tool, ToolKey::native("edit"));
+    assert_eq!(rules[0].scope.as_deref(), Some("/tmp/x/**"));
+    assert_eq!(rules[0].effect, Effect::Allow);
+
+    host.unload("perm_plugin").unwrap();
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn permission_rule_failed_load_leaves_store_empty() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
+    let err = host
+        .load_source("perm_broken", &src)
+        .expect_err("expected lua error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn reload_clears_stale_rules_of_that_plugin_only() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
+    host.load_source(
+        "perm_b",
+        r#"maki.api.register_permission_rule({ tool = "write", scope = "/tmp/y/**", effect = "deny" })"#,
+    )
+    .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 2);
+
+    host.load_source("perm_a", NO_RULE_SRC).unwrap();
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].tool, ToolKey::native("write"));
+    assert_eq!(rules[0].scope.as_deref(), Some("/tmp/y/**"));
+    assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
+#[test_case::test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
+#[test_case::test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
+#[test_case::test_case(r#"{ scope = "/x/**" }"#, "'tool' must be a native tool name string" ; "missing_tool")]
+#[test_case::test_case(r#"{ tool = "edit" }"#, "'scope' must be a string" ; "missing_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
+fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_source(
+            "perm_invalid",
+            &format!("maki.api.register_permission_rule({spec})"),
+        )
+        .expect_err("expected validation error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(err.to_string().contains(expected_err), "got: {err}");
 }
 
 #[test_case::test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]

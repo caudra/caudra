@@ -9,13 +9,14 @@ group = "Reference"
 
 Maki uses a permission system to decide what each tool is allowed to do and when to ask you first.
 
-Rules come from three layers, combined for resolution:
+Rules come from four layers, combined for resolution:
 
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
+4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/lua-api/#maki-api-register_permission_rule)
 
-Any matching deny blocks the tool. No exceptions.
+Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
 ## Check Flow
 
@@ -36,7 +37,7 @@ plan file write?    ── yes ──►  runs
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all three layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -50,6 +51,8 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
+
+The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 
 These tools have no builtin allow rule, so they prompt (or follow your `default`) every time unless you add rules:
 

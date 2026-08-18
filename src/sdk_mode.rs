@@ -19,7 +19,7 @@ use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
@@ -450,6 +450,7 @@ pub struct SdkParams {
     pub fast: bool,
     pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 struct Shared {
@@ -470,6 +471,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         fast,
         workflow,
         model_policy,
+        plugin_rules,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -503,6 +505,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
         model_policy: Arc::clone(&model_policy),
+        plugin_rules,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();

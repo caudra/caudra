@@ -123,6 +123,7 @@ mod tests {
         let maki = create_maki_global(
             &lua,
             Arc::default(),
+            Arc::default(),
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),

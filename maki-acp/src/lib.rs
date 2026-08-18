@@ -6,6 +6,7 @@ pub mod translate;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_config::ModelPolicy;
@@ -21,6 +22,7 @@ pub struct AcpParams {
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {
