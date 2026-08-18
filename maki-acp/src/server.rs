@@ -172,11 +172,12 @@ async fn new_session(
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let cwd = req.cwd.clone();
     let handle = spawn_session(params, req.cwd, None, Vec::new(), mcp.clone());
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec);
+    install_session(srv, handle, mcp, spec, cwd);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -191,18 +192,21 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let history = load_history(session_ref.id())?;
+    let (history, recorded_cwd) = load_history(session_ref.id())?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
-    for update in translate::replay_history(&history) {
+    let home = maki_storage::paths::home();
+    let replay_cwd = recorded_cwd.as_deref().unwrap_or(&req.cwd);
+    for update in translate::replay_history(&history, replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
+    let cwd = req.cwd.clone();
     let handle = spawn_session(params, req.cwd, Some(session_ref), history, mcp.clone());
     let spec = params.model.spec();
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec);
+    install_session(srv, handle, mcp, spec, cwd);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -319,6 +323,7 @@ fn install_session(
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_model: String,
+    cwd: PathBuf,
 ) {
     let pending = PendingState::default();
     start_event_pump(
@@ -326,6 +331,8 @@ fn install_session(
         handle.session_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        cwd,
+        maki_storage::paths::home(),
     );
     srv.session = Some(SessionState {
         handle,
@@ -336,16 +343,19 @@ fn install_session(
     });
 }
 
-fn load_history(session_id: MakiId) -> Result<Vec<Message>, AcpError> {
+fn load_history(session_id: MakiId) -> Result<(Vec<Message>, Option<PathBuf>), AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
 }
 
+/// History plus the absolute cwd the session recorded in its header. Tool
+/// inputs from a past run resolve against that cwd, not the client's current
+/// one; a non-absolute recording falls back to the caller's cwd.
 fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
-) -> Result<Vec<Message>, AcpError> {
+) -> Result<(Vec<Message>, Option<PathBuf>), AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -353,7 +363,12 @@ fn load_history_from(
     > = maki_storage::sessions::Session::load(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
-    Ok(session.take_messages())
+    let recorded = if Path::new(&session.cwd).is_absolute() {
+        Some(PathBuf::from(&session.cwd))
+    } else {
+        None
+    };
+    Ok((session.take_messages(), recorded))
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -526,6 +541,8 @@ fn start_event_pump(
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
+    cwd: PathBuf,
+    home: Option<PathBuf>,
 ) {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
@@ -542,9 +559,11 @@ fn start_event_pump(
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
-                AgentEvent::ToolStart(event) => translate::tool_start(&event),
+                AgentEvent::ToolStart(event) => {
+                    translate::tool_start(&event, &cwd, home.as_deref())
+                }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event),
+                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
                     let fields =
                         ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
@@ -736,11 +755,23 @@ mod tests {
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let history = load_history_from(&dir, id).unwrap();
+        let (history, recorded) = load_history_from(&dir, id).unwrap();
         assert_eq!(
             serde_json::to_value(&history).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
+        assert_eq!(recorded, Some(PathBuf::from("/project")));
+    }
+
+    #[test]
+    fn load_history_records_absolute_cwd_only() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new("anthropic/test-model", "relative/project");
+        session.save(&dir).unwrap();
+        let (_, recorded) = load_history_from(&dir, session.id).unwrap();
+        assert_eq!(recorded, None);
     }
 
     #[test]
