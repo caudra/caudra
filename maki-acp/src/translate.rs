@@ -167,18 +167,24 @@ fn input_line(tool: &str, raw_input: &serde_json::Value) -> Option<u32> {
     let key = match tool {
         "read" => "offset",
         "edit_lines" => "start",
-        "insert_lines" => "line",
+        // insert_lines writes *after* `line`, so the new text's 0-based row
+        // is the raw value itself, and 0 (insert at the top) is valid.
+        "insert_lines" => return raw_input.get("line").and_then(as_number),
         _ => return None,
     };
     raw_input.get(key).and_then(as_line).map(|l| l - 1)
 }
 
-/// raw_input is pre-validation, so models sometimes send numbers as strings.
 fn as_line(v: &serde_json::Value) -> Option<u32> {
+    as_number(v).filter(|&l| l >= 1)
+}
+
+/// raw_input is pre-validation, so models sometimes send numbers as strings.
+fn as_number(v: &serde_json::Value) -> Option<u32> {
     let n = v
         .as_u64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))?;
-    u32::try_from(n).ok().filter(|&l| l >= 1)
+    u32::try_from(n).ok()
 }
 
 fn location(path: PathBuf, line: Option<u32>) -> ToolCallLocation {
@@ -602,7 +608,8 @@ mod tests {
     #[test_case("edit", Some(json!({"path": "c.rs", "old_string": "a", "new_string": "b"})), Some(json!([{"path": "/home/user/project/c.rs"}])) ; "edit_relative_no_line")]
     #[test_case("multiedit", Some(json!({"path": "c.rs", "edits": []})), Some(json!([{"path": "/home/user/project/c.rs"}])) ; "multiedit_relative_no_line")]
     #[test_case("edit_lines", Some(json!({"path": "/a", "start": 3, "end": 9, "new_string": "n"})), Some(json!([{"path": "/a", "line": 2}])) ; "edit_lines_start_becomes_line")]
-    #[test_case("insert_lines", Some(json!({"path": "/a", "line": 5, "new_string": "n"})), Some(json!([{"path": "/a", "line": 4}])) ; "insert_lines_line")]
+    #[test_case("insert_lines", Some(json!({"path": "/a", "line": 5, "new_string": "n"})), Some(json!([{"path": "/a", "line": 5}])) ; "insert_lines_reports_the_inserted_row")]
+    #[test_case("insert_lines", Some(json!({"path": "/a", "line": 0, "new_string": "n"})), Some(json!([{"path": "/a", "line": 0}])) ; "insert_lines_at_top")]
     #[test_case("index", Some(json!({"path": "/a/b.rs"})), Some(json!([{"path": "/a/b.rs"}])) ; "index_file_path")]
     #[test_case("view_image", Some(json!({"path": "img.png"})), Some(json!([{"path": "/home/user/project/img.png"}])) ; "view_image_relative")]
     #[test_case("glob", Some(json!({"pattern": "*.rs", "path": "src"})), None ; "glob_directory_path_ignored")]
