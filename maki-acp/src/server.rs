@@ -205,7 +205,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let (history, recorded_cwd, restored_usage) = load_history(session_ref.id())?;
+    let (history, recorded_cwd, restored_usage, restored_model) = load_history(session_ref.id())?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
@@ -226,9 +226,12 @@ async fn load_session(
     let spec = params.model.spec();
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    // The restored total predates any per-turn cost, so price it once with the
-    // current model; later turns add their own exact cost.
-    let restored_cost = params.model.cost_of(&restored_usage, false);
+    // The restored total predates any per-turn cost, so price it once with
+    // the model the session recorded (the current default may cost 10x more
+    // or less); later turns add their own exact cost.
+    let restored_cost = Model::from_spec(&restored_model)
+        .map(|m| m.cost_of(&restored_usage, false))
+        .unwrap_or_else(|_| params.model.cost_of(&restored_usage, false));
     install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
@@ -442,7 +445,7 @@ fn install_session(
 
 fn load_history(
     session_id: MakiId,
-) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage), AcpError> {
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
@@ -454,7 +457,7 @@ fn load_history(
 fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
-) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage), AcpError> {
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -468,7 +471,8 @@ fn load_history_from(
         None
     };
     let usage = session.token_usage;
-    Ok((session.take_messages(), recorded, usage))
+    let model = session.model.clone();
+    Ok((session.take_messages(), recorded, usage, model))
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -886,7 +890,8 @@ mod tests {
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let (history, recorded, usage) = load_history_from(&dir, id).unwrap();
+        let (history, recorded, usage, model) = load_history_from(&dir, id).unwrap();
+        assert_eq!(model, "anthropic/test-model");
         assert_eq!(
             serde_json::to_value(&history).unwrap(),
             serde_json::to_value(&messages).unwrap()
@@ -902,7 +907,7 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
         session.save(&dir).unwrap();
-        let (_, recorded, _) = load_history_from(&dir, session.id).unwrap();
+        let (_, recorded, _, _) = load_history_from(&dir, session.id).unwrap();
         assert_eq!(recorded, None);
     }
 
