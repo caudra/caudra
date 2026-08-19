@@ -88,6 +88,14 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 
+## Plugins
+
+Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+P` | Browse sessions |
+
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
