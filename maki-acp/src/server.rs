@@ -311,7 +311,11 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            let request = elicitation::form_request(&session_id, ctx.tool_use_id, &input)?;
+            // Batch/code_execution children dispatch with an empty id; a
+            // scope pointing at a tool call the client never saw would get
+            // the elicitation rejected or dropped.
+            let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
+            let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             let guard = rx.lock().await;

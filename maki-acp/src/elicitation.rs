@@ -5,10 +5,9 @@
 use std::collections::BTreeMap;
 
 use agent_client_protocol_schema::{
-    ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
-    ElicitationContentValue, ElicitationFormMode, ElicitationPropertySchema, ElicitationSchema,
-    ElicitationSessionScope, EnumOption, MultiSelectPropertySchema, SessionId,
-    StringPropertySchema, ToolCallId,
+    ClientCapabilities, CreateElicitationRequest, ElicitationContentValue, ElicitationFormMode,
+    ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, EnumOption,
+    MultiSelectPropertySchema, SessionId, StringPropertySchema, ToolCallId,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -125,13 +124,23 @@ fn answer_text(value: Option<&ElicitationContentValue>) -> Option<String> {
 /// Turns the client's `elicitation/create` result into the same markdown the
 /// Lua tool feeds the model: one `header: labels` line per question.
 pub fn format_response(input: &Value, raw_result: &str) -> String {
-    let Ok(response) = serde_json::from_str::<CreateElicitationResponse>(raw_result) else {
+    let Ok(response) = serde_json::from_str::<Value>(raw_result) else {
         return DISMISSED.to_owned();
     };
-    let ElicitationAction::Accept(accept) = response.action else {
+    if response["action"] != "accept" {
         return DISMISSED.to_owned();
-    };
-    let content: BTreeMap<String, ElicitationContentValue> = accept.content.unwrap_or_default();
+    }
+    // Values parse per key: nothing in the schema is `required`, so clients
+    // may null out skipped fields, and one unreadable value should cost one
+    // answer, not the whole form.
+    let content: BTreeMap<String, ElicitationContentValue> = response["content"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| Some((k.clone(), serde_json::from_value(v.clone()).ok()?)))
+                .collect()
+        })
+        .unwrap_or_default();
     let questions = parse_questions(input).unwrap_or_default();
 
     questions
@@ -226,6 +235,19 @@ mod tests {
         assert_eq!(
             format_response(&questions_input(), &raw),
             "Framework: axum\nFeatures: auth, uploads\nQ3: (no answer)"
+        );
+    }
+
+    #[test]
+    fn nulled_out_field_costs_one_answer_not_the_form() {
+        let raw = serde_json::json!({
+            "action": "accept",
+            "content": { "q1": "axum", "q2": null }
+        })
+        .to_string();
+        assert_eq!(
+            format_response(&questions_input(), &raw),
+            "Framework: axum\nFeatures: (no answer)\nQ3: (no answer)"
         );
     }
 
