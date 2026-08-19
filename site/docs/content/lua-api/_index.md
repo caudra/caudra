@@ -531,15 +531,17 @@ Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`, and
-`"SessionFocusChanged"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
+`"SessionFocusChanged"`, and `"SessionStatusChanged"`. Plugins can also
+fire their own events with `exec_autocmds`.
 
 Each host event carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
-initial startup.
+initial startup. `"SessionStatusChanged"` fires whenever a session moves
+between `"working"`, `"needs_input"`, and `"idle"`; it carries
+`data.status`, `data.title`, and `data.focused` (boolean).
 
 **Parameters:**
 
