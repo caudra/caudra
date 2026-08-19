@@ -408,9 +408,11 @@ const OPUS: &str = "opus";
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
 /// Copilot writes the version with a dot, hence the two separators. Legacy ids
 /// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
-/// tells us there is no modern version to read here.
+/// tells us there is no modern version to read here. Gateway ids keep a
+/// vendor prefix (`anthropic/claude-opus-4-7`), so read the last path segment.
 fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
-    let mut parts = model_id.strip_prefix("claude-")?.split(['-', '.']);
+    let bare = model_id.rsplit('/').next().unwrap_or(model_id);
+    let mut parts = bare.strip_prefix("claude-")?.split(['-', '.']);
     let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -1009,6 +1011,7 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
