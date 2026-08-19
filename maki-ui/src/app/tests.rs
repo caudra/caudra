@@ -1250,7 +1250,6 @@ fn picker_enter_stays_at_navigated() {
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
-    kb::SESSIONS.to_key_event(),
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
     kb::HELP.to_key_event(),

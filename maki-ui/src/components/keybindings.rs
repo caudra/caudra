@@ -316,12 +316,6 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::SESSIONS.label),
-        description: "Browse sessions",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
         context: KeybindContext::General,
