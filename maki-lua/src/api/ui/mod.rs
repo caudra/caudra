@@ -438,6 +438,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
         desc: "Sequence of {key, label} pairs, e.g. `{{\"q\", \"quit\"}, {\"j\", \"down\"}}`. Pass nil to remove the plugin's hints.",
     }],
     returns: "",
+    guard: None,
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 

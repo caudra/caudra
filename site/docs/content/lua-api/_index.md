@@ -50,6 +50,33 @@ end
 Lua errors are reserved for programmer mistakes, like passing a number where
 a string belongs.
 
+## Permissions and plugin.toml {#plugin-permissions}
+
+Sensitive APIs are gated per plugin file; every gated function's entry in
+this reference names the permission it needs. The permissions are: `fs_read`, `fs_write`, `net`, `run`, `env`.
+A gated call without its permission raises
+`permission denied: '<name>' not granted for this plugin`.
+
+Grants come from a `plugin.toml` next to the Lua file (for
+`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+
+```toml
+[permissions]
+fs_read = true
+fs_write = true
+net = true
+run = true
+env = true
+```
+
+The rules:
+
+- No `plugin.toml` at all: every permission is denied, and maki logs a
+  warning at load time.
+- `plugin.toml` exists: permissions default to granted; set a key to
+  `false` to revoke it. An empty file grants everything.
+- Invalid TOML: everything denied, with a warning in the log.
+
 ## Overview
 
 | Module | What it is for |
@@ -1320,6 +1347,8 @@ maki.env.state_dir()
 Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
 Typically something like `~/.local/state/maki`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) State directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -1338,6 +1367,8 @@ maki.env.config_dir()
 
 Return the directory where maki looks for user configuration files.
 Typically something like `~/.config/maki`.
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Config directory path, or nil if it cannot be determined.
 
@@ -1358,6 +1389,8 @@ maki.env.logs_dir()
 Return the directory where maki writes its log files (`maki.log`).
 Typically something like `~/.local/logs/maki`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Logs directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -1377,6 +1410,8 @@ maki.env.legacy_dir()
 Return the legacy config path (`~/.maki`), if it exists on disk.
 Useful for migration logic. Returns nil when there is no legacy directory.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
 
@@ -1385,9 +1420,6 @@ Useful for migration logic. Returns nil when there is no legacy directory.
 Process and environment helpers, modeled after Neovim's `vim.fn` job
 control. Use these to run shell commands, wait for output, and check
 whether programs are installed.
-
-Job functions need the `run` permission. `executable` needs the `env`
-permission.
 
 ```lua
 local id = maki.fn.jobstart("git status", {
@@ -1406,6 +1438,8 @@ maki.fn.jobstart({cmd}, {opts?})
 Run a shell command in the background. The command runs through
 `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
 that you can pass to `jobstop` or `jobwait` to control the process.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1443,6 +1477,8 @@ maki.fn.jobstop({job_id})
 Kill a running job immediately (SIGKILL on Unix). Safe to call on
 jobs that already exited or on unknown ids.
 
+Requires the `run` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
@@ -1468,6 +1504,8 @@ job does not finish before the timeout.
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
 output into a buffer while parked here.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1497,6 +1535,8 @@ maki.fn.executable({name})
 Check whether {name} can be found on `$PATH` or is an absolute path
 to a file. Returns 1 when found, 0 otherwise (matches Neovim's
 `vim.fn.executable`).
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1591,6 +1631,8 @@ Read the entire file at {path} as a UTF-8 string.
 If the file contains bytes that are not valid UTF-8, this function throws.
 Use `read_bytes` for binary files.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
@@ -1617,6 +1659,8 @@ maki.fs.read_bytes({path})
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
 Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1645,6 +1689,8 @@ Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
 and `mtime` (number, fractional seconds since the Unix epoch; absent when the
 filesystem does not report a modification time).
 If {path} does not exist, returns nil with no error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1809,6 +1855,8 @@ Walk upward from {source} looking for a directory that contains one of the
 {marker} files or directories. Like `vim.fs.root`. Useful for finding the
 project root.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{source}` (`string`) Starting file or directory path.
@@ -1881,6 +1929,8 @@ List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Directory path.
@@ -1909,6 +1959,8 @@ maki.fs.write({path}, {content})
 Write {content} to the file at {path}, creating it if it does not exist
 or overwriting it if it does.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
@@ -1934,6 +1986,8 @@ maki.fs.atomic_write({path}, {content})
 Atomically replace {path} with {content}. The parent directory must exist.
 Readers observe either the old file or the complete new file.
 Existing file permissions are preserved. On Unix, new files use mode 0600.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1962,6 +2016,8 @@ Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
 Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
 Symlinks are removed themselves, never followed.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Path to the file or directory to remove.
@@ -1988,6 +2044,8 @@ maki.fs.mkdir({path}, {opts?})
 Create the directory at {path}. Set `parents = true` to create
 intermediate directories, like `mkdir -p`.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Directory path to create.
@@ -2012,6 +2070,8 @@ maki.fs.glob({pattern}, {opts?})
 Find files matching one or more glob patterns.
 Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
 recently modified files first.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2041,6 +2101,8 @@ grouped by file, similar to ripgrep output.
 
 Each result entry has a `path` and a list of `groups`. Each group contains
 `lines`, where every line has `line_nr`, `text`, and `is_match`.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2219,8 +2281,7 @@ local bytes = img:encode("png")
 Run Python code in a memory-safe, time-limited sandbox.
 
 The sandbox uses the monty interpreter. Python code can call back into
-Lua-defined tools, and stdout is streamed line by line. Requires the
-`run` permission.
+Lua-defined tools, and stdout is streamed line by line.
 
 ```lua
 local r, err = maki.interpreter.run("print('hello')", {
@@ -2246,6 +2307,8 @@ functions you provide in {opts}.tools.
 The result table has optional fields: `stdout` (string, trimmed combined
 output) and `output` (string, the final expression value). On error, the
 table is empty and the second return value is the error message.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2588,6 +2651,8 @@ or metadata IP addresses are blocked for safety.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
+
+Requires the `net` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4817,6 +4882,8 @@ maki.uv.cwd()
 
 Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Current working directory, or nil if it cannot be determined.
 
 **Example:**
@@ -4836,6 +4903,8 @@ maki.uv.os_homedir()
 
 Return the current user's home directory. Like `vim.uv.os_homedir`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Home directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -4854,6 +4923,8 @@ maki.uv.os_getenv({name})
 
 Look up the environment variable {name}. Like `vim.uv.os_getenv`.
 Returns nil when the variable is not set.
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 

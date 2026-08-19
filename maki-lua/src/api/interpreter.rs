@@ -203,8 +203,7 @@ lua_table! {
     /// Run Python code in a memory-safe, time-limited sandbox.
     ///
     /// The sandbox uses the monty interpreter. Python code can call back into
-    /// Lua-defined tools, and stdout is streamed line by line. Requires the
-    /// `run` permission.
+    /// Lua-defined tools, and stdout is streamed line by line.
     ///
     /// ```lua
     /// local r, err = maki.interpreter.run("print('hello')", {

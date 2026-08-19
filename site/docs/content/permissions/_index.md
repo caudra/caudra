@@ -195,6 +195,10 @@ Some constructs are too complex to analyze statically, so they always trigger a 
 
 Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when possible; they do not by themselves force a prompt the way substitutions do.
 
+## Plugin Permissions
+
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+
 ## Session Persistence
 
 When you save a session, its permission rules are saved too. Loading the session restores them.

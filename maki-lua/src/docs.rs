@@ -35,6 +35,10 @@ pub struct FnDoc {
     pub returns: &'static str,
     /// Lua snippet rendered as a fenced code block, or "" when absent.
     pub example: &'static str,
+    /// Manifest key of the plugin permission gating this function, from the
+    /// `guard =` attribute. Rendered into the docs so the reference can
+    /// never drift from the actual gate.
+    pub guard: Option<&'static str>,
 }
 
 pub struct ParamDoc {

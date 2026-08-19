@@ -239,6 +239,7 @@ const await__doc: FnDoc = FnDoc {
         },
     ],
     returns: "(...) Values passed by the caller to the injected callback.",
+    guard: None,
     example: "local result = maki.async.await(2, http.get, url)",
 };
 
@@ -260,6 +261,7 @@ const wrap__doc: FnDoc = FnDoc {
         },
     ],
     returns: "(function) Wrapped function you can call like a normal function.",
+    guard: None,
     example: "local get = maki.async.wrap(2, http.get)\nlocal body = get(url)",
 };
 
@@ -281,6 +283,7 @@ const join__doc: FnDoc = FnDoc {
         },
     ],
     returns: "",
+    guard: None,
     example: "maki.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
 };
 
