@@ -333,6 +333,12 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
 /// provider. Used to reconcile a resumed model so it matches one started
 /// fresh (e.g. inherited thinking support for a routed Aperture model).
 pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
+    // Script-backed providers adjust nothing but run their auth script at
+    // construction; resumed-session callers sit on the UI thread and must
+    // not wait on that.
+    if dynamic::display_name(&model.provider).is_some() {
+        return Ok(());
+    }
     provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
     Ok(())
 }
