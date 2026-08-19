@@ -39,10 +39,9 @@ struct TerminalEnvironment<'a> {
     term: Option<&'a str>,
 }
 
-#[derive(Default)]
-struct TmuxClient<'a> {
-    term_type: Option<&'a str>,
-    term_name: Option<&'a str>,
+struct TmuxClient {
+    term_type: String,
+    term_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,30 +57,7 @@ pub(crate) struct TerminalNotifier {
 
 impl TerminalNotifier {
     pub(crate) fn new(configured: NotificationMethod) -> Option<Self> {
-        let notifier = resolve_notifier(configured, || {
-            let term_program = std::env::var("TERM_PROGRAM").ok();
-            let term = std::env::var("TERM").ok();
-            let env = TerminalEnvironment {
-                term_program: term_program.as_deref(),
-                wezterm: std::env::var_os("WEZTERM_VERSION").is_some(),
-                iterm: std::env::var_os("ITERM_SESSION_ID").is_some()
-                    || std::env::var_os("ITERM_PROFILE").is_some()
-                    || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
-                kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
-                term: term.as_deref(),
-            };
-            let tmux_values = env
-                .term_program
-                .filter(|value| normalize_terminal_id(value) == "tmux")
-                .and_then(|_| query_tmux_client());
-            let tmux = tmux_values
-                .as_ref()
-                .map(|(term_type, term_name)| TmuxClient {
-                    term_type: non_empty(term_type),
-                    term_name: non_empty(term_name),
-                });
-            auto_supports_osc9(&env, tmux.as_ref())
-        })?;
+        let notifier = resolve_notifier(configured, detect_osc9_support)?;
         Some(Self {
             notifier,
             mux: TerminalMux::detect(),
@@ -105,9 +81,23 @@ impl TerminalNotifier {
     }
 }
 
-fn non_empty(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty()).then_some(value)
+fn detect_osc9_support() -> bool {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let term = std::env::var("TERM").ok();
+    let env = TerminalEnvironment {
+        term_program: term_program.as_deref(),
+        wezterm: std::env::var_os("WEZTERM_VERSION").is_some(),
+        iterm: std::env::var_os("ITERM_SESSION_ID").is_some()
+            || std::env::var_os("ITERM_PROFILE").is_some()
+            || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
+        kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        term: term.as_deref(),
+    };
+    let tmux = env
+        .term_program
+        .filter(|value| normalize_terminal_id(value) == "tmux")
+        .and_then(|_| query_tmux_client());
+    auto_supports_osc9(&env, tmux.as_ref())
 }
 
 fn normalize_terminal_id(value: &str) -> String {
@@ -151,15 +141,16 @@ fn resolve_notifier(
     }
 }
 
-fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient<'_>>) -> bool {
+fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) -> bool {
     if let Some(term_program) = env.term_program.filter(|value| !value.trim().is_empty()) {
         if normalize_terminal_id(term_program) == "tmux" {
             return tmux.is_some_and(|client| {
                 client
                     .term_type
-                    .and_then(|value| value.split_whitespace().next())
+                    .split_whitespace()
+                    .next()
                     .is_some_and(supports_osc9)
-                    || client.term_name.is_some_and(supports_osc9)
+                    || supports_osc9(&client.term_name)
             });
         }
         return supports_osc9(term_program);
@@ -167,7 +158,7 @@ fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient<'_
     env.wezterm || env.iterm || env.kitty || env.term.is_some_and(supports_osc9)
 }
 
-fn query_tmux_client() -> Option<(String, String)> {
+fn query_tmux_client() -> Option<TmuxClient> {
     let output = ProcessCommand::new("tmux")
         .args([
             "display-message",
@@ -181,25 +172,24 @@ fn query_tmux_client() -> Option<(String, String)> {
     }
     let output = String::from_utf8(output.stdout).ok()?;
     let (term_type, term_name) = output.trim_end().split_once('\t')?;
-    Some((term_type.to_string(), term_name.to_string()))
+    Some(TmuxClient {
+        term_type: term_type.into(),
+        term_name: term_name.into(),
+    })
 }
 
+/// A model response must not inject escape sequences into the terminal;
+/// `is_control` also covers DEL and the C1 range.
 fn sanitize_notification_message(message: &str) -> String {
     let sanitized = message
-        .chars()
-        .map(|character| {
-            if character.is_control() || character == '\u{7f}' {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        FALLBACK_NOTIFICATION_MESSAGE.to_string()
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sanitized.is_empty() {
+        FALLBACK_NOTIFICATION_MESSAGE.into()
     } else {
-        normalized
+        sanitized
     }
 }
 
@@ -393,6 +383,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     fn env<'a>(term_program: Option<&'a str>) -> TerminalEnvironment<'a> {
         TerminalEnvironment {
@@ -480,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_supports_codex_terminal_programs() {
+    fn auto_supports_known_osc9_terminals() {
         for value in ["Ghostty", "iTerm.app", "kitty", "WarpTerminal", "WezTerm"] {
             assert!(
                 auto_supports_osc9(&env(Some(value)), None),
@@ -533,16 +524,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_tmux_client_type_and_falls_back_to_bell() {
+    fn auto_inside_tmux_checks_client_terminal() {
         let terminal = env(Some("tmux"));
         let ghostty = TmuxClient {
-            term_type: Some("ghostty 1.2.3"),
-            term_name: Some("xterm-256color"),
+            term_type: "ghostty 1.2.3".into(),
+            term_name: "xterm-256color".into(),
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty)));
         let ghostty_name = TmuxClient {
-            term_type: Some("xterm-256color"),
-            term_name: Some("xterm-ghostty"),
+            term_type: "xterm-256color".into(),
+            term_name: "xterm-ghostty".into(),
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
         assert!(!auto_supports_osc9(&terminal, None));
@@ -563,22 +554,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn notification_message_sanitization_removes_terminal_controls_and_normalizes_whitespace() {
-        const MESSAGE: &str = "\0Task\t\u{7f}complete\u{85}\nnow\u{2003}";
-        const EXPECTED_MESSAGE: &str = "Task complete now";
-
-        assert_eq!(sanitize_notification_message(MESSAGE), EXPECTED_MESSAGE);
-    }
-
-    #[test]
-    fn empty_sanitized_notification_message_uses_fallback() {
-        const MESSAGE: &str = "\0\t\u{7f}\u{85}\n\u{2003}";
-
-        assert_eq!(
-            sanitize_notification_message(MESSAGE),
-            FALLBACK_NOTIFICATION_MESSAGE
-        );
+    #[test_case("\0Task\t\u{7f}complete\u{85}\nnow\u{2003}", "Task complete now" ; "strips_controls_and_collapses_whitespace")]
+    #[test_case("\0\t\u{7f}\u{85}\n\u{2003}", FALLBACK_NOTIFICATION_MESSAGE ; "all_control_input_falls_back")]
+    fn sanitize_notification_message_cases(message: &str, expected: &str) {
+        assert_eq!(sanitize_notification_message(message), expected);
     }
 
     #[test]

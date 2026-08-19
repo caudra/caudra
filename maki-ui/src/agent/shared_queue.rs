@@ -174,13 +174,13 @@ impl QueueReceiver {
         lock(&self.items).pop_front()
     }
 
-    pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) -> bool {
+    /// Runs `publish` under the queue lock, so a drain event can never
+    /// interleave with a concurrent push.
+    pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) {
         let items = lock(&self.items);
-        if !items.is_empty() {
-            return false;
+        if items.is_empty() {
+            publish();
         }
-        publish();
-        true
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
@@ -239,7 +239,7 @@ mod tests {
         tx.push(msg(false));
         let called = Cell::new(false);
 
-        assert!(!rx.publish_if_empty(|| called.set(true)));
+        rx.publish_if_empty(|| called.set(true));
         assert!(!called.get());
     }
 
@@ -256,10 +256,10 @@ mod tests {
             lock(&worker_order).push("push");
         });
 
-        assert!(rx.publish_if_empty(|| {
+        rx.publish_if_empty(|| {
             barrier.wait();
             lock(&order).push("drain");
-        }));
+        });
         worker.join().unwrap();
 
         assert_eq!(*lock(&order), ["drain", "push"]);

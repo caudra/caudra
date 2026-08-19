@@ -4234,6 +4234,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
     assert_eq!(response.chars().count(), 200);
     assert!(response.starts_with("first second 界"));
     assert_eq!(turn_response(&Message::default()), None);
+    assert_eq!(turn_response(&tool_use_msg("tool")), None);
 }
 
 #[test]
@@ -4258,33 +4259,21 @@ fn turn_response_stops_after_bounded_large_input() {
     assert!(!response.contains("not reached"));
 }
 
-#[test]
-fn tool_call_is_not_a_turn_response() {
-    assert_eq!(turn_response(&tool_use_msg("tool")), None);
-}
-
-#[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", NotificationPriority::Low ; "turn_response")]
-#[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", NotificationPriority::Low ; "turn_fallback")]
-#[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", NotificationPriority::High ; "permission_tool")]
-#[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", NotificationPriority::High ; "permission_fallback")]
-#[test_case(Notification::AuthenticationRequired, "Authentication required", NotificationPriority::High ; "authentication")]
-#[test_case(Notification::QuestionRequested, "Question requested", NotificationPriority::High ; "question")]
-#[test_case(Notification::PlanReady, "Plan ready", NotificationPriority::High ; "plan")]
-fn notification_message_and_priority(
+#[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", false ; "turn_response")]
+#[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", false ; "turn_fallback")]
+#[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", true ; "permission_tool")]
+#[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", true ; "permission_fallback")]
+#[test_case(Notification::AuthenticationRequired, "Authentication required", true ; "authentication")]
+#[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
+#[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
+#[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
+fn notification_message_and_urgency(
     notification: Notification,
     expected_message: &str,
-    expected_priority: NotificationPriority,
+    urgent: bool,
 ) {
     assert_eq!(notification.message(), expected_message);
-    assert_eq!(notification.priority(), expected_priority);
-}
-
-#[test]
-fn error_completion_has_safe_message() {
-    assert_eq!(
-        Notification::error_completion().message(),
-        "Agent stopped with an error"
-    );
+    assert_eq!(notification.is_urgent(), urgent);
 }
 
 #[test]

@@ -735,9 +735,9 @@ mod tests {
         (event_rx, cmd_tx)
     }
 
-    #[test_case(true, true ; "visible")]
-    #[test_case(false, false ; "hidden")]
-    fn needs_input_requires_visibility(visible: bool, expected: bool) {
+    #[test_case(true ; "visible")]
+    #[test_case(false ; "hidden")]
+    fn needs_input_requires_visibility(visible: bool) {
         let mut mgr = FloatManager::new();
         let (event_tx, cmd_rx, _, _) = make_channels();
         let config = FloatConfig {
@@ -746,7 +746,7 @@ mod tests {
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&[]), config, false, event_tx, cmd_rx);
-        assert_eq!(mgr.needs_input(), expected);
+        assert_eq!(mgr.needs_input(), visible);
     }
 
     #[test]

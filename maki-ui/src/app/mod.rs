@@ -134,21 +134,10 @@ pub(crate) enum Notification {
     PlanReady,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
-pub(crate) enum NotificationPriority {
-    Low,
-    High,
-}
-
 impl Notification {
-    pub(crate) fn priority(&self) -> NotificationPriority {
-        match self {
-            Self::TurnComplete { .. } => NotificationPriority::Low,
-            Self::PermissionRequested { .. }
-            | Self::AuthenticationRequired
-            | Self::QuestionRequested
-            | Self::PlanReady => NotificationPriority::High,
-        }
+    /// Prompts blocking the agent outrank turn completions.
+    pub(crate) fn is_urgent(&self) -> bool {
+        !matches!(self, Self::TurnComplete { .. })
     }
 
     pub(crate) fn message(&self) -> String {
@@ -173,32 +162,17 @@ impl Notification {
     }
 }
 
+/// Lazy, so a huge response only costs the first `NOTIFICATION_PREVIEW_CHARS`
+/// characters.
 fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<String> {
-    let mut preview = String::new();
-    let mut characters = 0;
-    let mut pending_space = false;
-    for chunk in chunks {
-        pending_space |= !preview.is_empty();
-        for character in chunk.chars() {
-            if character.is_whitespace() {
-                pending_space = !preview.is_empty();
-                continue;
-            }
-            if pending_space {
-                preview.push(' ');
-                characters += 1;
-                if characters == NOTIFICATION_PREVIEW_CHARS {
-                    preview.pop();
-                    return Some(preview);
-                }
-            }
-            pending_space = false;
-            preview.push(character);
-            characters += 1;
-            if characters == NOTIFICATION_PREVIEW_CHARS {
-                return Some(preview);
-            }
-        }
+    let mut preview: String = chunks
+        .flat_map(str::split_whitespace)
+        .enumerate()
+        .flat_map(|(i, word)| (i > 0).then_some(' ').into_iter().chain(word.chars()))
+        .take(NOTIFICATION_PREVIEW_CHARS)
+        .collect();
+    if preview.ends_with(' ') {
+        preview.pop();
     }
     (!preview.is_empty()).then_some(preview)
 }

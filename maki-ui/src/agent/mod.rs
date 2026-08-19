@@ -172,14 +172,14 @@ impl AgentHandles {
         old.cancel();
     }
 
-    /// Hand back the agent task, dropping every channel so the loop can
-    /// wind down. The caller sends `CancelAll` first and then awaits all
-    /// tabs at once via [`join_all`] instead of paying a serial timeout
-    /// per tab.
     pub(crate) fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
 
+    /// Hand back the agent task, dropping every channel so the loop can
+    /// wind down. The caller sends `CancelAll` first and then awaits all
+    /// tabs at once via [`join_all`] instead of paying a serial timeout
+    /// per tab.
     pub(crate) fn into_task(self) -> smol::Task<()> {
         self.task
     }
