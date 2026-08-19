@@ -197,6 +197,11 @@ maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
 maki.api.create_autocmd("SessionFocusChanged", {
   callback = function(ev)
     focused = ev.data and ev.data.session_id
+    -- Startup restore lands before the first focus event, so its items sit
+    -- under the "" key; the first focused session is the one they belong to.
+    if focused and todos[""] and not todos[focused] then
+      todos[focused], todos[""] = todos[""], nil
+    end
     sync_panel(items_of(focused), false)
   end,
 })
