@@ -317,8 +317,7 @@ fn trim_slash(url: String) -> String {
 
 fn price_per_m(field: Option<&Value>) -> f64 {
     field
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
         .map(|n| n * PER_MILLION)
         .unwrap_or(0.0)
 }
@@ -649,7 +648,7 @@ mod tests {
         let body = json!({
             "object": "list",
             "data": [
-                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "pricing": {"input": "0.000001", "output": "0.000002", "input_cache_read": "0.0000001"}},
+                {"id": "qwen3.6", "metadata": {"provider": {"id": "ollama"}}, "pricing": {"input": "0.000001", "output": 0.000002, "input_cache_read": "0.0000001"}},
                 {"id": "gemma4", "metadata": {"provider": {"id": "ikora"}}},
                 {"id": "raw-model"}
             ]

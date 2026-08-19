@@ -13,6 +13,9 @@ use crate::{
 };
 
 const STREAM_DONE: &str = "[DONE]";
+/// `tool_calls[].index` comes straight off the wire; a bogus huge value must
+/// not size the accumulator vec.
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
@@ -618,6 +621,10 @@ pub async fn parse_sse(
 
         if let Some(tc_deltas) = delta.tool_calls {
             for tc in tc_deltas {
+                if tc.index >= MAX_TOOL_CALLS_PER_MESSAGE {
+                    warn!(index = tc.index, "ignoring out-of-range tool call index");
+                    continue;
+                }
                 while tool_accumulators.len() <= tc.index {
                     tool_accumulators.push(ToolAccumulator {
                         id: String::new(),
