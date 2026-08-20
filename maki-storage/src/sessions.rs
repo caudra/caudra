@@ -524,6 +524,10 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
         }
     };
     prune_archives(existing, bytes);
+    // The live log is about to be renamed away. If the archive's directory
+    // entry is not durable by then, a crash frees the only inode holding the
+    // dropped turns, which is the loss this whole function exists to prevent.
+    crate::sync_parent_dir(&archive_path);
     info!(
         session_id = %session.id,
         new_msgs = new_count,
@@ -659,12 +663,14 @@ impl SessionLog {
     {
         fs::create_dir_all(dir).map_err(StorageError::from)?;
         let path = jsonl_path(dir, session.id);
-        archive_if_shrinking(dir, session);
         let tmp = path.with_extension("jsonl.tmp");
 
         let mut tmp_file = File::create(&tmp).map_err(StorageError::from)?;
         write_full_session(&mut tmp_file, session)?;
         tmp_file.sync_data().map_err(StorageError::from)?;
+        // Last thing before the rename: a write that never lands must not
+        // spend an archive slot, since taking one prunes the oldest.
+        archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
 
