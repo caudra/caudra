@@ -19,7 +19,7 @@ pub const CODE_BAR: &str = "│ ";
 pub const CODE_BAR_WRAP: &str = "│";
 /// Lines longer than this get truncated with `...` to protect the parser
 /// and terminal from runaway output.
-pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 500;
+pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 1_500;
 const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
