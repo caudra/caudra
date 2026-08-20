@@ -5,6 +5,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::rewind_picker::RewindEntry;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -39,6 +40,11 @@ const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stands in for a size the provider measured, baseline included.
+const MEASURED_CONTEXT: u32 = 100_000;
+/// The rewind fixture holds a few dozen bytes of chat, far below this, so it
+/// doubles as the window the gauge is allowed to land in.
+const SMALL_HISTORY: u32 = 1_000;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -2612,25 +2618,24 @@ fn build_rewind_app() -> App {
     app
 }
 
-#[test]
-fn rewind_to_middle_truncates_and_populates_input() {
-    let mut app = build_rewind_app();
-    app.state.context_size = 100_000;
-    let old_run_id = app.run_id;
-    let entry = crate::components::rewind_picker::RewindEntry {
+fn rewind_to_second_turn() -> RewindEntry {
+    RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
-    };
-    let actions = app.rewind_to(entry);
+    }
+}
+
+#[test]
+fn rewind_to_middle_truncates_and_populates_input() {
+    let mut app = build_rewind_app();
+    let old_run_id = app.run_id;
+    let actions = app.rewind_to(rewind_to_second_turn());
 
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
-    let expected_ctx = maki_agent::agent::estimate_message_tokens(app.state.session.messages());
-    assert_eq!(app.state.context_size, expected_ctx);
-    assert_eq!(app.chats[0].context_size, expected_ctx);
 
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
@@ -2638,13 +2643,32 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(loaded.messages.len(), 2);
 }
 
+/// Dropping two short messages may shave a few tokens off the gauge, never the
+/// baseline underneath it. A session that never ran a turn has no baseline, so
+/// there the rough estimate is all we get.
+#[test_case(MEASURED_CONTEXT, MEASURED_CONTEXT - SMALL_HISTORY ; "keeps_measured_baseline")]
+#[test_case(0,                0                                ; "falls_back_to_estimate")]
+fn rewind_recomputes_context_size(measured: u32, floor: u32) {
+    let mut app = build_rewind_app();
+    app.state.context_size = measured;
+    app.rewind_to(rewind_to_second_turn());
+
+    let size = app.state.context_size;
+    assert!(
+        size > floor && size < floor + SMALL_HISTORY,
+        "context {size} left the {floor}..{} window",
+        floor + SMALL_HISTORY
+    );
+    assert_eq!(app.chats[0].context_size, size);
+}
+
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
-    app.state.context_size = 100_000;
+    app.state.context_size = MEASURED_CONTEXT;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
-    let entry = crate::components::rewind_picker::RewindEntry {
+    let entry = RewindEntry {
         turn_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
@@ -4428,7 +4452,7 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
     );
     app.checkpoint();
 
-    let entry = crate::components::rewind_picker::RewindEntry {
+    let entry = RewindEntry {
         turn_index: 1,
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),

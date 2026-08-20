@@ -567,6 +567,9 @@ impl<'h> Agent<'h> {
 
 const CHARS_PER_TOKEN: usize = 4;
 
+/// Counts message content only. The system prompt and the tool schemas, a five
+/// figure baseline on a full tool set, stay invisible here, so never let this
+/// replace a context size the provider measured.
 pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
     if messages.is_empty() {
         return 0;
@@ -578,6 +581,7 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
             ContentBlock::Text { text } => Some(text.len()),
             ContentBlock::ToolResult { content, .. } => Some(content.len()),
             ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
             _ => None,
         })
         .sum();

@@ -6,6 +6,7 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
+use maki_agent::agent::estimate_message_tokens;
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
@@ -316,12 +317,21 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        // The live size came from the provider, so it also counts the system
+        // prompt and the tool schemas, a baseline the estimator cannot see.
+        // Subtract only what we drop, or the gauge collapses until the next
+        // turn measures it again. An emptied history is a fresh session though,
+        // baseline included.
+        let baseline = self
+            .state
+            .context_size
+            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
         let session = self.state.session_mut();
         session.truncate_messages(entry.turn_index);
         session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
         session.update_title_if_default();
-        self.state.context_size =
-            maki_agent::agent::estimate_message_tokens(self.state.session.messages());
+        let kept = estimate_message_tokens(self.state.session.messages());
+        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
 
         self.reset_ui_chrome();
         self.restore_display();
