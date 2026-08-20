@@ -494,7 +494,9 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     let more = s.total_matches > MAX_MATERIALIZED;
     let at_bottom = s.scroll_offset + s.viewport_height >= s.matches.len();
     let hint_row = usize::from(more && at_bottom);
-    let visible_rows = s.viewport_height - hint_row;
+    // A viewport one row tall spends it all on the hint, and `end` below would
+    // then slice backwards from `scroll_offset`.
+    let visible_rows = s.viewport_height.saturating_sub(hint_row);
 
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
     let end = (s.scroll_offset + visible_rows).min(s.matches.len());
