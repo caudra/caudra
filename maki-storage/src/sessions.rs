@@ -1673,10 +1673,13 @@ where
     pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
         let mut removed = try_remove(&jsonl_path(dir, id))?;
         removed |= remove_legacy_files(dir, id)?;
-        match fs::remove_dir_all(dir.join(ARCHIVE_DIR).join(id.to_string())) {
-            Ok(()) => removed = true,
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(StorageError::from(e).into()),
+        // Backups, not the session: failing to sweep them must not fail a
+        // delete whose log is already gone, and their presence alone does not
+        // make a session exist.
+        if let Err(e) = fs::remove_dir_all(dir.join(ARCHIVE_DIR).join(id.to_string()))
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!(error = %e, session_id = %id, "session archives remain after delete");
         }
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
