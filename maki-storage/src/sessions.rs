@@ -499,11 +499,8 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
 /// [`SessionLog::rewrite`] keeps its crash-safety promise.
 fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     let path = jsonl_path(dir, session.id);
-    let Some(old_count) = count_msg_lines(&path) else {
-        return;
-    };
     let new_count = session.messages.len();
-    if old_count <= new_count {
+    if !log_msg_count_exceeds(&path, new_count) {
         return;
     }
 
@@ -529,25 +526,34 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     prune_archives(existing, bytes);
     info!(
         session_id = %session.id,
-        old_msgs = old_count,
         new_msgs = new_count,
         archive = %archive_path.display(),
         "archived session log before shrink rewrite"
     );
 }
 
-/// `None` when the file is missing or unreadable, and the rewrite then goes
-/// ahead as before: nobody should lose a save because the old file would not
-/// count.
-fn count_msg_lines(path: &Path) -> Option<usize> {
-    let file = fs::File::open(path).ok()?;
+/// Whether the log holds more than `limit` messages, which is the whole
+/// question a shrink asks, so the scan stops at the first line past it instead
+/// of reading a log that can run to hundreds of megabytes. A missing or
+/// unreadable file answers no and the rewrite goes ahead as before: nobody
+/// should lose a save because the old file would not count.
+fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
     let mut count = 0;
     for line in BufReader::new(file).lines() {
-        if line.ok()?.starts_with(MSG_PREFIX) {
+        let Ok(line) = line else {
+            return false;
+        };
+        if line.starts_with(MSG_PREFIX) {
             count += 1;
+            if count > limit {
+                return true;
+            }
         }
     }
-    Some(count)
+    false
 }
 
 /// The archive is a second name for the log's current inode. The rewrite
@@ -556,6 +562,9 @@ fn count_msg_lines(path: &Path) -> Option<usize> {
 /// a stick) fall back to a plain copy. The size is for the byte budget.
 fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
     if fs::hard_link(from, to).is_err() {
+        // `create_new` first: the name is only free if the seq scan saw every
+        // archive, and `fs::copy` would truncate the one it collided with.
+        OpenOptions::new().write(true).create_new(true).open(to)?;
         fs::copy(from, to).inspect_err(|_| {
             let _ = fs::remove_file(to);
         })?;
