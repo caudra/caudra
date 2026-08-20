@@ -476,7 +476,6 @@ impl MessagesPanel {
         self.messages.len()
     }
 
-    #[cfg(test)]
     pub fn last_message_text(&self) -> &str {
         self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
     }

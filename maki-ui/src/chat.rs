@@ -25,6 +25,9 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+/// One notice per streak: a wedged model can spend twenty nudges, and twenty
+/// identical bubbles bury the conversation they are about.
+const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 
 pub enum ChatEventResult {
     Continue,
@@ -154,10 +157,12 @@ impl Chat {
             }
             AgentEvent::Nudge => {
                 self.messages_panel.flush();
-                self.messages_panel.push(DisplayMessage::new(
-                    DisplayRole::Assistant,
-                    "Model stalled after tool calls, nudging...".into(),
-                ));
+                if self.messages_panel.last_message_text() != NUDGE_TEXT {
+                    self.messages_panel.push(DisplayMessage::new(
+                        DisplayRole::Assistant,
+                        NUDGE_TEXT.into(),
+                    ));
+                }
             }
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
