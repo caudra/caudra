@@ -52,7 +52,7 @@ const ARCHIVE_KEEP: usize = 3;
 /// budget of their own. The newest archive always survives, whatever it weighs.
 const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
-const MSG_PREFIX: &str = r#"{"t":"msg""#;
+const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
 
 /// Hands out the token that tags one append-only run of a message list.
 /// Process wide, so two runs never pick the same number.
@@ -533,19 +533,26 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
 }
 
 /// Whether the log holds more than `limit` messages, which is the whole
-/// question a shrink asks, so the scan stops at the first line past it instead
-/// of reading a log that can run to hundreds of megabytes. A missing or
-/// unreadable file answers no and the rewrite goes ahead as before: nobody
-/// should lose a save because the old file would not count.
+/// question a shrink asks, so the scan stops at the first line past it. A
+/// growing log never trips that, so this still walks to EOF once per rewrite:
+/// it reads bytes into one reused buffer rather than allocating and
+/// UTF-8-validating a `String` per line, which is what made the pass show up
+/// next to the write it rides along with. A missing or unreadable file answers
+/// no and the rewrite goes ahead as before: nobody should lose a save because
+/// the old file would not count.
 fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
     let mut count = 0;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            return false;
-        };
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
         if line.starts_with(MSG_PREFIX) {
             count += 1;
             if count > limit {
@@ -553,7 +560,6 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
             }
         }
     }
-    false
 }
 
 /// The archive is a second name for the log's current inode. The rewrite
@@ -2098,9 +2104,9 @@ mod tests {
     }
 
     fn msg_line_count(path: &Path) -> usize {
-        fs::read_to_string(path)
+        fs::read(path)
             .unwrap()
-            .lines()
+            .split(|&b| b == b'\n')
             .filter(|line| line.starts_with(MSG_PREFIX))
             .count()
     }
