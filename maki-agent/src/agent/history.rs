@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -53,14 +53,30 @@ impl History {
         self.snapshot.messages.is_empty()
     }
 
+    /// Skips system padding so repeated nudges cannot push tool results
+    /// out of the window.
     pub fn has_recent_tool_results(&self, depth: usize) -> bool {
-        let msgs = self.as_slice();
-        let start = msgs.len().saturating_sub(depth);
-        msgs[start..].iter().any(|m| {
-            m.content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        })
+        self.as_slice()
+            .iter()
+            .rev()
+            .filter(|m| !is_system_padding(m))
+            .take(depth)
+            .any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            })
+    }
+
+    /// Reads the padding tail instead of keeping a counter, so any real
+    /// message resets the nudge budget on its own.
+    pub fn recent_nudges(&self) -> u32 {
+        self.as_slice()
+            .iter()
+            .rev()
+            .take_while(|m| is_system_padding(m))
+            .filter(|m| is_empty_marker(m))
+            .count() as u32
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
@@ -142,6 +158,20 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
     }
 
     changed
+}
+
+/// Empty markers and synthetic prompts (empty `display_text`) are
+/// bookkeeping, not conversation.
+fn is_system_padding(m: &Message) -> bool {
+    is_empty_marker(m)
+        || (m.display_text.as_deref() == Some("")
+            && m.content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::Text { .. })))
+}
+
+fn is_empty_marker(m: &Message) -> bool {
+    matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
 }
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
@@ -543,6 +573,19 @@ mod tests {
         1
         ; "at_depth_boundary"
     )]
+    #[test_case(
+        vec![
+            make_tool_result_msg(&["t1"]),
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::empty_marker(),
+            Message::synthetic("continue".into()),
+        ],
+        1
+        ; "padding_does_not_hide_tool_results"
+    )]
     fn has_recent_tool_results(messages: Vec<Message>, depth: usize) {
         let history = History::new(messages);
         let result = if depth == 0 {
@@ -551,6 +594,32 @@ mod tests {
             history.has_recent_tool_results(depth)
         };
         assert_eq!(result, depth > 0);
+    }
+
+    #[test_case(vec![], 0 ; "empty_history")]
+    #[test_case(
+        vec![
+            make_tool_result_msg(&["t1"]),
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::empty_marker(),
+        ],
+        3
+        ; "counts_markers_in_padding_tail"
+    )]
+    #[test_case(
+        vec![
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::user("continue".into()),
+        ],
+        0
+        ; "user_message_resets_streak"
+    )]
+    fn recent_nudges(messages: Vec<Message>, expected: u32) {
+        assert_eq!(History::new(messages).recent_nudges(), expected);
     }
 
     /// The writer thread serializes a snapshot while the user keeps typing, so

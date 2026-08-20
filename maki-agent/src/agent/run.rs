@@ -30,6 +30,8 @@ const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty r
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
 const MAX_NUDGES: u32 = 20;
+/// Counted over non-padding messages.
+const RECENT_TOOL_WINDOW: usize = 5;
 /// Without this note a cancelled reply replays in history as a finished
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
@@ -104,7 +106,6 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
-    nudges: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -146,7 +147,6 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
-            nudges: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
@@ -433,19 +433,15 @@ impl<'h> Agent<'h> {
     /// The turn came back without text, so [`Message::empty_marker`] takes its
     /// place in history. Returns true when the model was nudged to try again.
     fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
-        // Asked before the marker lands, since it shifts the recent window.
-        // Each nudge pads history with a marker and a prompt, so the window
-        // widens to keep the original tool results in sight.
-        let depth = 5 + 2 * self.nudges as usize;
-        let nudge = self.nudges < MAX_NUDGES && self.history.has_recent_tool_results(depth);
+        let nudges = self.history.recent_nudges();
+        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         self.history.push(Message::empty_marker());
         if !nudge {
             return Ok(false);
         }
 
-        self.nudges += 1;
         warn!(
-            self.nudges,
+            nudges = nudges + 1,
             "empty response after tool calls, nudging model to continue"
         );
         self.event_tx.send(AgentEvent::Nudge)?;
@@ -454,7 +450,6 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        self.nudges = 0;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
             response,
@@ -1322,6 +1317,32 @@ mod tests {
                 "history holds a message no provider will accept: {:?}",
                 history.as_slice()
             );
+        });
+    }
+
+    /// Pins the regression where a stale nudge counter made a follow-up
+    /// "continue" end instantly: the budget lives in the history tail, and
+    /// the new user message breaks the streak.
+    #[test]
+    fn nudge_budget_resets_on_new_run() {
+        smol::block_on(async {
+            let responses = [tool_call_response("glob", "t1")]
+                .into_iter()
+                .chain((0..=MAX_NUDGES).map(|_| empty_response()))
+                .chain([empty_response(), text_response(StopReason::EndTurn)])
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = agent.run(default_input()).await;
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            let nudges = events
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, MAX_NUDGES as usize + 1);
         });
     }
 
