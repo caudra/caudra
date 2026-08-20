@@ -170,8 +170,13 @@ fn is_system_padding(m: &Message) -> bool {
                 .all(|b| matches!(b, ContentBlock::Text { .. })))
 }
 
+/// Role and `display_text` are part of the shape: a user who types the marker
+/// text verbatim writes a real message, and it has to break the nudge streak
+/// like any other.
 fn is_empty_marker(m: &Message) -> bool {
-    matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
+    matches!(m.role, Role::Assistant)
+        && m.display_text.is_none()
+        && matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
 }
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
@@ -617,6 +622,15 @@ mod tests {
         ],
         0
         ; "user_message_resets_streak"
+    )]
+    #[test_case(
+        vec![
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            Message::user(EMPTY_RESPONSE_MARKER.into()),
+        ],
+        0
+        ; "user_typing_the_marker_text_resets_streak"
     )]
     fn recent_nudges(messages: Vec<Message>, expected: u32) {
         assert_eq!(History::new(messages).recent_nudges(), expected);
