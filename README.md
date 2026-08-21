@@ -137,8 +137,8 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 
 More info at the [official docs](https://maki.sh/docs).
 
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
-
 ## Example config
 
 [tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
+
+> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactor if needed nowadays.
