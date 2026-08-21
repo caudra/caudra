@@ -1,11 +1,8 @@
 # CONTRIBUTING
 
-> [!NOTE]
-> Currently undergoing a heavy refactor in the code to support neovim style lua plugins, which means migrating existing functionality to lua from native rust code too. This means you should avoid adding large features, and focus on bug fixes, and small changes in general. https://github.com/tontinton/maki/issues/112.
-
 Thanks for taking an interest in contributing to maki.
 
-Just remember I'd like to keep the project minimal to not become bloat.
+Just remember I'd like to keep the project minimal to not become bloat - think if some functionality you need can be done as a Lua plugin, and if not, think about the Lua APIs you need in order to implement the plugin. Do these APIs exist in neovim? If so, shoot up a PR. If the APIs don't exist, open an issue about it, let's discuss.
 
 When opening an issue, validate there is no open / closed issue talking about the exact thing you want to post about.
 
