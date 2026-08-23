@@ -468,6 +468,7 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
+    SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

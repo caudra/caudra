@@ -4588,6 +4588,34 @@ maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 maki.ui.set_status_hint(nil)
 ```
 
+---
+
+### `maki.ui.set_window_title()` {#maki-ui-set_window_title}
+
+```lua
+maki.ui.set_window_title({title})
+```
+
+Sets the terminal emulator's window title. Pass an empty string to
+clear it.
+
+The title passes through tmux, GNU screen, and zellij untouched, and
+control characters are stripped, so model text cannot inject escape
+sequences into the terminal. On exit maki hands the title back to the
+shell, on terminals that support the title stack.
+
+**Parameters:**
+
+- `{title}` (`string`) New window title, e.g. `"● 3/5 tests"`.
+
+**Example:**
+
+```lua
+maki.ui.set_window_title("maki: " .. session_name)
+-- Give the title back to the shell:
+maki.ui.set_window_title("")
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 

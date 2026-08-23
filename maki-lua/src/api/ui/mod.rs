@@ -249,6 +249,30 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Sets the terminal emulator's window title. Pass an empty string to
+/// clear it.
+///
+/// The title passes through tmux, GNU screen, and zellij untouched, and
+/// control characters are stripped, so model text cannot inject escape
+/// sequences into the terminal. On exit maki hands the title back to the
+/// shell, on terminals that support the title stack.
+///
+/// @param title string New window title, e.g. `"● 3/5 tests"`.
+/// @return
+/// @example
+/// maki.ui.set_window_title("maki: " .. session_name)
+/// -- Give the title back to the shell:
+/// maki.ui.set_window_title("")
+#[lua_fn]
+fn set_window_title(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    title: String,
+) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::SetWindowTitle(title));
+    Ok(())
+}
+
 /// Runs a built-in UI action by name, exactly as its default keybinding
 /// would. Handy when a default key never reaches maki because tmux or
 /// your terminal grabs it first: bind a new key with `maki.keymap.set`
@@ -456,6 +480,7 @@ lua_table! {
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_window_title,
     ]
 }
 
@@ -469,6 +494,7 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;

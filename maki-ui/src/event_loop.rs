@@ -803,6 +803,11 @@ impl<'t> EventLoop<'t> {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
+            UiAction::SetWindowTitle(title) => {
+                if let Err(error) = terminal::set_window_title(&title) {
+                    warn!(%error, "failed to set window title");
+                }
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
