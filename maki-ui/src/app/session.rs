@@ -131,6 +131,7 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            yolo: self.permissions.persisted_yolo(),
         }
     }
 
@@ -263,12 +264,22 @@ impl App {
         }
     }
 
+    /// Shared by every restore path: `focus_session` picks between resuming in
+    /// place and spawning a fresh runtime by tab state alone, so the same key
+    /// press has to land on the same permissions. The stored value replaces
+    /// whatever the previous session was running with, and a session that
+    /// stored nothing falls back to `--yolo` / `always_yolo`.
+    fn apply_stored_yolo(&self, meta: &SessionMeta) {
+        self.permissions.set_session_yolo(meta.yolo);
+    }
+
     /// Resume at process start: the agent was already spawned with this
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
         self.permissions
             .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
+        self.apply_stored_yolo(&self.state.session.meta);
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -295,6 +306,7 @@ impl App {
         self.state.cost = None;
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
+        self.permissions.set_session_yolo(None);
         if self.state.mode == Mode::Plan {
             self.enter_plan();
         }
@@ -358,6 +370,7 @@ impl App {
         self.checkpoint_now();
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
+        self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
         for w in self.state.warnings.drain(..) {

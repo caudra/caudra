@@ -154,6 +154,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    /// `None` when the user never set yolo for this session, which is what
+    /// makes `--yolo` a property of the invocation rather than of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo: Option<bool>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -3046,6 +3050,7 @@ mod tests {
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
         assert!(!meta.workflow);
+        assert!(meta.yolo.is_none());
     }
 
     #[test]
@@ -3056,6 +3061,7 @@ mod tests {
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
         session.meta.workflow = true;
+        session.meta.yolo = Some(true);
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -3065,6 +3071,7 @@ mod tests {
         );
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
+        assert_eq!(loaded.meta.yolo, Some(true));
     }
 
     #[test]

@@ -41,7 +41,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 ## Modes and toggles
 
-- **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
+- **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.

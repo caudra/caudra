@@ -78,7 +78,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "- **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`."
+        "- **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`."
     )
     .unwrap();
     writeln!(

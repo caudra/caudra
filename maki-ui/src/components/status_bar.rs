@@ -22,6 +22,7 @@ const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const YOLO_LABEL: &str = " [yolo]";
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -45,6 +46,7 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    pub yolo: bool,
     pub restoring: bool,
 }
 
@@ -193,6 +195,9 @@ impl StatusBar {
                 }
                 if ctx.workflow {
                     rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
+                }
+                if ctx.yolo {
+                    rest_spans.push(Span::styled(YOLO_LABEL, theme::current().error));
                 }
 
                 let context_text = format!(
@@ -361,7 +366,7 @@ mod tests {
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
 
-    fn render(global_cost: Option<f64>, show_global: bool) -> String {
+    fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
@@ -383,6 +388,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo,
             restoring: false,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
@@ -400,7 +406,7 @@ mod tests {
         global_cost: Option<f64>,
         show_global: bool,
     ) -> bool {
-        let text = render(global_cost, show_global);
+        let text = render(global_cost, show_global, false);
         assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
         let shown = text.matches(SESSION_COST_TEXT).count() == 1;
         assert_eq!(
@@ -409,6 +415,14 @@ mod tests {
             "a sigma carrying another number is a misrender: {text}"
         );
         shown
+    }
+
+    /// Yolo now outlives the process that turned it on, so the one-shot flash
+    /// is no longer enough to tell the user their prompts are being skipped.
+    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
+    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
+    fn the_bar_advertises_yolo(yolo: bool) -> bool {
+        render(None, false, yolo).contains(YOLO_LABEL.trim())
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

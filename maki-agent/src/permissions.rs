@@ -210,6 +210,12 @@ pub struct PermissionManager {
     config_rules: Vec<PermissionRule>,
     builtin_rules: Vec<PermissionRule>,
     yolo: AtomicBool,
+    /// Whether the user set yolo for this session themselves, which is what
+    /// makes it worth persisting.
+    yolo_explicit: AtomicBool,
+    /// What `--yolo` / `always_yolo` seeded `yolo` with, so a session with no
+    /// stored intent falls back to the flag instead of to off.
+    seed_yolo: bool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
@@ -253,6 +259,8 @@ impl PermissionManager {
             session_rules: Mutex::new(Vec::new()),
             config_rules,
             yolo: AtomicBool::new(config.yolo),
+            yolo_explicit: AtomicBool::new(false),
+            seed_yolo: config.yolo,
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd,
@@ -269,6 +277,8 @@ impl PermissionManager {
             config_rules: self.config_rules.clone(),
             builtin_rules: self.builtin_rules.clone(),
             yolo: AtomicBool::new(self.is_yolo()),
+            yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
+            seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
             cwd: self.cwd.clone(),
@@ -418,13 +428,34 @@ impl PermissionManager {
         }
     }
 
+    /// The explicit toggle, so it also claims the session's intent: `/yolo` off
+    /// under `--yolo` genuinely turns the session off and is remembered.
     pub fn toggle_yolo(&self) -> bool {
-        let prev = self.yolo.fetch_xor(true, Ordering::Relaxed);
-        !prev
+        let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
+        self.yolo_explicit.store(true, Ordering::Relaxed);
+        enabled
+    }
+
+    /// Replaces whatever this session was running with: `Some` is the user's
+    /// stored intent, `None` means they never expressed one and the seed
+    /// applies again.
+    pub fn set_session_yolo(&self, stored: Option<bool>) {
+        self.yolo
+            .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
+        self.yolo_explicit
+            .store(stored.is_some(), Ordering::Relaxed);
     }
 
     pub fn is_yolo(&self) -> bool {
         self.yolo.load(Ordering::Relaxed)
+    }
+
+    /// What the session may persist. A one-shot `--yolo` is a property of the
+    /// invocation, so on its own it stores nothing.
+    pub fn persisted_yolo(&self) -> Option<bool> {
+        self.yolo_explicit
+            .load(Ordering::Relaxed)
+            .then(|| self.is_yolo())
     }
 
     /// Outside-cwd paths are not blocked here. They flow through the normal
@@ -1309,6 +1340,55 @@ mod tests {
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
         ));
+    }
+
+    fn seeded_mgr(yolo: bool) -> PermissionManager {
+        mgr_with(
+            PermissionsConfig {
+                yolo,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    /// A fork runs the same session, so it has to answer both questions the
+    /// same way or a respawned agent drifts from the tab that owns it.
+    fn yolo_state(mgr: &PermissionManager) -> (bool, Option<bool>) {
+        let forked = mgr.fork();
+        assert_eq!(
+            (forked.is_yolo(), forked.persisted_yolo()),
+            (mgr.is_yolo(), mgr.persisted_yolo()),
+        );
+        (mgr.is_yolo(), mgr.persisted_yolo())
+    }
+
+    /// A stored intent replaces the seed outright, and no stored intent falls
+    /// back to it: `--yolo` must neither be erased by an untouched session nor
+    /// survive one the user explicitly turned off.
+    #[test_case(false, None        => (false, None)        ; "no_flag_and_no_intent_stays_off")]
+    #[test_case(true,  None        => (true,  None)        ; "the_flag_applies_but_is_never_stored")]
+    #[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
+    #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
+    #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
+    #[test_case(false, Some(false) => (false, Some(false)) ; "stored_off_stays_off")]
+    fn a_stored_yolo_intent_replaces_the_seed(
+        seed: bool,
+        stored: Option<bool>,
+    ) -> (bool, Option<bool>) {
+        let mgr = seeded_mgr(seed);
+        mgr.set_session_yolo(stored);
+        yolo_state(&mgr)
+    }
+
+    /// `/yolo` always drives the effective state, so under `--yolo` it can turn
+    /// the session off, and either way the session now owns the answer.
+    #[test_case(false => (true,  Some(true))  ; "toggling_on_claims_the_session")]
+    #[test_case(true  => (false, Some(false)) ; "toggling_off_under_the_flag_claims_the_session")]
+    fn toggling_yolo_records_the_intent(seed: bool) -> (bool, Option<bool>) {
+        let mgr = seeded_mgr(seed);
+        assert_eq!(mgr.toggle_yolo(), !seed);
+        yolo_state(&mgr)
     }
 
     #[test]

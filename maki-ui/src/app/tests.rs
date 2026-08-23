@@ -40,6 +40,7 @@ const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
+const RESUMED_PROMPT: &str = "carry me over";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
@@ -2398,6 +2399,92 @@ fn yolo_toggle() {
     assert!(!app.permissions.is_yolo());
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.contains("disabled"), "flash={flash:?}");
+}
+
+/// The toggle is session state like mode and thinking, so a checkpoint has to
+/// mirror it or a resume silently downgrades the session's permissions.
+#[test]
+fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
+    let mut app = test_app();
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.yolo, None);
+
+    app.execute_command(cmd("/yolo"), 0);
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.yolo, Some(true));
+
+    app.execute_command(cmd("/yolo"), 0);
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.yolo, Some(false));
+}
+
+fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSession) {
+    let mut app = test_app();
+    if seed {
+        app.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                yolo: true,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        ));
+    }
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.yolo = stored;
+    session.push_message(Message::user(RESUMED_PROMPT.into()));
+    (app, session)
+}
+
+/// The restored permissions, then what the next checkpoint writes back. Both
+/// matter: `--yolo` and `always_yolo` are properties of the invocation, so a
+/// resume under the flag must neither mark an untouched session nor erase the
+/// intent a marked one already carries.
+#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
+#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
+#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
+#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
+#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
+fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
+    let (mut app, session) = app_and_session_with_yolo(seed, stored);
+    app.state.session = Arc::new(session);
+
+    app.restore_resumed_session();
+    app.checkpoint();
+    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+}
+
+/// `focus_session` sends the same key press down this path instead of a fresh
+/// runtime whenever the focused tab is blank and idle, so it has to reach the
+/// same permissions as `resume_applies_stored_yolo`.
+#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
+#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
+#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
+#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
+#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
+fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
+    let (mut app, session) = app_and_session_with_yolo(seed, stored);
+    let model = app.state.model.clone();
+
+    app.apply_loaded_session(session, &model);
+    app.checkpoint();
+    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+}
+
+/// A tab keeps one permission manager for its whole life, so without an
+/// explicit reset `/new` would inherit the resumed session's answer and then
+/// checkpoint it into a session the user never said anything about.
+#[test_case(false => (false, None) ; "a_fresh_session_drops_a_stored_bypass")]
+#[test_case(true  => (true,  None) ; "a_fresh_session_returns_to_the_flag")]
+fn resetting_the_session_falls_back_to_the_yolo_seed(seed: bool) -> (bool, Option<bool>) {
+    let (mut app, session) = app_and_session_with_yolo(seed, Some(!seed));
+    app.state.session = Arc::new(session);
+    app.restore_resumed_session();
+    assert_eq!(app.permissions.is_yolo(), !seed);
+
+    app.reset_session();
+    app.checkpoint();
+    (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
 
 #[test]
