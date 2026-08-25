@@ -265,8 +265,74 @@ Workcell implements MCP `2026-07-28` through the pinned Rust MCP SDK revision in
 - HTTP is stateless Streamable HTTP at `POST /mcp`.
 - Stdio uses the SDK newline-delimited transport.
 - Tool, discovery, and list responses use complete-result envelopes.
-- Cancellation is cooperative; shell calls publish ordered progress when requested.
+- Cancellation is cooperative; shell calls publish ordered progress when requested. Each progress
+  notification includes a bounded, single-line standard `message` field with control and
+  bidirectional formatting characters escaped, plus an `ai.workcell/tool-output-chunk` metadata
+  object with the exact sequence, stream, and text.
 - Tasks, OAuth, legacy sessions, standalone HTTP GET streams, and MCP DELETE are not advertised.
+
+### Live shell output
+
+The `shell` tool streams stdout and stderr through the standard MCP
+[`notifications/progress`](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress)
+mechanism. Shell output is never written as raw data to the server's protocol stdout. A client opts
+in per call by including a unique string or integer `progressToken` in the request `_meta`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "tools/call",
+  "params": {
+    "name": "shell",
+    "arguments": { "command": "make" },
+    "_meta": {
+      "progressToken": "shell-42",
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": {
+        "name": "example-client",
+        "version": "1.0.0"
+      }
+    }
+  }
+}
+```
+
+Workcell then publishes each accepted output chunk before the final tool result:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/progress",
+  "params": {
+    "progressToken": "shell-42",
+    "progress": 1,
+    "message": "[stdout] compiling\\n",
+    "_meta": {
+      "ai.workcell/tool-output-chunk": {
+        "version": 1,
+        "sequence": 1,
+        "stream": "stdout",
+        "text": "compiling\n"
+      }
+    }
+  }
+}
+```
+
+- `progress` and `sequence` increase monotonically; the final result's `finalSequence` identifies the
+  last emitted chunk.
+- `message` is a bounded, single-line display fallback. Exact output remains in the namespaced
+  metadata, including whether it came from stdout or stderr.
+- Stdio clients receive progress as newline-delimited JSON-RPC notifications. HTTP clients receive it
+  on the originating request's SSE response stream.
+- Without a progress token, Workcell still drains and bounds the process pipes but returns output only
+  in the final stdout/stderr tails.
+- Clients must consume notifications while `tools/call` is pending and decide how to render them.
+  Supporting MCP transport alone does not guarantee visible live output.
+- Child programs may buffer output when connected to pipes instead of a terminal. Use program-specific
+  unbuffered or line-buffered modes when immediate output matters.
 
 Clients may negotiate `ai.workcell/execution-environment` version `v1`. The returned descriptor is a
 sanitized startup snapshot containing platform, container evidence, package-manager metadata, enabled

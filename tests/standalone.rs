@@ -18,6 +18,12 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 const TOKEN: &str = "workcell-integration-token-with-more-than-32-bytes";
 
 async fn fixture_server() -> (TempDir, WorkcellServer) {
+    fixture_server_with_policy(ShellPermissionPolicy::restricted()).await
+}
+
+async fn fixture_server_with_policy(
+    shell_policy: ShellPermissionPolicy,
+) -> (TempDir, WorkcellServer) {
     let root = tempfile::tempdir().expect("temporary root");
     tokio::fs::write(root.path().join("visible.txt"), "visible\n")
         .await
@@ -29,11 +35,61 @@ async fn fixture_server() -> (TempDir, WorkcellServer) {
         false,
         &[ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
         true,
-        ShellPermissionPolicy::restricted(),
+        shell_policy,
     )
     .await
     .expect("server");
     (root, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_streams_standard_shell_progress_before_the_result() {
+    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("start MCP service")
+            .waiting()
+            .await
+            .expect("MCP service")
+    });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(&mut write, &discover_request(1, json!({}))).await;
+    read_json(&mut read).await;
+    write_json(
+        &mut write,
+        &mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name": "shell",
+                "arguments": {
+                    "command": "printf live-output"
+                },
+                "_meta": {"progressToken": "shell-progress"}
+            }),
+        ),
+    )
+    .await;
+
+    let first = read_json(&mut read).await;
+    let result = read_json(&mut read).await;
+
+    assert_progress(&first, json!("shell-progress"), 1, "stdout", "live-output");
+    assert_eq!(result["id"], 2);
+    assert_eq!(result["result"]["structuredContent"]["finalSequence"], 1);
+
+    drop(write);
+    drop(read);
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server stopped")
+        .expect("server task");
 }
 
 #[tokio::test]
@@ -205,6 +261,59 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
     assert_eq!(http.shutdown().await, ShutdownOutcome::AlreadyStopped);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn http_streams_standard_shell_progress_before_the_result() {
+    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let mut response = post_rpc(
+        &Client::new(),
+        &endpoint,
+        Some(TOKEN),
+        mcp_request(
+            1,
+            "tools/call",
+            json!({
+                "name": "shell",
+                "arguments": {
+                    "command": "printf http-live"
+                },
+                "_meta": {"progressToken": 17}
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut buffer = Vec::new();
+    let first = next_sse_json(&mut response, &mut buffer).await;
+    let result = next_sse_json(&mut response, &mut buffer).await;
+
+    assert_progress(&first, json!(17), 1, "stdout", "http-live");
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["result"]["structuredContent"]["finalSequence"], 1);
+    assert!(buffer.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), response.chunk())
+            .await
+            .expect("SSE completion timeout")
+            .expect("SSE response body")
+            .is_none()
+    );
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
 async fn post_rpc(client: &Client, endpoint: &str, token: Option<&str>, body: Value) -> Response {
     let method = body["method"].as_str().unwrap();
     let mut request = client
@@ -233,6 +342,70 @@ async fn final_sse_json(response: Response) -> Value {
         .filter_map(|data| serde_json::from_str(data).ok())
         .last()
         .expect("SSE JSON-RPC response")
+}
+
+async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next(),
+        Some("text/event-stream")
+    );
+    loop {
+        let boundary = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|end| (end, 4))
+            .or_else(|| {
+                buffer
+                    .windows(2)
+                    .position(|window| window == b"\n\n")
+                    .map(|end| (end, 2))
+            });
+        if let Some((end, separator_bytes)) = boundary {
+            let event = buffer.drain(..end + separator_bytes).collect::<Vec<_>>();
+            let event = std::str::from_utf8(&event).expect("UTF-8 SSE event");
+            if let Some(data) = event.lines().find_map(|line| {
+                line.strip_prefix("data:")
+                    .map(|data| data.strip_prefix(' ').unwrap_or(data))
+            }) {
+                return serde_json::from_str(data).expect("SSE JSON-RPC message");
+            }
+        }
+        let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk())
+            .await
+            .expect("SSE message timeout")
+            .expect("SSE response body")
+            .expect("SSE stream ended before the final response");
+        buffer.extend_from_slice(&chunk);
+    }
+}
+
+fn assert_progress(
+    message: &Value,
+    expected_token: Value,
+    expected_sequence: u64,
+    expected_stream: &str,
+    expected_text: &str,
+) {
+    assert_eq!(message["method"], "notifications/progress");
+    assert_eq!(message["params"]["progressToken"], expected_token);
+    assert_eq!(message["params"]["progress"], expected_sequence as f64);
+    assert_eq!(
+        message["params"]["message"],
+        format!("[{expected_stream}] {expected_text}")
+    );
+    assert_eq!(
+        message["params"]["_meta"]["ai.workcell/tool-output-chunk"],
+        json!({
+            "version": 1,
+            "sequence": expected_sequence,
+            "stream": expected_stream,
+            "text": expected_text
+        })
+    );
 }
 
 fn request_meta(capabilities: Value) -> Value {
