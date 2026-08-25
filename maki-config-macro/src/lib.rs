@@ -53,6 +53,7 @@ struct FieldAttrs {
     default_doc: Option<LitStr>,
     min: Option<Expr>,
     desc: Option<String>,
+    env: Option<String>,
     key: Option<String>,
     ty_override: Option<String>,
     val: Option<String>,
@@ -102,6 +103,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
         default_doc: None,
         min: None,
         desc: None,
+        env: None,
         key: None,
         ty_override: None,
         val: None,
@@ -137,6 +139,11 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                 "desc" => {
                     if let ConfigAttrValue::Str(lit) = item.value {
                         attrs.desc = Some(lit.value());
+                    }
+                }
+                "env" => {
+                    if let ConfigAttrValue::Str(lit) = item.value {
+                        attrs.env = Some(lit.value());
                     }
                 }
                 "key" => {
@@ -238,6 +245,10 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
             Some(m) => quote! { Some(#m as u64) },
             None => quote! { None },
         };
+        let env_expr = match &attrs.env {
+            Some(e) => quote! { Some(#e) },
+            None => quote! { None },
+        };
 
         fields_entries.push(quote! {
             ConfigField {
@@ -245,6 +256,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ty: #ty_name,
                 default: #default_expr,
                 min: #min_expr,
+                env: #env_expr,
                 description: #desc,
             }
         });

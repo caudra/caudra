@@ -9,33 +9,37 @@ use maki_config::{
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
-fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
-    writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
-    writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
-    for f in fields {
-        let default = f.default.format_default();
-        let min = f.min.map_or("-".to_string(), |v| v.to_string());
-        writeln!(
-            out,
-            "| `{name}` | {ty} | `{default}` | {min} | {desc} |",
-            name = f.name,
-            ty = escape_pipes(f.ty),
-            desc = f.description,
-        )
-        .unwrap();
-    }
-}
+type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
-fn write_table_no_min(out: &mut String, fields: &[ConfigField]) {
-    writeln!(out, "| Field | Type | Default | Description |").unwrap();
-    writeln!(out, "|-------|------|---------|-------------|").unwrap();
+fn write_table(out: &mut String, fields: &[ConfigField]) {
+    let extra: Option<ExtraColumn> = if fields.iter().any(|f| f.env.is_some()) {
+        Some(("Env", |f| {
+            f.env.map_or("-".to_string(), |e| {
+                e.split(", ")
+                    .map(|v| format!("`{v}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        }))
+    } else if fields.iter().any(|f| f.min.is_some()) {
+        Some(("Min", |f| f.min.map_or("-".to_string(), |v| v.to_string())))
+    } else {
+        None
+    };
+
+    let (header, rule) = extra.map_or((String::new(), ""), |(name, _)| {
+        (format!(" {name} |"), "-----|")
+    });
+    writeln!(out, "| Field | Type | Default |{header} Description |").unwrap();
+    writeln!(out, "|-------|------|---------|{rule}-------------|").unwrap();
     for f in fields {
-        let default = f.default.format_default();
+        let cell = extra.map_or(String::new(), |(_, cell)| format!(" {} |", cell(f)));
         writeln!(
             out,
-            "| `{name}` | {ty} | `{default}` | {desc} |",
+            "| `{name}` | {ty} | `{default}` |{cell} {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
+            default = f.default.format_default(),
             desc = f.description,
         )
         .unwrap();
@@ -44,10 +48,6 @@ fn write_table_no_min(out: &mut String, fields: &[ConfigField]) {
 
 fn escape_pipes(ty: &str) -> String {
     ty.replace('|', "\\|")
-}
-
-fn has_any_min(fields: &[ConfigField]) -> bool {
-    fields.iter().any(|f| f.min.is_some())
 }
 
 fn lua_section_name(heading: &str) -> String {
@@ -60,11 +60,7 @@ fn lua_section_name(heading: &str) -> String {
 fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
     let lua_name = lua_section_name(heading);
     writeln!(out, "### `{lua_name}`\n").unwrap();
-    if has_any_min(fields) {
-        write_table_with_min(out, fields);
-    } else {
-        write_table_no_min(out, fields);
-    }
+    write_table(out, fields);
     writeln!(out).unwrap();
 }
 
@@ -142,9 +138,9 @@ fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
         out,
-        "Every field also has an environment variable, listed above, and the \
-         variable wins. See [Telemetry](/docs/telemetry/) for the full \
-         picture.\n"
+        "Every field also has an environment variable, shown in the Env \
+         column, and the variable wins. See [Telemetry](/docs/telemetry/) \
+         for the full picture.\n"
     )
     .unwrap();
 }
@@ -238,7 +234,7 @@ All fields are optional. Typos in field names cause an error right away.
     .unwrap();
 
     writeln!(out, "### Top-level\n").unwrap();
-    write_table_no_min(&mut out, TOP_LEVEL_FIELDS);
+    write_table(&mut out, TOP_LEVEL_FIELDS);
     writeln!(out).unwrap();
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);

@@ -107,6 +107,7 @@ pub struct ConfigField {
     pub ty: &'static str,
     pub default: ConfigValue,
     pub min: Option<u64>,
+    pub env: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -116,6 +117,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        env: None,
         description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
     },
     ConfigField {
@@ -123,6 +125,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        env: None,
         description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
     },
     ConfigField {
@@ -130,6 +133,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        env: None,
         description: "Start every session with workflow mode (task callable inside code_execution)",
     },
     ConfigField {
@@ -137,6 +141,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool | string",
         default: ConfigValue::Bool(false),
         min: None,
+        env: None,
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
 ];
@@ -1281,123 +1286,153 @@ impl StorageConfig {
 #[config(section = "telemetry")]
 pub struct TelemetryConfig {
     #[config(default = None, ty = "bool", default_doc = "false",
-             desc = "Master switch. Env: `MAKI_ENABLE_TELEMETRY`")]
+             env = "MAKI_ENABLE_TELEMETRY",
+             desc = "Master switch")]
     pub enabled: Option<bool>,
 
     #[config(default = None, ty = "string", default_doc = "none",
-             desc = "Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_METRICS_EXPORTER`")]
+             env = "OTEL_METRICS_EXPORTER",
+             desc = "Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub metrics_exporter: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "none",
-             desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_LOGS_EXPORTER`")]
+             env = "OTEL_LOGS_EXPORTER",
+             desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub logs_exporter: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`. Env: `OTEL_EXPORTER_OTLP_PROTOCOL`")]
+             env = "OTEL_EXPORTER_OTLP_PROTOCOL",
+             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`")]
     pub protocol: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. Env: `OTEL_EXPORTER_OTLP_ENDPOINT`")]
+             env = "OTEL_EXPORTER_OTLP_ENDPOINT",
+             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`")]
     pub endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
-             desc = "Extra headers sent with every export. Env: `OTEL_EXPORTER_OTLP_HEADERS`")]
+             env = "OTEL_EXPORTER_OTLP_HEADERS",
+             desc = "Extra headers sent with every export")]
     pub headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "10000",
-             desc = "Per-export request timeout (ms). Env: `OTEL_EXPORTER_OTLP_TIMEOUT`")]
+             env = "OTEL_EXPORTER_OTLP_TIMEOUT",
+             desc = "Per-export request timeout (ms)")]
     pub timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "none",
-             desc = "Payload compression: `gzip` or `none`. Env: `OTEL_EXPORTER_OTLP_COMPRESSION`")]
+             env = "OTEL_EXPORTER_OTLP_COMPRESSION",
+             desc = "Payload compression: `gzip` or `none`")]
     pub compression: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "Metrics-only protocol override. Env: `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`")]
+             env = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+             desc = "Metrics-only protocol override")]
     pub metrics_protocol: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "Metrics-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`")]
+             env = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+             desc = "Metrics-only endpoint, used verbatim with no path appended")]
     pub metrics_endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
-             desc = "Metrics-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_METRICS_HEADERS`")]
+             env = "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+             desc = "Metrics-only headers, merged over `headers`")]
     pub metrics_headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "-",
-             desc = "Metrics-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`")]
+             env = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+             desc = "Metrics-only request timeout (ms)")]
     pub metrics_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "Logs-only protocol override. Env: `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`")]
+             env = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+             desc = "Logs-only protocol override")]
     pub logs_protocol: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "-",
-             desc = "Logs-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`")]
+             env = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+             desc = "Logs-only endpoint, used verbatim with no path appended")]
     pub logs_endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
-             desc = "Logs-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_LOGS_HEADERS`")]
+             env = "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+             desc = "Logs-only headers, merged over `headers`")]
     pub logs_headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "-",
-             desc = "Logs-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT`")]
+             env = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+             desc = "Logs-only request timeout (ms)")]
     pub logs_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "60000",
-             desc = "How often metrics are exported (ms). Env: `OTEL_METRIC_EXPORT_INTERVAL`")]
+             env = "OTEL_METRIC_EXPORT_INTERVAL",
+             desc = "How often metrics are exported (ms)")]
     pub metrics_interval_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "30000",
-             desc = "Deadline for one metrics export, retries included (ms). Env: `OTEL_METRIC_EXPORT_TIMEOUT`")]
+             env = "OTEL_METRIC_EXPORT_TIMEOUT",
+             desc = "Deadline for one metrics export, retries included (ms)")]
     pub metrics_export_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "5000",
-             desc = "How often queued events are flushed (ms). Env: `OTEL_LOGS_EXPORT_INTERVAL` or `OTEL_BLRP_SCHEDULE_DELAY`")]
+             env = "OTEL_LOGS_EXPORT_INTERVAL, OTEL_BLRP_SCHEDULE_DELAY",
+             desc = "How often queued events are flushed (ms)")]
     pub logs_interval_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "2048",
-             desc = "Event queue capacity. Events are dropped and counted when it is full. Env: `OTEL_BLRP_MAX_QUEUE_SIZE`")]
+             env = "OTEL_BLRP_MAX_QUEUE_SIZE",
+             desc = "Event queue capacity. Events are dropped and counted when it is full")]
     pub logs_max_queue_size: Option<usize>,
 
     #[config(default = None, ty = "integer", default_doc = "512",
-             desc = "Maximum events per export request. Env: `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`")]
+             env = "OTEL_BLRP_MAX_EXPORT_BATCH_SIZE",
+             desc = "Maximum events per export request")]
     pub logs_max_export_batch_size: Option<usize>,
 
     #[config(default = None, ty = "integer", default_doc = "30000",
-             desc = "Deadline for one events export, retries included (ms). Env: `OTEL_BLRP_EXPORT_TIMEOUT`")]
+             env = "OTEL_BLRP_EXPORT_TIMEOUT",
+             desc = "Deadline for one events export, retries included (ms)")]
     pub logs_export_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "delta",
-             desc = "Metric temporality: `delta` or `cumulative`. Env: `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`")]
+             env = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+             desc = "Metric temporality: `delta` or `cumulative`")]
     pub metrics_temporality: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "maki",
-             desc = "`service.name` on the exported resource. Env: `OTEL_SERVICE_NAME`")]
+             env = "OTEL_SERVICE_NAME",
+             desc = "`service.name` on the exported resource")]
     pub service_name: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
-             desc = "Extra resource attributes, your place for team or environment labels. Env: `OTEL_RESOURCE_ATTRIBUTES`")]
+             env = "OTEL_RESOURCE_ATTRIBUTES",
+             desc = "Extra resource attributes, your place for team or environment labels")]
     pub resource_attributes: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "bool", default_doc = "true",
-             desc = "Attach `session.id` to metrics. Turn off to keep metric cardinality low. Env: `OTEL_METRICS_INCLUDE_SESSION_ID`")]
+             env = "OTEL_METRICS_INCLUDE_SESSION_ID",
+             desc = "Attach `session.id` to metrics. Turn off to keep metric cardinality low")]
     pub metrics_include_session_id: Option<bool>,
 
     #[config(default = None, ty = "bool", default_doc = "false",
-             desc = "Attach `app.version` to metrics. Env: `OTEL_METRICS_INCLUDE_VERSION`")]
+             env = "OTEL_METRICS_INCLUDE_VERSION",
+             desc = "Attach `app.version` to metrics")]
     pub metrics_include_version: Option<bool>,
 
     #[config(default = None, ty = "bool", default_doc = "false",
-             desc = "Include prompt text in `maki.user_prompt` events. Off by default. Env: `OTEL_LOG_USER_PROMPTS`")]
+             env = "OTEL_LOG_USER_PROMPTS",
+             desc = "Include prompt text in `maki.user_prompt` events. Off by default")]
     pub log_user_prompts: Option<bool>,
 
     #[config(default = None, ty = "bool", default_doc = "false",
-             desc = "Include tool input in `maki.tool_result` events. Off by default. Env: `OTEL_LOG_TOOL_DETAILS`")]
+             env = "OTEL_LOG_TOOL_DETAILS",
+             desc = "Include tool input in `maki.tool_result` events. Off by default")]
     pub log_tool_details: Option<bool>,
 
     #[config(default = None, ty = "integer", default_doc = "10240",
-             desc = "Character cap on any logged prompt or tool input. Env: `MAKI_OTEL_CONTENT_MAX_LENGTH`")]
+             env = "MAKI_OTEL_CONTENT_MAX_LENGTH",
+             desc = "Character cap on any logged prompt or tool input")]
     pub content_max_length: Option<usize>,
 }
 

@@ -138,40 +138,40 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 
 ### `telemetry`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Master switch. Env: `MAKI_ENABLE_TELEMETRY` |
-| `metrics_exporter` | string | `none` | Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_METRICS_EXPORTER` |
-| `logs_exporter` | string | `none` | Where events go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_LOGS_EXPORTER` |
-| `protocol` | string | `-` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`. Env: `OTEL_EXPORTER_OTLP_PROTOCOL` |
-| `endpoint` | string | `-` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. Env: `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| `headers` | table | `{}` | Extra headers sent with every export. Env: `OTEL_EXPORTER_OTLP_HEADERS` |
-| `timeout_ms` | integer | `10000` | Per-export request timeout (ms). Env: `OTEL_EXPORTER_OTLP_TIMEOUT` |
-| `compression` | string | `none` | Payload compression: `gzip` or `none`. Env: `OTEL_EXPORTER_OTLP_COMPRESSION` |
-| `metrics_protocol` | string | `-` | Metrics-only protocol override. Env: `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` |
-| `metrics_endpoint` | string | `-` | Metrics-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` |
-| `metrics_headers` | table | `{}` | Metrics-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_METRICS_HEADERS` |
-| `metrics_timeout_ms` | integer | `-` | Metrics-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` |
-| `logs_protocol` | string | `-` | Logs-only protocol override. Env: `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` |
-| `logs_endpoint` | string | `-` | Logs-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` |
-| `logs_headers` | table | `{}` | Logs-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_LOGS_HEADERS` |
-| `logs_timeout_ms` | integer | `-` | Logs-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` |
-| `metrics_interval_ms` | integer | `60000` | How often metrics are exported (ms). Env: `OTEL_METRIC_EXPORT_INTERVAL` |
-| `metrics_export_timeout_ms` | integer | `30000` | Deadline for one metrics export, retries included (ms). Env: `OTEL_METRIC_EXPORT_TIMEOUT` |
-| `logs_interval_ms` | integer | `5000` | How often queued events are flushed (ms). Env: `OTEL_LOGS_EXPORT_INTERVAL` or `OTEL_BLRP_SCHEDULE_DELAY` |
-| `logs_max_queue_size` | integer | `2048` | Event queue capacity. Events are dropped and counted when it is full. Env: `OTEL_BLRP_MAX_QUEUE_SIZE` |
-| `logs_max_export_batch_size` | integer | `512` | Maximum events per export request. Env: `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` |
-| `logs_export_timeout_ms` | integer | `30000` | Deadline for one events export, retries included (ms). Env: `OTEL_BLRP_EXPORT_TIMEOUT` |
-| `metrics_temporality` | string | `delta` | Metric temporality: `delta` or `cumulative`. Env: `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` |
-| `service_name` | string | `maki` | `service.name` on the exported resource. Env: `OTEL_SERVICE_NAME` |
-| `resource_attributes` | table | `{}` | Extra resource attributes, your place for team or environment labels. Env: `OTEL_RESOURCE_ATTRIBUTES` |
-| `metrics_include_session_id` | bool | `true` | Attach `session.id` to metrics. Turn off to keep metric cardinality low. Env: `OTEL_METRICS_INCLUDE_SESSION_ID` |
-| `metrics_include_version` | bool | `false` | Attach `app.version` to metrics. Env: `OTEL_METRICS_INCLUDE_VERSION` |
-| `log_user_prompts` | bool | `false` | Include prompt text in `maki.user_prompt` events. Off by default. Env: `OTEL_LOG_USER_PROMPTS` |
-| `log_tool_details` | bool | `false` | Include tool input in `maki.tool_result` events. Off by default. Env: `OTEL_LOG_TOOL_DETAILS` |
-| `content_max_length` | integer | `10240` | Character cap on any logged prompt or tool input. Env: `MAKI_OTEL_CONTENT_MAX_LENGTH` |
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `enabled` | bool | `false` | `MAKI_ENABLE_TELEMETRY` | Master switch |
+| `metrics_exporter` | string | `none` | `OTEL_METRICS_EXPORTER` | Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix |
+| `logs_exporter` | string | `none` | `OTEL_LOGS_EXPORTER` | Where events go: `otlp`, `console`, `none`, or a comma-separated mix |
+| `protocol` | string | `-` | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp` |
+| `endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs` |
+| `headers` | table | `{}` | `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers sent with every export |
+| `timeout_ms` | integer | `10000` | `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export request timeout (ms) |
+| `compression` | string | `none` | `OTEL_EXPORTER_OTLP_COMPRESSION` | Payload compression: `gzip` or `none` |
+| `metrics_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | Metrics-only protocol override |
+| `metrics_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-only endpoint, used verbatim with no path appended |
+| `metrics_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Metrics-only headers, merged over `headers` |
+| `metrics_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metrics-only request timeout (ms) |
+| `logs_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Logs-only protocol override |
+| `logs_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Logs-only endpoint, used verbatim with no path appended |
+| `logs_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Logs-only headers, merged over `headers` |
+| `logs_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Logs-only request timeout (ms) |
+| `metrics_interval_ms` | integer | `60000` | `OTEL_METRIC_EXPORT_INTERVAL` | How often metrics are exported (ms) |
+| `metrics_export_timeout_ms` | integer | `30000` | `OTEL_METRIC_EXPORT_TIMEOUT` | Deadline for one metrics export, retries included (ms) |
+| `logs_interval_ms` | integer | `5000` | `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_BLRP_SCHEDULE_DELAY` | How often queued events are flushed (ms) |
+| `logs_max_queue_size` | integer | `2048` | `OTEL_BLRP_MAX_QUEUE_SIZE` | Event queue capacity. Events are dropped and counted when it is full |
+| `logs_max_export_batch_size` | integer | `512` | `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` | Maximum events per export request |
+| `logs_export_timeout_ms` | integer | `30000` | `OTEL_BLRP_EXPORT_TIMEOUT` | Deadline for one events export, retries included (ms) |
+| `metrics_temporality` | string | `delta` | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality: `delta` or `cumulative` |
+| `service_name` | string | `maki` | `OTEL_SERVICE_NAME` | `service.name` on the exported resource |
+| `resource_attributes` | table | `{}` | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, your place for team or environment labels |
+| `metrics_include_session_id` | bool | `true` | `OTEL_METRICS_INCLUDE_SESSION_ID` | Attach `session.id` to metrics. Turn off to keep metric cardinality low |
+| `metrics_include_version` | bool | `false` | `OTEL_METRICS_INCLUDE_VERSION` | Attach `app.version` to metrics |
+| `log_user_prompts` | bool | `false` | `OTEL_LOG_USER_PROMPTS` | Include prompt text in `maki.user_prompt` events. Off by default |
+| `log_tool_details` | bool | `false` | `OTEL_LOG_TOOL_DETAILS` | Include tool input in `maki.tool_result` events. Off by default |
+| `content_max_length` | integer | `10240` | `MAKI_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
 
-Every field also has an environment variable, listed above, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
+Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
 
 ## Plugins
 
