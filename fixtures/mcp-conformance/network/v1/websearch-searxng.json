@@ -1,0 +1,74 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.searxng-normalization",
+  "provenance": [
+    "rust/crates/mcp-web/src/search/searxng.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "workcell",
+    "categories": "general,news",
+    "language": "en",
+    "time_range": "month",
+    "safesearch": 1,
+    "limit": 5
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "searxng",
+    "endpoint": "https://search.example.test/search"
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://search.example.test/search?q=workcell&format=json&results_on_new_tab=0&pageno=1&categories=general%2Cnews&language=en&time_range=month&safesearch=1",
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "jsonBody": {
+          "query": "workcell",
+          "number_of_results": 42,
+          "results": [
+            {
+              "title": "Workcell",
+              "url": "https://workcell.example/",
+              "content": "Canvas-first research workspace.",
+              "engine": ["demo"],
+              "iconDataUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "1. Workcell [demo]\n   URL: https://workcell.example/\n   Canvas-first research workspace.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "searxng",
+      "query": "workcell",
+      "resultsFound": 42,
+      "results": [
+        {
+          "title": "Workcell",
+          "url": "https://workcell.example/",
+          "snippet": "Canvas-first research workspace.",
+          "engine": "demo",
+          "iconDataUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "url": "https://search.example.test/search?q=workcell&format=json&results_on_new_tab=0&pageno=1&categories=general%2Cnews&language=en&time_range=month&safesearch=1",
+        "headers": {
+          "accept": "application/json",
+          "user-agent": "Workcell-ToolRuntime/0.1"
+        }
+      }
+    ]
+  }
+}

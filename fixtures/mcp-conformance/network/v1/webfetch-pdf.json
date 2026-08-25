@@ -1,0 +1,57 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.webfetch.pdf-extract-dispatch",
+  "provenance": [
+    "rust/crates/mcp-web/src/fetch/pdf_response.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "webfetch",
+  "input": {
+    "url": "https://example.test/study.pdf"
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://example.test/study.pdf",
+        "status": 200,
+        "headers": {
+          "content-type": "application/pdf"
+        },
+        "bodyAsset": "assets/network/study.pdf",
+        "repeat": true
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    },
+    "pdfExtractor": {
+      "expectedInputPrefix": "%PDF-",
+      "result": {
+        "text": "PDF body text with useful research evidence.",
+        "title": "PDF Study"
+      }
+    }
+  },
+  "expected": {
+    "contentText": "PDF body text with useful research evidence.",
+    "structuredContent": {
+      "kind": "webfetch",
+      "url": "https://example.test/study.pdf",
+      "finalUrl": "https://example.test/study.pdf",
+      "contentType": "application/pdf",
+      "format": "markdown",
+      "pdfMode": "extract",
+      "status": 200,
+      "title": "PDF Study",
+      "output": "PDF body text with useful research evidence.",
+      "truncated": false
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://example.test/study.pdf"
+      }
+    ]
+  }
+}

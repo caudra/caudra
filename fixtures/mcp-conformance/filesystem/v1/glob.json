@@ -1,0 +1,60 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.glob.recursive-markdown",
+  "provenance": [
+    "rust/crates/mcp-files/src/glob.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_glob",
+  "input": {
+    "pattern": "**/*.md"
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "{\n  \"cwd\": \"{{ROOT}}\",\n  \"relativePath\": \".\",\n  \"pattern\": \"**/*.md\",\n  \"files\": [\n    {\n      \"path\": \"{{ROOT}}/docs/guide.md\",\n      \"relativePath\": \"docs/guide.md\",\n      \"sizeBytes\": 8,\n      \"lineCount\": 2\n    }\n  ],\n  \"count\": 1,\n  \"truncated\": false\n}",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "**/*.md",
+      "files": [
+        {
+          "path": "{{ROOT}}/docs/guide.md",
+          "relativePath": "docs/guide.md",
+          "sizeBytes": 8,
+          "lineCount": 2
+        }
+      ],
+      "count": 1,
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

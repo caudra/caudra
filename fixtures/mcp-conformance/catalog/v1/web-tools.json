@@ -1,0 +1,87 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.web.intended.v1",
+  "catalogKind": "intended-mcp-projection",
+  "provenance": [
+    "crates/mcp-web/src/catalog.rs",
+    "crates/mcp-web/src/search/exa_mcp.rs",
+    "crates/mcp-web/tests/web_tools.rs"
+  ],
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{CURRENT_YEAR}}",
+        "source": "current UTC calendar year in the websearch description"
+      }
+    ]
+  },
+  "expected": {
+    "tools": [
+      {
+        "name": "websearch",
+        "description": "Search the web using Exa's credential-free hosted MCP service.\n\n- Search queries are sent to the third-party service at mcp.exa.ai.\n- Returns normalized titles, URLs, highlighted snippets, and optional source icon metadata.\n- Use semantically rich descriptions of the ideal page rather than short keyword lists.\n- Add category:company, category:people, category:news, category:research paper, or category:personal site to the query when useful.\n- Prefer precise queries with the current year for recent information.\n- Use webfetch after search identifies a page that needs detailed analysis.\n\nThe current year is {{CURRENT_YEAR}}.",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["query"],
+          "properties": {
+            "query": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "Natural-language search query sent to Exa's hosted MCP service. Maximum 512 characters."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 25,
+              "description": "Maximum results to return. Defaults to 10."
+            },
+            "timeoutSec": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60,
+              "description": "Request timeout in seconds. Defaults to 10."
+            }
+          }
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "web.search.v1"
+        }
+      },
+      {
+        "name": "webfetch",
+        "description": "Fetch content from a URL and return model-facing text.\n\n- The url parameter must be http or https.\n- The format parameter can be markdown, text, or html. It defaults to markdown.\n- The pdfMode parameter can be extract or attachment. It defaults to extract.\n- The timeout parameter is optional, in seconds, defaults to 30, and is capped at 60.\n- HTML pages are simplified for markdown/text output and script/style content is removed.\n- PDF responses are parsed to extracted text by default. Use pdfMode='attachment' to preserve the PDF as a data:application/pdf attachment without text extraction.\n- Model-facing output is bounded and may be truncated; structured metadata preserves URL, content type, format, status, and source icon metadata when available.\n- Use websearch first when you need to discover candidate URLs.",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url"],
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "HTTP(S) URL to fetch."
+            },
+            "format": {
+              "type": "string",
+              "enum": ["markdown", "text", "html"],
+              "description": "Output format."
+            },
+            "pdfMode": {
+              "type": "string",
+              "enum": ["extract", "attachment"],
+              "description": "PDF handling mode. Defaults to extract."
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60,
+              "description": "Timeout in seconds. Defaults to 30, max 60."
+            }
+          }
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "web.source.v1"
+        }
+      }
+    ]
+  }
+}

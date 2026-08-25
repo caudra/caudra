@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: new.txt
+@@
+-one
++ONE
+ three
+*** Add File: added.txt
++added
+*** End Patch

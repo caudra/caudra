@@ -1,0 +1,70 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.apply-patch.update-and-add",
+  "provenance": [
+    "rust/crates/mcp-files/src/patch.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_apply_patch",
+  "input": {
+    "patchText": {
+      "$asset": "assets/filesystem/update-and-add.patch",
+      "encoding": "utf8"
+    }
+  },
+  "configuration": {
+    "allowWrite": true
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "new.txt",
+        "asset": "assets/filesystem/new-three.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "{\n  \"kind\": \"patch\",\n  \"applied\": true,\n  \"diff\": \"--- new.txt\\n+++ new.txt\\n@@ -1,2 +1,2 @@\\n-one\\n+ONE\\n three\\n--- added.txt\\n+++ added.txt\\n@@ -1,0 +1,1 @@\\n+added\",\n  \"files\": [\n    {\n      \"filePath\": \"{{ROOT}}/new.txt\",\n      \"relativePath\": \"new.txt\",\n      \"type\": \"update\",\n      \"patch\": \"--- new.txt\\n+++ new.txt\\n@@ -1,2 +1,2 @@\\n-one\\n+ONE\\n three\",\n      \"additions\": 1,\n      \"deletions\": 1\n    },\n    {\n      \"filePath\": \"{{ROOT}}/added.txt\",\n      \"relativePath\": \"added.txt\",\n      \"type\": \"add\",\n      \"patch\": \"--- added.txt\\n+++ added.txt\\n@@ -1,0 +1,1 @@\\n+added\",\n      \"additions\": 1,\n      \"deletions\": 0\n    }\n  ]\n}",
+    "structuredContent": {
+      "kind": "patch",
+      "applied": true,
+      "diff": "--- new.txt\n+++ new.txt\n@@ -1,2 +1,2 @@\n-one\n+ONE\n three\n--- added.txt\n+++ added.txt\n@@ -1,0 +1,1 @@\n+added",
+      "files": [
+        {
+          "filePath": "{{ROOT}}/new.txt",
+          "relativePath": "new.txt",
+          "type": "update",
+          "patch": "--- new.txt\n+++ new.txt\n@@ -1,2 +1,2 @@\n-one\n+ONE\n three",
+          "additions": 1,
+          "deletions": 1
+        },
+        {
+          "filePath": "{{ROOT}}/added.txt",
+          "relativePath": "added.txt",
+          "type": "add",
+          "patch": "--- added.txt\n+++ added.txt\n@@ -1,0 +1,1 @@\n+added",
+          "additions": 1,
+          "deletions": 0
+        }
+      ]
+    },
+    "postFilesystem": [
+      {
+        "path": "added.txt",
+        "asset": "assets/filesystem/added.txt"
+      },
+      {
+        "path": "new.txt",
+        "asset": "assets/filesystem/new-patched.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

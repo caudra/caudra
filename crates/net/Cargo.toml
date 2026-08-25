@@ -1,0 +1,29 @@
+[package]
+name = "workcell-net"
+description = "Bounded outbound HTTP and SSRF policy for Workcell tools"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+httpdate = "1.0.3"
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

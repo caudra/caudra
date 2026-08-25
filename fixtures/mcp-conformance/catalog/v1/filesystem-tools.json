@@ -1,0 +1,229 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.filesystem.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-mcp",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-files/src/catalog.rs",
+    "rust/crates/mcp-files/tests/catalog_dispatch.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "file_read",
+        "title": "Read file or directory",
+        "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The filePath parameter can be absolute or file-root-relative.\n- An empty filePath is treated as \".\" and reads the file root directory.\n- By default, this tool returns up to 2000 lines from the start of the file.\n- The offset parameter is the line number to start from (1-indexed).\n- To read later sections, call this tool again with a larger offset.\n- Use file_grep to find specific content in large files or files with long lines.\n- If you are unsure of the correct file path, use file_glob to look up filenames by glob pattern.\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. Directories return sorted entries one per line, with a trailing `/` for subdirectories.\n- Any line longer than 2000 characters is truncated, and total model-facing output is byte-limited.\n- Avoid tiny repeated slices. If you need more context, read a larger window.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute path inside the configured root."
+            },
+            "offset": {
+              "description": "1-indexed starting line.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "description": "Maximum lines to return.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": ["filePath"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.read.v1"
+        }
+      },
+      {
+        "name": "file_glob",
+        "title": "Glob files",
+        "description": "Fast file pattern matching tool for files under the file root.\n\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\".\n- Returns matching file paths with byte sizes and line counts for bounded text files.\n- Use this tool when you need to find files by name patterns.\n- The optional path parameter limits the search root. Omit it to search the file root.\n- An empty path is treated as \".\".\n- Results skip .git and node_modules and are truncated to a safe result limit.\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, prefer a higher-level sidequest/task flow once available.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Glob pattern supporting *, **, ?, and brace alternatives."
+            },
+            "path": {
+              "description": "Optional directory under the configured root.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["pattern"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.list.v1"
+        }
+      },
+      {
+        "name": "file_grep",
+        "title": "Search file contents",
+        "description": "Fast content search tool for files under the file root.\n\n- Searches file contents using linear-time regular expressions.\n- Supports common regex syntax such as alternation, groups, classes, and repetition. Look-around and backreferences are rejected to guarantee bounded matching time.\n- Filter files by pattern with the include parameter, for example \"*.js\" or \"*.{ts,tsx}\".\n- An empty path is treated as \".\", and an empty include filter is ignored.\n- Returns file paths, line numbers, and matching lines.\n- Use this tool when you need to find files containing specific patterns.\n- For filtering the output of a shell command pipeline, use shell with rg when available, falling back to grep only when rg is unavailable.\n- Results skip binary files, .git, and node_modules and are truncated to a safe match limit.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Linear-time regular expression without look-around or backreferences."
+            },
+            "path": {
+              "description": "Optional file or directory under the root.",
+              "type": "string",
+              "minLength": 1
+            },
+            "include": {
+              "description": "Optional file glob filter.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["pattern"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.search.v1"
+        }
+      },
+      {
+        "name": "file_write",
+        "title": "Write file",
+        "description": "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provided path.\n- If this is an existing file, use file_read first to understand the current file contents.\n- Prefer file_edit for existing files when you are making targeted changes.\n- Do not create documentation files unless the user explicitly requested documentation.\n- Only use emojis if the user explicitly requests them.\n- This tool is mutating and should run only after a permission decision that shows the diff preview.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "File path inside the configured root."
+            },
+            "content": {
+              "type": "string",
+              "description": "Complete UTF-8 text content."
+            },
+            "dryRun": {
+              "description": "Preview the diff without changing the filesystem.",
+              "type": "boolean"
+            }
+          },
+          "required": ["filePath", "content"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.diff.v1"
+        }
+      },
+      {
+        "name": "file_edit",
+        "title": "Edit file",
+        "description": "Performs exact string replacements in files.\n\nUsage:\n- Use file_read before editing so oldString matches the current file contents.\n- When editing text from file_read output, preserve exact indentation after the line number prefix. Never include the line number prefix in oldString or newString.\n- Prefer file_edit for existing files. Use file_write only for new files or intentional full rewrites.\n- The edit fails if oldString is not found.\n- The edit fails if oldString is found multiple times. Provide more surrounding context or use replaceAll for intentional bulk replacements.\n- Only use emojis if the user explicitly requests them.\n- This tool is mutating and should run only after a permission decision that shows the diff preview.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "File path inside the configured root."
+            },
+            "oldString": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Exact text to replace."
+            },
+            "newString": {
+              "type": "string",
+              "description": "Replacement text."
+            },
+            "replaceAll": {
+              "description": "Replace every exact match.",
+              "type": "boolean"
+            },
+            "dryRun": {
+              "description": "Preview the diff without changing the filesystem.",
+              "type": "boolean"
+            }
+          },
+          "required": ["filePath", "oldString", "newString"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.diff.v1"
+        }
+      },
+      {
+        "name": "file_apply_patch",
+        "title": "Apply file patch",
+        "description": "Use file_apply_patch to edit files with a stripped-down, file-oriented diff format. The patch language is designed to be easy to parse and safe to review.\n\nEnvelope:\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nSupported sections:\n- *** Add File: <path> creates a new file. Every following line is a + line.\n- *** Delete File: <path> deletes an existing file.\n- *** Update File: <path> patches an existing file, optionally followed by *** Move to: <path>.\n\nExample:\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.ts\n@@ const greeting =\n-const greeting = \"hi\";\n+const greeting = \"hello\";\n*** End Patch\n```\n\nRules:\n- You must include Begin Patch and End Patch markers.\n- You must include an action header for each file.\n- Prefix new lines with + even when creating a file.\n- This tool is mutating and should run only after a permission decision that shows the full patch preview.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "patchText": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Complete stripped-down file patch."
+            },
+            "dryRun": {
+              "description": "Validate and preview the patch without changing files.",
+              "type": "boolean"
+            }
+          },
+          "required": ["patchText"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.diff.v1"
+        }
+      }
+    ]
+  }
+}

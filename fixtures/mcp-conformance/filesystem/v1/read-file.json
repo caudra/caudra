@@ -1,0 +1,50 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.read.file-window",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_read",
+  "input": {
+    "filePath": "notes.txt",
+    "offset": 2,
+    "limit": 2
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "{\n  \"kind\": \"file\",\n  \"path\": \"{{ROOT}}/notes.txt\",\n  \"relativePath\": \"notes.txt\",\n  \"text\": \"beta\\nalpha beta\",\n  \"numberedText\": \"2: beta\\n3: alpha beta\",\n  \"lineStart\": 2,\n  \"lineEnd\": 3,\n  \"totalLines\": 4,\n  \"truncated\": true\n}",
+    "structuredContent": {
+      "kind": "file",
+      "path": "{{ROOT}}/notes.txt",
+      "relativePath": "notes.txt",
+      "text": "beta\nalpha beta",
+      "numberedText": "2: beta\n3: alpha beta",
+      "lineStart": 2,
+      "lineEnd": 3,
+      "totalLines": 4,
+      "truncated": true
+    },
+    "postFilesystem": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

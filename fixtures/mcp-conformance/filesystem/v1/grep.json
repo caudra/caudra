@@ -1,0 +1,60 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.grep.anchored-with-include",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_grep",
+  "input": {
+    "pattern": "^alpha",
+    "include": "*.txt"
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "{\n  \"cwd\": \"{{ROOT}}\",\n  \"relativePath\": \".\",\n  \"pattern\": \"^alpha\",\n  \"include\": \"*.txt\",\n  \"rows\": [\n    {\n      \"path\": \"{{ROOT}}/notes.txt\",\n      \"relativePath\": \"notes.txt\",\n      \"line\": 1,\n      \"text\": \"alpha\"\n    },\n    {\n      \"path\": \"{{ROOT}}/notes.txt\",\n      \"relativePath\": \"notes.txt\",\n      \"line\": 3,\n      \"text\": \"alpha beta\"\n    }\n  ],\n  \"matches\": 2,\n  \"truncated\": false\n}",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "^alpha",
+      "include": "*.txt",
+      "rows": [
+        {
+          "path": "{{ROOT}}/notes.txt",
+          "relativePath": "notes.txt",
+          "line": 1,
+          "text": "alpha"
+        },
+        {
+          "path": "{{ROOT}}/notes.txt",
+          "relativePath": "notes.txt",
+          "line": 3,
+          "text": "alpha beta"
+        }
+      ],
+      "matches": 2,
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

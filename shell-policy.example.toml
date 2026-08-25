@@ -1,0 +1,16 @@
+version = 1
+default = "deny"
+
+# Patterns are exact strings or prefix globs ending in `*`.
+allow = [
+  "cargo *",
+  "git diff*",
+  "git status",
+  "pnpm test*",
+]
+
+# Deny rules are evaluated first and reject the complete shell request.
+deny = [
+  "rm *",
+  "git push*",
+]

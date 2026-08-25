@@ -1,0 +1,55 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.edit.unique-match",
+  "provenance": [
+    "rust/crates/mcp-files/src/mutation_operations.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_edit",
+  "input": {
+    "filePath": "new.txt",
+    "oldString": "two",
+    "newString": "three"
+  },
+  "configuration": {
+    "allowWrite": true
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "new.txt",
+        "asset": "assets/filesystem/new-two.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "{\n  \"kind\": \"edit\",\n  \"path\": \"{{ROOT}}/new.txt\",\n  \"relativePath\": \"new.txt\",\n  \"applied\": true,\n  \"diff\": {\n    \"file\": \"{{ROOT}}/new.txt\",\n    \"relativePath\": \"new.txt\",\n    \"patch\": \"--- new.txt\\n+++ new.txt\\n@@ -1,2 +1,2 @@\\n one\\n-two\\n+three\",\n    \"additions\": 1,\n    \"deletions\": 1\n  }\n}",
+    "structuredContent": {
+      "kind": "edit",
+      "path": "{{ROOT}}/new.txt",
+      "relativePath": "new.txt",
+      "applied": true,
+      "diff": {
+        "file": "{{ROOT}}/new.txt",
+        "relativePath": "new.txt",
+        "patch": "--- new.txt\n+++ new.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three",
+        "additions": 1,
+        "deletions": 1
+      }
+    },
+    "postFilesystem": [
+      {
+        "path": "new.txt",
+        "asset": "assets/filesystem/new-three.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}
