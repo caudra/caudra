@@ -46,6 +46,15 @@ fn catalog_is_backend_specific_and_ordered() {
     for tools in [&searxng, &exa, &exa_mcp, &brave, &unavailable] {
         assert_eq!(tools[0]["name"], json!("websearch"));
         assert_eq!(tools[1]["name"], json!("webfetch"));
+        for tool in tools.as_array().expect("web tool catalog") {
+            assert_eq!(
+                tool["annotations"],
+                json!({
+                    "readOnlyHint": true,
+                    "openWorldHint": true
+                })
+            );
+        }
     }
     let searxng_properties = searxng[0]["inputSchema"]["properties"]
         .as_object()

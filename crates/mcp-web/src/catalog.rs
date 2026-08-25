@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rmcp::model::{JsonObject, MetaObject, Tool};
+use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
 
 use crate::WebsearchExecutionConfiguration;
@@ -86,7 +86,15 @@ fn tool(
         PRESENTATION_KEY.to_owned(),
         Value::String(profile.to_owned()),
     );
-    Tool::new(name, description, input_schema).with_meta(MetaObject(meta))
+    Tool::new(name, description, input_schema)
+        .with_annotations(ToolAnnotations::from_raw(
+            None,
+            Some(true),
+            None,
+            None,
+            Some(true),
+        ))
+        .with_meta(MetaObject(meta))
 }
 
 fn schema(value: Value) -> Arc<JsonObject> {

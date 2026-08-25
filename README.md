@@ -390,6 +390,232 @@ crates/source-icons/   Bounded favicon discovery and normalization
 fixtures/              Cross-crate MCP conformance fixtures
 ```
 
+## Tool Reference
+
+Tool schemas are returned by `tools/list` and remain the authority for the arguments accepted by a
+particular server configuration. Argument validation is repeated during dispatch rather than relying
+on clients to honor those schemas. Every tool returns bounded model-facing text and, where applicable,
+structured content for clients that can render richer results.
+
+Workcell also publishes MCP tool annotations as presentation hints. Filesystem reads and environment
+inspection are read-only and closed-world. Web search and fetch are read-only but open-world because
+they contact external services. Filesystem mutations and shell execution are marked potentially
+destructive. These annotations do not replace client consent, Workcell admission checks, or deployment
+isolation.
+
+### Filesystem tools
+
+All filesystem paths are resolved against one canonical root. Inputs may use root-relative paths or
+absolute paths inside that root. Lexical escapes, stable symlink escapes, protected paths, and paths
+outside the root are rejected. Broad traversal skips symlinks, `.git`, `node_modules`, and protected
+entries. Binary classification uses bounded content inspection rather than filename extensions.
+
+The standalone defaults limit individual files and writes to 5 MiB, model-facing reads to 50 KiB,
+lines to 2,000 characters, read windows to 2,000 lines, search results to 100, and broad traversal to
+10,000 entries. Results report truncation when a presentation bound is reached. Embedders using the
+filesystem crate can supply stricter limits.
+
+#### `file_read`
+
+`file_read` reads a UTF-8 text file window or lists a directory.
+
+- `filePath` is required and must not be empty. Use `.` to address the configured root directory.
+- `offset` is an optional 1-indexed starting line. `limit` controls the maximum number of returned
+  lines and defaults to 2,000.
+- File output prefixes each line with `<line>: ` so later calls can request precise windows. Lines over
+  2,000 characters and total model-facing output are truncated independently.
+- Directory output is sorted, emits one entry per line, and appends `/` to directory names.
+- Binary files, oversized files, missing paths, root escapes, and unsupported file types return tool
+  errors instead of partial unlabelled content.
+
+Use `file_glob` to discover unknown paths and `file_grep` to locate relevant sections before reading a
+large file.
+
+#### `file_glob`
+
+`file_glob` finds files by path pattern without invoking a shell.
+
+- `pattern` is required and supports `*`, `**`, `?`, and brace alternatives such as `*.{ts,tsx}`.
+- `path` optionally narrows traversal to a directory under the configured root; omission searches from
+  the root.
+- Matches are returned in deterministic order with relative paths, byte sizes, and line counts for
+  bounded text files.
+- Pattern size, brace depth, generated alternatives, matching work, traversal entries, and result count
+  are all bounded. Results indicate when additional matches were omitted.
+
+#### `file_grep`
+
+`file_grep` searches bounded UTF-8 text files and returns matching paths, line numbers, and lines.
+
+- `pattern` is required and uses Rust's linear-time regular-expression engine. Alternation, groups,
+  character classes, anchors, and repetition are supported; look-around and backreferences are
+  rejected.
+- `path` optionally selects a file or directory. `include` optionally filters files with a glob such as
+  `*.rs` or `*.{ts,tsx}`.
+- Binary files, symlinks, `.git`, and `node_modules` are skipped during broad searches.
+- Regex length, file size, traversal work, match count, line length, and total output are bounded.
+
+#### `file_write`
+
+`file_write` creates a UTF-8 text file or replaces its complete contents.
+
+- `filePath` and `content` are required. Existing files should normally be read first so an intentional
+  full replacement is reviewable.
+- `dryRun: true` validates the operation and returns a bounded diff without changing the filesystem.
+- Without `--allow-write`, a non-dry-run call is rejected. Workcell never promotes a preview to a write
+  dynamically; write authority is immutable process configuration.
+- Applied writes use an exclusive same-directory temporary file and atomic rename. Existing mode bits
+  are preserved, while new files use mode `0600` on supported platforms.
+
+#### `file_edit`
+
+`file_edit` performs exact text replacement without requiring a whole-file rewrite.
+
+- `filePath`, `oldString`, and `newString` are required.
+- By default, the edit fails if `oldString` is absent or appears more than once. Set `replaceAll: true`
+  only when replacing every exact occurrence is intentional.
+- `dryRun: true` returns the planned diff. Applied edits require `--allow-write`.
+- Workcell revalidates source identity and content before publication, then uses the same atomic
+  same-directory replacement path as `file_write`.
+
+#### `file_apply_patch`
+
+`file_apply_patch` applies a reviewable, file-oriented patch envelope containing add, update, move, or
+delete sections.
+
+- `patchText` must begin with `*** Begin Patch`, end with `*** End Patch`, and include an action header
+  for every file.
+- Add-file content uses `+` lines. Update sections use contextual hunks and may include
+  `*** Move to:`. Delete sections remove an existing file.
+- `dryRun: true` validates the complete patch and returns its bounded plan without publishing files.
+  Applied patches require `--allow-write`.
+- Patch text, section count, file sizes, plan memory, diffs, and final MCP output are independently
+  bounded. Source files are revalidated before publication.
+- A multi-file patch is validated as a unit but is not transactional after publication starts. A later
+  operating-system I/O failure can leave earlier sections applied.
+
+### Web tools
+
+Both web tools are read-only from Workcell's perspective but communicate with an open world. Requests
+can be observed by destination services, consume provider quotas, and return content that changes
+between otherwise identical calls. Workcell applies network and output policy; it does not make remote
+content trustworthy.
+
+#### `websearch`
+
+`websearch` discovers candidate pages through the operator-selected provider.
+
+- `query` is always required. The remaining schema is provider-specific and is visible through
+  `tools/list`; parameters from one backend are rejected by another backend.
+- Credential-free Exa MCP is the default. SearXNG, direct Exa, Brave, Kagi, SerpApi Google, and SerpApi
+  Bing are available through immutable process configuration.
+- Search queries leave the Workcell process and are governed by the selected provider's privacy,
+  billing, rate-limit, and availability terms.
+- Results are URL-validated, normalized, deduplicated, count-bounded, field-bounded, and limited to
+  50 KiB of model-facing text. Structured output carries the canonical result array without duplicating
+  the formatted list.
+- Provider errors are normalized into bounded, actionable results without forwarding credentials or
+  arbitrary remote error bodies.
+- If search is disabled or misconfigured, the tool remains callable and returns safe configuration
+  guidance without issuing a search request.
+- Source icons are omitted by default. With `--web-icons`, best-effort icon enrichment may issue
+  additional requests to result origins and adds verified `iconUrl` and `iconDataUrl` fields.
+
+Use `websearch` for discovery, then pass only the most relevant result URLs to `webfetch` for full-page
+content.
+
+#### `webfetch`
+
+`webfetch` performs a bounded HTTP GET and converts a page or PDF into model-facing content.
+
+- `url` is required and must use HTTP or HTTPS. Public HTTP input is upgraded to HTTPS before the
+  request. Every resolved address and up to five redirect targets are checked against outbound URL,
+  DNS, and SSRF policy.
+- `format` accepts `markdown`, `text`, or `html` and defaults to `markdown`. For HTML pages, Markdown and
+  text modes use readability-oriented extraction and remove scripts, styles, iframes, and framework
+  payloads. HTML mode returns bounded raw HTML while still deriving safe title and extraction metadata.
+- `timeout` is one total network-and-primary-parsing deadline in seconds. It defaults to 30 and is
+  capped at 60. Optional icon decoration is skipped when that deadline is exhausted.
+- General response bodies are capped at 5 MiB. Model-facing output is independently capped at 2,000
+  lines and 50 KiB. Structured output records the requested URL, final URL, status, content type,
+  selected format, title, extraction method, low-signal indicator, and truncation state when available.
+- Unsupported non-text content returns an error instead of being decoded as text. JSON, XML,
+  JavaScript, XHTML, and other textual media types are returned as bounded text.
+
+PDF responses have a separate 6 MiB transfer ceiling and support two explicit modes:
+
+- `pdfMode: "extract"` is the default. Workcell verifies the PDF signature, rejects documents over 200
+  pages or other structural limits, bounds extracted text to 2 MiB, normalizes page text, and then
+  applies the normal 2,000-line and 50 KiB model-output limits. The structured result reports
+  `pdfMode: "extract"` and whether transfer, parser, or output bounds truncated the result.
+- `pdfMode: "attachment"` skips text extraction and returns the complete bounded PDF as an
+  `application/pdf` data-URL attachment. The filename is URL-decoded, stripped of traversal and control
+  characters, and byte-bounded. Workcell never emits a partial attachment: a truncated or oversized
+  PDF is rejected.
+- Responses declared as PDF, and eligible binary responses, must begin with `%PDF-`; mislabeled binary
+  content is rejected. Parse failures return a bounded error rather than raw parser diagnostics.
+- HTML and PDF parsing run in bounded in-process blocking jobs. This limits concurrent parser work but
+  is not hard CPU or memory containment; deploy Workcell inside a resource-limited process, container,
+  or VM when parsing untrusted documents.
+
+With `--web-icons`, `webfetch` may also resolve a verified source icon. Already-fetched HTML is reused
+where possible so icon discovery does not refetch the page body.
+
+### `shell`
+
+`shell` executes one Bash command in the Workcell execution environment.
+
+- `command` is required, limited to 65,536 UTF-8 bytes, parsed for immutable deny-first policy, and run
+  as `bash -lc` on Unix. Unknown fields and empty commands are rejected.
+- `workdir` selects the initial directory and defaults to `.`. It must resolve inside the configured
+  root. Only that initial directory is root-confined; the command can subsequently reach any path,
+  process, or network destination visible to the server process.
+- `timeout` is measured in milliseconds, defaults to 120,000, and is capped at 600,000.
+- Shell execution is denied unless admitted by `--shell-policy` or `--yolo`. Explicit deny rules always
+  win. Policy inspects command syntax but cannot infer the behavior of scripts, interpreters, wrappers,
+  or allowed programs.
+- The child receives a cleaned allowlist of environment variables rather than the complete Workcell
+  environment. Standard input is closed; stdout and stderr are captured separately.
+- With an MCP progress token, decoded stdout and stderr chunks are sent as ordered
+  `notifications/progress` messages before the final result. Without a token, output is still drained
+  safely and only bounded tails are returned.
+- The final structured result reports relative workdir, timeout, duration, exit code or signal,
+  timeout/output-limit state, final progress sequence, per-stream byte accounting, bounded stdout and
+  stderr tails, and truncation flags. Non-zero exits are completed tool results rather than transport
+  failures.
+- Workcell retains at most 1 MiB per stream for tail accounting, returns a combined 24 KiB fallback
+  preview, and terminates production commands after more than 100 MiB of combined raw output.
+- Cancellation, timeout, output overflow, and descendants that keep output pipes open trigger
+  best-effort process-group termination and child reaping. Process groups are lifecycle management, not
+  a sandbox, and deliberately detached descendants may escape them.
+
+At most four shell calls execute concurrently within one process. Queued calls remain cancellable.
+
+### `execution_environment`
+
+`execution_environment` collects a fresh, sanitized description of the current Workcell environment.
+
+- The tool accepts only an empty object. It is useful after shell activity may have installed commands,
+  changed versions, or altered Git and package-manager state since discovery.
+- Results include operating-system and architecture classifications, container evidence, runtime and
+  execution classifications, enabled tool groups, Git repository state, declared or inferred package
+  manager, recognized JavaScript lockfiles, and availability plus normalized versions for a fixed
+  command list.
+- Fixed probes cover common shells, Python and JavaScript runtimes, package managers, Git/search tools,
+  container CLIs, Kubernetes, and Dev Containers. `available` means a fixed executable outside the
+  configured root resolved and started; it does not mean every operation is authorized or safe.
+- Probes use fixed version or client-only arguments, a root-filtered `PATH`, an allowlisted environment,
+  bounded output, a 300 ms per-probe timeout, and a two-second total inspection deadline.
+- Raw paths, environment values, probe output, file contents, tool arguments, and credentials are
+  omitted. Container, sandbox, network, and command classifications are observations rather than
+  security guarantees.
+- Concurrent inspections are serialized. Avoid repeated calls when an earlier snapshot remains
+  sufficient.
+
+The same descriptor shape can be exposed during modern discovery through the optional
+`ai.workcell/execution-environment` extension. Use `--no-expose-execution-environment` to disable both
+the discovery descriptor and this tool.
+
 ## License
 
 Apache-2.0. See [`LICENSE.md`](LICENSE.md).
