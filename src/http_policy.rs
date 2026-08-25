@@ -25,11 +25,12 @@ const REQUEST_ID: &str = "x-request-id";
 #[derive(Clone, Debug)]
 pub struct HttpPolicy {
     allowed_hosts: Arc<HashSet<String>>,
+    modern_only: bool,
 }
 
 impl HttpPolicy {
     #[must_use]
-    pub fn new(hosts: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(hosts: impl IntoIterator<Item = String>, modern_only: bool) -> Self {
         Self {
             allowed_hosts: Arc::new(
                 hosts
@@ -37,6 +38,7 @@ impl HttpPolicy {
                     .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
                     .collect(),
             ),
+            modern_only,
         }
     }
 }
@@ -64,6 +66,13 @@ pub async fn enforce(
         HostClassification::Allowed if request.uri().path() != ENDPOINT_PATH => {
             policy_error(StatusCode::NOT_FOUND, -32_001, "MCP endpoint not found.")
         }
+        HostClassification::Allowed if request.headers().contains_key("mcp-session-id") => {
+            policy_error(
+                StatusCode::BAD_REQUEST,
+                -32_000,
+                "MCP protocol sessions are not supported.",
+            )
+        }
         HostClassification::Allowed if request.method() != Method::POST => {
             let mut response = policy_error(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -75,7 +84,7 @@ pub async fn enforce(
                 .insert(ALLOW, HeaderValue::from_static("POST"));
             response
         }
-        HostClassification::Allowed => match bounded_body(request).await {
+        HostClassification::Allowed => match bounded_body(request, policy.modern_only).await {
             Ok(bounded) => {
                 request = bounded;
                 bound_server_error(next.run(request).await)
@@ -95,7 +104,7 @@ pub async fn enforce(
     response
 }
 
-async fn bounded_body(request: Request) -> Result<Request, Response> {
+async fn bounded_body(request: Request, modern_only: bool) -> Result<Request, Response> {
     if let Some(declared) = request.headers().get(CONTENT_LENGTH) {
         let declared = declared
             .to_str()
@@ -116,14 +125,117 @@ async fn bounded_body(request: Request) -> Result<Request, Response> {
     let bytes = to_bytes(body, MAX_JSON_BODY_BYTES)
         .await
         .map_err(|_| body_too_large())?;
-    serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+    let value = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
         policy_error(
             StatusCode::BAD_REQUEST,
             -32_700,
             "Invalid JSON request body.",
         )
     })?;
+    validate_protocol_admission(&parts.headers, &value, modern_only)
+        .map_err(|error| (*error).into_response())?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
+}
+
+struct ProtocolAdmissionError {
+    code: i32,
+    message: &'static str,
+    id: Value,
+    data: Option<Value>,
+}
+
+impl ProtocolAdmissionError {
+    fn into_response(self) -> Response {
+        json_rpc_error(
+            StatusCode::BAD_REQUEST,
+            self.code,
+            self.message,
+            self.id,
+            self.data,
+        )
+    }
+}
+
+fn validate_protocol_admission(
+    headers: &HeaderMap,
+    body: &Value,
+    modern_only: bool,
+) -> Result<(), Box<ProtocolAdmissionError>> {
+    match body {
+        Value::Array(messages) => {
+            for message in messages {
+                validate_protocol_message(headers, message, modern_only)?;
+            }
+            Ok(())
+        }
+        Value::Object(_) => validate_protocol_message(headers, body, modern_only),
+        _ => Ok(()),
+    }
+}
+
+fn validate_protocol_message(
+    headers: &HeaderMap,
+    message: &Value,
+    modern_only: bool,
+) -> Result<(), Box<ProtocolAdmissionError>> {
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    let method = message.get("method").and_then(Value::as_str);
+    let body_version = message
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str);
+    let header_version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok());
+
+    if method == Some("initialize") {
+        let requested = message
+            .pointer("/params/protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if requested == "2026-07-28" {
+            return Err(Box::new(ProtocolAdmissionError {
+                code: -32_600,
+                message: "initialize is not valid for MCP 2026-07-28; use server/discover or per-request metadata.",
+                id,
+                data: Some(json!({"supported": crate::server::protocol_versions(modern_only)})),
+            }));
+        }
+        return require_supported_protocol(id, requested, modern_only);
+    }
+    if let Some(requested) = body_version {
+        return require_supported_protocol(id, requested, modern_only);
+    }
+
+    let requested = header_version.unwrap_or("2025-03-26");
+    if requested == "2026-07-28" {
+        return Err(Box::new(ProtocolAdmissionError {
+            code: -32_602,
+            message: "Modern MCP requests require per-request protocol metadata.",
+            id,
+            data: None,
+        }));
+    }
+    require_supported_protocol(id, requested, modern_only)
+}
+
+fn require_supported_protocol(
+    id: Value,
+    requested: &str,
+    modern_only: bool,
+) -> Result<(), Box<ProtocolAdmissionError>> {
+    let supported = crate::server::protocol_versions(modern_only);
+    if supported
+        .iter()
+        .any(|version| version.as_str() == requested)
+    {
+        return Ok(());
+    }
+    Err(Box::new(ProtocolAdmissionError {
+        code: -32_022,
+        message: "Unsupported protocol version",
+        id,
+        data: Some(json!({"requested": requested, "supported": supported})),
+    }))
 }
 
 fn body_too_large() -> Response {
@@ -190,13 +302,27 @@ fn safe_method(method: &Method) -> &'static str {
 }
 
 pub(crate) fn policy_error(status: StatusCode, code: i32, message: &'static str) -> Response {
+    json_rpc_error(status, code, message, Value::Null, None)
+}
+
+fn json_rpc_error(
+    status: StatusCode,
+    code: i32,
+    message: &'static str,
+    id: Value,
+    data: Option<Value>,
+) -> Response {
+    let mut error = json!({"code": code, "message": message});
+    if let Some(data) = data {
+        error["data"] = data;
+    }
     (
         status,
         [(CONTENT_TYPE, "application/json; charset=utf-8")],
         json!({
             "jsonrpc": "2.0",
-            "error": { "code": code, "message": message },
-            "id": null,
+            "error": error,
+            "id": id,
         })
         .to_string(),
     )

@@ -120,6 +120,10 @@ pub struct RawOptions {
     /// Disable negotiated, sanitized execution-environment disclosure.
     #[arg(long)]
     pub no_expose_execution_environment: bool,
+
+    /// Reject all pre-2026 MCP clients instead of serving the stateless fallback.
+    #[arg(long)]
+    pub modern_only: bool,
 }
 
 pub struct CliOptions {
@@ -137,6 +141,7 @@ pub struct CliOptions {
     pub http_token_file: Option<PathBuf>,
     pub allowed_hosts: Vec<String>,
     pub expose_execution_environment: bool,
+    pub modern_only: bool,
 }
 
 impl fmt::Debug for CliOptions {
@@ -165,6 +170,7 @@ impl fmt::Debug for CliOptions {
                 "expose_execution_environment",
                 &self.expose_execution_environment,
             )
+            .field("modern_only", &self.modern_only)
             .finish()
     }
 }
@@ -299,6 +305,15 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let modern_only = if self.modern_only {
+            true
+        } else {
+            match environment_value(environment, "WORKCELL_MCP_MODERN_ONLY")?.as_deref() {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err(CliError::InvalidEnvironment),
+            }
+        };
 
         let has_local = groups.contains(&ToolGroup::Files) || groups.contains(&ToolGroup::Shell);
         if has_local && self.root.is_none() {
@@ -337,6 +352,7 @@ impl RawOptions {
             http_token_file,
             allowed_hosts,
             expose_execution_environment,
+            modern_only,
         })
     }
 }
@@ -437,5 +453,16 @@ mod tests {
             RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web", "--web-icons"])
                 .unwrap();
         assert!(raw.resolve(&environment).unwrap().web_icons);
+    }
+
+    #[test]
+    fn parses_modern_only_flag() {
+        let raw = RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web"]).unwrap();
+        assert!(!raw.modern_only);
+
+        let raw =
+            RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web", "--modern-only"])
+                .unwrap();
+        assert!(raw.modern_only);
     }
 }

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use workcell_mcp::{
     cli::{HttpBindMode, ToolGroup},
-    server::WorkcellServer,
+    server::{ServerBehavior, WorkcellServer},
     transports::http::{HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome},
 };
 use workcell_mcp_shell::ShellPermissionPolicy;
@@ -15,6 +15,7 @@ use workcell_mcp_web::WebsearchExecutionConfiguration;
 
 const ACCEPT: &str = "application/json, text/event-stream";
 const PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 const TOKEN: &str = "workcell-integration-token-with-more-than-32-bytes";
 
 async fn fixture_server() -> (TempDir, WorkcellServer) {
@@ -23,6 +24,13 @@ async fn fixture_server() -> (TempDir, WorkcellServer) {
 
 async fn fixture_server_with_policy(
     shell_policy: ShellPermissionPolicy,
+) -> (TempDir, WorkcellServer) {
+    fixture_server_with_options(shell_policy, false).await
+}
+
+async fn fixture_server_with_options(
+    shell_policy: ShellPermissionPolicy,
+    modern_only: bool,
 ) -> (TempDir, WorkcellServer) {
     let root = tempfile::tempdir().expect("temporary root");
     tokio::fs::write(root.path().join("visible.txt"), "visible\n")
@@ -34,12 +42,131 @@ async fn fixture_server_with_policy(
         WebsearchExecutionConfiguration::unconfigured(),
         false,
         &[ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
-        true,
+        ServerBehavior {
+            expose_execution_environment: true,
+            modern_only,
+        },
         shell_policy,
     )
     .await
     .expect("server");
     (root, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_supports_legacy_initialization_and_shell_progress() {
+    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("start MCP service")
+            .waiting()
+            .await
+            .expect("MCP service")
+    });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(
+        &mut write,
+        &legacy_initialize_request(1, LEGACY_PROTOCOL_VERSION),
+    )
+    .await;
+    let initialized = read_json(&mut read).await;
+    assert_eq!(
+        initialized["result"]["protocolVersion"],
+        LEGACY_PROTOCOL_VERSION
+    );
+    write_json(
+        &mut write,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    )
+    .await;
+    write_json(
+        &mut write,
+        &legacy_request(
+            2,
+            "tools/call",
+            json!({
+                "name": "shell",
+                "arguments": {"command": "printf legacy-live"},
+                "_meta": {"progressToken": "legacy-progress"}
+            }),
+        ),
+    )
+    .await;
+
+    let progress = read_json(&mut read).await;
+    let result = read_json(&mut read).await;
+
+    assert_progress(
+        &progress,
+        json!("legacy-progress"),
+        1,
+        "stdout",
+        "legacy-live",
+    );
+    assert_eq!(result["id"], 2);
+    assert_eq!(result["result"]["structuredContent"]["finalSequence"], 1);
+
+    drop(write);
+    drop(read);
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server stopped")
+        .expect("server task");
+}
+
+#[tokio::test]
+async fn stdio_modern_only_rejects_legacy_initialization() {
+    let (_root, server) =
+        fixture_server_with_options(ShellPermissionPolicy::restricted(), true).await;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move { server.serve(server_transport).await });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(
+        &mut write,
+        &legacy_initialize_request(1, LEGACY_PROTOCOL_VERSION),
+    )
+    .await;
+    let rejected = read_json(&mut read).await;
+
+    assert_eq!(rejected["error"]["code"], -32_022);
+    assert_eq!(
+        rejected["error"]["data"]["supported"],
+        json!([PROTOCOL_VERSION])
+    );
+    drop(write);
+    drop(read);
+    assert!(server_task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn stdio_rejects_modern_version_on_legacy_initialize_lifecycle() {
+    let (_root, server) = fixture_server().await;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move { server.serve(server_transport).await });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(&mut write, &legacy_initialize_request(1, PROTOCOL_VERSION)).await;
+    let rejected = read_json(&mut read).await;
+
+    assert_eq!(rejected["error"]["code"], -32_600);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server/discover")
+    );
+    drop(write);
+    drop(read);
+    assert!(server_task.await.unwrap().is_err());
 }
 
 #[cfg(unix)]
@@ -113,6 +240,10 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     assert_eq!(
         discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "workcell-mcp"
+    );
+    assert_eq!(
+        discovered["result"]["supportedVersions"],
+        supported_dual_versions()
     );
 
     write_json(&mut write, &mcp_request(2, "tools/list", json!({}))).await;
@@ -314,6 +445,240 @@ async fn http_streams_standard_shell_progress_before_the_result() {
     assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn http_supports_stateless_legacy_calls_and_progress() {
+    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+
+    let initialized = post_legacy_rpc(
+        &client,
+        &endpoint,
+        legacy_initialize_request(1, LEGACY_PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(initialized.status(), StatusCode::OK);
+    assert!(!initialized.headers().contains_key("mcp-session-id"));
+    assert_eq!(
+        final_sse_json(initialized).await["result"]["protocolVersion"],
+        LEGACY_PROTOCOL_VERSION
+    );
+
+    let listed = post_legacy_rpc(
+        &client,
+        &endpoint,
+        legacy_request(2, "tools/list", json!({})),
+    )
+    .await;
+    assert!(!listed.headers().contains_key("mcp-session-id"));
+    let listed = final_sse_json(listed).await;
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9);
+    assert!(listed["result"].get("ttlMs").is_none());
+    assert!(listed["result"].get("cacheScope").is_none());
+
+    let stale_session = client
+        .post(&endpoint)
+        .bearer_auth(TOKEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, ACCEPT)
+        .header("MCP-Protocol-Version", LEGACY_PROTOCOL_VERSION)
+        .header("Mcp-Session-Id", "stale-session")
+        .json(&legacy_request(4, "tools/list", json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_session.status(), StatusCode::BAD_REQUEST);
+
+    let mut response = post_legacy_rpc(
+        &client,
+        &endpoint,
+        legacy_request(
+            3,
+            "tools/call",
+            json!({
+                "name": "shell",
+                "arguments": {"command": "printf legacy-http"},
+                "_meta": {"progressToken": 23}
+            }),
+        ),
+    )
+    .await;
+    let mut buffer = Vec::new();
+    let progress = next_sse_json(&mut response, &mut buffer).await;
+    let result = next_sse_json(&mut response, &mut buffer).await;
+    assert_progress(&progress, json!(23), 1, "stdout", "legacy-http");
+    assert_eq!(result["id"], 3);
+    assert!(buffer.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), response.chunk())
+            .await
+            .expect("SSE completion timeout")
+            .expect("SSE response body")
+            .is_none()
+    );
+
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn http_modern_only_rejects_legacy_and_advertises_only_modern() {
+    let (_root, server) =
+        fixture_server_with_options(ShellPermissionPolicy::restricted(), true).await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+
+    let discovered = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        discover_request(1, json!({})),
+    )
+    .await;
+    assert_eq!(
+        final_sse_json(discovered).await["result"]["supportedVersions"],
+        json!([PROTOCOL_VERSION])
+    );
+
+    let rejected = post_legacy_rpc(
+        &client,
+        &endpoint,
+        legacy_initialize_request(2, LEGACY_PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected = final_sse_json(rejected).await;
+    assert_eq!(rejected["error"]["code"], -32_022);
+    assert_eq!(
+        rejected["error"]["data"]["requested"],
+        LEGACY_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        rejected["error"]["data"]["supported"],
+        json!([PROTOCOL_VERSION])
+    );
+
+    for (id, protocol_version) in [(3, LEGACY_PROTOCOL_VERSION), (4, "2025-06-18")] {
+        let rejected = post_raw_rpc(
+            &client,
+            &endpoint,
+            id,
+            "tools/list",
+            json!({}),
+            Some(protocol_version),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.json::<Value>().await.unwrap()["error"]["code"],
+            -32_022
+        );
+    }
+
+    let missing_meta = post_raw_rpc(
+        &client,
+        &endpoint,
+        5,
+        "tools/list",
+        json!({}),
+        Some(PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(missing_meta.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        missing_meta.json::<Value>().await.unwrap()["error"]["code"],
+        -32_602
+    );
+
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn http_legacy_fallback_rejects_older_unknown_and_era_mismatched_versions() {
+    let (_root, server) = fixture_server().await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+
+    for (id, version) in [(1, "2025-06-18"), (2, "2099-01-01")] {
+        let rejected =
+            post_legacy_rpc(&client, &endpoint, legacy_initialize_request(id, version)).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let rejected = rejected.json::<Value>().await.unwrap();
+        assert_eq!(rejected["error"]["code"], -32_022);
+        assert_eq!(rejected["error"]["data"]["requested"], version);
+        assert_eq!(
+            rejected["error"]["data"]["supported"],
+            supported_dual_versions()
+        );
+    }
+
+    let wrong_lifecycle = post_legacy_rpc(
+        &client,
+        &endpoint,
+        legacy_initialize_request(3, PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(wrong_lifecycle.status(), StatusCode::BAD_REQUEST);
+    let wrong_lifecycle = wrong_lifecycle.json::<Value>().await.unwrap();
+    assert_eq!(wrong_lifecycle["error"]["code"], -32_600);
+    assert!(
+        wrong_lifecycle["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server/discover")
+    );
+
+    let rejected_call = post_raw_rpc(
+        &client,
+        &endpoint,
+        4,
+        "tools/list",
+        json!({}),
+        Some("2099-01-01"),
+    )
+    .await;
+    assert_eq!(rejected_call.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected_call.json::<Value>().await.unwrap()["error"]["code"],
+        -32_022
+    );
+
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
 async fn post_rpc(client: &Client, endpoint: &str, token: Option<&str>, body: Value) -> Response {
     let method = body["method"].as_str().unwrap();
     let mut request = client
@@ -331,10 +696,52 @@ async fn post_rpc(client: &Client, endpoint: &str, token: Option<&str>, body: Va
     request.json(&body).send().await.expect("RPC request")
 }
 
+async fn post_legacy_rpc(client: &Client, endpoint: &str, body: Value) -> Response {
+    let mut request = client
+        .post(endpoint)
+        .bearer_auth(TOKEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, ACCEPT);
+    if body["method"] != "initialize" {
+        request = request.header("MCP-Protocol-Version", LEGACY_PROTOCOL_VERSION);
+    }
+    request
+        .json(&body)
+        .send()
+        .await
+        .expect("legacy RPC request")
+}
+
+async fn post_raw_rpc(
+    client: &Client,
+    endpoint: &str,
+    id: u64,
+    method: &str,
+    params: Value,
+    protocol_version: Option<&str>,
+) -> Response {
+    let mut request = client
+        .post(endpoint)
+        .bearer_auth(TOKEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, ACCEPT);
+    if let Some(protocol_version) = protocol_version {
+        request = request.header("MCP-Protocol-Version", protocol_version);
+    }
+    request
+        .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+        .send()
+        .await
+        .expect("raw RPC request")
+}
+
 async fn final_sse_json(response: Response) -> Value {
     let content_type = response.headers()[header::CONTENT_TYPE].clone();
     let body = response.text().await.unwrap();
-    if content_type == "application/json" {
+    if content_type
+        .to_str()
+        .is_ok_and(|value| value.split(';').next() == Some("application/json"))
+    {
         return serde_json::from_str(&body).expect("JSON-RPC response");
     }
     body.split("\n\n")
@@ -423,6 +830,27 @@ fn discover_request(id: u64, capabilities: Value) -> Value {
         "method":"server/discover",
         "params":{"_meta":request_meta(capabilities)}
     })
+}
+
+fn legacy_initialize_request(id: u64, protocol_version: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {"name": "workcell-legacy-test", "version": "1"}
+        }
+    })
+}
+
+fn legacy_request(id: u64, method: &str, params: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+}
+
+fn supported_dual_versions() -> Value {
+    json!(["2026-07-28", "2025-11-25"])
 }
 
 fn mcp_request(id: u64, method: &str, mut params: Value) -> Value {

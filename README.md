@@ -259,17 +259,31 @@ See [`example.env`](example.env) for the full environment surface.
 
 ## Protocol
 
-Workcell implements MCP `2026-07-28` through the pinned Rust MCP SDK revision in `Cargo.toml`.
+Workcell implements modern MCP `2026-07-28` and an exact `2025-11-25` compatibility fallback through
+the pinned Rust MCP SDK revision in `Cargo.toml`. Discovery advertises the modern revision first.
+Modern-aware clients that probe with `server/discover` select it; clients that open directly with the
+legacy `initialize` handshake remain on `2025-11-25` because a server cannot force them to upgrade.
+
+Use `--modern-only` or `WORKCELL_MCP_MODERN_ONLY=true` to reject legacy initialization. The default
+dual-era posture is:
+
+| Client opening | Selected behavior |
+| --- | --- |
+| `server/discover` or complete per-request metadata | Stateless `2026-07-28` |
+| `initialize` requesting exactly `2025-11-25` | Legacy wire format with no HTTP session state |
+| Older, unknown, or legacy initialization under modern-only mode | `UnsupportedProtocolVersionError` |
 
 - Discovery starts with `server/discover`.
-- HTTP is stateless Streamable HTTP at `POST /mcp`.
+- HTTP is stateless Streamable HTTP at `POST /mcp` for both versions. Workcell does not issue or accept
+  `Mcp-Session-Id`; GET streams and DELETE lifecycle requests remain disabled.
 - Stdio uses the SDK newline-delimited transport.
-- Tool, discovery, and list responses use complete-result envelopes.
+- Modern tool, discovery, and list responses use complete-result envelopes. The SDK omits modern-only
+  result and caching fields for legacy peers.
 - Cancellation is cooperative; shell calls publish ordered progress when requested. Each progress
   notification includes a bounded, single-line standard `message` field with control and
   bidirectional formatting characters escaped, plus an `ai.workcell/tool-output-chunk` metadata
   object with the exact sequence, stream, and text.
-- Tasks, OAuth, legacy sessions, standalone HTTP GET streams, and MCP DELETE are not advertised.
+- Tasks, OAuth, protocol-level sessions, standalone HTTP GET streams, and MCP DELETE are not advertised.
 
 ### Live shell output
 

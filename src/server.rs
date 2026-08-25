@@ -10,9 +10,9 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, DiscoverResult,
-        ErrorCode, ExtensionCapabilities, Implementation, InitializeRequestParams, ListToolsResult,
-        PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestMetaObject,
-        ServerCapabilities, ServerInfo, Tool,
+        ErrorCode, ExtensionCapabilities, Implementation, InitializeRequestParams,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, ProgressToken, ProtocolVersion,
+        RequestMetaObject, ServerCapabilities, ServerInfo, Tool,
     },
     service::{Peer, RequestContext},
 };
@@ -28,12 +28,31 @@ use crate::{
     execution_environment::{ExecutionEnvironmentSnapshot, ToolGroupDisclosure},
 };
 
+const MODERN_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+const DUAL_ERA_PROTOCOLS: &[ProtocolVersion] =
+    &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
+
+pub(crate) fn protocol_versions(modern_only: bool) -> &'static [ProtocolVersion] {
+    if modern_only {
+        MODERN_PROTOCOLS
+    } else {
+        DUAL_ERA_PROTOCOLS
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServerBehavior {
+    pub expose_execution_environment: bool,
+    pub modern_only: bool,
+}
+
 #[derive(Clone)]
 pub struct WorkcellServer {
     files: Option<FileToolGroup>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
     execution_environment: Option<ExecutionEnvironmentSnapshot>,
+    modern_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +79,7 @@ impl WorkcellServer {
         web_configuration: WebsearchExecutionConfiguration,
         web_icons: bool,
         groups: &[ToolGroup],
-        expose_execution_environment: bool,
+        behavior: ServerBehavior,
         shell_policy: ShellPermissionPolicy,
     ) -> Result<Self, ServerBuildError> {
         let files = if groups.contains(&ToolGroup::Files) {
@@ -95,7 +114,7 @@ impl WorkcellServer {
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
         ])?;
-        let execution_environment = if expose_execution_environment {
+        let execution_environment = if behavior.expose_execution_environment {
             Some(ExecutionEnvironmentSnapshot::collect(root).await)
         } else {
             None
@@ -105,6 +124,7 @@ impl WorkcellServer {
             web,
             shell,
             execution_environment,
+            modern_only: behavior.modern_only,
         })
     }
 
@@ -122,6 +142,41 @@ impl WorkcellServer {
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
         ])
         .expect("validated tool groups cannot develop duplicate names")
+    }
+
+    #[must_use]
+    pub const fn modern_only(&self) -> bool {
+        self.modern_only
+    }
+
+    fn validate_request_context(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<ProtocolVersion, ErrorData> {
+        let requested = context.protocol_version().ok_or_else(|| {
+            ErrorData::invalid_params("request protocol version is required", None)
+        })?;
+        let supported = self.supported_protocol_versions();
+        if !supported.contains(&requested) {
+            return Err(ErrorData::unsupported_protocol_version(
+                requested, &supported,
+            ));
+        }
+        if requested == ProtocolVersion::V_2026_07_28 {
+            let missing = context
+                .meta
+                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
+            if !missing.is_empty() {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "request _meta is missing or has malformed required fields: {}",
+                        missing.join(", ")
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(requested)
     }
 
     pub async fn dispatch(
@@ -197,7 +252,30 @@ impl ServerHandler for WorkcellServer {
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+        Cow::Borrowed(protocol_versions(self.modern_only))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        if request.protocol_version == ProtocolVersion::V_2026_07_28 {
+            return Err(ErrorData::invalid_request(
+                "initialize is not valid for MCP 2026-07-28; use server/discover or per-request metadata",
+                Some(serde_json::json!({"supported": self.supported_protocol_versions()})),
+            ));
+        }
+        if self.modern_only || request.protocol_version != ProtocolVersion::V_2025_11_25 {
+            return Err(ErrorData::unsupported_protocol_version(
+                request.protocol_version,
+                &self.supported_protocol_versions(),
+            ));
+        }
+        context.peer.set_peer_info(request);
+        let mut info = self.get_info();
+        info.protocol_version = ProtocolVersion::V_2025_11_25;
+        Ok(info)
     }
 
     async fn discover(
@@ -226,7 +304,7 @@ impl ServerHandler for WorkcellServer {
             info.capabilities.extensions = Some(extensions);
         }
         Ok(DiscoverResult::from_server_info(
-            vec![ProtocolVersion::V_2026_07_28],
+            self.supported_protocol_versions().into_owned(),
             info,
         ))
     }
@@ -234,11 +312,15 @@ impl ServerHandler for WorkcellServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.catalog())
-            .with_ttl_ms(0)
-            .with_cache_scope(CacheScope::Private))
+        let protocol_version = self.validate_request_context(&context)?;
+        let result = ListToolsResult::with_all_items(self.catalog());
+        if protocol_version == ProtocolVersion::V_2026_07_28 {
+            Ok(result.with_ttl_ms(0).with_cache_scope(CacheScope::Private))
+        } else {
+            Ok(result)
+        }
     }
 
     async fn call_tool(
@@ -246,6 +328,7 @@ impl ServerHandler for WorkcellServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        self.validate_request_context(&context)?;
         let Some(tool_name) = self.canonical_tool_name(request.name.as_ref()) else {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,

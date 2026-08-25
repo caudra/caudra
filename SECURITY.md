@@ -46,6 +46,12 @@ The latest release is the supported security line. Linux is the primary producti
 loopback HTTP are suitable for same-host clients. Container HTTP requires a process bearer token and
 must be protected by the deployment network; Workcell does not terminate TLS.
 
+Workcell serves MCP `2026-07-28` first and accepts exactly `2025-11-25` as a compatibility fallback by
+default. Both HTTP eras remain stateless and POST-only: Workcell does not create protocol sessions,
+issue `Mcp-Session-Id`, or enable legacy GET/DELETE lifecycle routes. Use `--modern-only` or
+`WORKCELL_MCP_MODERN_ONLY=true` where accepting legacy request metadata and header semantics is not
+appropriate. Protocol headers are routing and consistency checks, not authentication or authorization.
+
 ## Known Residual Risks
 
 - Shell policy is syntactic, not confinement. An allowed command may use absolute paths, change

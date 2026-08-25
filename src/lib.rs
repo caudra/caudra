@@ -11,7 +11,7 @@ pub mod server;
 pub mod transports;
 
 use cli::{CliOptions, Transport};
-use server::WorkcellServer;
+use server::{ServerBehavior, WorkcellServer};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
@@ -30,7 +30,10 @@ pub async fn run(
         web,
         options.web_icons,
         &options.groups,
-        options.expose_execution_environment,
+        ServerBehavior {
+            expose_execution_environment: options.expose_execution_environment,
+            modern_only: options.modern_only,
+        },
         shell_policy,
     )
     .await?;

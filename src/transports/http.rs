@@ -111,6 +111,7 @@ impl HttpServer {
         configuration: HttpConfiguration,
     ) -> Result<Self, TransportError> {
         configuration.validate()?;
+        let modern_only = server.modern_only();
         let requested = SocketAddrV4::new(
             match configuration.bind_mode {
                 HttpBindMode::Loopback => Ipv4Addr::LOCALHOST,
@@ -126,6 +127,7 @@ impl HttpServer {
             .map_err(|_| TransportError::HttpBind)?;
         let shutdown = CancellationToken::new();
         let transport_config = StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
             .with_json_response(false)
             .with_sse_keep_alive(Some(SSE_KEEP_ALIVE))
             .with_sse_retry(Some(SSE_RETRY))
@@ -144,7 +146,7 @@ impl HttpServer {
                 authenticate,
             ))
             .layer(middleware::from_fn_with_state(
-                HttpPolicy::new(configuration.allowed_hosts),
+                HttpPolicy::new(configuration.allowed_hosts, modern_only),
                 http_policy::enforce,
             ));
         let (state_tx, _state_rx) = watch::channel(ServeState::Running);

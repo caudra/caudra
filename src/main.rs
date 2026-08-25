@@ -50,6 +50,7 @@ async fn main() -> ExitCode {
         websearch_backend = web.backend().map(WebsearchBackend::as_str),
         websearch_status = web.status(),
         authenticated_http = authentication.is_some(),
+        modern_only = options.modern_only,
         log_level = logging.level(),
         log_format = logging.format(),
         "Workcell MCP starting"
