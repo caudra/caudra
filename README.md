@@ -29,6 +29,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * 26 of the most popular themes.
 * Resume sessions.
 * Skills & MCPs.
+* Opt-in [OpenTelemetry](https://maki.sh/docs/telemetry/) export, same format as Claude Code's.
 * Plan mode.
 * Run bash commands using `!`, or `!!` if you want maki to not know about it.
 * `/cd` to change dir.
