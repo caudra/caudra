@@ -61,6 +61,7 @@ sequenceDiagram
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Preview-only unless `--allow-write` is set. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
+| Server | `execution_environment` | Returns a fresh, sanitized execution-environment snapshot using bounded fixed probes. |
 
 All groups are enabled by default. Use repeatable `--tool-group files|web|shell` arguments to expose a
 subset. Files and shell require a positional root.
@@ -348,10 +349,20 @@ Workcell then publishes each accepted output chunk before the final tool result:
 - Child programs may buffer output when connected to pipes instead of a terminal. Use program-specific
   unbuffered or line-buffered modes when immediate output matters.
 
-Clients may negotiate `ai.workcell/execution-environment` version `v1`. The returned descriptor is a
-sanitized startup snapshot containing platform, container evidence, package-manager metadata, enabled
-tool groups, and command availability. It never returns raw root paths, environment values, commands,
-tool arguments, or credentials. Disable it with `--no-expose-execution-environment`.
+Clients may negotiate `ai.workcell/execution-environment` version `v1` to receive a sanitized startup
+snapshot during discovery. The `execution_environment` tool returns the same descriptor shape from a
+fresh bounded inspection, so clients can observe later command installation or version changes, Git
+repository state, package-manager metadata, and recognized lockfiles without restarting Workcell.
+Concurrent tool inspections are serialized.
+
+Both surfaces report platform and container classifications, enabled tool groups, workspace metadata,
+and command availability. Fixed command probes resolve only executable targets outside the configured
+root, receive a `PATH` containing only canonical directories outside that root, then run with version
+or client-only arguments from the executable's parent directory, a cleaned allowlisted environment,
+bounded output, and short deadlines. Results never include raw root paths, environment values, probe
+output, file contents, tool arguments, or credentials. Availability and container, sandbox, and
+network classifications are best-effort observations rather than security guarantees. Disable both
+surfaces with `--no-expose-execution-environment`.
 
 ## Development
 

@@ -25,7 +25,10 @@ use workcell_mcp_web::{WebToolGroup, WebsearchExecutionConfiguration};
 
 use crate::{
     cli::ToolGroup,
-    execution_environment::{ExecutionEnvironmentSnapshot, ToolGroupDisclosure},
+    execution_environment::{
+        ExecutionEnvironmentDisclosure, TOOL_NAME as EXECUTION_ENVIRONMENT_TOOL,
+        ToolGroupDisclosure, tool as execution_environment_tool,
+    },
 };
 
 const MODERN_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
@@ -51,7 +54,7 @@ pub struct WorkcellServer {
     files: Option<FileToolGroup>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
-    execution_environment: Option<ExecutionEnvironmentSnapshot>,
+    execution_environment: Option<ExecutionEnvironmentDisclosure>,
     modern_only: bool,
 }
 
@@ -113,9 +116,14 @@ impl WorkcellServer {
             shell
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
+            if behavior.expose_execution_environment {
+                vec![execution_environment_tool()]
+            } else {
+                Vec::new()
+            },
         ])?;
         let execution_environment = if behavior.expose_execution_environment {
-            Some(ExecutionEnvironmentSnapshot::collect(root).await)
+            Some(ExecutionEnvironmentDisclosure::collect(root).await)
         } else {
             None
         };
@@ -140,6 +148,9 @@ impl WorkcellServer {
             self.shell
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
+            self.execution_environment
+                .as_ref()
+                .map_or_else(Vec::new, |_| vec![execution_environment_tool()]),
         ])
         .expect("validated tool groups cannot develop duplicate names")
     }
@@ -210,6 +221,13 @@ impl WorkcellServer {
         {
             return result;
         }
+        if name == EXECUTION_ENVIRONMENT_TOOL
+            && let Some(execution_environment) = &self.execution_environment
+        {
+            return Ok(execution_environment
+                .call_tool(arguments, self.tool_group_disclosure(), cancellation)
+                .await);
+        }
         if let Some(shell) = &self.shell
             && let Some(result) = shell
                 .dispatch(
@@ -227,6 +245,14 @@ impl WorkcellServer {
             "Unknown tool",
             None,
         ))
+    }
+
+    fn tool_group_disclosure(&self) -> ToolGroupDisclosure {
+        ToolGroupDisclosure {
+            files: self.files.is_some(),
+            web: self.web.is_some(),
+            shell: self.shell.is_some(),
+        }
     }
 
     fn canonical_tool_name(&self, requested: &str) -> Option<String> {
@@ -295,11 +321,7 @@ impl ServerHandler for WorkcellServer {
             let mut extensions = ExtensionCapabilities::new();
             extensions.insert(
                 crate::execution_environment::EXTENSION_ID.into(),
-                execution_environment.descriptor(ToolGroupDisclosure {
-                    files: self.files.is_some(),
-                    web: self.web.is_some(),
-                    shell: self.shell.is_some(),
-                }),
+                execution_environment.discovery_descriptor(self.tool_group_disclosure()),
             );
             info.capabilities.extensions = Some(extensions);
         }
@@ -454,6 +476,7 @@ mod tests {
             file_catalog(),
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
+            vec![execution_environment_tool()],
         ])
         .unwrap()
         .into_iter()
@@ -471,6 +494,7 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
+                "execution_environment",
             ]
         );
     }
@@ -479,5 +503,50 @@ mod tests {
     fn calendar_conversion_covers_year_boundaries() {
         assert_eq!(year_from_unix_days(0), 1970);
         assert_eq!(year_from_unix_days(19_723), 2024);
+    }
+
+    #[tokio::test]
+    async fn execution_environment_tool_follows_disclosure_switch() {
+        let disabled = WorkcellServer::configured(
+            None,
+            false,
+            WebsearchExecutionConfiguration::unconfigured(),
+            false,
+            &[],
+            ServerBehavior {
+                expose_execution_environment: false,
+                modern_only: false,
+            },
+            ShellPermissionPolicy::restricted(),
+        )
+        .await
+        .unwrap();
+        assert!(disabled.catalog().is_empty());
+        assert!(
+            disabled
+                .dispatch(
+                    EXECUTION_ENVIRONMENT_TOOL,
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+
+        let enabled = WorkcellServer::configured(
+            None,
+            false,
+            WebsearchExecutionConfiguration::unconfigured(),
+            false,
+            &[],
+            ServerBehavior {
+                expose_execution_environment: true,
+                modern_only: false,
+            },
+            ShellPermissionPolicy::restricted(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled.catalog()[0].name, EXECUTION_ENVIRONMENT_TOOL);
     }
 }

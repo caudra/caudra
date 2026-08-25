@@ -1,30 +1,35 @@
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncReadExt, process::Command, task::JoinSet};
+use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const EXTENSION_ID: &str = "ai.workcell/execution-environment";
+pub(crate) const TOOL_NAME: &str = "execution_environment";
+
+const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
+const TOOL_DESCRIPTION: &str = r#"Inspect the MCP server's current sanitized execution environment.
+
+Use this tool when command availability, installed versions, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.
+
+The result reports platform and runtime classifications, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.
+
+The tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with version or client-only arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Container, sandbox, network, and command classifications are best-effort observations; do not use them as security guarantees."#;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBE_OUTPUT_BYTES: u64 = 4_096;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
-const INHERITED_ENVIRONMENT: [&str; 13] = [
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "ComSpec",
-    "SystemRoot",
-    "WINDIR",
-];
+const INHERITED_ENVIRONMENT: [&str; 6] = ["PATH", "LANG", "LC_ALL", "TERM", "SystemRoot", "WINDIR"];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionEnvironmentSnapshot {
@@ -32,6 +37,13 @@ pub(crate) struct ExecutionEnvironmentSnapshot {
     container: ContainerDescriptor,
     workspace: WorkspaceDescriptor,
     commands: Vec<CommandDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionEnvironmentDisclosure {
+    root: Option<PathBuf>,
+    startup: ExecutionEnvironmentSnapshot,
+    refresh_gate: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -200,14 +212,269 @@ const fn probe(id: &'static str, executable: &'static str, args: &'static [&'sta
     }
 }
 
+impl ExecutionEnvironmentDisclosure {
+    pub(crate) async fn collect(root: Option<&Path>) -> Self {
+        let root = canonical_root(root).await;
+        Self {
+            startup: ExecutionEnvironmentSnapshot::collect(root.as_deref()).await,
+            root,
+            refresh_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    pub(crate) fn discovery_descriptor(
+        &self,
+        groups: ToolGroupDisclosure,
+    ) -> serde_json::Map<String, Value> {
+        self.startup.descriptor(groups)
+    }
+
+    pub(crate) async fn call_tool(
+        &self,
+        arguments: Value,
+        groups: ToolGroupDisclosure,
+        cancellation: CancellationToken,
+    ) -> CallToolResult {
+        if !matches!(&arguments, Value::Object(values) if values.is_empty()) {
+            return tool_error(
+                "Invalid arguments for tool execution_environment: expected an empty object",
+            );
+        }
+
+        let gate = self.refresh_gate.clone();
+        let permit = tokio::select! {
+            permit = gate.acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return tool_error("Execution-environment refresh gate is unavailable"),
+            },
+            () = cancellation.cancelled() => {
+                return tool_error("Execution-environment inspection cancelled");
+            }
+        };
+        let collection = tokio::time::timeout(
+            INSPECTION_TIMEOUT,
+            ExecutionEnvironmentSnapshot::collect(self.root.as_deref()),
+        );
+        tokio::pin!(collection);
+        let snapshot = tokio::select! {
+            snapshot = &mut collection => match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(_) => return tool_error("Execution-environment inspection timed out"),
+            },
+            () = cancellation.cancelled() => {
+                // The total collection deadline bounds cleanup. Let it finish before releasing the
+                // gate so cancellation cannot create overlapping process batches.
+                let _ = collection.await;
+                return tool_error("Execution-environment inspection cancelled");
+            }
+        };
+        drop(permit);
+        success(snapshot.descriptor(groups))
+    }
+}
+
+pub(crate) fn tool() -> Tool {
+    let input_schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    let mut meta = JsonObject::new();
+    meta.insert(
+        PRESENTATION_KEY.to_owned(),
+        Value::String("execution-environment.snapshot.v1".to_owned()),
+    );
+    Tool::new(
+        TOOL_NAME,
+        TOOL_DESCRIPTION,
+        Arc::new(
+            input_schema
+                .as_object()
+                .expect("execution-environment input schema is an object")
+                .clone(),
+        ),
+    )
+    .with_title("Inspect execution environment")
+    .with_raw_output_schema(output_schema())
+    .with_annotations(ToolAnnotations::from_raw(
+        None,
+        Some(true),
+        Some(false),
+        Some(true),
+        Some(false),
+    ))
+    .with_meta(MetaObject(meta))
+}
+
+fn output_schema() -> Arc<JsonObject> {
+    let nullable_string = json!({"type": ["string", "null"], "maxLength": 128});
+    let lockfiles = LOCKFILES
+        .iter()
+        .map(|(filename, _)| *filename)
+        .collect::<Vec<_>>();
+    let command_ids = PROBES.iter().map(|probe| probe.id).collect::<Vec<_>>();
+    let command_count = PROBES.len();
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "snapshotRevision", "scope", "os", "runtime", "execution",
+            "container", "workspace", "toolGroups", "commands"
+        ],
+        "properties": {
+            "version": {"const": "v1"},
+            "snapshotRevision": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "scope": {"const": "server-process"},
+            "os": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["family", "architecture", "pathStyle", "kernelRelease", "distribution", "wsl"],
+                "properties": {
+                    "family": {"enum": ["linux", "macos", "windows", "other"]},
+                    "architecture": {"enum": ["x86_64", "aarch64", "x86", "arm", "other"]},
+                    "pathStyle": {"enum": ["windows", "posix"]},
+                    "kernelRelease": nullable_string,
+                    "distribution": {"type": ["string", "null"], "maxLength": 128},
+                    "wsl": {"type": "boolean"}
+                }
+            },
+            "runtime": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "version"],
+                "properties": {
+                    "name": {"const": "workcell-mcp"},
+                    "version": {"type": "string"}
+                }
+            },
+            "execution": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["shell", "sandbox", "networkAccess", "environmentInheritance"],
+                "properties": {
+                    "shell": {"enum": ["bash", "cmd", "other", "none"]},
+                    "sandbox": {"enum": ["container", "virtual-machine", "unknown"]},
+                    "networkAccess": {"const": "host-policy"},
+                    "environmentInheritance": {"enum": ["allowlisted", "not-applicable"]}
+                }
+            },
+            "container": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "evidence"],
+                "properties": {
+                    "kind": {"enum": [
+                        "none", "docker", "podman", "containerd", "kubernetes", "lxc",
+                        "devcontainer", "codespaces", "wsl", "container", "virtual-machine", "unknown"
+                    ]},
+                    "evidence": {
+                        "type": "array",
+                        "uniqueItems": true,
+                        "items": {"enum": [
+                            "env-container", "env-codespaces", "env-devcontainer", "dockerenv",
+                            "containerenv", "proc-cgroup", "systemd-detect-virt", "wsl-kernel"
+                        ]}
+                    }
+                }
+            },
+            "workspace": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["git", "packageManager"],
+                "properties": {
+                    "git": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["available", "repository"],
+                        "properties": {
+                            "available": {"type": "boolean"},
+                            "repository": {"enum": ["yes", "no", "unknown"]}
+                        }
+                    },
+                    "packageManager": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["lockfiles"],
+                        "properties": {
+                            "declared": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["name"],
+                                "properties": {
+                                    "name": {"type": "string", "minLength": 1, "maxLength": 64},
+                                    "version": {"type": "string", "minLength": 1, "maxLength": 64}
+                                }
+                            },
+                            "inferred": {"type": "string", "minLength": 1, "maxLength": 64},
+                            "lockfiles": {
+                                "type": "array",
+                                "uniqueItems": true,
+                                "items": {"enum": lockfiles}
+                            }
+                        }
+                    }
+                }
+            },
+            "toolGroups": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["files", "web", "shell"],
+                "properties": {
+                    "files": {"type": "boolean"},
+                    "web": {"type": "boolean"},
+                    "shell": {"type": "boolean"}
+                }
+            },
+            "commands": {
+                "type": "array",
+                "minItems": command_count,
+                "maxItems": command_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "available"],
+                    "properties": {
+                        "id": {"enum": command_ids},
+                        "available": {"type": "boolean"},
+                        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+                    }
+                }
+            }
+        }
+    });
+    Arc::new(
+        schema
+            .as_object()
+            .expect("execution-environment output schema is an object")
+            .clone(),
+    )
+}
+
+fn success(descriptor: serde_json::Map<String, Value>) -> CallToolResult {
+    let structured = Value::Object(descriptor);
+    let text = serde_json::to_string_pretty(&structured)
+        .expect("execution-environment descriptor is serializable");
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(structured);
+    result
+}
+
+fn tool_error(message: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(message.into())])
+}
+
 impl ExecutionEnvironmentSnapshot {
     pub(crate) async fn collect(root: Option<&Path>) -> Self {
+        let canonical_root = canonical_root(root).await;
+        let root = canonical_root.as_deref();
         let (kernel_release, distribution, container, mut workspace, commands) = tokio::join!(
-            collect_kernel_release(),
+            collect_kernel_release(root),
             collect_distribution(),
-            detect_container(),
+            detect_container(root),
             collect_workspace(root),
-            collect_commands(),
+            collect_commands(root),
         );
         workspace.git.available = commands
             .iter()
@@ -282,6 +549,15 @@ impl ExecutionEnvironmentSnapshot {
     }
 }
 
+async fn canonical_root(root: Option<&Path>) -> Option<PathBuf> {
+    let root = root?;
+    Some(
+        tokio::fs::canonicalize(root)
+            .await
+            .unwrap_or_else(|_| root.to_path_buf()),
+    )
+}
+
 fn canonical_hash(value: &impl Serialize) -> String {
     let value = serde_json::to_value(value).expect("static descriptor is serializable");
     let bytes = serde_json::to_vec(&canonicalize(value)).expect("canonical JSON is serializable");
@@ -306,10 +582,11 @@ fn canonicalize(value: Value) -> Value {
     }
 }
 
-async fn collect_commands() -> Vec<CommandDescriptor> {
+async fn collect_commands(excluded_root: Option<&Path>) -> Vec<CommandDescriptor> {
     let mut tasks = JoinSet::new();
     for (index, probe) in PROBES.iter().copied().enumerate() {
-        tasks.spawn(async move { (index, run_probe(probe).await) });
+        let excluded_root = excluded_root.map(Path::to_path_buf);
+        tasks.spawn(async move { (index, run_probe(probe, excluded_root.as_deref()).await) });
     }
     let mut commands = Vec::with_capacity(PROBES.len());
     while let Some(Ok(result)) = tasks.join_next().await {
@@ -319,8 +596,8 @@ async fn collect_commands() -> Vec<CommandDescriptor> {
     commands.into_iter().map(|(_, command)| command).collect()
 }
 
-async fn run_probe(probe: Probe) -> CommandDescriptor {
-    let result = run_command(probe.executable, probe.args).await;
+async fn run_probe(probe: Probe, excluded_root: Option<&Path>) -> CommandDescriptor {
+    let result = run_command(probe.executable, probe.args, excluded_root).await;
     CommandDescriptor {
         id: probe.id,
         available: result.spawned,
@@ -339,8 +616,16 @@ struct CommandResult {
     stderr: Vec<u8>,
 }
 
-async fn run_command(executable: &str, args: &[&str]) -> CommandResult {
-    let mut command = Command::new(executable);
+async fn run_command(
+    executable: &str,
+    args: &[&str],
+    excluded_root: Option<&Path>,
+) -> CommandResult {
+    let Some(executable) = resolve_executable(executable, excluded_root).await else {
+        return CommandResult::default();
+    };
+    let working_directory = executable.path.parent().map(Path::to_path_buf);
+    let mut command = Command::new(executable.path);
     command
         .args(args)
         .env_clear()
@@ -348,10 +633,15 @@ async fn run_command(executable: &str, args: &[&str]) -> CommandResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    inherit_allowlisted_environment(&mut command);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
+    configure_probe_process(&mut command);
+    inherit_allowlisted_environment(&mut command, &executable.search_path);
     let Ok(mut child) = command.spawn() else {
         return CommandResult::default();
     };
+    let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
         return CommandResult {
             spawned: true,
@@ -364,7 +654,7 @@ async fn run_command(executable: &str, args: &[&str]) -> CommandResult {
             ..CommandResult::default()
         };
     };
-    tokio::time::timeout(PROBE_TIMEOUT, async {
+    match tokio::time::timeout(PROBE_TIMEOUT, async {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let mut bounded_stdout = stdout.take(MAX_PROBE_OUTPUT_BYTES);
@@ -384,14 +674,146 @@ async fn run_command(executable: &str, args: &[&str]) -> CommandResult {
         }
     })
     .await
-    .unwrap_or(CommandResult {
-        spawned: true,
-        ..CommandResult::default()
-    })
+    {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_probe(&mut child, pid).await;
+            CommandResult {
+                spawned: true,
+                ..CommandResult::default()
+            }
+        }
+    }
 }
 
-fn inherit_allowlisted_environment(command: &mut Command) {
+struct ResolvedExecutable {
+    path: PathBuf,
+    search_path: std::ffi::OsString,
+}
+
+async fn resolve_executable(
+    name: &str,
+    excluded_root: Option<&Path>,
+) -> Option<ResolvedExecutable> {
+    let inherited_path = std::env::var_os("PATH")?;
+    let search_path = filtered_search_path(&inherited_path, excluded_root).await?;
+    let path = resolve_executable_in(name, &search_path, excluded_root).await?;
+    Some(ResolvedExecutable { path, search_path })
+}
+
+async fn filtered_search_path(
+    search_path: &std::ffi::OsStr,
+    excluded_root: Option<&Path>,
+) -> Option<std::ffi::OsString> {
+    let mut safe_directories = Vec::new();
+    for directory in std::env::split_paths(search_path) {
+        let Ok(canonical) = tokio::fs::canonicalize(directory).await else {
+            continue;
+        };
+        if excluded_root.is_some_and(|root| canonical.starts_with(root)) {
+            continue;
+        }
+        if tokio::fs::metadata(&canonical)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            safe_directories.push(canonical);
+        }
+    }
+    (!safe_directories.is_empty())
+        .then(|| std::env::join_paths(safe_directories).ok())
+        .flatten()
+}
+
+async fn resolve_executable_in(
+    name: &str,
+    search_path: &std::ffi::OsStr,
+    excluded_root: Option<&Path>,
+) -> Option<PathBuf> {
+    for directory in std::env::split_paths(search_path) {
+        for candidate in executable_candidates(&directory, name) {
+            let Ok(canonical) = tokio::fs::canonicalize(candidate).await else {
+                continue;
+            };
+            if excluded_root.is_some_and(|root| canonical.starts_with(root)) {
+                continue;
+            }
+            let Ok(metadata) = tokio::fs::metadata(&canonical).await else {
+                continue;
+            };
+            if is_executable_file(&metadata, &canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    let candidate = directory.join(name);
+    if !cfg!(windows) || candidate.extension().is_some() {
+        return vec![candidate];
+    }
+    ["", ".com", ".exe", ".bat", ".cmd"]
+        .into_iter()
+        .map(|extension| directory.join(format!("{name}{extension}")))
+        .collect()
+}
+
+fn is_executable_file(metadata: &std::fs::Metadata, _path: &Path) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        _path.extension().is_some_and(|extension| {
+            matches!(
+                extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                "com" | "exe" | "bat" | "cmd"
+            )
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = _path;
+        true
+    }
+}
+
+fn configure_probe_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+}
+
+async fn terminate_probe(child: &mut tokio::process::Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        if let Some(pid) = pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw)
+        {
+            let _ = kill_process_group(pid, Signal::Kill);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn inherit_allowlisted_environment(command: &mut Command, search_path: &std::ffi::OsStr) {
     for name in INHERITED_ENVIRONMENT {
+        if name == "PATH" {
+            command.env(name, search_path);
+            continue;
+        }
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
@@ -422,12 +844,12 @@ fn is_version_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '+' | '-' | '_' | '(' | ')')
 }
 
-async fn collect_kernel_release() -> Option<String> {
+async fn collect_kernel_release(excluded_root: Option<&Path>) -> Option<String> {
     if cfg!(target_os = "linux") {
         return read_sanitized(Path::new("/proc/sys/kernel/osrelease"), 256).await;
     }
     if cfg!(target_os = "macos") {
-        let result = run_command("uname", &["-r"]).await;
+        let result = run_command("uname", &["-r"], excluded_root).await;
         if result.success {
             return sanitize_system_string(std::str::from_utf8(&result.stdout).ok()?);
         }
@@ -479,7 +901,7 @@ async fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= limit).then_some(bytes)
 }
 
-async fn detect_container() -> ContainerDescriptor {
+async fn detect_container(excluded_root: Option<&Path>) -> ContainerDescriptor {
     let mut evidence = Vec::new();
     let mut kind = "none";
 
@@ -527,7 +949,7 @@ async fn detect_container() -> ContainerDescriptor {
         kind = "wsl";
     }
 
-    let detected = run_command("systemd-detect-virt", &[]).await;
+    let detected = run_command("systemd-detect-virt", &[], excluded_root).await;
     if detected.success
         && let Some(detected_kind) = classify_virtualization_output(&detected.stdout)
     {
@@ -632,7 +1054,11 @@ fn trim_ascii(value: &[u8]) -> &[u8] {
 }
 
 async fn run_git_repository_probe(root: &Path) -> CommandResult {
-    let mut command = Command::new("git");
+    let Some(git) = resolve_executable("git", Some(root)).await else {
+        return CommandResult::default();
+    };
+    let working_directory = git.path.parent().map(Path::to_path_buf);
+    let mut command = Command::new(git.path);
     command
         .arg("-C")
         .arg(root)
@@ -642,17 +1068,22 @@ async fn run_git_repository_probe(root: &Path) -> CommandResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    inherit_allowlisted_environment(&mut command);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
+    configure_probe_process(&mut command);
+    inherit_allowlisted_environment(&mut command, &git.search_path);
     let Ok(mut child) = command.spawn() else {
         return CommandResult::default();
     };
+    let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
         return CommandResult {
             spawned: true,
             ..CommandResult::default()
         };
     };
-    tokio::time::timeout(PROBE_TIMEOUT, async {
+    match tokio::time::timeout(PROBE_TIMEOUT, async {
         let mut stdout_bytes = Vec::new();
         let mut bounded_stdout = stdout.take(16);
         let (status, output) =
@@ -665,10 +1096,16 @@ async fn run_git_repository_probe(root: &Path) -> CommandResult {
         }
     })
     .await
-    .unwrap_or(CommandResult {
-        spawned: true,
-        ..CommandResult::default()
-    })
+    {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_probe(&mut child, pid).await;
+            CommandResult {
+                spawned: true,
+                ..CommandResult::default()
+            }
+        }
+    }
 }
 
 async fn collect_package_manager(root: &Path) -> PackageManagerDescriptor {
@@ -763,6 +1200,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_catalog_matches_conformance_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/mcp-conformance/catalog/v1/execution-environment-tool.json"
+        ))
+        .expect("execution-environment catalog fixture");
+        assert_eq!(
+            serde_json::to_value(tool()).unwrap(),
+            fixture["expected"]["tools"][0]
+        );
+    }
+
+    #[test]
     fn version_normalization_never_returns_raw_output_or_paths() {
         assert_eq!(
             extract_version(b"git version 2.45.1\n"),
@@ -772,6 +1221,49 @@ mod tests {
         assert_eq!(extract_version(b"secret-canary\n"), None);
         assert_eq!(extract_version(b"/tmp/secret-canary-9\n"), None);
         assert_eq!(extract_version(&[b'1'; 65]), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_resolution_observes_installs_but_rejects_workspace_targets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let search_path = std::env::join_paths([bin.path()]).unwrap();
+        assert!(
+            resolve_executable_in("workcell-probe", &search_path, Some(root.path()))
+                .await
+                .is_none()
+        );
+
+        let executable = bin.path().join("workcell-probe");
+        tokio::fs::write(&executable, b"#!/bin/sh\nprintf '1.0.0\\n'\n")
+            .await
+            .unwrap();
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolve_executable_in("workcell-probe", &search_path, Some(root.path())).await,
+            Some(tokio::fs::canonicalize(&executable).await.unwrap())
+        );
+        assert!(
+            resolve_executable_in("workcell-probe", &search_path, Some(bin.path()))
+                .await
+                .is_none()
+        );
+        assert!(
+            filtered_search_path(&search_path, Some(bin.path()))
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -816,6 +1308,80 @@ mod tests {
                 .to_string()
                 .contains(root.path().to_string_lossy().as_ref())
         );
+    }
+
+    #[tokio::test]
+    async fn tool_collects_fresh_workspace_state_and_changes_revision() {
+        let root = tempdir().unwrap();
+        let disclosure = ExecutionEnvironmentDisclosure::collect(Some(root.path())).await;
+        let groups = ToolGroupDisclosure {
+            files: true,
+            web: false,
+            shell: true,
+        };
+        let first = disclosure
+            .call_tool(json!({}), groups, CancellationToken::new())
+            .await;
+        let first = first.structured_content.unwrap();
+        assert_eq!(
+            first["workspace"]["packageManager"],
+            json!({"lockfiles": []})
+        );
+
+        tokio::fs::write(
+            root.path().join("package.json"),
+            br#"{"packageManager":"pnpm@10.1.0","name":"must-not-leak"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.path().join("pnpm-lock.yaml"), b"must-not-leak")
+            .await
+            .unwrap();
+
+        let second = disclosure
+            .call_tool(json!({}), groups, CancellationToken::new())
+            .await;
+        let ContentBlock::Text(text) = &second.content[0] else {
+            panic!("expected text content");
+        };
+        let second = second.structured_content.unwrap();
+        assert_ne!(first["snapshotRevision"], second["snapshotRevision"]);
+        assert_eq!(
+            second["workspace"]["packageManager"],
+            json!({
+                "declared": {"name": "pnpm", "version": "10.1.0"},
+                "inferred": "pnpm",
+                "lockfiles": ["pnpm-lock.yaml"]
+            })
+        );
+        assert_eq!(text.text, serde_json::to_string_pretty(&second).unwrap());
+        assert!(!text.text.contains("must-not-leak"));
+        assert!(!text.text.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tool_rejects_arguments_and_honors_cancellation_while_queued() {
+        let disclosure = ExecutionEnvironmentDisclosure::collect(None).await;
+        let invalid = disclosure
+            .call_tool(
+                json!({"refresh": true}),
+                ToolGroupDisclosure::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(invalid.is_error, Some(true));
+
+        let _permit = disclosure.refresh_gate.acquire().await.unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = disclosure
+            .call_tool(json!({}), ToolGroupDisclosure::default(), cancellation)
+            .await;
+        assert_eq!(cancelled.is_error, Some(true));
+        let ContentBlock::Text(text) = &cancelled.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.text, "Execution-environment inspection cancelled");
     }
 
     #[tokio::test]

@@ -30,6 +30,20 @@ syntax fails closed because Workcell cannot prove that a hidden executable is un
 application policy layer, not an OS security boundary: allowed programs can still execute indirect
 behavior, so isolation remains mandatory for untrusted commands.
 
+Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
+read-only `execution_environment` tool is called. These probes resolve recognized programs through
+the process `PATH`, reject targets inside the configured root, and execute accepted targets with
+version or client-only arguments; they do not pass client-provided commands. Probe environments are
+cleared and selectively inherited, including a `PATH` containing only canonical directories outside
+the configured root and no inherited home or temporary-directory variables. Each probe starts from
+the resolved executable's parent directory rather than the workspace. Output, individual processes,
+and the complete tool inspection have deadlines; raw output is discarded after extracting normalized
+versions. Concurrent tool inspections are serialized, cancellation waits for bounded cleanup, and
+Unix probes use dedicated process groups for best-effort descendant termination. Operators must still
+treat installed executables as code and must not treat reported availability, container, sandbox, or
+network classifications as an authorization or isolation boundary. Disable discovery and the tool
+together with `--no-expose-execution-environment`.
+
 Recommended controls for untrusted workloads include:
 
 - A dedicated container, VM, microVM, or restricted operating-system account.

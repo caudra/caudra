@@ -90,6 +90,18 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
         &legacy_request(
             2,
             "tools/call",
+            json!({"name":"execution_environment","arguments":{}}),
+        ),
+    )
+    .await;
+    let environment = read_json(&mut read).await;
+    assert_eq!(environment["result"]["structuredContent"]["version"], "v1");
+
+    write_json(
+        &mut write,
+        &legacy_request(
+            3,
+            "tools/call",
             json!({
                 "name": "shell",
                 "arguments": {"command": "printf legacy-live"},
@@ -109,7 +121,7 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
         "stdout",
         "legacy-live",
     );
-    assert_eq!(result["id"], 2);
+    assert_eq!(result["id"], 3);
     assert_eq!(result["result"]["structuredContent"]["finalSequence"], 1);
 
     drop(write);
@@ -235,7 +247,18 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     let (read, mut write) = tokio::io::split(client_transport);
     let mut read = BufReader::new(read);
 
-    write_json(&mut write, &discover_request(1, json!({}))).await;
+    write_json(
+        &mut write,
+        &discover_request(
+            1,
+            json!({
+                "extensions": {
+                    "ai.workcell/execution-environment": {"versions": ["v1"]}
+                }
+            }),
+        ),
+    )
+    .await;
     let discovered = read_json(&mut read).await;
     assert_eq!(
         discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
@@ -244,6 +267,10 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     assert_eq!(
         discovered["result"]["supportedVersions"],
         supported_dual_versions()
+    );
+    assert_eq!(
+        discovered["result"]["capabilities"]["extensions"]["ai.workcell/execution-environment"]["version"],
+        "v1"
     );
 
     write_json(&mut write, &mcp_request(2, "tools/list", json!({}))).await;
@@ -266,6 +293,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "websearch",
             "webfetch",
             "shell",
+            "execution_environment",
         ]
     );
 
@@ -284,6 +312,22 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
         &mut write,
         &mcp_request(
             4,
+            "tools/call",
+            json!({"name":"execution_environment","arguments":{}}),
+        ),
+    )
+    .await;
+    let environment = read_json(&mut read).await;
+    assert_eq!(environment["result"]["structuredContent"]["version"], "v1");
+    assert_eq!(
+        environment["result"]["structuredContent"]["toolGroups"],
+        json!({"files": true, "web": true, "shell": true})
+    );
+
+    write_json(
+        &mut write,
+        &mcp_request(
+            5,
             "tools/call",
             json!({"name":"shell","arguments":{"command":"printf hello"}}),
         ),
@@ -348,7 +392,7 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
             .as_array()
             .unwrap()
             .len(),
-        9
+        10
     );
 
     let private_route = client
@@ -484,7 +528,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
     .await;
     assert!(!listed.headers().contains_key("mcp-session-id"));
     let listed = final_sse_json(listed).await;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 9);
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 10);
     assert!(listed["result"].get("ttlMs").is_none());
     assert!(listed["result"].get("cacheScope").is_none());
 
