@@ -117,7 +117,7 @@ pub struct RawOptions {
     #[arg(long = "allowed-host", action = clap::ArgAction::Append)]
     pub allowed_hosts: Vec<String>,
 
-    /// Disable negotiated, sanitized execution-environment disclosure.
+    /// Disable execution-environment discovery and tool probes.
     #[arg(long)]
     pub no_expose_execution_environment: bool,
 

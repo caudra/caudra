@@ -31,18 +31,27 @@ application policy layer, not an OS security boundary: allowed programs can stil
 behavior, so isolation remains mandatory for untrusted commands.
 
 Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
-read-only `execution_environment` tool is called. These probes resolve recognized programs through
-the process `PATH`, reject targets inside the configured root, and execute accepted targets with
-version or client-only arguments; they do not pass client-provided commands. Probe environments are
-cleared and selectively inherited, including a `PATH` containing only canonical directories outside
-the configured root and no inherited home or temporary-directory variables. Each probe starts from
-the resolved executable's parent directory rather than the workspace. Output, individual processes,
-and the complete tool inspection have deadlines; raw output is discarded after extracting normalized
-versions. Concurrent tool inspections are serialized, cancellation waits for bounded cleanup, and
-Unix probes use dedicated process groups for best-effort descendant termination. Operators must still
-treat installed executables as code and must not treat reported availability, container, sandbox, or
-network classifications as an authorization or isolation boundary. Disable discovery and the tool
-together with `--no-expose-execution-environment`.
+`execution_environment` tool is called. A non-root Unix process actively runs
+`sudo -n -- <resolved-true>` during each inspection; this may create audit records, update external
+policy state, refresh the sudo credential timestamp and extend cached authorization lifetime, or invoke
+local or remote PAM and sudo policy plugins. Success proves only that fixed command, while failure can
+mean a password requirement or command-specific denial. A `not-found` result means sudo did not resolve
+through the root-filtered `PATH`, not that no sudo binary exists elsewhere. Effective UID 0 may be
+namespaced or container-confined and does not imply host-level root. These observations disclose
+privilege-relevant capability but do not authorize shell use or bypass shell policy.
+
+All executable probes resolve recognized programs through the process `PATH`, reject targets inside
+the configured root, and execute accepted targets with fixed arguments; they do not pass
+client-provided commands. Probe environments are cleared and selectively inherited, including a
+`PATH` containing only canonical directories outside the configured root and no inherited home or
+temporary-directory variables. Each probe starts from the resolved executable's parent directory
+rather than the workspace. Output, individual processes, and the complete tool inspection have
+deadlines; raw output is discarded after extracting normalized versions. Concurrent tool inspections
+are serialized, cancellation waits for bounded cleanup, and Unix probes use dedicated process groups
+for best-effort descendant termination. Operators must still treat installed executables as code and
+must not treat reported availability or privilege, package-manager, container, sandbox, or network
+classifications as an authorization or isolation boundary. Disable discovery and the tool together
+with `--no-expose-execution-environment`.
 
 Recommended controls for untrusted workloads include:
 

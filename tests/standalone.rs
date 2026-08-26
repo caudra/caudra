@@ -95,7 +95,7 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
     )
     .await;
     let environment = read_json(&mut read).await;
-    assert_eq!(environment["result"]["structuredContent"]["version"], "v1");
+    assert_environment_descriptor(&environment["result"]["structuredContent"]);
 
     write_json(
         &mut write,
@@ -272,6 +272,9 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
         discovered["result"]["capabilities"]["extensions"]["ai.workcell/execution-environment"]["version"],
         "v1"
     );
+    assert_environment_descriptor(
+        &discovered["result"]["capabilities"]["extensions"]["ai.workcell/execution-environment"],
+    );
 
     write_json(&mut write, &mcp_request(2, "tools/list", json!({}))).await;
     let listed = read_json(&mut read).await;
@@ -318,7 +321,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     )
     .await;
     let environment = read_json(&mut read).await;
-    assert_eq!(environment["result"]["structuredContent"]["version"], "v1");
+    assert_environment_descriptor(&environment["result"]["structuredContent"]);
     assert_eq!(
         environment["result"]["structuredContent"]["toolGroups"],
         json!({"files": true, "web": true, "shell": true})
@@ -857,6 +860,22 @@ fn assert_progress(
             "text": expected_text
         })
     );
+}
+
+fn assert_environment_descriptor(descriptor: &Value) {
+    assert_eq!(descriptor["version"], "v1");
+    assert!(descriptor["os"]["systemPackageManager"]["name"].is_string());
+    assert!(descriptor["os"]["systemPackageManager"]["available"].is_boolean());
+    assert!(
+        descriptor["execution"]["privilege"]["effectiveRoot"].is_boolean()
+            || descriptor["execution"]["privilege"]["effectiveRoot"].is_null()
+    );
+    assert!(matches!(
+        descriptor["execution"]["privilege"]["nonInteractiveSudo"].as_str(),
+        Some(
+            "available" | "unavailable" | "not-found" | "not-needed" | "not-applicable" | "unknown"
+        )
+    ));
 }
 
 fn request_meta(capabilities: Value) -> Value {

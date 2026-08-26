@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -19,11 +20,13 @@ pub(crate) const TOOL_NAME: &str = "execution_environment";
 const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 const TOOL_DESCRIPTION: &str = r#"Inspect the MCP server's current sanitized execution environment.
 
-Use this tool when command availability, installed versions, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.
+Use this tool when command availability, installed versions, privilege access, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.
 
-The result reports platform and runtime classifications, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.
+The result reports platform and runtime classifications, the platform's primary system package manager, effective-root status, non-interactive sudo status, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.
 
-The tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with version or client-only arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Container, sandbox, network, and command classifications are best-effort observations; do not use them as security guarantees."#;
+On Unix, `effectiveRoot` means effective UID 0, which may be namespaced and does not imply host root. When not root, the tool tests `sudo -n -- <resolved-true>`; `available` proves only that fixed command and can refresh the sudo credential timestamp, create audit records, or invoke PAM and policy plugins. Root skips sudo as `not-needed`; unsupported platforms report `not-applicable`.
+
+The tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with fixed inspection arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Privilege, package-manager, container, sandbox, network, and command classifications are best-effort observations; do not use them as security or authorization guarantees."#;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -34,6 +37,7 @@ const INHERITED_ENVIRONMENT: [&str; 6] = ["PATH", "LANG", "LC_ALL", "TERM", "Sys
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionEnvironmentSnapshot {
     os: OsDescriptor,
+    privilege: PrivilegeDescriptor,
     container: ContainerDescriptor,
     workspace: WorkspaceDescriptor,
     commands: Vec<CommandDescriptor>,
@@ -61,7 +65,7 @@ struct SemanticDescriptor<'a> {
     scope: &'static str,
     os: &'a OsDescriptor,
     runtime: RuntimeDescriptor,
-    execution: ExecutionDescriptor,
+    execution: ExecutionDescriptor<'a>,
     container: &'a ContainerDescriptor,
     workspace: &'a WorkspaceDescriptor,
     tool_groups: ToolGroupDisclosure,
@@ -76,7 +80,7 @@ struct Descriptor<'a> {
     scope: &'static str,
     os: &'a OsDescriptor,
     runtime: RuntimeDescriptor,
-    execution: ExecutionDescriptor,
+    execution: ExecutionDescriptor<'a>,
     container: &'a ContainerDescriptor,
     workspace: &'a WorkspaceDescriptor,
     tool_groups: ToolGroupDisclosure,
@@ -92,6 +96,7 @@ struct OsDescriptor {
     kernel_release: Option<String>,
     distribution: Option<String>,
     wsl: bool,
+    system_package_manager: SystemPackageManagerDescriptor,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -102,11 +107,36 @@ struct RuntimeDescriptor {
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExecutionDescriptor {
+struct ExecutionDescriptor<'a> {
     shell: &'static str,
     sandbox: &'static str,
     network_access: &'static str,
     environment_inheritance: &'static str,
+    privilege: &'a PrivilegeDescriptor,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivilegeDescriptor {
+    effective_root: Option<bool>,
+    non_interactive_sudo: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SystemPackageManagerDescriptor {
+    name: &'static str,
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LinuxDistribution {
+    display: String,
+    id: String,
+    id_like: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +189,13 @@ struct Probe {
     args: &'static [&'static str],
 }
 
+#[derive(Clone, Copy)]
+struct SystemPackageManagerProbe {
+    name: &'static str,
+    executable: &'static str,
+    args: &'static [&'static str],
+}
+
 const PROBES: &[Probe] = &[
     probe("bash", "bash", &["--version"]),
     probe("zsh", "zsh", &["--version"]),
@@ -204,9 +241,54 @@ const LOCKFILES: &[(&str, &str)] = &[
     ("bun.lockb", "bun"),
 ];
 
+const APT: SystemPackageManagerProbe = system_package_manager("apt", "apt-get", &["--version"]);
+const DNF: SystemPackageManagerProbe = system_package_manager("dnf", "dnf", &["--version"]);
+const YUM: SystemPackageManagerProbe = system_package_manager("yum", "yum", &["--version"]);
+const APK: SystemPackageManagerProbe = system_package_manager("apk", "apk", &["--version"]);
+const PACMAN: SystemPackageManagerProbe =
+    system_package_manager("pacman", "pacman", &["--version"]);
+const ZYPPER: SystemPackageManagerProbe =
+    system_package_manager("zypper", "zypper", &["--version"]);
+const XBPS: SystemPackageManagerProbe =
+    system_package_manager("xbps", "xbps-install", &["--version"]);
+const EMERGE: SystemPackageManagerProbe =
+    system_package_manager("emerge", "emerge", &["--version"]);
+const NIX: SystemPackageManagerProbe = system_package_manager("nix", "nix", &["--version"]);
+const BREW: SystemPackageManagerProbe = system_package_manager("brew", "brew", &["--version"]);
+const WINGET: SystemPackageManagerProbe =
+    system_package_manager("winget", "winget", &["--version"]);
+const PKG: SystemPackageManagerProbe = system_package_manager("pkg", "pkg", &["--version"]);
+
+const ALL_SYSTEM_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[
+    APT, DNF, YUM, APK, PACMAN, ZYPPER, XBPS, EMERGE, NIX, BREW, WINGET, PKG,
+];
+const DEBIAN_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[APT];
+const RPM_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[DNF, YUM];
+const ALPINE_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[APK];
+const ARCH_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[PACMAN];
+const SUSE_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[ZYPPER];
+const VOID_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[XBPS];
+const GENTOO_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[EMERGE];
+const NIXOS_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[NIX];
+const MACOS_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[BREW];
+const WINDOWS_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[WINGET];
+const FREEBSD_PACKAGE_MANAGERS: &[SystemPackageManagerProbe] = &[PKG];
+
 const fn probe(id: &'static str, executable: &'static str, args: &'static [&'static str]) -> Probe {
     Probe {
         id,
+        executable,
+        args,
+    }
+}
+
+const fn system_package_manager(
+    name: &'static str,
+    executable: &'static str,
+    args: &'static [&'static str],
+) -> SystemPackageManagerProbe {
+    SystemPackageManagerProbe {
+        name,
         executable,
         args,
     }
@@ -299,10 +381,10 @@ pub(crate) fn tool() -> Tool {
     .with_raw_output_schema(output_schema())
     .with_annotations(ToolAnnotations::from_raw(
         None,
-        Some(true),
+        Some(false),
+        Some(false),
         Some(false),
         Some(true),
-        Some(false),
     ))
     .with_meta(MetaObject(meta))
 }
@@ -315,6 +397,15 @@ fn output_schema() -> Arc<JsonObject> {
         .collect::<Vec<_>>();
     let command_ids = PROBES.iter().map(|probe| probe.id).collect::<Vec<_>>();
     let command_count = PROBES.len();
+    let mut system_package_manager_names = ALL_SYSTEM_PACKAGE_MANAGERS
+        .iter()
+        .map(|manager| manager.name)
+        .collect::<Vec<_>>();
+    system_package_manager_names.push("unknown");
+    let system_package_manager_executables = ALL_SYSTEM_PACKAGE_MANAGERS
+        .iter()
+        .map(|manager| manager.executable)
+        .collect::<Vec<_>>();
     let schema = json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -330,14 +421,28 @@ fn output_schema() -> Arc<JsonObject> {
             "os": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["family", "architecture", "pathStyle", "kernelRelease", "distribution", "wsl"],
+                "required": [
+                    "family", "architecture", "pathStyle", "kernelRelease", "distribution", "wsl",
+                    "systemPackageManager"
+                ],
                 "properties": {
                     "family": {"enum": ["linux", "macos", "windows", "other"]},
                     "architecture": {"enum": ["x86_64", "aarch64", "x86", "arm", "other"]},
                     "pathStyle": {"enum": ["windows", "posix"]},
                     "kernelRelease": nullable_string,
                     "distribution": {"type": ["string", "null"], "maxLength": 128},
-                    "wsl": {"type": "boolean"}
+                    "wsl": {"type": "boolean"},
+                    "systemPackageManager": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["name", "available"],
+                        "properties": {
+                            "name": {"enum": system_package_manager_names},
+                            "available": {"type": "boolean"},
+                            "executable": {"enum": system_package_manager_executables},
+                            "version": {"type": "string", "minLength": 1, "maxLength": 64}
+                        }
+                    }
                 }
             },
             "runtime": {
@@ -352,12 +457,26 @@ fn output_schema() -> Arc<JsonObject> {
             "execution": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["shell", "sandbox", "networkAccess", "environmentInheritance"],
+                "required": [
+                    "shell", "sandbox", "networkAccess", "environmentInheritance", "privilege"
+                ],
                 "properties": {
                     "shell": {"enum": ["bash", "cmd", "other", "none"]},
                     "sandbox": {"enum": ["container", "virtual-machine", "unknown"]},
                     "networkAccess": {"const": "host-policy"},
-                    "environmentInheritance": {"enum": ["allowlisted", "not-applicable"]}
+                    "environmentInheritance": {"enum": ["allowlisted", "not-applicable"]},
+                    "privilege": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["effectiveRoot", "nonInteractiveSudo"],
+                        "properties": {
+                            "effectiveRoot": {"type": ["boolean", "null"]},
+                            "nonInteractiveSudo": {"enum": [
+                                "available", "unavailable", "not-found", "not-needed",
+                                "not-applicable", "unknown"
+                            ]}
+                        }
+                    }
                 }
             },
             "container": {
@@ -469,13 +588,16 @@ impl ExecutionEnvironmentSnapshot {
     pub(crate) async fn collect(root: Option<&Path>) -> Self {
         let canonical_root = canonical_root(root).await;
         let root = canonical_root.as_deref();
-        let (kernel_release, distribution, container, mut workspace, commands) = tokio::join!(
+        let (kernel_release, distribution, container, mut workspace, commands, privilege) = tokio::join!(
             collect_kernel_release(root),
             collect_distribution(),
             detect_container(root),
             collect_workspace(root),
             collect_commands(root),
+            collect_privilege(root),
         );
+        let system_package_manager =
+            collect_system_package_manager(root, distribution.as_ref()).await;
         workspace.git.available = commands
             .iter()
             .find(|command| command.id == "git")
@@ -487,9 +609,11 @@ impl ExecutionEnvironmentSnapshot {
                 architecture: architecture(),
                 path_style: if cfg!(windows) { "windows" } else { "posix" },
                 kernel_release,
-                distribution,
+                distribution: distribution.map(|distribution| distribution.display),
                 wsl,
+                system_package_manager,
             },
+            privilege,
             container,
             workspace,
             commands,
@@ -513,6 +637,7 @@ impl ExecutionEnvironmentSnapshot {
             } else {
                 "not-applicable"
             },
+            privilege: &self.privilege,
         };
         let runtime = RuntimeDescriptor {
             name: "workcell-mcp",
@@ -608,10 +733,11 @@ async fn run_probe(probe: Probe, excluded_root: Option<&Path>) -> CommandDescrip
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CommandResult {
     spawned: bool,
     success: bool,
+    timed_out: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -624,6 +750,11 @@ async fn run_command(
     let Some(executable) = resolve_executable(executable, excluded_root).await else {
         return CommandResult::default();
     };
+    let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    run_resolved_command(executable, &args).await
+}
+
+async fn run_resolved_command(executable: ResolvedExecutable, args: &[&OsStr]) -> CommandResult {
     let working_directory = executable.path.parent().map(Path::to_path_buf);
     let mut command = Command::new(executable.path);
     command
@@ -669,6 +800,7 @@ async fn run_command(
             success: status.is_ok_and(|status| status.success())
                 && stdout_result.is_ok()
                 && stderr_result.is_ok(),
+            timed_out: false,
             stdout: stdout_bytes,
             stderr: stderr_bytes,
         }
@@ -680,9 +812,190 @@ async fn run_command(
             terminate_probe(&mut child, pid).await;
             CommandResult {
                 spawned: true,
+                timed_out: true,
                 ..CommandResult::default()
             }
         }
+    }
+}
+
+async fn collect_privilege(excluded_root: Option<&Path>) -> PrivilegeDescriptor {
+    let effective_root = effective_root();
+    let non_interactive_sudo = match effective_root {
+        Some(true) => "not-needed",
+        Some(false) => probe_non_interactive_sudo(excluded_root).await,
+        None => "not-applicable",
+    };
+    PrivilegeDescriptor {
+        effective_root,
+        non_interactive_sudo,
+    }
+}
+
+#[cfg(unix)]
+fn effective_root() -> Option<bool> {
+    Some(rustix::process::geteuid().is_root())
+}
+
+#[cfg(not(unix))]
+const fn effective_root() -> Option<bool> {
+    None
+}
+
+async fn probe_non_interactive_sudo(excluded_root: Option<&Path>) -> &'static str {
+    let Some(sudo) = resolve_executable("sudo", excluded_root).await else {
+        return "not-found";
+    };
+    let Some(true_executable) = resolve_executable("true", excluded_root).await else {
+        return "unknown";
+    };
+    let args = [
+        OsStr::new("-n"),
+        OsStr::new("--"),
+        true_executable.path.as_os_str(),
+    ];
+    classify_sudo_result(&run_resolved_command(sudo, &args).await)
+}
+
+fn classify_sudo_result(result: &CommandResult) -> &'static str {
+    if result.timed_out || !result.spawned {
+        "unknown"
+    } else if result.success {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+async fn collect_system_package_manager(
+    excluded_root: Option<&Path>,
+    distribution: Option<&LinuxDistribution>,
+) -> SystemPackageManagerDescriptor {
+    let candidates =
+        system_package_manager_candidates(system_package_manager_platform(), distribution);
+    let Some(fallback) = candidates.first().copied() else {
+        return SystemPackageManagerDescriptor {
+            name: "unknown",
+            available: false,
+            executable: None,
+            version: None,
+        };
+    };
+    for candidate in candidates {
+        let Some(executable) = resolve_executable(candidate.executable, excluded_root).await else {
+            continue;
+        };
+        let args = candidate.args.iter().map(OsStr::new).collect::<Vec<_>>();
+        let result = run_resolved_command(executable, &args).await;
+        if !result.spawned {
+            continue;
+        }
+        return SystemPackageManagerDescriptor {
+            name: candidate.name,
+            available: result.spawned,
+            executable: Some(candidate.executable),
+            version: result
+                .success
+                .then(|| {
+                    extract_version(&result.stdout).or_else(|| extract_version(&result.stderr))
+                })
+                .flatten(),
+        };
+    }
+    SystemPackageManagerDescriptor {
+        name: fallback.name,
+        available: false,
+        executable: Some(fallback.executable),
+        version: None,
+    }
+}
+
+fn system_package_manager_candidates(
+    family: &str,
+    distribution: Option<&LinuxDistribution>,
+) -> &'static [SystemPackageManagerProbe] {
+    match family {
+        "linux" => linux_package_manager_candidates(distribution),
+        "macos" => MACOS_PACKAGE_MANAGERS,
+        "windows" => WINDOWS_PACKAGE_MANAGERS,
+        "freebsd" => FREEBSD_PACKAGE_MANAGERS,
+        _ => &[],
+    }
+}
+
+fn linux_package_manager_candidates(
+    distribution: Option<&LinuxDistribution>,
+) -> &'static [SystemPackageManagerProbe] {
+    let Some(distribution) = distribution else {
+        return &[];
+    };
+    if distribution_matches(
+        distribution,
+        &[
+            "debian",
+            "ubuntu",
+            "linuxmint",
+            "pop",
+            "kali",
+            "raspbian",
+            "neon",
+            "elementary",
+            "zorin",
+        ],
+    ) {
+        DEBIAN_PACKAGE_MANAGERS
+    } else if distribution_matches(
+        distribution,
+        &[
+            "fedora",
+            "rhel",
+            "centos",
+            "rocky",
+            "almalinux",
+            "ol",
+            "amzn",
+        ],
+    ) {
+        RPM_PACKAGE_MANAGERS
+    } else if distribution_matches(distribution, &["alpine"]) {
+        ALPINE_PACKAGE_MANAGERS
+    } else if distribution_matches(distribution, &["arch", "manjaro", "endeavouros", "garuda"]) {
+        ARCH_PACKAGE_MANAGERS
+    } else if distribution_matches(
+        distribution,
+        &[
+            "suse",
+            "opensuse",
+            "opensuse-leap",
+            "opensuse-tumbleweed",
+            "sles",
+        ],
+    ) {
+        SUSE_PACKAGE_MANAGERS
+    } else if distribution_matches(distribution, &["void"]) {
+        VOID_PACKAGE_MANAGERS
+    } else if distribution_matches(distribution, &["gentoo"]) {
+        GENTOO_PACKAGE_MANAGERS
+    } else if distribution_matches(distribution, &["nixos"]) {
+        NIXOS_PACKAGE_MANAGERS
+    } else {
+        &[]
+    }
+}
+
+fn distribution_matches(distribution: &LinuxDistribution, candidates: &[&str]) -> bool {
+    candidates.contains(&distribution.id.as_str())
+        || distribution
+            .id_like
+            .iter()
+            .any(|id| candidates.contains(&id.as_str()))
+}
+
+const fn system_package_manager_platform() -> &'static str {
+    if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        os_family()
     }
 }
 
@@ -857,17 +1170,34 @@ async fn collect_kernel_release(excluded_root: Option<&Path>) -> Option<String> 
     None
 }
 
-async fn collect_distribution() -> Option<String> {
+async fn collect_distribution() -> Option<LinuxDistribution> {
     if !cfg!(target_os = "linux") {
         return None;
     }
     let bytes = read_bounded(Path::new("/etc/os-release"), MAX_METADATA_BYTES).await?;
     let contents = std::str::from_utf8(&bytes).ok()?;
-    let id = os_release_value(contents, "ID").and_then(sanitize_system_string)?;
+    parse_linux_distribution(contents)
+}
+
+fn parse_linux_distribution(contents: &str) -> Option<LinuxDistribution> {
+    let id = os_release_value(contents, "ID").and_then(sanitize_distribution_id)?;
     let version = os_release_value(contents, "VERSION_ID").and_then(sanitize_system_string);
-    version
+    let display = version
         .and_then(|version| sanitize_system_string(&format!("{id} {version}")))
-        .or(Some(id))
+        .unwrap_or_else(|| id.clone());
+    let id_like = os_release_value(contents, "ID_LIKE")
+        .map(|value| {
+            value
+                .split_ascii_whitespace()
+                .filter_map(sanitize_distribution_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(LinuxDistribution {
+        display,
+        id,
+        id_like,
+    })
 }
 
 fn os_release_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
@@ -892,6 +1222,16 @@ fn sanitize_system_string(value: &str) -> Option<String> {
                 || matches!(byte, b'.' | b'+' | b'-' | b'_' | b'(' | b')' | b' ')
         }))
     .then(|| value.to_owned())
+}
+
+fn sanitize_distribution_id(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_')))
+    .then_some(value)
 }
 
 async fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -1091,6 +1431,7 @@ async fn run_git_repository_probe(root: &Path) -> CommandResult {
         CommandResult {
             spawned: true,
             success: status.is_ok_and(|status| status.success()) && output.is_ok(),
+            timed_out: false,
             stdout: stdout_bytes,
             stderr: Vec::new(),
         }
@@ -1221,6 +1562,90 @@ mod tests {
         assert_eq!(extract_version(b"secret-canary\n"), None);
         assert_eq!(extract_version(b"/tmp/secret-canary-9\n"), None);
         assert_eq!(extract_version(&[b'1'; 65]), None);
+    }
+
+    #[test]
+    fn parses_linux_distribution_without_retaining_untrusted_fields() {
+        let distribution = parse_linux_distribution(
+            "ID=ubuntu\nVERSION_ID=24.04\nID_LIKE=\"debian unsafe/path\"\nNAME=secret\n",
+        )
+        .unwrap();
+        assert_eq!(distribution.display, "ubuntu 24.04");
+        assert_eq!(distribution.id, "ubuntu");
+        assert_eq!(distribution.id_like, ["debian"]);
+    }
+
+    #[test]
+    fn maps_platforms_and_distribution_families_to_primary_package_managers() {
+        fn distribution(id: &str, id_like: &[&str]) -> LinuxDistribution {
+            LinuxDistribution {
+                display: id.to_owned(),
+                id: id.to_owned(),
+                id_like: id_like.iter().map(|value| (*value).to_owned()).collect(),
+            }
+        }
+
+        let cases = [
+            ("linux", distribution("ubuntu", &["debian"]), "apt"),
+            ("linux", distribution("rocky", &["rhel", "fedora"]), "dnf"),
+            ("linux", distribution("alpine", &[]), "apk"),
+            ("linux", distribution("manjaro", &["arch"]), "pacman"),
+            ("linux", distribution("sles", &["suse"]), "zypper"),
+            ("linux", distribution("void", &[]), "xbps"),
+            ("linux", distribution("gentoo", &[]), "emerge"),
+            ("linux", distribution("nixos", &[]), "nix"),
+            ("macos", distribution("unused", &[]), "brew"),
+            ("windows", distribution("unused", &[]), "winget"),
+            ("freebsd", distribution("unused", &[]), "pkg"),
+        ];
+        for (platform, distribution, expected) in cases {
+            assert_eq!(
+                system_package_manager_candidates(platform, Some(&distribution))[0].name,
+                expected
+            );
+        }
+        let rpm = distribution("rhel", &[]);
+        assert_eq!(
+            system_package_manager_candidates("linux", Some(&rpm))
+                .iter()
+                .map(|manager| manager.name)
+                .collect::<Vec<_>>(),
+            ["dnf", "yum"]
+        );
+        assert!(system_package_manager_candidates("other", None).is_empty());
+        assert!(
+            system_package_manager_candidates("linux", Some(&distribution("unrecognized", &[])))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn classifies_non_interactive_sudo_results_without_output_disclosure() {
+        assert_eq!(classify_sudo_result(&CommandResult::default()), "unknown");
+        assert_eq!(
+            classify_sudo_result(&CommandResult {
+                spawned: true,
+                success: true,
+                ..CommandResult::default()
+            }),
+            "available"
+        );
+        assert_eq!(
+            classify_sudo_result(&CommandResult {
+                spawned: true,
+                stderr: b"sensitive policy message".to_vec(),
+                ..CommandResult::default()
+            }),
+            "unavailable"
+        );
+        assert_eq!(
+            classify_sudo_result(&CommandResult {
+                spawned: true,
+                timed_out: true,
+                ..CommandResult::default()
+            }),
+            "unknown"
+        );
     }
 
     #[cfg(unix)]
@@ -1386,7 +1811,7 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_is_strict_and_revision_is_stable() {
-        let snapshot = ExecutionEnvironmentSnapshot::collect(None).await;
+        let mut snapshot = ExecutionEnvironmentSnapshot::collect(None).await;
         let groups = ToolGroupDisclosure {
             files: true,
             web: false,
@@ -1415,7 +1840,7 @@ mod tests {
         assert_eq!(first["scope"], "server-process");
         assert_eq!(first["runtime"]["name"], "workcell-mcp");
         assert_eq!(first["runtime"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(first["os"].as_object().unwrap().len(), 6);
+        assert_eq!(first["os"].as_object().unwrap().len(), 7);
         assert!(matches!(
             first["os"]["family"].as_str(),
             Some("linux" | "macos" | "windows" | "other")
@@ -1425,6 +1850,25 @@ mod tests {
             Some("x86_64" | "aarch64" | "x86" | "arm" | "other")
         ));
         assert!(first["os"]["wsl"].is_boolean());
+        assert!(first["os"]["systemPackageManager"]["available"].is_boolean());
+        assert!(matches!(
+            first["os"]["systemPackageManager"]["name"].as_str(),
+            Some(
+                "apt"
+                    | "dnf"
+                    | "yum"
+                    | "apk"
+                    | "pacman"
+                    | "zypper"
+                    | "xbps"
+                    | "emerge"
+                    | "nix"
+                    | "brew"
+                    | "winget"
+                    | "pkg"
+                    | "unknown"
+            )
+        ));
         assert!(matches!(
             first["container"]["kind"].as_str(),
             Some(
@@ -1466,6 +1910,21 @@ mod tests {
             first["execution"]["environmentInheritance"],
             "not-applicable"
         );
+        assert!(
+            first["execution"]["privilege"]["effectiveRoot"].is_boolean()
+                || first["execution"]["privilege"]["effectiveRoot"].is_null()
+        );
+        assert!(matches!(
+            first["execution"]["privilege"]["nonInteractiveSudo"].as_str(),
+            Some(
+                "available"
+                    | "unavailable"
+                    | "not-found"
+                    | "not-needed"
+                    | "not-applicable"
+                    | "unknown"
+            )
+        ));
         assert_eq!(first["workspace"]["git"]["repository"], "unknown");
         assert_eq!(
             first["workspace"]["packageManager"],
@@ -1497,6 +1956,23 @@ mod tests {
                 .unwrap()
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        let mut changed_manager = snapshot.clone();
+        changed_manager.os.system_package_manager.available =
+            !changed_manager.os.system_package_manager.available;
+        assert_ne!(
+            first["snapshotRevision"],
+            changed_manager.descriptor(groups)["snapshotRevision"]
+        );
+        snapshot.privilege.non_interactive_sudo =
+            if snapshot.privilege.non_interactive_sudo == "unknown" {
+                "unavailable"
+            } else {
+                "unknown"
+            };
+        assert_ne!(
+            first["snapshotRevision"],
+            snapshot.descriptor(groups)["snapshotRevision"]
         );
     }
 }

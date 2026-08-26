@@ -9,7 +9,7 @@
       {
         "name": "execution_environment",
         "title": "Inspect execution environment",
-        "description": "Inspect the MCP server's current sanitized execution environment.\n\nUse this tool when command availability, installed versions, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.\n\nThe result reports platform and runtime classifications, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.\n\nThe tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with version or client-only arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Container, sandbox, network, and command classifications are best-effort observations; do not use them as security guarantees.",
+        "description": "Inspect the MCP server's current sanitized execution environment.\n\nUse this tool when command availability, installed versions, privilege access, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.\n\nThe result reports platform and runtime classifications, the platform's primary system package manager, effective-root status, non-interactive sudo status, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.\n\nOn Unix, `effectiveRoot` means effective UID 0, which may be namespaced and does not imply host root. When not root, the tool tests `sudo -n -- <resolved-true>`; `available` proves only that fixed command and can refresh the sudo credential timestamp, create audit records, or invoke PAM and policy plugins. Root skips sudo as `not-needed`; unsupported platforms report `not-applicable`.\n\nThe tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with fixed inspection arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Privilege, package-manager, container, sandbox, network, and command classifications are best-effort observations; do not use them as security or authorization guarantees.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
@@ -48,7 +48,8 @@
                 "pathStyle",
                 "kernelRelease",
                 "distribution",
-                "wsl"
+                "wsl",
+                "systemPackageManager"
               ],
               "properties": {
                 "family": { "enum": ["linux", "macos", "windows", "other"] },
@@ -64,7 +65,53 @@
                   "type": ["string", "null"],
                   "maxLength": 128
                 },
-                "wsl": { "type": "boolean" }
+                "wsl": { "type": "boolean" },
+                "systemPackageManager": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "available"],
+                  "properties": {
+                    "name": {
+                      "enum": [
+                        "apt",
+                        "dnf",
+                        "yum",
+                        "apk",
+                        "pacman",
+                        "zypper",
+                        "xbps",
+                        "emerge",
+                        "nix",
+                        "brew",
+                        "winget",
+                        "pkg",
+                        "unknown"
+                      ]
+                    },
+                    "available": { "type": "boolean" },
+                    "executable": {
+                      "enum": [
+                        "apt-get",
+                        "dnf",
+                        "yum",
+                        "apk",
+                        "pacman",
+                        "zypper",
+                        "xbps-install",
+                        "emerge",
+                        "nix",
+                        "brew",
+                        "winget",
+                        "pkg"
+                      ]
+                    },
+                    "version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  }
+                }
               }
             },
             "runtime": {
@@ -83,7 +130,8 @@
                 "shell",
                 "sandbox",
                 "networkAccess",
-                "environmentInheritance"
+                "environmentInheritance",
+                "privilege"
               ],
               "properties": {
                 "shell": { "enum": ["bash", "cmd", "other", "none"] },
@@ -93,6 +141,24 @@
                 "networkAccess": { "const": "host-policy" },
                 "environmentInheritance": {
                   "enum": ["allowlisted", "not-applicable"]
+                },
+                "privilege": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["effectiveRoot", "nonInteractiveSudo"],
+                  "properties": {
+                    "effectiveRoot": { "type": ["boolean", "null"] },
+                    "nonInteractiveSudo": {
+                      "enum": [
+                        "available",
+                        "unavailable",
+                        "not-found",
+                        "not-needed",
+                        "not-applicable",
+                        "unknown"
+                      ]
+                    }
+                  }
                 }
               }
             },
@@ -253,10 +319,10 @@
           }
         },
         "annotations": {
-          "readOnlyHint": true,
+          "readOnlyHint": false,
           "destructiveHint": false,
-          "idempotentHint": true,
-          "openWorldHint": false
+          "idempotentHint": false,
+          "openWorldHint": true
         },
         "_meta": {
           "ai.workcell/presentation-profile": "execution-environment.snapshot.v1"

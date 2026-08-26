@@ -61,7 +61,7 @@ sequenceDiagram
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Preview-only unless `--allow-write` is set. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
-| Server | `execution_environment` | Returns a fresh, sanitized execution-environment snapshot using bounded fixed probes. |
+| Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups are enabled by default. Use repeatable `--tool-group files|web|shell` arguments to expose a
 subset. Files and shell require a positional root.
@@ -351,18 +351,20 @@ Workcell then publishes each accepted output chunk before the final tool result:
 
 Clients may negotiate `ai.workcell/execution-environment` version `v1` to receive a sanitized startup
 snapshot during discovery. The `execution_environment` tool returns the same descriptor shape from a
-fresh bounded inspection, so clients can observe later command installation or version changes, Git
-repository state, package-manager metadata, and recognized lockfiles without restarting Workcell.
+fresh bounded inspection, so clients can observe later command installation or version changes,
+effective-root and non-interactive sudo status, the platform's system package manager, Git repository
+state, project package-manager metadata, and recognized lockfiles without restarting Workcell.
 Concurrent tool inspections are serialized.
 
-Both surfaces report platform and container classifications, enabled tool groups, workspace metadata,
-and command availability. Fixed command probes resolve only executable targets outside the configured
-root, receive a `PATH` containing only canonical directories outside that root, then run with version
-or client-only arguments from the executable's parent directory, a cleaned allowlisted environment,
-bounded output, and short deadlines. Results never include raw root paths, environment values, probe
-output, file contents, tool arguments, or credentials. Availability and container, sandbox, and
-network classifications are best-effort observations rather than security guarantees. Disable both
-surfaces with `--no-expose-execution-environment`.
+Both surfaces report platform and container classifications, privilege observations, enabled tool
+groups, workspace metadata, and command availability. Fixed command probes resolve only executable
+targets outside the configured root, receive a `PATH` containing only canonical directories outside
+that root, then run with fixed arguments from the executable's parent directory, a cleaned allowlisted
+environment, bounded output, and short deadlines. Results never include raw root paths, environment
+values, probe output, file contents, tool arguments, or credentials. Availability and privilege,
+package-manager, container, sandbox, and network classifications are best-effort observations rather
+than security or authorization guarantees. Disable both surfaces with
+`--no-expose-execution-environment`.
 
 ## Development
 
@@ -397,11 +399,12 @@ particular server configuration. Argument validation is repeated during dispatch
 on clients to honor those schemas. Every tool returns bounded model-facing text and, where applicable,
 structured content for clients that can render richer results.
 
-Workcell also publishes MCP tool annotations as presentation hints. Filesystem reads and environment
-inspection are read-only and closed-world. Web search and fetch are read-only but open-world because
-they contact external services. Filesystem mutations and shell execution are marked potentially
-destructive. These annotations do not replace client consent, Workcell admission checks, or deployment
-isolation.
+Workcell also publishes MCP tool annotations as presentation hints. Filesystem reads are read-only and
+closed-world. Web search and fetch are read-only but open-world because they contact external services.
+Environment inspection is non-destructive but not read-only, idempotent, or closed-world because its
+sudo probe may update authentication state or invoke external policy plugins. Filesystem mutations and
+shell execution are marked potentially destructive. These annotations do not replace client consent,
+Workcell admission checks, or deployment isolation.
 
 ### Filesystem tools
 
@@ -596,19 +599,37 @@ At most four shell calls execute concurrently within one process. Queued calls r
 `execution_environment` collects a fresh, sanitized description of the current Workcell environment.
 
 - The tool accepts only an empty object. It is useful after shell activity may have installed commands,
-  changed versions, or altered Git and package-manager state since discovery.
-- Results include operating-system and architecture classifications, container evidence, runtime and
-  execution classifications, enabled tool groups, Git repository state, declared or inferred package
-  manager, recognized JavaScript lockfiles, and availability plus normalized versions for a fixed
-  command list.
+  changed versions or privilege access, or altered Git and package-manager state since discovery.
+- Results include operating-system and architecture classifications, the primary system package
+  manager, container evidence, runtime and execution classifications, effective-root and
+  non-interactive sudo status, enabled tool groups, Git repository state, declared or inferred project
+  package manager, recognized JavaScript lockfiles, and availability plus normalized versions for a
+  fixed command list.
+- Linux system-package-manager selection uses sanitized `/etc/os-release` `ID` and `ID_LIKE` values:
+  Debian families select `apt`, Fedora/RHEL families prefer `dnf` then `yum`, Alpine selects `apk`, Arch
+  selects `pacman`, SUSE selects `zypper`, Void selects `xbps`, Gentoo selects `emerge`, and NixOS
+  selects `nix`. macOS selects Homebrew, Windows selects WinGet, and FreeBSD selects `pkg`. The selected
+  executable is checked outside the configured root and its normalized version is included when the
+  fixed version probe succeeds.
+- On Unix, `execution.privilege.effectiveRoot` reports whether the Workcell process has effective UID 0.
+  UID 0 may be constrained by a container or user namespace and does not imply host-level root.
+- A root process reports `nonInteractiveSudo: "not-needed"` without invoking sudo. A non-root Unix
+  process resolves `sudo` and `true` outside the configured root and runs
+  `sudo -n -- <absolute-true-path>`. Status is `available`, `unavailable`, `not-found`, or `unknown`;
+  unsupported platforms report `not-applicable`. Success proves only that fixed command, not arbitrary
+  sudo authorization. A successful probe can refresh the sudo credential timestamp and extend cached
+  authorization lifetime; every probe can create audit records or invoke local or remote PAM/policy
+  plugins. `not-found` means sudo did not resolve through the root-filtered `PATH`, not that no sudo
+  binary exists elsewhere.
 - Fixed probes cover common shells, Python and JavaScript runtimes, package managers, Git/search tools,
   container CLIs, Kubernetes, and Dev Containers. `available` means a fixed executable outside the
   configured root resolved and started; it does not mean every operation is authorized or safe.
-- Probes use fixed version or client-only arguments, a root-filtered `PATH`, an allowlisted environment,
+- Probes use fixed inspection arguments, a root-filtered `PATH`, an allowlisted environment,
   bounded output, a 300 ms per-probe timeout, and a two-second total inspection deadline.
 - Raw paths, environment values, probe output, file contents, tool arguments, and credentials are
-  omitted. Container, sandbox, network, and command classifications are observations rather than
-  security guarantees.
+  omitted. Privilege, package-manager, container, sandbox, network, and command classifications are
+  observations rather than security guarantees. Because the sudo probe can have audit or policy-plugin
+  side effects, the MCP tool is not annotated read-only, idempotent, or closed-world.
 - Concurrent inspections are serialized. Avoid repeated calls when an earlier snapshot remains
   sufficient.
 
