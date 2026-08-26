@@ -265,6 +265,13 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.goal_modal.is_open() {
+            let status = self.state.goal.status();
+            let r = self.goal_modal.view(frame, full, status.as_ref());
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
@@ -274,6 +281,7 @@ impl App {
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
+        let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
@@ -299,6 +307,7 @@ impl App {
             workflow: self.state.workflow,
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
+            goal: goal.as_ref(),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

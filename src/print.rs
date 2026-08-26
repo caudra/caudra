@@ -18,7 +18,10 @@ use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
+use maki_agent::{
+    AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
+    PermissionsConfig,
+};
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
@@ -162,6 +165,7 @@ pub fn run(
     };
 
     let images = load_images(&image_paths)?;
+    let (prompt, goal) = print_goal(prompt)?;
 
     let prompt_slots = lua_handle.collect_prompt_slots();
 
@@ -186,6 +190,7 @@ pub fn run(
         workflow,
         model_policy,
         plugin_rules,
+        goal,
     });
 
     let HeadlessHandle {
@@ -193,6 +198,7 @@ pub fn run(
         tool_names,
         session_id,
         cwd,
+        goal,
         task,
     } = handle;
     crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
@@ -255,6 +261,48 @@ pub fn run(
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::GoalEvaluating { .. } => {}
+            AgentEvent::GoalEvaluation {
+                cost: goal_cost, ..
+            } => {
+                add_cost(&mut cost, *goal_cost);
+            }
+            AgentEvent::GoalFinished { result } => {
+                if result.verdict != GoalVerdict::Met {
+                    is_error = true;
+                    result_text = format!("Goal could not be achieved: {}", result.reason);
+                }
+            }
+            AgentEvent::GoalDeferred {
+                active_background_tasks: _,
+            } => {}
+            AgentEvent::GoalLoopCap { evaluations } => {
+                is_error = true;
+                result_text = format!(
+                    "Goal remains active after {evaluations} evaluations; automatic continuation paused"
+                );
+            }
+            AgentEvent::GoalTurnLimit { evaluations } => {
+                is_error = true;
+                result_text = format!(
+                    "Goal remains active after {evaluations} evaluations; the agent turn limit was reached"
+                );
+            }
+            AgentEvent::GoalEvaluationFailed {
+                evaluation,
+                message,
+                cost: goal_cost,
+                ..
+            } => {
+                add_cost(&mut cost, *goal_cost);
+                is_error = true;
+                result_text = format!("Goal evaluation #{evaluation} failed: {message}");
+            }
+            AgentEvent::GoalClearedAfterError { condition, message } => {
+                is_error = true;
+                result_text =
+                    format!("Goal cleared after an unrecoverable error: {condition} ({message})");
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -273,6 +321,9 @@ pub fn run(
             }
             AgentEvent::TurnComplete(tc) => {
                 add_cost(&mut cost, tc.cost);
+                if parent_tool_use_id.is_some() {
+                    goal.record_external_usage(tc.usage, tc.cost);
+                }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -358,6 +409,29 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {
+    let trimmed = prompt.trim();
+    let Some(args) = trimmed.strip_prefix("/goal") else {
+        return Ok((prompt, GoalHandle::default()));
+    };
+    if !args.is_empty() && !args.starts_with(char::is_whitespace) {
+        return Ok((prompt, GoalHandle::default()));
+    }
+    let condition = args.trim();
+    if condition.is_empty() {
+        return Err(eyre!("Usage: /goal <condition>"));
+    }
+    if matches!(
+        condition.to_ascii_lowercase().as_str(),
+        "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+    ) {
+        return Err(eyre!("No goal set"));
+    }
+    let goal = GoalHandle::default();
+    goal.set(condition)?;
+    Ok((maki_agent::goal_kickoff_message(condition), goal))
 }
 
 #[cfg(test)]

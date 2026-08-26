@@ -25,8 +25,8 @@ use crate::tools::{
 };
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
-    ToolOutputLines,
+    EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
+    ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -86,6 +86,7 @@ pub struct HeadlessParams {
     pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub goal: GoalHandle,
 }
 
 pub struct HeadlessHandle {
@@ -93,6 +94,7 @@ pub struct HeadlessHandle {
     pub tool_names: Vec<String>,
     pub session_id: SessionRef,
     pub cwd: String,
+    pub goal: GoalHandle,
     pub task: smol::Task<()>,
 }
 
@@ -188,6 +190,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let mailbox = SessionMailbox::register(session_id);
     let fast = params.fast;
     let workflow = params.workflow;
+    let goal = params.goal.clone();
     let task = smol::spawn({
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
@@ -236,6 +239,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 },
             )
             .with_loaded_instructions(instructions.loaded)
+            .with_goal(params.goal)
+            .with_background_wait()
             .with_mcp(mcp);
 
             let result = agent
@@ -270,6 +275,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         tool_names,
         session_id: session_ref,
         cwd: working_dir,
+        goal,
         task,
     }
 }

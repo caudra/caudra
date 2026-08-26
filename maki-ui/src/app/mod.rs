@@ -31,6 +31,7 @@ use crate::clipboard::ClipboardState;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
+use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
@@ -56,8 +57,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    AgentEvent, Envelope, GoalVerdict, ImageSource, McpConfigErrors, McpPromptInfo,
+    McpSnapshotReader, SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -204,6 +205,7 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
+    pub(super) goal_modal: GoalModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -222,6 +224,7 @@ pub struct App {
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(super) retry_info: Option<RetryInfo>,
+    goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
@@ -296,6 +299,7 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
+            goal_modal: GoalModal::default(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -314,6 +318,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             retry_info: None,
+            goal_deferred: false,
             zones: ZoneRegistry::new(),
             selection_state: None,
             clipboard: ClipboardState::new(),
@@ -513,6 +518,10 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        if self.goal_modal.is_open() {
+            self.goal_modal.scroll(delta);
+            return None;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -605,6 +614,11 @@ impl App {
                 return Some(vec![Action::RefreshUsage]);
             }
             self.usage_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.goal_modal.is_open() {
+            self.goal_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -1158,6 +1172,9 @@ impl App {
             self.state.token_usage += tc.usage;
             add_cost(&mut self.state.cost, tc.cost);
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
+            if subagent_id.is_some() {
+                self.state.goal.record_external_usage(tc.usage, tc.cost);
+            }
             self.state
                 .session_mut()
                 .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
@@ -1173,12 +1190,117 @@ impl App {
             }
         }
 
+        let event = match envelope.event {
+            AgentEvent::GoalEvaluating { evaluation } => {
+                self.flash(format!("Evaluating goal (#{evaluation})..."));
+                return vec![];
+            }
+            AgentEvent::GoalEvaluation {
+                verdict,
+                reason,
+                evaluation,
+                applied,
+                usage,
+                cost,
+                model,
+            } => {
+                self.state.token_usage += usage;
+                add_cost(&mut self.state.cost, cost);
+                add_cost(&mut self.chats[chat_idx].cost, cost);
+                self.state
+                    .session_mut()
+                    .add_model_usage(&model, usage.billed(cost));
+                if applied && verdict == GoalVerdict::NotMet {
+                    self.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Assistant,
+                        format!("Goal not yet met (#{evaluation}): {reason}"),
+                    ));
+                }
+                return vec![];
+            }
+            AgentEvent::GoalFinished { result } => {
+                let (role, label) = match result.verdict {
+                    GoalVerdict::Met => (DisplayRole::Done, "Goal achieved"),
+                    GoalVerdict::Impossible | GoalVerdict::NotMet => {
+                        (DisplayRole::Error, "Goal could not be achieved")
+                    }
+                };
+                self.main_chat().push(DisplayMessage::new(
+                    role,
+                    format!("{label}: {}", result.reason),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalDeferred {
+                active_background_tasks,
+            } => {
+                self.goal_deferred = true;
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    format!(
+                        "Goal evaluation deferred while {active_background_tasks} background task(s) run."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalLoopCap { evaluations } => {
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    format!(
+                        "Goal remains active after {evaluations} evaluations; automatic continuation paused. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalTurnLimit { evaluations } => {
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    format!(
+                        "Goal remains active after {evaluations} evaluations; the agent turn limit was reached. Send another message to resume."
+                    ),
+                ));
+                return vec![];
+            }
+            AgentEvent::GoalEvaluationFailed {
+                evaluation,
+                message,
+                applied,
+                usage,
+                cost,
+                model,
+            } => {
+                self.state.token_usage += usage;
+                add_cost(&mut self.state.cost, cost);
+                add_cost(&mut self.chats[chat_idx].cost, cost);
+                self.state
+                    .session_mut()
+                    .add_model_usage(&model, usage.billed(cost));
+                if applied {
+                    self.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        format!(
+                            "Goal evaluation #{evaluation} failed; the goal remains active: {message}"
+                        ),
+                    ));
+                }
+                return vec![];
+            }
+            AgentEvent::GoalClearedAfterError { condition, message } => {
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    format!("Goal cleared after an unrecoverable error: {condition} ({message})"),
+                ));
+                return vec![];
+            }
+            event => event,
+        };
+
         let plan_path = if self.state.mode == Mode::Plan {
             self.state.plan.path()
         } else {
             None
         };
-        let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
+        let result = self.chats[chat_idx].handle_event(event, plan_path);
 
         if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
             if chat_idx == 0 {
@@ -1212,9 +1334,11 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
-                    self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    if !self.goal_deferred {
+                        self.terminalize_turn(MISSING_TOOL_COMPLETION);
+                        self.chat_index.clear();
+                        self.subagent_answers.clear();
+                    }
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
@@ -1333,6 +1457,7 @@ impl App {
                     vec![Action::Btw(question)]
                 }
             }
+            "/goal" => self.execute_goal(&cmd.args),
             "/new" => self.reset_session(),
             "/queue" => {
                 self.queue.set_focus();
@@ -1418,6 +1543,44 @@ impl App {
             args,
             depth,
         );
+    }
+
+    fn execute_goal(&mut self, args: &str) -> Vec<Action> {
+        let condition = args.trim();
+        if condition.is_empty() {
+            self.goal_modal.open();
+            return vec![];
+        }
+        if matches!(
+            condition.to_ascii_lowercase().as_str(),
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel"
+        ) {
+            let message = self.state.goal.clear().map_or_else(
+                || "No goal set".to_string(),
+                |goal| format!("Goal cleared: {}", goal.condition),
+            );
+            self.flash(message);
+            return vec![];
+        }
+
+        let replacing = self.state.goal.snapshot().is_some();
+        match self.state.goal.set(condition) {
+            Ok(_) => {
+                self.flash(
+                    if replacing {
+                        "Goal replaced"
+                    } else {
+                        "Goal set"
+                    }
+                    .into(),
+                );
+                self.submit_goal(condition)
+            }
+            Err(error) => {
+                self.flash(error.to_string());
+                vec![]
+            }
+        }
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -1524,10 +1687,11 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 12] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.usage_modal,
+            &self.goal_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1541,10 +1705,11 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
+            &mut self.goal_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -1574,6 +1739,10 @@ impl App {
     /// error; a background run would wipe it (`start_run` clears the queue).
     pub(crate) fn holds_recovery_text(&self) -> bool {
         !self.recoverable_queue.is_empty()
+    }
+
+    pub(crate) fn goal_checkin_due(&self) -> bool {
+        self.goal_deferred && self.state.goal.snapshot().is_some()
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -1639,6 +1808,7 @@ impl App {
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
+                self.state.goal.snapshot().is_some(),
             ),
             self.selection_state
                 .as_ref()

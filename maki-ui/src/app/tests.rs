@@ -13,8 +13,9 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    DoneReason, GoalResult, GoalStatus, GoalVerdict, ImageMediaType, McpConfigErrors,
+    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -2507,6 +2508,145 @@ fn usage_command_toggles_modal() {
             .any(|a| matches!(a, Action::RefreshUsage)),
         "closing should not trigger a refresh"
     );
+}
+
+#[test]
+fn goal_command_sets_condition_and_starts_work() {
+    let mut app = test_app();
+    let actions = app.run_cmdline("/goal all focused tests pass", 0).unwrap();
+
+    assert_eq!(
+        app.state.goal.snapshot().unwrap().condition.as_ref(),
+        "all focused tests pass"
+    );
+    assert_eq!(app.status_bar.flash_text(), Some("Goal set"));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        Action::SendMessage(input) if input.message == "all focused tests pass"
+    )));
+}
+
+#[test_case("clear")]
+#[test_case("STOP")]
+#[test_case("off")]
+#[test_case("reset")]
+#[test_case("none")]
+#[test_case("cancel")]
+fn goal_clear_aliases_leave_no_active_goal(alias: &str) {
+    let mut app = test_app();
+    app.state.goal.set("ship it").unwrap();
+
+    let actions = app.run_cmdline(&format!("/goal {alias}"), 0).unwrap();
+
+    assert!(actions.is_empty());
+    assert!(app.state.goal.snapshot().is_none());
+    assert_eq!(app.status_bar.flash_text(), Some("Goal cleared: ship it"));
+}
+
+#[test]
+fn goal_without_arguments_opens_status_modal() {
+    let mut app = test_app();
+    assert!(!app.goal_modal.is_open());
+    assert!(app.run_cmdline("/goal", 0).unwrap().is_empty());
+    assert!(app.goal_modal.is_open());
+}
+
+#[test]
+fn deferred_goal_builds_an_automatic_checkin() {
+    let mut app = test_app();
+    app.state.goal.set("background result reviewed").unwrap();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::GoalDeferred {
+        active_background_tasks: 1,
+    }));
+    app.update(done_event());
+
+    assert!(app.goal_checkin_due());
+    let actions = app.start_goal_checkin();
+    let input = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendMessage(input) => Some(input),
+            _ => None,
+        })
+        .expect("check-in should start a run");
+    assert!(input.message.is_empty());
+    assert!(input.preamble.iter().any(|message| {
+        message
+            .first_text_content()
+            .is_some_and(|text| text.contains("Goal check-in"))
+    }));
+    assert!(!app.goal_checkin_due());
+}
+
+#[test]
+fn active_goal_round_trips_through_session_metadata() {
+    let mut app = test_app();
+    app.state.goal.set("persist me").unwrap();
+    app.checkpoint_with(Duration::ZERO);
+    assert_eq!(
+        app.state.session.meta.active_goal.as_deref(),
+        Some("persist me")
+    );
+
+    let model = app.state.model.clone();
+    let state = SessionState::from_session(
+        Arc::unwrap_or_clone(app.state.session),
+        &model,
+        &app.storage,
+        &app.model_policy,
+    );
+    assert_eq!(
+        state.goal.snapshot().unwrap().condition.as_ref(),
+        "persist me"
+    );
+}
+
+#[test]
+fn new_session_clears_active_goal() {
+    let mut app = test_app();
+    app.state.goal.set("old session only").unwrap();
+
+    app.reset_session();
+
+    assert!(app.state.goal.status().is_none());
+    assert!(app.state.session.meta.active_goal.is_none());
+}
+
+#[test]
+fn completed_goal_round_trips_through_session_metadata() {
+    let mut app = test_app();
+    app.state.goal.restore_finished(GoalResult {
+        condition: Arc::from("persist result"),
+        verdict: GoalVerdict::Met,
+        reason: Arc::from("verified"),
+        evaluations: 3,
+        duration: Duration::from_secs(42),
+        usage: TokenUsage {
+            input: 100,
+            output: 20,
+            ..Default::default()
+        },
+        cost: Some(0.25),
+    });
+    app.checkpoint_with(Duration::ZERO);
+    assert!(app.state.session.meta.goal_result.is_some());
+
+    let model = app.state.model.clone();
+    let state = SessionState::from_session(
+        Arc::unwrap_or_clone(app.state.session),
+        &model,
+        &app.storage,
+        &app.model_policy,
+    );
+    let Some(GoalStatus::Finished(result)) = state.goal.status() else {
+        panic!("completed goal was not restored");
+    };
+    assert_eq!(result.condition.as_ref(), "persist result");
+    assert_eq!(result.reason.as_ref(), "verified");
+    assert_eq!(result.cost, Some(0.25));
 }
 
 #[test]

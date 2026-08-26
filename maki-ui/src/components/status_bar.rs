@@ -17,6 +17,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
+use maki_agent::GoalSnapshot;
 
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
@@ -48,6 +49,7 @@ pub struct StatusBarContext<'a> {
     pub workflow: bool,
     pub yolo: bool,
     pub restoring: bool,
+    pub goal: Option<&'a GoalSnapshot>,
 }
 
 pub struct StatusBar {
@@ -114,11 +116,14 @@ impl StatusBar {
     /// The bar spins for a whole turn, again while a restore is in flight, and
     /// it counts a retry down by the second. It sits next to [`Self::view`] so
     /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
-        Cadence::when(
-            *status == Status::Streaming || restoring || retrying,
-            Cadence::SPINNER,
-        )
+    pub fn cadence(status: &Status, restoring: bool, retrying: bool, goal_active: bool) -> Cadence {
+        Cadence::any([
+            Cadence::when(
+                *status == Status::Streaming || restoring || retrying,
+                Cadence::SPINNER,
+            ),
+            Cadence::when(goal_active, Cadence::CLOCK),
+        ])
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -150,6 +155,17 @@ impl StatusBar {
             left_spans.push(Span::styled(
                 " auto-scroll paused",
                 theme::current().status_dim,
+            ));
+        }
+
+        if let Some(goal) = ctx.goal {
+            left_spans.push(Span::styled(
+                format!(
+                    " [goal · {} · {}]",
+                    goal.evaluations,
+                    format_goal_elapsed(goal.elapsed())
+                ),
+                theme::current().status_notice,
             ));
         }
 
@@ -258,6 +274,17 @@ impl StatusBar {
             Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
             right_area,
         );
+    }
+}
+
+fn format_goal_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds >= 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -390,6 +417,7 @@ mod tests {
             workflow: false,
             yolo,
             restoring: false,
+            goal: None,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())

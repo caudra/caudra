@@ -115,6 +115,7 @@ struct Entry {
 pub struct CancelMap<K> {
     entries: Mutex<HashMap<K, Entry>>,
     next_slot: AtomicU64,
+    changed: Event,
 }
 
 impl<K: Eq + std::hash::Hash> Default for CancelMap<K> {
@@ -128,6 +129,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         Self {
             entries: Mutex::new(HashMap::new()),
             next_slot: AtomicU64::new(0),
+            changed: Event::new(),
         }
     }
 
@@ -160,6 +162,8 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         if entry.registrations.is_empty() {
             map.remove(id);
         }
+        drop(map);
+        self.changed.notify(usize::MAX);
     }
 
     /// Cancels everything under {id} and marks later siblings cancelled.
@@ -171,6 +175,8 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         for registration in &mut entry.registrations {
             drop(registration.trigger.take());
         }
+        drop(map);
+        self.changed.notify(usize::MAX);
     }
 
     pub fn remove(&self, id: &K) {
@@ -178,6 +184,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+        self.changed.notify(usize::MAX);
     }
 
     #[cfg(test)]
@@ -193,6 +200,35 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain();
+        self.changed.notify(usize::MAX);
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|entry| {
+                entry
+                    .registrations
+                    .iter()
+                    .filter(|registration| registration.trigger.is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    pub async fn wait_for_idle(&self) {
+        loop {
+            if self.active_count() == 0 {
+                return;
+            }
+            let listener = self.changed.listen();
+            if self.active_count() == 0 {
+                return;
+            }
+            listener.await;
+        }
     }
 }
 

@@ -7,9 +7,10 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
 use maki_agent::agent::estimate_message_tokens;
+use maki_agent::{GoalStatus, GoalVerdict};
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredSubagent};
 
 use crate::AppSession;
 
@@ -38,6 +39,8 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
         || session.meta.input_draft.is_some()
         || !session.meta.queued_messages.is_empty()
+        || session.meta.active_goal.is_some()
+        || session.meta.goal_result.is_some()
         || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
@@ -131,6 +134,23 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            active_goal: state.goal.active_condition(),
+            goal_result: match state.goal.status() {
+                Some(GoalStatus::Finished(goal)) => Some(Box::new(StoredGoalResult {
+                    condition: goal.condition.to_string(),
+                    verdict: match goal.verdict {
+                        GoalVerdict::Met => StoredGoalVerdict::Met,
+                        GoalVerdict::Impossible | GoalVerdict::NotMet => {
+                            StoredGoalVerdict::Impossible
+                        }
+                    },
+                    reason: goal.reason.to_string(),
+                    evaluations: goal.evaluations,
+                    duration_ms: goal.duration.as_millis().min(u128::from(u64::MAX)) as u64,
+                    usage: goal.usage.billed(goal.cost),
+                })),
+                Some(GoalStatus::Active(_)) | None => None,
+            },
             yolo: self.permissions.persisted_yolo(),
         }
     }
@@ -305,6 +325,8 @@ impl App {
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
         self.state.context_size = 0;
+        self.state.goal.reset();
+        self.goal_deferred = false;
         self.state.plan = PlanState::None;
         self.permissions.set_session_yolo(None);
         if self.state.mode == Mode::Plan {

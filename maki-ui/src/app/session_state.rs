@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use maki_agent::{GoalHandle, GoalResult, GoalVerdict};
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::adjust_model;
 use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
-use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+use maki_storage::sessions::{StoredEffect, StoredGoalVerdict, StoredMode, StoredRule};
 
 use crate::AppSession;
 
@@ -27,6 +28,7 @@ pub(crate) struct SessionState {
     pub thinking: ThinkingConfig,
     pub fast: bool,
     pub workflow: bool,
+    pub goal: GoalHandle,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
@@ -85,6 +87,21 @@ impl SessionState {
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
+        let goal = GoalHandle::restored(session.meta.active_goal.as_deref());
+        if let Some(stored) = session.meta.goal_result.as_ref() {
+            goal.restore_finished(GoalResult {
+                condition: Arc::from(stored.condition.as_str()),
+                verdict: match stored.verdict {
+                    StoredGoalVerdict::Met => GoalVerdict::Met,
+                    StoredGoalVerdict::Impossible => GoalVerdict::Impossible,
+                },
+                reason: Arc::from(stored.reason.as_str()),
+                evaluations: stored.evaluations,
+                duration: std::time::Duration::from_millis(stored.duration_ms),
+                usage: stored.usage.into(),
+                cost: stored.usage.cost,
+            });
+        }
 
         Self {
             // Saved model may differ from the live one (updated, removed, etc).
@@ -97,6 +114,7 @@ impl SessionState {
                 .unwrap_or_default(),
             fast,
             workflow: session.meta.workflow,
+            goal,
             session: Arc::new(session),
             model,
             token_usage,

@@ -132,6 +132,24 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredGoalVerdict {
+    Met,
+    Impossible,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredGoalResult {
+    pub condition: String,
+    pub verdict: StoredGoalVerdict,
+    pub reason: String,
+    pub evaluations: u32,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub usage: StoredTokenUsage,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default)]
@@ -154,6 +172,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_result: Option<Box<StoredGoalResult>>,
     /// `None` when the user never set yolo for this session, which is what
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]

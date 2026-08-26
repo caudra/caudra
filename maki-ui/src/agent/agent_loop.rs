@@ -12,8 +12,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
-    McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
+    Instructions, McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -50,6 +50,7 @@ pub(super) struct AgentLoop {
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    goal: GoalHandle,
 }
 
 impl AgentLoop {
@@ -74,6 +75,7 @@ impl AgentLoop {
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
         model_policy: Arc<ModelPolicy>,
+        goal: GoalHandle,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
@@ -100,6 +102,7 @@ impl AgentLoop {
             lua_handle,
             subagent_cancels,
             model_policy,
+            goal,
         }
     }
 
@@ -179,14 +182,17 @@ impl AgentLoop {
             self.timeouts,
             &self.model_policy,
         );
-        agent::compact(
+        let usage = agent::compact(
             &*provider,
             &model,
             &mut self.history,
             event_tx,
             &self.config,
         )
-        .await
+        .await?;
+        self.goal
+            .record_external_usage(usage, model.billed_cost(&usage, false));
+        Ok(())
     }
 
     async fn do_agent_run(
@@ -274,6 +280,7 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
+        .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;

@@ -29,7 +29,7 @@ fn canonicalize_tool_names(message: &mut Message) {
 
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
-    event_tx: &EventSender,
+    event_tx: Option<&EventSender>,
 ) -> String {
     let mut streamed = String::new();
     while let Ok(pe) = prx.recv_async().await {
@@ -53,7 +53,7 @@ async fn forward_provider_events(
                 cache,
             },
         };
-        if event_tx.send(ae).is_err() {
+        if event_tx.is_some_and(|event_tx| event_tx.send(ae).is_err()) {
             break;
         }
     }
@@ -97,6 +97,49 @@ pub(crate) async fn stream_with_retry(
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
+    stream_with_retry_inner(
+        provider,
+        messages,
+        model,
+        system,
+        tools,
+        Some(event_tx),
+        cancel,
+        opts,
+        session_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_silent_with_retry(
+    provider: &dyn Provider,
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    cancel: &CancelToken,
+    opts: RequestOptions,
+    session_id: Option<&SessionRef>,
+) -> Result<StreamResponse, StreamError> {
+    stream_with_retry_inner(
+        provider, messages, model, system, tools, None, cancel, opts, session_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_with_retry_inner(
+    provider: &dyn Provider,
+    messages: &[Message],
+    model: &Model,
+    system: &str,
+    tools: &Value,
+    event_tx: Option<&EventSender>,
+    cancel: &CancelToken,
+    opts: RequestOptions,
+    session_id: Option<&SessionRef>,
+) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
@@ -105,8 +148,8 @@ pub(crate) async fn stream_with_retry(
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
-            let event_tx = event_tx.clone();
-            async move { forward_provider_events(prx, &event_tx).await }
+            let event_tx = event_tx.cloned();
+            async move { forward_provider_events(prx, event_tx.as_ref()).await }
         });
         let result = futures_lite::future::race(
             provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
@@ -138,11 +181,13 @@ pub(crate) async fn stream_with_retry(
                 }
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
-                event_tx.send(AgentEvent::Retry {
-                    attempt,
-                    message: e.retry_message(),
-                    delay_ms,
-                })?;
+                if let Some(event_tx) = event_tx {
+                    event_tx.send(AgentEvent::Retry {
+                        attempt,
+                        message: e.retry_message(),
+                        delay_ms,
+                    })?;
+                }
                 futures_lite::future::race(
                     async {
                         smol::Timer::after(delay).await;

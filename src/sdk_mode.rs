@@ -981,6 +981,14 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::GoalEvaluating { .. }
+            | AgentEvent::GoalFinished { .. }
+            | AgentEvent::GoalDeferred { .. }
+            | AgentEvent::GoalLoopCap { .. }
+            | AgentEvent::GoalTurnLimit { .. }
+            | AgentEvent::GoalClearedAfterError { .. } => {}
+            AgentEvent::GoalEvaluation { cost, .. } => add_cost(&mut self.cost, *cost),
+            AgentEvent::GoalEvaluationFailed { cost, .. } => add_cost(&mut self.cost, *cost),
             AgentEvent::Retry {
                 attempt,
                 message,

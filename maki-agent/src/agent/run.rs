@@ -11,6 +11,10 @@ use maki_providers::{
 };
 
 use super::compaction;
+use super::goal::{
+    Evaluator, GOAL_BLOCK_CAP, GoalApply, GoalHandle, GoalStatus, continuation_message,
+    is_unrecoverable,
+};
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::{StreamError, stream_with_retry};
@@ -120,6 +124,9 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    goal: GoalHandle,
+    goal_blocks: u32,
+    wait_for_background: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -159,6 +166,9 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            goal: GoalHandle::default(),
+            goal_blocks: 0,
+            wait_for_background: false,
         }
     }
 
@@ -195,6 +205,16 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn with_goal(mut self, goal: GoalHandle) -> Self {
+        self.goal = goal;
+        self
+    }
+
+    pub fn with_background_wait(mut self) -> Self {
+        self.wait_for_background = true;
+        self
+    }
+
     /// Cancellation is an ending, not a failure: it comes back as
     /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
     pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
@@ -208,6 +228,7 @@ impl<'h> Agent<'h> {
             workflow,
             prompt: _,
         } = input;
+        self.goal_blocks = 0;
         self.rollback_len = self.history.len();
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
@@ -250,7 +271,17 @@ impl<'h> Agent<'h> {
                 sanitize_cancelled_history(self.history, self.rollback_len);
                 DoneReason::Cancelled
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                if is_unrecoverable(&e)
+                    && let Some(goal) = self.goal.clear()
+                {
+                    self.event_tx.send(AgentEvent::GoalClearedAfterError {
+                        condition: goal.condition.to_string(),
+                        message: e.to_string(),
+                    })?;
+                }
+                return Err(e);
+            }
         };
         self.emit_done(reason)?;
 
@@ -273,6 +304,11 @@ impl<'h> Agent<'h> {
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
+                if let Some(goal) = self.goal.snapshot() {
+                    self.event_tx.send(AgentEvent::GoalTurnLimit {
+                        evaluations: goal.evaluations,
+                    })?;
+                }
                 return Ok(DoneReason::MaxTurns);
             }
             match self.turn().await? {
@@ -358,6 +394,11 @@ impl<'h> Agent<'h> {
         self.emit_turn_complete(&response)?;
         let usage = response.usage;
         self.total_usage += usage;
+        self.goal.record_usage(
+            usage,
+            self.model
+                .billed_cost(&usage, self.opts.clamped(&self.model).fast),
+        );
         self.context_size = usage.total_input();
 
         if has_tools {
@@ -390,7 +431,117 @@ impl<'h> Agent<'h> {
         if has_tools {
             Ok(TurnOutcome::Continue)
         } else {
-            Ok(TurnOutcome::Done(stop_reason.into()))
+            self.goal_completion(stop_reason.into()).await
+        }
+    }
+
+    async fn goal_completion(
+        &mut self,
+        done_reason: DoneReason,
+    ) -> Result<TurnOutcome, AgentError> {
+        let Some(goal) = self.goal.snapshot() else {
+            return Ok(TurnOutcome::Done(done_reason));
+        };
+        let active_background_tasks = self.subagent_cancels.active_count();
+        if active_background_tasks > 0 {
+            self.event_tx.send(AgentEvent::GoalDeferred {
+                active_background_tasks,
+            })?;
+            if self.wait_for_background {
+                futures_lite::future::race(
+                    async {
+                        self.subagent_cancels.wait_for_idle().await;
+                        Ok(())
+                    },
+                    async {
+                        self.cancel.cancelled().await;
+                        Err(AgentError::Cancelled)
+                    },
+                )
+                .await?;
+                self.push_input_context(Vec::new());
+                return Ok(TurnOutcome::Continue);
+            }
+            return Ok(TurnOutcome::Done(done_reason));
+        }
+
+        let evaluation = goal.evaluations.saturating_add(1);
+        self.event_tx
+            .send(AgentEvent::GoalEvaluating { evaluation })?;
+        let result = Evaluator {
+            provider: &*self.provider,
+            current_model: &self.model,
+            history: self.history.as_slice(),
+            condition: &goal.condition,
+            evaluation,
+            cancel: &self.cancel,
+            session_id: self.session_id.as_ref(),
+            model_policy: &self.model_policy,
+        }
+        .run()
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(failure) => {
+                self.total_usage += failure.usage;
+                self.goal
+                    .record_usage_for(goal.generation, failure.usage, failure.cost);
+                let cancelled = matches!(failure.error, AgentError::Cancelled);
+                let applied = self.goal.is_generation_active(goal.generation);
+                self.event_tx.send(AgentEvent::GoalEvaluationFailed {
+                    evaluation,
+                    message: failure.error.to_string(),
+                    applied,
+                    usage: failure.usage,
+                    cost: failure.cost,
+                    model: failure.model,
+                })?;
+                if cancelled {
+                    return Err(AgentError::Cancelled);
+                }
+                return Ok(TurnOutcome::Done(done_reason));
+            }
+        };
+
+        self.total_usage += result.usage;
+        self.goal
+            .record_usage_for(goal.generation, result.usage, result.cost);
+        let reason: Arc<str> = Arc::from(result.reason.as_str());
+        let apply =
+            self.goal
+                .apply_evaluation(goal.generation, result.verdict, Arc::clone(&reason));
+        self.event_tx.send(AgentEvent::GoalEvaluation {
+            verdict: result.verdict,
+            reason: result.reason.clone(),
+            evaluation,
+            applied: !matches!(apply, GoalApply::Stale),
+            usage: result.usage,
+            cost: result.cost,
+            model: result.model,
+        })?;
+
+        match apply {
+            GoalApply::Stale => Ok(TurnOutcome::Done(done_reason)),
+            GoalApply::Terminal => {
+                if let Some(GoalStatus::Finished(result)) = self.goal.status() {
+                    self.event_tx.send(AgentEvent::GoalFinished { result })?;
+                }
+                Ok(TurnOutcome::Done(done_reason))
+            }
+            GoalApply::Continue { evaluation } => {
+                if self.goal_blocks >= GOAL_BLOCK_CAP {
+                    self.event_tx.send(AgentEvent::GoalLoopCap {
+                        evaluations: evaluation,
+                    })?;
+                    return Ok(TurnOutcome::Done(done_reason));
+                }
+                self.goal_blocks += 1;
+                self.history.push(Message::synthetic(continuation_message(
+                    &goal.condition,
+                    &reason,
+                )));
+                Ok(TurnOutcome::Continue)
+            }
         }
     }
 
@@ -538,7 +689,7 @@ impl<'h> Agent<'h> {
             self.timeouts,
             &self.model_policy,
         );
-        self.total_usage += compaction::compact_history(
+        let usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -547,6 +698,9 @@ impl<'h> Agent<'h> {
             &self.config,
         )
         .await?;
+        let cost = compact_model.billed_cost(&usage, false);
+        self.total_usage += usage;
+        self.goal.record_usage(usage, cost);
         self.rollback_len = self.history.len();
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
@@ -611,6 +765,7 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
@@ -674,6 +829,40 @@ mod tests {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    struct ControlledEvaluatorProvider {
+        calls: AtomicUsize,
+        evaluator_started: flume::Sender<()>,
+        evaluator_response: flume::Receiver<StreamResponse>,
+    }
+
+    impl Provider for ControlledEvaluatorProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(text_response(StopReason::EndTurn));
+                }
+                self.evaluator_started.send(()).unwrap();
+                self.evaluator_response
+                    .recv_async()
+                    .await
+                    .map_err(|_| AgentError::Cancelled)
             })
         }
 
@@ -766,6 +955,25 @@ mod tests {
         }
     }
 
+    fn goal_response(ok: bool, impossible: bool, reason: &str) -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: serde_json::json!({
+                "ok": ok,
+                "reason": reason,
+                "impossible": impossible,
+            })
+            .to_string(),
+        }])
+    }
+
+    fn invalid_goal_response() -> StreamResponse {
+        let mut response = assistant_response(vec![ContentBlock::Text {
+            text: "not json".into(),
+        }]);
+        response.usage.output = 7;
+        response
+    }
+
     fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
@@ -817,6 +1025,248 @@ mod tests {
             workflow: false,
             prompt: None,
         }
+    }
+
+    #[test]
+    fn goal_met_gates_done_with_private_tool_free_evaluation() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                goal_response(true, false, "verified"),
+            ]);
+            let captured_tools = Arc::clone(&provider.captured_tools);
+            let goal = GoalHandle::default();
+            goal.set("tests pass").unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.tools = serde_json::json!([{"name": "bash"}]);
+            let mut agent = agent.with_goal(goal.clone());
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            let events: Vec<_> = event_rx.try_iter().map(|envelope| envelope.event).collect();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalEvaluating { evaluation: 1 }))
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalFinished { result } if result.verdict == super::super::goal::GoalVerdict::Met
+            )));
+            assert!(matches!(goal.status(), Some(GoalStatus::Finished(_))));
+            assert_eq!(
+                captured_tools.lock().unwrap().as_slice(),
+                [serde_json::json!([{"name": "bash"}]), serde_json::json!([]),]
+            );
+            assert_eq!(history.len(), 2, "evaluator transcript must remain private");
+            assert!(history.as_slice().iter().all(|message| {
+                !message
+                    .user_text()
+                    .is_some_and(|text| text.contains("verified"))
+            }));
+        });
+    }
+
+    #[test]
+    fn unmet_goal_continues_without_persisting_evaluator_output() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                goal_response(false, false, "lint has not run"),
+                text_response(StopReason::EndTurn),
+                goal_response(true, false, "lint passed"),
+            ]);
+            let goal = GoalHandle::default();
+            goal.set("lint passes").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let Some(GoalStatus::Finished(result)) = goal.status() else {
+                panic!("goal did not finish");
+            };
+            assert_eq!(result.evaluations, 2);
+            let history_text: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter_map(Message::first_text_content)
+                .collect();
+            assert!(
+                history_text
+                    .iter()
+                    .any(|text| text.contains("lint has not run"))
+            );
+            assert!(history.as_slice().iter().all(|message| {
+                message
+                    .first_text_content()
+                    .is_none_or(|text| !text.contains("\"ok\""))
+            }));
+        });
+    }
+
+    #[test]
+    fn replacing_goal_discards_in_flight_verdict() {
+        smol::block_on(async {
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (response_tx, response_rx) = flume::bounded(1);
+            let provider = ControlledEvaluatorProvider {
+                calls: AtomicUsize::new(0),
+                evaluator_started: started_tx,
+                evaluator_response: response_rx,
+            };
+            let goal = GoalHandle::default();
+            goal.set("old goal").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            let control = async {
+                started_rx.recv_async().await.unwrap();
+                goal.set("replacement").unwrap();
+                response_tx
+                    .send_async(goal_response(true, false, "old goal met"))
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = futures_lite::future::zip(agent.run(default_input()), control).await;
+            assert_eq!(result.unwrap(), DoneReason::EndTurn);
+            drop(agent);
+
+            let replacement = goal.snapshot().unwrap();
+            assert_eq!(replacement.condition.as_ref(), "replacement");
+            assert_eq!(replacement.evaluations, 0);
+            assert!(event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::GoalEvaluation { applied: false, .. }
+            )));
+        });
+    }
+
+    #[test]
+    fn cancellation_during_goal_evaluation_stays_cancelled() {
+        smol::block_on(async {
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (_keep_response_open, response_rx) = flume::bounded(1);
+            let provider = ControlledEvaluatorProvider {
+                calls: AtomicUsize::new(0),
+                evaluator_started: started_tx,
+                evaluator_response: response_rx,
+            };
+            let goal = GoalHandle::default();
+            goal.set("keep active").unwrap();
+            let (trigger, cancel) = CancelToken::new();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone()).with_cancel(cancel);
+
+            let cancel_when_started = async {
+                started_rx.recv_async().await.unwrap();
+                trigger.cancel();
+            };
+            let (result, ()) =
+                futures_lite::future::zip(agent.run(default_input()), cancel_when_started).await;
+            assert_eq!(result.unwrap(), DoneReason::Cancelled);
+            drop(agent);
+
+            assert!(goal.snapshot().is_some());
+            assert!(event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::Done {
+                    reason: DoneReason::Cancelled,
+                    ..
+                }
+            )));
+        });
+    }
+
+    #[test]
+    fn invalid_evaluator_attempts_are_billed() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                invalid_goal_response(),
+                invalid_goal_response(),
+                invalid_goal_response(),
+            ]);
+            let goal = GoalHandle::default();
+            goal.set("strict result").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(goal.snapshot().unwrap().usage.output, 21);
+            assert!(event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::GoalEvaluationFailed {
+                    usage: TokenUsage { output: 21, .. },
+                    ..
+                }
+            )));
+        });
+    }
+
+    #[test]
+    fn goal_loop_cap_pauses_after_eight_continuations() {
+        smol::block_on(async {
+            let mut responses = Vec::new();
+            for _ in 0..=GOAL_BLOCK_CAP {
+                responses.push(text_response(StopReason::EndTurn));
+                responses.push(goal_response(false, false, "more work remains"));
+            }
+            let goal = GoalHandle::default();
+            goal.set("never met").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(goal.snapshot().unwrap().evaluations, GOAL_BLOCK_CAP + 1);
+            assert!(event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::GoalLoopCap { evaluations } if evaluations == GOAL_BLOCK_CAP + 1
+            )));
+        });
+    }
+
+    #[test]
+    fn turn_limit_reports_unresolved_goal() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                goal_response(false, false, "more work remains"),
+            ]);
+            let goal = GoalHandle::default();
+            goal.set("needs another turn").unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.config.max_turns = Some(1);
+            let mut agent = agent.with_goal(goal.clone());
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::MaxTurns
+            );
+            drop(agent);
+
+            assert!(goal.snapshot().is_some());
+            assert!(event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::GoalTurnLimit { evaluations: 1 }
+            )));
+        });
     }
 
     #[test]

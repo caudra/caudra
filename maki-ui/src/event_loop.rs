@@ -324,6 +324,7 @@ impl SpawnCtx {
     fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
+        let goal = maki_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         let handles = AgentHandles::spawn(
             &self.model_slot,
             session.messages().to_vec(),
@@ -336,6 +337,7 @@ impl SpawnCtx {
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Arc::clone(&self.model_policy),
+            goal,
         );
         let mut app = App::new(
             &self.model_slot.load().model,
@@ -779,6 +781,7 @@ impl<'t> EventLoop<'t> {
         // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
+        dirty |= self.start_goal_checkins();
         self.emit_status_changes();
         self.emit_task_changes();
         self.emit_notifications();
@@ -975,6 +978,26 @@ impl<'t> EventLoop<'t> {
         let dirty = Dirty::from(!ready.is_empty());
         for (index, preamble) in ready {
             let actions = self.sessions[index].app.start_mailbox_run(preamble);
+            self.dispatch(index, actions);
+        }
+        dirty
+    }
+
+    fn start_goal_checkins(&mut self) -> Dirty {
+        let ready: Vec<_> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, runtime)| {
+                (runtime.quiescent()
+                    && runtime.app.goal_checkin_due()
+                    && runtime.handles.active_background_tasks() == 0)
+                    .then_some(index)
+            })
+            .collect();
+        let dirty = Dirty::from(!ready.is_empty());
+        for index in ready {
+            let actions = self.sessions[index].app.start_goal_checkin();
             self.dispatch(index, actions);
         }
         dirty

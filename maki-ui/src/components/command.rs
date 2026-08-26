@@ -80,6 +80,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: usize::MAX,
     },
     BuiltinCommand {
+        name: "/goal",
+        description: "Work until a completion condition is met",
+        max_args: usize::MAX,
+    },
+    BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,

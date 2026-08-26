@@ -133,6 +133,14 @@ impl Chat {
                 }
             }
             AgentEvent::TurnComplete(_) => {}
+            AgentEvent::GoalEvaluating { .. }
+            | AgentEvent::GoalEvaluation { .. }
+            | AgentEvent::GoalFinished { .. }
+            | AgentEvent::GoalDeferred { .. }
+            | AgentEvent::GoalLoopCap { .. }
+            | AgentEvent::GoalTurnLimit { .. }
+            | AgentEvent::GoalEvaluationFailed { .. }
+            | AgentEvent::GoalClearedAfterError { .. } => {}
             AgentEvent::ToolResultsSubmitted { .. } => {
                 if let Some(usage) = self.pending_turn_usage.take() {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);

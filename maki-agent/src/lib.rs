@@ -14,8 +14,10 @@ pub use mcp::{
 };
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
+    Agent, AgentParams, AgentRunParams, GoalError, GoalHandle, GoalResult, GoalSnapshot,
+    GoalStatus, GoalVerdict, History, HistorySnapshot, Instructions, LoadedInstructions,
+    MAX_GOAL_CHARS, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
     is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};

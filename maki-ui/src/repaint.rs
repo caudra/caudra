@@ -169,6 +169,10 @@ impl Cadence {
         frame: Some(SMOOTH_FRAME),
         moves: false,
     };
+    pub const CLOCK: Self = Self {
+        frame: Some(Duration::from_secs(1)),
+        moves: true,
+    };
 
     /// `cadence` while `applies`, else [`Cadence::IDLE`].
     pub fn when(applies: bool, cadence: Self) -> Self {

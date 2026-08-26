@@ -11,6 +11,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::agent::{GoalResult, GoalVerdict};
+
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +571,42 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    GoalEvaluating {
+        evaluation: u32,
+    },
+    GoalEvaluation {
+        verdict: GoalVerdict,
+        reason: String,
+        evaluation: u32,
+        applied: bool,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        model: String,
+    },
+    GoalFinished {
+        result: GoalResult,
+    },
+    GoalDeferred {
+        active_background_tasks: usize,
+    },
+    GoalLoopCap {
+        evaluations: u32,
+    },
+    GoalTurnLimit {
+        evaluations: u32,
+    },
+    GoalEvaluationFailed {
+        evaluation: u32,
+        message: String,
+        applied: bool,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        model: String,
+    },
+    GoalClearedAfterError {
+        condition: String,
+        message: String,
+    },
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,

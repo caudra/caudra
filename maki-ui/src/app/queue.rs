@@ -148,6 +148,33 @@ impl App {
         }
     }
 
+    pub(super) fn submit_goal(&mut self, condition: &str) -> Vec<Action> {
+        let msg = QueuedMessage {
+            text: condition.to_owned(),
+            images: Vec::new(),
+        };
+        let mut input = self.build_agent_input(&msg);
+        input.preamble.push(maki_providers::Message::synthetic(
+            maki_agent::goal_kickoff_message(condition),
+        ));
+        if self.status == Status::Streaming {
+            let Some(ref shared) = self.queue.shared else {
+                self.flash(NO_QUEUE_ERR.into());
+                return vec![];
+            };
+            shared.push(QueueItem::Message {
+                text: msg.text,
+                image_count: 0,
+                input,
+                run_id: self.run_id,
+                displayed: false,
+            });
+            vec![]
+        } else {
+            self.start_run(input, msg.text)
+        }
+    }
+
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
@@ -222,11 +249,27 @@ impl App {
         self.start_run(input, String::new())
     }
 
+    pub(crate) fn start_goal_checkin(&mut self) -> Vec<Action> {
+        let Some(goal) = self.state.goal.snapshot() else {
+            self.goal_deferred = false;
+            return vec![];
+        };
+        let mut input = self.build_agent_input(&QueuedMessage {
+            text: String::new(),
+            images: Vec::new(),
+        });
+        input.preamble.push(maki_providers::Message::synthetic(
+            maki_agent::goal_checkin_message(&goal.condition),
+        ));
+        self.start_run(input, String::new())
+    }
+
     /// The one place a fresh run starts: every path that emits
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
         self.run_id += 1;
+        self.goal_deferred = false;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();

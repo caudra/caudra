@@ -31,6 +31,30 @@ end
 
 Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
+const GOALS: &str = r#"## Completion goals
+
+`/goal <condition>` asks Maki to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
+
+At the end of each natural work turn, a separate weak-model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
+
+Run `/goal` without arguments to open the status panel. It shows the condition, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
+
+Use `/goal clear` to stop early. The aliases `stop`, `off`, `reset`, `none`, and `cancel` are accepted after `/goal`, without regard to case.
+
+Goal state belongs to the session. Active and completed status survive resume, while `/new` clears them. Normal permissions still apply, so unattended goals need rules or YOLO mode that already permit the required tools.
+
+Maki defers evaluation while tracked background agents are running and starts a hidden check-in after they finish. Worker compaction can still run, but evaluator calls never compact or alter history.
+
+Eight automatic continuations are allowed in one query. When that safety cap or the configured turn limit is reached, Maki returns control with the goal still active. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
+
+One-shot headless mode accepts the same form:
+
+```bash
+maki --print '/goal tests pass and cargo clippy is clean'
+```
+
+Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result."#;
+
 fn write_row(out: &mut String, name: &str, description: &str) {
     writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
 }
@@ -74,6 +98,9 @@ pub fn generate() -> String {
     .unwrap();
 
     writeln!(out).unwrap();
+    writeln!(out, "{GOALS}").unwrap();
+    writeln!(out).unwrap();
+
     writeln!(out, "## Modes and toggles").unwrap();
     writeln!(out).unwrap();
     writeln!(

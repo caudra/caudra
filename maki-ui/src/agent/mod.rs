@@ -54,6 +54,8 @@ pub(crate) struct AgentHandles {
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
+    pub(crate) goal: maki_agent::GoalHandle,
+    subagent_cancels: Arc<CancelMap<String>>,
     pub(crate) timeouts: maki_providers::Timeouts,
     model_policy: Arc<ModelPolicy>,
     mailbox: Option<SessionMailbox>,
@@ -76,6 +78,7 @@ impl AgentHandles {
         mcp_handle: Option<McpHandle>,
         mcp_config_errors: McpConfigErrors,
         model_policy: Arc<ModelPolicy>,
+        goal: maki_agent::GoalHandle,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -90,6 +93,7 @@ impl AgentHandles {
             timeouts,
             lua_handle,
             model_policy,
+            goal,
         )
     }
 
@@ -106,6 +110,18 @@ impl AgentHandles {
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
+        if self.goal.status().is_none() {
+            match app.state.goal.status() {
+                Some(maki_agent::GoalStatus::Active(goal)) => {
+                    let _ = self.goal.set(&goal.condition);
+                }
+                Some(maki_agent::GoalStatus::Finished(result)) => {
+                    self.goal.restore_finished(result);
+                }
+                None => {}
+            }
+        }
+        app.state.goal = self.goal.clone();
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
@@ -129,6 +145,10 @@ impl AgentHandles {
             .as_ref()
             .map(SessionMailbox::claim_wake)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn active_background_tasks(&self) -> usize {
+        self.subagent_cancels.active_count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -163,6 +183,7 @@ impl AgentHandles {
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
+            app.state.goal.clone(),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -225,6 +246,7 @@ fn spawn_agent_internal(
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
+    goal: maki_agent::GoalHandle,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -266,8 +288,9 @@ fn spawn_agent_internal(
         mailbox.clone(),
         timeouts,
         lua_handle,
-        subagent_cancels,
+        Arc::clone(&subagent_cancels),
         Arc::clone(&model_policy),
+        goal.clone(),
     );
 
     let task = smol::spawn(agent_loop.run());
@@ -282,6 +305,8 @@ fn spawn_agent_internal(
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,
+        goal,
+        subagent_cancels,
         timeouts,
         model_policy,
         mailbox,
@@ -364,6 +389,7 @@ mod tests {
             None,
             McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),
+            maki_agent::GoalHandle::default(),
         );
         (handles, model_slot, permissions)
     }

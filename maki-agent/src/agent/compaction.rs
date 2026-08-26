@@ -128,7 +128,7 @@ pub async fn compact(
     history: &mut History,
     event_tx: &EventSender,
     config: &AgentConfig,
-) -> Result<(), AgentError> {
+) -> Result<TokenUsage, AgentError> {
     let cancel = CancelToken::none();
     let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
@@ -141,7 +141,7 @@ pub async fn compact(
         reason: DoneReason::EndTurn,
     })?;
 
-    Ok(())
+    Ok(usage)
 }
 
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
