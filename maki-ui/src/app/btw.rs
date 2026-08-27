@@ -3,7 +3,7 @@ use std::sync::Arc;
 use flume::Sender;
 use futures_lite::future;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{Message, Model, ProviderEvent, RequestOptions, project_messages};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
@@ -34,11 +34,19 @@ impl App {
     ) {
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
-        let mut messages = self
+        let items = self
             .shared_history
             .as_ref()
             .map(|h| Vec::clone(&h.load().messages))
             .unwrap_or_default();
+        let mut messages = match project_messages(&items) {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.status_bar
+                    .flash(format!("Failed to read session history: {error}"));
+                return;
+            }
+        };
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
         let system = self
             .btw_system

@@ -26,7 +26,10 @@ use maki_agent::{
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{
+    ContentBlock, HistoryItem, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage,
+    add_cost, expand_message,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -41,6 +44,14 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+
+fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
+    let mut items: Vec<HistoryItem> = Vec::new();
+    for message in messages {
+        items.extend(expand_message(message, items.last().map(|item| item.id)));
+    }
+    items
+}
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -518,9 +529,10 @@ async fn session(
             Err(error) => return Ok(err_pair(error.to_string())),
         },
     };
-    let history = history_lease
+    let history_items = history_lease
         .history()
-        .map_or_else(Vec::new, |messages| messages.as_ref().clone());
+        .map_or_else(Vec::new, |messages| expand_history(messages));
+    let history = try_pair!(History::restored(history_items));
 
     // Register a cancel trigger so the child token does not fire on drop
     // and kill the subagent at birth.
@@ -561,7 +573,7 @@ async fn session(
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
-        history: History::restored(history),
+        history,
         history_lease: Some(history_lease),
         sub_event_tx,
         child_cancel,
@@ -942,7 +954,6 @@ fn call_local_tool(
 #[cfg(test)]
 mod tests {
     use maki_agent::{DoneReason, TurnCompleteEvent};
-    use maki_providers::Message;
     use serde_json::json;
 
     use super::*;
@@ -972,6 +983,47 @@ mod tests {
         assert!(raised.contains("boom"), "got: {raised}");
         let wrong = call("function() return 42 end", input).unwrap_err();
         assert!(wrong.contains("expected string"), "got: {wrong}");
+    }
+
+    #[test]
+    fn grouped_history_expands_with_stable_parent_chain_and_round_trips() {
+        const CALL_ID: &str = "call-1";
+        const TOOL_NAME: &str = "read";
+        let messages = vec![
+            Message::user("inspect".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                    ContentBlock::tool_use(CALL_ID, TOOL_NAME, json!({"path": "src/lib.rs"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL_ID.into(),
+                    content: "contents".into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            },
+        ];
+
+        let items = expand_history(&messages);
+
+        assert!(
+            items
+                .windows(2)
+                .all(|pair| pair[1].parent_id == Some(pair[0].id))
+        );
+        let projected = History::restored(items).unwrap().into_vec();
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(messages).unwrap()
+        );
     }
 
     const RUN_ID: u64 = 7;

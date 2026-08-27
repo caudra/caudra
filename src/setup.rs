@@ -6,7 +6,9 @@ use color_eyre::eyre::{Context, eyre};
 
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{Model, ModelError, ModelTier};
+use maki_providers::{HistoryItem, active_history_items, resolve_history_head};
 use maki_storage::StateDir;
+use maki_storage::id::MakiId;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
@@ -20,6 +22,29 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "synthetic",
     "deepseek",
 ];
+
+pub type StoredSession = maki_agent::StoredSession;
+
+pub fn session_history_head(session: &StoredSession) -> Option<MakiId> {
+    resolve_history_head(
+        session.messages(),
+        session.meta.history_head,
+        session.meta.pending_revert.is_some(),
+    )
+}
+
+pub fn active_session_history(session: &StoredSession) -> Result<Vec<HistoryItem>> {
+    active_history_items(session.messages(), session_history_head(session))
+        .context("resolve active session history")
+}
+
+pub fn load_session(id: MakiId, storage: &StateDir) -> Result<StoredSession> {
+    maki_agent::load_stored_session(id, storage).context("load persisted session")
+}
+
+pub fn latest_session(cwd: &str, storage: &StateDir) -> Result<Option<StoredSession>> {
+    maki_agent::latest_stored_session(cwd, storage).context("load latest persisted session")
+}
 
 pub fn resolve_model(
     explicit: Option<&str>,
@@ -165,4 +190,110 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
         .with_env_filter(filter)
         .with_writer(writer)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_agent::{History, ToolOutput};
+    use maki_providers::{ContentBlock, Message, Role, TokenUsage, project_messages};
+    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionError};
+
+    const CWD: &str = "/repo";
+    const MAIN_PROMPT: &str = "main prompt";
+    const MODEL_SPEC: &str = "anthropic/test-model";
+    const SUBAGENT_PROMPT: &str = "subagent prompt";
+    const TITLE: &str = "Migrated session";
+    const CURRENT_LOG_VERSION: &str = r#""v":3"#;
+    const PREVIOUS_LOG_VERSION: &str = r#""v":2"#;
+    const PREVIOUS_LOG_FORMAT_VERSION: u32 = 2;
+
+    type LegacySession = Session<Message, TokenUsage, ToolOutput>;
+
+    fn messages() -> Vec<Message> {
+        vec![
+            Message::user(MAIN_PROMPT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "first".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "second".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn current_session_load_preserves_item_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let items = History::new(messages()).into_items();
+        let mut session = StoredSession::new(MODEL_SPEC, CWD);
+        let id = session.id;
+        session.replace_messages(items.clone());
+        session.save(&storage).unwrap();
+
+        assert_eq!(load_session(id, &storage).unwrap().messages(), items);
+    }
+
+    #[test]
+    fn legacy_session_load_expands_all_message_collections() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let messages = messages();
+        let expected = serde_json::to_value(&messages).unwrap();
+        let mut session = LegacySession::new(MODEL_SPEC, CWD);
+        let id = session.id;
+        session.set_title(TITLE.into());
+        session.replace_messages(messages);
+        session.set_subagent_messages("task-1".into(), vec![Message::user(SUBAGENT_PROMPT.into())]);
+        session.save(&storage).unwrap();
+        let path = storage
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{id}.jsonl"));
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(data.contains(CURRENT_LOG_VERSION));
+        std::fs::write(
+            &path,
+            data.replacen(CURRENT_LOG_VERSION, PREVIOUS_LOG_VERSION, 1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            StoredSession::load(id, &storage),
+            Err(SessionError::VersionMismatch {
+                found: PREVIOUS_LOG_FORMAT_VERSION,
+                ..
+            })
+        ));
+
+        let loaded = load_session(id, &storage).unwrap();
+
+        assert_eq!(loaded.title, TITLE);
+        assert_eq!(
+            serde_json::to_value(project_messages(loaded.messages()).unwrap()).unwrap(),
+            expected
+        );
+        let subagent = project_messages(&loaded.subagent_messages()["task-1"]).unwrap();
+        assert_eq!(subagent[0].user_text(), Some(SUBAGENT_PROMPT));
+        assert!(
+            loaded
+                .messages()
+                .windows(2)
+                .all(|pair| pair[1].parent_id == Some(pair[0].id))
+        );
+        assert!(StoredSession::load(id, &storage).is_ok());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains(CURRENT_LOG_VERSION)
+        );
+        assert_eq!(latest_session(CWD, &storage).unwrap().unwrap().id, id);
+    }
 }

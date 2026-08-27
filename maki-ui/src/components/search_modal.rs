@@ -451,9 +451,9 @@ mod tests {
         );
     }
 
-    #[test_case("maki>", &["you> hello", "maki> world", "thinking> hmm"], 1 ; "maki_prefix")]
-    #[test_case("you>",  &["you> request", "maki> response", "bash> output"], 0 ; "you_prefix")]
-    fn search_role_prefix_matches(query: &str, texts: &[&str], expected_idx: usize) {
+    #[test_case("thinking>", &["hello", "world", "thinking> hmm"], 2 ; "thinking_prefix")]
+    #[test_case("bash>",     &["request", "response", "bash> output"], 2 ; "tool_prefix")]
+    fn search_non_author_prefix_matches(query: &str, texts: &[&str], expected_idx: usize) {
         let modal = modal_with_query(query, texts);
         assert_eq!(modal.matches.len(), 1);
         assert_eq!(modal.matches[0].segment_index, expected_idx);

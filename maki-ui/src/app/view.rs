@@ -215,7 +215,7 @@ impl App {
                 Placeholder::QueueEdit
             } else if self.status == Status::Streaming {
                 Placeholder::Queue
-            } else if self.state.session.messages().is_empty() {
+            } else if crate::session_history_head(&self.state.session).is_none() {
                 Placeholder::Suggestion
             } else {
                 Placeholder::Blank
@@ -265,6 +265,7 @@ impl App {
         }
 
         render_if_open!(self.rewind_picker);
+        render_if_open!(self.message_actions);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);

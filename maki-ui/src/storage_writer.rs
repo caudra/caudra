@@ -6,6 +6,7 @@
 //! whichever the app asked for last is what reaches disk.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ const SAVE_RECOVERED: &str = "Session save recovered";
 type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
+type SaveCallback = flume::Sender<Result<(), SessionError>>;
 
 /// One slot per session, holding whatever the app asked for last. Deletes
 /// used to ride a side channel, where a flush queued before a delete could
@@ -31,6 +33,7 @@ type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 /// had just saved.
 enum Entry {
     Save(Arc<AppSession>),
+    SaveSync(Arc<AppSession>, SaveCallback),
     Delete(DeleteCallback),
 }
 
@@ -75,6 +78,13 @@ impl StorageWriter {
         self.enqueue(session.id, Entry::Save(session));
     }
 
+    pub fn save_sync(&self, session: Arc<AppSession>) -> Result<(), SessionError> {
+        let id = session.id;
+        let (done_tx, done_rx) = flume::bounded(1);
+        self.enqueue(id, Entry::SaveSync(session, done_tx));
+        done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
+    }
+
     /// Delete a session's files on the writer thread; `done` fires there, so
     /// callers never block on disk. Deleting a session that was never written
     /// reports success, and a save enqueued afterwards supersedes the delete.
@@ -83,11 +93,14 @@ impl StorageWriter {
     }
 
     fn enqueue(&self, id: MakiId, entry: Entry) {
-        lock(&self.pending).insert(id, entry);
+        let superseded = { lock(&self.pending).insert(id, entry) };
+        if let Some(superseded) = superseded {
+            resolve_entry(superseded, Err(superseded_error(id)));
+        }
         if self.wake.send(()).is_err()
-            && let Some(Entry::Delete(done)) = lock(&self.pending).remove(&id)
+            && let Some(entry) = lock(&self.pending).remove(&id)
         {
-            done(Err(writer_gone()));
+            resolve_entry(entry, Err(writer_gone()));
         }
     }
 
@@ -105,6 +118,23 @@ fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<MakiId, Entry>> 
 
 fn writer_gone() -> SessionError {
     StorageError::Io(io::Error::other("storage writer unavailable")).into()
+}
+
+fn superseded_error(id: MakiId) -> SessionError {
+    StorageError::Io(io::Error::other(format!(
+        "storage operation for session {id} was superseded by a newer operation"
+    )))
+    .into()
+}
+
+fn resolve_entry(entry: Entry, result: Result<(), SessionError>) {
+    match entry {
+        Entry::Delete(done) => done(result),
+        Entry::SaveSync(_, done) => {
+            let _ = done.send(result);
+        }
+        Entry::Save(_) => {}
+    }
 }
 
 /// Everything the writer thread owns. It never leaves that thread, so nothing
@@ -140,14 +170,30 @@ impl Writer {
                         // is the last retry.
                         lock(pending).entry(id).or_insert(Entry::Save(session));
                     }
-                    self.report(id, result);
+                    self.report(id, &result);
+                }
+                Entry::SaveSync(session, done) => {
+                    let result = self.write(&session);
+                    self.report(id, &result);
+                    let _ = done.send(result);
                 }
                 Entry::Delete(done) => {
                     self.forget(id);
-                    done(match AppSession::delete(id, &self.dir) {
+                    let session_result = match AppSession::delete(id, &self.dir) {
                         Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
                         result => result,
-                    });
+                    };
+                    let snapshots = self
+                        .dir
+                        .path()
+                        .join(maki_agent::snapshots::SESSION_SNAPSHOTS_DIR)
+                        .join(id.to_string());
+                    let snapshot_result = match fs::remove_dir_all(snapshots) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(SessionError::Storage(error.into())),
+                    };
+                    done(session_result.and(snapshot_result));
                 }
             }
         }
@@ -175,7 +221,7 @@ impl Writer {
         Ok(())
     }
 
-    fn report(&mut self, id: MakiId, result: Result<(), impl std::fmt::Display>) {
+    fn report(&mut self, id: MakiId, result: &Result<(), impl std::fmt::Display>) {
         match result {
             Ok(()) => {
                 if self.failing.remove(&id) {
@@ -218,8 +264,8 @@ mod tests {
     }
 
     fn message_texts(session: &AppSession) -> Vec<String> {
-        session
-            .messages()
+        maki_providers::project_messages(session.messages())
+            .unwrap()
             .iter()
             .map(|m| m.user_text().unwrap_or_default().to_string())
             .collect()
@@ -275,6 +321,110 @@ mod tests {
         assert!(AppSession::load(id, &dir).is_err());
     }
 
+    #[test]
+    fn synchronous_save_is_visible_before_it_returns() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let mut session = AppSession::new(MODEL, CWD);
+        crate::push_history_message(&mut session, user_message(0));
+        let id = session.id;
+
+        writer.save_sync(Arc::new(session)).unwrap();
+
+        assert!(AppSession::load(id, &dir).is_ok());
+        writer.shutdown(DRAIN_TIMEOUT);
+    }
+
+    #[test]
+    fn delete_removes_all_workspace_snapshot_roots_for_the_session() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let mut session = AppSession::new(MODEL, CWD);
+        crate::push_history_message(&mut session, user_message(0));
+        let id = session.id;
+        writer.save_sync(Arc::new(session)).unwrap();
+        let snapshots = dir
+            .path()
+            .join(maki_agent::snapshots::SESSION_SNAPSHOTS_DIR)
+            .join(id.to_string());
+        fs::create_dir_all(snapshots.join("workspace-a")).unwrap();
+        fs::write(
+            snapshots.join("workspace-a").join("journal.json"),
+            "pending",
+        )
+        .unwrap();
+        let (done_tx, done_rx) = flume::bounded(1);
+
+        writer.delete(id, move |result| {
+            let _ = done_tx.send(result);
+        });
+
+        done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        assert!(!snapshots.exists());
+        writer.shutdown(DRAIN_TIMEOUT);
+    }
+
+    #[test]
+    fn newer_save_resolves_superseded_delete_callback_once() {
+        let pending: Pending = Arc::default();
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let id = session.id;
+        let (done_tx, done_rx) = flume::unbounded();
+        let callback = move |result| {
+            let _ = done_tx.send(result);
+        };
+
+        lock(&pending).insert(id, Entry::Delete(Box::new(callback)));
+        if let Some(superseded) = lock(&pending).insert(id, Entry::Save(session)) {
+            resolve_entry(superseded, Err(superseded_error(id)));
+        }
+
+        let error = done_rx.recv().unwrap().unwrap_err().to_string();
+        assert!(error.contains("superseded"), "{error}");
+        assert!(done_rx.try_recv().is_err());
+        assert!(matches!(lock(&pending).get(&id), Some(Entry::Save(_))));
+    }
+
+    #[test]
+    fn save_sync_and_delete_interleaving_resolves_each_superseded_callback() {
+        let pending: Pending = Arc::default();
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let id = session.id;
+        let (save_tx, save_rx) = flume::bounded(1);
+        let (delete_tx, delete_rx) = flume::bounded(1);
+
+        lock(&pending).insert(id, Entry::SaveSync(Arc::clone(&session), save_tx));
+        let delete = Entry::Delete(Box::new(move |result| {
+            let _ = delete_tx.send(result);
+        }));
+        if let Some(superseded) = lock(&pending).insert(id, delete) {
+            resolve_entry(superseded, Err(superseded_error(id)));
+        }
+        if let Some(superseded) = lock(&pending).insert(id, Entry::Save(session)) {
+            resolve_entry(superseded, Err(superseded_error(id)));
+        }
+
+        assert!(
+            save_rx
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("superseded")
+        );
+        assert!(
+            delete_rx
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("superseded")
+        );
+        assert!(save_rx.try_recv().is_err());
+        assert!(delete_rx.try_recv().is_err());
+        assert!(matches!(lock(&pending).get(&id), Some(Entry::Save(_))));
+    }
+
     /// A fresh writer over an existing file has no cursor, so it re-opens the
     /// log and gets cursors for the loaded session, not the live one. The first
     /// append must diverge into a full rewrite instead of landing on stale
@@ -285,14 +435,17 @@ mod tests {
         let mut session = AppSession::new(MODEL, CWD);
         let id = session.id;
         for i in 0..5 {
-            session.push_message(user_message(i));
+            crate::push_history_message(&mut session, user_message(i));
         }
         let (first, _first_warn_rx) = writer(&dir);
         first.send(Arc::new(session.clone()));
         first.shutdown(DRAIN_TIMEOUT);
 
         session.truncate_messages(2);
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        crate::push_history_message(
+            &mut session,
+            maki_providers::Message::user(RESUMED_MSG.into()),
+        );
         session.insert_tool_output(
             TOOL_ID.into(),
             maki_agent::ToolOutput::Plain(TOOL_TEXT.to_string().into()),
@@ -359,10 +512,13 @@ mod tests {
         let (writer, warn_rx) = writer(&dir);
         let mut session = AppSession::new(MODEL, CWD);
         let id = session.id;
-        session.push_message(user_message(0));
+        crate::push_history_message(&mut session, user_message(0));
         writer.send(Arc::new(session.clone()));
         writer.delete(id, |_| {});
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        crate::push_history_message(
+            &mut session,
+            maki_providers::Message::user(RESUMED_MSG.into()),
+        );
         writer.send(Arc::new(session));
         writer.shutdown(DRAIN_TIMEOUT);
 
@@ -406,7 +562,7 @@ mod tests {
         let (writer, warn_rx) = writer(&dir);
         let mut session = AppSession::new(MODEL, CWD);
         let id = session.id;
-        session.push_message(user_message(0));
+        crate::push_history_message(&mut session, user_message(0));
         writer.send(Arc::new(session.clone()));
 
         let (done_tx, done_rx) = flume::bounded(1);
@@ -416,7 +572,10 @@ mod tests {
         done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
         assert!(AppSession::load(id, &dir).is_err());
 
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        crate::push_history_message(
+            &mut session,
+            maki_providers::Message::user(RESUMED_MSG.into()),
+        );
         writer.send(Arc::new(session));
         writer.shutdown(DRAIN_TIMEOUT);
 

@@ -76,6 +76,11 @@ impl MessageQueue {
         self.viewport = 0;
     }
 
+    pub(crate) fn disconnect(&mut self) {
+        self.clear();
+        self.shared = None;
+    }
+
     pub(crate) fn focus(&self) -> Option<usize> {
         let selected = self.selected?;
         self.panel_entries()
@@ -635,6 +640,16 @@ impl App {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
         }
+        if self
+            .state
+            .session
+            .meta
+            .pending_revert
+            .as_ref()
+            .is_some_and(|pending| pending.restore_operation.is_some())
+        {
+            return SubmitOutcome::Rejected(super::REVERT_BUSY_MSG);
+        }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
                 SubmitOutcome::Queued
@@ -715,6 +730,9 @@ impl App {
         if self.state.session.meta.queued_messages_together {
             self.queue.set_delivery(QueueDelivery::TogetherNextTurn);
         }
+        if !self.state.session.meta.queued_messages.is_empty() {
+            self.status = Status::Streaming;
+        }
         // Read, not taken: the live queue is what the next checkpoint mirrors
         // back into the session, so emptying it here changes nothing on disk.
         for text in self.state.session.meta.queued_messages.clone() {
@@ -793,6 +811,22 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        if self.cancelling_run.is_some()
+            || self
+                .state
+                .session
+                .meta
+                .pending_revert
+                .as_ref()
+                .is_some_and(|pending| pending.restore_operation.is_some())
+        {
+            self.flash(super::REVERT_BUSY_MSG.into());
+            return Vec::new();
+        }
+        if let Err(error) = self.snapshot_history_head() {
+            self.flash(format!("Failed to snapshot workspace: {error}"));
+            return Vec::new();
+        }
         self.run_id += 1;
         self.goal_deferred = false;
         self.clear_exit_request();

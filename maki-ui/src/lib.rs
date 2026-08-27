@@ -35,12 +35,51 @@ mod terminal;
 use std::time::Instant;
 
 use color_eyre::Result;
-use maki_agent::ToolOutput;
-use maki_providers::Message;
-use maki_providers::TokenUsage;
+use color_eyre::eyre::Context;
+use maki_providers::{
+    HistoryItem, HistoryProjectionError, Message, active_history_items, expand_message,
+    resolve_history_head,
+};
+use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 
-pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
+pub type AppSession = maki_agent::StoredSession;
+
+pub(crate) fn load_app_session(id: MakiId, storage: &StateDir) -> Result<AppSession> {
+    maki_agent::load_stored_session(id, storage).context("load persisted session")
+}
+
+pub(crate) fn session_history_head(session: &AppSession) -> Option<MakiId> {
+    resolve_history_head(
+        session.messages(),
+        session.meta.history_head,
+        session.meta.pending_revert.is_some(),
+    )
+}
+
+pub(crate) fn active_session_history(
+    session: &AppSession,
+) -> Result<Vec<HistoryItem>, HistoryProjectionError> {
+    active_history_items(session.messages(), session_history_head(session))
+}
+
+pub(crate) fn history_items(messages: &[Message]) -> Vec<HistoryItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        items.extend(expand_message(
+            message,
+            items.last().map(|item: &HistoryItem| item.id),
+        ));
+    }
+    items
+}
+
+#[cfg(test)]
+pub(crate) fn push_history_message(session: &mut AppSession, message: Message) {
+    for item in expand_message(&message, session.messages().last().map(|item| item.id)) {
+        session.push_message(item);
+    }
+}
 
 pub(crate) use agent::AgentCommand;
 pub use event_loop::EventLoopParams;

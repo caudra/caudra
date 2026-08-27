@@ -3,7 +3,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
 use crossterm::event::KeyEvent;
-use maki_providers::{Message, Role};
+use maki_providers::{HistoryItem, HistoryItemKind, UserOrigin};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -20,7 +20,6 @@ pub enum RewindPickerAction {
 pub struct RewindEntry {
     pub turn_index: usize,
     pub prompt_preview: String,
-    pub prompt_text: String,
 }
 
 impl PickerItem for RewindEntry {
@@ -40,14 +39,18 @@ impl RewindPicker {
         }
     }
 
-    pub fn open(&mut self, messages: &[Message]) -> Result<(), String> {
+    pub fn open(&mut self, items: &[HistoryItem]) -> Result<(), String> {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
-        for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) || msg.is_observation() {
-                continue;
-            }
-            let Some(full_text) = msg.user_text() else {
+        let mut start = 0;
+        while start < items.len() {
+            let group_id = items[start].group_id;
+            let end = items[start..]
+                .iter()
+                .position(|item| item.group_id != group_id)
+                .map_or(items.len(), |offset| start + offset);
+            let Some(full_text) = user_turn_text(&items[start..end]) else {
+                start = end;
                 continue;
             };
             turn_num += 1;
@@ -61,10 +64,10 @@ impl RewindPicker {
                 format!("{turn_num}: {first_line}")
             };
             entries.push(RewindEntry {
-                turn_index: msg_idx,
+                turn_index: start,
                 prompt_preview: preview,
-                prompt_text: full_text.to_owned(),
             });
+            start = end;
         }
         if entries.is_empty() {
             return Err(NO_TURNS_MSG.into());
@@ -108,6 +111,27 @@ impl RewindPicker {
     }
 }
 
+fn user_turn_text(items: &[HistoryItem]) -> Option<&str> {
+    let first = items
+        .iter()
+        .find(|item| matches!(item.kind, HistoryItemKind::User { .. }))?;
+    let HistoryItemKind::User {
+        display_text,
+        origin: UserOrigin::Turn,
+        ..
+    } = &first.kind
+    else {
+        return None;
+    };
+    if let Some(display_text) = display_text {
+        return (!display_text.is_empty()).then_some(display_text.as_str());
+    }
+    items.iter().find_map(|item| match &item.kind {
+        HistoryItemKind::User { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    })
+}
+
 impl Overlay for RewindPicker {
     fn is_open(&self) -> bool {
         self.is_open()
@@ -125,7 +149,7 @@ impl Overlay for RewindPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_providers::ContentBlock;
+    use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
 
     fn user_msg(text: &str) -> Message {
@@ -147,7 +171,10 @@ mod tests {
     #[test_case(&[Message::synthetic("continue".into())]     ; "only_synthetic")]
     fn open_without_user_turns_returns_error(msgs: &[Message]) {
         let mut picker = RewindPicker::new();
-        assert_eq!(picker.open(msgs), Err(NO_TURNS_MSG.into()));
+        assert_eq!(
+            picker.open(&crate::history_items(msgs)),
+            Err(NO_TURNS_MSG.into())
+        );
     }
 
     #[test]
@@ -160,7 +187,7 @@ mod tests {
             assistant_msg(),
             user_msg("third"),
         ];
-        picker.open(&msgs).unwrap();
+        picker.open(&crate::history_items(&msgs)).unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("third"));
         assert_eq!(item.turn_index, 4);
@@ -170,31 +197,34 @@ mod tests {
     fn long_prompt_is_truncated_in_preview() {
         let mut picker = RewindPicker::new();
         let long_text = "a".repeat(120);
-        picker.open(&[user_msg(&long_text)]).unwrap();
+        picker
+            .open(&crate::history_items(&[user_msg(&long_text)]))
+            .unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().ends_with("..."));
         assert!(item.label().len() < 90);
-        assert_eq!(item.prompt_text, long_text);
     }
 
     #[test]
     fn multiline_prompt_uses_first_line_for_preview() {
         let mut picker = RewindPicker::new();
-        picker.open(&[user_msg("first line\nsecond line")]).unwrap();
+        picker
+            .open(&crate::history_items(&[user_msg(
+                "first line\nsecond line",
+            )]))
+            .unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("first line"));
         assert!(!item.label().contains("second"));
-        assert_eq!(item.prompt_text, "first line\nsecond line");
     }
 
     #[test]
     fn display_text_overrides_content() {
         let mut picker = RewindPicker::new();
         let msg = Message::user_display("ai sees this".into(), "user typed this".into());
-        picker.open(&[msg]).unwrap();
+        picker.open(&crate::history_items(&[msg])).unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("user typed this"));
-        assert_eq!(item.prompt_text, "user typed this");
     }
 
     #[test]
@@ -206,7 +236,7 @@ mod tests {
             assistant_msg(),
             Message::synthetic("[Cancelled by user]".into()),
         ];
-        picker.open(&msgs).unwrap();
+        picker.open(&crate::history_items(&msgs)).unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("real prompt"));
         assert_eq!(item.turn_index, 1);
@@ -222,7 +252,7 @@ mod tests {
             assistant_msg(),
             user_msg("second"),
         ];
-        picker.open(&msgs).unwrap();
+        picker.open(&crate::history_items(&msgs)).unwrap();
         let top = picker.picker.selected_item().unwrap();
         assert!(top.label().starts_with("2: second"));
     }

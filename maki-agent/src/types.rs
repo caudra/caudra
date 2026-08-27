@@ -531,21 +531,23 @@ fn append_model_suffix(content: &mut String, model_suffix: &str) {
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
+    let mut tool_result_image_owners = Vec::new();
     for r in results {
         let mut result_content = r.output.as_text();
         if let Some(model_suffix) = r.model_suffix() {
             append_model_suffix(&mut result_content, model_suffix);
+        }
+        if let ToolOutput::Image { source, .. } = &r.output {
+            images.push(ContentBlock::Image {
+                source: source.clone(),
+            });
+            tool_result_image_owners.push(r.id.clone());
         }
         content.push(ContentBlock::ToolResult {
             tool_use_id: r.id,
             content: result_content,
             is_error: r.is_error,
         });
-        if let ToolOutput::Image { source, .. } = &r.output {
-            images.push(ContentBlock::Image {
-                source: source.clone(),
-            });
-        }
     }
     // Anthropic wants every tool_result before other content in the user
     // message, so images go after all results.
@@ -553,6 +555,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     Message {
         role: Role::User,
         content,
+        tool_result_image_owners,
         ..Default::default()
     }
 }
@@ -1269,6 +1272,13 @@ mod tests {
         );
         assert!(
             matches!(&msg.content[4], ContentBlock::Image { source } if &*source.data == "aW1n")
+        );
+        assert_eq!(msg.tool_result_image_owners, ["t1", "t3"]);
+        assert!(
+            serde_json::to_value(msg)
+                .unwrap()
+                .get("tool_result_image_owners")
+                .is_none()
         );
     }
 

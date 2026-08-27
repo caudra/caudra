@@ -43,6 +43,47 @@ fn panel_with_tools(ids: &[(&str, &'static str)]) -> MessagesPanel {
     panel
 }
 
+#[test]
+fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let ids = std::array::from_fn::<_, 5, _>(|_| maki_storage::id::MakiId::generate());
+    let sources = [
+        DisplaySource::User(ids[0]),
+        DisplaySource::AssistantText(ids[1]),
+        DisplaySource::Reasoning(ids[2]),
+        DisplaySource::ToolCall {
+            id: ids[3],
+            result_id: Some(ids[4]),
+        },
+        DisplaySource::ToolResult(ids[4]),
+    ];
+    for (index, source) in sources.into_iter().enumerate() {
+        let role = match source {
+            DisplaySource::User(_) => DisplayRole::User,
+            DisplaySource::Reasoning(_) => DisplayRole::Thinking,
+            DisplaySource::ToolCall { .. } => DisplayRole::Tool(Box::new(ToolRole {
+                id: "tool-row".into(),
+                status: ToolStatus::Success,
+                name: "read".into(),
+            })),
+            DisplaySource::AssistantText(_) | DisplaySource::ToolResult(_) => {
+                DisplayRole::Assistant
+            }
+        };
+        let mut message = DisplayMessage::new(role, format!("message {index}"));
+        message.source = Some(source);
+        panel.push(message);
+    }
+    panel.rebuild_line_cache();
+    panel.set_scroll_top(0);
+    let area = Rect::new(0, 0, 80, 20);
+
+    for (index, source) in sources.into_iter().enumerate() {
+        assert_eq!(panel.source_at(index as u16 * 2, area), Some(source));
+    }
+    assert_eq!(panel.source_at(1, area), None, "spacer is UI-only");
+}
+
 fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
@@ -670,7 +711,7 @@ fn search_text_bash_with_code_input() {
 }
 
 #[test]
-fn search_text_includes_role_prefix() {
+fn search_text_omits_author_labels() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -678,9 +719,84 @@ fn search_text_includes_role_prefix() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "you> hello");
-    assert_eq!(texts[2], format!("maki> {md}"));
+    assert_eq!(texts[0], "hello");
+    assert_eq!(texts[2], md);
     assert_eq!(texts[4], "thinking> hmm");
+}
+
+#[test]
+fn author_messages_render_as_unlabelled_background_bands() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "world".into()));
+
+    let terminal = render(&mut panel, 24, 8);
+    let buffer = terminal.backend().buffer();
+    let rows = (0..buffer.area.height)
+        .map(|y| {
+            let text = (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect::<String>();
+            (y, text)
+        })
+        .collect::<Vec<_>>();
+    let user_row = rows
+        .iter()
+        .find(|(_, text)| text.contains("hello"))
+        .unwrap()
+        .0;
+    let assistant_row = rows
+        .iter()
+        .find(|(_, text)| text.contains("world"))
+        .unwrap()
+        .0;
+    let content_right = panel.viewport_width - 1;
+    let user_bg = buffer.cell((0, user_row)).unwrap().style().bg;
+    let assistant_bg = buffer.cell((0, assistant_row)).unwrap().style().bg;
+
+    assert_ne!(user_bg, assistant_bg);
+    assert_eq!(
+        buffer.cell((content_right, user_row)).unwrap().style().bg,
+        user_bg
+    );
+    assert_eq!(
+        buffer
+            .cell((content_right, assistant_row))
+            .unwrap()
+            .style()
+            .bg,
+        assistant_bg
+    );
+    assert!(rows.iter().all(|(_, text)| !text.contains("you>")));
+    assert!(rows.iter().all(|(_, text)| !text.contains("maki>")));
+}
+
+#[test]
+fn streaming_assistant_uses_an_unlabelled_background_band() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer("streaming");
+
+    let terminal = render(&mut panel, 24, 8);
+    let buffer = terminal.backend().buffer();
+    let row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect::<String>()
+                .contains("streaming")
+        })
+        .unwrap();
+    let bg = buffer.cell((0, row)).unwrap().style().bg;
+
+    assert!(bg.is_some());
+    assert_eq!(
+        buffer
+            .cell((panel.viewport_width - 1, row))
+            .unwrap()
+            .style()
+            .bg,
+        bg
+    );
 }
 
 #[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]
@@ -799,7 +915,7 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
 
-const MAKI_PREFIX_LEN: u16 = 6;
+const MESSAGE_START_COL: u16 = 0;
 
 fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
     let mut sel = Selection::start(
@@ -826,7 +942,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
 fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let world_start = MAKI_PREFIX_LEN + "Hello ".len() as u16;
+    let world_start = MESSAGE_START_COL + "Hello ".len() as u16;
     let sel = make_sel(area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
@@ -872,7 +988,7 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let heights = panel.segment_heights().to_vec();
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = heights[0] + heights[1];
-    let sel = make_sel(area, (0, 0), (seg1_start as u32, MAKI_PREFIX_LEN + 6));
+    let sel = make_sel(area, (0, 0), (seg1_start as u32, MESSAGE_START_COL + 6));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -888,8 +1004,8 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
     render(&mut panel, 80, 24);
     let total: u16 = panel.segment_heights().iter().sum();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(area, (0, MAKI_PREFIX_LEN), ((total - 1) as u32, 79));
-    let up = make_sel(area, ((total - 1) as u32, 79), (0, MAKI_PREFIX_LEN));
+    let down = make_sel(area, (0, MESSAGE_START_COL), ((total - 1) as u32, 79));
+    let up = make_sel(area, ((total - 1) as u32, 79), (0, MESSAGE_START_COL));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));

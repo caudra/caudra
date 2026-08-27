@@ -63,7 +63,7 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImageSource {
     pub media_type: ImageMediaType,
     pub data: Arc<str>,
@@ -219,6 +219,11 @@ pub struct Message {
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+    /// One call ID per trailing tool-result image, in image order. This is
+    /// runtime projection metadata and must never reach provider wires or
+    /// legacy persisted messages.
+    #[serde(skip)]
+    pub tool_result_image_owners: Vec<String>,
 }
 
 impl Message {

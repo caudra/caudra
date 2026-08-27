@@ -327,6 +327,10 @@ impl InputBox {
         self.pending_images.push(source);
     }
 
+    pub(crate) fn pending_images(&self) -> &[ImageSource] {
+        &self.pending_images
+    }
+
     pub fn set_input(&mut self, s: String) {
         self.buffer = InputDocument::from_plain(s);
     }

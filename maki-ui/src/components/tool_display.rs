@@ -49,9 +49,9 @@ pub struct RoleStyle {
 
 pub fn assistant_style() -> RoleStyle {
     RoleStyle {
-        prefix: "maki> ",
+        prefix: "",
         text_style: theme::current().assistant,
-        prefix_style: theme::current().assistant_prefix,
+        prefix_style: theme::current().assistant,
         use_markdown: true,
         max_line_bytes: None,
     }
@@ -59,9 +59,9 @@ pub fn assistant_style() -> RoleStyle {
 
 pub fn user_style() -> RoleStyle {
     RoleStyle {
-        prefix: "you> ",
+        prefix: "",
         text_style: theme::current().assistant,
-        prefix_style: theme::current().user,
+        prefix_style: theme::current().assistant,
         use_markdown: true,
         max_line_bytes: None,
     }
@@ -834,6 +834,7 @@ mod tests {
                 name: BASH_TOOL_NAME.into(),
             })),
             text: text.into(),
+            source: None,
             tool_input: input.map(Arc::new),
             tool_raw_input: None,
             tool_output: output.map(Arc::new),
@@ -972,6 +973,7 @@ mod tests {
                 name: TASK_TOOL_NAME.into(),
             })),
             text: "Find auth".into(),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
@@ -1067,6 +1069,7 @@ mod tests {
                 name: "index".into(),
             })),
             text: format!("src/lib.rs\n{body}"),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
@@ -1107,6 +1110,7 @@ mod tests {
                 name: "index".into(),
             })),
             text: "src/lib.rs\nplain fallback".into(),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
@@ -1420,6 +1424,7 @@ mod tests {
                 name: BASH_TOOL_NAME.into(),
             })),
             text,
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output,
@@ -1515,6 +1520,7 @@ mod tests {
                 name: READ_TOOL_NAME.into(),
             })),
             text: "read /src/main.rs".into(),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::ReadCode {
@@ -1631,6 +1637,7 @@ mod tests {
                 name: "index".into(),
             })),
             text: "src/lib.rs\nbody_text_here".into(),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
@@ -1670,6 +1677,7 @@ mod tests {
                 name: "index".into(),
             })),
             text: "header\nbody_fallback".into(),
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,

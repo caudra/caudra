@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,11 +30,11 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model, ModelTier};
+use maki_providers::{HistoryItem, Message, Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::sessions::{SessionError, normalize_title};
+use maki_storage::sessions::{SessionError, StoredImage, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -41,12 +42,15 @@ use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
-use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::app::{
+    App, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content, turn_response,
+};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::input::InputReader;
+use crate::load_app_session;
 use crate::repaint::{Dirty, IDLE_POLL};
 
 use crate::storage_writer::StorageWriter;
@@ -60,6 +64,8 @@ const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
+const CWD_BUSY_ERR: &str = "Wait for all sessions to become idle before changing directory";
+const CWD_REVERT_ERR: &str = "Resolve pending reverts before changing directory";
 
 fn preset_label(tier: ModelTier) -> &'static str {
     match tier {
@@ -299,10 +305,123 @@ impl SessionRuntime {
     /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
     /// after an agent error.
     fn quiescent(&self) -> bool {
-        SessionStatus::of(&self.app) == SessionStatus::Idle
-            && self.handles.queue.is_empty()
-            && !self.app.holds_recovery_text()
+        runtime_state_quiescent(
+            SessionStatus::of(&self.app),
+            self.handles.queue.is_empty(),
+            self.handles.active_background_tasks(),
+            self.app.shell.active_ids().len(),
+            self.app.holds_recovery_text(),
+            self.app
+                .state
+                .session
+                .meta
+                .pending_revert
+                .as_ref()
+                .is_some_and(|pending| pending.restore_operation.is_some()),
+        )
     }
+}
+
+fn runtime_state_quiescent(
+    status: SessionStatus,
+    queue_empty: bool,
+    background_tasks: usize,
+    shell_commands: usize,
+    holds_recovery_text: bool,
+    restore_operation_pending: bool,
+) -> bool {
+    status == SessionStatus::Idle
+        && queue_empty
+        && background_tasks == 0
+        && shell_commands == 0
+        && !holds_recovery_text
+        && !restore_operation_pending
+}
+
+fn cwd_change_blocker(states: impl IntoIterator<Item = (bool, bool)>) -> Option<&'static str> {
+    let mut pending_revert = false;
+    for (quiescent, has_pending_revert) in states {
+        if !quiescent {
+            return Some(CWD_BUSY_ERR);
+        }
+        pending_revert |= has_pending_revert;
+    }
+    pending_revert.then_some(CWD_REVERT_ERR)
+}
+
+fn canonical_cwd(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "failed to resolve working directory {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn matching_workspace_quiescent<'a>(
+    target: &Path,
+    sessions: impl IntoIterator<Item = (&'a Path, bool)>,
+) -> bool {
+    sessions
+        .into_iter()
+        .all(|(cwd, quiescent)| canonical_cwd(cwd).is_ok_and(|cwd| cwd != target || quiescent))
+}
+
+fn validate_session_cwd(session: &AppSession, process_cwd: &Path) -> Result<(), String> {
+    let session_cwd = canonical_cwd(Path::new(&session.cwd))?;
+    if session_cwd == process_cwd {
+        return Ok(());
+    }
+    Err(format!(
+        "Session {} belongs to {}; current working directory is {}. Use /cd {} before opening it",
+        session.id,
+        session_cwd.display(),
+        process_cwd.display(),
+        session_cwd.display()
+    ))
+}
+
+fn prepare_session_for_runtime(
+    storage: &StateDir,
+    storage_writer: &StorageWriter,
+    mut session: AppSession,
+) -> Result<(AppSession, Arc<maki_agent::snapshots::SnapshotStore>), String> {
+    let process_cwd = canonical_cwd(
+        &std::env::current_dir()
+            .map_err(|error| format!("failed to read current directory: {error}"))?,
+    )?;
+    validate_session_cwd(&session, &process_cwd)?;
+    let snapshot_store = App::snapshot_store_for(storage, session.id, &process_cwd)
+        .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+    crate::app::recover_pending_workspace_restore(&mut session, &snapshot_store, storage_writer)?;
+    Ok((session, snapshot_store))
+}
+
+fn recover_stored_sessions_in_cwd(
+    storage: &StateDir,
+    storage_writer: &StorageWriter,
+    cwd: &Path,
+) -> Result<(), String> {
+    let cwd_text = cwd.to_string_lossy();
+    let sessions = AppSession::list(&cwd_text, storage)
+        .map_err(|error| format!("Failed to scan sessions for workspace recovery: {error}"))?;
+    for summary in sessions {
+        let mut session = load_app_session(summary.id, storage).map_err(|error| {
+            format!(
+                "Failed to load session {} for workspace recovery: {error}",
+                summary.id
+            )
+        })?;
+        validate_session_cwd(&session, cwd)?;
+        let snapshot_store = App::snapshot_store_for(storage, session.id, cwd)
+            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+        crate::app::recover_pending_workspace_restore(
+            &mut session,
+            &snapshot_store,
+            storage_writer,
+        )?;
+    }
+    Ok(())
 }
 
 /// Everything needed to bring up a new session runtime after startup.
@@ -329,15 +448,23 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
-        let resumed = !session.messages().is_empty();
+    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime, String> {
+        let (session, snapshot_store) =
+            prepare_session_for_runtime(&self.storage, &self.storage_writer, session)?;
+        let initial_history = match crate::active_session_history(&session) {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::error!(%error, session_id = %session.id, "failed to restore active history");
+                Vec::new()
+            }
+        };
+        let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let permissions = Arc::new(self.permissions.fork());
         let goal = maki_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
-        let subagent_history =
-            maki_agent::SubagentHistoryStore::seeded(session.subagent_messages().clone());
+        let subagent_history = crate::agent::stored_subagent_history(&session);
         let handles = AgentHandles::spawn(
             &self.model_slot,
-            session.messages().to_vec(),
+            initial_history,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -354,6 +481,7 @@ impl SpawnCtx {
             &self.model_slot.load().model,
             session,
             self.storage.clone(),
+            snapshot_store,
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
             handles.mcp_config_errors.clone(),
@@ -369,11 +497,11 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
         );
         handles.apply_to_app(&mut app);
-        if resumed {
+        if restore_session {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        SessionRuntime {
+        Ok(SessionRuntime {
             app,
             handles,
             shell_tx,
@@ -381,7 +509,7 @@ impl SpawnCtx {
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
-        }
+        })
     }
 }
 
@@ -532,7 +660,9 @@ impl<'t> EventLoop<'t> {
             crate::update::spawn_check();
         });
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let cwd =
+            canonical_cwd(&std::env::current_dir().context("read current working directory")?)
+                .map_err(|error| eyre!(error))?;
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
 
         let provider: Arc<dyn Provider> = if needs_login {
@@ -570,10 +700,14 @@ impl<'t> EventLoop<'t> {
             model_policy,
         };
 
+        recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd)
+            .map_err(|error| eyre!(error))?;
+
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|session| ctx.spawn_runtime(session))
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|error| eyre!(error))?;
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
@@ -1084,7 +1218,14 @@ impl<'t> EventLoop<'t> {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                     AppSession::new(&slot.model.spec(), &cwd.to_string_lossy())
                 };
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let idx = self.push_runtime(runtime);
                 let id = self.sessions[idx].id();
                 maki_otel::emit::session_started(
                     maki_otel::emit::START_FRESH,
@@ -1122,7 +1263,7 @@ impl<'t> EventLoop<'t> {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
                         let mut session =
-                            AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+                            load_app_session(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
                         self.ctx.storage_writer.send(Arc::new(session));
                     }
@@ -1212,18 +1353,30 @@ impl<'t> EventLoop<'t> {
     /// as a new runtime so the session you came from stays live.
     fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
+            let process_cwd = canonical_cwd(
+                &std::env::current_dir()
+                    .map_err(|error| format!("failed to read current directory: {error}"))?,
+            )?;
+            validate_session_cwd(&self.sessions[i].app.state.session, &process_cwd)?;
             self.focused = i;
             return Ok(());
         }
+        let session = load_app_session(id, &self.ctx.storage)
+            .map_err(|e| format!("Failed to load session: {e}"))?;
+        let process_cwd = canonical_cwd(
+            &std::env::current_dir()
+                .map_err(|error| format!("failed to read current directory: {error}"))?,
+        )?;
+        validate_session_cwd(&session, &process_cwd)?;
         let focused = &mut self.sessions[self.focused];
         if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
-            let actions = focused.app.load_session(id);
-            self.dispatch(self.focused, actions);
+            let model = focused.app.state.model.clone();
+            let loaded = focused.app.apply_loaded_session(session, &model)?;
+            self.dispatch(self.focused, vec![Action::LoadSession(Box::new(loaded))]);
             return Ok(());
         }
-        let session = AppSession::load(id, &self.ctx.storage)
-            .map_err(|e| format!("Failed to load session: {e}"))?;
-        let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+        let runtime = self.ctx.spawn_runtime(session)?;
+        let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
     }
@@ -1335,7 +1488,93 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
+    fn workspace_group_quiescent(&self, idx: usize) -> bool {
+        let Ok(target) = canonical_cwd(Path::new(&self.sessions[idx].app.state.session.cwd)) else {
+            return false;
+        };
+        matching_workspace_quiescent(
+            &target,
+            self.sessions.iter().map(|runtime| {
+                (
+                    Path::new(&runtime.app.state.session.cwd),
+                    runtime.quiescent(),
+                )
+            }),
+        )
+    }
+
+    fn change_working_directory(&mut self, idx: usize, cwd: PathBuf) {
+        if let Some(error) = cwd_change_blocker(self.sessions.iter().map(|runtime| {
+            (
+                runtime.quiescent(),
+                runtime.app.state.session.meta.pending_revert.is_some(),
+            )
+        })) {
+            self.sessions[idx].app.flash(error.into());
+            return;
+        }
+
+        let mut stores = Vec::with_capacity(self.sessions.len());
+        for runtime_index in 0..self.sessions.len() {
+            let session_id = self.sessions[runtime_index].id();
+            let store = match App::snapshot_store_for(&self.ctx.storage, session_id, &cwd) {
+                Ok(store) => store,
+                Err(error) => {
+                    self.sessions[idx].app.flash(format!("cd: {error}"));
+                    return;
+                }
+            };
+            match store.journal_state() {
+                Ok(None) => stores.push(store),
+                Ok(Some(_)) => {
+                    self.sessions[idx].app.flash(format!(
+                        "cd: session {} has an unfinished workspace restore in {}",
+                        session_id,
+                        cwd.display()
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    self.sessions[idx]
+                        .app
+                        .flash(format!("cd: failed to inspect workspace restore: {error}"));
+                    return;
+                }
+            }
+        }
+
+        if let Err(error) = std::env::set_current_dir(&cwd) {
+            self.sessions[idx].app.flash(format!("cd: {error}"));
+            return;
+        }
+        for (runtime, store) in self.sessions.iter_mut().zip(stores) {
+            runtime.app.install_working_directory(&cwd, store);
+            runtime.app.checkpoint_now();
+        }
+        let mut save_error = None;
+        for runtime in &self.sessions {
+            if runtime.app.has_content()
+                && let Err(error) = self
+                    .ctx
+                    .storage_writer
+                    .save_sync(Arc::clone(&runtime.app.state.session))
+                && save_error.is_none()
+            {
+                save_error = Some(error);
+            }
+        }
+        if let Some(error) = save_error {
+            self.sessions[idx].app.flash(format!(
+                "cd: changed working directory but failed to persist every session: {error}"
+            ));
+        } else {
+            self.sessions[idx]
+                .app
+                .flash(format!("cd {}", cwd.display()));
+        }
+    }
+
+    fn respawn_agent(&mut self, idx: usize, history: Vec<HistoryItem>) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
         let lua_handle = rt.app.lua_event_handle.clone();
@@ -1396,6 +1635,58 @@ impl<'t> EventLoop<'t> {
                 }
                 self.respawn_agent(idx, loaded.messages);
             }
+            Action::ForkSession(forked) => {
+                let ForkedSession { mut session, draft } = *forked;
+                if let Some(draft) = draft {
+                    install_fork_draft(&mut session, draft);
+                }
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        self.sessions[idx].app.flash(error);
+                        return;
+                    }
+                };
+                let child = self.push_runtime(runtime);
+                let id = self.sessions[child].id();
+                self.sessions[child].app.checkpoint_now();
+                self.focused = child;
+                maki_otel::emit::session_started(
+                    maki_otel::emit::START_FORK,
+                    Some(&id.to_string()),
+                );
+            }
+            Action::RevertSession { source, mode } => {
+                if !self.workspace_group_quiescent(idx) {
+                    self.sessions[idx]
+                        .app
+                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                    return;
+                }
+                let actions = self.sessions[idx].app.revert_at(source, mode);
+                self.dispatch(idx, actions);
+            }
+            Action::RewindSession(entry) => {
+                if !self.workspace_group_quiescent(idx) {
+                    self.sessions[idx]
+                        .app
+                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                    return;
+                }
+                let actions = self.sessions[idx].app.rewind_to(entry);
+                self.dispatch(idx, actions);
+            }
+            Action::UnrevertSession => {
+                if !self.workspace_group_quiescent(idx) {
+                    self.sessions[idx]
+                        .app
+                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                    return;
+                }
+                let actions = self.sessions[idx].app.unrevert();
+                self.dispatch(idx, actions);
+            }
+            Action::ChangeWorkingDirectory(cwd) => self.change_working_directory(idx, cwd),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);
@@ -1570,6 +1861,31 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn drain_shutdown_envelopes(&mut self) -> bool {
+        let mut drained = false;
+        for index in 0..self.sessions.len() {
+            while let Ok(envelope) = self.sessions[index].handles.agent_rx.try_recv() {
+                self.handle_agent(index, Box::new(envelope));
+                drained = true;
+            }
+            while let Ok(event) = self.sessions[index].shell_rx.try_recv() {
+                self.sessions[index].app.handle_shell_event(event);
+                drained = true;
+            }
+        }
+        drained
+    }
+
+    fn shutdown_quiescent(&self) -> bool {
+        self.sessions.iter().all(|runtime| {
+            SessionStatus::of(&runtime.app) == SessionStatus::Idle
+                && runtime.handles.active_background_tasks() == 0
+                && runtime.app.shell.active_ids().is_empty()
+                && runtime.handles.agent_rx.is_empty()
+                && runtime.shell_rx.is_empty()
+        })
+    }
+
     fn shutdown(mut self) -> ShutdownReport {
         let started = Instant::now();
         let mut phase_start = started;
@@ -1582,25 +1898,50 @@ impl<'t> EventLoop<'t> {
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
-        for rt in &self.sessions {
+        for rt in &mut self.sessions {
+            rt.app.prepare_shutdown();
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let kill_mcp_ms = lap();
-        let mut tabs = Vec::with_capacity(self.sessions.len());
+        let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+        loop {
+            self.drain_shutdown_envelopes();
+            if self.shutdown_quiescent() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!("agents did not quiesce within {AGENT_SHUTDOWN_TIMEOUT:?}, forcing shutdown");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.drain_shutdown_envelopes();
+
+        let mut apps = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app, handles, ..
             } = rt;
-            app.checkpoint_now();
-            // `app` drops at the end of this iteration, closing the
-            // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            app.disconnect_agent_queue();
+            apps.push(app);
             agent_tasks.push(handles.into_task());
         }
-        let save_sessions_ms = lap();
-        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
+        crate::agent::join_all(
+            agent_tasks,
+            deadline.saturating_duration_since(Instant::now()),
+        );
         let join_agents_ms = lap();
+
+        let mut tabs = Vec::with_capacity(apps.len());
+        for mut app in apps {
+            if let Err(error) = app.snapshot_history_head() {
+                warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed");
+            }
+            app.checkpoint_now();
+            tabs.push(Arc::unwrap_or_clone(app.state.session));
+        }
+        let save_sessions_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             smol::block_on(h.shutdown());
         }
@@ -1614,8 +1955,8 @@ impl<'t> EventLoop<'t> {
         let storage_drain_ms = lap();
         info!(
             kill_mcp_ms,
-            save_sessions_ms,
             join_agents_ms,
+            save_sessions_ms,
             mcp_shutdown_ms,
             storage_drain_ms,
             total_ms = started.elapsed().as_millis() as u64,
@@ -1627,6 +1968,18 @@ impl<'t> EventLoop<'t> {
             focused: self.focused,
         }
     }
+}
+
+fn install_fork_draft(session: &mut AppSession, draft: ForkDraft) {
+    session.meta.input_draft = Some(draft.text);
+    session.meta.input_draft_images = draft
+        .images
+        .into_iter()
+        .map(|image| StoredImage {
+            media_type: image.media_type.mime().into(),
+            data: image.data.to_string(),
+        })
+        .collect();
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
@@ -1641,11 +1994,33 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 mod tests {
     use super::*;
     use maki_agent::DoneReason;
-    use maki_providers::TokenUsage;
+    use maki_providers::{ImageMediaType, ImageSource, TokenUsage};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn fork_draft_makes_empty_history_session_restorable() {
+        let mut session = AppSession::new("test-model", "/tmp");
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="));
+
+        install_fork_draft(
+            &mut session,
+            ForkDraft {
+                text: "edit me".into(),
+                images: vec![image.clone()],
+            },
+        );
+
+        assert!(session_has_content(&session));
+        assert_eq!(session.meta.input_draft.as_deref(), Some("edit me"));
+        assert_eq!(session.meta.input_draft_images.len(), 1);
+        assert_eq!(session.meta.input_draft_images[0].media_type, "image/png");
+        assert_eq!(session.meta.input_draft_images[0].data, image.data.as_ref());
+        assert!(session.messages().is_empty());
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
@@ -1775,5 +2150,203 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    #[test_case(1, 0 ; "background_subagent")]
+    #[test_case(0, 1 ; "shell_command")]
+    fn active_workspace_work_is_not_quiescent(background_tasks: usize, shell_commands: usize) {
+        assert!(!runtime_state_quiescent(
+            SessionStatus::Idle,
+            true,
+            background_tasks,
+            shell_commands,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn every_session_on_the_same_canonical_workspace_must_be_quiescent() {
+        let target = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let canonical = canonical_cwd(target.path()).unwrap();
+
+        assert!(!matching_workspace_quiescent(
+            &canonical,
+            [(target.path(), true), (target.path(), false)]
+        ));
+        assert!(matching_workspace_quiescent(
+            &canonical,
+            [(target.path(), true), (other.path(), false)]
+        ));
+    }
+
+    #[test]
+    fn cwd_change_requires_every_tab_idle_and_without_pending_reverts() {
+        assert_eq!(
+            cwd_change_blocker([(true, false), (false, false)]),
+            Some(CWD_BUSY_ERR)
+        );
+        assert_eq!(
+            cwd_change_blocker([(true, false), (true, true)]),
+            Some(CWD_REVERT_ERR)
+        );
+        assert_eq!(cwd_change_blocker([(true, false), (true, false)]), None);
+    }
+
+    #[test]
+    fn focus_validation_rejects_a_stored_session_from_another_cwd() {
+        let current = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let session = AppSession::new("test-model", &other.path().to_string_lossy());
+
+        let error =
+            validate_session_cwd(&session, &canonical_cwd(current.path()).unwrap()).unwrap_err();
+
+        assert!(error.contains("Use /cd"), "{error}");
+        assert!(error.contains(&session.id.to_string()), "{error}");
+    }
+
+    fn corrupt_restore_journal(storage: &StateDir, session: &AppSession, cwd: &Path) {
+        let store = App::snapshot_store_for(storage, session.id, cwd).unwrap();
+        store.snapshot_session_start(cwd).unwrap();
+        let store_dir = storage
+            .path()
+            .join(maki_agent::snapshots::SESSION_SNAPSHOTS_DIR)
+            .join(session.id.to_string())
+            .join(maki_agent::snapshots::workspace_key(cwd).unwrap());
+        std::fs::write(store_dir.join("restore-journal.json"), "not json").unwrap();
+    }
+
+    #[test]
+    fn runtime_preparation_returns_recovery_error_without_flushing_stored_queue() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
+        let mut session = AppSession::new("test-model", &cwd.to_string_lossy());
+        session.meta.queued_messages = vec!["still queued".into()];
+        session.save(&storage).unwrap();
+        corrupt_restore_journal(&storage, &session, &cwd);
+        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
+
+        let error = match prepare_session_for_runtime(&storage, &writer, session.clone()) {
+            Ok(_) => panic!("corrupt recovery journal unexpectedly allowed runtime preparation"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("inspect workspace restore journal"),
+            "{error}"
+        );
+        assert_eq!(
+            load_app_session(session.id, &storage)
+                .unwrap()
+                .meta
+                .queued_messages,
+            ["still queued"]
+        );
+        writer.shutdown(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_scans_unopened_sessions_for_restore_journals() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let cwd = TempDir::new().unwrap();
+        let cwd = canonical_cwd(cwd.path()).unwrap();
+        let mut resumed = AppSession::new("test-model", &cwd.to_string_lossy());
+        crate::push_history_message(&mut resumed, Message::user("resumed".into()));
+        resumed.save(&storage).unwrap();
+        let mut unopened = AppSession::new("test-model", &cwd.to_string_lossy());
+        crate::push_history_message(&mut unopened, Message::user("unopened".into()));
+        unopened.save(&storage).unwrap();
+        corrupt_restore_journal(&storage, &unopened, &cwd);
+        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
+
+        let error = recover_stored_sessions_in_cwd(&storage, &writer, &cwd).unwrap_err();
+
+        assert!(
+            error.contains("inspect workspace restore journal"),
+            "{error}"
+        );
+        writer.shutdown(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_recovers_an_interrupted_restore_for_an_unopened_session() {
+        use maki_storage::sessions::{
+            PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation,
+            PendingRestorePhase,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let workspace = TempDir::new().unwrap();
+        let cwd = canonical_cwd(workspace.path()).unwrap();
+        let file = cwd.join("tracked.txt");
+        let mut resumed = AppSession::new("test-model", &cwd.to_string_lossy());
+        crate::push_history_message(&mut resumed, Message::user("resumed".into()));
+        resumed.save(&storage).unwrap();
+
+        let mut unopened = AppSession::new("test-model", &cwd.to_string_lossy());
+        let items = crate::history_items(&[
+            Message::user("target".into()),
+            Message::user("source".into()),
+        ]);
+        let target_head = items[0].id;
+        let source_head = items[1].id;
+        unopened.replace_messages(items);
+        let store = App::snapshot_store_for(&storage, unopened.id, &cwd).unwrap();
+        std::fs::write(&file, "root").unwrap();
+        store.snapshot_session_start(&cwd).unwrap();
+        std::fs::write(&file, "target").unwrap();
+        store.snapshot(&cwd, target_head).unwrap();
+        std::fs::write(&file, "source").unwrap();
+        store.snapshot(&cwd, source_head).unwrap();
+        let operation_id = MakiId::generate();
+        unopened.set_conversation_state(
+            Some(source_head),
+            Some(PendingConversationRevert {
+                original_head: Some(source_head),
+                target_head: Some(target_head),
+                original_workspace_head: Some(Some(source_head).into()),
+                workspace_head: Some(Some(source_head).into()),
+                file_status: None,
+                restore_operation: Some(PendingRestoreOperation {
+                    id: operation_id,
+                    kind: PendingRestoreKind::Revert,
+                    phase: PendingRestorePhase::Intent,
+                    target_workspace_head: Some(target_head).into(),
+                    conversation_target: Some(Some(target_head).into()),
+                    overwrite: false,
+                }),
+            }),
+        );
+        unopened.save(&storage).unwrap();
+        store
+            .restore_transaction_with_policy(
+                &cwd,
+                &[source_head],
+                &[target_head],
+                maki_agent::snapshots::ConflictPolicy::Abort,
+                operation_id,
+            )
+            .unwrap();
+        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
+
+        recover_stored_sessions_in_cwd(&storage, &writer, &cwd).unwrap();
+
+        let recovered = load_app_session(unopened.id, &storage).unwrap();
+        assert_eq!(crate::session_history_head(&recovered), Some(target_head));
+        assert!(
+            recovered
+                .meta
+                .pending_revert
+                .as_ref()
+                .is_some_and(|pending| pending.restore_operation.is_none())
+        );
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "target");
+        assert_eq!(store.journal_state().unwrap(), None);
+        writer.shutdown(Duration::from_secs(30));
     }
 }

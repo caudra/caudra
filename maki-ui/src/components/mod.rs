@@ -11,6 +11,7 @@ pub(crate) mod list_picker;
 pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
+pub(crate) mod message_actions;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
@@ -34,9 +35,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, ImageSource, ToolInput, ToolOutput};
 use maki_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
-use maki_providers::{Message, ModelTier};
+use maki_providers::{HistoryItem, MakiId, ModelTier};
 use ratatui::text::{Line, Span};
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -180,7 +181,7 @@ impl ModalScroll {
 }
 
 pub struct LoadedSession {
-    pub messages: Vec<Message>,
+    pub messages: Vec<HistoryItem>,
     pub model_spec: String,
 }
 
@@ -202,6 +203,14 @@ pub enum Action {
     },
     NewSession,
     LoadSession(Box<LoadedSession>),
+    ForkSession(Box<ForkedSession>),
+    RevertSession {
+        source: DisplaySource,
+        mode: RestoreMode,
+    },
+    RewindSession(rewind_picker::RewindEntry),
+    UnrevertSession,
+    ChangeWorkingDirectory(PathBuf),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
@@ -218,6 +227,33 @@ pub enum Action {
     EditInputInEditor,
     Btw(String),
     Suspend,
+}
+
+pub struct ForkedSession {
+    pub session: crate::AppSession,
+    pub draft: Option<ForkDraft>,
+}
+
+pub struct ForkDraft {
+    pub text: String,
+    pub images: Vec<ImageSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    Conversation,
+    Files,
+    Both,
+}
+
+impl RestoreMode {
+    pub(crate) fn restores_conversation(self) -> bool {
+        matches!(self, Self::Conversation | Self::Both)
+    }
+
+    pub(crate) fn restores_files(self) -> bool {
+        matches!(self, Self::Files | Self::Both)
+    }
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
@@ -288,6 +324,7 @@ pub enum ToolStatus {
 pub struct DisplayMessage {
     pub role: DisplayRole,
     pub text: String,
+    pub source: Option<DisplaySource>,
     pub tool_input: Option<Arc<ToolInput>>,
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
@@ -308,6 +345,7 @@ impl DisplayMessage {
         Self {
             role,
             text,
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
@@ -328,6 +366,7 @@ impl DisplayMessage {
         Self {
             role: DisplayRole::Assistant,
             text,
+            source: None,
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
@@ -348,6 +387,18 @@ impl DisplayMessage {
         (self.render_snapshot.is_some() || self.render_header.is_some())
             && self.snapshot_theme_gen != current_gen
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplaySource {
+    User(MakiId),
+    AssistantText(MakiId),
+    Reasoning(MakiId),
+    ToolCall {
+        id: MakiId,
+        result_id: Option<MakiId>,
+    },
+    ToolResult(MakiId),
 }
 
 #[derive(Debug, Clone, PartialEq)]

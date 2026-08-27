@@ -12,6 +12,7 @@ use syntect::highlighting::{
 };
 
 const DEFAULT_THEME: &str = "dracula";
+const MESSAGE_BACKGROUND_TINT: f32 = 0.08;
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
@@ -656,6 +657,17 @@ fn build_syntax_theme(
 }
 
 impl Theme {
+    pub(crate) fn user_message_style(&self) -> Style {
+        tinted_background(self.background, self.user.fg.unwrap_or(self.foreground))
+    }
+
+    pub(crate) fn assistant_message_style(&self) -> Style {
+        tinted_background(
+            self.background,
+            self.assistant_prefix.fg.unwrap_or(self.foreground),
+        )
+    }
+
     fn from_toml(toml_str: &str) -> Result<Self, String> {
         let full_table: toml::Table = toml::from_str(toml_str).map_err(|e| e.to_string())?;
 
@@ -878,6 +890,17 @@ pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
 
+fn tinted_background(background: Color, tint: Color) -> Style {
+    match (background, tint) {
+        (Color::Rgb(br, bg, bb), Color::Rgb(tr, tg, tb)) => Style::new().bg(Color::Rgb(
+            lerp_u8(br, tr, MESSAGE_BACKGROUND_TINT),
+            lerp_u8(bg, tg, MESSAGE_BACKGROUND_TINT),
+            lerp_u8(bb, tb, MESSAGE_BACKGROUND_TINT),
+        )),
+        _ => Style::new().bg(background),
+    }
+}
+
 pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
     match (style.fg, current().background) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => style.fg(Color::Rgb(
@@ -930,6 +953,14 @@ mod tests {
         assert_eq!(t.diff_old.bg, Some(Color::Rgb(0x4D, 0x1F, 0x1F)));
         assert_eq!(t.diff_new.bg, Some(Color::Rgb(0x1F, 0x3D, 0x1F)));
         assert_eq!(t.input_border.fg, Some(Color::Rgb(0x62, 0x72, 0xa4)));
+        assert_eq!(
+            t.user_message_style().bg,
+            Some(Color::Rgb(0x2f, 0x39, 0x45))
+        );
+        assert_eq!(
+            t.assistant_message_style().bg,
+            Some(Color::Rgb(0x39, 0x30, 0x41))
+        );
     }
 
     #[test]

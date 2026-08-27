@@ -17,17 +17,25 @@ use agent_client_protocol_schema::{
 };
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
+#[cfg(test)]
+use maki_agent::ToolOutput;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_agent::{
+    AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, load_stored_session,
+};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
-use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_providers::{
+    HistoryItem, TokenUsage, active_history_items, add_cost, resolve_history_head, settle_session,
+};
+#[cfg(test)]
+use maki_providers::{Message, expand_message};
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
@@ -286,7 +294,9 @@ async fn load_session(
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
-    for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
+    let history = History::restored(restored.history)
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    for update in translate::replay_history(history.as_slice(), replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
     let cwd = req.cwd.clone();
@@ -295,7 +305,7 @@ async fn load_session(
         params,
         req.cwd,
         Some(session_ref),
-        restored.history,
+        history.into_items(),
         mcp.clone(),
     );
     maki_otel::emit::session_started(
@@ -323,7 +333,7 @@ fn spawn_session(
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
-    history: Vec<Message>,
+    history: Vec<HistoryItem>,
     mcp_handle: Option<McpHandle>,
 ) -> (InteractiveHandle, PendingState) {
     let pending = PendingState::default();
@@ -531,7 +541,7 @@ fn install_session(
 
 #[derive(Debug)]
 struct Restored {
-    history: Vec<Message>,
+    history: Vec<HistoryItem>,
     /// Only set when the session recorded an absolute cwd.
     cwd: Option<PathBuf>,
     usage: TokenUsage,
@@ -552,11 +562,7 @@ fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
 ) -> Result<Restored, AcpError> {
-    let session: maki_storage::sessions::Session<
-        Message,
-        maki_providers::TokenUsage,
-        maki_agent::ToolOutput,
-    > = maki_storage::sessions::Session::load(session_id, storage).map_err(|e| {
+    let session = load_stored_session(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
     let recorded = if Path::new(&session.cwd).is_absolute() {
@@ -564,12 +570,19 @@ fn load_history_from(
     } else {
         None
     };
+    let head = resolve_history_head(
+        session.messages(),
+        session.meta.history_head,
+        session.meta.pending_revert.is_some(),
+    );
+    let history = active_history_items(session.messages(), head)
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
     Ok(Restored {
         cwd: recorded,
         usage: session.token_usage,
         by_model: session.usage_by_model().clone(),
         model: session.model.clone(),
-        history: session.take_messages(),
+        history,
     })
 }
 
@@ -870,6 +883,15 @@ mod tests {
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
 
+    fn history_items(messages: &[Message]) -> Vec<HistoryItem> {
+        let mut items = Vec::new();
+        for message in messages {
+            let parent_id = items.last().map(|item: &HistoryItem| item.id);
+            items.extend(expand_message(message, parent_id));
+        }
+        items
+    }
+
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
             "id": id,
@@ -993,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn load_history_round_trips_stored_messages() {
+    fn load_history_round_trips_stored_items() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let messages = vec![
@@ -1007,9 +1029,10 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+        let items = history_items(&messages);
+        let mut session: Session<HistoryItem, TokenUsage, ToolOutput> =
             Session::new("anthropic/test-model", "/project");
-        session.replace_messages(messages.clone());
+        session.replace_messages(items.clone());
         session.token_usage = TokenUsage {
             input: 1_000,
             output: 200,
@@ -1020,12 +1043,62 @@ mod tests {
         let id: MakiId = session.id;
         let restored = load_history_from(&dir, id).unwrap();
         assert_eq!(restored.model, "anthropic/test-model");
-        assert_eq!(
-            serde_json::to_value(&restored.history).unwrap(),
-            serde_json::to_value(&messages).unwrap()
-        );
+        assert_eq!(restored.history, items);
         assert_eq!(restored.cwd, Some(PathBuf::from("/project")));
         assert_eq!(restored.usage, session.token_usage);
+    }
+
+    #[test]
+    fn load_history_returns_only_the_persisted_active_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let root = history_items(&[Message::user("root".into())])[0].clone();
+        let abandoned =
+            expand_message(&Message::user("abandoned".into()), Some(root.id))[0].clone();
+        let branch = expand_message(&Message::user("branch".into()), Some(root.id))[0].clone();
+        let mut session: Session<HistoryItem, TokenUsage, ToolOutput> =
+            Session::new("anthropic/test-model", "/project");
+        session.replace_messages(vec![root.clone(), abandoned, branch.clone()]);
+        session.meta.history_head = Some(branch.id);
+        session.save(&dir).unwrap();
+
+        let restored = load_history_from(&dir, session.id).unwrap();
+
+        assert_eq!(restored.history, [root, branch]);
+    }
+
+    #[test]
+    fn load_history_expands_legacy_messages_into_one_item_chain() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let messages = vec![
+            Message::user("rename foo to bar".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![MsgBlock::Text {
+                    text: "done".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut session: Session<Message, TokenUsage, ToolOutput> =
+            Session::new("anthropic/test-model", "/project");
+        session.replace_messages(messages.clone());
+        session.save(&dir).unwrap();
+
+        let restored = load_history_from(&dir, session.id).unwrap();
+
+        assert!(
+            restored
+                .history
+                .windows(2)
+                .all(|pair| pair[1].parent_id == Some(pair[0].id))
+        );
+        assert_eq!(
+            serde_json::to_value(History::restored(restored.history).unwrap().into_vec()).unwrap(),
+            serde_json::to_value(messages).unwrap()
+        );
+        assert!(Session::<HistoryItem, TokenUsage, ToolOutput>::load(session.id, &dir).is_ok());
     }
 
     /// Resuming must bill what the session actually paid. If `by_model` came
@@ -1035,7 +1108,7 @@ mod tests {
     fn load_history_prices_a_resumed_session_at_what_it_paid() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+        let mut session: Session<HistoryItem, TokenUsage, ToolOutput> =
             Session::new(RETIRED_SPEC, "/project");
         session.token_usage = TokenUsage {
             input: 1_000_000,
@@ -1079,7 +1152,7 @@ mod tests {
     fn load_history_records_absolute_cwd_only() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+        let mut session: Session<HistoryItem, TokenUsage, ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
         session.save(&dir).unwrap();
         assert_eq!(load_history_from(&dir, session.id).unwrap().cwd, None);

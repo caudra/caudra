@@ -198,12 +198,12 @@ fn resolve_session(
         let id: MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let session = setup::load_session(id, storage)?;
         setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
         return Ok(session);
     }
     if continue_session {
-        match AppSession::latest(cwd, storage) {
+        match setup::latest_session(cwd, storage) {
             Ok(Some(session)) => {
                 setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
                 return Ok(session);
@@ -305,7 +305,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     loop {
         for session in &mut tabs {
-            if session.messages().is_empty() {
+            if setup::session_history_head(session).is_none() {
                 session.meta.fast |= stack.config.always_fast;
                 session.meta.workflow |= stack.config.always_workflow;
                 if let Some(thinking) = stack.config.always_thinking {
@@ -314,7 +314,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
         let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
+        let model = if setup::session_history_head(focused_tab).is_none()
             || !stack
                 .config
                 .provider

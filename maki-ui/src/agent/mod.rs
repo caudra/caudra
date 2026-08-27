@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, SubagentHistoryStore,
+    McpHandle, McpSnapshotReader, SessionMailbox, SharedHistory, SubagentHistoryStore,
     ToolOutputLines,
 };
 use maki_config::ModelPolicy;
@@ -20,7 +20,7 @@ use maki_storage::id::SessionRef;
 
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::{HistoryItem, Message, Model, project_messages};
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -50,7 +50,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
-    pub(crate) history: SharedMessages,
+    pub(crate) history: SharedHistory,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
@@ -69,7 +69,7 @@ impl AgentHandles {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
-        initial_history: Vec<Message>,
+        initial_history: Vec<HistoryItem>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -157,7 +157,7 @@ impl AgentHandles {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
-        history: Vec<Message>,
+        history: Vec<HistoryItem>,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -169,12 +169,19 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
+        let queue_snapshot_ready = app.state.session.meta.queued_messages.is_empty()
+            || match app.snapshot_history_head() {
+                Ok(()) => true,
+                Err(error) => {
+                    app.flash(format!("Failed to snapshot workspace: {error}"));
+                    false
+                }
+            };
         let slot = model_slot.load();
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
-        let subagent_history =
-            SubagentHistoryStore::seeded(app.state.session.subagent_messages().clone());
+        let subagent_history = stored_subagent_history(&app.state.session);
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
@@ -195,7 +202,9 @@ impl AgentHandles {
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
-        app.flush_restored_queue();
+        if queue_snapshot_ready {
+            app.flush_restored_queue();
+        }
         old.cancel();
     }
 
@@ -242,7 +251,7 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
-    initial_history: Vec<Message>,
+    initial_history: Vec<HistoryItem>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -259,10 +268,11 @@ fn spawn_agent_internal(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
-    // Seeded empty because `AgentLoop::new` below publishes the real snapshot
-    // synchronously, before any handle escapes.
-    let shared_history: SharedMessages =
-        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    // Keep the incoming items visible if restore validation fails. A valid
+    // AgentLoop synchronously replaces this with its sanitized snapshot.
+    let shared_history: SharedHistory = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        initial_history.clone(),
+    )));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
@@ -320,6 +330,21 @@ fn spawn_agent_internal(
         mailbox,
         task,
     }
+}
+
+pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHistoryStore {
+    let histories = session
+        .subagent_messages()
+        .iter()
+        .filter_map(|(task_id, items)| match project_messages(items) {
+            Ok(messages) => Some((task_id.clone(), Arc::new(messages))),
+            Err(error) => {
+                warn!(%error, %task_id, "failed to restore subagent history");
+                None
+            }
+        })
+        .collect();
+    SubagentHistoryStore::seeded(histories)
 }
 
 #[cfg(test)]
@@ -387,7 +412,7 @@ mod tests {
         ));
         let handles = AgentHandles::spawn(
             &model_slot,
-            initial_history,
+            crate::history_items(&initial_history),
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
@@ -484,7 +509,11 @@ mod tests {
             1,
             "the seeded empty snapshot must be replaced synchronously"
         );
-        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+        assert!(matches!(
+            &snapshot.messages[0].kind,
+            maki_providers::HistoryItemKind::User { text, .. }
+                if text == RESUMED_HISTORY_TEXT
+        ));
     }
 
     #[test]
@@ -492,7 +521,7 @@ mod tests {
         let (mut handles, model_slot, permissions) = stub_spawn();
         let mut app = crate::app::tests::test_app();
         handles.respawn(
-            vec![Message::user(RESUMED_HISTORY_TEXT.into())],
+            crate::history_items(&[Message::user(RESUMED_HISTORY_TEXT.into())]),
             &model_slot,
             AgentConfig::default(),
             ToolOutputLines::default(),
@@ -511,7 +540,11 @@ mod tests {
             1,
             "a checkpoint right after respawn must not see the seeded empty snapshot"
         );
-        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+        assert!(matches!(
+            &snapshot.messages[0].kind,
+            maki_providers::HistoryItemKind::User { text, .. }
+                if text == RESUMED_HISTORY_TEXT
+        ));
     }
 
     #[test]

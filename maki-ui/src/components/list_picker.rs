@@ -65,6 +65,7 @@ pub struct ListPicker<T> {
     max_visible: Option<u16>,
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<String>,
+    width_percent: u16,
 }
 
 struct State<T> {
@@ -77,6 +78,12 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
+}
+
+#[derive(Clone, Copy)]
+struct RenderOptions {
+    max_visible: Option<u16>,
+    width_percent: u16,
 }
 
 impl<T: PickerItem> State<T> {
@@ -233,11 +240,17 @@ impl<T: PickerItem> ListPicker<T> {
             max_visible: None,
             footer: None,
             error_text: None,
+            width_percent: MIN_WIDTH_PERCENT,
         }
     }
 
     pub fn with_max_visible(mut self, max: u16) -> Self {
         self.max_visible = Some(max);
+        self
+    }
+
+    pub fn with_width_percent(mut self, width_percent: u16) -> Self {
+        self.width_percent = width_percent.clamp(1, 100);
         self
     }
 
@@ -490,7 +503,10 @@ impl<T: PickerItem> ListPicker<T> {
                 area,
                 s,
                 &self.title,
-                self.max_visible,
+                RenderOptions {
+                    max_visible: self.max_visible,
+                    width_percent: self.width_percent,
+                },
                 footer,
                 self.error_text.as_deref(),
             ),
@@ -517,7 +533,7 @@ fn render_ready<T: PickerItem>(
     area: Rect,
     s: &mut State<T>,
     title: &str,
-    max_visible: Option<u16>,
+    options: RenderOptions,
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<&str>,
 ) -> Rect {
@@ -526,7 +542,7 @@ fn render_ready<T: PickerItem>(
         1
     } else {
         let rows = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len()) as u16;
-        match max_visible {
+        match options.max_visible {
             Some(max) => rows.min(max),
             None => rows,
         }
@@ -534,7 +550,7 @@ fn render_ready<T: PickerItem>(
     let error_rows = error_text.is_some() as u16;
     let modal = Modal {
         title,
-        width_percent: MIN_WIDTH_PERCENT,
+        width_percent: options.width_percent,
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
     let (popup, inner) = modal.render(

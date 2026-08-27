@@ -38,6 +38,7 @@ use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::PermissionPrompt;
@@ -50,7 +51,8 @@ use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
+    is_ctrl,
 };
 use crate::image;
 use crate::input_document::InputDraft;
@@ -59,9 +61,10 @@ use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, QueueItemId, SharedMessages, SteeringQueue, SubagentInfo,
+    McpPromptInfo, McpSnapshotReader, QueueItemId, SharedHistory, SteeringQueue, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -76,12 +79,13 @@ use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
+pub use crate::components::RestoreMode;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
-pub(crate) use session::session_has_content;
+pub(crate) use session::{REVERT_BUSY_MSG, recover_pending_workspace_restore, session_has_content};
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
@@ -107,6 +111,7 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+const UNREVERT_RECORD_FILE: &str = "unrevert.json";
 
 /// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
 /// in practice; the cap only exists so a command aliasing itself reports an
@@ -212,6 +217,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) message_actions: MessageActions,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) goal_modal: GoalModal,
@@ -226,6 +232,7 @@ pub struct App {
     pub(super) task_back_area: Option<Rect>,
     pub(super) queue_hits: Vec<QueueHit>,
     pub(super) queue_mouse_down: Option<QueueHit>,
+    pub(super) message_mouse_down: Option<MessageMouseDown>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
@@ -240,6 +247,7 @@ pub struct App {
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
+    pub(crate) cancelling_run: Option<u64>,
     pub(super) retry_info: Option<RetryInfo>,
     goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
@@ -249,8 +257,9 @@ pub struct App {
     pub(super) last_exit: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    pub(crate) snapshot_store: Arc<SnapshotStore>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
-    pub(crate) shared_history: Option<SharedMessages>,
+    pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -278,12 +287,19 @@ struct PendingSteer {
     draft: InputDraft,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct MessageMouseDown {
+    pub source: DisplaySource,
+    pub since: Instant,
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &Model,
         session: AppSession,
         storage: StateDir,
+        snapshot_store: Arc<SnapshotStore>,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
@@ -329,6 +345,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
+            message_actions: MessageActions::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             goal_modal: GoalModal::default(),
@@ -343,6 +360,7 @@ impl App {
             task_back_area: None,
             queue_hits: Vec::new(),
             queue_mouse_down: None,
+            message_mouse_down: None,
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
@@ -357,6 +375,7 @@ impl App {
             cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
+            cancelling_run: None,
             retry_info: None,
             goal_deferred: false,
             zones: ZoneRegistry::new(),
@@ -365,6 +384,7 @@ impl App {
             last_esc: None,
             last_exit: None,
             storage,
+            snapshot_store,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
@@ -394,6 +414,56 @@ impl App {
                 .collect(),
         );
         app
+    }
+
+    pub(crate) fn snapshot_store_for(
+        storage: &StateDir,
+        session_id: maki_storage::id::MakiId,
+        cwd: &std::path::Path,
+    ) -> Result<Arc<SnapshotStore>, SnapshotError> {
+        Ok(Arc::new(SnapshotStore::new(Self::snapshot_store_path(
+            storage, session_id, cwd,
+        )?)))
+    }
+
+    fn snapshot_store_path(
+        storage: &StateDir,
+        session_id: maki_storage::id::MakiId,
+        cwd: &std::path::Path,
+    ) -> Result<PathBuf, SnapshotError> {
+        Ok(storage
+            .path()
+            .join(SESSION_SNAPSHOTS_DIR)
+            .join(session_id.to_string())
+            .join(workspace_key(cwd)?))
+    }
+
+    pub(super) fn discard_workspace_unrevert(&self) -> Result<(), SnapshotError> {
+        let path = Self::snapshot_store_path(
+            &self.storage,
+            self.state.session.id,
+            std::path::Path::new(&self.state.session.cwd),
+        )?
+        .join(UNREVERT_RECORD_FILE);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) fn snapshot_history_head(&mut self) -> Result<(), SnapshotError> {
+        let head = self
+            .shared_history
+            .as_ref()
+            .and_then(|history| history.load().messages.last().map(|item| item.id))
+            .or_else(|| crate::session_history_head(&self.state.session));
+        let cwd = std::path::Path::new(&self.state.session.cwd);
+        self.snapshot_store.snapshot_session_start(cwd)?;
+        if let Some(head) = head {
+            self.snapshot_store.snapshot(cwd, head)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -603,10 +673,7 @@ impl App {
                 }
                 vec![]
             }
-            Msg::Mouse(event) => {
-                self.handle_mouse(event);
-                vec![]
-            }
+            Msg::Mouse(event) => self.handle_mouse(event),
             Msg::Scroll { column, row, delta } => {
                 self.handle_scroll(column, row, delta);
                 vec![]
@@ -663,6 +730,7 @@ impl App {
             };
         }
         try_picker!(self.rewind_picker);
+        try_picker!(self.message_actions);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
         let zone = self.zone_at(row, column)?.zone;
@@ -897,8 +965,36 @@ impl App {
         if self.rewind_picker.is_open() {
             return Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Select(entry) => vec![Action::RewindSession(entry)],
                 RewindPickerAction::Close => vec![],
+            });
+        }
+
+        if self.message_actions.is_open() {
+            return Some(match self.message_actions.handle_key(key) {
+                MessageActionsAction::Consumed | MessageActionsAction::Close => vec![],
+                MessageActionsAction::Select { source, kind } => match kind {
+                    MessageActionKind::Fork => match self.fork_at(source) {
+                        Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
+                        Err(error) => {
+                            self.flash(error);
+                            vec![]
+                        }
+                    },
+                    MessageActionKind::RevertBoth => vec![Action::RevertSession {
+                        source,
+                        mode: RestoreMode::Both,
+                    }],
+                    MessageActionKind::RevertConversation => vec![Action::RevertSession {
+                        source,
+                        mode: RestoreMode::Conversation,
+                    }],
+                    MessageActionKind::RevertFiles => vec![Action::RevertSession {
+                        source,
+                        mode: RestoreMode::Files,
+                    }],
+                    MessageActionKind::Unrevert => vec![Action::UnrevertSession],
+                },
             });
         }
 
@@ -1349,9 +1445,13 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        if self.cancelling_run.is_some() {
+            return Vec::new();
+        }
         self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
+        self.cancelling_run = Some(cancelled_run);
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -1370,7 +1470,6 @@ impl App {
         self.queue.clear();
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
-        self.status = Status::Idle;
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
@@ -1417,6 +1516,19 @@ impl App {
             return vec![];
         }
         if envelope.run_id != self.run_id {
+            let cancelled_terminal = envelope.subagent.is_none()
+                && self.cancelling_run == Some(envelope.run_id)
+                && matches!(
+                    &envelope.event,
+                    AgentEvent::Done { .. } | AgentEvent::Error { .. }
+                );
+            if cancelled_terminal {
+                self.cancelling_run = None;
+                self.status = Status::Idle;
+                if let Err(error) = self.snapshot_history_head() {
+                    self.flash(format!("Failed to snapshot cancelled run: {error}"));
+                }
+            }
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1432,6 +1544,12 @@ impl App {
             return vec![];
         }
 
+        let snapshot_top_level = envelope.subagent.is_none()
+            && matches!(
+                &envelope.event,
+                AgentEvent::Done { .. } | AgentEvent::Error { .. }
+            );
+
         if let AgentEvent::SubagentHistory { task_id, messages } = envelope.event {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory. This event only knows
@@ -1444,7 +1562,7 @@ impl App {
             self.preserve_unconsumed_steers(&task_id);
             self.state
                 .session_mut()
-                .set_subagent_messages(task_id, messages);
+                .set_subagent_messages(task_id, crate::history_items(&messages));
             return vec![];
         }
 
@@ -1768,6 +1886,9 @@ impl App {
                 | ChatEventResult::QueueBatchConsumed { .. } => unreachable!(),
                 ChatEventResult::Continue => {}
             }
+        }
+        if snapshot_top_level && let Err(error) = self.snapshot_history_head() {
+            self.flash(format!("Failed to snapshot completed run: {error}"));
         }
         vec![]
     }
@@ -2127,22 +2248,33 @@ impl App {
                 None => PathBuf::from(args),
             }
         };
-        match std::env::set_current_dir(&path) {
-            Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
-                    self.state
-                        .session_mut()
-                        .set_cwd(canonical.to_string_lossy().into_owned());
-                }
-                self.status_bar.refresh_cwd();
-                self.flash(format!("cd {}", path.display()))
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                self.flash(format!("cd: not a directory: {}", path.display()));
+                return Vec::new();
             }
-            Err(e) => self.flash(format!("cd: {e}")),
-        }
-        vec![]
+            Err(error) => {
+                self.flash(format!("cd: {error}"));
+                return Vec::new();
+            }
+        };
+        vec![Action::ChangeWorkingDirectory(canonical)]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    pub(crate) fn install_working_directory(
+        &mut self,
+        cwd: &std::path::Path,
+        snapshot_store: Arc<SnapshotStore>,
+    ) {
+        self.state
+            .session_mut()
+            .set_cwd(cwd.to_string_lossy().into_owned());
+        self.snapshot_store = snapshot_store;
+        self.status_bar.refresh_cwd();
+    }
+
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2153,6 +2285,7 @@ impl App {
             &self.file_picker,
             &self.paste_editor,
             &self.rewind_picker,
+            &self.message_actions,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -2161,7 +2294,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2172,6 +2305,7 @@ impl App {
             &mut self.file_picker,
             &mut self.paste_editor,
             &mut self.rewind_picker,
+            &mut self.message_actions,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -2196,6 +2330,20 @@ impl App {
     /// error; a background run would wipe it (`start_run` clears the queue).
     pub(crate) fn holds_recovery_text(&self) -> bool {
         !self.recoverable_queue.is_empty()
+    }
+
+    pub(crate) fn prepare_shutdown(&mut self) {
+        if self.recoverable_queue.is_empty() {
+            self.recoverable_queue = self.queue.text_messages();
+            self.recoverable_queue_together =
+                self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn;
+        }
+        self.queue.clear();
+        self.shell.cancel_all();
+    }
+
+    pub(crate) fn disconnect_agent_queue(&mut self) {
+        self.queue.disconnect();
     }
 
     pub(crate) fn goal_checkin_due(&self) -> bool {
@@ -2338,6 +2486,7 @@ impl App {
         }
         try_picker!(self.file_picker);
         try_picker!(self.rewind_picker);
+        try_picker!(self.message_actions);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

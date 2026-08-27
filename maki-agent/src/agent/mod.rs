@@ -12,7 +12,7 @@ pub use goal::{
     goal_checkin_message, goal_kickoff_message,
 };
 pub use history::{
-    History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
 };
 pub use instructions::{
     Instructions, LoadedInstructions, build_system_prompt, find_subdirectory_instructions,

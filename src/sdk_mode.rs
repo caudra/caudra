@@ -23,15 +23,14 @@ use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
+    PermissionsConfig,
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{HistoryItem, ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::Session;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -667,22 +666,30 @@ pub fn run(params: SdkParams) -> Result<()> {
     Ok(())
 }
 
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Message>)> {
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<HistoryItem>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         let session_ref: SessionRef = id
             .parse()
             .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
-        let session = StoredSession::load(session_ref.id(), &storage)
+        let session = crate::setup::load_session(session_ref.id(), &storage)
             .map_err(|e| eyre!("load session {id}: {e}"))?;
+        let history = crate::setup::active_session_history(&session)
+            .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
         let resumed = (!cli.fork_session).then_some(session_ref);
-        (resumed, session.take_messages())
+        let history = if cli.fork_session {
+            rebase_history(history)?
+        } else {
+            history
+        };
+        (resumed, history)
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
-        match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.take_messages()),
+        match crate::setup::latest_session(cwd, &storage) {
+            Ok(Some(session)) => {
+                let history = crate::setup::active_session_history(&session)?;
+                (Some(SessionRef::from(session.id)), history)
+            }
             _ => (None, Vec::new()),
         }
     } else {
@@ -700,6 +707,11 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Mess
     };
 
     Ok((cli_session_id.or(resumed_id), history))
+}
+
+fn rebase_history(items: Vec<HistoryItem>) -> Result<Vec<HistoryItem>> {
+    let messages = History::restored(items)?.into_vec();
+    Ok(History::new(messages).into_items())
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -1107,7 +1119,30 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
+
+    fn history_messages(items: Vec<HistoryItem>) -> Vec<Message> {
+        History::restored(items).unwrap().into_vec()
+    }
+
+    fn sample_messages() -> Vec<Message> {
+        vec![
+            Message::user("hello".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "first".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "second".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ]
+    }
 
     fn claude_to_maki_tool_name(name: &str) -> &str {
         TOOL_NAME_MAP
@@ -1141,6 +1176,21 @@ mod tests {
     fn unknown_tool_name_passthrough() {
         assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
         assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
+    }
+
+    #[test]
+    fn fork_rebases_item_identity_without_changing_provider_content() {
+        let items = History::new(sample_messages()).into_items();
+        let original_ids: Vec<_> = items.iter().map(|item| item.id).collect();
+        let expected = serde_json::to_value(history_messages(items.clone())).unwrap();
+
+        let forked = rebase_history(items).unwrap();
+
+        assert!(forked.iter().all(|item| !original_ids.contains(&item.id)));
+        assert_eq!(
+            serde_json::to_value(history_messages(forked)).unwrap(),
+            expected
+        );
     }
 
     const MODEL: &str = "test-model";

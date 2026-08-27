@@ -1,56 +1,82 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_providers::{
+    ContentBlock, EMPTY_RESPONSE_MARKER, HistoryItem, HistoryItemKind, HistoryProjectionError,
+    MakiId, Message, Role, expand_message, project_messages,
+};
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
-pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
-pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<HistoryItem>;
+pub type SharedHistory = Arc<ArcSwap<HistorySnapshot>>;
 
 pub struct History {
-    /// The value the mirror publishes, held whole so the two can never
-    /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
-    mirror: Option<SharedMessages>,
+    messages: Vec<Message>,
+    mirror: Option<SharedHistory>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
-            snapshot: HistorySnapshot::new(messages),
+            snapshot: HistorySnapshot::new(expand_messages(&messages)),
+            messages,
             mirror: None,
         }
     }
 
-    pub fn restored(mut messages: Vec<Message>) -> Self {
-        sanitize_restored(&mut messages);
-        Self::new(messages)
+    pub fn restored(mut items: Vec<HistoryItem>) -> Result<Self, HistoryProjectionError> {
+        let items_before = items.len();
+        let changed = sanitize_restored_tool_items(&mut items)?;
+        let messages = project_messages(&items)?;
+
+        if changed {
+            warn!(
+                before = items_before,
+                after = items.len(),
+                "sanitized restored history"
+            );
+        }
+
+        Ok(Self {
+            snapshot: HistorySnapshot::new(items),
+            messages,
+            mirror: None,
+        })
     }
 
-    pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
+    pub fn with_mirror(mut self, mirror: SharedHistory) -> Self {
         self.mirror = Some(mirror);
         self.publish();
         self
     }
 
     pub fn as_slice(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn active_items(&self) -> &[HistoryItem] {
         &self.snapshot.messages
     }
 
+    pub fn item_head(&self) -> Option<MakiId> {
+        self.active_items().last().map(|item| item.id)
+    }
+
     pub fn push(&mut self, msg: Message) {
-        self.edit(|msgs| msgs.push(msg));
+        self.extend([msg]);
     }
 
     pub fn len(&self) -> usize {
-        self.snapshot.messages.len()
+        self.messages.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.snapshot.messages.is_empty()
+        self.messages.is_empty()
     }
 
     /// Skips system padding so repeated nudges cannot push tool results
@@ -80,30 +106,40 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
-        self.rewrite(|msgs| *msgs = messages);
-    }
-
-    pub fn truncate(&mut self, len: usize) {
-        self.rewrite(|msgs| msgs.truncate(len));
-    }
-
-    pub fn into_vec(self) -> Vec<Message> {
-        Arc::unwrap_or_clone(self.snapshot.messages)
-    }
-
-    /// An append: whatever a consumer already holds of the list stays good.
-    fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        f(Arc::make_mut(&mut self.snapshot.messages));
+        self.snapshot = HistorySnapshot {
+            epoch: next_epoch(),
+            messages: Arc::new(expand_messages(&messages)),
+        };
+        self.messages = messages;
         self.publish();
     }
 
-    /// Any other change, so a consumer has to start the list over.
-    fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
+    pub fn truncate(&mut self, len: usize) {
+        let item_len = item_len_for_message_count(self.active_items(), len);
         self.snapshot.epoch = next_epoch();
-        self.edit(f);
+        Arc::make_mut(&mut self.snapshot.messages).truncate(item_len);
+        self.messages.truncate(len);
+        self.publish();
     }
 
-    /// The mirror gets the messages as they are. Closing dangling tool calls
+    pub fn into_vec(self) -> Vec<Message> {
+        self.messages
+    }
+
+    pub fn into_items(self) -> Vec<HistoryItem> {
+        Arc::unwrap_or_clone(self.snapshot.messages)
+    }
+
+    fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
+        let items = Arc::make_mut(&mut self.snapshot.messages);
+        for message in messages {
+            append_message_items(items, &message);
+            self.messages.push(message);
+        }
+        self.publish();
+    }
+
+    /// The mirror gets the items as they are. Closing dangling tool calls
     /// here used to make the snapshot as long as the real results that came
     /// next, so the log never saw them. Callers that need an API-valid list
     /// close the dangling calls on their own copy.
@@ -111,6 +147,160 @@ impl History {
         let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+fn expand_messages(messages: &[Message]) -> Vec<HistoryItem> {
+    let mut items = Vec::new();
+    for message in messages {
+        append_message_items(&mut items, message);
+    }
+    items
+}
+
+fn append_message_items(items: &mut Vec<HistoryItem>, message: &Message) {
+    items.extend(expand_message(message, items.last().map(|item| item.id)));
+}
+
+fn item_len_for_message_count(items: &[HistoryItem], message_count: usize) -> usize {
+    if message_count == 0 {
+        return 0;
+    }
+
+    let mut groups = 0;
+    let mut previous_group = None;
+    for (index, item) in items.iter().enumerate() {
+        if previous_group != Some(item.group_id) {
+            groups += 1;
+            previous_group = Some(item.group_id);
+        }
+        if groups > message_count {
+            return index;
+        }
+    }
+    items.len()
+}
+
+fn sanitize_restored_tool_items(
+    items: &mut Vec<HistoryItem>,
+) -> Result<bool, HistoryProjectionError> {
+    match project_messages(items) {
+        Ok(_) => {}
+        Err(error) if error.is_sanitizable_tool_order_error() => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut sanitized = Vec::with_capacity(items.len());
+    let mut start = 0;
+    let mut pending_calls = Vec::new();
+    let mut changed = false;
+
+    while start < items.len() {
+        let group_id = items[start].group_id;
+        let end = items[start..]
+            .iter()
+            .position(|item| item.group_id != group_id)
+            .map_or(items.len(), |offset| start + offset);
+        let group = &items[start..end];
+        let had_results = group
+            .iter()
+            .any(|item| matches!(item.kind, HistoryItemKind::ToolResult { .. }));
+        if !pending_calls.is_empty() && !had_results {
+            append_unavailable_results(&mut sanitized, MakiId::generate(), &pending_calls);
+            pending_calls.clear();
+            changed = true;
+        }
+
+        if !had_results {
+            sanitized.extend_from_slice(group);
+            pending_calls = group
+                .iter()
+                .filter_map(|item| match &item.kind {
+                    HistoryItemKind::ToolCall { call_id, .. } => Some(call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            start = end;
+            continue;
+        }
+
+        let expected_calls = std::mem::take(&mut pending_calls);
+        let mut missing_calls = expected_calls.clone();
+        let mut kept_result = false;
+        let group_start = sanitized.len();
+
+        for item in group {
+            let keep = match &item.kind {
+                HistoryItemKind::ToolResult { call_id, .. } => {
+                    let valid = missing_calls
+                        .iter()
+                        .position(|expected| expected == call_id)
+                        .is_some_and(|position| {
+                            missing_calls.remove(position);
+                            true
+                        });
+                    kept_result |= valid;
+                    valid
+                }
+                _ => true,
+            };
+            if keep {
+                sanitized.push(item.clone());
+            } else {
+                changed = true;
+            }
+        }
+
+        if expected_calls.is_empty() && !kept_result {
+            let group_items = sanitized.split_off(group_start);
+            sanitized.extend(group_items.into_iter().filter_map(|mut item| {
+                let HistoryItemKind::User { text, images, .. } = &mut item.kind else {
+                    return Some(item);
+                };
+                images.clear();
+                (!text.is_empty()).then_some(item)
+            }));
+        }
+        if !missing_calls.is_empty() {
+            append_unavailable_results(&mut sanitized, group[0].group_id, &missing_calls);
+            changed = true;
+        }
+        start = end;
+    }
+
+    if !pending_calls.is_empty() {
+        append_unavailable_results(&mut sanitized, MakiId::generate(), &pending_calls);
+        changed = true;
+    }
+
+    if changed {
+        let mut parent_id = None;
+        for item in &mut sanitized {
+            item.parent_id = parent_id;
+            parent_id = Some(item.id);
+        }
+        *items = sanitized;
+    }
+    Ok(changed)
+}
+
+fn append_unavailable_results(items: &mut Vec<HistoryItem>, group_id: MakiId, call_ids: &[String]) {
+    items.extend(call_ids.iter().map(|call_id| HistoryItem {
+        id: MakiId::generate(),
+        parent_id: None,
+        group_id,
+        kind: HistoryItemKind::ToolResult {
+            call_id: call_id.clone(),
+            content: UNAVAILABLE_RESULT.into(),
+            is_error: true,
+            images: Vec::new(),
+        },
+    }));
 }
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
@@ -179,23 +369,6 @@ fn is_empty_marker(m: &Message) -> bool {
         && matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
 }
 
-/// Restored sessions can have orphaned tool_results or unclosed tool_uses
-/// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
-    let len_before = messages.len();
-    let mut changed = remove_orphaned_tool_results(messages);
-    close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
-    changed |= messages.len() != len_before;
-
-    if changed {
-        warn!(
-            before = len_before,
-            after = messages.len(),
-            "sanitized restored history"
-        );
-    }
-}
-
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     let Some(last) = messages.last() else { return };
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
@@ -221,10 +394,14 @@ pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: us
     if history.len() <= rollback_len {
         return;
     }
-    history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
-        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
-    });
+    let mut tail = history.as_slice().last().cloned().into_iter().collect();
+    close_dangling_tool_calls(&mut tail, CANCEL_MARKER);
+    let mut additions = Vec::with_capacity(2);
+    if tail.len() == 2 {
+        additions.push(tail.pop().unwrap());
+    }
+    additions.push(Message::synthetic(CANCEL_MARKER.into()));
+    history.extend(additions);
 }
 
 #[cfg(test)]
@@ -272,8 +449,16 @@ mod tests {
         }
     }
 
-    fn make_mirror() -> SharedMessages {
+    fn make_mirror() -> SharedHistory {
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()))
+    }
+
+    fn restore_messages(messages: Vec<Message>) -> History {
+        History::restored(expand_messages(&messages)).unwrap()
+    }
+
+    fn snapshot_messages(snapshot: &HistorySnapshot) -> Vec<Message> {
+        project_messages(&snapshot.messages).unwrap()
     }
 
     #[track_caller]
@@ -371,6 +556,93 @@ mod tests {
     }
 
     #[test]
+    fn append_preserves_item_ids_groups_and_parent_chain() {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+        let root_id = history.item_head().unwrap();
+
+        history.push(make_tool_use_msg(&["t1", "t2"]));
+        let assistant_items = &history.active_items()[1..];
+        let assistant_group = assistant_items[0].group_id;
+        assert!(
+            assistant_items
+                .iter()
+                .all(|item| item.group_id == assistant_group)
+        );
+        assert_eq!(assistant_items[0].parent_id, Some(root_id));
+        let assistant_head = history.item_head().unwrap();
+
+        history.push(make_tool_result_msg(&["t1", "t2"]));
+        let result_items = &history.active_items()[3..];
+        let result_group = result_items[0].group_id;
+        assert_ne!(assistant_group, result_group);
+        assert!(
+            result_items
+                .iter()
+                .all(|item| item.group_id == result_group)
+        );
+        assert_eq!(result_items[0].parent_id, Some(assistant_head));
+        assert_eq!(history.active_items()[0].id, root_id);
+        assert!(
+            history
+                .active_items()
+                .windows(2)
+                .all(|pair| pair[1].parent_id == Some(pair[0].id))
+        );
+    }
+
+    #[test]
+    fn restored_history_preserves_stable_item_ids() {
+        let original = History::new(vec![
+            Message::user(GO.into()),
+            text_msg(Role::Assistant, "done"),
+        ]);
+        let items = original.active_items().to_vec();
+        let ids: Vec<MakiId> = items.iter().map(|item| item.id).collect();
+
+        let restored = History::restored(items).unwrap();
+
+        assert_eq!(
+            restored
+                .active_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(restored.item_head(), ids.last().copied());
+    }
+
+    #[test]
+    fn truncate_stops_at_group_boundary_and_mints_epoch() {
+        let mirror = make_mirror();
+        let mut history = History::new(vec![
+            Message::user(GO.into()),
+            make_tool_use_msg(&["t1", "t2"]),
+            make_tool_result_msg(&["t1", "t2"]),
+        ])
+        .with_mirror(Arc::clone(&mirror));
+        let epoch = mirror.load().epoch;
+        let expected_ids: Vec<MakiId> = history.active_items()[..3]
+            .iter()
+            .map(|item| item.id)
+            .collect();
+
+        history.truncate(2);
+
+        assert_ne!(mirror.load().epoch, epoch);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history
+                .active_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(history.item_head(), expected_ids.last().copied());
+    }
+
+    #[test]
     fn close_dangling_tool_uses_appends_error_results() {
         let mut messages = vec![Message::user("go".into()), make_tool_use_msg(&["t1", "t2"])];
         close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
@@ -415,15 +687,16 @@ mod tests {
         sanitize_cancelled_history(&mut history, 0);
 
         let snap = mirror.load();
+        let messages = snapshot_messages(&snap);
         assert_eq!(snap.epoch, epoch, "cancel cleanup is a pure append");
-        assert_eq!(snap.messages.len(), history.len(), "mirror is verbatim");
-        assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
-        assert!(snap.messages[2].content.iter().any(|b| matches!(
+        assert_eq!(messages.len(), history.len(), "mirror projects verbatim");
+        assert_eq!(extract_error_ids(&messages[2]), ["t1"]);
+        assert!(messages[2].content.iter().any(|b| matches!(
             b,
             ContentBlock::ToolResult { content, .. } if content == CANCEL_MARKER
         )));
         assert!(matches!(
-            &snap.messages[3].content[0],
+            &messages[3].content[0],
             ContentBlock::Text { text } if text == CANCEL_MARKER
         ));
     }
@@ -465,7 +738,7 @@ mod tests {
         ; "dangling_tool_use_closed_with_synthetic_result"
     )]
     fn sanitize_restored_cases(messages: Vec<Message>, expected_len: usize) {
-        let history = History::restored(messages);
+        let history = restore_messages(messages);
         assert_eq!(history.len(), expected_len);
     }
 
@@ -479,11 +752,11 @@ mod tests {
         };
         let mut orphaned = make_tool_result_msg(&["orphan"]);
         orphaned.content.push(image_block.clone());
-        let history = History::restored(vec![Message::user("go".into()), orphaned]);
+        let history = restore_messages(vec![Message::user("go".into()), orphaned]);
         assert_eq!(history.len(), 1);
 
         // Chat-pasted image (no tool results) is untouched.
-        let history = History::restored(vec![Message {
+        let history = restore_messages(vec![Message {
             role: Role::User,
             content: vec![image_block],
             ..Default::default()
@@ -504,7 +777,8 @@ mod tests {
                 std::sync::Arc::from("aGVsbG8="),
             ),
         });
-        let history = History::restored(vec![
+        msg.tool_result_image_owners.push("t1".into());
+        let history = restore_messages(vec![
             Message::user("go".into()),
             make_tool_use_msg(&["t1"]),
             msg,
@@ -537,7 +811,7 @@ mod tests {
 
     #[test]
     fn sanitize_restored_partial_orphan_keeps_matched_ids() {
-        let history = History::restored(vec![
+        let history = restore_messages(vec![
             Message::user("go".into()),
             make_tool_use_msg(&["t1"]),
             make_tool_result_msg(&["t1", "t2"]),
@@ -551,6 +825,45 @@ mod tests {
             })
             .collect();
         assert_eq!(results, ["t1"]);
+    }
+
+    #[test]
+    fn sanitize_restored_closes_calls_before_an_intervening_user_group() {
+        let history = restore_messages(vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1"]),
+            Message::user("later".into()),
+        ]);
+
+        assert_eq!(history.len(), 4);
+        assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1"]);
+        assert_eq!(history.as_slice()[3].user_text(), Some("later"));
+        assert!(project_messages(history.active_items()).is_ok());
+    }
+
+    #[test]
+    fn sanitize_restored_completes_partial_parallel_results_once() {
+        let history = restore_messages(vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1", "t2"]),
+            make_tool_result_msg(&["t1"]),
+        ]);
+
+        let result_message = &history.as_slice()[2];
+        let ids: Vec<_> = result_message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [("t1", false), ("t2", true)]);
+        assert!(project_messages(history.active_items()).is_ok());
     }
 
     #[test_case(
@@ -647,13 +960,13 @@ mod tests {
         let after_new = mirror.load_full();
         history.push(Message::user(SECOND.into()));
         assert_eq!(after_new.messages.len(), 1);
-        assert_eq!(after_new.messages[0].user_text(), Some(FIRST));
+        assert_eq!(snapshot_messages(&after_new)[0].user_text(), Some(FIRST));
         assert!(!Arc::ptr_eq(&after_new.messages, &mirror.load().messages));
 
         let after_push = mirror.load_full();
         history.truncate(1);
         assert_eq!(after_push.messages.len(), 2);
-        assert_eq!(after_push.messages[1].user_text(), Some(SECOND));
+        assert_eq!(snapshot_messages(&after_push)[1].user_text(), Some(SECOND));
         assert!(!Arc::ptr_eq(&after_push.messages, &mirror.load().messages));
     }
 
@@ -670,8 +983,9 @@ mod tests {
             .with_mirror(Arc::clone(&mirror));
 
         let snap = mirror.load();
+        let messages = snapshot_messages(&snap);
         assert_eq!(snap.messages.len(), 2);
-        assert_eq!(snap.messages[0].user_text(), Some(SECOND));
+        assert_eq!(messages[0].user_text(), Some(SECOND));
         assert_ne!(snap.epoch, run1_epoch, "run 2 is not an append onto run 1");
     }
 
@@ -680,21 +994,23 @@ mod tests {
         let mirror = make_mirror();
         let seed_epoch = mirror.load().epoch;
 
-        let history = History::restored(vec![
+        let history = History::restored(expand_messages(&[
             Message::user(GO.into()),
             make_tool_use_msg(&["t1"]),
             make_tool_result_msg(&["orphan"]),
-        ])
+        ]))
+        .unwrap()
         .with_mirror(Arc::clone(&mirror));
 
         let snap = mirror.load();
+        let messages = snapshot_messages(&snap);
         assert_ne!(snap.epoch, seed_epoch);
         assert!(
             Arc::ptr_eq(&snap.messages, &history.snapshot.messages),
             "mirror shares the sanitized buffer verbatim"
         );
-        assert_eq!(snap.messages.len(), 3);
-        assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
+        assert_eq!(snap.messages.len(), history.active_items().len());
+        assert_eq!(extract_error_ids(&messages[2]), ["t1"]);
     }
 
     #[test]
@@ -720,12 +1036,15 @@ mod tests {
         let mut history =
             History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
         let epoch = mirror.load().epoch;
+        let original_id = history.item_head().unwrap();
 
         history.replace(vec![Message::user(SECOND.into())]);
 
         let snap = mirror.load();
+        let messages = snapshot_messages(&snap);
         assert_ne!(snap.epoch, epoch);
         assert_eq!(snap.messages.len(), 1);
-        assert_eq!(snap.messages[0].user_text(), Some(SECOND));
+        assert_ne!(history.item_head(), Some(original_id));
+        assert_eq!(messages[0].user_text(), Some(SECOND));
     }
 }

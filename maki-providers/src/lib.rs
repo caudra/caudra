@@ -1,4 +1,5 @@
 pub(crate) mod error;
+pub mod history;
 pub mod manifest;
 pub mod model;
 pub mod model_registry;
@@ -9,6 +10,11 @@ pub mod retry;
 pub(crate) mod types;
 
 pub use error::AgentError;
+pub use history::{
+    AssistantTextState, HistoryItem, HistoryItemKind, HistoryProjectionError, MakiId, UserOrigin,
+    active_history_items, expand_message, merge_history_items, project_messages,
+    resolve_history_head,
+};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,

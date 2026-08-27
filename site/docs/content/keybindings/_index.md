@@ -90,7 +90,10 @@ Some pickers add extra bindings on top of the defaults:
 
 | Context | Key | Action |
 |---------|-----|--------|
-| Queue | `Enter` | Remove item |
+| Queue | `Enter` | Edit item |
+| Queue | `d` / `Delete` | Delete item |
+| Queue | `m` | Move unsent item to Main |
+| Queue | `b` | Toggle send together |
 | Commands | `Tab` | Complete command |
 | Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
 | Model Picker | `R` | Reset model purpose |

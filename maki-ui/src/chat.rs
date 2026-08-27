@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
@@ -16,7 +16,7 @@ use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{HistoryItem, HistoryItemKind, MakiId, UserOrigin};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -321,6 +321,10 @@ impl Chat {
         self.messages_panel.tool_id_at(row, area)
     }
 
+    pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
+        self.messages_panel.source_at(row, area)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,
@@ -405,6 +409,10 @@ impl Chat {
         self.messages_panel.load_messages(msgs);
     }
 
+    pub fn bind_sources(&mut self, messages: &[DisplayMessage]) {
+        self.messages_panel.bind_sources(messages);
+    }
+
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
@@ -485,123 +493,154 @@ impl Chat {
 }
 
 pub fn history_to_display(
-    messages: &[Message],
+    items: &[HistoryItem],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
-    let results = build_tool_results_map(messages);
+    let results = build_tool_results_map(items);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
-        if msg.is_observation() {
-            continue;
-        }
-        match msg.role {
-            Role::User => {
-                if let Some(text) = msg.user_text() {
-                    display.push(DisplayMessage::new(DisplayRole::User, text.to_owned()));
+    let mut displayed_user_groups = HashSet::new();
+    for item in items {
+        match &item.kind {
+            HistoryItemKind::User { .. } => {
+                if displayed_user_groups.insert(item.group_id)
+                    && let Some((id, text)) = visible_user_text(items, item.group_id)
+                {
+                    let mut message = DisplayMessage::new(DisplayRole::User, text.to_owned());
+                    message.source = Some(DisplaySource::User(id));
+                    display.push(message);
                 }
             }
-            Role::Assistant => {
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } if !text.is_empty() => {
-                            display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
-                        }
-                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                            display
-                                .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            let static_name = name.as_str();
-                            let reg = ToolRegistry::global();
-                            let tool_call: Option<Box<dyn ToolInvocation>> =
-                                reg.get(name).and_then(|entry| entry.try_parse(input));
-                            let summary = reg.resolve_header(name, input);
-                            let (status, result_text) = results
-                                .get(id.as_str())
-                                .map(|(err, text)| {
-                                    let s = if *err {
-                                        ToolStatus::Error
-                                    } else {
-                                        ToolStatus::Success
-                                    };
-                                    (s, Some(&**text))
-                                })
-                                .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str()).map(Arc::as_ref);
-                            let (text, truncated_lines, tool_output, mut annotation) =
-                                build_loaded_tool(
-                                    static_name,
-                                    &summary,
-                                    stored.cloned(),
-                                    result_text,
-                                    tool_output_lines,
-                                );
-                            if let Some(ta) =
-                                tool_call.as_deref().and_then(|tc| tc.start_annotation())
-                            {
-                                append_annotation(&mut annotation, &ta);
-                            }
-                            let output = stored
-                                .map(|o| o.as_text())
-                                .or_else(|| result_text.map(str::to_owned))
-                                .unwrap_or_default();
-                            let state = stored.and_then(|o| o.state().cloned());
-                            // Structured outputs (e.g. Diff) render natively
-                            // in Rust with full fidelity; a Lua restore
-                            // snapshot would replace that with a poorer text
-                            // view.
-                            let rust_rendered =
-                                stored.is_some_and(|o| o.structured_display_text().is_some());
-                            if !rust_rendered {
-                                restore_items.push(maki_lua::RestoreItem {
-                                    tool: Arc::from(static_name),
-                                    tool_use_id: id.clone(),
-                                    output,
-                                    input: input.clone(),
-                                    is_error: status == ToolStatus::Error,
-                                    tool_output_lines: *tool_output_lines,
-                                    theme_gen: None,
-                                    clicks: Vec::new(),
-                                    state,
-                                });
-                            }
-                            display.push(DisplayMessage {
-                                role: DisplayRole::Tool(Box::new(ToolRole {
-                                    id: id.clone(),
-                                    status,
-                                    name: static_name.into(),
-                                })),
-                                text,
-                                tool_input: None,
-                                tool_raw_input: Some(Arc::new(input.clone())),
-                                tool_output,
-                                live_output: None,
-                                annotation,
-                                plan_path: None,
-                                timestamp: None,
-                                turn_usage: None,
-                                truncated_lines,
-                                render_snapshot: None,
-                                render_header: None,
-                                snapshot_theme_gen: 0,
-                                thinking_collapsed: false,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
+            HistoryItemKind::AssistantText { text, .. } if !text.is_empty() => {
+                let mut message = DisplayMessage::new(DisplayRole::Assistant, text.clone());
+                message.source = Some(DisplaySource::AssistantText(item.id));
+                display.push(message);
             }
+            HistoryItemKind::Reasoning {
+                text,
+                redacted: false,
+                ..
+            } if !text.is_empty() => {
+                let mut message = DisplayMessage::new(DisplayRole::Thinking, text.clone());
+                message.source = Some(DisplaySource::Reasoning(item.id));
+                display.push(message);
+            }
+            HistoryItemKind::ToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let static_name = name.as_str();
+                let reg = ToolRegistry::global();
+                let tool_call: Option<Box<dyn ToolInvocation>> =
+                    reg.get(name).and_then(|entry| entry.try_parse(input));
+                let summary = reg.resolve_header(name, input);
+                let result = results.get(call_id.as_str());
+                let (status, result_text) = result
+                    .map(|result| {
+                        let status = if result.is_error {
+                            ToolStatus::Error
+                        } else {
+                            ToolStatus::Success
+                        };
+                        (status, Some(result.content))
+                    })
+                    .unwrap_or((ToolStatus::Success, None));
+                let stored = tool_outputs.get(call_id.as_str()).map(Arc::as_ref);
+                let (text, truncated_lines, tool_output, mut annotation) = build_loaded_tool(
+                    static_name,
+                    &summary,
+                    stored.cloned(),
+                    result_text,
+                    tool_output_lines,
+                );
+                if let Some(tool_annotation) = tool_call
+                    .as_deref()
+                    .and_then(|call| call.start_annotation())
+                {
+                    append_annotation(&mut annotation, &tool_annotation);
+                }
+                let output = stored
+                    .map(|output| output.as_text())
+                    .or_else(|| result_text.map(str::to_owned))
+                    .unwrap_or_default();
+                let state = stored.and_then(|output| output.state().cloned());
+                let rust_rendered =
+                    stored.is_some_and(|output| output.structured_display_text().is_some());
+                if !rust_rendered {
+                    restore_items.push(maki_lua::RestoreItem {
+                        tool: Arc::from(static_name),
+                        tool_use_id: call_id.clone(),
+                        output,
+                        input: input.clone(),
+                        is_error: status == ToolStatus::Error,
+                        tool_output_lines: *tool_output_lines,
+                        theme_gen: None,
+                        clicks: Vec::new(),
+                        state,
+                    });
+                }
+                display.push(DisplayMessage {
+                    role: DisplayRole::Tool(Box::new(ToolRole {
+                        id: call_id.clone(),
+                        status,
+                        name: static_name.into(),
+                    })),
+                    text,
+                    source: Some(DisplaySource::ToolCall {
+                        id: item.id,
+                        result_id: result.map(|result| result.id),
+                    }),
+                    tool_input: None,
+                    tool_raw_input: Some(Arc::new(input.clone())),
+                    tool_output,
+                    live_output: None,
+                    annotation,
+                    plan_path: None,
+                    timestamp: None,
+                    turn_usage: None,
+                    truncated_lines,
+                    render_snapshot: None,
+                    render_header: None,
+                    snapshot_theme_gen: 0,
+                    thinking_collapsed: false,
+                });
+            }
+            HistoryItemKind::AssistantText { .. }
+            | HistoryItemKind::Reasoning { .. }
+            | HistoryItemKind::ToolResult { .. } => {}
         }
     }
     (display, restore_items)
 }
 
-/// `ToolResult` is gone after session load, so we rebuild from
-/// whatever the `DisplayMessage` kept.
+fn visible_user_text(items: &[HistoryItem], group_id: MakiId) -> Option<(MakiId, &str)> {
+    let mut users = items.iter().filter(|item| item.group_id == group_id);
+    let first = users
+        .clone()
+        .find(|item| matches!(item.kind, HistoryItemKind::User { .. }))?;
+    let HistoryItemKind::User {
+        display_text,
+        origin: UserOrigin::Turn,
+        ..
+    } = &first.kind
+    else {
+        return None;
+    };
+    if let Some(display_text) = display_text {
+        return (!display_text.is_empty()).then_some((first.id, display_text.as_str()));
+    }
+    users.find_map(|item| match &item.kind {
+        HistoryItemKind::User { text, .. } if !text.trim().is_empty() => {
+            Some((item.id, text.as_str()))
+        }
+        _ => None,
+    })
+}
+
+/// Rebuilds a Lua restore request from the data retained by a tool row.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -666,21 +705,30 @@ fn build_loaded_tool(
     }
 }
 
-fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
+struct ToolResultRef<'a> {
+    id: MakiId,
+    content: &'a str,
+    is_error: bool,
+}
+
+fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<'_>> {
     let mut map = HashMap::new();
-    for msg in messages {
-        if !matches!(msg.role, Role::User) || msg.is_observation() {
-            continue;
-        }
-        for block in &msg.content {
-            if let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } = block
-            {
-                map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
-            }
+    for item in items {
+        if let HistoryItemKind::ToolResult {
+            call_id,
+            content,
+            is_error,
+            ..
+        } = &item.kind
+        {
+            map.insert(
+                call_id.as_str(),
+                ToolResultRef {
+                    id: item.id,
+                    content,
+                    is_error: *is_error,
+                },
+            );
         }
     }
     map
@@ -691,6 +739,7 @@ mod tests {
     use super::*;
     use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use maki_config::UiConfig;
+    use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -745,6 +794,17 @@ mod tests {
 
     fn empty_outputs() -> HashMap<String, Arc<ToolOutput>> {
         HashMap::new()
+    }
+
+    fn display_messages(
+        messages: &[Message],
+        outputs: &HashMap<String, Arc<ToolOutput>>,
+    ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
+        history_to_display(
+            &crate::history_items(messages),
+            outputs,
+            &ToolOutputLines::default(),
+        )
     }
 
     const MAIN_NAME: &str = "Main";
@@ -855,17 +915,14 @@ mod tests {
             }],
             ..Default::default()
         }];
-        assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
-                .0
-                .is_empty()
-        );
+        assert!(display_messages(&msgs, &empty_outputs()).0.is_empty());
     }
 
     #[test]
     fn history_hides_observations_but_keeps_the_reply() {
         let msgs = vec![
             Message::observation("build failed".into()),
+            Message::synthetic("internal nudge".into()),
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
@@ -874,10 +931,60 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &empty_outputs()).0;
         assert_eq!(display.len(), 1);
         assert_eq!(display[0].role, DisplayRole::Assistant);
         assert_eq!(display[0].text, "I will fix it");
+    }
+
+    #[test]
+    fn history_sources_keep_atomic_ids_on_merged_tools() {
+        let messages = vec![
+            Message::user("do it".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "inspect".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "running".into(),
+                    },
+                    ContentBlock::tool_use("t1", "bash", serde_json::json!({"command": "true"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&messages);
+
+        let display = history_to_display(&items, &empty_outputs(), &ToolOutputLines::default()).0;
+
+        assert_eq!(display[0].source, Some(DisplaySource::User(items[0].id)));
+        assert_eq!(
+            display[1].source,
+            Some(DisplaySource::Reasoning(items[1].id))
+        );
+        assert_eq!(
+            display[2].source,
+            Some(DisplaySource::AssistantText(items[2].id))
+        );
+        assert_eq!(
+            display[3].source,
+            Some(DisplaySource::ToolCall {
+                id: items[3].id,
+                result_id: Some(items[4].id),
+            })
+        );
     }
 
     fn tool_use_pair(
@@ -913,7 +1020,7 @@ mod tests {
             "output",
             is_error,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &empty_outputs()).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -949,7 +1056,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &empty_outputs()).0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -997,7 +1104,7 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let display = display_messages(&msgs, &outputs).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -1020,7 +1127,7 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &outputs).0;
         assert!(display[0].annotation.is_some());
     }
 
@@ -1034,7 +1141,7 @@ mod tests {
             &joined,
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &empty_outputs()).0;
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -1050,7 +1157,7 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &empty_outputs()).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -1071,7 +1178,7 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display = display_messages(&msgs, &HashMap::new()).0;
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -1123,10 +1230,10 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        let (_, items) = display_messages(&msgs, &outputs);
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        let (_, items) = display_messages(&msgs, &empty_outputs());
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
     }
 

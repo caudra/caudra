@@ -17,6 +17,7 @@ use crate::metrics::{
 pub const START_FRESH: &str = "fresh";
 pub const START_RESUME: &str = "resume";
 pub const START_CONTINUE: &str = "continue";
+pub const START_FORK: &str = "fork";
 
 pub const TOKEN_INPUT: &str = "input";
 pub const TOKEN_OUTPUT: &str = "output";

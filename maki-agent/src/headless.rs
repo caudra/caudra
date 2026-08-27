@@ -4,14 +4,14 @@ use std::sync::Arc;
 use async_lock::Mutex;
 use flume::Receiver;
 use maki_config::ModelPolicy;
+#[cfg(test)]
 use maki_providers::Message;
 use maki_providers::Timeouts;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+use maki_providers::{HistoryItem, merge_history_items};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -26,10 +26,9 @@ use crate::tools::{
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
-    SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput, ToolOutputLines,
+    StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutputLines,
+    load_stored_session,
 };
-
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
 struct SessionStore {
     dir: StateDir,
@@ -47,7 +46,7 @@ impl SessionStore {
     }
 
     fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
+        match load_stored_session(session_id, &dir) {
             Ok(session) => Self::from_session(dir, session),
             Err(_) => {
                 let mut session = StoredSession::new(model_spec, cwd);
@@ -60,7 +59,20 @@ impl SessionStore {
     }
 
     fn from_session(dir: StateDir, session: StoredSession) -> Self {
-        let subagent_history = SubagentHistoryStore::seeded(session.subagent_messages().clone());
+        let subagent_messages = session
+            .subagent_messages()
+            .iter()
+            .filter_map(
+                |(task_id, items)| match History::restored(items.as_ref().clone()) {
+                    Ok(history) => Some((task_id.clone(), Arc::new(history.into_vec()))),
+                    Err(error) => {
+                        warn!(%task_id, %error, "failed to restore subagent history");
+                        None
+                    }
+                },
+            )
+            .collect();
+        let subagent_history = SubagentHistoryStore::seeded(subagent_messages);
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
@@ -76,8 +88,17 @@ impl SessionStore {
         }
     }
 
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.replace_messages(messages.to_vec());
+    fn record_turn(&mut self, history: &History, model_spec: String) {
+        let mut merged = self.session.messages().to_vec();
+        if let Err(error) = merge_history_items(&mut merged, history.active_items()) {
+            warn!(%error, "refusing to persist invalid history graph");
+            return;
+        }
+        if merged.as_slice() != self.session.messages() {
+            self.session.replace_messages(merged);
+        }
+        self.session
+            .set_conversation_state(history.item_head(), None);
         self.session.set_model(model_spec);
         let snapshot = self.subagent_history.snapshot();
         if snapshot.revision() != self.persisted_subagent_history.revision() {
@@ -88,10 +109,9 @@ impl SessionStore {
                     .get(task_id)
                     .is_some_and(|persisted| Arc::ptr_eq(persisted, history));
                 if !unchanged {
-                    self.session.set_subagent_messages(
-                        task_id.clone(),
-                        Arc::unwrap_or_clone(Arc::clone(history)),
-                    );
+                    let items =
+                        History::new(Arc::unwrap_or_clone(Arc::clone(history))).into_items();
+                    self.session.set_subagent_messages(task_id.clone(), items);
                 }
             }
             self.persisted_subagent_history = snapshot;
@@ -321,7 +341,7 @@ pub struct InteractiveParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub session_id: Option<SessionRef>,
-    pub initial_history: Vec<Message>,
+    pub initial_history: Vec<HistoryItem>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -357,10 +377,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         params.workflow,
     );
 
+    let restored_history = History::restored(params.initial_history);
+    let initial_messages = restored_history
+        .as_ref()
+        .map(|history| history.as_slice())
+        .unwrap_or_default();
     let mcp = params
         .mcp_handle
         .clone()
-        .map(|h| McpSession::new(h, &params.initial_history));
+        .map(|h| McpSession::new(h, initial_messages));
     let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -394,6 +419,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         async move {
+            let mut history = match restored_history {
+                Ok(history) => history,
+                Err(error) => {
+                    error!(%error, "failed to restore history");
+                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
+                        message: format!("Failed to restore history: {error}"),
+                    });
+                    return;
+                }
+            };
             let mut model = params.model;
             let mut provider: Arc<dyn Provider> =
                 match provider::from_model_async(&mut model, params.timeouts).await {
@@ -412,7 +447,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .as_ref()
                 .map(|store| store.subagent_history.clone())
                 .unwrap_or_default();
-            let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
             while let Ok(input) = input_rx.recv_async().await {
@@ -525,7 +559,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 }
 
                 if let Some(store) = &mut store {
-                    store.record_turn(history.as_slice(), model.spec());
+                    store.record_turn(&history, model.spec());
                 }
                 run_id += 1;
             }
@@ -604,7 +638,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
+        let history = History::new(messages.clone());
+        store.record_turn(&history, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 1);
@@ -615,34 +650,34 @@ mod tests {
     fn record_turn_persists_observations() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        store.record_turn(
-            &[
-                Message::user("fix the login bug".into()),
-                Message::observation("build failed".into()),
-            ],
-            MODEL_SPEC.into(),
-        );
+        let history = History::new(vec![
+            Message::user("fix the login bug".into()),
+            Message::observation("build failed".into()),
+        ]);
+        store.record_turn(&history, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
-        assert!(loaded.messages()[1].is_observation());
+        let restored = History::restored(loaded.messages().to_vec()).unwrap();
+        assert!(restored.as_slice()[1].is_observation());
     }
 
     #[test]
     fn reopening_resumes_existing_session() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
+        store.record_turn(
+            &History::new(vec![Message::user("first prompt".into())]),
+            MODEL_SPEC.into(),
+        );
         drop(store);
 
         let mut store = store_in(&tmp);
         assert_eq!(store.session.messages().len(), 1);
 
-        let messages = vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ];
-        store.record_turn(&messages, "other/model".into());
+        let mut history = History::restored(store.session.messages().to_vec()).unwrap();
+        history.push(Message::user("second prompt".into()));
+        store.record_turn(&history, "other/model".into());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
@@ -658,13 +693,12 @@ mod tests {
             .reserve("task-1")
             .unwrap()
             .complete(vec![Message::user("investigate".into())]);
-        store.record_turn(&[], MODEL_SPEC.into());
+        store.record_turn(&History::default(), MODEL_SPEC.into());
 
         let loaded = load(&tmp);
-        assert_eq!(
-            loaded.subagent_messages()["task-1"][0].user_text(),
-            Some("investigate")
-        );
+        let task_history =
+            History::restored(loaded.subagent_messages()["task-1"].as_ref().clone()).unwrap();
+        assert_eq!(task_history.as_slice()[0].user_text(), Some("investigate"));
 
         let reopened = store_in(&tmp);
         let lease = reopened.subagent_history.continue_task("task-1").unwrap();

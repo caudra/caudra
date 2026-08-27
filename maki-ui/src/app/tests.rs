@@ -7,22 +7,30 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{DisplaySource, ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use maki_agent::{
-    DoneReason, GoalResult, GoalStatus, GoalVerdict, ImageMediaType, McpConfigErrors,
-    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
+    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use maki_config::{PermissionsConfig, UiConfig};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredPasteRange, StoredQueuedDraft, StoredThinking};
+use maki_providers::{
+    ContentBlock, Effort, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
+    expand_message, project_messages,
+};
+use maki_storage::id::MakiId;
+use maki_storage::sessions::{
+    PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
+    Session, StoredMode, StoredPasteRange, StoredQueuedDraft, StoredSubagent, StoredThinking,
+};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -52,6 +60,12 @@ const MEASURED_CONTEXT: u32 = 100_000;
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
+const SNAPSHOT_FILE: &str = "tracked.txt";
+const ROOT_CONTENT: &str = "root";
+const FIRST_CONTENT: &str = "after first";
+const CURRENT_CONTENT: &str = "current";
+const CONFLICT_CONTENT: &str = "conflict";
+const CONTINUED_CONTENT: &str = "continued after revert";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -67,10 +81,19 @@ fn build_app_with_lua(
     lua_commands: LuaCommandReader,
 ) -> App {
     let model = test_model();
+    let mut session = AppSession::new("test-model", "");
+    let workspace = dir
+        .path()
+        .join("maki-ui-test-workspaces")
+        .join(session.id.to_string());
+    std::fs::create_dir_all(&workspace).unwrap();
+    session.set_cwd(workspace.to_string_lossy().into_owned());
+    let snapshot_store = App::snapshot_store_for(&dir, session.id, &workspace).unwrap();
     App::new(
         &model,
-        AppSession::new("test-model", "/tmp/test"),
+        session,
         dir,
+        snapshot_store,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
@@ -942,9 +965,7 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 #[test]
 fn load_session_clears_plan() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("test".into()));
+    crate::push_history_message(app.state.session_mut(), Message::user("test".into()));
     app.state.session_mut().save(&app.storage).unwrap();
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
@@ -952,6 +973,27 @@ fn load_session_clears_plan() {
     app.load_session(id);
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
+}
+
+#[test]
+fn load_session_from_picker_migrates_legacy_messages() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let mut legacy: Session<Message, TokenUsage, ToolOutput> =
+        Session::new("test-model", &app.state.session.cwd);
+    legacy.replace_messages(vec![Message::user("legacy prompt".into())]);
+    legacy.save(&app.storage).unwrap();
+
+    let actions = app.load_session(legacy.id);
+
+    let Action::LoadSession(loaded) = &actions[0] else {
+        panic!("expected LoadSession");
+    };
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(
+        project_messages(&loaded.messages).unwrap()[0].user_text(),
+        Some("legacy prompt")
+    );
+    assert!(AppSession::load(legacy.id, &app.storage).is_ok());
 }
 
 #[test]
@@ -1207,7 +1249,7 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     stored.token_usage = RESTORED_TOKENS;
     stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
 
-    app.apply_loaded_session(stored, &test_model());
+    app.apply_loaded_session(stored, &test_model()).unwrap();
     assert_eq!(app.state.cost, Some(RESTORED_COST));
     assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
 
@@ -1379,7 +1421,9 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.chats[1].in_progress_count(), 0);
     assert!(app.chats[1].is_finished());
     assert!(app.chat_index.is_empty());
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.cancelling_run, Some(1));
+    assert!(app.cadence().moves());
 }
 
 /// What a subagent's own session sends when it closes, which the `task` tool
@@ -1847,6 +1891,177 @@ fn mouse_drag_updates_selection() {
 }
 
 #[test]
+fn right_click_opens_message_actions_without_changing_selection() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+    let before = *app.selection_state.as_ref().unwrap().sel();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 2,
+        area.y,
+    ));
+
+    assert!(app.message_actions.is_open());
+    let after = app.selection_state.as_ref().unwrap().sel();
+    assert_eq!(after.normalized(), before.normalized());
+    assert_eq!(after.area, before.area);
+    assert_eq!(after.zone, before.zone);
+}
+
+#[test]
+fn live_rows_receive_sources_when_history_is_merged() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.main_chat().push_user_message("hello");
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        items.clone(),
+    ))));
+
+    app.checkpoint_with(Duration::ZERO);
+
+    assert_eq!(
+        app.main_chat().message_at(0).unwrap().source,
+        Some(DisplaySource::User(items[0].id))
+    );
+}
+
+#[test]
+fn left_click_keeps_existing_message_interaction_path() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+
+    assert!(matches!(
+        app.selection_state,
+        Some(SelectionState::Dragging { .. })
+    ));
+    assert!(!app.message_actions.is_open());
+}
+
+#[test]
+fn long_left_click_opens_message_actions() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+    app.message_mouse_down.as_mut().unwrap().since =
+        Instant::now() - super::mouse::MESSAGE_LONG_CLICK;
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+
+    assert!(app.message_actions.is_open());
+    assert!(app.selection_state.is_none());
+}
+
+#[test]
+fn short_left_click_does_not_open_message_actions() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+
+    assert!(!app.message_actions.is_open());
+}
+
+#[test]
+fn dragging_cancels_message_long_click() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        area.y,
+    ));
+    app.message_mouse_down.as_mut().unwrap().since =
+        Instant::now() - super::mouse::MESSAGE_LONG_CLICK;
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + 8,
+        area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 8,
+        area.y,
+    ));
+
+    assert!(!app.message_actions.is_open());
+    assert!(app.message_mouse_down.is_none());
+}
+
+#[test]
+fn right_click_streaming_row_flashes_unavailable() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::TextDelta {
+        text: "partial".into(),
+    }));
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 2,
+        area.y,
+    ));
+
+    assert!(!app.message_actions.is_open());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some("Message actions unavailable here")
+    );
+}
+
+#[test]
 fn mouse_drag_clamps_to_area() {
     let mut app = test_app();
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
@@ -1936,7 +2151,8 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.cancelling_run, Some(1));
     assert_eq!(app.chats[0].in_progress_count(), 0);
 }
 
@@ -1946,9 +2162,7 @@ fn double_esc_idle_opens_rewind_picker() {
     type_and_submit(&mut app, "hello");
     app.status = Status::Idle;
     app.run_id = 1;
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
+    crate::push_history_message(app.state.session_mut(), Message::user("hello".into()));
 
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -1971,7 +2185,8 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.cancelling_run, Some(1));
     assert_ne!(app.exit_request, ExitRequest::Success);
 }
 
@@ -2893,6 +3108,14 @@ fn stale_events_ignored_after_run_id_increment() {
 
     cancel_app(&mut app);
     let current_run = app.run_id;
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::Cancelled,
+        },
+        1,
+    ));
     let actions = type_and_submit(&mut app, "new prompt");
     assert!(matches!(&actions[0], Action::SendMessage(i) if i.message == "new prompt"));
     let active_run = app.run_id;
@@ -2927,6 +3150,7 @@ fn stale_done_does_not_drain_queue() {
     app.update(agent_msg_with_run_id(done(), 1));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.cancelling_run, None);
 }
 
 #[test]
@@ -3032,7 +3256,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
 )]
 #[test_case(
     |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
+        crate::push_history_message(app.state.session_mut(), Message::user("test".into()));
         app.open_rewind_picker();
     },
     &[KeybindContext::RewindPicker],
@@ -3086,7 +3310,7 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
 
-    session.push_message(Message::user("hello".into()));
+    crate::push_history_message(&mut session, Message::user("hello".into()));
     assert!(session_has_content(&session));
 }
 
@@ -3201,7 +3425,13 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
     app.checkpoint();
 
     assert_eq!(app.state.session.messages().len(), 2);
-    assert!(app.state.session.messages()[0].is_observation());
+    assert!(matches!(
+        app.state.session.messages()[0].kind,
+        HistoryItemKind::User {
+            origin: UserOrigin::Observation,
+            ..
+        }
+    ));
     assert_eq!(app.state.session.title, initial_title);
 }
 
@@ -3216,9 +3446,7 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
 #[test]
 fn reload_persists_session_with_content_to_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
+    crate::push_history_message(app.state.session_mut(), Message::user("hello".into()));
     let actions = app.execute_command(cmd("/reload"), 0);
     assert_eq!(app.exit_request, ExitRequest::Reload);
     assert!(matches!(actions.as_slice(), [Action::ManualExit]));
@@ -3249,6 +3477,7 @@ fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
 
     app.restore_resumed_session();
     assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
+    assert_eq!(app.status, Status::Streaming);
 
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
@@ -3257,12 +3486,12 @@ fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
 #[test]
 fn apply_loaded_session_defers_queued_messages_until_respawn() {
     let mut app = test_app();
-    let mut session = AppSession::new("test-model", "/tmp/test");
+    let mut session = AppSession::new("test-model", &app.state.session.cwd);
     session.meta.queued_messages = vec!["deferred".into()];
-    session.push_message(Message::user("hello".into()));
+    crate::push_history_message(&mut session, Message::user("hello".into()));
 
     let model = app.state.model.clone();
-    app.apply_loaded_session(session, &model);
+    app.apply_loaded_session(session, &model).unwrap();
 
     assert!(app.queue.is_empty());
     assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
@@ -3311,9 +3540,9 @@ fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSessi
             Arc::default(),
         ));
     }
-    let mut session = AppSession::new("test-model", "/tmp/test");
+    let mut session = AppSession::new("test-model", &app.state.session.cwd);
     session.meta.yolo = stored;
-    session.push_message(Message::user(RESUMED_PROMPT.into()));
+    crate::push_history_message(&mut session, Message::user(RESUMED_PROMPT.into()));
     (app, session)
 }
 
@@ -3347,7 +3576,7 @@ fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (b
     let (mut app, session) = app_and_session_with_yolo(seed, stored);
     let model = app.state.model.clone();
 
-    app.apply_loaded_session(session, &model);
+    app.apply_loaded_session(session, &model).unwrap();
     app.checkpoint();
     (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
@@ -3583,21 +3812,21 @@ fn ctrl_r_refreshes_usage_while_modal_open() {
 #[test]
 fn cd_command_behavior() {
     let mut app = test_app();
-    app.execute_command(
+    let old_store = Arc::clone(&app.snapshot_store);
+    let original_cwd = app.state.session.cwd.clone();
+    let actions = app.execute_command(
         ParsedCommand {
             name: "/cd".into(),
             args: "/tmp".into(),
         },
         0,
     );
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
-    // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
-    // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
-    // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
-    // returns the resolved form, so the test expectation must match.
-    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
-    assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
+    let [Action::ChangeWorkingDirectory(resolved)] = actions.as_slice() else {
+        panic!("expected process-wide cwd action");
+    };
+    assert_eq!(resolved, &std::fs::canonicalize("/tmp").unwrap());
+    assert_eq!(app.state.session.cwd, original_cwd);
+    assert!(Arc::ptr_eq(&old_store, &app.snapshot_store));
 
     app.execute_command(
         ParsedCommand {
@@ -3608,6 +3837,46 @@ fn cd_command_behavior() {
     );
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
+}
+
+#[test]
+fn cd_lifecycle_guard_is_deferred_to_the_multi_session_event_loop() {
+    let mut cancelling = test_app();
+    let cancelling_cwd = cancelling.state.session.cwd.clone();
+    cancelling.status = Status::Streaming;
+    cancelling.run_id = 1;
+    cancelling.handle_cancel();
+
+    let actions = cancelling.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/".into(),
+        },
+        0,
+    );
+
+    assert_eq!(cancelling.state.session.cwd, cancelling_cwd);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ChangeWorkingDirectory(_)]
+    ));
+
+    let mut reverted = build_rewind_app();
+    reverted.rewind_to(rewind_to_second_turn());
+    let reverted_cwd = reverted.state.session.cwd.clone();
+    let actions = reverted.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/".into(),
+        },
+        0,
+    );
+
+    assert_eq!(reverted.state.session.cwd, reverted_cwd);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ChangeWorkingDirectory(_)]
+    ));
 }
 
 #[test]
@@ -3749,28 +4018,30 @@ fn slash_noncommand_sends_as_prompt() {
 fn build_rewind_app() -> App {
     let mut app = test_app();
 
-    app.state.session_mut().replace_messages(vec![
-        Message::user("first prompt".into()),
-        Message {
-            role: Role::Assistant,
-            content: vec![
-                ContentBlock::Text {
-                    text: "response 1".into(),
-                },
-                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({})),
-            ],
-            ..Default::default()
-        },
-        Message::user("second prompt".into()),
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: "response 2".into(),
-            }],
-            ..Default::default()
-        },
-        Message::user("third prompt".into()),
-    ]);
+    app.state
+        .session_mut()
+        .replace_messages(crate::history_items(&[
+            Message::user("first prompt".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "response 1".into(),
+                    },
+                    ContentBlock::tool_use("tool-1", "bash", serde_json::json!({})),
+                ],
+                ..Default::default()
+            },
+            Message::user("second prompt".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "response 2".into(),
+                }],
+                ..Default::default()
+            },
+            Message::user("third prompt".into()),
+        ]));
     app.state
         .session_mut()
         .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
@@ -3779,27 +4050,47 @@ fn build_rewind_app() -> App {
 
 fn rewind_to_second_turn() -> RewindEntry {
     RewindEntry {
-        turn_index: 2,
+        turn_index: 3,
         prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
     }
 }
 
 #[test]
-fn rewind_to_middle_truncates_and_populates_input() {
+fn rewind_to_middle_stages_head_move_and_populates_input() {
     let mut app = build_rewind_app();
     let old_run_id = app.run_id;
+    let original_head = crate::session_history_head(&app.state.session);
     let actions = app.rewind_to(rewind_to_second_turn());
 
-    assert_eq!(app.state.session.messages().len(), 2);
+    assert_eq!(app.state.session.messages().len(), 6);
+    assert_eq!(
+        crate::active_session_history(&app.state.session)
+            .unwrap()
+            .len(),
+        3
+    );
     assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
+    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
+    assert_eq!(pending.original_head, original_head);
+    assert_eq!(pending.target_head, app.state.session.meta.history_head);
 
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
     };
-    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages.len(), 3);
+}
+
+#[test]
+fn rewind_picker_defers_restore_to_event_loop_quiescence_dispatch() {
+    let mut app = build_rewind_app();
+    app.open_rewind_picker();
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(matches!(actions.as_slice(), [Action::RewindSession(_)]));
+    assert!(app.state.session.meta.pending_revert.is_none());
 }
 
 /// Dropping two short messages may shave a few tokens off the gauge, never the
@@ -3822,7 +4113,7 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
 }
 
 #[test]
-fn rewind_to_first_turn_clears_everything() {
+fn rewind_to_first_turn_selects_empty_root_without_deleting_state() {
     let mut app = build_rewind_app();
     app.state.context_size = MEASURED_CONTEXT;
     app.state.token_usage.input = 500;
@@ -3830,17 +4121,1010 @@ fn rewind_to_first_turn_clears_everything() {
     let entry = RewindEntry {
         turn_index: 0,
         prompt_preview: "1: first".into(),
-        prompt_text: "first prompt".into(),
     };
     let actions = app.rewind_to(entry);
 
-    assert!(app.state.session.messages().is_empty());
-    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
+    assert_eq!(app.state.session.messages().len(), 6);
+    assert!(
+        crate::active_session_history(&app.state.session)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
     assert_eq!(app.chats[0].context_size, 0);
     assert!(matches!(&actions[0], Action::LoadSession(_)));
+}
+
+#[test]
+fn unrevert_restores_exact_original_head_and_clears_the_rewound_draft() {
+    let mut app = build_rewind_app();
+    let original_head = crate::session_history_head(&app.state.session);
+    let expected = crate::active_session_history(&app.state.session).unwrap();
+    app.rewind_to(rewind_to_second_turn());
+
+    let actions = app.unrevert();
+
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        original_head
+    );
+    assert_eq!(
+        crate::active_session_history(&app.state.session).unwrap(),
+        expected
+    );
+    assert_eq!(app.state.session.meta.pending_revert, None);
+    assert!(app.input_box.buffer.value().is_empty());
+    let Action::LoadSession(loaded) = &actions[0] else {
+        panic!("expected LoadSession");
+    };
+    assert_eq!(loaded.messages, expected);
+}
+
+fn assistant_message(text: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        ..Default::default()
+    }
+}
+
+fn snapshot_revert_app() -> (TempDir, App, PathBuf, MakiId, MakiId, MakiId) {
+    let (temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    let path = workspace.join(SNAPSHOT_FILE);
+    std::fs::write(&path, ROOT_CONTENT).unwrap();
+    app.snapshot_store
+        .snapshot_session_start(&workspace)
+        .unwrap();
+
+    let items = crate::history_items(&[
+        Message::user("first prompt".into()),
+        assistant_message("first response"),
+        Message::user("second prompt".into()),
+        assistant_message("second response"),
+    ]);
+    let first_user = items[0].id;
+    let first_head = items[1].id;
+    let second_user = items[2].id;
+    let current_head = items[3].id;
+    app.state.session_mut().replace_messages(items);
+
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    app.snapshot_store.snapshot(&workspace, first_head).unwrap();
+    std::fs::write(&path, CURRENT_CONTENT).unwrap();
+    app.snapshot_store
+        .snapshot(&workspace, current_head)
+        .unwrap();
+
+    (temp, app, path, first_user, second_user, first_head)
+}
+
+fn persist_both_restore_intent(app: &mut App, target_head: Option<MakiId>) -> MakiId {
+    let source_head = crate::session_history_head(&app.state.session);
+    let operation_id = MakiId::generate();
+    app.state.session_mut().set_conversation_state(
+        source_head,
+        Some(PendingConversationRevert {
+            original_head: source_head,
+            target_head,
+            original_workspace_head: Some(source_head.into()),
+            workspace_head: Some(source_head.into()),
+            file_status: None,
+            restore_operation: Some(PendingRestoreOperation {
+                id: operation_id,
+                kind: PendingRestoreKind::Revert,
+                phase: PendingRestorePhase::Intent,
+                target_workspace_head: target_head.into(),
+                conversation_target: Some(target_head.into()),
+                overwrite: false,
+            }),
+        }),
+    );
+    app.storage_writer
+        .save_sync(Arc::clone(&app.state.session))
+        .unwrap();
+    operation_id
+}
+
+#[test]
+fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    let path = workspace.join(SNAPSHOT_FILE);
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    let initial = crate::history_items(&[
+        Message::user("first prompt".into()),
+        assistant_message("first response"),
+    ]);
+    let initial_head = initial.last().unwrap().id;
+    app.state.session_mut().replace_messages(initial.clone());
+
+    let actions = app.start_from_queue(&QueuedMessage {
+        text: "next prompt".into(),
+        images: Vec::new(),
+    });
+
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
+    assert!(app.snapshot_store.has_session_start());
+    assert!(app.snapshot_store.has_checkpoint(initial_head));
+    assert_eq!(
+        app.snapshot_store.load_manifest(initial_head).unwrap(),
+        app.snapshot_store.load_session_start_manifest().unwrap()
+    );
+
+    let completed = crate::history_items(&[
+        Message::user("first prompt".into()),
+        assistant_message("first response"),
+        Message::user("next prompt".into()),
+        assistant_message("next response"),
+    ]);
+    let completed_head = completed.last().unwrap().id;
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        completed,
+    ))));
+    std::fs::write(path, CURRENT_CONTENT).unwrap();
+
+    app.update(done_event());
+
+    assert!(app.snapshot_store.has_checkpoint(completed_head));
+    assert_ne!(
+        app.snapshot_store.load_manifest(completed_head).unwrap()[SNAPSHOT_FILE].hash,
+        app.snapshot_store.load_manifest(initial_head).unwrap()[SNAPSHOT_FILE].hash
+    );
+}
+
+#[test]
+fn cancelled_top_level_snapshots_atomic_head_but_subagent_completion_does_not() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    std::fs::write(workspace.join(SNAPSHOT_FILE), CURRENT_CONTENT).unwrap();
+    let cancelled = crate::history_items(&[
+        Message::user("cancel me".into()),
+        assistant_message("partial response"),
+    ]);
+    let cancelled_head = cancelled.last().unwrap().id;
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        cancelled,
+    ))));
+    app.run_id = 2;
+    app.cancelling_run = Some(1);
+    app.status = Status::Streaming;
+
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        },
+        TASK_ID,
+        Some(RESEARCH_NAME),
+        2,
+    ));
+    assert!(!app.snapshot_store.has_checkpoint(cancelled_head));
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::Cancelled,
+        },
+        1,
+    ));
+
+    assert!(app.snapshot_store.has_checkpoint(cancelled_head));
+    assert_eq!(app.cancelling_run, None);
+    assert_eq!(app.status, Status::Idle);
+}
+
+#[test]
+fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    let path = workspace.join(SNAPSHOT_FILE);
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    let history = crate::history_items(&[
+        Message::user("cancel me".into()),
+        assistant_message("partial response"),
+    ]);
+    let head = history.last().unwrap().id;
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        history,
+    ))));
+    let (shared_queue, _receiver) = shared_queue::queue();
+    app.queue.set_shared(shared_queue);
+    app.status = Status::Streaming;
+    app.run_id = 7;
+
+    let actions = app.handle_cancel();
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 7 }]
+    ));
+    assert_eq!(app.cancelling_run, Some(7));
+    assert_eq!(app.status, Status::Streaming);
+    assert!(matches!(
+        app.submit_prompt(queued_msg("new work")),
+        SubmitOutcome::Queued
+    ));
+    app.update(agent_msg_with_run_id(done(), 6));
+    assert_eq!(app.cancelling_run, Some(7));
+    assert_eq!(app.status, Status::Streaming);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Error {
+            message: "cancelled".into(),
+        },
+        7,
+    ));
+
+    assert_eq!(app.cancelling_run, None);
+    assert_eq!(app.status, Status::Idle);
+    let captured = app.snapshot_store.load_manifest(head).unwrap();
+    std::fs::write(path, CURRENT_CONTENT).unwrap();
+    app.update(agent_msg_with_run_id(done(), 7));
+    assert_eq!(app.snapshot_store.load_manifest(head).unwrap(), captured);
+}
+
+#[test]
+fn both_restore_moves_files_then_conversation() {
+    let (_temp, mut app, path, _, second_user, first_head) = snapshot_revert_app();
+
+    let actions = app.revert_to(second_user, RestoreMode::Both);
+
+    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        Some(first_head)
+    );
+    assert_eq!(app.input_box.buffer.value(), "second prompt");
+    let status: RestoreStatus = serde_json::from_value(
+        app.state
+            .session
+            .meta
+            .pending_revert
+            .as_ref()
+            .unwrap()
+            .file_status
+            .clone()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(status.is_restored());
+}
+
+#[test]
+fn both_restore_conflict_preserves_conversation_head() {
+    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
+    let original_head = crate::session_history_head(&app.state.session);
+    std::fs::write(&path, CONFLICT_CONTENT).unwrap();
+
+    let actions = app.revert_to(second_user, RestoreMode::Both);
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        original_head
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CONFLICT_CONTENT);
+    let status: RestoreStatus = serde_json::from_value(
+        app.state
+            .session
+            .meta
+            .pending_revert
+            .as_ref()
+            .unwrap()
+            .file_status
+            .clone()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        status,
+        RestoreStatus::Failed {
+            kind: RestoreFailureKind::Conflicts,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn both_restore_to_first_user_restores_session_root() {
+    let (_temp, mut app, path, first_user, _, _) = snapshot_revert_app();
+
+    let actions = app.revert_to(first_user, RestoreMode::Both);
+
+    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
+    assert_eq!(crate::session_history_head(&app.state.session), None);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), ROOT_CONTENT);
+    assert_eq!(app.input_box.buffer.value(), "first prompt");
+}
+
+#[test]
+fn recovery_completes_intent_saved_before_the_restore_journal_exists() {
+    let (_temp, mut app, path, _, _, first_head) = snapshot_revert_app();
+    persist_both_restore_intent(&mut app, Some(first_head));
+    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
+    let session_id = app.state.session.id;
+    let mut restarted = AppSession::load(session_id, &app.storage).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
+    assert!(
+        restarted
+            .meta
+            .pending_revert
+            .as_ref()
+            .is_some_and(|pending| pending.restore_operation.is_some())
+    );
+
+    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
+    assert_eq!(crate::session_history_head(&restarted), Some(first_head));
+    assert!(
+        restarted
+            .meta
+            .pending_revert
+            .as_ref()
+            .is_some_and(|pending| pending.restore_operation.is_none())
+    );
+    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
+}
+
+#[test]
+fn recovery_moves_conversation_after_a_completed_file_journal() {
+    let (_temp, mut app, path, _, _, first_head) = snapshot_revert_app();
+    let source_head = crate::session_history_head(&app.state.session).unwrap();
+    let operation_id = persist_both_restore_intent(&mut app, Some(first_head));
+    let cwd = PathBuf::from(&app.state.session.cwd);
+
+    app.snapshot_store
+        .restore_transaction_with_policy(
+            &cwd,
+            &[source_head],
+            &[first_head],
+            maki_agent::snapshots::ConflictPolicy::Abort,
+            operation_id,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
+    let session_id = app.state.session.id;
+    let mut restarted = AppSession::load(session_id, &app.storage).unwrap();
+    assert_eq!(crate::session_history_head(&restarted), Some(source_head));
+
+    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
+    assert_eq!(crate::session_history_head(&restarted), Some(first_head));
+    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
+}
+
+#[test]
+fn conversation_then_files_revert_uses_the_workspace_head_as_its_source() {
+    let (_temp, mut app, path, first_user, second_user, _) = snapshot_revert_app();
+
+    app.revert_to(second_user, RestoreMode::Conversation);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
+
+    let actions = app.revert_to(first_user, RestoreMode::Files);
+
+    assert!(actions.is_empty());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), ROOT_CONTENT);
+    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
+    assert_eq!(pending.workspace_head.as_ref().unwrap().head, None);
+}
+
+#[test]
+fn files_then_conversation_revert_preserves_the_workspace_source_chain() {
+    let (_temp, mut app, path, first_user, second_user, _) = snapshot_revert_app();
+    let current_head = app.state.session.messages().last().unwrap().id;
+
+    app.revert_to(second_user, RestoreMode::Files);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
+    app.revert_to(first_user, RestoreMode::Conversation);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
+
+    let actions = app.revert_to(current_head, RestoreMode::Files);
+
+    assert!(actions.is_empty());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
+    assert_eq!(
+        pending.workspace_head.as_ref().unwrap().head,
+        Some(current_head)
+    );
+}
+
+#[test]
+fn user_revert_restores_display_text_and_images_as_draft() {
+    let mut app = test_app();
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+    let items = crate::history_items(&[Message::user_display_with_images(
+        "expanded prompt".into(),
+        "typed prompt".into(),
+        vec![image.clone()],
+    )]);
+    let user_id = items[0].id;
+    app.state.session_mut().replace_messages(items);
+
+    app.revert_to(user_id, RestoreMode::Conversation);
+    let submission = app.input_box.submit().unwrap();
+
+    assert_eq!(submission.text, "typed prompt");
+    assert_eq!(submission.images, [image]);
+}
+
+#[test_case(true  ; "completed_call_targets_result")]
+#[test_case(false ; "incomplete_call_targets_call")]
+fn tool_revert_uses_last_atomic_completed_item(completed: bool) {
+    let mut app = test_app();
+    let mut messages = vec![
+        Message::user("run tool".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "call-1",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+    ];
+    if completed {
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        });
+    }
+    let items = crate::history_items(&messages);
+    let call_id = items
+        .iter()
+        .find(|item| matches!(item.kind, HistoryItemKind::ToolCall { .. }))
+        .unwrap()
+        .id;
+    let expected_head = items.last().unwrap().id;
+    app.state.session_mut().replace_messages(items);
+
+    app.revert_to(call_id, RestoreMode::Conversation);
+
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        Some(expected_head)
+    );
+}
+
+#[test]
+fn fork_and_revert_through_parallel_result_include_the_whole_result_group() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user("run tools".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::tool_use("call-1", "read", serde_json::json!({})),
+                ContentBlock::tool_use("call-2", "read", serde_json::json!({})),
+            ],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "one".into(),
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-2".into(),
+                    content: "two".into(),
+                    is_error: false,
+                },
+            ],
+            ..Default::default()
+        },
+    ]);
+    let first_result = items[3].id;
+    let last_result = items[4].id;
+    app.state.session_mut().replace_messages(items.clone());
+
+    let forked = app
+        .fork_at(DisplaySource::ToolResult(first_result))
+        .unwrap();
+    assert_eq!(forked.session.messages(), items);
+    assert_eq!(
+        project_messages(forked.session.messages()).unwrap()[2]
+            .content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            .count(),
+        2
+    );
+
+    app.revert_to(first_result, RestoreMode::Conversation);
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        Some(last_result)
+    );
+    assert_eq!(
+        project_messages(&crate::active_session_history(&app.state.session).unwrap()).unwrap()[2]
+            .content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn unrevert_restores_worktree_before_original_conversation() {
+    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
+    let original_head = crate::session_history_head(&app.state.session);
+    app.revert_to(second_user, RestoreMode::Both);
+
+    let actions = app.unrevert();
+
+    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        original_head
+    );
+    assert!(app.state.session.meta.pending_revert.is_none());
+}
+
+#[test]
+fn fresh_file_revert_replaces_the_unrevert_baseline_after_continued_work() {
+    let (_temp, mut app, path, first_user, second_user, first_head) = snapshot_revert_app();
+    app.revert_to(second_user, RestoreMode::Both);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
+
+    let mut continued = crate::active_session_history(&app.state.session).unwrap();
+    let mut parent = Some(first_head);
+    for message in [
+        Message::user("continue on reverted branch".into()),
+        assistant_message("continued response"),
+    ] {
+        for item in expand_message(&message, parent) {
+            parent = Some(item.id);
+            continued.push(item);
+        }
+    }
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        continued,
+    ))));
+    std::fs::write(&path, CONTINUED_CONTENT).unwrap();
+    app.checkpoint();
+    assert!(app.state.session.meta.pending_revert.is_none());
+    app.snapshot_history_head().unwrap();
+
+    app.revert_to(first_user, RestoreMode::Files);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), ROOT_CONTENT);
+    app.unrevert();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CONTINUED_CONTENT);
+    assert!(app.state.session.meta.pending_revert.is_none());
+}
+
+#[test]
+fn unrevert_recovery_keeps_conversation_reverted_until_files_are_restored() {
+    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
+    let original_head = crate::session_history_head(&app.state.session);
+    app.revert_to(second_user, RestoreMode::Both);
+    let reverted_head = crate::session_history_head(&app.state.session);
+    let mut pending = app.state.session.meta.pending_revert.clone().unwrap();
+    let operation_id = MakiId::generate();
+    pending.restore_operation = Some(PendingRestoreOperation {
+        id: operation_id,
+        kind: PendingRestoreKind::Unrevert,
+        phase: PendingRestorePhase::Intent,
+        target_workspace_head: pending.original_workspace_head.clone().unwrap(),
+        conversation_target: Some(original_head.into()),
+        overwrite: false,
+    });
+    app.state
+        .session_mut()
+        .set_conversation_state(reverted_head, Some(pending));
+    app.storage_writer
+        .save_sync(Arc::clone(&app.state.session))
+        .unwrap();
+    let cwd = PathBuf::from(&app.state.session.cwd);
+
+    app.snapshot_store
+        .unrevert_transaction_with_policy(
+            &cwd,
+            maki_agent::snapshots::ConflictPolicy::Abort,
+            operation_id,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
+    let mut restarted = AppSession::load(app.state.session.id, &app.storage).unwrap();
+    assert_eq!(crate::session_history_head(&restarted), reverted_head);
+
+    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+    assert_eq!(crate::session_history_head(&restarted), original_head);
+    assert!(restarted.meta.pending_revert.is_none());
+}
+
+#[test]
+fn unrevert_conflict_keeps_pending_state_and_can_retry() {
+    let (_temp, mut app, path, _, second_user, first_head) = snapshot_revert_app();
+    let original_head = crate::session_history_head(&app.state.session);
+    app.revert_to(second_user, RestoreMode::Both);
+    std::fs::write(&path, CONFLICT_CONTENT).unwrap();
+
+    let actions = app.unrevert();
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        Some(first_head)
+    );
+    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
+    let status: RestoreStatus =
+        serde_json::from_value(pending.file_status.clone().unwrap()).unwrap();
+    assert!(status.worktree_is_reverted());
+
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    let actions = app.unrevert();
+
+    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        original_head
+    );
+    assert!(app.state.session.meta.pending_revert.is_none());
+}
+
+#[test]
+fn fork_targets_every_display_source_with_user_before_and_other_items_inclusive() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="));
+    let items = crate::history_items(&[
+        Message::user_display_with_images(
+            "expanded".into(),
+            "editable".into(),
+            vec![image.clone()],
+        ),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "reason".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+                ContentBlock::tool_use("call-1", "read", serde_json::json!({})),
+            ],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        },
+    ]);
+    let sources = [
+        (DisplaySource::User(items[0].id), 0),
+        (DisplaySource::Reasoning(items[1].id), 2),
+        (DisplaySource::AssistantText(items[2].id), 3),
+        (
+            DisplaySource::ToolCall {
+                id: items[3].id,
+                result_id: Some(items[4].id),
+            },
+            5,
+        ),
+        (DisplaySource::ToolResult(items[4].id), 5),
+    ];
+    app.state.session_mut().replace_messages(items.clone());
+
+    for (source, expected_len) in sources {
+        let forked = app.fork_at(source).unwrap();
+        assert_eq!(forked.session.messages(), &items[..expected_len]);
+        if matches!(source, DisplaySource::User(_)) {
+            let draft = forked.draft.unwrap();
+            assert_eq!(draft.text, "editable");
+            assert_eq!(draft.images.as_slice(), std::slice::from_ref(&image));
+        } else {
+            assert!(forked.draft.is_none());
+        }
+    }
+}
+
+#[test]
+fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user("run".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "call-1",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+    ]);
+    let source = DisplaySource::ToolCall {
+        id: items[1].id,
+        result_id: None,
+    };
+    app.state.session_mut().replace_messages(items.clone());
+    app.message_actions.open(source, false);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(matches!(actions.as_slice(), [Action::ForkSession(_)]));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SendMessage(_)))
+    );
+    let Action::ForkSession(forked) = &actions[0] else {
+        unreachable!()
+    };
+    assert_eq!(forked.session.messages(), items);
+}
+
+#[test]
+fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user("delegate".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "task-live",
+                "task",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "task-live".into(),
+                content: "done".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        },
+        Message::user("later".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "task-late",
+                "task",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+    ]);
+    let subagent = crate::history_items(&[
+        Message::user("inspect".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "nested-tool",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+    ]);
+    let session = app.state.session_mut();
+    session.replace_messages(items.clone());
+    session.set_subagent_messages("task-live".into(), subagent.clone());
+    session.set_subagent_messages(
+        "task-late".into(),
+        crate::history_items(&[Message::user("late".into())]),
+    );
+    for id in ["task-live", "nested-tool", "task-late"] {
+        session.insert_tool_output(id.into(), ToolOutput::Plain(id.into()));
+    }
+    session.set_subagents(vec![
+        StoredSubagent {
+            tool_use_id: "task-live".into(),
+            name: "live".into(),
+            model: Some("test-model".into()),
+        },
+        StoredSubagent {
+            tool_use_id: "task-late".into(),
+            name: "late".into(),
+            model: None,
+        },
+    ]);
+    let before = serde_json::to_value(&*app.state.session).unwrap();
+
+    let forked = app
+        .fork_at(DisplaySource::ToolCall {
+            id: items[1].id,
+            result_id: Some(items[2].id),
+        })
+        .unwrap();
+
+    assert_eq!(serde_json::to_value(&*app.state.session).unwrap(), before);
+    assert_eq!(forked.session.messages(), &items[..3]);
+    assert_eq!(
+        forked.session.subagent_messages()["task-live"].as_ref(),
+        &subagent
+    );
+    assert!(!forked.session.subagent_messages().contains_key("task-late"));
+    assert_eq!(forked.session.subagents().len(), 1);
+    assert!(forked.session.tool_outputs().contains_key("task-live"));
+    assert!(forked.session.tool_outputs().contains_key("nested-tool"));
+    assert!(!forked.session.tool_outputs().contains_key("task-late"));
+    assert_eq!(forked.session.token_usage, TokenUsage::default());
+    assert!(forked.session.meta.pending_revert.is_none());
+    assert!(forked.session.meta.queued_messages.is_empty());
+    assert!(forked.session.meta.active_goal.is_none());
+}
+
+#[test]
+fn fork_title_uses_next_number_for_base_title() {
+    let (_temp, storage, _, mut app) = tempdir_app();
+    app.state.session_mut().set_title("Investigate".into());
+    let mut existing = AppSession::new(&app.state.session.model, &app.state.session.cwd);
+    existing.set_title("Investigate (fork #2)".into());
+    existing.save(&storage).unwrap();
+    let item = crate::history_items(&[Message::user("prompt".into())]);
+    let source = DisplaySource::User(item[0].id);
+    app.state.session_mut().replace_messages(item);
+
+    let forked = app.fork_at(source).unwrap();
+
+    assert_eq!(forked.session.title, "Investigate (fork #3)");
+    assert_ne!(forked.session.id, app.state.session.id);
+    assert!(forked.session.created_at >= app.state.session.created_at);
+}
+
+#[test]
+fn fork_copies_execution_settings_but_resets_ephemeral_state() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let plan = PathBuf::from(&app.state.session.cwd).join("plan.md");
+    std::fs::write(&plan, "plan").unwrap();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(plan.clone());
+    app.state.thinking = ThinkingConfig::Adaptive;
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.permissions.load_session_rules(vec![PermissionRule {
+        tool: ToolKey::parse("bash").unwrap(),
+        scope: Some("cargo test".into()),
+        effect: Effect::Allow,
+    }]);
+    app.permissions.set_session_yolo(Some(true));
+    app.state.token_usage.input = 42;
+    app.state.session_mut().meta.input_draft = Some("old draft".into());
+    app.state.session_mut().meta.queued_messages = vec!["queued".into()];
+    app.state.session_mut().meta.active_goal = Some("goal".into());
+    let items = crate::history_items(&[Message::user("prompt".into())]);
+    let source = DisplaySource::User(items[0].id);
+    app.state.session_mut().replace_messages(items);
+
+    let forked = app.fork_at(source).unwrap();
+    let child = forked.session;
+
+    assert_eq!(child.model, app.state.session.model);
+    assert_eq!(child.cwd, app.state.session.cwd);
+    assert_eq!(child.meta.mode, Some(StoredMode::Plan));
+    assert_eq!(child.meta.plan_path.as_deref(), plan.to_str());
+    assert!(child.meta.plan_written);
+    assert_eq!(child.meta.thinking, Some(StoredThinking::Adaptive));
+    assert!(child.meta.fast);
+    assert!(child.meta.workflow);
+    assert_eq!(child.meta.session_rules.len(), 1);
+    assert_eq!(child.meta.yolo, Some(true));
+    assert_eq!(child.token_usage, TokenUsage::default());
+    assert!(child.usage_by_model().is_empty());
+    assert!(child.meta.input_draft.is_none());
+    assert!(child.meta.input_draft_images.is_empty());
+    assert!(child.meta.queued_messages.is_empty());
+    assert!(child.meta.active_goal.is_none());
+    assert!(child.meta.goal_result.is_none());
+    assert!(child.meta.pending_revert.is_none());
+}
+
+#[test]
+fn fork_copies_ancestor_snapshots_into_child_store_without_restoring_files() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    let path = workspace.join(SNAPSHOT_FILE);
+    std::fs::write(&path, ROOT_CONTENT).unwrap();
+    app.snapshot_store
+        .snapshot_session_start(&workspace)
+        .unwrap();
+    let items =
+        crate::history_items(&[Message::user("prompt".into()), assistant_message("answer")]);
+    app.state.session_mut().replace_messages(items.clone());
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    app.snapshot_store
+        .snapshot(&workspace, items[1].id)
+        .unwrap();
+    std::fs::write(&path, CURRENT_CONTENT).unwrap();
+
+    let forked = app
+        .fork_at(DisplaySource::AssistantText(items[1].id))
+        .unwrap();
+    let child = App::snapshot_store_for(
+        &app.storage,
+        forked.session.id,
+        std::path::Path::new(&forked.session.cwd),
+    )
+    .unwrap();
+
+    assert!(child.has_session_start());
+    assert!(child.has_checkpoint(items[1].id));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+}
+
+#[test]
+fn revert_is_rejected_while_streaming() {
+    let mut app = build_rewind_app();
+    let source = DisplaySource::AssistantText(app.state.session.messages()[1].id);
+    let head = crate::session_history_head(&app.state.session);
+    app.status = Status::Streaming;
+
+    let actions = app.revert_at(source, RestoreMode::Conversation);
+
+    assert!(actions.is_empty());
+    assert_eq!(crate::session_history_head(&app.state.session), head);
+    assert_eq!(app.status_bar.flash_text(), Some(REVERT_BUSY_MSG));
+}
+
+#[test]
+fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
+    let (_temp, mut reverting, path, _, second_user, _) = snapshot_revert_app();
+    let original_head = crate::session_history_head(&reverting.state.session);
+    reverting.status = Status::Streaming;
+    reverting.run_id = 1;
+    reverting.handle_cancel();
+
+    assert!(
+        reverting
+            .revert_to(second_user, RestoreMode::Both)
+            .is_empty()
+    );
+    assert_eq!(
+        crate::session_history_head(&reverting.state.session),
+        original_head
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+
+    let (_temp, mut unreverting, path, _, second_user, _) = snapshot_revert_app();
+    unreverting.revert_to(second_user, RestoreMode::Both);
+    let reverted_head = crate::session_history_head(&unreverting.state.session);
+    unreverting.status = Status::Streaming;
+    unreverting.run_id = 1;
+    unreverting.handle_cancel();
+
+    assert!(unreverting.unrevert().is_empty());
+    assert_eq!(
+        crate::session_history_head(&unreverting.state.session),
+        reverted_head
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -4086,7 +5370,7 @@ fn mcp_toggle_dispatches_action() {
 )]
 #[test_case(
     |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
+        crate::push_history_message(app.state.session_mut(), Message::user("test".into()));
         app.open_rewind_picker();
     },
     ""
@@ -4223,7 +5507,7 @@ fn streaming_app_with_history() -> App {
         },
     ];
     app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
-        maki_agent::HistorySnapshot::new(history),
+        maki_agent::HistorySnapshot::new(crate::history_items(&history)),
     )));
     app
 }
@@ -4851,7 +6135,8 @@ fn streaming_cancel_wins_over_quit_override() {
         matches!(&actions[0], Action::CancelAgent { .. }),
         "built-in cancel must win while streaming even when Ctrl+C is overridden"
     );
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.cancelling_run, Some(1));
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
@@ -4885,7 +6170,8 @@ fn streaming_cancel_wins_over_esc_override() {
         matches!(&actions[0], Action::CancelAgent { .. }),
         "built-in cancel must win while streaming even when Esc is overridden"
     );
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.cancelling_run, Some(1));
     assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
 
@@ -5700,7 +6986,7 @@ fn tool_text(id: &str) -> String {
 }
 
 fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::History {
-    let mirror: maki_agent::SharedMessages =
+    let mirror: maki_agent::SharedHistory =
         Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::default()));
     let history = maki_agent::History::new(messages).with_mirror(Arc::clone(&mirror));
     app.shared_history = Some(mirror);
@@ -5745,22 +7031,76 @@ fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
     drain_writer(app, writer);
 
     let loaded = AppSession::load(id, &dir).unwrap();
-    assert_eq!(loaded.messages().len(), 3);
-    let [
-        ContentBlock::ToolResult {
-            content, is_error, ..
-        },
-    ] = &loaded.messages()[2].content[..]
+    assert_eq!(loaded.messages().len(), 4);
+    let Some(HistoryItemKind::ToolResult {
+        content, is_error, ..
+    }) = loaded.messages().iter().find_map(|item| match &item.kind {
+        result @ HistoryItemKind::ToolResult { .. } => Some(result),
+        _ => None,
+    })
     else {
-        panic!("expected one real tool result: {:?}", loaded.messages()[2]);
+        panic!("expected one real tool result: {:?}", loaded.messages());
     };
     assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
 }
 
-/// In the window between a rewind and the agent respawn, syncing from the
-/// mirror would bring back the messages that were just dropped.
 #[test]
-fn checkpoint_after_rewind_persists_the_truncated_history() {
+fn restored_unfinished_batch_checkpoint_keeps_pending_unrevert_until_real_work() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user("go".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::tool_use("t1", "read", serde_json::json!({})),
+                ContentBlock::tool_use("t2", "read", serde_json::json!({})),
+            ],
+            ..Default::default()
+        },
+    ]);
+    let first_call = items[1].id;
+    let unfinished_head = items.last().unwrap().id;
+    app.state.session_mut().replace_messages(items);
+    let forked = app
+        .fork_at(DisplaySource::ToolCall {
+            id: first_call,
+            result_id: None,
+        })
+        .unwrap();
+    assert_eq!(forked.session.messages().len(), 3);
+    assert!(maki_agent::History::restored(forked.session.messages().to_vec()).is_ok());
+
+    app.revert_to(first_call, RestoreMode::Conversation);
+    assert!(app.state.session.meta.pending_revert.is_some());
+    assert_eq!(
+        crate::session_history_head(&app.state.session),
+        Some(unfinished_head)
+    );
+
+    let mirror: maki_agent::SharedHistory =
+        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    let mut history =
+        maki_agent::History::restored(crate::active_session_history(&app.state.session).unwrap())
+            .unwrap()
+            .with_mirror(Arc::clone(&mirror));
+    app.shared_history = Some(mirror);
+
+    app.checkpoint();
+
+    assert!(app.state.session.meta.pending_revert.is_some());
+    assert_ne!(
+        crate::session_history_head(&app.state.session),
+        Some(unfinished_head)
+    );
+
+    history.push(Message::user("actual work".into()));
+    app.checkpoint();
+    assert!(app.state.session.meta.pending_revert.is_none());
+}
+
+/// A staged head move is durable without deleting the inactive tail.
+#[test]
+fn checkpoint_after_rewind_persists_head_and_inactive_tail() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     let _live = attach_live_history(
         &mut app,
@@ -5774,7 +7114,6 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
     let entry = RewindEntry {
         turn_index: 1,
         prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
     };
     app.rewind_to(entry);
     assert!(app.shared_history.is_none(), "mirror handle is dropped");
@@ -5782,7 +7121,52 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
 
     let id = app.state.session.id;
     drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(loaded.messages().len(), 2);
+    assert_eq!(crate::active_session_history(&loaded).unwrap().len(), 1);
+    assert!(loaded.meta.pending_revert.is_some());
+}
+
+#[test]
+fn branched_checkpoint_and_restart_retain_the_abandoned_tail() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(
+        &mut app,
+        vec![
+            Message::user("first prompt".into()),
+            Message::user("abandoned prompt".into()),
+        ],
+    );
+    app.checkpoint();
+    let abandoned_id = app.state.session.messages()[1].id;
+    app.rewind_to(RewindEntry {
+        turn_index: 1,
+        prompt_preview: "2: abandoned".into(),
+    });
+
+    let mut branch = crate::active_session_history(&app.state.session).unwrap();
+    let parent_id = branch.last().map(|item| item.id);
+    branch.extend(expand_message(
+        &Message::user("replacement prompt".into()),
+        parent_id,
+    ));
+    let branch_head = branch.last().unwrap().id;
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
+        maki_agent::HistorySnapshot::new(branch),
+    )));
+    app.checkpoint();
+
+    assert_eq!(app.state.session.meta.pending_revert, None);
+    assert_eq!(app.state.session.meta.history_head, Some(branch_head));
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(loaded.messages().len(), 3);
+    assert!(loaded.messages().iter().any(|item| item.id == abandoned_id));
+    assert_eq!(crate::session_history_head(&loaded), Some(branch_head));
+    assert_eq!(crate::active_session_history(&loaded).unwrap().len(), 2);
+    assert_eq!(loaded.meta.pending_revert, None);
 }
 
 #[test]
@@ -5813,8 +7197,8 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
 #[test]
 fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    let mut stored = AppSession::new("test-model", "/tmp/test");
-    stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
+    let mut stored = AppSession::new("test-model", &app.state.session.cwd);
+    crate::push_history_message(&mut stored, Message::user(STORED_SESSION_TEXT.into()));
     stored.save(&dir).unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
@@ -5842,17 +7226,21 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     let loaded = AppSession::load(stored.id, &dir).unwrap();
     assert_eq!(loaded.meta.input_draft.as_deref(), Some(SWITCHED_DRAFT));
     assert_eq!(loaded.messages().len(), 1);
-    assert_eq!(loaded.messages()[0].user_text(), Some(STORED_SESSION_TEXT));
+    assert!(matches!(
+        &loaded.messages()[0].kind,
+        HistoryItemKind::User { text, .. } if text == STORED_SESSION_TEXT
+    ));
     let previous = AppSession::load(live_id, &dir).unwrap();
-    assert_eq!(previous.messages()[0].user_text(), Some(LIVE_AGENT_TEXT));
+    assert!(matches!(
+        &previous.messages()[0].kind,
+        HistoryItemKind::User { text, .. } if text == LIVE_AGENT_TEXT
+    ));
 }
 
 #[test]
 fn idle_checkpoint_changes_nothing() {
     let mut app = test_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
+    crate::push_history_message(app.state.session_mut(), Message::user("hello".into()));
     app.checkpoint();
     let (revision, updated_at) = (app.state.session.revision(), app.state.session.updated_at);
 
@@ -5896,9 +7284,10 @@ fn a_content_change_writes_the_waiting_draft_with_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     type_draft_leaving_last_key_waiting(&mut app);
 
-    app.state
-        .session_mut()
-        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(LIVE_AGENT_TEXT.into()),
+    );
     app.checkpoint_with(SOFT_DELAY_HELD);
 
     let id = app.state.session.id;
@@ -5919,6 +7308,17 @@ fn shutdown_writes_a_draft_that_is_still_waiting() {
     drain_writer(app, writer);
     let saved = AppSession::load(id, &dir).unwrap();
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
+}
+
+#[test]
+fn shutdown_preparation_preserves_unclaimed_queue_for_the_final_checkpoint() {
+    let mut app = app_with_queued_message();
+
+    app.prepare_shutdown();
+    app.disconnect_agent_queue();
+    app.checkpoint_now();
+
+    assert_eq!(app.state.session.meta.queued_messages, ["queued"]);
 }
 
 /// Submitting empties the draft a frame before the agent mirrors the prompt
@@ -5962,9 +7362,7 @@ fn deleting_the_draft_takes_the_session_off_disk() {
 #[test]
 fn two_tool_results_checkpointed_separately_both_reach_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("prompt".into()));
+    crate::push_history_message(app.state.session_mut(), Message::user("prompt".into()));
     app.status = Status::Streaming;
     app.run_id = 1;
 

@@ -13,12 +13,12 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
-    Instructions, McpCommand, PromptRole, SessionMailbox, SharedMessages, SubagentHistoryStore,
+    Instructions, McpCommand, PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore,
     ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model};
+use maki_providers::{AgentError, HistoryItem, Message, Model};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
@@ -36,6 +36,7 @@ pub(super) struct AgentLoop {
     tools: Value,
     mcp: Option<McpSession>,
     history: History,
+    history_restore_error: Option<String>,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
@@ -61,8 +62,8 @@ impl AgentLoop {
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
-        initial_history: Vec<Message>,
-        shared_history: SharedMessages,
+        initial_history: Vec<HistoryItem>,
+        shared_history: SharedHistory,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
@@ -80,7 +81,16 @@ impl AgentLoop {
         model_policy: Arc<ModelPolicy>,
         goal: GoalHandle,
     ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
+        let restored_history = History::restored(initial_history);
+        let initial_messages = restored_history
+            .as_ref()
+            .map(|history| history.as_slice())
+            .unwrap_or_default();
+        let mcp = mcp_handle.map(|h| McpSession::new(h, initial_messages));
+        let (history, history_restore_error) = match restored_history {
+            Ok(history) => (history.with_mirror(shared_history), None),
+            Err(error) => (History::default(), Some(error.to_string())),
+        };
         Self {
             model_slot,
             config,
@@ -89,7 +99,8 @@ impl AgentLoop {
             instructions: Instructions::default(),
             tools: Value::Null,
             mcp,
-            history: History::restored(initial_history).with_mirror(shared_history),
+            history,
+            history_restore_error,
             btw_system,
             cancel_map,
             init_cancel,
@@ -111,6 +122,13 @@ impl AgentLoop {
     }
 
     pub(super) async fn run(mut self) {
+        if let Some(error) = self.history_restore_error.take() {
+            error!(%error, "failed to restore history");
+            let _ = EventSender::new(self.agent_tx, self.min_run_id).send(AgentEvent::Error {
+                message: format!("Failed to restore history: {error}"),
+            });
+            return;
+        }
         if !self.initialize().await {
             return;
         }

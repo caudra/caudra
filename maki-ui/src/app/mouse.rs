@@ -9,23 +9,49 @@ use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
-use super::App;
 use super::tasks::MAIN_TASK_ID;
+use super::{App, MessageMouseDown};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(super) const MESSAGE_LONG_CLICK: Duration = Duration::from_millis(500);
+const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
 
 impl App {
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
         if self.paste_editor.is_open() {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.paste_editor.handle_click(event.row, event.column);
             }
-            return;
+            return Vec::new();
         }
         match event.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.any_overlay_open() {
+                    return Vec::new();
+                }
+                let Some(zone) = self.zone_at(event.row, event.column) else {
+                    return Vec::new();
+                };
+                if zone.zone != SelectionZone::Messages || !self.is_main_chat() {
+                    self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
+                    return Vec::new();
+                }
+                let area = self.msg_area();
+                if !area.contains(Position::new(event.column, event.row)) {
+                    self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
+                    return Vec::new();
+                }
+                let Some(source) = self.chats[0].source_at(event.row, area) else {
+                    self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
+                    return Vec::new();
+                };
+                self.message_actions
+                    .open(source, self.state.session.meta.pending_revert.is_some());
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.queue_mouse_down = None;
+                self.message_mouse_down = None;
                 if !self.is_main_chat()
                     && !self.has_modal_overlay()
                     && self
@@ -34,7 +60,7 @@ impl App {
                 {
                     self.selection_state = None;
                     let _ = self.focus_task(MAIN_TASK_ID);
-                    return;
+                    return Vec::new();
                 }
                 if !self.has_modal_overlay() {
                     self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
@@ -44,7 +70,7 @@ impl App {
                 }
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
-                        return;
+                        return Vec::new();
                     }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
@@ -58,8 +84,18 @@ impl App {
                         if let Some(id) = paste {
                             self.selection_state = None;
                             self.open_paste_editor(id);
-                            return;
+                            return Vec::new();
                         }
+                    }
+                    if zone.zone == SelectionZone::Messages
+                        && self.is_main_chat()
+                        && !self.has_modal_overlay()
+                        && let Some(source) = self.chats[0].source_at(event.row, self.msg_area())
+                    {
+                        self.message_mouse_down = Some(MessageMouseDown {
+                            source,
+                            since: Instant::now(),
+                        });
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
@@ -76,6 +112,7 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.message_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -86,12 +123,27 @@ impl App {
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if zone == SelectionZone::Messages
+                            && self.is_main_chat()
+                            && let Some(pressed) = self.message_mouse_down.take()
+                            && pressed.since.elapsed() >= MESSAGE_LONG_CLICK
+                            && self.chats[0].source_at(event.row, self.msg_area())
+                                == Some(pressed.source)
+                        {
+                            self.queue_mouse_down = None;
+                            self.message_actions.open(
+                                pressed.source,
+                                self.state.session.meta.pending_revert.is_some(),
+                            );
+                            return Vec::new();
+                        }
+                        self.message_mouse_down = None;
                         if !self.has_modal_overlay()
                             && let Some(pressed) = self.queue_mouse_down.take()
                             && self.queue_hit_at(event.row, event.column) == Some(pressed)
                         {
                             self.handle_queue_click(pressed);
-                            return;
+                            return Vec::new();
                         }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
@@ -104,7 +156,7 @@ impl App {
                                     .cloned()
                                     .unwrap_or_else(|| tool_id.to_owned());
                                 if self.focus_task(&task_id).is_ok() {
-                                    return;
+                                    return Vec::new();
                                 }
                             }
                             self.chats[self.active_chat].handle_click(event.row, area);
@@ -112,9 +164,11 @@ impl App {
                     }
                 }
                 self.queue_mouse_down = None;
+                self.message_mouse_down = None;
             }
             _ => {}
         }
+        Vec::new()
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {

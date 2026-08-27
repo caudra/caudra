@@ -13,7 +13,8 @@ use super::tool_display::{
     thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
+    DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, apply_scroll_delta,
+    code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -186,6 +187,24 @@ impl MessagesPanel {
         self.rebake_requested.clear();
         self.highlight_segment = None;
         self.thinking_collapsed = !self.show_thinking;
+    }
+
+    pub fn bind_sources(&mut self, source_messages: &[DisplayMessage]) {
+        let mut start = 0;
+        for message in &mut self.messages {
+            let Some(offset) = source_messages[start..]
+                .iter()
+                .position(|source| same_display_item(message, source))
+            else {
+                continue;
+            };
+            let source = &source_messages[start + offset];
+            message.source = source.source;
+            start += offset + 1;
+            if start == source_messages.len() {
+                break;
+            }
+        }
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -632,6 +651,27 @@ impl MessagesPanel {
             .as_deref()
     }
 
+    pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
+        if area.height == 0 || row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let segment = self.cache.segment_at_row(doc_row, self.viewport_width)?.1;
+        if let Some(index) = segment.msg_index {
+            return self.messages.get(index)?.source;
+        }
+        let tool_id = segment
+            .tool_id
+            .as_deref()
+            .and_then(segment::instruction_parent)
+            .or(segment.tool_id.as_deref())?;
+        self.messages.iter().rev().find_map(|message| {
+            matches!(&message.role, DisplayRole::Tool(tool) if tool.id == tool_id)
+                .then_some(message.source)
+                .flatten()
+        })
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
@@ -860,16 +900,26 @@ impl MessagesPanel {
             }
             let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
+            let style = if seg.tool_id.is_some() {
+                Some(theme::current().tool_bg)
+            } else {
+                seg.msg_index
+                    .and_then(|index| self.messages.get(index))
+                    .and_then(|message| message_background(&message.role))
+            };
             cursor.render(seg.lines(), h, style, highlight, frame);
         }
 
         let mut height_idx = 0usize;
-        let streamed: [(&StreamingContent, bool); 2] = [
-            (&self.streaming_thinking, thinking_collapsed),
-            (&self.streaming_text, false),
+        let streamed: [(&StreamingContent, bool, Option<Style>); 2] = [
+            (&self.streaming_thinking, thinking_collapsed, None),
+            (
+                &self.streaming_text,
+                false,
+                Some(theme::current().assistant_message_style()),
+            ),
         ];
-        for (sc, collapsed) in streamed {
+        for (sc, collapsed, style) in streamed {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
                 continue;
             }
@@ -884,7 +934,7 @@ impl MessagesPanel {
                 if collapsed {
                     cursor.render(&collapsed_thinking_lines, h, None, false, frame);
                 } else {
-                    cursor.render(sc.cached_lines(), h, None, false, frame);
+                    cursor.render(sc.cached_lines(), h, style, false, frame);
                 }
             }
         }
@@ -1487,6 +1537,16 @@ impl MessagesPanel {
     }
 }
 
+fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
+    match (&left.role, &right.role) {
+        (DisplayRole::Tool(left), DisplayRole::Tool(right)) => left.id == right.id,
+        (DisplayRole::User, DisplayRole::User)
+        | (DisplayRole::Assistant, DisplayRole::Assistant)
+        | (DisplayRole::Thinking, DisplayRole::Thinking) => left.text == right.text,
+        _ => false,
+    }
+}
+
 /// Two-line thinking indicator: a header (`thinking> ...`) followed by a
 /// `(N lines) (click to expand)` footer. Shared by the streaming and cached
 /// views when `show_thinking` is off.
@@ -1506,6 +1566,17 @@ fn logical_line_count(text: &str) -> usize {
         0
     } else {
         text.bytes().filter(|&b| b == b'\n').count() + 1
+    }
+}
+
+fn message_background(role: &DisplayRole) -> Option<Style> {
+    let theme = theme::current();
+    match role {
+        DisplayRole::User => Some(theme.user_message_style()),
+        DisplayRole::Assistant => Some(theme.assistant_message_style()),
+        DisplayRole::Thinking | DisplayRole::Error | DisplayRole::Done | DisplayRole::Tool(_) => {
+            None
+        }
     }
 }
 
