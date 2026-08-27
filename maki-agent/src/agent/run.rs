@@ -26,7 +26,8 @@ use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
+    ExtractedCommand, InterruptSource, QueueConsumedItem, SessionMailbox, SubagentHistoryStore,
+    TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -228,26 +229,28 @@ impl<'h> Agent<'h> {
     /// Cancellation is an ending, not a failure: it comes back as
     /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
     pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
-        let AgentInput {
-            message,
-            mode,
-            images,
-            preamble,
-            thinking,
-            fast,
-            workflow,
-            prompt: _,
-        } = input;
+        self.run_inputs(vec![input], false).await
+    }
+
+    pub async fn run_batch(
+        &mut self,
+        first: AgentInput,
+        rest: Vec<AgentInput>,
+    ) -> Result<DoneReason, AgentError> {
+        let mut inputs = Vec::with_capacity(rest.len() + 1);
+        inputs.push(first);
+        inputs.extend(rest);
+        self.run_inputs(inputs, true).await
+    }
+
+    async fn run_inputs(
+        &mut self,
+        inputs: Vec<AgentInput>,
+        queued: bool,
+    ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
         self.rollback_len = self.history.len();
-        self.push_input_context(preamble);
-        if !message.trim().is_empty() || !images.is_empty() {
-            self.history
-                .push(Message::user_with_images(message.clone(), images));
-        }
-        self.mode = mode;
-        self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
+        let message = self.push_user_inputs(inputs, queued);
 
         info!(
             model = %self.model.id,
@@ -296,6 +299,41 @@ impl<'h> Agent<'h> {
         self.emit_done(reason)?;
 
         Ok(reason)
+    }
+
+    fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
+        let Some(latest) = inputs.last() else {
+            return String::new();
+        };
+        self.mode = latest.mode.clone();
+        self.workflow = latest.workflow;
+        self.opts = RequestOptions {
+            thinking: latest.thinking,
+            fast: latest.fast,
+        };
+
+        let mut preamble = Vec::new();
+        for input in &mut inputs {
+            preamble.append(&mut input.preamble);
+        }
+        self.push_input_context(preamble);
+
+        let mut telemetry = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.message.trim().is_empty() && input.images.is_empty() {
+                continue;
+            }
+            telemetry.push(input.message.clone());
+            let message = if queued {
+                let display = input.message;
+                let wrapped = queued_message(&display);
+                Message::user_display_with_images(wrapped, display, input.images)
+            } else {
+                Message::user_with_images(input.message, input.images)
+            };
+            self.history.push(message);
+        }
+        telemetry.join("\n\n")
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -774,18 +812,30 @@ impl<'h> Agent<'h> {
             return Ok(false);
         };
         match cmd {
-            ExtractedCommand::Interrupt(mut input, _) => {
+            ExtractedCommand::Interrupt(input, run_id, id) => {
                 self.event_tx.send(AgentEvent::QueueItemConsumed {
+                    id,
                     text: input.message.clone(),
                     image_count: input.images.len(),
                 })?;
-                self.push_input_context(std::mem::take(&mut input.preamble));
-                self.mode = input.mode.clone();
-                let display = input.message.clone();
-                let wrapped = format!(
-                    "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
+                self.push_user_inputs(vec![input], true);
+                let _ = run_id;
+            }
+            ExtractedCommand::InterruptBatch(inputs) => {
+                self.event_tx.send(AgentEvent::QueueBatchConsumed {
+                    items: inputs
+                        .iter()
+                        .map(|queued| QueueConsumedItem {
+                            id: queued.id,
+                            text: queued.input.message.clone(),
+                            image_count: queued.input.images.len(),
+                        })
+                        .collect(),
+                })?;
+                self.push_user_inputs(
+                    inputs.into_iter().map(|queued| queued.input).collect(),
+                    true,
                 );
-                self.history.push(Message::user_display(wrapped, display));
             }
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
@@ -793,6 +843,12 @@ impl<'h> Agent<'h> {
         }
         Ok(true)
     }
+}
+
+fn queued_message(display: &str) -> String {
+    format!(
+        "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
+    )
 }
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -833,9 +889,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::Envelope;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::{Envelope, QueueItemId};
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1358,7 +1414,11 @@ mod tests {
             SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
-            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                input,
+                0,
+                QueueItemId::new(),
+            )]);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             agent.mailbox = Some(mailbox);
@@ -1375,6 +1435,59 @@ mod tests {
             assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
             assert!(history.as_slice()[0].is_observation());
             assert!(history.as_slice()[1].is_observation());
+        });
+    }
+
+    #[test]
+    fn queued_batch_emits_one_event_and_preserves_separate_history_messages() {
+        smol::block_on(async {
+            let first_id = QueueItemId::new();
+            let second_id = QueueItemId::new();
+            let mut first = default_input();
+            first.message = "first".into();
+            first.images.push(maki_providers::ImageSource::new(
+                maki_providers::ImageMediaType::Png,
+                Arc::from("aGVsbG8="),
+            ));
+            let mut second = default_input();
+            second.message = "second".into();
+            let source = MockInterruptSource::new(vec![ExtractedCommand::InterruptBatch(vec![
+                crate::QueuedInterrupt {
+                    id: first_id,
+                    input: first,
+                    run_id: 0,
+                },
+                crate::QueuedInterrupt {
+                    id: second_id,
+                    input: second,
+                    run_id: 0,
+                },
+            ])]);
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent.with_interrupt_source(source);
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let events = drain_events(&event_rx);
+            let items = events
+                .iter()
+                .find_map(|envelope| match &envelope.event {
+                    AgentEvent::QueueBatchConsumed { items } => Some(items),
+                    _ => None,
+                })
+                .expect("batch consumption event missing");
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].id, first_id);
+            assert_eq!(items[1].id, second_id);
+            assert_eq!(history.len(), 2);
+            assert_eq!(history.as_slice()[0].user_text(), Some("first"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("second"));
+            assert!(matches!(
+                history.as_slice()[0].content.first(),
+                Some(ContentBlock::Image { .. })
+            ));
         });
     }
 
@@ -1540,6 +1653,7 @@ mod tests {
                 Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
                     default_input(),
                     0,
+                    QueueItemId::new(),
                 )]))
             } else {
                 None

@@ -5,6 +5,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -21,7 +22,7 @@ use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredPasteRange, StoredThinking};
+use maki_storage::sessions::{StoredMode, StoredPasteRange, StoredQueuedDraft, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -707,6 +708,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
 
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
+            id: maki_agent::QueueItemId::new(),
             text: "queued".into(),
             image_count: 0,
         },
@@ -731,6 +733,7 @@ fn queue_item_consumed_marks_agent_streaming() {
 
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
+            id: maki_agent::QueueItemId::new(),
             text: "restored".into(),
             image_count: 0,
         },
@@ -1410,9 +1413,9 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
 
     let mut app = test_app();
     app.run_id = 1;
-    let (steer_tx, steer_rx) = flume::unbounded();
+    let (steer_tx, _steer_rx) = maki_agent::steering_queue();
     let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
-    info.steer_tx = Some(steer_tx);
+    info.steer_tx = Some(steer_tx.clone());
     app.update(subagent_msg_with_info(
         AgentEvent::TextDelta {
             text: "working".into(),
@@ -1426,8 +1429,8 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert!(actions.is_empty());
-    let input = steer_rx.try_recv().expect("steer was not sent");
-    assert_eq!(input.message, STEER);
+    let queued = steer_tx.entries();
+    assert_eq!(queued[0].text, STEER);
     assert_eq!(app.chats[1].message_count(), 0, "wait for consumption ack");
     assert!(
         rendered(&mut app).contains(STEER),
@@ -1436,6 +1439,7 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
 
     app.update(subagent_msg_with_info(
         AgentEvent::QueueItemConsumed {
+            id: queued[0].id,
             text: STEER.into(),
             image_count: 0,
         },
@@ -1453,9 +1457,9 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
 fn subagent_paste_submits_expanded() {
     let mut app = test_app();
     app.run_id = 1;
-    let (steer_tx, steer_rx) = flume::unbounded();
+    let (steer_tx, _steer_rx) = maki_agent::steering_queue();
     let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
-    info.steer_tx = Some(steer_tx);
+    info.steer_tx = Some(steer_tx.clone());
     app.update(subagent_msg_with_info(
         AgentEvent::TextDelta {
             text: "working".into(),
@@ -1471,16 +1475,16 @@ fn subagent_paste_submits_expanded() {
         "[Pasted 3 lines] "
     );
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
-    assert_eq!(steer_rx.try_recv().unwrap().message, "a\nb\nc");
+    assert_eq!(steer_tx.entries()[0].text, "a\nb\nc");
 }
 
 #[test]
-fn unconsumed_subagent_steer_returns_to_the_composer_on_close() {
+fn unconsumed_subagent_steer_remains_unsent_on_close() {
     const STEER: &str = "do not change the public API";
 
     let mut app = test_app();
     app.run_id = 1;
-    let (steer_tx, steer_rx) = flume::unbounded();
+    let (steer_tx, _steer_rx) = maki_agent::steering_queue();
     let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
     info.steer_tx = Some(steer_tx);
     app.update(subagent_msg_with_info(
@@ -1493,12 +1497,39 @@ fn unconsumed_subagent_steer_returns_to_the_composer_on_close() {
     app.sync_subagent_input_target();
     app.subagent_input_box.set_input(STEER.into());
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(steer_rx.try_recv().unwrap().message, STEER);
-
     close_subagent_transcript(&mut app, TASK_ID);
 
-    assert_eq!(app.subagent_input_box.buffer.value(), STEER);
+    assert_eq!(app.subagent_input_box.buffer.value(), "");
     assert!(!app.subagent_steers.contains_key(TASK_ID));
+    assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+    assert_eq!(app.unsent_subagent_steers[TASK_ID][0].text, STEER);
+}
+
+#[test]
+fn main_error_preserves_unconsumed_subagent_steers_as_unsent() {
+    const STEER: &str = "keep this guidance";
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = maki_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input(STEER.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.active_chat = 0;
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "provider failed".into(),
+    }));
+
+    assert_eq!(app.unsent_subagent_steers[TASK_ID][0].text, STEER);
     assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
 }
 
@@ -1677,6 +1708,7 @@ fn open_search(app: &mut App) {
 }
 
 fn focus_queue(app: &mut App) {
+    app.active_chat = 0;
     app.status = Status::Streaming;
     app.run_id = 1;
     app.queue_and_notify(queued_msg("q"));
@@ -2047,6 +2079,57 @@ fn rendered(app: &mut App) -> String {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     buffer_text(terminal.backend().buffer())
+}
+
+fn click_queue_action(app: &mut App, action: QueueAction) {
+    let _ = rendered(app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: hit_action,
+                    ..
+                } if hit_action == action
+            )
+        })
+        .copied()
+        .expect("queue action was not rendered");
+    let column = hit.area.x + hit.area.width.saturating_sub(1) / 2;
+    let row = hit.area.y;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+}
+
+fn click_queue_delivery_toggle(app: &mut App) {
+    let _ = rendered(app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| hit.target == QueueHitTarget::ToggleTogether)
+        .copied()
+        .expect("queue delivery toggle was not rendered");
+    let column = hit.area.x + hit.area.width.saturating_sub(1) / 2;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        hit.area.y,
+    ));
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the
@@ -2485,23 +2568,31 @@ fn queue_boundary_clamps() {
 }
 
 #[test]
-fn queue_enter_removes_selected() {
+fn queue_enter_edits_selected_in_place() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
     app.queue.set_focus_at(0);
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "second");
+    assert!(app.queue_editor_active());
+    assert_eq!(app.input_box.buffer.value(), "queued");
+
+    app.input_box.set_input("edited".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.queue_editor_active());
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(app.queue.panel_entries()[0].text, "edited");
+    assert_eq!(app.queue.panel_entries()[1].text, "second");
     assert_eq!(app.queue.focus(), Some(0));
 }
 
 #[test]
-fn queue_enter_deletes_last_unfocuses() {
+fn queue_delete_key_deletes_last_and_unfocuses() {
     let mut app = app_with_queued_message();
     app.queue.set_focus_at(0);
 
-    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Key(key(KeyCode::Char('d'))));
     assert!(app.queue.is_empty());
     assert!(app.queue.focus().is_none());
 }
@@ -2533,6 +2624,256 @@ fn ctrl_q_pops_front() {
         Some(0),
         "focus adjusted when item removed"
     );
+}
+
+#[test]
+fn queue_batch_key_toggles_one_shot_delivery() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(
+        app.queue.delivery(),
+        maki_agent::QueueDelivery::TogetherNextTurn
+    );
+    assert!(rendered(&mut app).contains("Mode: Together"));
+
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.queue.delivery(), maki_agent::QueueDelivery::Separate);
+}
+
+#[test]
+fn queue_title_mouse_toggle_switches_delivery_mode() {
+    let mut app = app_with_queued_message();
+
+    assert!(rendered(&mut app).contains("Mode: Separate"));
+    click_queue_delivery_toggle(&mut app);
+    assert_eq!(
+        app.queue.delivery(),
+        maki_agent::QueueDelivery::TogetherNextTurn
+    );
+    assert!(rendered(&mut app).contains("Mode: Together"));
+    click_queue_delivery_toggle(&mut app);
+    assert_eq!(app.queue.delivery(), maki_agent::QueueDelivery::Separate);
+}
+
+#[test]
+fn consumed_batch_renders_separate_grouped_user_bubbles() {
+    let mut app = test_app();
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::QueueBatchConsumed {
+        items: vec![
+            maki_agent::QueueConsumedItem {
+                id: maki_agent::QueueItemId::new(),
+                text: "first".into(),
+                image_count: 0,
+            },
+            maki_agent::QueueConsumedItem {
+                id: maki_agent::QueueItemId::new(),
+                text: "second".into(),
+                image_count: 0,
+            },
+        ],
+    }));
+
+    assert_eq!(app.main_chat().message_count(), 2);
+    assert_eq!(app.main_chat().message_at(0).unwrap().text, "first");
+    assert_eq!(app.main_chat().message_at(1).unwrap().text, "second");
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn mouse_selects_and_edits_queue_without_losing_composer_draft() {
+    let mut app = app_with_queued_message();
+    app.input_box.set_input("keep this draft".into());
+
+    click_queue_action(&mut app, QueueAction::Select);
+    assert_eq!(app.queue.focus(), Some(0));
+
+    click_queue_action(&mut app, QueueAction::Edit);
+    assert!(app.queue_editor_active());
+    assert_eq!(app.input_box.buffer.value(), "queued");
+
+    app.input_box.set_input("edited with mouse".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.queue.panel_entries()[0].text, "edited with mouse");
+    assert_eq!(app.input_box.buffer.value(), "keep this draft");
+}
+
+#[test]
+fn mouse_delete_is_explicit_and_atomic() {
+    let mut app = app_with_queued_message();
+
+    click_queue_action(&mut app, QueueAction::Select);
+    assert_eq!(app.queue.len(), 1, "selection is not destructive");
+    click_queue_action(&mut app, QueueAction::Delete);
+
+    assert!(app.queue.is_empty());
+    assert!(app.queue.focus().is_none());
+}
+
+#[test]
+fn dragging_queue_text_does_not_select_or_delete_item() {
+    let mut app = app_with_queued_message();
+    let _ = rendered(&mut app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .unwrap();
+    let row = hit.area.y;
+    let start = hit.area.x;
+    let end = (start + 3).min(hit.area.right().saturating_sub(1));
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        start,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        end,
+        row,
+    ));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), end, row));
+
+    assert!(app.selection_state.is_some());
+    assert!(app.queue.focus().is_none());
+    assert_eq!(app.queue.len(), 1);
+}
+
+#[test]
+fn wheel_over_long_queue_scrolls_its_bounded_viewport() {
+    let mut app = app_with_queued_message();
+    for index in 1..6 {
+        app.queue_and_notify(queued_msg(&format!("queued {index}")));
+    }
+    let _ = rendered(&mut app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .unwrap();
+
+    app.update(Msg::Scroll {
+        column: hit.area.x,
+        row: hit.area.y,
+        delta: -3,
+    });
+
+    assert_eq!(app.queue.viewport(), 2);
+    assert_eq!(crate::components::queue_panel::height(app.queue.len()), 6);
+}
+
+#[test]
+fn subagent_queue_edit_updates_the_real_interrupt_queue() {
+    const STEER: &str = "inspect auth";
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = maki_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input(STEER.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    app.focus_active_queue();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.subagent_input_box
+        .set_input("inspect session auth".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(steer_queue.entries()[0].text, "inspect session auth");
+    assert_eq!(
+        app.pending_subagent_steers[TASK_ID][0].text,
+        "inspect session auth"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('d'))));
+    assert!(steer_queue.entries().is_empty());
+    assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+#[test]
+fn subagent_together_delivery_is_scoped_to_that_task() {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = maki_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input("first".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.focus_active_queue();
+
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+
+    assert_eq!(
+        steer_queue.delivery(),
+        maki_agent::QueueDelivery::TogetherNextTurn
+    );
+    assert_eq!(app.queue.delivery(), maki_agent::QueueDelivery::Separate);
+}
+
+#[test]
+fn finished_task_mouse_action_moves_unsent_item_to_main() {
+    const STEER: &str = "report the failure";
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = maki_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input(STEER.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    close_subagent_transcript(&mut app, TASK_ID);
+
+    click_queue_action(&mut app, QueueAction::Select);
+    click_queue_action(&mut app, QueueAction::MoveMain);
+
+    assert!(!app.unsent_subagent_steers.contains_key(TASK_ID));
+    assert_eq!(app.queue.panel_entries()[0].text, STEER);
 }
 
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
@@ -2731,12 +3072,62 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.queued_messages.clear();
 
+    session.meta.unsent_subagent_messages.insert(
+        TASK_ID.into(),
+        vec![StoredQueuedDraft {
+            text: "unsent".into(),
+            paste_ranges: Vec::new(),
+        }],
+    );
+    assert!(session_has_content(&session));
+    session.meta.unsent_subagent_messages.clear();
+
     session.meta.mode = Some(StoredMode::Plan);
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
 
     session.push_message(Message::user("hello".into()));
     assert!(session_has_content(&session));
+}
+
+#[test]
+fn checkpoint_and_restore_preserve_separate_unsent_task_messages() {
+    let mut app = test_app();
+    app.unsent_subagent_steers.insert(
+        TASK_ID.into(),
+        ["first", "second"]
+            .into_iter()
+            .map(|text| PendingSteer {
+                id: maki_agent::QueueItemId::new(),
+                text: text.into(),
+                draft: InputDraft {
+                    text: text.into(),
+                    paste_ranges: Vec::new(),
+                },
+            })
+            .collect(),
+    );
+
+    app.checkpoint();
+    let stored = app.state.session.meta.unsent_subagent_messages.clone();
+    assert_eq!(
+        stored[TASK_ID]
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+
+    let mut restored = test_app();
+    restored.state.session_mut().meta.unsent_subagent_messages = stored;
+    restored.restore_display();
+    assert_eq!(
+        restored.unsent_subagent_steers[TASK_ID]
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
 }
 
 #[test]
@@ -2767,6 +3158,26 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
     assert!(session_has_content(session));
+}
+
+#[test]
+fn checkpoint_and_restore_preserve_together_delivery() {
+    let mut app = app_with_queued_message();
+    app.queue
+        .set_delivery(maki_agent::QueueDelivery::TogetherNextTurn);
+    app.checkpoint();
+
+    assert!(app.state.session.meta.queued_messages_together);
+    let meta = app.state.session.meta.clone();
+    let mut restored = test_app();
+    restored.state.session_mut().meta = meta;
+    restored.flush_restored_queue();
+
+    assert_eq!(
+        restored.queue.delivery(),
+        maki_agent::QueueDelivery::TogetherNextTurn
+    );
+    assert_eq!(restored.queue.panel_entries().len(), 1);
 }
 
 #[test]
@@ -4052,6 +4463,8 @@ fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
 fn error_event_matching_run_id_saves_session_and_queued_messages() {
     let mut app = streaming_app_with_history();
     app.queue_and_notify(queued_msg("next"));
+    app.queue
+        .set_delivery(maki_agent::QueueDelivery::TogetherNextTurn);
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
@@ -4060,6 +4473,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
 
     assert_eq!(app.state.session.messages().len(), 2);
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.state.session.meta.queued_messages_together);
     assert!(app.queue.is_empty());
 
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
@@ -4067,21 +4481,26 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     type_and_submit(&mut app, "replacement");
     app.checkpoint();
     assert!(app.state.session.meta.queued_messages.is_empty());
+    assert!(!app.state.session.meta.queued_messages_together);
 }
 
 #[test]
 fn flush_restored_queue_drops_recovery_snapshot() {
     let mut app = streaming_app_with_history();
     app.queue_and_notify(queued_msg("next"));
+    app.queue
+        .set_delivery(maki_agent::QueueDelivery::TogetherNextTurn);
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.state.session.meta.queued_messages_together);
 
     app.flush_restored_queue();
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.state.session.meta.queued_messages_together);
     assert!(app.recoverable_queue.is_empty());
 
     app.queue.clear();

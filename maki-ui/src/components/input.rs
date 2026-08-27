@@ -42,6 +42,7 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "remove dead code",
 ];
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
+const QUEUE_EDIT_PLACEHOLDER: &str = "Edit queued message...";
 const STEER_PLACEHOLDER: &str = "Steer this task...";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
@@ -52,6 +53,7 @@ pub enum Placeholder {
     Suggestion,
     Blank,
     Queue,
+    QueueEdit,
     Steer,
 }
 
@@ -68,6 +70,11 @@ pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
     pub(crate) draft: InputDraft,
+}
+
+pub(crate) struct InputState {
+    draft: InputDraft,
+    images: Vec<ImageSource>,
 }
 
 impl Submission {
@@ -111,6 +118,14 @@ pub struct InputBox {
 
 impl InputBox {
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        self.handle_key_inner(key, true)
+    }
+
+    pub(crate) fn handle_editor_key(&mut self, key: KeyEvent) -> InputAction {
+        self.handle_key_inner(key, false)
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent, record_history: bool) -> InputAction {
         self.follow_cursor = true;
 
         match key.code {
@@ -135,7 +150,7 @@ impl InputBox {
                 return InputAction::ContinueLine;
             }
             KeyCode::Enter => {
-                return match self.submit() {
+                return match self.submit_inner(record_history) {
                     Some(sub) => InputAction::Submit(sub),
                     None => InputAction::Submit(Submission::empty()),
                 };
@@ -273,14 +288,21 @@ impl InputBox {
         self.buffer.add_line();
     }
 
+    #[cfg(test)]
     pub fn submit(&mut self) -> Option<Submission> {
+        self.submit_inner(true)
+    }
+
+    fn submit_inner(&mut self, record_history: bool) -> Option<Submission> {
         let draft = self.buffer.draft();
         let text = draft.text.trim().to_string();
         let images = mem::take(&mut self.pending_images);
         if text.is_empty() && images.is_empty() {
             return None;
         }
-        self.history.push(text.clone());
+        if record_history {
+            self.history.push(text.clone());
+        }
         self.discard();
         Some(Submission {
             text,
@@ -315,6 +337,21 @@ impl InputBox {
 
     pub(crate) fn set_draft(&mut self, draft: InputDraft) {
         self.buffer = InputDocument::from_draft(draft);
+    }
+
+    pub(crate) fn take_state(&mut self) -> InputState {
+        let state = InputState {
+            draft: self.draft(),
+            images: mem::take(&mut self.pending_images),
+        };
+        self.discard();
+        state
+    }
+
+    pub(crate) fn set_state(&mut self, state: InputState) {
+        self.set_draft(state.draft);
+        self.pending_images = state.images;
+        self.move_to_end();
     }
 
     pub(crate) fn expanded_text(&self) -> String {
@@ -444,6 +481,7 @@ impl InputBox {
                     ],
                 ),
                 Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
+                Placeholder::QueueEdit => (QUEUE_EDIT_PLACEHOLDER, Vec::new()),
                 Placeholder::Steer => (STEER_PLACEHOLDER, Vec::new()),
                 Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
             };

@@ -112,6 +112,9 @@ impl App {
     /// are looked up by id, never by position and never through `chat_index`,
     /// a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
+        self.cancel_queue_edit();
+        self.unfocus_active_queue();
+        self.task_queue_viewport = 0;
         self.active_chat = if id == MAIN_TASK_ID {
             0
         } else {

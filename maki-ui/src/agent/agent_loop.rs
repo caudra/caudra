@@ -117,12 +117,24 @@ impl AgentLoop {
 
         while let Ok(()) = self.queue.recv_notify().await {
             let mut last_run_id = None;
-            while let Some(entry) = self.queue.pop() {
-                if entry.run_id() < self.min_run_id {
-                    continue;
+            loop {
+                let mut claimed = self.queue.claim();
+                if claimed.is_empty() {
+                    break;
                 }
-                last_run_id = Some(entry.run_id());
-                self.process_entry(entry).await;
+                claimed.retain(|(_, entry)| entry.run_id() >= self.min_run_id);
+                let Some((_, last)) = claimed.last() else {
+                    continue;
+                };
+                last_run_id = Some(last.run_id());
+                if claimed.len() == 1 {
+                    let Some((id, entry)) = claimed.pop() else {
+                        continue;
+                    };
+                    self.process_entry(id, entry).await;
+                } else {
+                    self.process_batch(claimed).await;
+                }
             }
             if let Some(run_id) = last_run_id {
                 let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
@@ -132,7 +144,7 @@ impl AgentLoop {
         }
     }
 
-    async fn process_entry(&mut self, entry: QueueItem) {
+    async fn process_entry(&mut self, id: maki_agent::QueueItemId, entry: QueueItem) {
         let run_id = entry.run_id();
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
 
@@ -145,7 +157,11 @@ impl AgentLoop {
                 ..
             } => {
                 if !displayed {
-                    let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
+                    let _ = event_tx.send(AgentEvent::QueueItemConsumed {
+                        id,
+                        text,
+                        image_count,
+                    });
                 }
                 self.do_agent_run(input, event_tx, run_id).await
             }
@@ -154,6 +170,40 @@ impl AgentLoop {
 
         if let Err(e) = result {
             self.emit_error(run_id, e);
+        }
+    }
+
+    async fn process_batch(&mut self, entries: Vec<(maki_agent::QueueItemId, QueueItem)>) {
+        let Some(run_id) = entries.last().map(|(_, entry)| entry.run_id()) else {
+            return;
+        };
+        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        let mut consumed = Vec::with_capacity(entries.len());
+        let mut inputs = Vec::with_capacity(entries.len());
+        for (id, entry) in entries {
+            let QueueItem::Message {
+                text,
+                image_count,
+                input,
+                displayed: false,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            consumed.push(maki_agent::QueueConsumedItem {
+                id,
+                text,
+                image_count,
+            });
+            inputs.push(input);
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        let _ = event_tx.send(AgentEvent::QueueBatchConsumed { items: consumed });
+        if let Err(error) = self.do_agent_batch(inputs, event_tx, run_id).await {
+            self.emit_error(run_id, error);
         }
     }
 
@@ -201,10 +251,31 @@ impl AgentLoop {
 
     async fn do_agent_run(
         &mut self,
-        mut input: AgentInput,
+        input: AgentInput,
         event_tx: EventSender,
         run_id: u64,
     ) -> Result<(), AgentError> {
+        self.do_agent_inputs(vec![input], event_tx, run_id).await
+    }
+
+    async fn do_agent_batch(
+        &mut self,
+        inputs: Vec<AgentInput>,
+        event_tx: EventSender,
+        run_id: u64,
+    ) -> Result<(), AgentError> {
+        self.do_agent_inputs(inputs, event_tx, run_id).await
+    }
+
+    async fn do_agent_inputs(
+        &mut self,
+        mut inputs: Vec<AgentInput>,
+        event_tx: EventSender,
+        run_id: u64,
+    ) -> Result<(), AgentError> {
+        let Some(input) = inputs.last_mut() else {
+            return Ok(());
+        };
         let slot = self.model_slot.load();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
@@ -288,7 +359,15 @@ impl AgentLoop {
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone());
 
-        let result = agent.run(input).await;
+        let result = if inputs.len() == 1 {
+            let Some(input) = inputs.pop() else {
+                return Ok(());
+            };
+            agent.run(input).await
+        } else {
+            let first = inputs.remove(0);
+            agent.run_batch(first, inputs).await
+        };
         drop(agent);
 
         self.clear_cancel_trigger(run_id);

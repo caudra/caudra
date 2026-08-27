@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
+use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -24,6 +25,7 @@ impl App {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.queue_mouse_down = None;
                 if !self.is_main_chat()
                     && !self.has_modal_overlay()
                     && self
@@ -33,6 +35,12 @@ impl App {
                     self.selection_state = None;
                     let _ = self.focus_task(MAIN_TASK_ID);
                     return;
+                }
+                if !self.has_modal_overlay() {
+                    self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
+                    if self.queue_mouse_down.is_none() {
+                        self.unfocus_active_queue();
+                    }
                 }
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
@@ -73,10 +81,18 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
                     if !sel.is_empty() {
+                        self.queue_mouse_down = None;
                         self.selection_state = Some(SelectionState::PendingCopy { sel });
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if !self.has_modal_overlay()
+                            && let Some(pressed) = self.queue_mouse_down.take()
+                            && self.queue_hit_at(event.row, event.column) == Some(pressed)
+                        {
+                            self.handle_queue_click(pressed);
+                            return;
+                        }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
                             if self.active_chat == 0
@@ -95,6 +111,7 @@ impl App {
                         }
                     }
                 }
+                self.queue_mouse_down = None;
             }
             _ => {}
         }
@@ -103,6 +120,11 @@ impl App {
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
         if self.paste_editor.is_open() {
             self.paste_editor.scroll(delta);
+            return;
+        }
+        if !self.has_modal_overlay() && self.queue_hit_at(row, column).is_some() {
+            self.scroll_active_queue(delta);
+            self.clear_selection_unless_pending_copy();
             return;
         }
         let drag_zone = match self.selection_state {
@@ -269,6 +291,33 @@ impl App {
 
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
         self.zones.zone_at(row, col)
+    }
+
+    fn queue_hit_at(&self, row: u16, col: u16) -> Option<QueueHit> {
+        let position = Position::new(col, row);
+        self.queue_hits
+            .iter()
+            .rev()
+            .find(|hit| hit.area.contains(position))
+            .copied()
+    }
+
+    fn handle_queue_click(&mut self, hit: QueueHit) {
+        match hit.target {
+            QueueHitTarget::ToggleTogether => self.toggle_active_queue_delivery(),
+            QueueHitTarget::Item { .. } if self.queue_editor_active() => {}
+            QueueHitTarget::Item { id, action } => match action {
+                QueueAction::Select => self.select_active_queue_item(id),
+                QueueAction::Edit => {
+                    self.select_active_queue_item(id);
+                    self.begin_queue_edit(id);
+                }
+                QueueAction::Delete => {
+                    self.delete_active_queue_item(id);
+                }
+                QueueAction::MoveMain => self.move_unsent_to_main(id),
+            },
+        }
     }
 
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {

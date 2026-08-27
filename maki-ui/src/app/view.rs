@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -33,6 +32,7 @@ struct ViewLayout {
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         self.sync_subagent_input_target();
+        self.queue_hits.clear();
         let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.active_chat;
@@ -84,11 +84,9 @@ impl App {
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(
-                self.active_subagent_pending()
-                    .map_or(0, |messages| messages.len()),
-            ) + panel_h
-                + if self.active_subagent_can_steer() {
+            queue_panel::height(self.active_queue_entries().len())
+                + panel_h
+                + if self.active_subagent_can_steer() || self.queue_editor_active() {
                     self.subagent_input_box.height(inner.width).min(max_bottom)
                 } else {
                     1
@@ -109,10 +107,7 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else if !self.is_main_chat() {
-            queue_panel::height(
-                self.active_subagent_pending()
-                    .map_or(0, |messages| messages.len()),
-            )
+            queue_panel::height(self.active_queue_entries().len())
         } else {
             queue_panel::height(self.queue.panel_len())
         };
@@ -160,24 +155,32 @@ impl App {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
-            let queue_entries = self
-                .active_subagent_pending()
-                .into_iter()
-                .flatten()
-                .map(|pending| queue_panel::QueueEntry {
-                    text: Cow::Borrowed(pending.text.as_str()),
-                    color: theme::current().foreground,
-                })
-                .collect::<Vec<_>>();
-            queue_panel::view_readonly(frame, layout.queue_area, &queue_entries);
+            let queue_entries = self.active_queue_entries();
+            let queue_title = self.active_queue_title();
+            let together = self
+                .active_queue_delivery()
+                .map(|delivery| delivery == maki_agent::QueueDelivery::TogetherNextTurn);
+            self.queue_hits = queue_panel::view(
+                frame,
+                layout.queue_area,
+                &queue_title,
+                &queue_entries,
+                self.active_queue_focus(),
+                self.active_queue_viewport(),
+                together,
+            );
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            if self.active_subagent_can_steer() {
+            if self.active_subagent_can_steer() || self.queue_editor_active() {
                 self.subagent_input_box.view(
                     frame,
                     layout.input_area,
-                    Placeholder::Steer,
+                    if self.queue_editor_active() {
+                        Placeholder::QueueEdit
+                    } else {
+                        Placeholder::Steer
+                    },
                     self.separator_style(),
                     !self.any_overlay_open(),
                     None,
@@ -192,11 +195,25 @@ impl App {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
-            queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            let queue_title = self.active_queue_title();
+            let together = self
+                .active_queue_delivery()
+                .map(|delivery| delivery == maki_agent::QueueDelivery::TogetherNextTurn);
+            self.queue_hits = queue_panel::view(
+                frame,
+                layout.queue_area,
+                &queue_title,
+                &queue_entries,
+                self.queue.focus(),
+                self.queue.viewport(),
+                together,
+            );
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let placeholder = if self.status == Status::Streaming {
+            let placeholder = if self.queue_editor_active() {
+                Placeholder::QueueEdit
+            } else if self.status == Status::Streaming {
                 Placeholder::Queue
             } else if self.state.session.messages().is_empty() {
                 Placeholder::Suggestion
@@ -346,7 +363,9 @@ impl App {
 
         if layout.input_area.height > 0
             && !layout.bottom_takeover
-            && (self.is_main_chat() || self.active_subagent_can_steer())
+            && (self.is_main_chat()
+                || self.active_subagent_can_steer()
+                || self.queue_editor_active())
         {
             let input_inner = Rect::new(
                 layout.input_area.x,
@@ -454,7 +473,9 @@ impl App {
             contexts.push(KeybindContext::PasteEditor);
         } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
-        } else if self.queue.focus().is_some() {
+        } else if self.queue_editor_active() {
+            contexts.push(KeybindContext::Editing);
+        } else if self.active_queue_is_focused() {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);

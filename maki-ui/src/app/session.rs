@@ -12,7 +12,8 @@ use maki_agent::{GoalStatus, GoalVerdict};
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
-    SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredPasteRange, StoredSubagent,
+    SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredPasteRange, StoredQueuedDraft,
+    StoredSubagent,
 };
 
 use crate::AppSession;
@@ -42,6 +43,7 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
         || session.meta.input_draft.is_some()
         || !session.meta.queued_messages.is_empty()
+        || !session.meta.unsent_subagent_messages.is_empty()
         || session.meta.active_goal.is_some()
         || session.meta.goal_result.is_some()
         || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
@@ -142,6 +144,35 @@ impl App {
             } else {
                 self.recoverable_queue.clone()
             },
+            queued_messages_together: if self.recoverable_queue.is_empty() {
+                self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn
+            } else {
+                self.recoverable_queue_together
+            },
+            unsent_subagent_messages: self
+                .unsent_subagent_steers
+                .iter()
+                .map(|(task_id, items)| {
+                    (
+                        task_id.clone(),
+                        items
+                            .iter()
+                            .map(|item| StoredQueuedDraft {
+                                text: item.draft.text.clone(),
+                                paste_ranges: item
+                                    .draft
+                                    .paste_ranges
+                                    .iter()
+                                    .map(|range| StoredPasteRange {
+                                        start: range.start,
+                                        end: range.end,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
@@ -196,6 +227,7 @@ impl App {
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
+        self.cancel_queue_edit();
         self.chats.clear();
         let mut main = Chat::new(
             "Main".into(),
@@ -209,6 +241,7 @@ impl App {
         self.subagent_answers.clear();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
+        self.unsent_subagent_steers.clear();
         self.parent_task_ids.clear();
         self.subagent_input_box.discard();
         self.subagent_input_task = None;
@@ -216,7 +249,12 @@ impl App {
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
+        self.task_queue_selection = None;
+        self.task_queue_viewport = 0;
+        self.queue_hits.clear();
+        self.queue_mouse_down = None;
         self.recoverable_queue.clear();
+        self.recoverable_queue_together = false;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
@@ -260,6 +298,33 @@ impl App {
         };
         self.input_box.set_draft(draft);
         self.input_box.move_to_end();
+        self.unsent_subagent_steers = self
+            .state
+            .session
+            .meta
+            .unsent_subagent_messages
+            .iter()
+            .map(|(task_id, items)| {
+                (
+                    task_id.clone(),
+                    items
+                        .iter()
+                        .map(|item| super::PendingSteer {
+                            id: maki_agent::QueueItemId::new(),
+                            text: item.text.clone(),
+                            draft: InputDraft {
+                                text: item.text.clone(),
+                                paste_ranges: item
+                                    .paste_ranges
+                                    .iter()
+                                    .map(|range| range.start..range.end)
+                                    .collect(),
+                            },
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
 
         self.fire_restore_items(restore_items);
 

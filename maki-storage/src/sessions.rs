@@ -156,6 +156,13 @@ pub struct StoredPasteRange {
     pub end: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredQueuedDraft {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paste_ranges: Vec<StoredPasteRange>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default)]
@@ -174,6 +181,10 @@ pub struct SessionMeta {
     pub input_draft_pastes: Vec<StoredPasteRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued_messages_together: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub unsent_subagent_messages: HashMap<String, Vec<StoredQueuedDraft>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1753,9 +1764,9 @@ mod tests {
     use super::ThinkingParseError;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredPasteRange, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, next_epoch,
-        update_cwd_index, write_full_session,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredPasteRange,
+        StoredQueuedDraft, StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path,
+        load_cwd_index, next_epoch, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
@@ -3102,6 +3113,8 @@ mod tests {
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
         assert!(!meta.workflow);
+        assert!(!meta.queued_messages_together);
+        assert!(meta.unsent_subagent_messages.is_empty());
         assert!(meta.yolo.is_none());
     }
 
@@ -3113,6 +3126,14 @@ mod tests {
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
         session.meta.workflow = true;
+        session.meta.queued_messages_together = true;
+        session.meta.unsent_subagent_messages.insert(
+            "task-1".into(),
+            vec![StoredQueuedDraft {
+                text: "follow up".into(),
+                paste_ranges: vec![StoredPasteRange { start: 0, end: 9 }],
+            }],
+        );
         session.meta.yolo = Some(true);
         session.save_to(dir).unwrap();
 
@@ -3123,6 +3144,11 @@ mod tests {
         );
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
+        assert!(loaded.meta.queued_messages_together);
+        assert_eq!(
+            loaded.meta.unsent_subagent_messages["task-1"][0].text,
+            "follow up"
+        );
         assert_eq!(loaded.meta.yolo, Some(true));
     }
 

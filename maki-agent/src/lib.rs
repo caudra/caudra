@@ -25,6 +25,7 @@ pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;
 pub mod diff;
+pub mod editable_queue;
 pub mod permissions;
 pub mod prompt;
 mod subagent_history;
@@ -39,14 +40,18 @@ pub use subagent_history::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use editable_queue::{
+    EditableQueue, EditableQueueReceiver, QueueDelivery, QueueItemId, SteeringQueue,
+    SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
+};
 pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
-    GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan,
-    SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, QueueConsumedItem, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -66,8 +71,15 @@ impl AgentMode {
 }
 
 pub enum ExtractedCommand {
-    Interrupt(AgentInput, u64),
+    Interrupt(AgentInput, u64, QueueItemId),
+    InterruptBatch(Vec<QueuedInterrupt>),
     Compact(u64),
+}
+
+pub struct QueuedInterrupt {
+    pub id: QueueItemId,
+    pub input: AgentInput,
+    pub run_id: u64,
 }
 
 pub trait InterruptSource: Send + Sync {

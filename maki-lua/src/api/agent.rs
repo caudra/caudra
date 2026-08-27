@@ -19,8 +19,9 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, ExtractedCommand, History, InterruptSource,
-    McpSession, SubagentHistoryError, SubagentHistoryLease, SubagentInfo, ToolDoneEvent,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, InterruptSource, McpSession,
+    SteeringQueue, SteeringQueueReceiver, SubagentHistoryError, SubagentHistoryLease, SubagentInfo,
+    ToolDoneEvent, steering_queue,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -40,19 +41,6 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
-
-struct SessionInterruptSource {
-    rx: flume::Receiver<AgentInput>,
-}
-
-impl InterruptSource for SessionInterruptSource {
-    fn poll(&self) -> Option<ExtractedCommand> {
-        self.rx
-            .try_recv()
-            .ok()
-            .map(|input| ExtractedCommand::Interrupt(input, 0))
-    }
-}
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -495,7 +483,7 @@ async fn session(
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (steer_tx, steer_rx) = flume::unbounded::<AgentInput>();
+    let (steer_tx, steer_rx) = steering_queue();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (usage_tx, usage_rx) = flume::unbounded();
@@ -577,7 +565,7 @@ async fn session(
         history_lease: Some(history_lease),
         sub_event_tx,
         child_cancel,
-        interrupt_source: Arc::new(SessionInterruptSource { rx: steer_rx }),
+        interrupt_source: Arc::new(steer_rx),
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
         steer_tx: Some(steer_tx),
@@ -706,10 +694,10 @@ struct SessionState {
     history_lease: Option<SubagentHistoryLease>,
     sub_event_tx: EventSender,
     child_cancel: maki_agent::cancel::CancelToken,
-    interrupt_source: Arc<SessionInterruptSource>,
+    interrupt_source: Arc<SteeringQueueReceiver>,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
-    steer_tx: Option<flume::Sender<AgentInput>>,
+    steer_tx: Option<SteeringQueue>,
     parent_cancels: Arc<CancelMap<String>>,
     parent_tool_use_id: String,
     task_id: String,

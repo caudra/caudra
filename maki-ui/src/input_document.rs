@@ -22,23 +22,6 @@ impl InputDraft {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
-
-    pub fn append(&mut self, other: Self) {
-        if other.text.is_empty() {
-            return;
-        }
-        if !self.text.is_empty() {
-            self.text.push('\n');
-        }
-        let offset = self.text.len();
-        self.text.push_str(&other.text);
-        self.paste_ranges.extend(
-            other
-                .paste_ranges
-                .into_iter()
-                .map(|range| range.start + offset..range.end + offset),
-        );
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

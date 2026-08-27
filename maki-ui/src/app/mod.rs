@@ -42,6 +42,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::queue_panel::QueueHit;
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -60,7 +61,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, SharedMessages, SubagentInfo,
+    McpPromptInfo, McpSnapshotReader, QueueItemId, SharedMessages, SteeringQueue, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -223,12 +224,18 @@ pub struct App {
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub(super) task_back_area: Option<Rect>,
+    pub(super) queue_hits: Vec<QueueHit>,
+    pub(super) queue_mouse_down: Option<QueueHit>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
+    queue_editor: Option<queue::QueueEditor>,
+    task_queue_selection: Option<(String, QueueItemId)>,
+    task_queue_viewport: usize,
     recoverable_queue: Vec<String>,
+    recoverable_queue_together: bool,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
@@ -259,12 +266,14 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
-    subagent_steers: HashMap<String, flume::Sender<AgentInput>>,
+    subagent_steers: HashMap<String, SteeringQueue>,
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
+    unsent_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
 }
 
 struct PendingSteer {
+    id: QueueItemId,
     text: String,
     draft: InputDraft,
 }
@@ -332,12 +341,18 @@ impl App {
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             task_back_area: None,
+            queue_hits: Vec::new(),
+            queue_mouse_down: None,
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
+            queue_editor: None,
+            task_queue_selection: None,
+            task_queue_viewport: 0,
             recoverable_queue: Vec::new(),
+            recoverable_queue_together: false,
             answer_tx: None,
             cmd_tx: None,
             pending_input: PendingInput::None,
@@ -369,6 +384,7 @@ impl App {
             subagent_answers: HashMap::new(),
             subagent_steers: HashMap::new(),
             pending_subagent_steers: HashMap::new(),
+            unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
         };
         app.model_picker.set_recents(
@@ -398,10 +414,6 @@ impl App {
     fn active_subagent_can_steer(&self) -> bool {
         self.active_subagent_id()
             .is_some_and(|id| self.subagent_steers.contains_key(id))
-    }
-
-    fn active_subagent_pending(&self) -> Option<&VecDeque<PendingSteer>> {
-        self.pending_subagent_steers.get(self.active_subagent_id()?)
     }
 
     fn active_input_box(&self) -> &InputBox {
@@ -703,6 +715,9 @@ impl App {
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
         }
+        if key::POP_QUEUE.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::PopQueue));
+        }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
@@ -836,18 +851,44 @@ impl App {
             });
         }
 
-        if self.queue.focus().is_some() {
+        if self.queue_editor_active() {
+            return Some(self.handle_queue_editor_key(key));
+        }
+
+        if self.active_queue_is_focused() {
             match key.code {
-                KeyCode::Up => self.queue.move_focus_up(),
-                KeyCode::Down => self.queue.move_focus_down(),
+                KeyCode::Up => self.move_active_queue_focus(-1),
+                KeyCode::Down => self.move_active_queue_focus(1),
                 KeyCode::Enter => {
-                    self.queue.remove_focused();
+                    if let Some(id) = self
+                        .active_queue_entries()
+                        .get(self.active_queue_focus().unwrap_or(0))
+                        .filter(|entry| entry.editable)
+                        .map(|entry| entry.id)
+                    {
+                        self.begin_queue_edit(id);
+                    }
                 }
-                KeyCode::Esc => self.queue.unfocus(),
-                _ if key::QUIT.matches(key) => self.queue.unfocus(),
-                _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
+                KeyCode::Delete => self.delete_focused_queue_item(),
+                KeyCode::Char('d') if key.modifiers.is_empty() => {
+                    self.delete_focused_queue_item();
                 }
+                KeyCode::Char('m') if key.modifiers.is_empty() => {
+                    if let Some(id) = self
+                        .active_queue_entries()
+                        .get(self.active_queue_focus().unwrap_or(0))
+                        .filter(|entry| entry.movable)
+                        .map(|entry| entry.id)
+                    {
+                        self.move_unsent_to_main(id);
+                    }
+                }
+                KeyCode::Char('b') if key.modifiers.is_empty() => {
+                    self.toggle_active_queue_delivery();
+                }
+                KeyCode::Esc => self.unfocus_active_queue(),
+                _ if key::QUIT.matches(key) => self.unfocus_active_queue(),
+                _ if key::POP_QUEUE.matches(key) => self.pop_active_queue(),
                 _ => {}
             }
             return Some(vec![]);
@@ -957,10 +998,16 @@ impl App {
             }
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
             BuiltinAction::PopQueue => {
-                self.queue.remove(0);
+                self.pop_active_queue();
             }
-            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::PrevChat => {
+                self.cancel_queue_edit();
+                self.unfocus_active_queue();
+                self.active_chat = self.active_chat.saturating_sub(1);
+            }
             BuiltinAction::NextChat => {
+                self.cancel_queue_edit();
+                self.unfocus_active_queue();
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
@@ -1013,6 +1060,10 @@ impl App {
                 return self.handle_subagent_chat_key(key);
             }
             return match key.code {
+                KeyCode::Enter if !self.active_queue_entries().is_empty() => {
+                    self.focus_active_queue();
+                    vec![]
+                }
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                 KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
                     if let Some(t) = self.last_esc.take()
@@ -1058,6 +1109,10 @@ impl App {
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
+        if sub.images.is_empty() && sub.text.trim() == "/queue" {
+            self.focus_active_queue();
+            return vec![];
+        }
         if sub.text.trim().is_empty() || !sub.images.is_empty() {
             return vec![];
         }
@@ -1083,45 +1138,42 @@ impl App {
             workflow: false,
             prompt: None,
         };
-        if tx.send(input).is_err() {
-            self.subagent_input_box.set_draft(draft);
-            self.subagent_steers.remove(&task_id);
-            return vec![];
-        }
+        let id = tx.push(input);
         self.pending_subagent_steers
             .entry(task_id)
             .or_default()
-            .push_back(PendingSteer { text, draft });
+            .push_back(PendingSteer { id, text, draft });
         vec![]
     }
 
-    fn restore_unconsumed_steers(&mut self, task_id: &str) {
+    fn preserve_unconsumed_steers(&mut self, task_id: &str) {
+        let remaining = self
+            .subagent_steers
+            .remove(task_id)
+            .map(|queue| queue.drain())
+            .unwrap_or_default();
         let Some(pending) = self.pending_subagent_steers.remove(task_id) else {
             return;
         };
-        let mut recovered = InputDraft::default();
-        for pending in pending {
-            recovered.append(pending.draft);
-        }
-        if self.subagent_input_task.as_deref() == Some(task_id) {
-            recovered.append(self.subagent_input_box.draft());
-            self.subagent_input_box.set_draft(recovered);
-        } else {
-            self.subagent_drafts
+        let remaining_ids: std::collections::HashSet<_> =
+            remaining.into_iter().map(|(id, _)| id).collect();
+        let unsent: VecDeque<_> = pending
+            .into_iter()
+            .filter(|item| remaining_ids.contains(&item.id))
+            .collect();
+        if !unsent.is_empty() {
+            self.unsent_subagent_steers
                 .entry(task_id.to_owned())
-                .and_modify(|draft| {
-                    recovered.append(std::mem::take(draft));
-                    *draft = recovered.clone();
-                })
-                .or_insert(recovered);
+                .or_default()
+                .extend(unsent);
+            self.flash(STEER_NOT_CONSUMED_MSG.into());
         }
-        self.flash(STEER_NOT_CONSUMED_MSG.into());
     }
 
-    fn restore_all_unconsumed_steers(&mut self) {
+    fn preserve_all_unconsumed_steers(&mut self) {
         let task_ids: Vec<_> = self.pending_subagent_steers.keys().cloned().collect();
         for task_id in task_ids {
-            self.restore_unconsumed_steers(&task_id);
+            self.preserve_unconsumed_steers(&task_id);
         }
     }
 
@@ -1143,9 +1195,7 @@ impl App {
             return self.run_builtin(BuiltinAction::EditInput);
         }
         if is_ctrl(&key) {
-            if key::POP_QUEUE.matches(key) {
-                return self.run_builtin(BuiltinAction::PopQueue);
-            } else if key::OPEN_EDITOR.matches(key) {
+            if key::OPEN_EDITOR.matches(key) {
                 return self.run_builtin(BuiltinAction::PlanEditor);
             } else if key::SEARCH.matches(key) {
                 return self.run_builtin(BuiltinAction::Search);
@@ -1299,6 +1349,7 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.retry_info = None;
@@ -1306,6 +1357,7 @@ impl App {
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
+        self.preserve_all_unconsumed_steers();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
         self.shell.cancel_all();
@@ -1317,6 +1369,7 @@ impl App {
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         self.queue.clear();
         self.recoverable_queue.clear();
+        self.recoverable_queue_together = false;
         self.status = Status::Idle;
         vec![Action::CancelAgent {
             run_id: cancelled_run,
@@ -1332,7 +1385,7 @@ impl App {
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&task_id);
-        self.subagent_steers.remove(&task_id);
+        self.preserve_unconsumed_steers(&task_id);
 
         vec![Action::CancelSubagent {
             tool_use_id: task_id,
@@ -1388,8 +1441,7 @@ impl App {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
             self.subagent_answers.remove(&task_id);
-            self.subagent_steers.remove(&task_id);
-            self.restore_unconsumed_steers(&task_id);
+            self.preserve_unconsumed_steers(&task_id);
             self.state
                 .session_mut()
                 .set_subagent_messages(task_id, messages);
@@ -1608,19 +1660,45 @@ impl App {
         };
         let result = self.chats[chat_idx].handle_event(event, plan_path);
 
-        if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
+        let result = match result {
+            ChatEventResult::QueueBatchConsumed { items } => {
+                if chat_idx == 0 {
+                    self.on_queue_batch_consumed(&items);
+                } else if let Some(task_id) = subagent_id {
+                    let messages = items
+                        .iter()
+                        .map(|item| format_with_images(&item.text, item.image_count));
+                    self.chats[chat_idx].show_user_messages(messages);
+                    if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
+                        pending.retain(|queued| items.iter().all(|item| item.id != queued.id));
+                        if pending.is_empty() {
+                            self.pending_subagent_steers.remove(&task_id);
+                        }
+                    }
+                    self.clamp_active_queue_focus();
+                }
+                return vec![];
+            }
+            result => result,
+        };
+
+        if let ChatEventResult::QueueItemConsumed {
+            id,
+            text,
+            image_count,
+        } = result
+        {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(&text, image_count);
             } else if let Some(task_id) = subagent_id {
                 self.chats[chat_idx].show_user_message(text.clone());
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
-                    if pending.front().is_some_and(|queued| queued.text == text) {
-                        pending.pop_front();
-                    }
+                    pending.retain(|queued| queued.id != id);
                     if pending.is_empty() {
                         self.pending_subagent_steers.remove(&task_id);
                     }
                 }
+                self.clamp_active_queue_focus();
             }
             return vec![];
         }
@@ -1652,7 +1730,7 @@ impl App {
                     self.status_bar.clear_flash();
                     if !self.goal_deferred {
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                        self.restore_all_unconsumed_steers();
+                        self.preserve_all_unconsumed_steers();
                         self.chat_index.clear();
                         self.subagent_answers.clear();
                         self.subagent_steers.clear();
@@ -1664,13 +1742,16 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
+                    self.cancel_queue_edit();
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.subagent_answers.clear();
-                    self.subagent_steers.clear();
                     self.terminalize_turn(&message);
-                    self.restore_all_unconsumed_steers();
+                    self.preserve_all_unconsumed_steers();
+                    self.subagent_steers.clear();
                     self.recoverable_queue = self.queue.text_messages();
+                    self.recoverable_queue_together =
+                        self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn;
                     self.queue.clear();
                     self.chat_index.clear();
                     self.fire_session_autocmd(
@@ -1683,7 +1764,8 @@ impl App {
                 }
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest { .. }
-                | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
+                | ChatEventResult::QueueItemConsumed { .. }
+                | ChatEventResult::QueueBatchConsumed { .. } => unreachable!(),
                 ChatEventResult::Continue => {}
             }
         }
@@ -1818,7 +1900,7 @@ impl App {
             "/goal-model" => self.open_goal_model_picker(),
             "/new" => self.reset_session(),
             "/queue" => {
-                self.queue.set_focus();
+                self.focus_active_queue();
                 vec![]
             }
             "/model" => {
@@ -2261,7 +2343,7 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
-            if self.active_subagent_can_steer() {
+            if self.active_subagent_can_steer() || self.queue_editor_active() {
                 let _ = self.subagent_input_box.handle_paste(text);
             }
             return;

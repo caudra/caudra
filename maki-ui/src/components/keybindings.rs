@@ -562,7 +562,25 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Remove item",
+        description: "Edit item",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("d", "Delete"),
+        description: "Delete item",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("m"),
+        description: "Move unsent item to Main",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("b"),
+        description: "Toggle send together",
         context: KeybindContext::QueueFocus,
         platform: Platform::All,
     },

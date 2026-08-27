@@ -267,6 +267,16 @@ impl Message {
         }
     }
 
+    pub fn user_display_with_images(
+        ai_text: String,
+        display: String,
+        images: Vec<ImageSource>,
+    ) -> Self {
+        let mut message = Self::user_with_images(ai_text, images);
+        message.display_text = Some(display);
+        message
+    }
+
     pub fn user_with_images(text: String, images: Vec<ImageSource>) -> Self {
         let mut content: Vec<ContentBlock> = images
             .into_iter()

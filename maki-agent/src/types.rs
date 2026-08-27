@@ -642,8 +642,12 @@ pub enum AgentEvent {
         message: Box<Message>,
     },
     QueueItemConsumed {
+        id: crate::QueueItemId,
         text: String,
         image_count: usize,
+    },
+    QueueBatchConsumed {
+        items: Vec<QueueConsumedItem>,
     },
     QueueDrained,
     Done {
@@ -694,6 +698,13 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueueConsumedItem {
+    pub id: crate::QueueItemId,
+    pub text: String,
+    pub image_count: usize,
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
@@ -935,7 +946,7 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     #[serde(skip)]
-    pub steer_tx: Option<flume::Sender<crate::AgentInput>>,
+    pub steer_tx: Option<crate::SteeringQueue>,
 }
 
 #[derive(Debug, Clone)]

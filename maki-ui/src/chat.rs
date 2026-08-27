@@ -34,8 +34,12 @@ pub enum ChatEventResult {
     Continue,
     Done,
     QueueItemConsumed {
+        id: maki_agent::QueueItemId,
         text: String,
         image_count: usize,
+    },
+    QueueBatchConsumed {
+        items: Vec<maki_agent::QueueConsumedItem>,
     },
     Error(String),
     PermissionRequest {
@@ -163,8 +167,19 @@ impl Chat {
             AgentEvent::CompactionDone => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, image_count } => {
-                return ChatEventResult::QueueItemConsumed { text, image_count };
+            AgentEvent::QueueItemConsumed {
+                id,
+                text,
+                image_count,
+            } => {
+                return ChatEventResult::QueueItemConsumed {
+                    id,
+                    text,
+                    image_count,
+                };
+            }
+            AgentEvent::QueueBatchConsumed { items } => {
+                return ChatEventResult::QueueBatchConsumed { items };
             }
             AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
@@ -400,6 +415,14 @@ impl Chat {
     pub fn show_user_message(&mut self, text: impl Into<String>) {
         self.flush();
         self.push_user_message(text);
+        self.enable_auto_scroll();
+    }
+
+    pub fn show_user_messages(&mut self, messages: impl IntoIterator<Item = String>) {
+        self.flush();
+        for message in messages {
+            self.push_user_message(message);
+        }
         self.enable_auto_scroll();
     }
 

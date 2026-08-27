@@ -7,18 +7,17 @@
 //! set it.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
+use maki_agent::{
+    AgentInput, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
+    InterruptSource, QueueDelivery, QueueItemId, QueuedInterrupt, editable_queue,
+};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
-
-type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
@@ -58,25 +57,31 @@ impl QueueItem {
         }
     }
 
-    fn as_queue_entry(&self) -> QueueEntry<'static> {
+    fn as_queue_entry(&self, id: QueueItemId) -> QueueEntry<'static> {
         match self {
             Self::Message { text, .. } => QueueEntry {
+                id,
                 text: Cow::Owned(text.clone()),
                 color: theme::current().foreground,
+                editable: true,
+                movable: false,
             },
             Self::Compact { .. } => QueueEntry {
+                id,
                 text: Cow::Borrowed(COMPACT_LABEL),
                 color: theme::current()
                     .queue
                     .fg
                     .unwrap_or(theme::current().foreground),
+                editable: false,
+                movable: false,
             },
         }
     }
 
-    fn into_extracted_command(self) -> ExtractedCommand {
+    fn into_extracted_command(self, id: QueueItemId) -> ExtractedCommand {
         match self {
-            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
+            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id, id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
         }
     }
@@ -92,46 +97,56 @@ impl QueueItem {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 #[derive(Clone)]
 pub(crate) struct QueueSender {
-    items: Items,
-    notify_tx: flume::Sender<()>,
+    queue: EditableQueue<QueueItem>,
 }
 
 pub(crate) struct QueueReceiver {
-    items: Items,
-    notify_rx: flume::Receiver<()>,
+    queue: EditableQueueReceiver<QueueItem>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
-    let (notify_tx, notify_rx) = flume::bounded(1);
-    let items: Items = Arc::new(Mutex::new(VecDeque::new()));
-    (
-        QueueSender {
-            items: Arc::clone(&items),
-            notify_tx,
-        },
-        QueueReceiver { items, notify_rx },
-    )
+    let (queue, receiver) = editable_queue();
+    (QueueSender { queue }, QueueReceiver { queue: receiver })
 }
 
 impl QueueSender {
-    pub(crate) fn push(&self, entry: QueueItem) {
-        lock(&self.items).push_back(entry);
-        let _ = self.notify_tx.try_send(());
+    pub(crate) fn push(&self, entry: QueueItem) -> QueueItemId {
+        self.queue.push(entry)
     }
 
-    pub(crate) fn remove(&self, index: usize) -> Option<QueueItem> {
-        let mut items = lock(&self.items);
-        (index < items.len()).then(|| items.remove(index)).flatten()
+    pub(crate) fn remove_id(&self, id: QueueItemId) -> Option<QueueItem> {
+        self.queue.remove(id)
+    }
+
+    pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<String> {
+        self.queue.begin_edit(id, |item| match item {
+            QueueItem::Message { text, .. } => Some(text.clone()),
+            QueueItem::Compact { .. } => None,
+        })
+    }
+
+    pub(crate) fn finish_edit(&self, id: QueueItemId, text: String) -> bool {
+        self.queue.finish_edit(id, |item| {
+            if let QueueItem::Message {
+                text: display,
+                input,
+                ..
+            } = item
+            {
+                display.clone_from(&text);
+                input.message = text;
+            }
+        })
+    }
+
+    pub(crate) fn cancel_edit(&self, id: QueueItemId) -> bool {
+        self.queue.cancel_edit(id)
     }
 
     pub(crate) fn len(&self) -> usize {
-        lock(&self.items).len()
+        self.queue.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -139,65 +154,102 @@ impl QueueSender {
     }
 
     pub(crate) fn clear(&self) {
-        lock(&self.items).clear();
+        self.queue.clear();
+    }
+
+    pub(crate) fn delivery(&self) -> QueueDelivery {
+        self.queue.delivery()
+    }
+
+    pub(crate) fn set_delivery(&self, delivery: QueueDelivery) {
+        self.queue.set_delivery(delivery);
+    }
+
+    pub(crate) fn toggle_delivery(&self) -> QueueDelivery {
+        self.queue.toggle_delivery()
     }
 
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        lock(&self.items)
-            .iter()
-            .filter(|item| item.visible_in_panel())
-            .filter_map(|item| match item {
-                QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } => None,
+        self.queue
+            .entries(|_, item, _| match item {
+                QueueItem::Message {
+                    text, displayed, ..
+                } if !displayed => Some(text.clone()),
+                QueueItem::Message { .. } | QueueItem::Compact { .. } => None,
             })
+            .into_iter()
+            .flatten()
             .collect()
     }
 
     pub(crate) fn panel_len(&self) -> usize {
-        lock(&self.items)
-            .iter()
-            .filter(|item| item.visible_in_panel())
+        self.queue
+            .entries(|_, item, _| item.visible_in_panel())
+            .into_iter()
+            .filter(|visible| *visible)
             .count()
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        lock(&self.items)
-            .iter()
-            .filter(|item| item.visible_in_panel())
-            .map(QueueItem::as_queue_entry)
+        self.queue
+            .entries(|id, item, _| item.visible_in_panel().then(|| item.as_queue_entry(id)))
+            .into_iter()
+            .flatten()
             .collect()
     }
 }
 
 impl QueueReceiver {
-    pub(crate) fn pop(&self) -> Option<QueueItem> {
-        lock(&self.items).pop_front()
+    pub(crate) fn claim(&self) -> Vec<(QueueItemId, QueueItem)> {
+        self.queue.claim(|item| {
+            matches!(
+                item,
+                QueueItem::Message {
+                    displayed: false,
+                    ..
+                }
+            )
+        })
     }
 
     /// Runs `publish` under the queue lock, so a drain event can never
     /// interleave with a concurrent push.
     pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) {
-        let items = lock(&self.items);
-        if items.is_empty() {
-            publish();
-        }
+        self.queue.publish_if_empty(publish);
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
-        self.notify_rx.recv_async().await
+        self.queue.recv_notify().await
     }
 }
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        self.pop().map(QueueItem::into_extracted_command)
+        let mut claimed = self.claim();
+        match claimed.len() {
+            0 => None,
+            1 => claimed
+                .pop()
+                .map(|(id, item)| item.into_extracted_command(id)),
+            _ => Some(ExtractedCommand::InterruptBatch(
+                claimed
+                    .into_iter()
+                    .filter_map(|(id, item)| match item {
+                        QueueItem::Message { input, run_id, .. } => {
+                            Some(QueuedInterrupt { id, input, run_id })
+                        }
+                        QueueItem::Compact { .. } => None,
+                    })
+                    .collect(),
+            )),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     use super::*;
@@ -253,15 +305,45 @@ mod tests {
         let worker = thread::spawn(move || {
             worker_barrier.wait();
             tx.push(msg(false));
-            lock(&worker_order).push("push");
+            worker_order.lock().unwrap().push("push");
         });
 
         rx.publish_if_empty(|| {
             barrier.wait();
-            lock(&order).push("drain");
+            order.lock().unwrap().push("drain");
         });
         worker.join().unwrap();
 
-        assert_eq!(*lock(&order), ["drain", "push"]);
+        assert_eq!(*order.lock().unwrap(), ["drain", "push"]);
+    }
+
+    #[test]
+    fn together_claim_waits_past_hidden_immediate_item_then_takes_deferred_run() {
+        let (tx, rx) = queue();
+        tx.push(msg(true));
+        tx.push(msg(false));
+        tx.push(msg(false));
+        tx.set_delivery(QueueDelivery::TogetherNextTurn);
+
+        assert_eq!(rx.claim().len(), 1);
+        assert_eq!(tx.delivery(), QueueDelivery::TogetherNextTurn);
+        assert_eq!(rx.claim().len(), 2);
+        assert_eq!(tx.delivery(), QueueDelivery::Separate);
+    }
+
+    #[test]
+    fn compact_is_a_hard_barrier_for_together_claim() {
+        let (tx, rx) = queue();
+        tx.push(QueueItem::Compact { run_id: 0 });
+        tx.push(msg(false));
+        tx.push(msg(false));
+        tx.set_delivery(QueueDelivery::TogetherNextTurn);
+
+        assert!(matches!(
+            rx.claim().as_slice(),
+            [(_, QueueItem::Compact { .. })]
+        ));
+        assert_eq!(tx.delivery(), QueueDelivery::TogetherNextTurn);
+        assert_eq!(rx.claim().len(), 2);
     }
 }

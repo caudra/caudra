@@ -744,7 +744,9 @@ impl<'t> EventLoop<'t> {
                 }
                 return;
             }
-            AgentEvent::QueueItemConsumed { .. } if current => {
+            AgentEvent::QueueItemConsumed { .. } | AgentEvent::QueueBatchConsumed { .. }
+                if current =>
+            {
                 rt.notifications.on_queue_item_consumed();
                 if rt.app.exit_on_done {
                     rt.app.clear_exit_request();
