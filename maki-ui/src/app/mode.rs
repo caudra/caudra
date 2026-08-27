@@ -149,11 +149,7 @@ impl App {
     }
 
     pub(crate) fn is_bash_input(&self) -> bool {
-        self.input_box
-            .buffer
-            .lines()
-            .first()
-            .is_some_and(|l| l.starts_with('!'))
+        self.input_box.buffer.starts_with_shell_prefix()
     }
 
     pub(super) fn effective_mode_color(&self) -> Color {

@@ -613,10 +613,7 @@ impl<'t> EventLoop<'t> {
 
     pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
         if let Some(prompt) = initial_prompt {
-            let sub = Submission {
-                text: prompt,
-                images: Vec::new(),
-            };
+            let sub = Submission::from_text(prompt);
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         }
@@ -1470,14 +1467,16 @@ impl<'t> EventLoop<'t> {
                 self.open_editor(idx, &path);
             }
             Action::EditInputInEditor => {
-                let current_text = self.sessions[idx].app.input_box.buffer.value();
+                let current_text = self.sessions[idx].app.input_box.expanded_text();
                 let result = {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
                 self.terminal_focused = false;
                 match result {
-                    Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
+                    Ok(edited) => self.sessions[idx]
+                        .app
+                        .apply_external_input(&current_text, edited),
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }

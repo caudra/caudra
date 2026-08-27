@@ -6,11 +6,14 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
+use crate::input_document::InputDraft;
 use maki_agent::agent::estimate_message_tokens;
 use maki_agent::{GoalStatus, GoalVerdict};
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredSubagent};
+use maki_storage::sessions::{
+    SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredPasteRange, StoredSubagent,
+};
 
 use crate::AppSession;
 
@@ -118,14 +121,22 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
+        let draft = self.input_box.draft();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
-            input_draft: (!draft.is_empty()).then_some(draft),
+            input_draft: (!draft.is_empty()).then_some(draft.text),
+            input_draft_pastes: draft
+                .paste_ranges
+                .into_iter()
+                .map(|range| StoredPasteRange {
+                    start: range.start,
+                    end: range.end,
+                })
+                .collect(),
             queued_messages: if self.recoverable_queue.is_empty() {
                 self.queue.text_messages()
             } else {
@@ -230,10 +241,25 @@ impl App {
         let main = self.main_chat();
         main.cost = cost;
         main.context_size = context_size;
-        if let Some(draft) = self.state.session.meta.input_draft.clone() {
-            self.input_box.set_input(draft);
-            self.input_box.buffer.move_to_end();
-        }
+        let draft = InputDraft {
+            text: self
+                .state
+                .session
+                .meta
+                .input_draft
+                .clone()
+                .unwrap_or_default(),
+            paste_ranges: self
+                .state
+                .session
+                .meta
+                .input_draft_pastes
+                .iter()
+                .map(|range| range.start..range.end)
+                .collect(),
+        };
+        self.input_box.set_draft(draft);
+        self.input_box.move_to_end();
 
         self.fire_restore_items(restore_items);
 

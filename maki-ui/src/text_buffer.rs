@@ -19,6 +19,7 @@ pub enum EditResult {
     Changed,
 }
 
+#[derive(Debug, Clone)]
 pub struct TextBuffer {
     lines: Vec<String>,
     raw_x: usize,
@@ -53,6 +54,28 @@ impl TextBuffer {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    pub fn cursor_offset(&self) -> usize {
+        self.lines
+            .iter()
+            .take(self.cursor_y)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            + self.x()
+    }
+
+    pub fn set_cursor_offset(&mut self, mut offset: usize) {
+        for (y, line) in self.lines.iter().enumerate() {
+            let len = line.chars().count();
+            if offset <= len {
+                self.cursor_y = y;
+                self.raw_x = offset;
+                return;
+            }
+            offset = offset.saturating_sub(len + 1);
+        }
+        self.move_to_end();
     }
 
     fn current_line(&self) -> &str {

@@ -150,6 +150,12 @@ pub struct StoredGoalResult {
     pub usage: StoredTokenUsage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPasteRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default)]
@@ -164,6 +170,8 @@ pub struct SessionMeta {
     pub context_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_draft_pastes: Vec<StoredPasteRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,7 +514,7 @@ enum LogRecord<M, U, T> {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
-        meta: SessionMeta,
+        meta: Box<SessionMeta>,
     },
 }
 
@@ -891,7 +899,7 @@ where
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
-            meta: session.meta.clone(),
+            meta: Box::new(session.meta.clone()),
         },
     )?;
     Ok(buf)
@@ -1053,7 +1061,7 @@ where
                 updated_at = m_updated;
                 subagents = m_subagents;
                 usage_by_model = m_usage_by_model;
-                meta = m_meta;
+                meta = *m_meta;
             }
         }
     }
@@ -1745,9 +1753,9 @@ mod tests {
     use super::ThinkingParseError;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, update_cwd_index,
-        write_full_session,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredPasteRange, StoredSubagent,
+        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
@@ -1773,6 +1781,28 @@ mod tests {
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
+
+    #[test]
+    fn old_session_meta_defaults_paste_ranges() {
+        let meta: SessionMeta = serde_json::from_value(serde_json::json!({
+            "input_draft": "plain draft"
+        }))
+        .unwrap();
+        assert_eq!(meta.input_draft.as_deref(), Some("plain draft"));
+        assert!(meta.input_draft_pastes.is_empty());
+    }
+
+    #[test]
+    fn session_meta_roundtrips_paste_ranges() {
+        let meta = SessionMeta {
+            input_draft: Some("a\nb\nc".into()),
+            input_draft_pastes: vec![StoredPasteRange { start: 0, end: 5 }],
+            ..SessionMeta::default()
+        };
+        let value = serde_json::to_value(&meta).unwrap();
+        let restored: SessionMeta = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, meta);
+    }
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {

@@ -50,6 +50,14 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+Del` / `⌥Del` | Delete word forward |
 | `Ctrl+K` | Delete to end of line |
 
+## Pasted Text
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Insert newline |
+| `Ctrl+S` | Save pasted text |
+| `Esc` | Cancel editing |
+
 ## While Streaming
 
 | Key | Action |
@@ -138,3 +146,4 @@ These are input conventions, not remappable key rows:
 
 - Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
 - `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.
+- Text pastes with at least 3 lines or more than 150 characters appear as compact tokens. Focus one and press `Enter`, or click it, to edit the complete pasted text.

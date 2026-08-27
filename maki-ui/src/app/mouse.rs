@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
+use crate::components::Overlay;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -15,6 +16,12 @@ pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.paste_editor.is_open() {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.paste_editor.handle_click(event.row, event.column);
+            }
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.is_main_chat()
@@ -34,12 +41,17 @@ impl App {
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
                         let focused = !self.any_overlay_open();
-                        self.active_input_box_mut().handle_click(
+                        let paste = self.active_input_box_mut().handle_click(
                             zone.area,
                             event.row,
                             event.column,
                             focused,
                         );
+                        if let Some(id) = paste {
+                            self.selection_state = None;
+                            self.open_paste_editor(id);
+                            return;
+                        }
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
@@ -89,6 +101,10 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.paste_editor.is_open() {
+            self.paste_editor.scroll(delta);
+            return;
+        }
         let drag_zone = match self.selection_state {
             Some(SelectionState::Dragging { ref sel, .. }) => Some(sel.zone),
             _ => None,

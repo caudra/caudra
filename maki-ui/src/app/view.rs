@@ -164,8 +164,8 @@ impl App {
                 .active_subagent_pending()
                 .into_iter()
                 .flatten()
-                .map(|text| queue_panel::QueueEntry {
-                    text: Cow::Owned(text.clone()),
+                .map(|pending| queue_panel::QueueEntry {
+                    text: Cow::Borrowed(pending.text.as_str()),
                     color: theme::current().foreground,
                 })
                 .collect::<Vec<_>>();
@@ -291,6 +291,10 @@ impl App {
             }
         }
         let r = self.float_mgr.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.paste_editor.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -446,7 +450,9 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.plan_form_active() {
+        if self.paste_editor.is_open() {
+            contexts.push(KeybindContext::PasteEditor);
+        } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);

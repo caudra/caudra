@@ -15,6 +15,7 @@ pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;
+mod input_document;
 mod markdown;
 mod render_worker;
 pub mod repaint;

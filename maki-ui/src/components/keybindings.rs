@@ -178,6 +178,7 @@ pub enum KeybindContext {
     ModelPicker,
     QueueFocus,
     CommandPalette,
+    PasteEditor,
     Search,
     FilePicker,
 }
@@ -195,6 +196,7 @@ impl KeybindContext {
             Self::ModelPicker => "Model Picker",
             Self::QueueFocus => "Queue",
             Self::CommandPalette => "Commands",
+            Self::PasteEditor => "Pasted Text",
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
         }
@@ -472,6 +474,24 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
         context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Insert newline",
+        context: KeybindContext::PasteEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+S"),
+        description: "Save pasted text",
+        context: KeybindContext::PasteEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Esc"),
+        description: "Cancel editing",
+        context: KeybindContext::PasteEditor,
         platform: Platform::All,
     },
     Keybind {

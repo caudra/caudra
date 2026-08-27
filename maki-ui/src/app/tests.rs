@@ -21,7 +21,7 @@ use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredThinking};
+use maki_storage::sessions::{StoredMode, StoredPasteRange, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -555,13 +555,119 @@ fn paste_works_regardless_of_status(status: Status) {
     assert_eq!(app.input_box.buffer.value(), "pasted");
 }
 
-#[test_case("a\rb\rc",       "a\nb\nc"       ; "bare_cr")]
-#[test_case("a\r\nb\r\nc",   "a\nb\nc"       ; "crlf")]
-#[test_case("a\r\nb\rc\nd",  "a\nb\nc\nd"    ; "mixed")]
-fn paste_normalizes_line_endings(input: &str, expected: &str) {
+#[test_case("a\rb\rc",       "a\nb\nc",      "[Pasted 3 lines] " ; "bare_cr")]
+#[test_case("a\r\nb\r\nc",   "a\nb\nc",      "[Pasted 3 lines] " ; "crlf")]
+#[test_case("a\r\nb\rc\nd",  "a\nb\nc\nd",   "[Pasted 4 lines] " ; "mixed")]
+fn paste_normalizes_line_endings(input: &str, expected: &str, display: &str) {
     let mut app = test_app();
     app.update(Msg::Paste(input.into()));
-    assert_eq!(app.input_box.buffer.value(), expected);
+    assert_eq!(app.input_box.buffer.value(), format!("{expected} "));
+    assert_eq!(app.input_box.buffer.display_text(), display);
+}
+
+#[test]
+fn summarized_paste_can_be_edited_in_modal() {
+    let mut app = test_app();
+    app.update(Msg::Paste("a\nb\nc".into()));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.paste_editor.is_open());
+
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL,
+    )));
+
+    assert!(!app.paste_editor.is_open());
+    assert_eq!(app.input_box.buffer.display_text(), "[Pasted 3 lines] ");
+    assert_eq!(app.input_box.buffer.expanded_text(), "a!\nb\nc ");
+}
+
+#[test]
+fn switching_tasks_closes_paste_editor() {
+    let mut app = app_with_subagent();
+    app.update(Msg::Paste("a\nb\nc".into()));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.paste_editor.is_open());
+
+    app.active_chat = 1;
+    app.update(Msg::Paste("new task text".into()));
+    assert!(!app.paste_editor.is_open());
+    assert_eq!(app.input_box.buffer.expanded_text(), "a\nb\nc ");
+}
+
+#[test]
+fn hidden_paste_cannot_trigger_command_palette() {
+    let mut app = test_app();
+    app.update(Msg::Paste("/new\na\nb".into()));
+    assert!(!app.command_palette.is_active());
+}
+
+#[test]
+fn hidden_paste_cannot_trigger_exit() {
+    let mut app = test_app();
+    app.update(Msg::Paste("exit\n\n".into()));
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test]
+fn enter_edits_focused_paste_before_executing_palette_command() {
+    let mut app = test_app();
+    for character in "/goal ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    app.update(Msg::Paste("a\nb\nc".into()));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    assert!(app.command_palette.is_active());
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(app.paste_editor.is_open());
+    assert!(app.state.goal.snapshot().is_none());
+}
+
+#[test]
+fn summarized_draft_checkpoints_and_restores() {
+    let mut app = test_app();
+    app.update(Msg::Paste("a\nb\nc".into()));
+    app.checkpoint_with(Duration::ZERO);
+
+    assert_eq!(
+        app.state.session.meta.input_draft.as_deref(),
+        Some("a\nb\nc ")
+    );
+    assert_eq!(app.state.session.meta.input_draft_pastes.len(), 1);
+    assert_eq!(
+        app.state.session.meta.input_draft_pastes.first(),
+        Some(&StoredPasteRange { start: 0, end: 5 })
+    );
+
+    app.input_box.discard();
+    app.restore_display();
+    assert_eq!(app.input_box.buffer.display_text(), "[Pasted 3 lines] ");
+    assert_eq!(app.input_box.buffer.expanded_text(), "a\nb\nc ");
+}
+
+#[test]
+fn shell_paste_expands_before_execution() {
+    let mut app = test_app();
+    app.update(Msg::Paste("! printf test\na\nb".into()));
+    assert!(app.is_bash_input());
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(!app.input_box.has_pastes());
+    assert_eq!(app.input_box.buffer.display_text(), "! printf test\na\nb ");
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ShellCommand { .. }]));
 }
 
 #[test]
@@ -1341,6 +1447,31 @@ fn focused_running_subagent_composer_steers_at_the_child_queue() {
     assert_eq!(last.role, DisplayRole::User);
     assert_eq!(last.text, STEER);
     assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+#[test]
+fn subagent_paste_submits_expanded() {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_tx, steer_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_tx);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+
+    app.update(Msg::Paste("a\nb\nc".into()));
+    assert_eq!(
+        app.subagent_input_box.buffer.display_text(),
+        "[Pasted 3 lines] "
+    );
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(steer_rx.try_recv().unwrap().message, "a\nb\nc");
 }
 
 #[test]
@@ -2582,10 +2713,7 @@ fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[K
 #[test]
 fn submit_exit_quits() {
     let mut app = test_app();
-    let actions = app.handle_submit(Submission {
-        text: "exit".into(),
-        images: vec![],
-    });
+    let actions = app.handle_submit(Submission::from_text("exit".into()));
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }

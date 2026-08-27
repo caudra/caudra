@@ -4,6 +4,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
+use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize_paste};
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
@@ -56,6 +57,7 @@ pub enum Placeholder {
 
 pub enum InputAction {
     Submit(Submission),
+    EditPaste(PasteId),
     ContinueLine,
     PaletteSync(String),
     Passthrough(KeyEvent),
@@ -65,6 +67,7 @@ pub enum InputAction {
 pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
+    pub(crate) draft: InputDraft,
 }
 
 impl Submission {
@@ -72,19 +75,31 @@ impl Submission {
         Self {
             text: String::new(),
             images: Vec::new(),
+            draft: InputDraft::default(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.images.is_empty()
     }
+
+    pub(crate) fn from_text(text: String) -> Self {
+        Self {
+            draft: InputDraft {
+                text: text.clone(),
+                paste_ranges: Vec::new(),
+            },
+            text,
+            images: Vec::new(),
+        }
+    }
 }
 
 pub struct InputBox {
-    pub(crate) buffer: TextBuffer,
+    pub(crate) buffer: InputDocument,
     history: InputHistory,
     history_index: Option<usize>,
-    draft: String,
+    draft: InputDraft,
     scroll_y: u16,
     follow_cursor: bool,
     placeholder_hint: &'static str,
@@ -112,6 +127,9 @@ impl InputBox {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;
             }
+            KeyCode::Enter if let Some(id) = self.buffer.focused_paste() => {
+                return InputAction::EditPaste(id);
+            }
             KeyCode::Enter if self.char_before_cursor_is_backslash() => {
                 self.continue_line();
                 return InputAction::ContinueLine;
@@ -126,15 +144,25 @@ impl InputBox {
         }
 
         match self.buffer.handle_key(key) {
-            EditResult::Changed => InputAction::PaletteSync(self.buffer.value()),
+            EditResult::Changed => InputAction::PaletteSync(self.buffer.palette_text()),
             EditResult::Moved | EditResult::Ignored => InputAction::None,
         }
     }
 
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
+        if should_summarize_paste(text) {
+            self.buffer.insert_paste(text);
+        } else {
+            self.buffer.insert_text(text);
+        }
+        InputAction::PaletteSync(self.buffer.palette_text())
+    }
+
+    fn handle_plain_paste(&mut self, text: &str) -> InputAction {
+        self.follow_cursor = true;
         self.buffer.insert_text(text);
-        InputAction::PaletteSync(self.buffer.value())
+        InputAction::PaletteSync(self.buffer.palette_text())
     }
 
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
@@ -153,7 +181,7 @@ impl InputBox {
         let needs_trailing = char_after.is_some_and(&is_word_boundary) && !text.ends_with(' ');
 
         if !needs_leading && !needs_trailing {
-            return self.handle_paste(text);
+            return self.handle_plain_paste(text);
         }
 
         let mut spaced = String::with_capacity(
@@ -168,16 +196,16 @@ impl InputBox {
             spaced.push(' ');
         }
 
-        self.handle_paste(&spaced)
+        self.handle_plain_paste(&spaced)
     }
 
     pub fn new(history: InputHistory, max_input_lines: u32) -> Self {
         let max_input_lines = max_input_lines.clamp(1, u16::MAX as u32 - 2) as u16;
         Self {
-            buffer: TextBuffer::new(String::new()),
+            buffer: InputDocument::new(),
             history,
             history_index: None,
-            draft: String::new(),
+            draft: InputDraft::default(),
             scroll_y: 0,
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
@@ -213,7 +241,8 @@ impl InputBox {
 
     pub fn height(&self, width: u16) -> u16 {
         let ew = effective_width(width as usize);
-        let mut visual_lines = total_visual_lines(&self.buffer, ew, true);
+        let mut visual_lines =
+            total_visual_lines(&self.buffer, ew, self.buffer.focused_paste().is_none());
         if !self.pending_images.is_empty() {
             visual_lines += 1;
         }
@@ -245,20 +274,25 @@ impl InputBox {
     }
 
     pub fn submit(&mut self) -> Option<Submission> {
-        let text = self.buffer.value().trim().to_string();
+        let draft = self.buffer.draft();
+        let text = draft.text.trim().to_string();
         let images = mem::take(&mut self.pending_images);
         if text.is_empty() && images.is_empty() {
             return None;
         }
         self.history.push(text.clone());
         self.discard();
-        Some(Submission { text, images })
+        Some(Submission {
+            text,
+            images,
+            draft,
+        })
     }
 
     pub fn discard(&mut self) {
         self.pending_images.clear();
         self.history_index = None;
-        self.draft.clear();
+        self.draft = InputDraft::default();
         self.buffer.clear();
         self.scroll_y = 0;
     }
@@ -272,7 +306,43 @@ impl InputBox {
     }
 
     pub fn set_input(&mut self, s: String) {
-        self.buffer = TextBuffer::new(s);
+        self.buffer = InputDocument::from_plain(s);
+    }
+
+    pub(crate) fn draft(&self) -> InputDraft {
+        self.buffer.draft()
+    }
+
+    pub(crate) fn set_draft(&mut self, draft: InputDraft) {
+        self.buffer = InputDocument::from_draft(draft);
+    }
+
+    pub(crate) fn expanded_text(&self) -> String {
+        self.buffer.expanded_text()
+    }
+
+    pub(crate) fn palette_text(&self) -> String {
+        self.buffer.palette_text()
+    }
+
+    pub(crate) fn has_pastes(&self) -> bool {
+        self.buffer.has_pastes()
+    }
+
+    pub(crate) fn paste_text(&self, id: PasteId) -> Option<&str> {
+        self.buffer.paste_text(id)
+    }
+
+    pub(crate) fn update_paste(&mut self, id: PasteId, text: &str) -> bool {
+        self.buffer.update_paste(id, text)
+    }
+
+    pub(crate) fn move_to_end(&mut self) {
+        self.buffer.move_to_end();
+    }
+
+    pub(crate) fn expand_pastes(&mut self) {
+        self.buffer.expand_pastes();
     }
 
     pub fn history_up(&mut self) {
@@ -281,7 +351,7 @@ impl InputBox {
         }
         let new_index = match self.history_index {
             None => {
-                self.draft = self.buffer.value();
+                self.draft = self.buffer.draft();
                 self.history.len() - 1
             }
             Some(0) => return,
@@ -304,7 +374,7 @@ impl InputBox {
         } else {
             self.history_index = None;
             let draft = mem::take(&mut self.draft);
-            self.set_input(draft);
+            self.set_draft(draft);
         }
     }
 
@@ -341,6 +411,8 @@ impl InputBox {
     ) {
         let content_height = area.height.saturating_sub(2);
         let ew = effective_width(area.width as usize);
+        let focused_paste = focused.then(|| self.buffer.focused_paste()).flatten();
+        let cursor_visible = focused && focused_paste.is_none();
 
         if self.follow_cursor {
             let visual_cursor_y = self.visual_cursor_y(ew);
@@ -351,7 +423,7 @@ impl InputBox {
             }
         }
 
-        let mut total_vl = total_visual_lines(&self.buffer, ew, focused) as u16;
+        let mut total_vl = total_visual_lines(&self.buffer, ew, cursor_visible) as u16;
         if !self.pending_images.is_empty() {
             total_vl += 1;
         }
@@ -360,7 +432,7 @@ impl InputBox {
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
 
-        let is_empty = self.buffer.value().is_empty();
+        let is_empty = self.buffer.display_text().is_empty();
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {
@@ -387,11 +459,17 @@ impl InputBox {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, line)| {
-                    let is_cursor_line = i == cursor_y && focused;
-                    let shell_spans = if i == 0 {
+                    let paste_ranges = self.buffer.paste_ranges_on_line(i);
+                    let is_cursor_line = i == cursor_y && focused && focused_paste.is_none();
+                    let shell_spans = if i == 0 && paste_ranges.is_empty() {
                         shell_highlight_spans(line)
                     } else {
                         None
+                    };
+                    let styled_spans = if paste_ranges.is_empty() {
+                        shell_spans
+                    } else {
+                        Some(paste_token_spans(line, &paste_ranges, focused_paste))
                     };
                     wrap_line(
                         line,
@@ -399,7 +477,7 @@ impl InputBox {
                         is_cursor_line,
                         cursor_x,
                         i == 0,
-                        shell_spans.as_deref(),
+                        styled_spans.as_deref(),
                     )
                 })
                 .collect()
@@ -457,17 +535,28 @@ impl InputBox {
 
     /// Move the text cursor to the position corresponding to a mouse click at
     /// the terminal coordinates (row, col) within the input content area.
-    pub fn handle_click(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
-        let Some((y, x)) = self.click_position(area, row, col, focused) else {
-            return;
-        };
+    pub fn handle_click(
+        &mut self,
+        area: Rect,
+        row: u16,
+        col: u16,
+        focused: bool,
+    ) -> Option<PasteId> {
+        let (y, x, text_hit) = self.click_position_with_hit(area, row, col, focused)?;
+        if text_hit && let Some(id) = self.buffer.paste_at(y, x) {
+            self.buffer.focus_paste(id);
+            self.follow_cursor = true;
+            return Some(id);
+        }
         self.buffer.set_cursor(y, x);
         self.follow_cursor = true;
+        None
     }
 
     /// Convert a mouse click at terminal (row, col) within the input content
     /// area into a (line_index, char_index) in the text buffer, accounting
     /// for scroll offset, word-wrap, and the chevron/padding prefix.
+    #[cfg(test)]
     fn click_position(
         &self,
         area: Rect,
@@ -475,6 +564,17 @@ impl InputBox {
         col: u16,
         focused: bool,
     ) -> Option<(usize, usize)> {
+        self.click_position_with_hit(area, row, col, focused)
+            .map(|(y, x, _)| (y, x))
+    }
+
+    fn click_position_with_hit(
+        &self,
+        area: Rect,
+        row: u16,
+        col: u16,
+        focused: bool,
+    ) -> Option<(usize, usize, bool)> {
         let content_y = row.checked_sub(area.y)?;
         let content_x = col.checked_sub(area.x)?;
 
@@ -488,7 +588,8 @@ impl InputBox {
             let chars: Vec<char> = line.chars().collect();
             let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
 
-            let is_cursor_line = buf_line_idx == cursor_line && focused;
+            let is_cursor_line =
+                buf_line_idx == cursor_line && focused && self.buffer.focused_paste().is_none();
             let ranges = wrap_ranges(&widths, ew, is_cursor_line);
 
             let n_visual_rows = ranges.len();
@@ -501,6 +602,7 @@ impl InputBox {
 
                 // The first visual row of each buffer line has a 2-cell prefix
                 // (chevron or continuation padding).  Wrapped rows have none.
+                let in_prefix = wrap_row == 0 && content_x < PREFIX_WIDTH;
                 let text_col = if wrap_row == 0 {
                     (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
                 } else {
@@ -519,7 +621,7 @@ impl InputBox {
                     char_idx += 1;
                 }
 
-                return Some((buf_line_idx, char_idx));
+                return Some((buf_line_idx, char_idx, !in_prefix));
             }
             visual += n_visual_rows;
         }
@@ -689,7 +791,7 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
     result
 }
 
-fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> usize {
+fn total_visual_lines(buffer: &InputDocument, ew: usize, cursor_visible: bool) -> usize {
     let cursor_y = buffer.y();
     buffer
         .lines()
@@ -705,10 +807,42 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
         .sum()
 }
 
+fn paste_token_spans(
+    line: &str,
+    pastes: &[(std::ops::Range<usize>, PasteId)],
+    focused: Option<PasteId>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(pastes.len() * 2 + 1);
+    let mut cursor = 0;
+    for (range, id) in pastes {
+        if cursor < range.start {
+            spans.push(Span::raw(
+                line.chars()
+                    .skip(cursor)
+                    .take(range.start - cursor)
+                    .collect::<String>(),
+            ));
+        }
+        let text: String = line.chars().skip(range.start).take(range.len()).collect();
+        let style = if focused == Some(*id) {
+            theme::current().item_selected
+        } else {
+            theme::current().active
+        };
+        spans.push(Span::styled(text, style));
+        cursor = range.end;
+    }
+    if cursor < line.chars().count() {
+        spans.push(Span::raw(line.chars().skip(cursor).collect::<String>()));
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
+    use crossterm::event::KeyModifiers;
     use ratatui::layout::Rect;
     use test_case::test_case;
 
@@ -741,6 +875,56 @@ mod tests {
         input.buffer.add_line();
         type_text(&mut input, "line2");
         assert_eq!(input.submit().unwrap().text, "line1\nline2");
+    }
+
+    #[test]
+    fn summarized_paste_opens_editor_and_submits_expanded_text() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("a\nb\nc");
+
+        assert_eq!(input.buffer.display_text(), "[Pasted 3 lines] ");
+        assert_eq!(input.buffer.line_count(), 1);
+        input.buffer.move_left();
+        input.buffer.move_left();
+        assert!(matches!(
+            input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::EditPaste(_)
+        ));
+
+        let submission = input.submit().unwrap();
+        assert_eq!(submission.text, "a\nb\nc");
+        assert_eq!(submission.draft.paste_ranges.len(), 1);
+        assert_eq!(submission.draft.paste_ranges.first(), Some(&(0..5)));
+    }
+
+    #[test]
+    fn history_restores_summarized_draft() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        input.handle_paste("a\nb\nc");
+
+        input.history_up();
+        assert_eq!(input.buffer.display_text(), "history");
+        input.history_down();
+        assert_eq!(input.buffer.display_text(), "[Pasted 3 lines] ");
+        assert_eq!(input.buffer.expanded_text(), "a\nb\nc ");
+    }
+
+    #[test]
+    fn clicking_summarized_paste_returns_its_id() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("a\nb\nc");
+        let id = input
+            .handle_click(Rect::new(0, 0, 80, 1), 0, 2, true)
+            .expect("paste token should be clickable");
+        assert_eq!(input.buffer.focused_paste(), Some(id));
+    }
+
+    #[test]
+    fn clicking_input_prefix_does_not_open_paste() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("a\nb\nc");
+        assert_eq!(input.handle_click(Rect::new(0, 0, 80, 1), 0, 0, true), None);
     }
 
     #[test]
@@ -932,7 +1116,7 @@ mod tests {
         let scroll_before = input.scroll_y;
         assert!(scroll_before > 0);
 
-        input.buffer = TextBuffer::new("short".into());
+        input.buffer = InputDocument::from_plain("short".into());
         let _ = render_input(&mut input, 40, area_height);
         assert_eq!(input.scroll_y, 0);
     }
@@ -1127,6 +1311,15 @@ mod tests {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.handle_paste_with_spaces("file.rs");
         assert_eq!(input.buffer.value(), "file.rs");
+    }
+
+    #[test]
+    fn file_picker_insertion_never_creates_paste_token() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        let path = format!("/tmp/{}", "x".repeat(151));
+        input.handle_paste_with_spaces(&path);
+        assert_eq!(input.buffer.display_text(), path);
+        assert!(!input.has_pastes());
     }
 
     #[test]

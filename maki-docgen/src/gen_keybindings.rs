@@ -21,6 +21,7 @@ const PLUGIN_BINDS: &[(&str, &str)] =
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
+    KeybindContext::PasteEditor,
     KeybindContext::Streaming,
     KeybindContext::FormInput,
     KeybindContext::Picker,
@@ -209,6 +210,9 @@ fn write_overrides(out: &mut String) {
          - Prefix a line with `!` to run a shell command yourself (5 minute \
          timeout). Use `!!` to hide the command and its output from the agent.\n\
          - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
-         model supports vision. You can also paste image file paths.\n",
+         model supports vision. You can also paste image file paths.\n\
+         - Text pastes with at least 3 lines or more than 150 characters appear \
+         as compact tokens. Focus one and press `Enter`, or click it, to edit \
+         the complete pasted text.\n",
     );
 }

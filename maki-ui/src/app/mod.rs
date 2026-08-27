@@ -39,6 +39,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -51,6 +52,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -98,6 +100,7 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
+const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -201,7 +204,7 @@ pub struct App {
     pub(crate) input_box: InputBox,
     subagent_input_box: InputBox,
     subagent_input_task: Option<String>,
-    subagent_drafts: HashMap<String, String>,
+    subagent_drafts: HashMap<String, InputDraft>,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
@@ -215,6 +218,7 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
@@ -256,8 +260,13 @@ pub struct App {
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
     subagent_steers: HashMap<String, flume::Sender<AgentInput>>,
-    pending_subagent_steers: HashMap<String, VecDeque<String>>,
+    pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
+}
+
+struct PendingSteer {
+    text: String,
+    draft: InputDraft,
 }
 
 impl App {
@@ -318,6 +327,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
@@ -390,7 +400,7 @@ impl App {
             .is_some_and(|id| self.subagent_steers.contains_key(id))
     }
 
-    fn active_subagent_pending(&self) -> Option<&VecDeque<String>> {
+    fn active_subagent_pending(&self) -> Option<&VecDeque<PendingSteer>> {
         self.pending_subagent_steers.get(self.active_subagent_id()?)
     }
 
@@ -415,8 +425,9 @@ impl App {
         if self.subagent_input_task == next {
             return;
         }
+        self.paste_editor.close();
         if let Some(previous) = self.subagent_input_task.take() {
-            let draft = self.subagent_input_box.buffer.value();
+            let draft = self.subagent_input_box.draft();
             if draft.is_empty() {
                 self.subagent_drafts.remove(&previous);
             } else {
@@ -427,7 +438,7 @@ impl App {
             .as_ref()
             .and_then(|id| self.subagent_drafts.remove(id))
             .unwrap_or_default();
-        self.subagent_input_box.set_input(draft);
+        self.subagent_input_box.set_draft(draft);
         self.subagent_input_task = next;
     }
 
@@ -555,7 +566,11 @@ impl App {
         match msg {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
+                self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if self.paste_editor.handle_paste(&text) {
+                    return vec![];
+                }
                 if text.is_empty() {
                     if self.is_main_chat() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
@@ -710,6 +725,24 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.paste_editor.is_open() {
+            match self.paste_editor.handle_key(key) {
+                PasteEditorAction::Consumed => {}
+                PasteEditorAction::Cancel => self.paste_editor.close(),
+                PasteEditorAction::Save { target, id, text } => {
+                    let updated = self.active_input_target() == Some(target)
+                        && self.active_input_box_mut().update_paste(id, &text)
+                        && self.is_main_chat();
+                    if updated {
+                        let palette_text = self.input_box.palette_text();
+                        self.command_palette.sync(&palette_text);
+                    }
+                    self.paste_editor.close();
+                }
+            }
+            return Some(vec![]);
+        }
+
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
@@ -1002,6 +1035,10 @@ impl App {
     fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match self.subagent_input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_subagent_submit(sub),
+            InputAction::EditPaste(id) => {
+                self.open_paste_editor(id);
+                vec![]
+            }
             InputAction::Passthrough(key) => match key.code {
                 KeyCode::Esc => {
                     if let Some(t) = self.last_esc.take()
@@ -1028,10 +1065,14 @@ impl App {
             return vec![];
         };
         let Some(tx) = self.subagent_steers.get(&task_id) else {
-            self.subagent_input_box.set_input(sub.text);
+            self.subagent_input_box.set_draft(sub.draft);
             return vec![];
         };
-        let text = sub.text;
+        let Submission {
+            text,
+            images: _,
+            draft,
+        } = sub;
         let input = AgentInput {
             message: text.clone(),
             mode: AgentMode::Build,
@@ -1043,14 +1084,14 @@ impl App {
             prompt: None,
         };
         if tx.send(input).is_err() {
-            self.subagent_input_box.set_input(text);
+            self.subagent_input_box.set_draft(draft);
             self.subagent_steers.remove(&task_id);
             return vec![];
         }
         self.pending_subagent_steers
             .entry(task_id)
             .or_default()
-            .push_back(text);
+            .push_back(PendingSteer { text, draft });
         vec![]
     }
 
@@ -1058,19 +1099,21 @@ impl App {
         let Some(pending) = self.pending_subagent_steers.remove(task_id) else {
             return;
         };
-        let text = pending.into_iter().collect::<Vec<_>>().join("\n");
+        let mut recovered = InputDraft::default();
+        for pending in pending {
+            recovered.append(pending.draft);
+        }
         if self.subagent_input_task.as_deref() == Some(task_id) {
-            let current = self.subagent_input_box.buffer.value();
-            self.subagent_input_box.set_input(if current.is_empty() {
-                text
-            } else {
-                format!("{text}\n{current}")
-            });
+            recovered.append(self.subagent_input_box.draft());
+            self.subagent_input_box.set_draft(recovered);
         } else {
             self.subagent_drafts
                 .entry(task_id.to_owned())
-                .and_modify(|draft| *draft = format!("{text}\n{draft}"))
-                .or_insert(text);
+                .and_modify(|draft| {
+                    recovered.append(std::mem::take(draft));
+                    *draft = recovered.clone();
+                })
+                .or_insert(recovered);
         }
         self.flash(STEER_NOT_CONSUMED_MSG.into());
     }
@@ -1116,6 +1159,14 @@ impl App {
             return vec![];
         }
 
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && let Some(id) = self.input_box.buffer.focused_paste()
+        {
+            self.open_paste_editor(id);
+            return vec![];
+        }
+
         match self
             .command_palette
             .handle_key(key, &self.input_box.buffer.value())
@@ -1134,9 +1185,25 @@ impl App {
             CommandAction::Passthrough => {}
         }
 
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && self.input_box.has_pastes()
+            && self.input_box.buffer.focused_paste().is_none()
+            && shell::parse_shell_prefix(&self.input_box.expanded_text()).is_some()
+        {
+            self.input_box.expand_pastes();
+            self.command_palette.close();
+            self.flash(SHELL_PASTE_EXPANDED_MSG.into());
+            return vec![];
+        }
+
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::EditPaste(id) => {
+                self.open_paste_editor(id);
+                vec![]
+            }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
                 vec![]
@@ -1209,7 +1276,7 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
-        if sub.text.trim() == "exit" {
+        if sub.draft.paste_ranges.is_empty() && sub.text.trim() == "exit" {
             return self.quit();
         }
 
@@ -1547,7 +1614,7 @@ impl App {
             } else if let Some(task_id) = subagent_id {
                 self.chats[chat_idx].show_user_message(text.clone());
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
-                    if pending.front().is_some_and(|queued| queued == &text) {
+                    if pending.front().is_some_and(|queued| queued.text == text) {
                         pending.pop_front();
                     }
                     if pending.is_empty() {
@@ -1993,7 +2060,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2002,6 +2069,7 @@ impl App {
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
+            &self.paste_editor,
             &self.rewind_picker,
             &self.theme_picker,
             &self.model_picker,
@@ -2011,7 +2079,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2020,6 +2088,7 @@ impl App {
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
+            &mut self.paste_editor,
             &mut self.rewind_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
@@ -2200,6 +2269,36 @@ impl App {
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
             self.command_palette.sync(&val);
         }
+    }
+
+    pub(super) fn open_paste_editor(&mut self, id: crate::input_document::PasteId) {
+        let Some(text) = self.active_input_box().paste_text(id).map(str::to_owned) else {
+            return;
+        };
+        let Some(target) = self.active_input_target() else {
+            return;
+        };
+        self.paste_editor.open(target, id, text);
+    }
+
+    fn active_input_target(&self) -> Option<PasteEditorTarget> {
+        if self.is_main_chat() {
+            Some(PasteEditorTarget::Main)
+        } else {
+            self.active_subagent_id()
+                .map(|id| PasteEditorTarget::Subagent(id.to_owned()))
+        }
+    }
+
+    pub(crate) fn apply_external_input(&mut self, previous: &str, edited: String) {
+        let edited = edited.replace("\r\n", "\n").replace('\r', "\n");
+        if edited == previous {
+            return;
+        }
+        self.input_box.set_input(edited);
+        self.input_box.move_to_end();
+        let palette_text = self.input_box.palette_text();
+        self.command_palette.sync(&palette_text);
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
