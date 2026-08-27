@@ -26,7 +26,7 @@ use crate::tools::{
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
-    ToolOutput, ToolOutputLines,
+    SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -34,6 +34,8 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 struct SessionStore {
     dir: StateDir,
     session: StoredSession,
+    subagent_history: SubagentHistoryStore,
+    persisted_subagent_history: SubagentHistorySnapshot,
 }
 
 impl SessionStore {
@@ -46,14 +48,25 @@ impl SessionStore {
 
     fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
         match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
+            Ok(session) => Self::from_session(dir, session),
             Err(_) => {
                 let mut session = StoredSession::new(model_spec, cwd);
                 session.id = session_id;
-                let mut store = Self { dir, session };
+                let mut store = Self::from_session(dir, session);
                 store.save();
                 store
             }
+        }
+    }
+
+    fn from_session(dir: StateDir, session: StoredSession) -> Self {
+        let subagent_history = SubagentHistoryStore::seeded(session.subagent_messages().clone());
+        let persisted_subagent_history = subagent_history.snapshot();
+        Self {
+            dir,
+            session,
+            subagent_history,
+            persisted_subagent_history,
         }
     }
 
@@ -66,6 +79,23 @@ impl SessionStore {
     fn record_turn(&mut self, messages: &[Message], model_spec: String) {
         self.session.replace_messages(messages.to_vec());
         self.session.set_model(model_spec);
+        let snapshot = self.subagent_history.snapshot();
+        if snapshot.revision() != self.persisted_subagent_history.revision() {
+            for (task_id, history) in snapshot.histories() {
+                let unchanged = self
+                    .persisted_subagent_history
+                    .histories()
+                    .get(task_id)
+                    .is_some_and(|persisted| Arc::ptr_eq(persisted, history));
+                if !unchanged {
+                    self.session.set_subagent_messages(
+                        task_id.clone(),
+                        Arc::unwrap_or_clone(Arc::clone(history)),
+                    );
+                }
+            }
+            self.persisted_subagent_history = snapshot;
+        }
         self.session.update_title_if_default();
         self.save();
     }
@@ -227,6 +257,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    subagent_history: SubagentHistoryStore::default(),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
@@ -377,6 +408,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
 
             let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
+            let subagent_history = store
+                .as_ref()
+                .map(|store| store.subagent_history.clone())
+                .unwrap_or_default();
             let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
@@ -460,6 +495,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        subagent_history: subagent_history.clone(),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                         model_policy: Arc::clone(&params.model_policy),
@@ -611,6 +647,28 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    #[test]
+    fn record_turn_syncs_and_reloads_subagent_history() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store
+            .subagent_history
+            .reserve("task-1")
+            .unwrap()
+            .complete(vec![Message::user("investigate".into())]);
+        store.record_turn(&[], MODEL_SPEC.into());
+
+        let loaded = load(&tmp);
+        assert_eq!(
+            loaded.subagent_messages()["task-1"][0].user_text(),
+            Some("investigate")
+        );
+
+        let reopened = store_in(&tmp);
+        let lease = reopened.subagent_history.continue_task("task-1").unwrap();
+        assert_eq!(lease.history().unwrap()[0].user_text(), Some("investigate"));
     }
 
     #[test]

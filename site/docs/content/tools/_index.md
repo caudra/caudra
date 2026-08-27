@@ -174,6 +174,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
+| `task_id` | string | no | A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh. |
 
 ### `todo_write` {#todo_write}
 

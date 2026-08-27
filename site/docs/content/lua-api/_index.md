@@ -230,6 +230,7 @@ string or a table with richer output fields.
     - `image` (`table`) { media_type: string, data: string } base64 image.
     - `instructions` (`table`) Array of { path, content } blocks injected as context.
     - `state` (`any`) Serializable state forwarded to restore.
+    - `model_suffix` (`string`) Extra parent-model context omitted from UI and direct tool calls.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -929,6 +930,7 @@ and tool set.
     `handler` (function). The handler receives the input table and must return
     `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
+  - `task_id` (`string?`) completed task to continue with its existing history.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session access to MCP tools. Their
     definitions are injected automatically each turn (deferred behind
@@ -965,6 +967,18 @@ Create one with `maki.agent.session()`, then send messages with
 `:prompt()`. The session remembers previous turns, so you can have
 a multi-step conversation. Call `:close()` when you are done, or let
 garbage collection handle it.
+
+---
+
+### `Session:id()` {#Session-id}
+
+```lua
+Session:id()
+```
+
+Return the stable task ID used for continuation and UI routing.
+
+**Returns:** string
 
 ---
 

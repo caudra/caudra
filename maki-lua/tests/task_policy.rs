@@ -48,6 +48,7 @@ const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
 const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
+const CONTINUED_TASK_ID: &str = "task-continued";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
@@ -142,7 +143,11 @@ end
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
+  recorder.session_task_id = opts.task_id
   local sess = { opts = opts }
+  function sess:id()
+    return opts.task_id or "task-test"
+  end
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
     return behaviors[opts.name](self, msg)
@@ -171,6 +176,7 @@ maki.api.register_tool({
       acquired = recorder.acquired,
       released = recorder.released,
       sem_size = recorder.sem_size,
+      session_task_id = recorder.session_task_id,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -274,6 +280,24 @@ fn model_spec_ignored_when_allow_model_off() {
         opts.get("spec").is_none_or(Value::is_null),
         "spec should not be forwarded when allow_model is off"
     );
+}
+
+#[test]
+fn task_id_is_forwarded_and_returned_as_model_only_metadata() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["task_id"] = json!(CONTINUED_TASK_ID);
+    let entry = reg.get(TASK_TOOL).expect("task tool missing");
+    let invocation = entry.tool.parse(&input).expect("task input failed");
+    let result = smol::block_on(invocation.execute(&stub_ctx(&AgentMode::Build)));
+
+    let output = result.output.expect("continued task failed");
+    assert_eq!(output.as_display_text(), PLAIN_TEXT);
+    assert_eq!(
+        result.model_suffix.as_deref(),
+        Some("<task_metadata>\ntask_id: task-continued\n</task_metadata>")
+    );
+    assert_eq!(probe(&reg)["session_task_id"], json!(CONTINUED_TASK_ID));
 }
 
 fn answer_schema() -> Value {

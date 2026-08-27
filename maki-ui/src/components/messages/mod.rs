@@ -161,6 +161,14 @@ impl MessagesPanel {
         self.cache.clear();
     }
 
+    pub fn remove(&mut self, index: usize) {
+        if index >= self.messages.len() {
+            return;
+        }
+        self.messages.remove(index);
+        self.cache.clear();
+    }
+
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
         if !self.show_thinking {
             for msg in &mut msgs {
@@ -423,6 +431,7 @@ impl MessagesPanel {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                model_suffix: None,
             });
         }
     }
@@ -609,6 +618,18 @@ impl MessagesPanel {
 
     pub fn set_accent(&mut self, color: ratatui::style::Color) {
         self.accent.set(color);
+    }
+
+    pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
+        if area.height == 0 {
+            return None;
+        }
+        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        self.cache
+            .segment_at_row(doc_row, self.viewport_width)?
+            .1
+            .tool_id
+            .as_deref()
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {

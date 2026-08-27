@@ -21,6 +21,7 @@ use maki_agent::GoalSnapshot;
 
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
+const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const YOLO_LABEL: &str = " [yolo]";
@@ -43,6 +44,7 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
+    pub back_to_main: bool,
     pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
@@ -126,7 +128,7 @@ impl StatusBar {
         ])
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Option<Rect> {
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -144,9 +146,23 @@ impl StatusBar {
 
         left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
 
+        let back_offset = ctx
+            .back_to_main
+            .then(|| left_spans.iter().map(Span::width).sum::<usize>() + " ".width());
+        if ctx.back_to_main {
+            left_spans.push(Span::styled(
+                format!(" {BACK_TO_MAIN_LABEL}"),
+                theme::current().status_notice,
+            ));
+        }
+
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
-                format!(" [{name}]"),
+                if ctx.back_to_main {
+                    format!(" {name}")
+                } else {
+                    format!(" [{name}]")
+                },
                 theme::current().status_dim,
             ));
         }
@@ -274,6 +290,14 @@ impl StatusBar {
             Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
             right_area,
         );
+
+        back_offset.and_then(|offset| {
+            let offset = u16::try_from(offset).ok()?;
+            let width = u16::try_from(BACK_TO_MAIN_LABEL.width()).ok()?;
+            let x = area.x.checked_add(offset)?;
+            (area.height > 0 && x.checked_add(width)? <= left_area.right())
+                .then(|| Rect::new(x, area.y, width, 1))
+        })
     }
 }
 
@@ -411,6 +435,7 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
+            back_to_main: false,
             retry_info: None,
             thinking_label: None,
             fast: false,
@@ -419,7 +444,11 @@ mod tests {
             restoring: false,
             goal: None,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 

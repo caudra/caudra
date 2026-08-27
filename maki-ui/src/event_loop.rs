@@ -325,6 +325,8 @@ impl SpawnCtx {
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
         let goal = maki_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
+        let subagent_history =
+            maki_agent::SubagentHistoryStore::seeded(session.subagent_messages().clone());
         let handles = AgentHandles::spawn(
             &self.model_slot,
             session.messages().to_vec(),
@@ -338,6 +340,7 @@ impl SpawnCtx {
             self.mcp_config_errors.clone(),
             Arc::clone(&self.model_policy),
             goal,
+            subagent_history,
         );
         let mut app = App::new(
             &self.model_slot.load().model,

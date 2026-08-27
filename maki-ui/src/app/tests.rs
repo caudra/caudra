@@ -193,10 +193,12 @@ fn subagent_info_with_tx(
 ) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
+        task_id: parent_id.into(),
         name: name.into(),
         prompt: None,
         model: None,
         answer_tx,
+        steer_tx: None,
     }
 }
 
@@ -238,6 +240,14 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: Some(info),
+        run_id: 1,
+    }))
+}
+
+fn subagent_msg_with_info(event: AgentEvent, subagent: SubagentInfo) -> Msg {
+    Msg::Agent(Box::new(Envelope {
+        event,
+        subagent: Some(subagent),
         run_id: 1,
     }))
 }
@@ -420,6 +430,7 @@ fn tool_done_transitions_plan_to_ready(
         is_error: false,
         annotation: None,
         written_path,
+        model_suffix: None,
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
@@ -761,6 +772,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         is_error: false,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     }))));
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
@@ -1170,7 +1182,7 @@ fn cancel_resets_all_chats_and_indices() {
 /// does before it reports success or failure.
 pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::SubagentHistory {
-        tool_use_id: id.into(),
+        task_id: id.into(),
         messages: vec![],
     }));
 }
@@ -1183,11 +1195,136 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         is_error,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     }))));
 }
 
 fn finish_subagent_task(app: &mut App, is_error: bool) {
     finish_subagent(app, TASK_ID, is_error);
+}
+
+#[test]
+fn focused_running_subagent_composer_steers_at_the_child_queue() {
+    const STEER: &str = "focus on the authentication failure";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_tx, steer_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_tx);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info.clone(),
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input(STEER.into());
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(actions.is_empty());
+    let input = steer_rx.try_recv().expect("steer was not sent");
+    assert_eq!(input.message, STEER);
+    assert_eq!(app.chats[1].message_count(), 0, "wait for consumption ack");
+    assert!(
+        rendered(&mut app).contains(STEER),
+        "pending steer must be visible in the task queue panel"
+    );
+
+    app.update(subagent_msg_with_info(
+        AgentEvent::QueueItemConsumed {
+            text: STEER.into(),
+            image_count: 0,
+        },
+        info,
+    ));
+    let last = app.chats[1]
+        .message_at(app.chats[1].message_count() - 1)
+        .expect("steer bubble missing");
+    assert_eq!(last.role, DisplayRole::User);
+    assert_eq!(last.text, STEER);
+    assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+#[test]
+fn unconsumed_subagent_steer_returns_to_the_composer_on_close() {
+    const STEER: &str = "do not change the public API";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_tx, steer_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_tx);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    app.subagent_input_box.set_input(STEER.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(steer_rx.try_recv().unwrap().message, STEER);
+
+    close_subagent_transcript(&mut app, TASK_ID);
+
+    assert_eq!(app.subagent_input_box.buffer.value(), STEER);
+    assert!(!app.subagent_steers.contains_key(TASK_ID));
+    assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+#[test]
+fn continuation_reuses_stable_task_chat_and_new_parent_tool_id() {
+    const FIRST_TOOL_ID: &str = "tool-first";
+    const NEXT_TOOL_ID: &str = "tool-next";
+    const CONTINUED_PROMPT: &str = "check the failing test now";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    let mut first = subagent_info(FIRST_TOOL_ID, RESEARCH_NAME);
+    first.task_id = TASK_ID.into();
+    first.prompt = Some("inspect the tests".into());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "first result".into(),
+        },
+        first,
+    ));
+    close_subagent_transcript(&mut app, TASK_ID);
+    finish_subagent(&mut app, FIRST_TOOL_ID, false);
+    assert!(app.chats[1].is_finished());
+
+    let mut continued = subagent_info(NEXT_TOOL_ID, RESEARCH_NAME);
+    continued.task_id = TASK_ID.into();
+    continued.prompt = Some(CONTINUED_PROMPT.into());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "continued result".into(),
+        },
+        continued,
+    ));
+
+    assert_eq!(app.chats.len(), 2);
+    assert!(!app.chats[1].is_finished());
+    assert_eq!(
+        app.parent_task_ids.get(NEXT_TOOL_ID).map(String::as_str),
+        Some(TASK_ID)
+    );
+    assert!(
+        (0..app.chats[1].message_count()).any(|idx| {
+            app.chats[1]
+                .message_at(idx)
+                .is_some_and(|message| message.text == CONTINUED_PROMPT)
+        }),
+        "continued prompt missing from reused chat"
+    );
+
+    close_subagent_transcript(&mut app, TASK_ID);
+    finish_subagent(&mut app, NEXT_TOOL_ID, false);
+    assert!(app.chats[1].is_finished());
 }
 
 #[test]
@@ -1772,6 +1909,79 @@ fn empty_click_clears_selection() {
     assert!(app.selection_state.is_none());
 }
 
+#[test]
+fn clicking_completed_task_in_main_chat_focuses_its_stable_chat() {
+    const PARENT_TOOL_ID: &str = "outer-task-tool";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(PARENT_TOOL_ID, "task")));
+    let mut info = subagent_info(PARENT_TOOL_ID, RESEARCH_NAME);
+    info.task_id = TASK_ID.into();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "hi".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    finish_subagent(&mut app, PARENT_TOOL_ID, false);
+
+    let area = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, area);
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| app.chats[0].view(frame, area, false))
+        .unwrap();
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 0));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 0));
+
+    assert_eq!(
+        app.chats[app.active_chat].task_id().map(|id| id.as_ref()),
+        Some(TASK_ID)
+    );
+}
+
+#[test]
+fn task_status_back_button_focuses_main_chat() {
+    let mut app = app_with_subagent();
+    app.focus_task(TASK_ID).unwrap();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+
+    assert!(buffer_text(terminal.backend().buffer()).contains("[< Main] research"));
+    let area = app
+        .task_back_area
+        .expect("task back button should be visible");
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    ));
+
+    assert_eq!(app.active_chat, 0);
+}
+
+#[test]
+fn modal_blocks_task_status_back_button() {
+    let mut app = app_with_subagent();
+    app.focus_task(TASK_ID).unwrap();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let area = app
+        .task_back_area
+        .expect("task back button should be visible");
+    app.help_modal.toggle();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    ));
+
+    assert_eq!(app.active_chat, 1);
+}
+
 fn make_pending_copy(app: &mut App) {
     set_zone(app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
@@ -2142,6 +2352,8 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 
 #[test]
 fn resolve_or_create_chat_sets_model_id_and_annotation() {
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -2160,13 +2372,22 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
         AgentEvent::TextDelta { text: "hi".into() },
         TASK_ID,
         "research",
-        "anthropic/claude-sonnet-4-20250514",
+        MODEL,
+    ));
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta {
+            text: " again".into(),
+        },
+        TASK_ID,
+        "research",
+        MODEL,
     ));
 
     assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].model_id.as_deref(), Some(MODEL));
     assert_eq!(
-        app.chats[1].model_id.as_deref(),
-        Some("anthropic/claude-sonnet-4-20250514")
+        app.chats[0].message_at(0).unwrap().annotation.as_deref(),
+        Some(MODEL)
     );
 }
 
@@ -3606,6 +3827,7 @@ fn plan_app() -> App {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        model_suffix: None,
     }))));
     app
 }
@@ -3625,6 +3847,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
+        model_suffix: None,
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
     if expect_form {
@@ -3657,6 +3880,7 @@ fn re_edit_keeps_plan_form_visible() {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        model_suffix: None,
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
@@ -3725,6 +3949,7 @@ fn rewrite_plan(app: &mut App) {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        model_suffix: None,
     }))));
 }
 
@@ -4101,7 +4326,7 @@ fn subagent_history_finishes_workflow_chat() {
 
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
-            tool_use_id: "session-abc".into(),
+            task_id: "session-abc".into(),
             messages: vec![],
         },
         1,
@@ -4985,6 +5210,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             is_error: false,
             annotation: None,
             written_path: None,
+            model_suffix: None,
         }))));
         app.checkpoint();
     }

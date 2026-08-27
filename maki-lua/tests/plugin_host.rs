@@ -3623,6 +3623,60 @@ fn call_tool_resolves_lua_tool_and_reports_unknown() {
     host.unload("echo_plugin").unwrap();
 }
 
+#[test_case::test_case(false ; "success")]
+#[test_case::test_case(true ; "error")]
+fn lua_model_suffix_reaches_parent_model_but_not_flattened_output(is_error: bool) {
+    const VISIBLE_OUTPUT: &str = "visible output";
+    const MODEL_SUFFIX: &str = "model-only context";
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "model_suffix_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                return {{
+                    llm_output = "{VISIBLE_OUTPUT}",
+                    model_suffix = "{MODEL_SUFFIX}",
+                    is_error = {is_error},
+                }}
+            end,
+        }})"#
+    );
+    host.load_source("model_suffix_plugin", &src).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "t1".into(),
+        "model_suffix_probe",
+        &serde_json::json!({}),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert_eq!(done.is_error, is_error);
+    assert_eq!(done.output.as_text(), VISIBLE_OUTPUT);
+    assert_eq!(done.model_suffix(), Some(MODEL_SUFFIX));
+    let flattened = maki_agent::tools::interpreter_bridge::flatten(&done);
+    if is_error {
+        assert_eq!(flattened.unwrap_err(), VISIBLE_OUTPUT);
+    } else {
+        assert_eq!(flattened.unwrap(), VISIBLE_OUTPUT);
+    }
+    let message = maki_agent::types::tool_results(vec![done]);
+    assert!(matches!(
+        &message.content[0],
+        maki_providers::ContentBlock::ToolResult { content, is_error: actual_error, .. }
+            if content == "visible output\n\nmodel-only context" && *actual_error == is_error
+    ));
+}
+
 #[test]
 fn session_close_idempotent_and_prompt_after_close_errors() {
     let reg = fresh_registry();
@@ -3648,7 +3702,36 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
     assert_eq!(out, SESSION_CLOSED_ERR);
 }
 
+#[test]
+fn session_task_id_reopens_completed_history() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_continue_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local first, first_err = maki.agent.session(ctx, {{}})
+                if first_err then return first_err end
+                local task_id = first:id()
+                first:close()
+                local continued, continued_err = maki.agent.session(ctx, {{ task_id = task_id }})
+                if continued_err then return continued_err end
+                local continued_id = continued:id()
+                continued:close()
+                return continued_id
+            end
+        }})"#
+    );
+    host.load_source("session_continue_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "session_continue_probe", serde_json::json!({})).unwrap();
+    assert!(out.starts_with("session-"), "got: {out}");
+}
+
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
+#[test_case::test_case("{ task_id = 'missing' }", "unknown subagent task ID `missing`" ; "unknown_task_id")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {

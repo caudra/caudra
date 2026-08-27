@@ -30,14 +30,14 @@ read main.rs                 index main.rs
                              + read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A `task` subagent gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
+**Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can grep, read, and hit dead ends as much as it wants while only its final summary enters the main conversation. Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
 
 ```
-main context                subagent context (discarded)
+main context                subagent context (isolated)
 ────────────                ────────────────────────────
 task("find auth") ───────►  glob, grep ×6, read ×9, ...
                   ◄───────  "JWT middleware, auth.rs:120"
-one line stays              ~20k tokens never seen
+one line stays              ~20k tokens stay outside main
 ```
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Maki loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).

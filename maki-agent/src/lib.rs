@@ -27,10 +27,14 @@ pub mod command;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;
+mod subagent_history;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
+pub use subagent_history::{
+    SubagentHistoryError, SubagentHistoryLease, SubagentHistorySnapshot, SubagentHistoryStore,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

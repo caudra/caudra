@@ -11,7 +11,8 @@ use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, SubagentHistoryStore,
+    ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -79,6 +80,7 @@ impl AgentHandles {
         mcp_config_errors: McpConfigErrors,
         model_policy: Arc<ModelPolicy>,
         goal: maki_agent::GoalHandle,
+        subagent_history: SubagentHistoryStore,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -94,6 +96,7 @@ impl AgentHandles {
             lua_handle,
             model_policy,
             goal,
+            subagent_history,
         )
     }
 
@@ -170,6 +173,8 @@ impl AgentHandles {
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
+        let subagent_history =
+            SubagentHistoryStore::seeded(app.state.session.subagent_messages().clone());
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
@@ -184,6 +189,7 @@ impl AgentHandles {
             lua_handle,
             Arc::clone(&self.model_policy),
             app.state.goal.clone(),
+            subagent_history,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -247,6 +253,7 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
     goal: maki_agent::GoalHandle,
+    subagent_history: SubagentHistoryStore,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -289,6 +296,7 @@ fn spawn_agent_internal(
         timeouts,
         lua_handle,
         Arc::clone(&subagent_cancels),
+        subagent_history.clone(),
         Arc::clone(&model_policy),
         goal.clone(),
     );
@@ -390,6 +398,7 @@ mod tests {
             McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),
             maki_agent::GoalHandle::default(),
+            SubagentHistoryStore::default(),
         );
         (handles, model_slot, permissions)
     }

@@ -3,11 +3,12 @@ use std::time::{Duration, Instant};
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
 use super::App;
+use super::tasks::MAIN_TASK_ID;
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -16,6 +17,16 @@ impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if !self.is_main_chat()
+                    && !self.has_modal_overlay()
+                    && self
+                        .task_back_area
+                        .is_some_and(|area| area.contains(Position::new(event.column, event.row)))
+                {
+                    self.selection_state = None;
+                    let _ = self.focus_task(MAIN_TASK_ID);
+                    return;
+                }
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
                         return;
@@ -23,8 +34,12 @@ impl App {
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
                         let focused = !self.any_overlay_open();
-                        self.input_box
-                            .handle_click(zone.area, event.row, event.column, focused);
+                        self.active_input_box_mut().handle_click(
+                            zone.area,
+                            event.row,
+                            event.column,
+                            focused,
+                        );
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
@@ -52,6 +67,18 @@ impl App {
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
+                            if self.active_chat == 0
+                                && let Some(tool_id) = self.chats[0].tool_id_at(event.row, area)
+                            {
+                                let task_id = self
+                                    .parent_task_ids
+                                    .get(tool_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| tool_id.to_owned());
+                                if self.focus_task(&task_id).is_ok() {
+                                    return;
+                                }
+                            }
                             self.chats[self.active_chat].handle_click(event.row, area);
                         }
                     }
@@ -191,9 +218,10 @@ impl App {
                     self.selection_state = None;
                     return;
                 };
-                let copy_text = self.input_box.copy_text();
+                let input_box = self.active_input_box();
+                let copy_text = input_box.copy_text();
                 let input_area = sel.area;
-                let line_breaks = self.input_box.line_breaks(input_area.width);
+                let line_breaks = input_box.line_breaks(input_area.width);
                 let regions = [ContentRegion {
                     area: input_area,
                     raw_text: &copy_text,
@@ -230,7 +258,7 @@ impl App {
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {
         match zone {
             SelectionZone::Messages => self.chats[self.active_chat].scroll_top() as u32,
-            SelectionZone::Input => self.input_box.scroll_y() as u32,
+            SelectionZone::Input => self.active_input_box().scroll_y() as u32,
             SelectionZone::Overlay => 0,
         }
     }
@@ -238,7 +266,7 @@ impl App {
     pub(super) fn scroll_zone(&mut self, zone: SelectionZone, delta: i32) {
         match zone {
             SelectionZone::Messages => self.chats[self.active_chat].scroll(delta),
-            SelectionZone::Input => self.input_box.scroll(delta),
+            SelectionZone::Input => self.active_input_box_mut().scroll(delta),
             SelectionZone::Overlay => {}
         }
     }

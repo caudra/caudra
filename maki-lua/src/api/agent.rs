@@ -19,7 +19,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, ExtractedCommand, History, InterruptSource,
+    McpSession, SubagentHistoryError, SubagentHistoryLease, SubagentInfo, ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -39,6 +40,19 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+
+struct SessionInterruptSource {
+    rx: flume::Receiver<AgentInput>,
+}
+
+impl InterruptSource for SessionInterruptSource {
+    fn poll(&self) -> Option<ExtractedCommand> {
+        self.rx
+            .try_recv()
+            .ok()
+            .map(|input| ExtractedCommand::Interrupt(input, 0))
+    }
+}
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -362,6 +376,7 @@ async fn call_tool(
 ///     `handler` (function). The handler receives the input table and must return
 ///     `(string)` or `(nil, err)`.
 ///   `name` (string?) - display name for logs and UI.
+///   `task_id` (string?) - completed task to continue with its existing history.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session access to MCP tools. Their
 ///     definitions are injected automatically each turn (deferred behind
@@ -396,6 +411,7 @@ async fn session(
     let tools_val: Option<LuaValue> = opts.get("tools")?;
     let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     let name: Option<String> = opts.get("name")?;
+    let continued_task_id: Option<String> = opts.get("task_id")?;
     let thinking_val: Option<LuaValue> = opts.get("thinking")?;
     let audience = match opts.get::<Option<String>>("audience")? {
         Some(s) => {
@@ -490,6 +506,7 @@ async fn session(
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (steer_tx, steer_rx) = flume::unbounded::<AgentInput>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (usage_tx, usage_rx) = flume::unbounded();
@@ -503,20 +520,39 @@ async fn session(
     ))
     .detach();
 
-    // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth. The fallback key gets its own id:
-    // it keys `subagent_cancels`, so sharing the session id would make two
-    // subagents running at once collide.
-    let ui_id = agent_ctx
+    let parent_tool_use_id = agent_ctx
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    let mut task_id = continued_task_id
+        .clone()
+        .unwrap_or_else(|| parent_tool_use_id.clone());
+    let history_lease = match continued_task_id {
+        Some(_) => try_pair!(agent_ctx.subagent_history.continue_task(&task_id)),
+        None => match agent_ctx.subagent_history.reserve(task_id.clone()) {
+            Ok(lease) => lease,
+            Err(
+                SubagentHistoryError::AlreadyActive { .. }
+                | SubagentHistoryError::AlreadyCompleted { .. },
+            ) => {
+                task_id = format!("session-{}", MakiId::generate());
+                try_pair!(agent_ctx.subagent_history.reserve(task_id.clone()))
+            }
+            Err(error) => return Ok(err_pair(error.to_string())),
+        },
+    };
+    let history = history_lease
+        .history()
+        .map_or_else(Vec::new, |messages| messages.as_ref().clone());
+
+    // Register a cancel trigger so the child token does not fire on drop
+    // and kill the subagent at birth.
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
-    // Several sessions can share one `ui_id`, so keep the slot and retire
+    // Several sessions can share one task id, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
         .subagent_cancels
-        .insert(ui_id.clone(), child_trigger);
+        .insert(task_id.clone(), child_trigger);
 
     let name = name.unwrap_or_default();
     info!(name = %name, model = %model.id, "subagent session opened");
@@ -534,6 +570,7 @@ async fn session(
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
+            subagent_history: agent_ctx.subagent_history.clone(),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
@@ -547,13 +584,17 @@ async fn session(
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
-        history: History::new(Vec::new()),
+        history: History::restored(history),
+        history_lease: Some(history_lease),
         sub_event_tx,
         child_cancel,
+        interrupt_source: Arc::new(SessionInterruptSource { rx: steer_rx }),
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
+        steer_tx: Some(steer_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
-        ui_id,
+        parent_tool_use_id,
+        task_id,
         cancel_slot,
         parent_event_tx: parent_tx,
         subagent_info,
@@ -673,16 +714,17 @@ struct SessionState {
     /// subagent and its parent.
     mcp: Option<McpSession>,
     history: History,
+    history_lease: Option<SubagentHistoryLease>,
     sub_event_tx: EventSender,
     child_cancel: maki_agent::cancel::CancelToken,
+    interrupt_source: Arc<SessionInterruptSource>,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
+    steer_tx: Option<flume::Sender<AgentInput>>,
     parent_cancels: Arc<CancelMap<String>>,
-    /// Stable identity for UI, cancel, and history. Falls back to a synthetic
-    /// id for workflow-mode sessions (no model-issued tool call exists).
-    /// Shared with any sibling session the same tool call opened.
-    ui_id: String,
-    /// Which registration under [`ui_id`](Self::ui_id) is ours.
+    parent_tool_use_id: String,
+    task_id: String,
+    /// Which cancellation registration under `task_id` is ours.
     cancel_slot: CancelSlot,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
@@ -700,10 +742,13 @@ impl SessionState {
             return;
         }
         self.closed = true;
-        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
+        self.parent_cancels.retire(&self.task_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        if let Some(lease) = self.history_lease.take() {
+            lease.complete(Arc::new(messages.clone()));
+        }
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id: self.ui_id.clone(),
+            task_id: self.task_id.clone(),
             messages,
         });
         info!(
@@ -767,15 +812,18 @@ async fn prompt(
     }
     if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
-            parent_tool_use_id: s.ui_id.clone(),
+            parent_tool_use_id: s.parent_tool_use_id.clone(),
+            task_id: s.task_id.clone(),
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
             answer_tx: s.answer_tx.take(),
+            steer_tx: s.steer_tx.take(),
         });
     }
 
     let history_len = s.history.len();
+    let interrupt_source: Arc<dyn InterruptSource> = s.interrupt_source.clone();
     let mut agent = Agent::new(
         s.params.clone(),
         AgentRunParams {
@@ -786,6 +834,7 @@ async fn prompt(
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
+    .with_interrupt_source(interrupt_source)
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));
@@ -866,6 +915,17 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
+/// Return the stable task ID used for continuation and UI routing.
+///
+/// @return string
+#[lua_fn]
+async fn id(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<String> {
+    let inner = Arc::clone(&this.inner);
+    drop(this);
+    let task_id = inner.lock().await.task_id.clone();
+    Ok(task_id)
+}
+
 /// Close the session and flush its history back to the parent agent. You can
 /// call this multiple times safely. If you forget, it runs automatically when
 /// the session is garbage collected.
@@ -887,7 +947,7 @@ lua_class! {
     /// `:prompt()`. The session remembers previous turns, so you can have
     /// a multi-step conversation. Call `:close()` when you are done, or let
     /// garbage collection handle it.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [id, prompt, close]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -978,10 +1038,12 @@ mod tests {
         subagent_info
             .set(SubagentInfo {
                 parent_tool_use_id: PARENT_ID.into(),
+                task_id: PARENT_ID.into(),
                 name: "research".into(),
                 prompt: None,
                 model: None,
                 answer_tx: None,
+                steer_tx: None,
             })
             .unwrap();
         let (usage_tx, usage_rx) = flume::unbounded();

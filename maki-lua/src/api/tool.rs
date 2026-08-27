@@ -472,6 +472,7 @@ impl ToolInvocation for LuaToolInvocation {
                     let instructions = reply.instructions;
                     let image = reply.image;
                     let state = reply.state;
+                    let model_suffix = reply.model_suffix;
                     ToolExecResult {
                         output: reply.result.map(|s| {
                             if let Some(source) = image {
@@ -497,6 +498,7 @@ impl ToolInvocation for LuaToolInvocation {
                         }),
                         annotation: reply.annotation,
                         written_path: reply.written_path,
+                        model_suffix,
                     }
                 }
             }
@@ -616,6 +618,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                image       (table)   { media_type: string, data: string } base64 image.
 ///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
+///                                model_suffix (string) Extra parent-model context omitted from UI and direct tool calls.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -1438,6 +1441,7 @@ pub(crate) struct ToolCallReply {
     /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    pub model_suffix: Option<String>,
 }
 
 impl ToolCallReply {
@@ -1453,6 +1457,7 @@ impl ToolCallReply {
             .and_then(|v| Self::extract_snapshot(&v));
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
+        let model_suffix = t.get::<String>("model_suffix").ok();
         let instructions = extract_instructions(t);
         let written_path = t.get::<String>("written_path").ok();
         let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
@@ -1487,6 +1492,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            model_suffix,
         }
     }
 
@@ -1520,6 +1526,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            model_suffix: None,
         }
     }
 
@@ -1989,6 +1996,21 @@ mod tests {
         let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert_eq!(reply.result, Err("boom".to_string()));
         assert_eq!(reply.format, LuaOutputFormat::Markdown);
+    }
+
+    #[test_case::test_case(false ; "success")]
+    #[test_case::test_case(true ; "error")]
+    fn from_lua_value_extracts_model_suffix(is_error: bool) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "visible").unwrap();
+        t.set("model_suffix", "model context").unwrap();
+        t.set("is_error", is_error).unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
+
+        assert_eq!(reply.model_suffix.as_deref(), Some("model context"));
+        assert_eq!(reply.result.is_err(), is_error);
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +57,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, GoalVerdict, ImageSource, McpConfigErrors, McpPromptInfo,
-    McpSnapshotReader, SharedMessages, SubagentInfo,
+    AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
+    McpPromptInfo, McpSnapshotReader, SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -70,7 +70,7 @@ use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -96,6 +96,7 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -197,6 +198,9 @@ pub struct App {
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
+    subagent_input_box: InputBox,
+    subagent_input_task: Option<String>,
+    subagent_drafts: HashMap<String, String>,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
@@ -213,6 +217,7 @@ pub struct App {
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
+    pub(super) task_back_area: Option<Rect>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
@@ -248,6 +253,9 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    subagent_steers: HashMap<String, flume::Sender<AgentInput>>,
+    pending_subagent_steers: HashMap<String, VecDeque<String>>,
+    parent_task_ids: HashMap<String, String>,
 }
 
 impl App {
@@ -278,6 +286,7 @@ impl App {
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
+        let subagent_input_box = InputBox::new(InputHistory::default(), ui_config.max_input_lines);
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -287,6 +296,9 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box,
+            subagent_input_box,
+            subagent_input_task: None,
+            subagent_drafts: HashMap::new(),
             command_palette: CommandPalette::new(
                 custom_commands,
                 mcp_reader.clone(),
@@ -307,6 +319,7 @@ impl App {
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
+            task_back_area: None,
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
@@ -341,6 +354,9 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            subagent_steers: HashMap::new(),
+            pending_subagent_steers: HashMap::new(),
+            parent_task_ids: HashMap::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -357,6 +373,59 @@ impl App {
 
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
+    }
+
+    fn active_subagent_id(&self) -> Option<&str> {
+        self.chats
+            .get(self.active_chat)?
+            .task_id()
+            .map(|id| id.as_ref())
+    }
+
+    fn active_subagent_can_steer(&self) -> bool {
+        self.active_subagent_id()
+            .is_some_and(|id| self.subagent_steers.contains_key(id))
+    }
+
+    fn active_subagent_pending(&self) -> Option<&VecDeque<String>> {
+        self.pending_subagent_steers.get(self.active_subagent_id()?)
+    }
+
+    fn active_input_box(&self) -> &InputBox {
+        if self.is_main_chat() {
+            &self.input_box
+        } else {
+            &self.subagent_input_box
+        }
+    }
+
+    fn active_input_box_mut(&mut self) -> &mut InputBox {
+        if self.is_main_chat() {
+            &mut self.input_box
+        } else {
+            &mut self.subagent_input_box
+        }
+    }
+
+    fn sync_subagent_input_target(&mut self) {
+        let next = self.active_subagent_id().map(str::to_owned);
+        if self.subagent_input_task == next {
+            return;
+        }
+        if let Some(previous) = self.subagent_input_task.take() {
+            let draft = self.subagent_input_box.buffer.value();
+            if draft.is_empty() {
+                self.subagent_drafts.remove(&previous);
+            } else {
+                self.subagent_drafts.insert(previous, draft);
+            }
+        }
+        let draft = next
+            .as_ref()
+            .and_then(|id| self.subagent_drafts.remove(id))
+            .unwrap_or_default();
+        self.subagent_input_box.set_input(draft);
+        self.subagent_input_task = next;
     }
 
     fn plan_form_active(&self) -> bool {
@@ -551,6 +620,13 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
+            if !self.is_main_chat()
+                && self.active_subagent_can_steer()
+                && !self.subagent_input_box.is_empty()
+            {
+                self.subagent_input_box.discard();
+                return Some(vec![]);
+            }
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -810,6 +886,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
+        self.sync_subagent_input_target();
 
         if key::SUSPEND.matches(key) && cfg!(unix) {
             return vec![Action::Suspend];
@@ -830,6 +907,9 @@ impl App {
         }
 
         if !self.is_main_chat() {
+            if self.active_subagent_can_steer() {
+                return self.handle_subagent_chat_key(key);
+            }
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                 KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
@@ -848,6 +928,89 @@ impl App {
         }
 
         self.handle_main_chat_key(key)
+    }
+
+    fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.subagent_input_box.handle_key(key) {
+            InputAction::Submit(sub) => self.handle_subagent_submit(sub),
+            InputAction::Passthrough(key) => match key.code {
+                KeyCode::Esc => {
+                    if let Some(t) = self.last_esc.take()
+                        && t.elapsed() < self.status_bar.flash_duration
+                    {
+                        self.handle_subagent_cancel()
+                    } else {
+                        self.last_esc = Some(Instant::now());
+                        self.status_bar.flash(FLASH_CANCEL.into());
+                        vec![]
+                    }
+                }
+                _ => vec![],
+            },
+            InputAction::ContinueLine | InputAction::PaletteSync(_) | InputAction::None => vec![],
+        }
+    }
+
+    fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
+        if sub.text.trim().is_empty() || !sub.images.is_empty() {
+            return vec![];
+        }
+        let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
+            return vec![];
+        };
+        let Some(tx) = self.subagent_steers.get(&task_id) else {
+            self.subagent_input_box.set_input(sub.text);
+            return vec![];
+        };
+        let text = sub.text;
+        let input = AgentInput {
+            message: text.clone(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+            workflow: false,
+            prompt: None,
+        };
+        if tx.send(input).is_err() {
+            self.subagent_input_box.set_input(text);
+            self.subagent_steers.remove(&task_id);
+            return vec![];
+        }
+        self.pending_subagent_steers
+            .entry(task_id)
+            .or_default()
+            .push_back(text);
+        vec![]
+    }
+
+    fn restore_unconsumed_steers(&mut self, task_id: &str) {
+        let Some(pending) = self.pending_subagent_steers.remove(task_id) else {
+            return;
+        };
+        let text = pending.into_iter().collect::<Vec<_>>().join("\n");
+        if self.subagent_input_task.as_deref() == Some(task_id) {
+            let current = self.subagent_input_box.buffer.value();
+            self.subagent_input_box.set_input(if current.is_empty() {
+                text
+            } else {
+                format!("{text}\n{current}")
+            });
+        } else {
+            self.subagent_drafts
+                .entry(task_id.to_owned())
+                .and_modify(|draft| *draft = format!("{text}\n{draft}"))
+                .or_insert(text);
+        }
+        self.flash(STEER_NOT_CONSUMED_MSG.into());
+    }
+
+    fn restore_all_unconsumed_steers(&mut self) {
+        let task_ids: Vec<_> = self.pending_subagent_steers.keys().cloned().collect();
+        for task_id in task_ids {
+            self.restore_unconsumed_steers(&task_id);
+        }
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> bool {
@@ -1010,6 +1173,8 @@ impl App {
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
+        self.subagent_steers.clear();
+        self.pending_subagent_steers.clear();
         self.shell.cancel_all();
         for chat in &mut self.chats {
             chat.flush();
@@ -1026,22 +1191,19 @@ impl App {
     }
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let tool_use_id = self
-            .chat_index
-            .iter()
-            .find(|&(_, &idx)| idx == self.active_chat)
-            .map(|(id, _)| id.clone());
-
-        let Some(tool_use_id) = tool_use_id else {
+        let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
             return vec![];
         };
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(&tool_use_id);
+        self.subagent_answers.remove(&task_id);
+        self.subagent_steers.remove(&task_id);
 
-        vec![Action::CancelSubagent { tool_use_id }]
+        vec![Action::CancelSubagent {
+            tool_use_id: task_id,
+        }]
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
@@ -1084,21 +1246,20 @@ impl App {
             return vec![];
         }
 
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        } = envelope.event
-        {
+        if let AgentEvent::SubagentHistory { task_id, messages } = envelope.event {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory. This event only knows
             // that the transcript closed, so say Unknown and leave the verdict
             // to the ToolDone that follows elsewhere.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+            if let Some(&sub_idx) = self.chat_index.get(task_id.as_str()) {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
+            self.subagent_answers.remove(&task_id);
+            self.subagent_steers.remove(&task_id);
+            self.restore_unconsumed_steers(&task_id);
             self.state
                 .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
+                .set_subagent_messages(task_id, messages);
             return vec![];
         }
 
@@ -1120,7 +1281,8 @@ impl App {
             _ => {}
         }
 
-        let subagent_id = envelope
+        let subagent_id = envelope.subagent.as_ref().map(|s| s.task_id.clone());
+        let parent_tool_use_id = envelope
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
@@ -1139,7 +1301,10 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+            if subagent_id.is_none()
+                && let Some(task_id) = self.parent_task_ids.get(&e.id)
+                && let Some(&sub_idx) = self.chat_index.get(task_id)
+            {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
                 } else {
@@ -1184,7 +1349,7 @@ impl App {
                 self.state.context_size = ctx_size;
             }
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
-            if let Some(tool_id) = &subagent_id {
+            if let Some(tool_id) = &parent_tool_use_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
                 self.chats[0].set_tool_turn_usage(tool_id, formatted);
             }
@@ -1305,6 +1470,16 @@ impl App {
         if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(&text, image_count);
+            } else if let Some(task_id) = subagent_id {
+                self.chats[chat_idx].show_user_message(text.clone());
+                if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
+                    if pending.front().is_some_and(|queued| queued == &text) {
+                        pending.pop_front();
+                    }
+                    if pending.is_empty() {
+                        self.pending_subagent_steers.remove(&task_id);
+                    }
+                }
             }
             return vec![];
         }
@@ -1336,8 +1511,10 @@ impl App {
                     self.status_bar.clear_flash();
                     if !self.goal_deferred {
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
+                        self.restore_all_unconsumed_steers();
                         self.chat_index.clear();
                         self.subagent_answers.clear();
+                        self.subagent_steers.clear();
                     }
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
@@ -1349,7 +1526,9 @@ impl App {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.subagent_answers.clear();
+                    self.subagent_steers.clear();
                     self.terminalize_turn(&message);
+                    self.restore_all_unconsumed_steers();
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
                     self.chat_index.clear();
@@ -1371,31 +1550,67 @@ impl App {
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
-        let id = &subagent.parent_tool_use_id;
-        if let Some(&idx) = self.chat_index.get(id.as_str()) {
+        let task_id = &subagent.task_id;
+        let parent_tool_use_id = &subagent.parent_tool_use_id;
+        let first_parent_event = self
+            .parent_task_ids
+            .insert(parent_tool_use_id.clone(), task_id.clone())
+            .is_none();
+        if let Some(ref tx) = subagent.answer_tx {
+            self.subagent_answers.insert(task_id.clone(), tx.clone());
+        }
+        if let Some(ref tx) = subagent.steer_tx {
+            self.subagent_steers.insert(task_id.clone(), tx.clone());
+        }
+        if first_parent_event {
+            self.chats[0].update_tool_summary(parent_tool_use_id, &subagent.name);
+            if let Some(ref model) = subagent.model {
+                self.chats[0].update_tool_model(parent_tool_use_id, model);
+            }
+        }
+
+        if let Some(&idx) = self.chat_index.get(task_id.as_str()) {
+            if self.chats[idx].is_finished() {
+                let chat = &mut self.chats[idx];
+                chat.resume();
+                chat.name.clone_from(&subagent.name);
+                chat.model_id.clone_from(&subagent.model);
+                if let Some(ref prompt) = subagent.prompt {
+                    chat.push_user_message(prompt);
+                }
+                self.sync_subagents();
+            }
             return idx;
         }
-        let idx = self.chats.len();
-        self.chat_index.insert(id.clone(), idx);
-        if let Some(ref tx) = subagent.answer_tx {
-            self.subagent_answers.insert(id.clone(), tx.clone());
-        }
-        self.chats[0].update_tool_summary(id, &subagent.name);
-        if let Some(ref model) = subagent.model {
-            self.chats[0].update_tool_model(id, model);
-        }
-        let mut chat = Chat::subagent(
-            id,
-            subagent.name.clone(),
-            self.ui_config.clone(),
-            self.lua_event_handle.clone(),
-        );
-        chat.set_restore_channel(self.restore_event_tx.clone());
-        chat.model_id = subagent.model.clone();
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
-        self.chats.push(chat);
+        let idx = if let Some(idx) = self
+            .chats
+            .iter()
+            .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task_id))
+        {
+            let chat = &mut self.chats[idx];
+            chat.resume();
+            chat.name.clone_from(&subagent.name);
+            chat.model_id.clone_from(&subagent.model);
+            if let Some(ref prompt) = subagent.prompt {
+                chat.push_user_message(prompt);
+            }
+            idx
+        } else {
+            let mut chat = Chat::subagent(
+                task_id,
+                subagent.name.clone(),
+                self.ui_config.clone(),
+                self.lua_event_handle.clone(),
+            );
+            chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.model_id = subagent.model.clone();
+            if let Some(ref prompt) = subagent.prompt {
+                chat.push_user_message(prompt);
+            }
+            self.chats.push(chat);
+            self.chats.len() - 1
+        };
+        self.chat_index.insert(task_id.clone(), idx);
         self.sync_subagents();
         idx
     }
@@ -1854,6 +2069,7 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
+        self.sync_subagent_input_target();
         if self.plan_form_active() {
             return;
         }
@@ -1885,6 +2101,9 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
+            if self.active_subagent_can_steer() {
+                let _ = self.subagent_input_box.handle_paste(text);
+            }
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {

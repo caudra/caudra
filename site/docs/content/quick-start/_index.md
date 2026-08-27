@@ -92,6 +92,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Plan mode.** `Tab` toggles it. The agent may only write the plan file until you approve, then back to build mode.
 - **Models.** `/model` switches mid-session.
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `maki --continue` resumes where you left off.
+- **Tasks.** Click a task call to inspect its subagent transcript. Send guidance from the task input while it runs, then click `[< Main]` to return. `/tasks` or `Ctrl+X` opens every task. Details in [Commands](/docs/commands/#tasks).
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
 - **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).

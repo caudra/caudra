@@ -25,7 +25,7 @@ use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
+    ExtractedCommand, InterruptSource, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -77,6 +77,7 @@ pub struct AgentParams {
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
@@ -119,6 +120,7 @@ pub struct Agent<'h> {
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
+    subagent_history: SubagentHistoryStore,
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
     workflow: bool,
@@ -161,6 +163,7 @@ impl<'h> Agent<'h> {
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
+            subagent_history: params.subagent_history,
             registry: params.registry,
             audience: params.audience,
             workflow: false,
@@ -424,7 +427,7 @@ impl<'h> Agent<'h> {
             }
         }
 
-        if self.try_auto_compact().await? || self.handle_queued_command().await? {
+        if self.handle_queued_command().await? || self.try_auto_compact().await? {
             return Ok(TurnOutcome::Continue);
         }
 
@@ -654,6 +657,7 @@ impl<'h> Agent<'h> {
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
+            subagent_history: self.subagent_history.clone(),
             registry: Arc::clone(&self.registry),
             workflow: self.workflow,
             audience: self.audience,
@@ -1000,6 +1004,7 @@ mod tests {
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+                subagent_history: SubagentHistoryStore::default(),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::new(ModelPolicy::default()),

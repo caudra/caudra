@@ -95,6 +95,13 @@ impl Chat {
         self.finish.map(|(outcome, _)| outcome).into()
     }
 
+    pub(crate) fn resume(&mut self) {
+        self.flush();
+        if let Some((_, bubble)) = self.finish.take() {
+            self.messages_panel.remove(bubble);
+        }
+    }
+
     pub fn set_pending_turn_usage(&mut self, usage: String) {
         self.pending_turn_usage = Some(usage);
     }
@@ -293,6 +300,10 @@ impl Chat {
 
     pub fn handle_click(&mut self, row: u16, area: Rect) {
         self.messages_panel.handle_click(row, area);
+    }
+
+    pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
+        self.messages_panel.tool_id_at(row, area)
     }
 
     pub fn tool_snapshot(
@@ -689,6 +700,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path,
+            model_suffix: None,
         }))
     }
 

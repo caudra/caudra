@@ -470,9 +470,12 @@ pub struct ToolDoneEvent {
     pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    #[serde(skip)]
+    pub model_suffix: Option<String>,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
+const MODEL_SUFFIX_SEPARATOR: &str = "\n\n";
 
 impl ToolDoneEvent {
     pub fn error(id: String, message: impl Into<String>) -> Self {
@@ -484,6 +487,7 @@ impl ToolDoneEvent {
             is_error: true,
             annotation: None,
             written_path: None,
+            model_suffix: None,
         }
     }
 
@@ -496,19 +500,45 @@ impl ToolDoneEvent {
             .or_else(|| self.output.written_path())
     }
 
+    pub fn model_suffix(&self) -> Option<&str> {
+        self.model_suffix.as_deref()
+    }
+
+    pub fn with_model_suffix(mut self, model_suffix: Option<String>) -> Self {
+        self.model_suffix = model_suffix;
+        self
+    }
+
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
         self.written_path()
             .is_some_and(|wp| Path::new(wp) == plan_path)
     }
 }
 
+fn append_model_suffix(content: &mut String, model_suffix: &str) {
+    let model_suffix = model_suffix.trim_matches(['\r', '\n']);
+    if model_suffix.is_empty() {
+        return;
+    }
+    let content_len = content.trim_end_matches(['\r', '\n']).len();
+    content.truncate(content_len);
+    if !content.is_empty() {
+        content.push_str(MODEL_SUFFIX_SEPARATOR);
+    }
+    content.push_str(model_suffix);
+}
+
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
     for r in results {
+        let mut result_content = r.output.as_text();
+        if let Some(model_suffix) = r.model_suffix() {
+            append_model_suffix(&mut result_content, model_suffix);
+        }
         content.push(ContentBlock::ToolResult {
             tool_use_id: r.id,
-            content: r.output.as_text(),
+            content: result_content,
             is_error: r.is_error,
         });
         if let ToolOutput::Image { source, .. } = &r.output {
@@ -639,7 +669,7 @@ pub enum AgentEvent {
     AuthRequired,
     Nudge,
     SubagentHistory {
-        tool_use_id: String,
+        task_id: String,
         messages: Vec<Message>,
     },
     ToolSnapshot {
@@ -895,6 +925,7 @@ pub struct TurnCompleteEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
     pub parent_tool_use_id: String,
+    pub task_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,
     #[serde(rename = "parent_prompt", skip_serializing_if = "Option::is_none")]
@@ -903,6 +934,8 @@ pub struct SubagentInfo {
     pub model: Option<String>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    #[serde(skip)]
+    pub steer_tx: Option<flume::Sender<crate::AgentInput>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1112,6 +1145,7 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
+                model_suffix: None,
             },
             ToolDoneEvent {
                 id: "t2".into(),
@@ -1120,6 +1154,7 @@ mod tests {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                model_suffix: None,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -1130,6 +1165,58 @@ mod tests {
         assert!(
             matches!(&msg.content[1], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t2" && *is_error)
         );
+    }
+
+    #[test]
+    fn tool_results_appends_model_suffix_on_success_and_error() {
+        let done = |id: &str, output: &str, is_error: bool, suffix: &str| {
+            ToolDoneEvent {
+                id: id.into(),
+                tool: Arc::from("test"),
+                output: ToolOutput::Plain(output.into()),
+                is_error,
+                annotation: None,
+                written_path: None,
+                model_suffix: None,
+            }
+            .with_model_suffix(Some(suffix.into()))
+        };
+        let msg = tool_results(vec![
+            done("ok", "visible\n\n", false, "\nmodel context\n"),
+            done("err", "failed", true, "recovery hint"),
+        ]);
+
+        assert!(
+            matches!(&msg.content[0], ContentBlock::ToolResult { content, is_error, .. }
+                if content == "visible\n\nmodel context" && !is_error)
+        );
+        assert!(
+            matches!(&msg.content[1], ContentBlock::ToolResult { content, is_error, .. }
+                if content == "failed\n\nrecovery hint" && *is_error)
+        );
+    }
+
+    #[test]
+    fn tool_done_model_suffix_preserves_path_and_is_not_serialized() {
+        const MODEL_SUFFIX: &str = "internal model context";
+
+        let done = ToolDoneEvent {
+            id: "t1".into(),
+            tool: Arc::from("write"),
+            output: ToolOutput::Plain("wrote file".into()),
+            is_error: false,
+            annotation: None,
+            written_path: Some("/tmp/file.rs".into()),
+            model_suffix: None,
+        }
+        .with_model_suffix(Some(MODEL_SUFFIX.into()));
+
+        assert_eq!(done.written_path(), Some("/tmp/file.rs"));
+        assert_eq!(done.model_suffix(), Some(MODEL_SUFFIX));
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""written_path":"/tmp/file.rs""#));
+        assert!(!json.contains("model_suffix"));
+        assert!(!json.contains(MODEL_SUFFIX));
     }
 
     #[test]
@@ -1148,6 +1235,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            model_suffix: None,
         };
 
         let msg = tool_results(vec![
@@ -1230,6 +1318,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
+            model_suffix: None,
         };
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
@@ -1473,6 +1562,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path,
+            model_suffix: None,
         };
         assert_eq!(event.written_path(), expected);
     }

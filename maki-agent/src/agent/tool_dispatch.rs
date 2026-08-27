@@ -144,6 +144,7 @@ async fn run_inner(
         is_error: true,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     };
 
     if let Some(entry) = entry {
@@ -217,6 +218,7 @@ async fn run_inner(
                     is_error: false,
                     annotation: result.annotation,
                     written_path: result.written_path,
+                    model_suffix: result.model_suffix,
                 }
             }
             Err(message) => {
@@ -227,7 +229,7 @@ async fn run_inner(
                     error = %message,
                     "tool failed"
                 );
-                done_error(message)
+                done_error(message).with_model_suffix(result.model_suffix)
             }
         }
     } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
@@ -298,6 +300,7 @@ fn run_tool_search(
         is_error,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     }
 }
 
@@ -329,6 +332,7 @@ async fn run_local_tool(
         is_error,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     }
 }
 
@@ -379,6 +383,7 @@ async fn execute_mcp_tool(
         is_error,
         annotation: None,
         written_path: None,
+        model_suffix: None,
     };
 
     if ctx.mode.plan_path().is_some() {

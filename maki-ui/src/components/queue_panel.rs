@@ -27,6 +27,20 @@ pub fn height(queue_len: usize) -> u16 {
 }
 
 pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option<usize>) {
+    view_inner(frame, area, entries, focus, true);
+}
+
+pub fn view_readonly(frame: &mut Frame, area: Rect, entries: &[QueueEntry]) {
+    view_inner(frame, area, entries, None, false);
+}
+
+fn view_inner(
+    frame: &mut Frame,
+    area: Rect,
+    entries: &[QueueEntry],
+    focus: Option<usize>,
+    show_delete_hint: bool,
+) {
     if entries.is_empty() {
         return;
     }
@@ -38,7 +52,7 @@ pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option
             let flat = entry.text.replace('\n', " ");
             let (style, hint_parts) = if focus == Some(i) {
                 (theme::current().queue_delete, ("", FOCUSED_HINT, ""))
-            } else if i == 0 {
+            } else if i == 0 && show_delete_hint {
                 (
                     Style::new().fg(entry.color),
                     (" - ", key::POP_QUEUE.label, " to delete"),

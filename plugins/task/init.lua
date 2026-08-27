@@ -24,6 +24,7 @@ local SCHEMA_ROOT_ERROR = "output_schema must have type object"
 local STRUCTURED_MISSING_ERROR = "subagent finished without calling structured_output"
 local STRUCTURED_INVALID_ERROR = "subagent result does not match output_schema"
 local SUMMARY_MISSING_ERROR = "subagent finished without providing a summary"
+local TASK_METADATA_FORMAT = "<task_metadata>\ntask_id: %s\n</task_metadata>"
 local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local NUDGE_SUMMARY =
@@ -43,7 +44,7 @@ Subagent types (set via `subagent_type`):
 Notes:
 1. Launch multiple tasks concurrently when possible.
 2. The agent's result is not visible to the user. Summarize it in your response.
-3. Each invocation starts fresh - inline any needed context into the prompt.
+3. The result includes a task_id. Pass it to a later task call to continue the same subagent history.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
 
@@ -67,6 +68,10 @@ local schema = {
     prompt = {
       type = "string",
       description = "Detailed task prompt for the agent",
+    },
+    task_id = {
+      type = "string",
+      description = "A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh.",
     },
     subagent_type = {
       type = "string",
@@ -108,6 +113,11 @@ local function bounded_errors(errors)
     out[i] = errors[i]
   end
   return table.concat(out, "\n")
+end
+
+local function with_task_id(task_id, reply)
+  reply.model_suffix = string.format(TASK_METADATA_FORMAT, task_id)
+  return reply
 end
 
 local function handler(input, ctx)
@@ -180,6 +190,7 @@ local function handler(input, ctx)
   -- pcall so a raised error cannot leak the permit.
   local ok, out = pcall(function()
     local sess, sess_err = maki.agent.session(ctx, {
+      task_id = input.task_id,
       model_spec = model.spec,
       system = system,
       tools = tool_defs,
@@ -190,6 +201,7 @@ local function handler(input, ctx)
     if sess_err then
       return { llm_output = sess_err, is_error = true }
     end
+    local task_id = sess:id()
 
     local message = input.prompt
     if validator then
@@ -216,21 +228,24 @@ local function handler(input, ctx)
       -- A result alongside the error means the run was cut short after
       -- streaming some text, and half a transcript beats a bare error.
       if result then
-        return {
+        return with_task_id(task_id, {
           llm_output = "sub-agent interrupted (" .. err .. "). Partial output:\n" .. result.text,
           is_error = true,
-        }
+        })
       end
-      return { llm_output = "sub-agent error: " .. err, is_error = true }
+      return with_task_id(task_id, { llm_output = "sub-agent error: " .. err, is_error = true })
     end
     if validator and not captured then
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
-      return { llm_output = msg, is_error = true }
+      return with_task_id(task_id, { llm_output = msg, is_error = true })
     end
     if not validator and result.text == "" then
-      return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
+      return with_task_id(task_id, { llm_output = SUMMARY_MISSING_ERROR, is_error = true })
     end
-    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
+    return with_task_id(task_id, {
+      llm_output = captured and maki.json.encode(captured) or result.text,
+      format = "markdown",
+    })
   end)
 
   permit:release()

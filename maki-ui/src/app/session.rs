@@ -155,21 +155,24 @@ impl App {
         }
     }
 
-    /// Called where the set of subagent tabs changes, not at checkpoint time:
-    /// the turn-end path clears `chat_index` right after pruning it, so a later
-    /// rebuild would only ever find an empty map.
     pub(super) fn sync_subagents(&mut self) {
-        let mut ordered: Vec<_> = self.chat_index.iter().collect();
-        ordered.sort_by_key(|&(_, chat_index)| chat_index);
-        let subagents = ordered
-            .into_iter()
-            .map(|(tool_id, &chat_index)| {
-                let chat = &self.chats[chat_index];
-                StoredSubagent {
-                    tool_use_id: tool_id.clone(),
+        let histories = self.state.session.subagent_messages();
+        let subagents = self
+            .chats
+            .iter()
+            .skip(1)
+            .filter_map(|chat| {
+                let task_id = chat.task_id()?;
+                if !histories.contains_key(task_id.as_ref())
+                    && !self.chat_index.contains_key(task_id.as_ref())
+                {
+                    return None;
+                }
+                Some(StoredSubagent {
+                    tool_use_id: task_id.to_string(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
-                }
+                })
             })
             .collect();
         self.state.session_mut().set_subagents(subagents);
@@ -192,6 +195,13 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
+        self.subagent_answers.clear();
+        self.subagent_steers.clear();
+        self.pending_subagent_steers.clear();
+        self.parent_task_ids.clear();
+        self.subagent_input_box.discard();
+        self.subagent_input_task = None;
+        self.subagent_drafts.clear();
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear();

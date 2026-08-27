@@ -60,6 +60,8 @@ pub fn build_tool_input(args: &[Value], kwargs: &[(String, Value)]) -> Result<Va
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
     use test_case::test_case;
 
@@ -81,5 +83,27 @@ mod tests {
     #[test_case(&[json!(1), json!(2)], &[]      ; "multiple_positional_non_objects")]
     fn build_tool_input_rejects_positional_non_objects(args: &[Value], kwargs: &[(String, Value)]) {
         assert_eq!(build_tool_input(args, kwargs).unwrap_err(), EXPECTED_ERR);
+    }
+
+    #[test_case(false ; "success")]
+    #[test_case(true ; "error")]
+    fn flatten_excludes_model_suffix(is_error: bool) {
+        let done = crate::ToolDoneEvent {
+            id: "t1".into(),
+            tool: Arc::from("test"),
+            output: crate::ToolOutput::Plain("visible output".into()),
+            is_error,
+            annotation: None,
+            written_path: None,
+            model_suffix: None,
+        }
+        .with_model_suffix(Some("model-only context".into()));
+
+        let result = flatten(&done);
+        if is_error {
+            assert_eq!(result.unwrap_err(), "visible output");
+        } else {
+            assert_eq!(result.unwrap(), "visible output");
+        }
     }
 }

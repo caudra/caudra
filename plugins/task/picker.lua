@@ -37,10 +37,10 @@ local function dispw(s)
   return utf8.len(s) or #s
 end
 
--- Opening a subagent puts its transcript where the main chat was, and the picker
--- is the only way back, so the input area advertises the key while the session
--- has subagents. maki.task.list() suspends and autocmd callbacks cannot, so the
--- round-trip runs off to the side.
+-- Opening a subagent puts its transcript where the main chat was. The status
+-- bar links back to Main, while this hint advertises the picker for jumping
+-- between every task. maki.task.list() suspends and autocmd callbacks cannot,
+-- so the round-trip runs off to the side.
 local function refresh_hint()
   maki.async.run(function()
     local n = 0
@@ -326,7 +326,7 @@ maki.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionRe
 
 maki.api.register_command({
   name = "/tasks",
-  description = "Browse and search tasks",
+  description = "Browse tasks and steer running subagents",
   handler = open,
 })
 

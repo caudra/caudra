@@ -13,7 +13,8 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
-    Instructions, McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    Instructions, McpCommand, PromptRole, SessionMailbox, SharedMessages, SubagentHistoryStore,
+    ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -49,6 +50,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    subagent_history: SubagentHistoryStore,
     model_policy: Arc<ModelPolicy>,
     goal: GoalHandle,
 }
@@ -74,6 +76,7 @@ impl AgentLoop {
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
+        subagent_history: SubagentHistoryStore,
         model_policy: Arc<ModelPolicy>,
         goal: GoalHandle,
     ) -> Self {
@@ -101,6 +104,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            subagent_history,
             model_policy,
             goal,
         }
@@ -265,6 +269,7 @@ impl AgentLoop {
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.model_policy),

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -31,6 +32,7 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
+        self.sync_subagent_input_target();
         let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.active_chat;
@@ -82,7 +84,15 @@ impl App {
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            if panel_h > 0 { panel_h + 1 } else { 1 }
+            queue_panel::height(
+                self.active_subagent_pending()
+                    .map_or(0, |messages| messages.len()),
+            ) + panel_h
+                + if self.active_subagent_can_steer() {
+                    self.subagent_input_box.height(inner.width).min(max_bottom)
+                } else {
+                    1
+                }
         };
 
         // The `below` split lives outside `inner` (drawn by render_splits), so
@@ -98,6 +108,11 @@ impl App {
 
         let queue_height = if bottom_takeover {
             0
+        } else if !self.is_main_chat() {
+            queue_panel::height(
+                self.active_subagent_pending()
+                    .map_or(0, |messages| messages.len()),
+            )
         } else {
             queue_panel::height(self.queue.panel_len())
         };
@@ -145,34 +160,34 @@ impl App {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
-            let panel_reqs = self.float_mgr.panel_reqs();
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let (panel_areas, sep_area) = if panel_h > 0 {
-                let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
-                    .areas(layout.bottom_area);
-                let constraints: Vec<_> = panel_reqs
-                    .iter()
-                    .map(|&(_, h)| Constraint::Length(h))
-                    .collect();
-                let sub = Layout::vertical(constraints).split(panels);
-                let areas: Vec<(usize, Rect)> = panel_reqs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(idx, _))| (idx, sub[i]))
-                    .collect();
-                (Some(areas), s)
-            } else {
-                (None, layout.bottom_area)
-            };
-            if let Some(areas) = panel_areas {
-                for (idx, rect) in areas {
-                    self.float_mgr.view_panel(frame, idx, rect);
-                }
+            let queue_entries = self
+                .active_subagent_pending()
+                .into_iter()
+                .flatten()
+                .map(|text| queue_panel::QueueEntry {
+                    text: Cow::Owned(text.clone()),
+                    color: theme::current().foreground,
+                })
+                .collect::<Vec<_>>();
+            queue_panel::view_readonly(frame, layout.queue_area, &queue_entries);
+            for &(idx, rect) in &layout.panel_windows {
+                self.float_mgr.view_panel(frame, idx, rect);
             }
-            let sep = Block::default()
-                .borders(Borders::TOP)
-                .border_style(self.separator_style());
-            frame.render_widget(sep, sep_area);
+            if self.active_subagent_can_steer() {
+                self.subagent_input_box.view(
+                    frame,
+                    layout.input_area,
+                    Placeholder::Steer,
+                    self.separator_style(),
+                    !self.any_overlay_open(),
+                    None,
+                );
+            } else {
+                let sep = Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(self.separator_style());
+                frame.render_widget(sep, layout.input_area);
+            }
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
@@ -301,6 +316,7 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
+            back_to_main: render_chat != 0,
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
@@ -309,7 +325,7 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             goal: goal.as_ref(),
         };
-        self.status_bar.view(frame, status_area, &ctx);
+        self.task_back_area = self.status_bar.view(frame, status_area, &ctx);
     }
 
     fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect) {
@@ -321,7 +337,10 @@ impl App {
             zone: SelectionZone::Messages,
         });
 
-        if layout.input_area.height > 0 && !layout.bottom_takeover && self.is_main_chat() {
+        if layout.input_area.height > 0
+            && !layout.bottom_takeover
+            && (self.is_main_chat() || self.active_subagent_can_steer())
+        {
             let input_inner = Rect::new(
                 layout.input_area.x,
                 layout.input_area.y + 1,
@@ -344,7 +363,10 @@ impl App {
             self.zones.push_overlay(selection::inset_border(rect));
         }
 
-        if !self.is_main_chat() && layout.bottom_area.height > 0 {
+        if !self.is_main_chat()
+            && !self.active_subagent_can_steer()
+            && layout.bottom_area.height > 0
+        {
             self.zones.push_overlay(layout.bottom_area);
         }
 
