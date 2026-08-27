@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::{GoalStatus, GoalVerdict};
+use maki_providers::model_registry::GoalEvaluatorTarget;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
@@ -50,14 +51,20 @@ impl GoalModal {
         self.scroll.scroll(delta);
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, status: Option<&GoalStatus>) -> Rect {
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        status: Option<&GoalStatus>,
+        evaluator: &GoalEvaluatorTarget,
+    ) -> Rect {
         if !self.open {
             return Rect::default();
         }
 
         let width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
             .saturating_sub((2 + H_PAD * 2) as u32) as u16;
-        let lines = status_lines(status);
+        let lines = status_lines(status, evaluator);
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width) as u16;
@@ -98,14 +105,19 @@ impl Overlay for GoalModal {
     }
 }
 
-fn status_lines(status: Option<&GoalStatus>) -> Vec<Line<'static>> {
+fn status_lines(
+    status: Option<&GoalStatus>,
+    evaluator: &GoalEvaluatorTarget,
+) -> Vec<Line<'static>> {
     let theme = theme::current();
     let Some(status) = status else {
         return vec![
             Line::from(Span::styled("No goal set", theme.status_dim)),
             Line::default(),
+            evaluator_line(evaluator),
+            Line::default(),
             Line::from(Span::styled(
-                "Start one with /goal <condition>",
+                "Start with /goal <condition>  ·  Change evaluator with /goal-model",
                 theme.tool_dim,
             )),
         ];
@@ -153,6 +165,7 @@ fn status_lines(status: Option<&GoalStatus>) -> Vec<Line<'static>> {
         Line::from(Span::styled("Condition", theme.panel_title)),
         Line::from(condition.to_owned()),
         Line::default(),
+        evaluator_line(evaluator),
         Line::from(vec![
             Span::styled("Evaluations  ", theme.tool_dim),
             Span::raw(evaluations.to_string()),
@@ -178,16 +191,28 @@ fn status_lines(status: Option<&GoalStatus>) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(
         Line::from(Span::styled(
-            if active {
-                "/goal clear to stop  ·  Esc to close"
+             if active {
+                "/goal-clear to stop  ·  /goal-model to change evaluator  ·  Esc to close"
             } else {
-                "/goal <condition> to start another  ·  Esc to close"
+                "/goal <condition> to start another  ·  /goal-model to change evaluator  ·  Esc to close"
             },
             theme.tool_dim,
         ))
         .alignment(Alignment::Center),
     );
     lines
+}
+
+fn evaluator_line(target: &GoalEvaluatorTarget) -> Line<'static> {
+    let value = match target {
+        GoalEvaluatorTarget::Auto => "auto (weak, then current model)".into(),
+        GoalEvaluatorTarget::Tier(tier) => format!("{tier} (active provider)"),
+        GoalEvaluatorTarget::Model(spec) => spec.clone(),
+    };
+    Line::from(vec![
+        Span::styled("Evaluator  ", theme::current().tool_dim),
+        Span::raw(value),
+    ])
 }
 
 fn format_duration(duration: Duration) -> String {

@@ -1,4 +1,4 @@
-//! Per-model tier assignments (strong / medium / weak).
+//! Persisted model tier assignments and workload-role selections.
 //!
 //! Three layers, checked in order: user overrides (persisted, one model per
 //! tier) > static entries from the provider registry > auto-assignment by
@@ -10,10 +10,11 @@
 //! The global lock never escapes this module: accessors lock internally and
 //! return owned data, so a caller can never hold a read guard across model
 //! construction (recursive read + queued writer = deadlock). The module owns
-//! persistence: [`load_from_storage`] at startup, [`set_and_persist`] on user
-//! edits. Callers never touch the on-disk format directly.
+//! persistence: [`load_from_storage`] at startup and typed setters on user edits.
+//! Callers never touch the on-disk format directly.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -24,6 +25,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{ModelInfo, ModelTier};
 
 const TIERS_FILE: &str = "model-tiers";
+const ROLES_FILE: &str = "model-roles";
 
 static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
 
@@ -74,9 +76,35 @@ pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum GoalEvaluatorTarget {
+    #[default]
+    Auto,
+    Tier(ModelTier),
+    Model(String),
+}
+
+impl fmt::Display for GoalEvaluatorTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Tier(tier) => tier.fmt(f),
+            Self::Model(spec) => f.write_str(spec),
+        }
+    }
+}
+
+pub fn goal_evaluator_target() -> GoalEvaluatorTarget {
+    read().goal_evaluator.clone().unwrap_or_default()
+}
+
 pub fn load_from_storage(dir: &StateDir) {
     let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
-    write().set_overrides(overrides);
+    let goal_evaluator = read_roles(dir.path().join(ROLES_FILE).as_path()).goal_evaluator;
+    let mut registry = write();
+    registry.set_overrides(overrides);
+    registry.goal_evaluator = goal_evaluator.filter(|target| *target != GoalEvaluatorTarget::Auto);
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
@@ -85,6 +113,17 @@ pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
 
 pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
     update_and_persist(dir, |reg| reg.unset(spec, tier));
+}
+
+pub fn set_goal_evaluator_and_persist(target: GoalEvaluatorTarget, dir: &StateDir) {
+    let snapshot = {
+        let mut registry = write();
+        registry.goal_evaluator = (target != GoalEvaluatorTarget::Auto).then_some(target);
+        RolesFile {
+            goal_evaluator: registry.goal_evaluator.clone(),
+        }
+    };
+    write_roles(dir.path().join(ROLES_FILE).as_path(), &snapshot);
 }
 
 /// Snapshot under the lock, persist outside it: file IO must never run while
@@ -107,6 +146,7 @@ struct ModelRegistry {
     /// Not persisted - rebuilt every session. Used for auto-tier assignment
     /// and discovered metadata lookup.
     known_models: HashMap<String, Vec<ModelInfo>>,
+    goal_evaluator: Option<GoalEvaluatorTarget>,
 }
 
 impl ModelRegistry {
@@ -308,6 +348,38 @@ fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
     };
     if let Err(e) = atomic_write(path, &json) {
         warn!(path = %path.display(), error = %e, "failed to persist tier overrides");
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RolesFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_evaluator: Option<GoalEvaluatorTarget>,
+}
+
+fn read_roles(path: &Path) -> RolesFile {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return RolesFile::default();
+    };
+    if raw.trim().is_empty() {
+        return RolesFile::default();
+    }
+    serde_json::from_str(&raw).unwrap_or_else(|error| {
+        warn!(path = %path.display(), %error, "failed to parse model roles, ignoring");
+        RolesFile::default()
+    })
+}
+
+fn write_roles(path: &Path, roles: &RolesFile) {
+    let json = match serde_json::to_vec_pretty(roles) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "failed to serialize model roles");
+            return;
+        }
+    };
+    if let Err(error) = atomic_write(path, &json) {
+        warn!(path = %path.display(), %error, "failed to persist model roles");
     }
 }
 
@@ -529,6 +601,51 @@ mod tests {
         let loaded = read_overrides(&path);
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
         assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3:8b");
+    }
+
+    #[test]
+    fn goal_evaluator_role_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(ROLES_FILE);
+        let roles = RolesFile {
+            goal_evaluator: Some(GoalEvaluatorTarget::Tier(ModelTier::Medium)),
+        };
+
+        write_roles(&path, &roles);
+
+        assert_eq!(
+            read_roles(&path).goal_evaluator,
+            Some(GoalEvaluatorTarget::Tier(ModelTier::Medium))
+        );
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(raw.contains("\"goal_evaluator\""));
+        assert!(raw.contains("\"kind\": \"tier\""));
+        assert!(raw.contains("\"value\": \"medium\""));
+    }
+
+    #[test]
+    fn goal_evaluator_exact_model_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(ROLES_FILE);
+        let target = GoalEvaluatorTarget::Model("openai/gpt-5.4-nano".into());
+
+        write_roles(
+            &path,
+            &RolesFile {
+                goal_evaluator: Some(target.clone()),
+            },
+        );
+
+        assert_eq!(read_roles(&path).goal_evaluator, Some(target));
+    }
+
+    #[test]
+    fn invalid_goal_evaluator_role_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(ROLES_FILE);
+        std::fs::write(&path, b"not json").unwrap();
+
+        assert!(read_roles(&path).goal_evaluator.is_none());
     }
 
     #[test]

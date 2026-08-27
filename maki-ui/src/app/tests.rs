@@ -2765,11 +2765,48 @@ fn goal_clear_aliases_leave_no_active_goal(alias: &str) {
 }
 
 #[test]
+fn goal_clear_registered_command_stops_active_goal() {
+    let mut app = test_app();
+    app.state.goal.set("ship it").unwrap();
+
+    let actions = app.run_cmdline("/goal-clear", 0).unwrap();
+
+    assert!(actions.is_empty());
+    assert!(app.state.goal.snapshot().is_none());
+    assert_eq!(app.status_bar.flash_text(), Some("Goal cleared: ship it"));
+}
+
+#[test]
 fn goal_without_arguments_opens_status_modal() {
     let mut app = test_app();
     assert!(!app.goal_modal.is_open());
     assert!(app.run_cmdline("/goal", 0).unwrap().is_empty());
     assert!(app.goal_modal.is_open());
+}
+
+#[test_case("/goal-model"; "registered_command")]
+#[test_case("/goal MODEL"; "legacy_subcommand")]
+fn goal_model_opens_dedicated_picker_without_starting_goal(command: &str) {
+    let mut app = test_app();
+
+    let actions = app.run_cmdline(command, 0).unwrap();
+
+    assert!(app.model_picker.is_open());
+    assert!(app.state.goal.snapshot().is_none());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn qualified_goal_model_uses_the_normal_session_usage_key() {
+    assert_eq!(
+        goal_usage_model("anthropic/claude-haiku", "anthropic"),
+        "claude-haiku"
+    );
+    assert_eq!(
+        goal_usage_model("openrouter/vendor/model", "anthropic"),
+        "openrouter/vendor/model"
+    );
+    assert_eq!(goal_usage_model("bare-model", "anthropic"), "bare-model");
 }
 
 #[test]

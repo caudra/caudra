@@ -12,8 +12,8 @@ use maki_providers::{
 
 use super::compaction;
 use super::goal::{
-    Evaluator, GOAL_BLOCK_CAP, GoalApply, GoalHandle, GoalStatus, continuation_message,
-    is_unrecoverable,
+    Evaluator, GOAL_BLOCK_CAP, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator,
+    continuation_message, is_unrecoverable, resolve_evaluator,
 };
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
@@ -127,6 +127,7 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     goal: GoalHandle,
+    goal_evaluator: Option<ResolvedEvaluator>,
     goal_blocks: u32,
     wait_for_background: bool,
 }
@@ -170,6 +171,7 @@ impl<'h> Agent<'h> {
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             goal: GoalHandle::default(),
+            goal_evaluator: None,
             goal_blocks: 0,
             wait_for_background: false,
         }
@@ -471,15 +473,60 @@ impl<'h> Agent<'h> {
         let evaluation = goal.evaluations.saturating_add(1);
         self.event_tx
             .send(AgentEvent::GoalEvaluating { evaluation })?;
+        let target = maki_providers::model_registry::goal_evaluator_target();
+        let cached_provider = self
+            .goal_evaluator
+            .as_ref()
+            .filter(|resolved| {
+                matches!(
+                    &target,
+                    maki_providers::model_registry::GoalEvaluatorTarget::Model(_)
+                ) && resolved.target == target
+            })
+            .map(|resolved| Arc::clone(&resolved.provider));
+        let evaluator = match resolve_evaluator(
+            &self.provider,
+            &self.model,
+            target.clone(),
+            self.timeouts,
+            &self.model_policy,
+            &self.cancel,
+            cached_provider,
+        )
+        .await
+        {
+            Ok(resolved) => {
+                self.goal_evaluator = matches!(
+                    resolved.target,
+                    maki_providers::model_registry::GoalEvaluatorTarget::Model(_)
+                )
+                .then_some(resolved.clone());
+                resolved
+            }
+            Err(error) => {
+                let cancelled = matches!(error, AgentError::Cancelled);
+                self.event_tx.send(AgentEvent::GoalEvaluationFailed {
+                    evaluation,
+                    message: error.to_string(),
+                    applied: self.goal.is_generation_active(goal.generation),
+                    usage: TokenUsage::default(),
+                    cost: None,
+                    model: target.to_string(),
+                })?;
+                if cancelled {
+                    return Err(AgentError::Cancelled);
+                }
+                return Ok(TurnOutcome::Done(done_reason));
+            }
+        };
         let result = Evaluator {
-            provider: &*self.provider,
-            current_model: &self.model,
+            provider: &*evaluator.provider,
+            model: &evaluator.model,
             history: self.history.as_slice(),
             condition: &goal.condition,
             evaluation,
             cancel: &self.cancel,
             session_id: self.session_id.as_ref(),
-            model_policy: &self.model_policy,
         }
         .run()
         .await;

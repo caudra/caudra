@@ -793,6 +793,9 @@ impl App {
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
+                ModelPickerAction::SetGoalEvaluator(target) => {
+                    vec![Action::SetGoalEvaluator(target)]
+                }
                 ModelPickerAction::AssignTier(spec, tier) => {
                     vec![Action::AssignTier(spec, tier)]
                 }
@@ -1372,9 +1375,13 @@ impl App {
                 self.state.token_usage += usage;
                 add_cost(&mut self.state.cost, cost);
                 add_cost(&mut self.chats[chat_idx].cost, cost);
-                self.state
-                    .session_mut()
-                    .add_model_usage(&model, usage.billed(cost));
+                if usage.context_tokens() > 0 || cost.is_some() {
+                    let usage_model =
+                        goal_usage_model(&model, &self.state.model.provider).to_string();
+                    self.state
+                        .session_mut()
+                        .add_model_usage(&usage_model, usage.billed(cost));
+                }
                 if applied && verdict == GoalVerdict::NotMet {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Assistant,
@@ -1437,9 +1444,13 @@ impl App {
                 self.state.token_usage += usage;
                 add_cost(&mut self.state.cost, cost);
                 add_cost(&mut self.chats[chat_idx].cost, cost);
-                self.state
-                    .session_mut()
-                    .add_model_usage(&model, usage.billed(cost));
+                if usage.context_tokens() > 0 || cost.is_some() {
+                    let usage_model =
+                        goal_usage_model(&model, &self.state.model.provider).to_string();
+                    self.state
+                        .session_mut()
+                        .add_model_usage(&usage_model, usage.billed(cost));
+                }
                 if applied {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Error,
@@ -1673,6 +1684,8 @@ impl App {
                 }
             }
             "/goal" => self.execute_goal(&cmd.args),
+            "/goal-clear" => self.clear_goal(),
+            "/goal-model" => self.open_goal_model_picker(),
             "/new" => self.reset_session(),
             "/queue" => {
                 self.queue.set_focus();
@@ -1766,16 +1779,14 @@ impl App {
             self.goal_modal.open();
             return vec![];
         }
+        if condition.eq_ignore_ascii_case("model") {
+            return self.open_goal_model_picker();
+        }
         if matches!(
             condition.to_ascii_lowercase().as_str(),
             "clear" | "stop" | "off" | "reset" | "none" | "cancel"
         ) {
-            let message = self.state.goal.clear().map_or_else(
-                || "No goal set".to_string(),
-                |goal| format!("Goal cleared: {}", goal.condition),
-            );
-            self.flash(message);
-            return vec![];
+            return self.clear_goal();
         }
 
         let replacing = self.state.goal.snapshot().is_some();
@@ -1796,6 +1807,21 @@ impl App {
                 vec![]
             }
         }
+    }
+
+    fn open_goal_model_picker(&mut self) -> Vec<Action> {
+        self.model_picker
+            .open_goal(maki_providers::model_registry::goal_evaluator_target());
+        vec![Action::RefreshModels]
+    }
+
+    fn clear_goal(&mut self) -> Vec<Action> {
+        let message = self.state.goal.clear().map_or_else(
+            || "No goal set".to_string(),
+            |goal| format!("Goal cleared: {}", goal.condition),
+        );
+        self.flash(message);
+        vec![]
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -2167,6 +2193,13 @@ impl App {
         };
         actions.extend(self.start_from_queue(&msg));
         actions
+    }
+}
+
+fn goal_usage_model<'a>(model: &'a str, current_provider: &str) -> &'a str {
+    match model.split_once('/') {
+        Some((provider, id)) if provider == current_provider => id,
+        _ => model,
     }
 }
 

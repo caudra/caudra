@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_providers::model_registry::GoalEvaluatorTarget;
 use maki_providers::{Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -206,6 +207,7 @@ pub enum Action {
     },
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
+    SetGoalEvaluator(GoalEvaluatorTarget),
     RefreshModels,
     RefreshUsage,
     Compact,

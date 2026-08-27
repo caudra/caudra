@@ -25,6 +25,8 @@ Type `/` in the input box to open the command palette.
 | `/cd` | Change working directory |
 | `/btw` | Ask a quick question (no tools, no history pollution) |
 | `/goal` | Work until a completion condition is met |
+| `/goal-clear` | Stop the active completion goal |
+| `/goal-model` | Choose the completion goal evaluator |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
@@ -50,11 +52,15 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 `/goal <condition>` asks Maki to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
 
-At the end of each natural work turn, a separate weak-model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
+At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal` without arguments to open the status panel. It shows the condition, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
+Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Auto preserves the default behavior: use the active provider's weak model, then fall back to the current conversation model when no weak model is available. Strong, Medium, and Weak explicitly select that tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
 
-Use `/goal clear` to stop early. The aliases `stop`, `off`, `reset`, `none`, and `cancel` are accepted after `/goal`, without regard to case.
+The evaluator choice is saved globally in `~/.local/state/maki/model-roles` and applies across sessions. You can also open `/model` and press `Ctrl+G` on a row to toggle that exact model as the goal evaluator. Run `/goal-model` and select Auto to restore the default.
+
+Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
+
+Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
 
 Goal state belongs to the session. Active and completed status survive resume, while `/new` clears them. Normal permissions still apply, so unattended goals need rules or YOLO mode that already permit the required tools.
 

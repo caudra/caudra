@@ -536,6 +536,12 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+G"),
+        description: "Toggle goal evaluator model",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {

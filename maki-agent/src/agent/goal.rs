@@ -1,10 +1,13 @@
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use maki_config::ModelPolicy;
-use maki_providers::provider::Provider;
+use maki_providers::model_registry::GoalEvaluatorTarget;
+use maki_providers::provider::{Provider, from_model_async};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelTier, RequestOptions, TokenUsage,
+    AgentError, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions, Timeouts,
+    TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
@@ -268,6 +271,120 @@ pub(crate) struct EvaluationError {
     pub model: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct ResolvedEvaluator {
+    pub target: GoalEvaluatorTarget,
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+}
+
+pub(crate) async fn resolve_evaluator(
+    current_provider: &Arc<dyn Provider>,
+    current_model: &Model,
+    target: GoalEvaluatorTarget,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+    cancel: &CancelToken,
+    cached_provider: Option<Arc<dyn Provider>>,
+) -> Result<ResolvedEvaluator, AgentError> {
+    let current_provider = Arc::clone(current_provider);
+    let current_model = current_model.clone();
+    let current_slug = Arc::clone(&current_model.provider);
+    let target_for_resolution = target.clone();
+    let model_policy = model_policy.clone();
+    let (mut model, provider) = initialization_with_limits(cancel, async move {
+        let mut model = smol::unblock(move || {
+            evaluator_model(&current_model, &target_for_resolution, &model_policy)
+        })
+        .await?;
+        let provider: Arc<dyn Provider> = if model.provider == current_slug {
+            current_provider.adjust_model(&mut model);
+            current_provider
+        } else if let Some(provider) = cached_provider {
+            provider.adjust_model(&mut model);
+            provider
+        } else {
+            Arc::from(from_model_async(&mut model, timeouts).await?)
+        };
+        Ok((model, provider))
+    })
+    .await?;
+    model.max_output_tokens = Some(
+        model
+            .max_output_tokens
+            .unwrap_or(EVALUATOR_OUTPUT_TOKENS)
+            .min(EVALUATOR_OUTPUT_TOKENS),
+    );
+    Ok(ResolvedEvaluator {
+        target,
+        provider,
+        model,
+    })
+}
+
+async fn initialization_with_limits<T>(
+    cancel: &CancelToken,
+    future: impl Future<Output = Result<T, AgentError>>,
+) -> Result<T, AgentError> {
+    let timed = futures_lite::future::race(future, async {
+        smol::Timer::after(EVALUATOR_TIMEOUT).await;
+        Err(AgentError::Timeout {
+            secs: EVALUATOR_TIMEOUT.as_secs(),
+        })
+    });
+    cancel
+        .race(timed)
+        .await
+        .map_err(|_| AgentError::Cancelled)?
+}
+
+fn goal_model_error(spec: &str, error: ModelError) -> AgentError {
+    AgentError::Config {
+        message: format!("cannot resolve goal evaluator model '{spec}': {error}"),
+    }
+}
+
+fn evaluator_model(
+    current_model: &Model,
+    target: &GoalEvaluatorTarget,
+    model_policy: &ModelPolicy,
+) -> Result<Model, AgentError> {
+    let model = match target {
+        GoalEvaluatorTarget::Auto => {
+            Model::from_tier_with_policy(&current_model.provider, ModelTier::Weak, model_policy)
+                .unwrap_or_else(|_| current_model.clone())
+        }
+        GoalEvaluatorTarget::Tier(ModelTier::Compaction) => {
+            return Err(AgentError::Config {
+                message: "compaction is not a valid goal evaluator tier".into(),
+            });
+        }
+        GoalEvaluatorTarget::Tier(tier) => {
+            Model::from_tier_with_policy(&current_model.provider, *tier, model_policy).map_err(
+                |error| AgentError::Config {
+                    message: format!("cannot resolve {tier} goal evaluator: {error}"),
+                },
+            )?
+        }
+        GoalEvaluatorTarget::Model(spec) => {
+            if !model_policy.allows(spec) {
+                return Err(goal_model_error(
+                    spec,
+                    ModelError::NotAllowed(spec.to_string()),
+                ));
+            }
+            match Model::from_spec(spec) {
+                Err(ModelError::UnsupportedProvider(_)) => {
+                    maki_providers::warm_catalog();
+                    Model::from_spec(spec).map_err(|error| goal_model_error(spec, error))?
+                }
+                result => result.map_err(|error| goal_model_error(spec, error))?,
+            }
+        }
+    };
+    Ok(model)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvaluationWire {
@@ -279,30 +396,17 @@ struct EvaluationWire {
 
 pub(crate) struct Evaluator<'a> {
     pub provider: &'a dyn Provider,
-    pub current_model: &'a Model,
+    pub model: &'a Model,
     pub history: &'a [Message],
     pub condition: &'a str,
     pub evaluation: u32,
     pub cancel: &'a CancelToken,
     pub session_id: Option<&'a SessionRef>,
-    pub model_policy: &'a ModelPolicy,
 }
 
 impl Evaluator<'_> {
     pub async fn run(&self) -> Result<EvaluationResult, EvaluationError> {
-        let mut model = Model::from_tier_with_policy(
-            &self.current_model.provider,
-            ModelTier::Weak,
-            self.model_policy,
-        )
-        .unwrap_or_else(|_| self.current_model.clone());
-        self.provider.adjust_model(&mut model);
-        model.max_output_tokens = Some(
-            model
-                .max_output_tokens
-                .unwrap_or(EVALUATOR_OUTPUT_TOKENS)
-                .min(EVALUATOR_OUTPUT_TOKENS),
-        );
+        let model = self.model;
 
         let mut percent = INITIAL_TRANSCRIPT_PERCENT;
         let mut validation_attempt = 0;
@@ -312,7 +416,7 @@ impl Evaluator<'_> {
         let mut cost = None;
 
         loop {
-            let mut messages = transcript_within_budget(self.history, &model, percent);
+            let mut messages = transcript_within_budget(self.history, model, percent);
             close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
             messages.push(Message::synthetic(evaluator_prompt(
                 self.condition,
@@ -323,7 +427,7 @@ impl Evaluator<'_> {
 
             let response = match evaluator_request(
                 self.provider,
-                &model,
+                model,
                 &messages,
                 crate::prompt::GOAL_EVALUATOR,
                 self.cancel,
@@ -343,7 +447,7 @@ impl Evaluator<'_> {
                         error,
                         usage,
                         cost,
-                        model: model.id,
+                        model: model.spec(),
                     });
                 }
             };
@@ -357,7 +461,7 @@ impl Evaluator<'_> {
                         error,
                         usage,
                         cost,
-                        model: model.id,
+                        model: model.spec(),
                     });
                 }
             };
@@ -368,7 +472,7 @@ impl Evaluator<'_> {
                         reason,
                         usage,
                         cost,
-                        model: model.id,
+                        model: model.spec(),
                     });
                 }
                 Err(error) => {
@@ -383,7 +487,7 @@ impl Evaluator<'_> {
                             },
                             usage,
                             cost,
-                            model: model.id,
+                            model: model.spec(),
                         });
                     }
                     previous_error = Some(error);
@@ -595,6 +699,30 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{ModelInfo, ProviderEvent, StreamResponse};
+    use serde_json::Value;
+
+    struct NullProvider;
+
+    impl Provider for NullProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
 
     #[test]
     fn validates_condition_by_characters() {
@@ -659,5 +787,124 @@ mod tests {
             .is_err()
         );
         assert!(parse_evaluation("{ok: true, reason: 'repaired', impossible: false}").is_err());
+    }
+
+    #[test]
+    fn resolves_auto_tiers_and_exact_models() {
+        smol::block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(NullProvider);
+            let current = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let policy = ModelPolicy::default();
+
+            let auto = resolve_evaluator(
+                &provider,
+                &current,
+                GoalEvaluatorTarget::Auto,
+                Timeouts::default(),
+                &policy,
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(auto.model.tier, ModelTier::Weak);
+            assert_eq!(auto.model.max_output_tokens, Some(EVALUATOR_OUTPUT_TOKENS));
+            assert!(Arc::ptr_eq(&auto.provider, &provider));
+
+            let strong = resolve_evaluator(
+                &provider,
+                &current,
+                GoalEvaluatorTarget::Tier(ModelTier::Strong),
+                Timeouts::default(),
+                &policy,
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(strong.model.tier, ModelTier::Strong);
+            assert_eq!(strong.model.provider.as_ref(), "anthropic");
+
+            let cross_provider = evaluator_model(
+                &current,
+                &GoalEvaluatorTarget::Model("ollama/qwen3".into()),
+                &policy,
+            )
+            .unwrap();
+            assert_eq!(cross_provider.spec(), "ollama/qwen3");
+
+            let exact = resolve_evaluator(
+                &provider,
+                &current,
+                GoalEvaluatorTarget::Model("anthropic/claude-opus-4-6-20260101".into()),
+                Timeouts::default(),
+                &policy,
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(exact.model.spec(), "anthropic/claude-opus-4-6-20260101");
+            assert!(Arc::ptr_eq(&exact.provider, &provider));
+        });
+    }
+
+    #[test]
+    fn explicit_goal_evaluator_never_silently_falls_back() {
+        smol::block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(NullProvider);
+            let current = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let policy = ModelPolicy::new(&[], &["anthropic/claude-opus*".into()]).unwrap();
+
+            let disallowed = resolve_evaluator(
+                &provider,
+                &current,
+                GoalEvaluatorTarget::Model("anthropic/claude-opus-4-6".into()),
+                Timeouts::default(),
+                &policy,
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .err()
+            .expect("disallowed exact model should fail");
+            assert!(disallowed.to_string().contains("not allowed"));
+
+            let invalid_tier = resolve_evaluator(
+                &provider,
+                &current,
+                GoalEvaluatorTarget::Tier(ModelTier::Compaction),
+                Timeouts::default(),
+                &ModelPolicy::default(),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .err()
+            .expect("compaction target should fail");
+            assert!(
+                invalid_tier
+                    .to_string()
+                    .contains("not a valid goal evaluator tier")
+            );
+        });
+    }
+
+    #[test]
+    fn evaluator_initialization_honors_cancellation() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let initialization = initialization_with_limits(
+                &cancel,
+                futures_lite::future::pending::<Result<(), AgentError>>(),
+            );
+            let cancel_now = async move {
+                trigger.cancel();
+            };
+
+            let (result, ()) = futures_lite::future::zip(initialization, cancel_now).await;
+
+            assert!(matches!(result, Err(AgentError::Cancelled)));
+        });
     }
 }

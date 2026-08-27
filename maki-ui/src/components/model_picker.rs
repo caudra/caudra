@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
-use maki_providers::model_registry;
+use maki_providers::model_registry::{self, GoalEvaluatorTarget};
 use maki_providers::provider::ProviderKind;
 
 use crate::components::Overlay;
@@ -17,11 +17,13 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Models ";
+const GOAL_TITLE: &str = " Goal evaluator model ";
+const TARGET_SECTION: &str = "Evaluator target";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
 
-fn footer_line() -> Line<'static> {
+fn model_footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
@@ -34,6 +36,18 @@ fn footer_line() -> Line<'static> {
         Span::styled(" weak", t.tool_dim),
         Span::styled("  $", t.keybind_key),
         Span::styled(" compaction", t.tool_dim),
+        Span::styled("  Ctrl+G", t.keybind_key),
+        Span::styled(" goal", t.tool_dim),
+    ])
+}
+
+fn goal_footer_line() -> Line<'static> {
+    let t = theme::current();
+    Line::from(vec![
+        Span::styled("  Enter", t.keybind_key),
+        Span::styled(" select", t.tool_dim),
+        Span::styled("  Esc", t.keybind_key),
+        Span::styled(" cancel", t.tool_dim),
     ])
 }
 
@@ -57,9 +71,16 @@ fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
     }
 }
 
+fn goal_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('g' | 'G'))
+}
+
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
+    SetGoalEvaluator(GoalEvaluatorTarget),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
     Close,
@@ -72,6 +93,8 @@ struct ModelEntry {
     suffix: Option<String>,
     tier: String,
     override_tiers: Vec<ModelTier>,
+    goal_target: Option<GoalEvaluatorTarget>,
+    goal_assigned: bool,
     free: bool,
 }
 
@@ -93,8 +116,14 @@ impl PickerItem for ModelEntry {
     }
 
     fn is_highlighted(&self) -> bool {
-        !self.override_tiers.is_empty()
+        !self.override_tiers.is_empty() || self.goal_assigned
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerMode {
+    Models,
+    Goal,
 }
 
 pub struct ModelPicker {
@@ -103,6 +132,8 @@ pub struct ModelPicker {
     available: Watch<Vec<String>>,
     recents: Vec<String>,
     current_spec: String,
+    goal_target: GoalEvaluatorTarget,
+    mode: PickerMode,
     needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
     anchor: Option<(bool, String)>,
@@ -111,11 +142,13 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
-            picker: ListPicker::new().with_footer_builder(footer_line),
+            picker: ListPicker::new().with_footer_builder(model_footer_line),
             models,
             available: Watch::default(),
             recents: Vec::new(),
             current_spec: String::new(),
+            goal_target: GoalEvaluatorTarget::Auto,
+            mode: PickerMode::Models,
             needs_rebuild: false,
             anchor: None,
         }
@@ -127,13 +160,28 @@ impl ModelPicker {
     }
 
     pub fn open(&mut self, current_spec: &str) {
+        self.mode = PickerMode::Models;
         self.current_spec = current_spec.to_owned();
+        self.goal_target = model_registry::goal_evaluator_target();
         self.anchor = None;
         self.needs_rebuild = false;
+        self.picker.set_footer_builder(model_footer_line);
         let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
         self.preselect_current_model();
+    }
+
+    pub fn open_goal(&mut self, target: GoalEvaluatorTarget) {
+        self.mode = PickerMode::Goal;
+        self.goal_target = target;
+        self.anchor = None;
+        self.needs_rebuild = false;
+        self.picker.set_footer_builder(goal_footer_line);
+        let _ = self.available.poll(self.models.load_full());
+        let entries = self.load_entries();
+        self.picker.open(entries, GOAL_TITLE);
+        self.preselect_goal_target();
     }
 
     /// Providers fetch their model lists in the background and drop them into
@@ -154,6 +202,8 @@ impl ModelPicker {
         if let Some((was_recent, spec)) = &self.anchor {
             self.picker
                 .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
+        } else if self.mode == PickerMode::Goal {
+            self.preselect_goal_target();
         } else {
             self.preselect_current_model();
         }
@@ -162,25 +212,68 @@ impl ModelPicker {
 
     fn load_entries(&self) -> Vec<ModelEntry> {
         let specs = self.available.get();
+        if self.mode == PickerMode::Goal {
+            let mut entries = goal_target_entries(&self.goal_target);
+            let mut models: Vec<ModelEntry> = specs
+                .map(|specs| {
+                    specs
+                        .iter()
+                        .filter_map(|spec| {
+                            let mut entry = parse_model_entry(spec)?;
+                            let target = GoalEvaluatorTarget::Model(spec.clone());
+                            entry.goal_assigned = self.goal_target == target;
+                            entry.goal_target = Some(target);
+                            if entry.goal_assigned {
+                                entry.tier = goal_detail(&entry.tier);
+                            }
+                            Some(entry)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            sort_models(&mut models);
+            if let GoalEvaluatorTarget::Model(spec) = &self.goal_target
+                && !models.iter().any(|entry| entry.spec == *spec)
+            {
+                entries.push(saved_goal_model_entry(spec));
+            }
+            entries.extend(models);
+            return entries;
+        }
+
         let mut entries = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
+                self.mark_goal_assignment(&mut e);
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
             }
         }
         let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|spec| {
+                        let mut entry = parse_model_entry(spec)?;
+                        self.mark_goal_assignment(&mut entry);
+                        Some(entry)
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        full.sort_by(|a, b| {
-            a.provider_display
-                .cmp(&b.provider_display)
-                .then_with(|| b.free.cmp(&a.free))
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        sort_models(&mut full);
         entries.extend(full);
         entries
+    }
+
+    fn mark_goal_assignment(&self, entry: &mut ModelEntry) {
+        entry.goal_assigned = matches!(
+            &self.goal_target,
+            GoalEvaluatorTarget::Model(spec) if spec == &entry.spec
+        );
+        if entry.goal_assigned {
+            entry.tier = goal_detail(&entry.tier);
+        }
     }
 
     fn preselect_current_model(&mut self) {
@@ -190,6 +283,11 @@ impl ModelPicker {
         {
             self.picker.select_item_by(|e| e.spec == self.current_spec);
         }
+    }
+
+    fn preselect_goal_target(&mut self) {
+        self.picker
+            .select_item_by(|entry| entry.goal_target.as_ref() == Some(&self.goal_target));
     }
 
     pub fn is_open(&self) -> bool {
@@ -231,7 +329,21 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
-        if let Some(tier) = tier_for_shortcut(key)
+        if self.mode == PickerMode::Models
+            && goal_shortcut(key)
+            && let Some(entry) = self.picker.selected_item()
+        {
+            let exact = GoalEvaluatorTarget::Model(entry.spec.clone());
+            let target = if self.goal_target == exact {
+                GoalEvaluatorTarget::Auto
+            } else {
+                exact
+            };
+            self.goal_target = target.clone();
+            self.needs_rebuild = true;
+            ModelPickerAction::SetGoalEvaluator(target)
+        } else if self.mode == PickerMode::Models
+            && let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
@@ -244,6 +356,11 @@ impl ModelPicker {
         } else {
             match self.picker.handle_key(key) {
                 PickerAction::Consumed => ModelPickerAction::Consumed,
+                PickerAction::Select(entry) if self.mode == PickerMode::Goal => {
+                    ModelPickerAction::SetGoalEvaluator(
+                        entry.goal_target.unwrap_or(GoalEvaluatorTarget::Auto),
+                    )
+                }
                 PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
                 PickerAction::Close => ModelPickerAction::Close,
                 PickerAction::Toggle(..) => ModelPickerAction::Consumed,
@@ -253,6 +370,75 @@ impl ModelPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+}
+
+fn goal_target_entries(current: &GoalEvaluatorTarget) -> Vec<ModelEntry> {
+    [
+        ("Auto", "weak, then current", GoalEvaluatorTarget::Auto),
+        (
+            "Strong",
+            "active provider",
+            GoalEvaluatorTarget::Tier(ModelTier::Strong),
+        ),
+        (
+            "Medium",
+            "active provider",
+            GoalEvaluatorTarget::Tier(ModelTier::Medium),
+        ),
+        (
+            "Weak",
+            "active provider",
+            GoalEvaluatorTarget::Tier(ModelTier::Weak),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, detail, target)| ModelEntry {
+        spec: format!("@goal:{target}"),
+        id: label.into(),
+        provider_display: TARGET_SECTION.into(),
+        suffix: None,
+        tier: detail.into(),
+        override_tiers: Vec::new(),
+        goal_assigned: &target == current,
+        goal_target: Some(target),
+        free: false,
+    })
+    .collect()
+}
+
+fn saved_goal_model_entry(spec: &str) -> ModelEntry {
+    let id = spec
+        .split_once('/')
+        .map_or(spec, |(_, model_id)| model_id)
+        .to_string();
+    ModelEntry {
+        spec: spec.to_string(),
+        id,
+        provider_display: TARGET_SECTION.into(),
+        suffix: None,
+        tier: "saved exact model".into(),
+        override_tiers: Vec::new(),
+        goal_target: Some(GoalEvaluatorTarget::Model(spec.to_string())),
+        goal_assigned: true,
+        free: false,
+    }
+}
+
+fn sort_models(models: &mut [ModelEntry]) {
+    models.sort_by(|a, b| {
+        a.provider_display
+            .cmp(&b.provider_display)
+            .then_with(|| b.free.cmp(&a.free))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn goal_detail(detail: &str) -> String {
+    if detail.is_empty() {
+        "goal".into()
+    } else {
+        format!("{detail}/goal")
     }
 }
 
@@ -314,6 +500,8 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         suffix: None,
         tier,
         override_tiers,
+        goal_target: None,
+        goal_assigned: false,
         free,
     })
 }
@@ -406,6 +594,105 @@ mod tests {
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101")
         );
+    }
+
+    #[test]
+    fn goal_picker_selects_tier_target() {
+        let mut p = ModelPicker::new(test_models());
+        p.open_goal(GoalEvaluatorTarget::Auto);
+        p.handle_key(key(KeyCode::Down));
+
+        let action = p.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Tier(ModelTier::Strong))
+        ));
+    }
+
+    #[test]
+    fn goal_picker_preselects_exact_model() {
+        let mut p = ModelPicker::new(test_models());
+        p.open_goal(GoalEvaluatorTarget::Model(SWAPPED_SPEC.into()));
+
+        let action = p.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Model(spec))
+                if spec == SWAPPED_SPEC
+        ));
+    }
+
+    #[test]
+    fn goal_picker_preserves_saved_exact_model_missing_from_discovery() {
+        let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models);
+        p.open_goal(target.clone());
+
+        let action = p.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            ModelPickerAction::SetGoalEvaluator(selected) if selected == target
+        ));
+    }
+
+    #[test]
+    fn goal_picker_refresh_keeps_unavailable_saved_exact_model_selected() {
+        let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(Arc::clone(&models));
+        p.open_goal(target.clone());
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ])));
+
+        assert_eq!(p.refresh(), Dirty::YES);
+        let action = p.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            ModelPickerAction::SetGoalEvaluator(selected) if selected == target
+        ));
+    }
+
+    #[test]
+    fn ctrl_g_toggles_highlighted_model_as_goal_evaluator() {
+        let spec = "anthropic/claude-opus-4-6-20260101";
+        let mut p = ModelPicker::new(test_models());
+        p.open(spec);
+
+        let shortcut = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let assign = p.handle_key(shortcut);
+        let reset = p.handle_key(shortcut);
+
+        assert!(matches!(
+            assign,
+            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Model(value)) if value == spec
+        ));
+        assert!(matches!(
+            reset,
+            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Auto)
+        ));
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn lowercase_g_remains_available_to_search() {
+        let mut p = ModelPicker::new(test_models());
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        p.handle_key(key(KeyCode::Char('g')));
+        p.handle_key(key(KeyCode::Char('l')));
+        p.handle_key(key(KeyCode::Char('m')));
+        let action = p.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            ModelPickerAction::Select(spec) if spec == SWAPPED_SPEC
+        ));
     }
 
     #[test]
@@ -616,9 +903,7 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
-        p.handle_key(key(KeyCode::Char('g')));
-        p.handle_key(key(KeyCode::Char('l')));
-        p.handle_key(key(KeyCode::Char('m')));
+        p.handle_paste("glm");
 
         models.store(None);
         let _ = p.refresh();

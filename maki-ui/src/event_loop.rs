@@ -1401,6 +1401,15 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
+            Action::SetGoalEvaluator(target) => {
+                maki_providers::model_registry::set_goal_evaluator_and_persist(
+                    target.clone(),
+                    &self.ctx.storage,
+                );
+                self.sessions[idx]
+                    .app
+                    .flash(format!("Goal evaluator: {target}"));
+            }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();

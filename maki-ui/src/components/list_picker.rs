@@ -246,6 +246,10 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
+    pub fn set_footer_builder(&mut self, builder: fn() -> Line<'static>) {
+        self.footer = Some(builder);
+    }
+
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
         assert_eq!(
             items.len(),

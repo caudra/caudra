@@ -85,6 +85,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: usize::MAX,
     },
     BuiltinCommand {
+        name: "/goal-clear",
+        description: "Stop the active completion goal",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/goal-model",
+        description: "Choose the completion goal evaluator",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
@@ -644,6 +654,13 @@ mod tests {
     fn filter_by_substring(input: &str, expect_active: bool) {
         let p = synced(input);
         assert_eq!(p.is_active(), expect_active);
+    }
+
+    #[test_case("/goal-c", "/goal-clear" ; "clear")]
+    #[test_case("/goal-m", "/goal-model" ; "model")]
+    fn goal_control_commands_are_discoverable(input: &str, expected: &str) {
+        let p = synced(input);
+        assert!(p.filtered.iter().any(|item| p.item_name(item) == expected));
     }
 
     #[test]
