@@ -19,7 +19,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
-| `Ctrl+M` | Model picker |
+| `Ctrl+M` / `Alt+M` | Model picker |
 
 ## Editing
 
@@ -28,6 +28,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Enter` | Submit prompt |
 | `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Toggle mode |
+| `Shift+Tab` | Cycle reasoning effort |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
@@ -82,8 +83,8 @@ Some pickers add extra bindings on top of the defaults:
 |---------|-----|--------|
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
-| Model Picker | `Ctrl+G` | Toggle goal evaluator model |
+| Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
+| Model Picker | `R` | Reset model purpose |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |

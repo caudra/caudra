@@ -60,19 +60,8 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
     };
     let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
     let effective = requested.min(ctx.model.tier);
-    if effective == ctx.model.tier {
-        return Ok(Model::clone(&ctx.model));
-    }
-    let slug = &ctx.model.provider;
-    maki_providers::model_registry::spec_for_tier(slug, effective)
-        .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
-        .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-                .map_err(|e| e.to_string())
-        })
+    Model::from_tier_with_policy(&ctx.model.provider, effective, &ctx.model_policy)
+        .map_err(|e| e.to_string())
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {

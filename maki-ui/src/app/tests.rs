@@ -409,6 +409,28 @@ fn toggle_mode_state_machine() {
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 }
 
+#[test]
+fn ctrl_m_opens_model_picker() {
+    let mut app = test_app();
+
+    let actions = app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+
+    assert!(app.model_picker.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn alt_m_opens_model_picker_through_visible_plan_form() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.plan_form.toggle();
+
+    let actions = app.update(Msg::Key(kb::MODEL_PICKER_FALLBACK.to_key_event()));
+
+    assert!(app.model_picker.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
 #[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
@@ -4258,6 +4280,55 @@ fn thinking_toggle_cycles_off_adaptive() {
 
     app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
+}
+
+#[test]
+fn shift_tab_cycles_explicit_reasoning_efforts() {
+    let mut app = test_app();
+    let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+
+    for effort in Effort::ALL {
+        assert!(app.update(Msg::Key(shift_tab)).is_empty());
+        assert_eq!(app.state.thinking, ThinkingConfig::Effort(effort));
+        let expected = format!("Reasoning effort: {effort}");
+        assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
+    }
+    app.update(Msg::Key(shift_tab));
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+}
+
+#[test]
+fn backtab_representation_cycles_reasoning_effort() {
+    let mut app = test_app();
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+}
+
+#[test]
+fn required_reasoning_wraps_from_max_to_minimal() {
+    let mut app = test_app();
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+    app.state.thinking = ThinkingConfig::Effort(Effort::Max);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+}
+
+#[test]
+fn shift_tab_rejects_model_without_reasoning() {
+    let mut app = test_app();
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+    assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
 }
 
 #[test]

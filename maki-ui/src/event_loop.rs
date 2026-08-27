@@ -29,7 +29,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::{Message, Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -60,6 +60,14 @@ const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
+
+fn preset_label(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Weak => "Fast",
+        ModelTier::Medium => "Balanced",
+        ModelTier::Strong => "Best",
+    }
+}
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -1396,10 +1404,20 @@ impl<'t> EventLoop<'t> {
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
-                maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
+                maki_providers::model_registry::set_and_persist(
+                    spec.clone(),
+                    tier,
+                    &self.ctx.storage,
+                );
+                self.sessions[idx]
+                    .app
+                    .flash(format!("{} model: {spec}", preset_label(tier)));
             }
-            Action::UnassignTier(spec, tier) => {
-                maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
+            Action::ResetTier(tier) => {
+                maki_providers::model_registry::reset_tier_and_persist(tier, &self.ctx.storage);
+                self.sessions[idx]
+                    .app
+                    .flash(format!("{} model: default", preset_label(tier)));
             }
             Action::SetGoalEvaluator(target) => {
                 maki_providers::model_registry::set_goal_evaluator_and_persist(
@@ -1409,6 +1427,15 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx]
                     .app
                     .flash(format!("Goal evaluator: {target}"));
+            }
+            Action::SetCompaction(target) => {
+                maki_providers::model_registry::set_compaction_and_persist(
+                    target.clone(),
+                    &self.ctx.storage,
+                );
+                self.sessions[idx]
+                    .app
+                    .flash(format!("Compaction model: {target}"));
             }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];

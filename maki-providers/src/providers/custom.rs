@@ -203,7 +203,12 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
         return TierLookup::Unknown;
     };
     let kind = protocol_kind(protocol);
-    match def.models.iter().find(|m| ModelTier::from(m.tier) == tier) {
+    match def
+        .models
+        .iter()
+        .filter(|model| model.tier != maki_config::providers::Tier::LegacyCompaction)
+        .find(|model| ModelTier::from(model.tier) == tier)
+    {
         Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
         None => TierLookup::NoModelForTier(kind),
     }
@@ -258,7 +263,8 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
 fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     for model in models {
         if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
-            model.tier = Some(ModelTier::from(declared.tier));
+            model.tier = (declared.tier != maki_config::providers::Tier::LegacyCompaction)
+                .then(|| ModelTier::from(declared.tier));
         }
     }
 }

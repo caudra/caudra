@@ -5,6 +5,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
+use maki_providers::model_registry::CompactionTarget;
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
@@ -47,16 +48,20 @@ pub fn resolve_compaction_model(
     model: &Model,
     timeouts: maki_providers::Timeouts,
     model_policy: &ModelPolicy,
-) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) =
-        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
-        && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
-    {
-        return (Arc::from(p), m);
+) -> Result<(Arc<dyn Provider>, Model), AgentError> {
+    let CompactionTarget::Model(spec) = maki_providers::model_registry::compaction_target() else {
+        return Ok((Arc::clone(provider), model.clone()));
+    };
+    if !model_policy.allows(&spec) {
+        return Err(AgentError::Config {
+            message: format!("compaction model '{spec}' is not allowed by provider model policy"),
+        });
     }
-    (Arc::clone(provider), model.clone())
+    let mut compact_model = Model::from_spec(&spec).map_err(|error| AgentError::Config {
+        message: format!("cannot resolve compaction model '{spec}': {error}"),
+    })?;
+    let compact_provider = maki_providers::provider::from_model(&mut compact_model, timeouts)?;
+    Ok((Arc::from(compact_provider), compact_model))
 }
 
 enum TurnOutcome {
@@ -739,7 +744,7 @@ impl<'h> Agent<'h> {
             &self.model,
             self.timeouts,
             &self.model_policy,
-        );
+        )?;
         let usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,

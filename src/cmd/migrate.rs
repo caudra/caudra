@@ -281,6 +281,11 @@ pub fn xdg() -> Result<()> {
         &xdg.state.join("model-tiers"),
         "model-tiers",
     )?;
+    merge_json_file(
+        &legacy.join("model-roles"),
+        &xdg.state.join("model-roles"),
+        "model-roles",
+    )?;
 
     for name in ["theme", "model"] {
         let src = legacy.join(name);

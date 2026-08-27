@@ -24,7 +24,10 @@ pub enum Tier {
     #[default]
     Medium,
     Strong,
-    Compaction,
+    /// Accepted only so existing provider files continue to load. Compaction
+    /// model selection now lives in the global model-role configuration.
+    #[serde(rename = "compaction")]
+    LegacyCompaction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,7 +464,7 @@ tier = "mediums"
     #[test_case("weak", Tier::Weak ; "weak")]
     #[test_case("medium", Tier::Medium ; "medium")]
     #[test_case("strong", Tier::Strong ; "strong")]
-    #[test_case("compaction", Tier::Compaction ; "compaction")]
+    #[test_case("compaction", Tier::LegacyCompaction ; "legacy_compaction")]
     fn model_def_tier_roundtrip(input: &str, expected: Tier) {
         let toml = format!(
             r#"id = "x"

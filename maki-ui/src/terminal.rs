@@ -27,6 +27,10 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits()
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES.bits(),
+);
 
 pub(crate) struct TerminalGuard;
 
@@ -348,9 +352,7 @@ fn disable_focus_change() {
 fn disable_focus_change() {}
 
 fn push_keyboard_enhancement() {
-    if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-    )) {
+    if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENTS)) {
         tracing::warn!(error = %e, "failed to enable keyboard enhancement (Kitty protocol)");
     }
 }
@@ -423,6 +425,17 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn keyboard_enhancements_disambiguate_control_keys() {
+        assert!(
+            KEYBOARD_ENHANCEMENTS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        assert!(
+            KEYBOARD_ENHANCEMENTS
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        );
+    }
 
     fn env<'a>(term_program: Option<&'a str>) -> TerminalEnvironment<'a> {
         TerminalEnvironment {

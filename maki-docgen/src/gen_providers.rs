@@ -12,7 +12,9 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Tier overrides are saved to `~/.local/state/maki/model-tiers`. Press `Ctrl+G` to toggle the highlighted exact model as the completion-goal evaluator; that role is saved to `~/.local/state/maki/model-roles`. Both apply across sessions."#;
+const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose; uppercase `R` resets the displayed purpose.
+
+Fast, Balanced, and Best are global exact-model presets saved to `~/.local/state/maki/model-tiers`. Goal and Compact are workload roles saved to `~/.local/state/maki/model-roles`. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model; Default Compact uses the chat model."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -208,7 +210,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, or `strong` |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -325,7 +327,6 @@ fn tier_label(tier: ModelTier) -> &'static str {
         ModelTier::Weak => "Weak",
         ModelTier::Medium => "Medium",
         ModelTier::Strong => "Strong",
-        ModelTier::Compaction => "Compaction",
     }
 }
 
@@ -564,9 +565,9 @@ pub fn generate() -> String {
     let _ = writeln!(
         out,
         "Maki talks to LLM providers over their HTTP APIs. \
-         Models are split into three tiers: **weak** (cheap and fast), \
+         Models are split into three capability tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
-         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"
+         Compaction is a separate workload role, not a capability tier.\n"
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");

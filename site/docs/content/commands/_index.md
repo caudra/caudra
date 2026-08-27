@@ -28,7 +28,7 @@ Type `/` in the input box to open the command palette.
 | `/goal-clear` | Stop the active completion goal |
 | `/goal-model` | Choose the completion goal evaluator |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
-| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) |
+| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
@@ -54,9 +54,9 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Auto preserves the default behavior: use the active provider's weak model, then fall back to the current conversation model when no weak model is available. Strong, Medium, and Weak explicitly select that tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
+Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Default tries the global Fast preset, then the active provider's weak model, and finally the current conversation model. Fast, Balanced, and Best use their global exact-model preset when assigned, otherwise the matching tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
 
-The evaluator choice is saved globally in `~/.local/state/maki/model-roles` and applies across sessions. You can also open `/model` and press `Ctrl+G` on a row to toggle that exact model as the goal evaluator. Run `/goal-model` and select Auto to restore the default.
+The evaluator choice is saved globally in `~/.local/state/maki/model-roles` and applies across sessions. The same Goal mode is available from `/model` with `Tab`; press uppercase `R` in that mode to restore Default.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
 

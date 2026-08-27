@@ -45,8 +45,8 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
     read().spec_for_tier(provider, tier)
 }
 
-pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
-    read().spec_for_tier_any(tier)
+pub fn override_spec_for_tier(tier: ModelTier) -> Option<String> {
+    read().overrides.get(&tier).cloned()
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -88,8 +88,27 @@ pub enum GoalEvaluatorTarget {
 impl fmt::Display for GoalEvaluatorTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Tier(tier) => tier.fmt(f),
+            Self::Auto => f.write_str("default"),
+            Self::Tier(ModelTier::Weak) => f.write_str("fast"),
+            Self::Tier(ModelTier::Medium) => f.write_str("balanced"),
+            Self::Tier(ModelTier::Strong) => f.write_str("best"),
+            Self::Model(spec) => f.write_str(spec),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CompactionTarget {
+    #[default]
+    Auto,
+    Model(String),
+}
+
+impl fmt::Display for CompactionTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("default"),
             Self::Model(spec) => f.write_str(spec),
         }
     }
@@ -99,12 +118,24 @@ pub fn goal_evaluator_target() -> GoalEvaluatorTarget {
     read().goal_evaluator.clone().unwrap_or_default()
 }
 
+pub fn compaction_target() -> CompactionTarget {
+    read().compaction.clone().unwrap_or_default()
+}
+
 pub fn load_from_storage(dir: &StateDir) {
-    let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
-    let goal_evaluator = read_roles(dir.path().join(ROLES_FILE).as_path()).goal_evaluator;
+    let (overrides, roles, had_legacy_compaction) = read_state(dir);
     let mut registry = write();
-    registry.set_overrides(overrides);
-    registry.goal_evaluator = goal_evaluator.filter(|target| *target != GoalEvaluatorTarget::Auto);
+    registry.set_overrides(overrides.clone());
+    registry.goal_evaluator = roles
+        .goal_evaluator
+        .clone()
+        .filter(|target| *target != GoalEvaluatorTarget::Auto);
+    registry.compaction = roles.compaction.clone();
+    drop(registry);
+    if had_legacy_compaction {
+        write_overrides(dir.path().join(TIERS_FILE).as_path(), &overrides);
+        write_roles(dir.path().join(ROLES_FILE).as_path(), &roles);
+    }
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
@@ -115,13 +146,26 @@ pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
     update_and_persist(dir, |reg| reg.unset(spec, tier));
 }
 
+pub fn reset_tier_and_persist(tier: ModelTier, dir: &StateDir) {
+    update_and_persist(dir, |registry| {
+        registry.overrides.remove(&tier);
+    });
+}
+
 pub fn set_goal_evaluator_and_persist(target: GoalEvaluatorTarget, dir: &StateDir) {
     let snapshot = {
         let mut registry = write();
         registry.goal_evaluator = (target != GoalEvaluatorTarget::Auto).then_some(target);
-        RolesFile {
-            goal_evaluator: registry.goal_evaluator.clone(),
-        }
+        registry.roles_snapshot()
+    };
+    write_roles(dir.path().join(ROLES_FILE).as_path(), &snapshot);
+}
+
+pub fn set_compaction_and_persist(target: CompactionTarget, dir: &StateDir) {
+    let snapshot = {
+        let mut registry = write();
+        registry.compaction = Some(target);
+        registry.roles_snapshot()
     };
     write_roles(dir.path().join(ROLES_FILE).as_path(), &snapshot);
 }
@@ -147,6 +191,9 @@ struct ModelRegistry {
     /// and discovered metadata lookup.
     known_models: HashMap<String, Vec<ModelInfo>>,
     goal_evaluator: Option<GoalEvaluatorTarget>,
+    /// `None` means no new-format value was loaded. `Some(Auto)` is an explicit
+    /// reset and must suppress a stale legacy compaction tier on restart.
+    compaction: Option<CompactionTarget>,
 }
 
 impl ModelRegistry {
@@ -172,6 +219,13 @@ impl ModelRegistry {
         self.overrides.get(&tier).map(String::as_str) == Some(spec)
     }
 
+    fn roles_snapshot(&self) -> RolesFile {
+        RolesFile {
+            goal_evaluator: self.goal_evaluator.clone(),
+            compaction: self.compaction.clone(),
+        }
+    }
+
     /// Lookup discovered metadata for a model by ID.
     fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
         self.known_models
@@ -181,14 +235,9 @@ impl ModelRegistry {
     }
 
     fn tier_for(&self, spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
-        // A spec may hold several tiers; prefer the strongest agent tier,
-        // falling back to Compaction only when it is the sole assignment.
-        let mut tiers = self.override_tiers(spec).into_iter();
-        if let Some(first) = tiers.next() {
-            return match first {
-                ModelTier::Compaction => tiers.next().unwrap_or(first),
-                t => t,
-            };
+        // A spec may hold several presets; prefer the strongest assignment.
+        if let Some(first) = self.override_tiers(spec).into_iter().next() {
+            return first;
         }
         if tiers_from_discovery(provider)
             && let Some((_, model_id)) = spec.split_once('/')
@@ -253,7 +302,6 @@ impl ModelRegistry {
             ModelTier::Strong => 0,
             ModelTier::Medium => 1,
             ModelTier::Weak => 2,
-            ModelTier::Compaction => return None,
         };
         Some(format!(
             "{provider}/{}",
@@ -263,18 +311,6 @@ impl ModelRegistry {
 
     fn claimed_elsewhere(&self, spec: &str, tier: ModelTier) -> bool {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
-    }
-
-    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
-        }
-        for provider in self.known_models.keys() {
-            if let Some(spec) = self.spec_for_tier(provider, tier) {
-                return Some(spec);
-            }
-        }
-        None
     }
 
     fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
@@ -318,24 +354,59 @@ fn tier_for_position(pos: usize) -> ModelTier {
 // to multiple tiers; a spec-keyed file would collapse them to a single entry.
 // Legacy files were spec-keyed and are inverted on read.
 
-fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
+#[derive(Default)]
+struct PersistedOverrides {
+    presets: BTreeMap<ModelTier, String>,
+    legacy_compaction: Option<String>,
+}
+
+fn quality_tier(value: &str) -> Option<ModelTier> {
+    match value {
+        "weak" => Some(ModelTier::Weak),
+        "medium" => Some(ModelTier::Medium),
+        "strong" => Some(ModelTier::Strong),
+        _ => None,
+    }
+}
+
+fn read_persisted_overrides(path: &Path) -> PersistedOverrides {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
+        return PersistedOverrides::default();
     };
     if raw.trim().is_empty() {
-        return BTreeMap::new();
+        return PersistedOverrides::default();
     }
-    if let Ok(map) = serde_json::from_str::<BTreeMap<ModelTier, String>>(&raw) {
-        return map;
-    }
-    // Legacy format: { "provider/model": "tier" } — invert on read.
-    match serde_json::from_str::<BTreeMap<String, ModelTier>>(&raw) {
-        Ok(legacy) => legacy.into_iter().map(|(s, t)| (t, s)).collect(),
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse tier overrides, ignoring");
-            BTreeMap::new()
+    let map = match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+        Ok(map) => map,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "failed to parse tier overrides, ignoring");
+            return PersistedOverrides::default();
+        }
+    };
+    let tier_keyed = map
+        .keys()
+        .any(|key| quality_tier(key).is_some() || key == "compaction");
+    let mut persisted = PersistedOverrides::default();
+    for (key, value) in map {
+        let (tier_name, spec) = if tier_keyed {
+            (key.as_str(), value)
+        } else {
+            (value.as_str(), key)
+        };
+        if tier_name == "compaction" {
+            persisted.legacy_compaction = Some(spec);
+        } else if let Some(tier) = quality_tier(tier_name) {
+            persisted.presets.insert(tier, spec);
+        } else {
+            warn!(path = %path.display(), tier = tier_name, "unknown model tier override, ignoring");
         }
     }
+    persisted
+}
+
+#[cfg(test)]
+fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
+    read_persisted_overrides(path).presets
 }
 
 fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
@@ -355,6 +426,18 @@ fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
 struct RolesFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_evaluator: Option<GoalEvaluatorTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction: Option<CompactionTarget>,
+}
+
+fn read_state(dir: &StateDir) -> (BTreeMap<ModelTier, String>, RolesFile, bool) {
+    let persisted = read_persisted_overrides(dir.path().join(TIERS_FILE).as_path());
+    let had_legacy_compaction = persisted.legacy_compaction.is_some();
+    let mut roles = read_roles(dir.path().join(ROLES_FILE).as_path());
+    if roles.compaction.is_none() {
+        roles.compaction = persisted.legacy_compaction.map(CompactionTarget::Model);
+    }
+    (persisted.presets, roles, had_legacy_compaction)
 }
 
 fn read_roles(path: &Path) -> RolesFile {
@@ -512,17 +595,14 @@ mod tests {
     }
 
     #[test]
-    fn tier_for_prefers_strongest_over_multi_tier_spec() {
+    fn tier_for_prefers_strongest_preset_assignment() {
         let mut reg = make_map(&[], &[]);
         reg.set("ollama/multi".into(), ModelTier::Medium);
         reg.set("ollama/multi".into(), ModelTier::Strong);
-        reg.set("ollama/multi".into(), ModelTier::Compaction);
-        reg.set("ollama/compact-only".into(), ModelTier::Compaction);
 
         let t = |spec| reg.tier_for(spec, "ollama", None);
 
         assert_eq!(t("ollama/multi"), ModelTier::Strong);
-        assert_eq!(t("ollama/compact-only"), ModelTier::Compaction);
     }
 
     #[test]
@@ -545,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_any_cross_provider() {
+    fn preset_overrides_are_global_exact_models() {
         let reg = make_map(
             &[
                 (ModelTier::Weak, "zai/glm-5"),
@@ -553,16 +633,10 @@ mod tests {
             ],
             &["big", "mid", "small"],
         );
+        assert_eq!(reg.overrides[&ModelTier::Strong], "openai/gpt-foo");
+        assert_eq!(reg.overrides[&ModelTier::Weak], "zai/glm-5");
         assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong),
-            Some("openai/gpt-foo".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak),
-            Some("zai/glm-5".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium),
+            reg.spec_for_tier("ollama", ModelTier::Medium),
             Some("ollama/mid".into())
         );
     }
@@ -609,6 +683,7 @@ mod tests {
         let path = tmp.path().join(ROLES_FILE);
         let roles = RolesFile {
             goal_evaluator: Some(GoalEvaluatorTarget::Tier(ModelTier::Medium)),
+            compaction: None,
         };
 
         write_roles(&path, &roles);
@@ -633,6 +708,7 @@ mod tests {
             &path,
             &RolesFile {
                 goal_evaluator: Some(target.clone()),
+                compaction: None,
             },
         );
 
@@ -646,6 +722,63 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
 
         assert!(read_roles(&path).goal_evaluator.is_none());
+    }
+
+    #[test]
+    fn compaction_role_round_trips_without_entering_tier_file() {
+        let tmp = TempDir::new().unwrap();
+        let tiers_path = tmp.path().join(TIERS_FILE);
+        let roles_path = tmp.path().join(ROLES_FILE);
+        let mut overrides = BTreeMap::new();
+        overrides.insert(ModelTier::Strong, "openai/gpt-5.4".into());
+
+        write_overrides(&tiers_path, &overrides);
+        write_roles(
+            &roles_path,
+            &RolesFile {
+                goal_evaluator: None,
+                compaction: Some(CompactionTarget::Model("openai/gpt-5.4-mini".into())),
+            },
+        );
+
+        assert!(
+            !std::fs::read_to_string(tiers_path)
+                .unwrap()
+                .contains("compaction")
+        );
+        assert_eq!(
+            read_roles(&roles_path).compaction,
+            Some(CompactionTarget::Model("openai/gpt-5.4-mini".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_compaction_tier_migrates_unless_role_was_reset() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        std::fs::write(
+            tmp.path().join(TIERS_FILE),
+            r#"{"strong":"openai/gpt-5.4","compaction":"openai/gpt-5.4-mini"}"#,
+        )
+        .unwrap();
+
+        let (overrides, roles, had_legacy_compaction) = read_state(&dir);
+        assert!(had_legacy_compaction);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[&ModelTier::Strong], "openai/gpt-5.4");
+        assert_eq!(
+            roles.compaction,
+            Some(CompactionTarget::Model("openai/gpt-5.4-mini".into()))
+        );
+
+        write_roles(
+            &tmp.path().join(ROLES_FILE),
+            &RolesFile {
+                goal_evaluator: None,
+                compaction: Some(CompactionTarget::Auto),
+            },
+        );
+        assert_eq!(read_state(&dir).1.compaction, Some(CompactionTarget::Auto));
     }
 
     #[test]
@@ -702,6 +835,21 @@ mod tests {
         let loaded = read_overrides(&path);
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/b");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/c");
+    }
+
+    #[test]
+    fn backwards_compat_extracts_compaction_from_legacy_spec_keyed_format() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(TIERS_FILE);
+        std::fs::write(
+            &path,
+            r#"{"ollama/compact":"compaction","ollama/strong":"strong"}"#,
+        )
+        .unwrap();
+
+        let loaded = read_persisted_overrides(&path);
+        assert_eq!(loaded.presets[&ModelTier::Strong], "ollama/strong");
+        assert_eq!(loaded.legacy_compaction.as_deref(), Some("ollama/compact"));
     }
 
     #[test]

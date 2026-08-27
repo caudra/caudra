@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
-use maki_providers::model_registry::{self, GoalEvaluatorTarget};
+use maki_providers::model_registry::{self, CompactionTarget, GoalEvaluatorTarget};
 use maki_providers::provider::ProviderKind;
 
 use crate::components::Overlay;
@@ -16,8 +16,6 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
-const TITLE: &str = " Models ";
-const GOAL_TITLE: &str = " Goal evaluator model ";
 const TARGET_SECTION: &str = "Evaluator target";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
@@ -28,61 +26,35 @@ fn model_footer_line() -> Line<'static> {
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
-        Span::styled("  !", t.keybind_key),
-        Span::styled(" strong", t.tool_dim),
-        Span::styled("  @", t.keybind_key),
-        Span::styled(" medium", t.tool_dim),
-        Span::styled("  #", t.keybind_key),
-        Span::styled(" weak", t.tool_dim),
-        Span::styled("  $", t.keybind_key),
-        Span::styled(" compaction", t.tool_dim),
-        Span::styled("  Ctrl+G", t.keybind_key),
-        Span::styled(" goal", t.tool_dim),
+        Span::styled("  Tab/S-Tab", t.keybind_key),
+        Span::styled(" purpose", t.tool_dim),
     ])
 }
 
-fn goal_footer_line() -> Line<'static> {
+fn assignment_footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
-        Span::styled(" select", t.tool_dim),
-        Span::styled("  Esc", t.keybind_key),
-        Span::styled(" cancel", t.tool_dim),
+        Span::styled(" assign", t.tool_dim),
+        Span::styled("  R", t.keybind_key),
+        Span::styled(" reset", t.tool_dim),
+        Span::styled("  Tab/S-Tab", t.keybind_key),
+        Span::styled(" purpose", t.tool_dim),
     ])
 }
 
-fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    let digit = match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
-        // Kitty protocol: Shift+digit reported with base key + SHIFT modifier
-        (KeyCode::Char(c @ '1'..='4'), true) => c,
-        // Legacy terminals: Shift+digit reported as the resulting character
-        (KeyCode::Char('!' | '¡'), false) => '1', // US, ES
-        (KeyCode::Char('@' | '"' | '™'), false) => '2', // US, UK/DE
-        (KeyCode::Char('#' | '§' | '£'), false) => '3', // US, DE, UK
-        (KeyCode::Char('$' | '€' | '¤'), false) => '4', // US, EU, Nordic
-        _ => return None,
-    };
-    match digit {
-        '1' => Some(ModelTier::Strong),
-        '2' => Some(ModelTier::Medium),
-        '3' => Some(ModelTier::Weak),
-        '4' => Some(ModelTier::Compaction),
-        _ => None,
-    }
-}
-
-fn goal_shortcut(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('g' | 'G'))
+fn is_reset_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('R'))
+        || (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
     SetGoalEvaluator(GoalEvaluatorTarget),
+    SetCompaction(CompactionTarget),
     AssignTier(String, ModelTier),
-    UnassignTier(String, ModelTier),
+    ResetTier(ModelTier),
     Close,
 }
 
@@ -120,10 +92,59 @@ impl PickerItem for ModelEntry {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerMode {
-    Models,
+    Chat,
     Goal,
+    Compact,
+    Fast,
+    Balanced,
+    Best,
+}
+
+impl PickerMode {
+    const ALL: [Self; 6] = [
+        Self::Chat,
+        Self::Goal,
+        Self::Compact,
+        Self::Fast,
+        Self::Balanced,
+        Self::Best,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Goal => "Goal",
+            Self::Compact => "Compact",
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Best => "Best",
+        }
+    }
+
+    fn title(self) -> String {
+        format!(" Models · {} ", self.label())
+    }
+
+    fn preset_tier(self) -> Option<ModelTier> {
+        match self {
+            Self::Fast => Some(ModelTier::Weak),
+            Self::Balanced => Some(ModelTier::Medium),
+            Self::Best => Some(ModelTier::Strong),
+            _ => None,
+        }
+    }
+
+    fn shifted(self, backwards: bool) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        let next = if backwards {
+            index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)
+        } else {
+            (index + 1) % Self::ALL.len()
+        };
+        Self::ALL[next]
+    }
 }
 
 pub struct ModelPicker {
@@ -133,6 +154,7 @@ pub struct ModelPicker {
     recents: Vec<String>,
     current_spec: String,
     goal_target: GoalEvaluatorTarget,
+    compaction_target: CompactionTarget,
     mode: PickerMode,
     needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
@@ -148,7 +170,8 @@ impl ModelPicker {
             recents: Vec::new(),
             current_spec: String::new(),
             goal_target: GoalEvaluatorTarget::Auto,
-            mode: PickerMode::Models,
+            compaction_target: CompactionTarget::Auto,
+            mode: PickerMode::Chat,
             needs_rebuild: false,
             anchor: None,
         }
@@ -160,28 +183,31 @@ impl ModelPicker {
     }
 
     pub fn open(&mut self, current_spec: &str) {
-        self.mode = PickerMode::Models;
+        self.mode = PickerMode::Chat;
         self.current_spec = current_spec.to_owned();
         self.goal_target = model_registry::goal_evaluator_target();
+        self.compaction_target = model_registry::compaction_target();
         self.anchor = None;
         self.needs_rebuild = false;
         self.picker.set_footer_builder(model_footer_line);
         let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
-        self.picker.open(entries, TITLE);
-        self.preselect_current_model();
+        self.picker.open(entries, self.mode.title());
+        self.preselect_mode();
     }
 
-    pub fn open_goal(&mut self, target: GoalEvaluatorTarget) {
+    pub fn open_goal(&mut self, current_spec: &str, target: GoalEvaluatorTarget) {
         self.mode = PickerMode::Goal;
+        self.current_spec = current_spec.to_owned();
         self.goal_target = target;
+        self.compaction_target = model_registry::compaction_target();
         self.anchor = None;
         self.needs_rebuild = false;
-        self.picker.set_footer_builder(goal_footer_line);
+        self.picker.set_footer_builder(assignment_footer_line);
         let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
-        self.picker.open(entries, GOAL_TITLE);
-        self.preselect_goal_target();
+        self.picker.open(entries, self.mode.title());
+        self.preselect_mode();
     }
 
     /// Providers fetch their model lists in the background and drop them into
@@ -202,10 +228,8 @@ impl ModelPicker {
         if let Some((was_recent, spec)) = &self.anchor {
             self.picker
                 .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
-        } else if self.mode == PickerMode::Goal {
-            self.preselect_goal_target();
         } else {
-            self.preselect_current_model();
+            self.preselect_mode();
         }
         Dirty::YES
     }
@@ -224,7 +248,7 @@ impl ModelPicker {
                             entry.goal_assigned = self.goal_target == target;
                             entry.goal_target = Some(target);
                             if entry.goal_assigned {
-                                entry.tier = goal_detail(&entry.tier);
+                                entry.tier = assignment_detail(&entry.tier, self.mode.label());
                             }
                             Some(entry)
                         })
@@ -244,7 +268,7 @@ impl ModelPicker {
         let mut entries = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
-                self.mark_goal_assignment(&mut e);
+                self.mark_assignment(&mut e);
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
@@ -255,7 +279,7 @@ impl ModelPicker {
                 s.iter()
                     .filter_map(|spec| {
                         let mut entry = parse_model_entry(spec)?;
-                        self.mark_goal_assignment(&mut entry);
+                        self.mark_assignment(&mut entry);
                         Some(entry)
                     })
                     .collect()
@@ -263,31 +287,56 @@ impl ModelPicker {
             .unwrap_or_default();
         sort_models(&mut full);
         entries.extend(full);
+        if let Some(spec) = self.assigned_spec()
+            && !entries.iter().any(|entry| entry.spec == spec)
+        {
+            entries.insert(0, saved_assignment_entry(&spec, self.mode.label()));
+        }
         entries
     }
 
-    fn mark_goal_assignment(&self, entry: &mut ModelEntry) {
-        entry.goal_assigned = matches!(
-            &self.goal_target,
-            GoalEvaluatorTarget::Model(spec) if spec == &entry.spec
-        );
+    fn mark_assignment(&self, entry: &mut ModelEntry) {
+        entry.goal_assigned = self.assigned_spec().is_some_and(|spec| spec == entry.spec);
         if entry.goal_assigned {
-            entry.tier = goal_detail(&entry.tier);
+            entry.tier = assignment_detail(&entry.tier, self.mode.label());
         }
     }
 
-    fn preselect_current_model(&mut self) {
+    fn assigned_spec(&self) -> Option<String> {
+        match self.mode {
+            PickerMode::Goal => match &self.goal_target {
+                GoalEvaluatorTarget::Model(spec) => Some(spec.clone()),
+                _ => None,
+            },
+            PickerMode::Compact => match &self.compaction_target {
+                CompactionTarget::Model(spec) => Some(spec.clone()),
+                CompactionTarget::Auto => None,
+            },
+            mode => mode
+                .preset_tier()
+                .and_then(model_registry::override_spec_for_tier),
+        }
+    }
+
+    fn preselect_mode(&mut self) {
+        if self.mode == PickerMode::Goal {
+            self.picker
+                .select_item_by(|entry| entry.goal_target.as_ref() == Some(&self.goal_target));
+        } else if let Some(spec) = self.assigned_spec() {
+            self.preselect_spec(&spec);
+        } else if self.mode == PickerMode::Chat {
+            let spec = self.current_spec.clone();
+            self.preselect_spec(&spec);
+        }
+    }
+
+    fn preselect_spec(&mut self, spec: &str) {
         if !self
             .picker
-            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
+            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none())
         {
-            self.picker.select_item_by(|e| e.spec == self.current_spec);
+            self.picker.select_item_by(|entry| entry.spec == spec);
         }
-    }
-
-    fn preselect_goal_target(&mut self) {
-        self.picker
-            .select_item_by(|entry| entry.goal_target.as_ref() == Some(&self.goal_target));
     }
 
     pub fn is_open(&self) -> bool {
@@ -329,42 +378,65 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
-        if self.mode == PickerMode::Models
-            && goal_shortcut(key)
-            && let Some(entry) = self.picker.selected_item()
-        {
-            let exact = GoalEvaluatorTarget::Model(entry.spec.clone());
-            let target = if self.goal_target == exact {
-                GoalEvaluatorTarget::Auto
-            } else {
-                exact
-            };
-            self.goal_target = target.clone();
+        let backwards = match key.code {
+            KeyCode::BackTab => Some(true),
+            KeyCode::Tab => Some(key.modifiers.contains(KeyModifiers::SHIFT)),
+            _ => None,
+        };
+        if let Some(backwards) = backwards {
+            self.mode = self.mode.shifted(backwards);
+            self.anchor = None;
+            self.picker.set_title(self.mode.title());
+            self.picker
+                .set_footer_builder(if self.mode == PickerMode::Chat {
+                    model_footer_line
+                } else {
+                    assignment_footer_line
+                });
+            let entries = self.load_entries();
+            self.picker.replace_items(entries);
+            self.preselect_mode();
+            return ModelPickerAction::Consumed;
+        }
+        if is_reset_key(key) {
+            self.anchor = None;
+            self.picker.clear_search();
             self.needs_rebuild = true;
-            ModelPickerAction::SetGoalEvaluator(target)
-        } else if self.mode == PickerMode::Models
-            && let Some(tier) = tier_for_shortcut(key)
-            && let Some(entry) = self.picker.selected_item()
-        {
-            let spec = entry.spec.clone();
-            self.needs_rebuild = true;
-            if entry.override_tiers.contains(&tier) {
-                ModelPickerAction::UnassignTier(spec, tier)
-            } else {
-                ModelPickerAction::AssignTier(spec, tier)
-            }
-        } else {
-            match self.picker.handle_key(key) {
-                PickerAction::Consumed => ModelPickerAction::Consumed,
-                PickerAction::Select(entry) if self.mode == PickerMode::Goal => {
-                    ModelPickerAction::SetGoalEvaluator(
-                        entry.goal_target.unwrap_or(GoalEvaluatorTarget::Auto),
-                    )
+            return match self.mode {
+                PickerMode::Chat => {
+                    self.preselect_mode();
+                    ModelPickerAction::Consumed
                 }
-                PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
-                PickerAction::Close => ModelPickerAction::Close,
-                PickerAction::Toggle(..) => ModelPickerAction::Consumed,
-            }
+                PickerMode::Goal => {
+                    self.goal_target = GoalEvaluatorTarget::Auto;
+                    ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Auto)
+                }
+                PickerMode::Compact => {
+                    self.compaction_target = CompactionTarget::Auto;
+                    ModelPickerAction::SetCompaction(CompactionTarget::Auto)
+                }
+                mode => ModelPickerAction::ResetTier(
+                    mode.preset_tier().expect("preset mode must have a tier"),
+                ),
+            };
+        }
+        match self.picker.handle_key(key) {
+            PickerAction::Consumed => ModelPickerAction::Consumed,
+            PickerAction::Select(entry) => match self.mode {
+                PickerMode::Chat => ModelPickerAction::Select(entry.spec),
+                PickerMode::Goal => ModelPickerAction::SetGoalEvaluator(
+                    entry.goal_target.unwrap_or(GoalEvaluatorTarget::Auto),
+                ),
+                PickerMode::Compact => {
+                    ModelPickerAction::SetCompaction(CompactionTarget::Model(entry.spec))
+                }
+                mode => ModelPickerAction::AssignTier(
+                    entry.spec,
+                    mode.preset_tier().expect("preset mode must have a tier"),
+                ),
+            },
+            PickerAction::Close => ModelPickerAction::Close,
+            PickerAction::Toggle(..) => ModelPickerAction::Consumed,
         }
     }
 
@@ -375,21 +447,21 @@ impl ModelPicker {
 
 fn goal_target_entries(current: &GoalEvaluatorTarget) -> Vec<ModelEntry> {
     [
-        ("Auto", "weak, then current", GoalEvaluatorTarget::Auto),
+        ("Default", "fast, then chat", GoalEvaluatorTarget::Auto),
         (
-            "Strong",
-            "active provider",
-            GoalEvaluatorTarget::Tier(ModelTier::Strong),
+            "Fast",
+            "global preset",
+            GoalEvaluatorTarget::Tier(ModelTier::Weak),
         ),
         (
-            "Medium",
-            "active provider",
+            "Balanced",
+            "global preset",
             GoalEvaluatorTarget::Tier(ModelTier::Medium),
         ),
         (
-            "Weak",
-            "active provider",
-            GoalEvaluatorTarget::Tier(ModelTier::Weak),
+            "Best",
+            "global preset",
+            GoalEvaluatorTarget::Tier(ModelTier::Strong),
         ),
     ]
     .into_iter()
@@ -425,6 +497,13 @@ fn saved_goal_model_entry(spec: &str) -> ModelEntry {
     }
 }
 
+fn saved_assignment_entry(spec: &str, purpose: &str) -> ModelEntry {
+    let mut entry = saved_goal_model_entry(spec);
+    entry.goal_target = None;
+    entry.tier = format!("saved {} model", purpose.to_ascii_lowercase());
+    entry
+}
+
 fn sort_models(models: &mut [ModelEntry]) {
     models.sort_by(|a, b| {
         a.provider_display
@@ -434,11 +513,12 @@ fn sort_models(models: &mut [ModelEntry]) {
     });
 }
 
-fn goal_detail(detail: &str) -> String {
+fn assignment_detail(detail: &str, purpose: &str) -> String {
+    let purpose = purpose.to_ascii_lowercase();
     if detail.is_empty() {
-        "goal".into()
+        purpose
     } else {
-        format!("{detail}/goal")
+        format!("{detail}/{purpose}")
     }
 }
 
@@ -599,21 +679,21 @@ mod tests {
     #[test]
     fn goal_picker_selects_tier_target() {
         let mut p = ModelPicker::new(test_models());
-        p.open_goal(GoalEvaluatorTarget::Auto);
+        p.open_goal("", GoalEvaluatorTarget::Auto);
         p.handle_key(key(KeyCode::Down));
 
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             action,
-            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Tier(ModelTier::Strong))
+            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Tier(ModelTier::Weak))
         ));
     }
 
     #[test]
     fn goal_picker_preselects_exact_model() {
         let mut p = ModelPicker::new(test_models());
-        p.open_goal(GoalEvaluatorTarget::Model(SWAPPED_SPEC.into()));
+        p.open_goal("", GoalEvaluatorTarget::Model(SWAPPED_SPEC.into()));
 
         let action = p.handle_key(key(KeyCode::Enter));
 
@@ -629,7 +709,7 @@ mod tests {
         let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
         let models = Arc::new(ArcSwapOption::empty());
         let mut p = ModelPicker::new(models);
-        p.open_goal(target.clone());
+        p.open_goal("", target.clone());
 
         let action = p.handle_key(key(KeyCode::Enter));
 
@@ -644,7 +724,7 @@ mod tests {
         let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
         let models = Arc::new(ArcSwapOption::empty());
         let mut p = ModelPicker::new(Arc::clone(&models));
-        p.open_goal(target.clone());
+        p.open_goal("", target.clone());
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
@@ -659,19 +739,25 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_toggles_highlighted_model_as_goal_evaluator() {
+    fn tab_switches_to_goal_and_reset_restores_default() {
         let spec = "anthropic/claude-opus-4-6-20260101";
         let mut p = ModelPicker::new(test_models());
         p.open(spec);
 
-        let shortcut = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        let assign = p.handle_key(shortcut);
-        let reset = p.handle_key(shortcut);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Tab)),
+            ModelPickerAction::Consumed
+        ));
+        p.picker
+            .select_item_by(|entry| entry.spec == spec && entry.goal_target.is_some());
+        let assign = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             assign,
             ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Model(value)) if value == spec
         ));
+        p.open_goal(spec, GoalEvaluatorTarget::Model(spec.into()));
+        let reset = p.handle_key(key(KeyCode::Char('R')));
         assert!(matches!(
             reset,
             ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Auto)
@@ -717,21 +803,100 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
-    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
-    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
-    #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
-    #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
-    fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
+    #[test_case(3, ModelTier::Weak     ; "fast")]
+    #[test_case(4, ModelTier::Medium   ; "balanced")]
+    #[test_case(5, ModelTier::Strong   ; "best")]
+    fn preset_modes_assign_selected_exact_model(tabs: usize, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("anthropic/claude-sonnet-4-20250514");
-        let action = p.handle_key(k);
+        for _ in 0..tabs {
+            p.handle_key(key(KeyCode::Tab));
+        }
+        p.picker.select_item_by(|entry| {
+            entry.spec == "anthropic/claude-sonnet-4-20250514" && entry.suffix().is_none()
+        });
+        let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(&action, ModelPickerAction::AssignTier(s, t)
                 if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
             "expected AssignTier(claude-sonnet, {want:?}), got something else",
         );
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn shift_tab_wraps_from_chat_to_best() {
+        let spec = "anthropic/claude-sonnet-4-20250514";
+        let mut p = ModelPicker::new(test_models());
+        p.open(spec);
+        p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        p.picker
+            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::AssignTier(value, ModelTier::Strong) if value == spec
+        ));
+    }
+
+    #[test]
+    fn uppercase_r_resets_preset_while_lowercase_r_filters() {
+        let mut p = ModelPicker::new(test_models());
+        p.open("");
+        for _ in 0..3 {
+            p.handle_key(key(KeyCode::Tab));
+        }
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('r'))),
+            ModelPickerAction::Consumed
+        ));
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('R'))),
+            ModelPickerAction::ResetTier(ModelTier::Weak)
+        ));
         assert!(p.is_open());
+    }
+
+    #[test]
+    fn uppercase_r_clears_chat_search_and_reselects_current_model() {
+        let current = "anthropic/claude-sonnet-4-20250514";
+        let mut p = ModelPicker::new(test_models());
+        p.open(current);
+        p.handle_paste("glm");
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('R'))),
+            ModelPickerAction::Consumed
+        ));
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Select(spec) if spec == current
+        ));
+    }
+
+    #[test]
+    fn compact_mode_assigns_and_resets_exact_model() {
+        let spec = "anthropic/claude-sonnet-4-20250514";
+        let mut p = ModelPicker::new(test_models());
+        p.open(spec);
+        p.handle_key(key(KeyCode::Tab));
+        p.handle_key(key(KeyCode::Tab));
+        p.picker
+            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::SetCompaction(CompactionTarget::Model(value)) if value == spec
+        ));
+
+        p.open(spec);
+        p.handle_key(key(KeyCode::Tab));
+        p.handle_key(key(KeyCode::Tab));
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('R'))),
+            ModelPickerAction::SetCompaction(CompactionTarget::Auto)
+        ));
     }
 
     #[test]
@@ -820,7 +985,7 @@ mod tests {
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
         p.handle_key(key(KeyCode::Down));
-        p.handle_key(key(KeyCode::Char('!')));
+        p.needs_rebuild = true;
 
         let _ = p.refresh();
 

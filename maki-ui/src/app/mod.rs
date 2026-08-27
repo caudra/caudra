@@ -54,7 +54,7 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
@@ -64,7 +64,7 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Effort, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -448,6 +448,32 @@ impl App {
         Ok(self.state.thinking)
     }
 
+    fn cycle_reasoning_effort(&mut self) {
+        if !self.state.model.supports_thinking() {
+            self.flash(THINKING_UNSUPPORTED_MSG.into());
+            return;
+        }
+        let first = Effort::ALL[0];
+        self.state.thinking = match self.state.thinking {
+            ThinkingConfig::Effort(current) => Effort::ALL
+                .iter()
+                .position(|effort| *effort == current)
+                .and_then(|index| Effort::ALL.get(index + 1).copied())
+                .map(ThinkingConfig::Effort)
+                .unwrap_or_else(|| {
+                    if self.state.model.requires_thinking() {
+                        ThinkingConfig::Effort(first)
+                    } else {
+                        ThinkingConfig::Off
+                    }
+                }),
+            ThinkingConfig::Off | ThinkingConfig::Adaptive | ThinkingConfig::Budget(_) => {
+                ThinkingConfig::Effort(first)
+            }
+        };
+        self.flash(format!("Reasoning effort: {}", self.state.thinking));
+    }
+
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
         if fast && !self.state.model.supports_fast() {
             return Err(FAST_UNSUPPORTED_MSG.into());
@@ -799,8 +825,11 @@ impl App {
                 ModelPickerAction::AssignTier(spec, tier) => {
                     vec![Action::AssignTier(spec, tier)]
                 }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
+                ModelPickerAction::ResetTier(tier) => {
+                    vec![Action::ResetTier(tier)]
+                }
+                ModelPickerAction::SetCompaction(target) => {
+                    vec![Action::SetCompaction(target)]
                 }
                 ModelPickerAction::Close => vec![],
             });
@@ -907,6 +936,15 @@ impl App {
 
         if let Some(actions) = self.handle_ctrl(key) {
             return actions;
+        }
+
+        if is_shift_tab(key) {
+            self.cycle_reasoning_effort();
+            return vec![];
+        }
+
+        if key::MODEL_PICKER.matches(key) || key::MODEL_PICKER_FALLBACK.matches(key) {
+            return self.run_builtin(BuiltinAction::ModelPicker);
         }
 
         if !self.is_main_chat() {
@@ -1032,9 +1070,6 @@ impl App {
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
-        }
-        if key::MODEL_PICKER.matches(key) {
-            return self.run_builtin(BuiltinAction::ModelPicker);
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
@@ -1810,8 +1845,10 @@ impl App {
     }
 
     fn open_goal_model_picker(&mut self) -> Vec<Action> {
-        self.model_picker
-            .open_goal(maki_providers::model_registry::goal_evaluator_target());
+        self.model_picker.open_goal(
+            &self.state.model.spec(),
+            maki_providers::model_registry::goal_evaluator_target(),
+        );
         vec![Action::RefreshModels]
     }
 
@@ -2205,6 +2242,11 @@ fn goal_usage_model<'a>(model: &'a str, current_provider: &str) -> &'a str {
 
 fn is_streaming_stop_key(key: KeyEvent) -> bool {
     key::QUIT.matches(key) || key.code == KeyCode::Esc
+}
+
+fn is_shift_tab(key: KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::SHIFT)
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

@@ -250,6 +250,10 @@ impl<T: PickerItem> ListPicker<T> {
         self.footer = Some(builder);
     }
 
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
+
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
         assert_eq!(
             items.len(),
@@ -292,6 +296,13 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn set_error_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    pub fn clear_search(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            state.search = TextBuffer::new(String::new());
+            state.update_search_and_clamp();
+        }
     }
 
     pub fn replace_items(&mut self, items: Vec<T>) {

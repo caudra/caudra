@@ -185,7 +185,7 @@ impl AgentLoop {
             &slot.model,
             self.timeouts,
             &self.model_policy,
-        );
+        )?;
         let usage = agent::compact(
             &*provider,
             &model,

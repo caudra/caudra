@@ -125,7 +125,6 @@ pub enum ModelTier {
     Weak,
     Medium,
     Strong,
-    Compaction,
 }
 
 impl fmt::Display for ModelTier {
@@ -134,7 +133,6 @@ impl fmt::Display for ModelTier {
             Self::Weak => "weak",
             Self::Medium => "medium",
             Self::Strong => "strong",
-            Self::Compaction => "compaction",
         })
     }
 }
@@ -147,7 +145,6 @@ impl FromStr for ModelTier {
             "weak" => Ok(Self::Weak),
             "medium" => Ok(Self::Medium),
             "strong" => Ok(Self::Strong),
-            "compaction" => Ok(Self::Compaction),
             other => Err(ModelError::InvalidTier(other.to_string())),
         }
     }
@@ -160,7 +157,7 @@ impl From<maki_config::providers::Tier> for ModelTier {
             Tier::Weak => Self::Weak,
             Tier::Medium => Self::Medium,
             Tier::Strong => Self::Strong,
-            Tier::Compaction => Self::Compaction,
+            Tier::LegacyCompaction => Self::Medium,
         }
     }
 }
@@ -415,6 +412,9 @@ impl Model {
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
+        if let Some(spec) = model_registry::override_spec_for_tier(tier) {
+            return Self::from_spec(&spec);
+        }
         if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
         }
@@ -429,6 +429,9 @@ impl Model {
         tier: ModelTier,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
+        if let Some(spec) = model_registry::override_spec_for_tier(tier) {
+            return Self::from_spec_with_policy(&spec, policy);
+        }
         if let Ok(model) = Self::from_tier_dynamic(slug, tier)
             && policy.allows(&model.spec())
         {
@@ -662,12 +665,7 @@ mod tests {
         .unwrap()
     }
 
-    const TIERS: [ModelTier; 4] = [
-        ModelTier::Weak,
-        ModelTier::Medium,
-        ModelTier::Strong,
-        ModelTier::Compaction,
-    ];
+    const TIERS: [ModelTier; 3] = [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong];
 
     const EPSILON: f64 = 1e-10;
     /// The only builtin whose rates move with the wall clock.
@@ -919,10 +917,6 @@ mod tests {
                 if manifest.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;
                 }
-                // Compaction is user-assigned only, not in static registry
-                if tier == ModelTier::Compaction {
-                    continue;
-                }
                 let model = Model::from_tier(manifest.slug, tier).unwrap();
                 assert_eq!(model.provider, slug);
                 assert_eq!(model.tier, tier);
@@ -954,10 +948,6 @@ mod tests {
             let entries = manifest.models;
             for &tier in &TIERS {
                 if manifest.slug == "deepseek" && tier == ModelTier::Weak {
-                    continue;
-                }
-                // Compaction is user-assigned only, not in static registry
-                if tier == ModelTier::Compaction {
                     continue;
                 }
                 let count = entries

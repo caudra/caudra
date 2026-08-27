@@ -143,6 +143,11 @@ pub mod key {
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const MODEL_PICKER: Bind = ctrl_bind!('m');
+    pub const MODEL_PICKER_FALLBACK: Bind = Bind {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+M",
+    };
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -336,7 +341,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::MODEL_PICKER.label),
+        label: KeyLabel::Alt(key::MODEL_PICKER.label, key::MODEL_PICKER_FALLBACK.label),
         description: "Model picker",
         context: KeybindContext::General,
         platform: Platform::All,
@@ -365,6 +370,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Tab"),
         description: "Toggle mode",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+Tab"),
+        description: "Cycle reasoning effort",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -531,14 +542,14 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("!/@/#/$"),
-        description: "Set tier (strong/medium/weak/compaction)",
+        label: KeyLabel::Alt("Tab", "Shift+Tab"),
+        description: "Switch model purpose",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Ctrl+G"),
-        description: "Toggle goal evaluator model",
+        label: KeyLabel::Single("R"),
+        description: "Reset model purpose",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },

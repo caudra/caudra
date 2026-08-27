@@ -354,11 +354,6 @@ fn evaluator_model(
             Model::from_tier_with_policy(&current_model.provider, ModelTier::Weak, model_policy)
                 .unwrap_or_else(|_| current_model.clone())
         }
-        GoalEvaluatorTarget::Tier(ModelTier::Compaction) => {
-            return Err(AgentError::Config {
-                message: "compaction is not a valid goal evaluator tier".into(),
-            });
-        }
         GoalEvaluatorTarget::Tier(tier) => {
             Model::from_tier_with_policy(&current_model.provider, *tier, model_policy).map_err(
                 |error| AgentError::Config {
@@ -869,24 +864,6 @@ mod tests {
             .err()
             .expect("disallowed exact model should fail");
             assert!(disallowed.to_string().contains("not allowed"));
-
-            let invalid_tier = resolve_evaluator(
-                &provider,
-                &current,
-                GoalEvaluatorTarget::Tier(ModelTier::Compaction),
-                Timeouts::default(),
-                &ModelPolicy::default(),
-                &CancelToken::none(),
-                None,
-            )
-            .await
-            .err()
-            .expect("compaction target should fail");
-            assert!(
-                invalid_tier
-                    .to_string()
-                    .contains("not a valid goal evaluator tier")
-            );
         });
     }
 
