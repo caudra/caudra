@@ -1,5 +1,5 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
-//! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
+//! Double-esc cancels/rewinds and double Ctrl+D exits within `flash_duration`.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
@@ -87,6 +87,7 @@ const CANCEL_MSG: &str = "Cancelled.";
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
+const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
@@ -234,6 +235,7 @@ pub struct App {
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
+    pub(super) last_exit: Option<Instant>,
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
@@ -336,6 +338,7 @@ impl App {
             selection_state: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
+            last_exit: None,
             storage,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
@@ -640,10 +643,7 @@ impl App {
         Some(zone)
     }
 
-    fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
-        if !is_ctrl(&key) {
-            return None;
-        }
+    fn handle_global_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if key::QUIT.matches(key) {
             self.command_palette.close();
             if !self.is_main_chat()
@@ -662,6 +662,28 @@ impl App {
                 self.input_box.discard();
                 vec![]
             });
+        }
+        if key::EXIT.matches(key) {
+            let input_empty = if self.is_main_chat() {
+                self.input_box.is_empty()
+            } else {
+                !self.active_subagent_can_steer() || self.subagent_input_box.is_empty()
+            };
+            if self.status != Status::Idle || !input_empty {
+                self.last_exit = None;
+                return Some(vec![]);
+            }
+            return Some(
+                if let Some(pressed_at) = self.last_exit.take()
+                    && pressed_at.elapsed() < self.status_bar.flash_duration
+                {
+                    self.quit()
+                } else {
+                    self.last_exit = Some(Instant::now());
+                    self.status_bar.flash(FLASH_EXIT.into());
+                    vec![]
+                },
+            );
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
@@ -920,21 +942,27 @@ impl App {
         self.clear_selection_unless_pending_copy();
         self.sync_subagent_input_target();
 
+        if !key::EXIT.matches(key) {
+            self.last_exit = None;
+        }
+
         if key::SUSPEND.matches(key) && cfg!(unix) {
             return vec![Action::Suspend];
         }
 
         if let Some(actions) = self.dispatch_overlay(key) {
+            self.last_exit = None;
             return actions;
         }
 
         if !(self.status == Status::Streaming && is_streaming_stop_key(key))
             && self.dispatch_override(key)
         {
+            self.last_exit = None;
             return vec![];
         }
 
-        if let Some(actions) = self.handle_ctrl(key) {
+        if let Some(actions) = self.handle_global_key(key) {
             return actions;
         }
 

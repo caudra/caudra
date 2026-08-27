@@ -14,6 +14,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `Ctrl+C` | Quit / clear input |
+| `Ctrl+D Ctrl+D` | Exit |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
@@ -34,7 +35,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Alt+←` / `Alt+→` | Move word left / right |
 | `Ctrl+A` | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
-| `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
+| `Ctrl+U` / `PageDown` | Scroll half page up / down |
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |
@@ -73,7 +74,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Esc` | Close |
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
-| `Ctrl+U` / `Ctrl+D` | Scroll page up / down |
+| `Ctrl+U` | Scroll page up |
 
 ## Context-Specific
 

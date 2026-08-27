@@ -346,6 +346,77 @@ fn ctrl_c_quits_when_input_empty() {
     assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }
 
+#[test]
+fn ctrl_d_exits_on_second_press_within_timeout() {
+    let mut app = test_app();
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_some());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_EXIT));
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+}
+
+#[test]
+fn expired_ctrl_d_press_rearms_exit() {
+    let mut app = test_app();
+    app.last_exit = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_some());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_EXIT));
+}
+
+#[test]
+fn another_key_interrupts_ctrl_d_sequence() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::EXIT.to_key_event()));
+
+    app.update(Msg::Key(key(KeyCode::Left)));
+    assert!(app.last_exit.is_none());
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_some());
+}
+
+#[test_case(with_text as fn(&mut App)  ; "text")]
+#[test_case(with_image as fn(&mut App) ; "image")]
+fn ctrl_d_does_not_arm_with_nonempty_input(setup: fn(&mut App)) {
+    let mut app = test_app();
+    setup(&mut app);
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
+    assert!(!app.input_box.is_empty());
+}
+
+#[test]
+fn ctrl_d_does_not_arm_while_streaming() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    for _ in 0..2 {
+        assert!(app.update(Msg::Key(kb::EXIT.to_key_event())).is_empty());
+    }
+
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
+}
+
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
 #[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
@@ -362,6 +433,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 fn reset_session_clears_exit_request_source() {
     let mut app = test_app();
     app.exit_on_done = true;
+    app.last_exit = Some(Instant::now());
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::Done {
@@ -373,6 +445,7 @@ fn reset_session_clears_exit_request_source() {
     app.reset_session();
 
     assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
 }
 
 #[test]
@@ -1458,6 +1531,7 @@ fn cancelling_from_inside_a_subagent_reports_error() {
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
+    kb::EXIT.to_key_event(),
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
@@ -1500,6 +1574,8 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
         scroll_before,
         "scroll changed through overlay"
     );
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
 }
 
 #[test]
@@ -1568,6 +1644,28 @@ fn scroll_shortcuts_toggle_auto_scroll() {
     assert!(!app.chats[0].auto_scroll());
     app.update(Msg::Key(kb::SCROLL_BOTTOM.to_key_event()));
     assert!(app.chats[0].auto_scroll());
+}
+
+#[test]
+fn page_down_scrolls_main_chat_half_page() {
+    let mut app = test_app();
+    for i in 0..50 {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+    let area = Rect::new(0, 0, 80, 20);
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| app.active_chat().view(frame, area, false))
+        .unwrap();
+    app.active_chat().scroll_to_top();
+    let expected = app.active_chat().half_page() as u16;
+
+    app.update(Msg::Key(kb::SCROLL_HALF_DOWN.to_key_event()));
+
+    assert_eq!(kb::SCROLL_HALF_DOWN.code, KeyCode::PageDown);
+    assert_eq!(app.active_chat().scroll_top(), expected);
 }
 
 #[test]
@@ -4103,6 +4201,19 @@ fn override_shadows_quit_builtin() {
         ExitRequest::None,
         "override must consume Ctrl+C before the built-in quit handler runs"
     );
+}
+
+#[test]
+fn override_shadows_double_ctrl_d_exit() {
+    let mut app = test_app();
+    let probe = install_override(&mut app, kb::EXIT.code, kb::EXIT.modifiers);
+
+    let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
 }
 
 #[test]

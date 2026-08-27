@@ -128,10 +128,15 @@ pub mod key {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     pub const QUIT: Bind = ctrl_bind!('c');
+    pub const EXIT: Bind = ctrl_bind!('d');
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
-    pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
+    pub const SCROLL_HALF_DOWN: Bind = Bind {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        label: "PageDown",
+    };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
@@ -307,6 +312,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
         description: "Quit / clear input",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+D Ctrl+D"),
+        description: "Exit",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -524,8 +535,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll page up / down",
+        label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
+        description: "Scroll page up",
         context: KeybindContext::Picker,
         platform: Platform::All,
     },

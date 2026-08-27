@@ -210,6 +210,7 @@ impl App {
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
         self.last_esc = None;
+        self.last_exit = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
     }
