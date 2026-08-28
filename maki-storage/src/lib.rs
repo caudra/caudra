@@ -69,14 +69,34 @@ pub enum StorageError {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    let tmp = staged_write(path, data)?;
+    tmp.as_file().sync_data()?;
+    persist(tmp, path)
+}
+
+/// Atomic against readers, but not durable until the caller runs `sync_dir`
+/// on the parent. Writing a batch costs two fsyncs per file through
+/// `atomic_write`, which dominates everything else once the batch is large,
+/// so a batch of immutable files should share one flush instead. A lone
+/// write has nothing to amortise and wants `atomic_write`.
+pub fn atomic_write_deferred(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    let tmp = staged_write(path, data)?;
+    rename_into_place(tmp, path)
+}
+
+/// Flushes directory entries left behind by `atomic_write_deferred`.
+pub fn sync_dir(dir: &Path) {
+    sync_dir_handle(dir);
+}
+
+fn staged_write(path: &Path, data: &[u8]) -> Result<NamedTempFile, StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
     if let Ok(metadata) = fs::metadata(path) {
         fs::set_permissions(tmp.path(), metadata.permissions())?;
     }
-    tmp.as_file().sync_data()?;
-    persist(tmp, path)
+    Ok(tmp)
 }
 
 pub(crate) fn atomic_write_permissions(
@@ -100,13 +120,17 @@ pub(crate) fn atomic_write_permissions(
 /// `persist()` doesn't support the fibonacci backoff retry that Windows
 /// virus scanners require. On failure, we manually clean up the temp file.
 fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
+    rename_into_place(tmp, path)?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+fn rename_into_place(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
     let (_, tmp_path) = tmp.into_parts();
     retry_rename(&tmp_path, path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
         StorageError::Io(e)
-    })?;
-    sync_parent_dir(path);
-    Ok(())
+    })
 }
 
 /// A rename is durable only once the directory entry reaches disk; without
@@ -116,13 +140,20 @@ fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
 /// `retry_rename`.
 pub(crate) fn sync_parent_dir(path: &Path) {
     #[cfg(unix)]
-    if let Some(dir) = path.parent()
-        && let Ok(f) = fs::File::open(dir)
-    {
-        let _ = f.sync_all();
+    if let Some(dir) = path.parent() {
+        sync_dir_handle(dir);
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+fn sync_dir_handle(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(f) = fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Rename with fibonacci backoff to handle transient `PermissionDenied` from

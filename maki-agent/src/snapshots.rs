@@ -680,6 +680,8 @@ impl SnapshotStore {
                 destination.write_object_named(&entry.hash, &bytes)?;
             }
         }
+        // Ordered before the manifests below, which name these objects.
+        destination.sync_objects();
         for (key, manifest) in manifests {
             destination.write_manifest_path(&destination.manifest_path(key), &manifest)?;
         }
@@ -785,6 +787,12 @@ impl SnapshotStore {
                     mode: file_mode(&file.metadata),
                 },
             );
+        }
+
+        if stats.objects_written > 0 {
+            let sync_start = Instant::now();
+            self.sync_objects();
+            stats.object_write_ms += elapsed_ms(sync_start);
         }
         Ok((manifest, stats))
     }
@@ -1126,8 +1134,8 @@ impl SnapshotStore {
         }
         let bytes = fs::read(path)?;
         let hash = self.hasher.hash(&bytes);
-        if store_object {
-            self.write_object(&hash, &bytes)?;
+        if store_object && self.write_object(&hash, &bytes)? {
+            self.sync_objects();
         }
         Ok(ObservedPath::File(FileEntry {
             hash: hex_encode(&hash),
@@ -1142,17 +1150,31 @@ impl SnapshotStore {
     /// Reports whether the object was written. Skipping an object that is
     /// already present is the common case, so the count separates durable
     /// writes from verification reads when a capture is slow.
+    ///
+    /// Objects are named by their own hash, so a present object of the right
+    /// length is taken as correct rather than re-read and re-hashed. Anything
+    /// that slips through is still caught: `read_object` verifies the hash on
+    /// every restore, which is where a bad object would do damage.
+    ///
+    /// Not durable on return. Callers must `sync_objects` before writing a
+    /// manifest that names the object.
     fn write_object_named(&self, hash: &str, bytes: &[u8]) -> Result<bool, SnapshotError> {
         let path = self.objects_dir().join(hash);
-        match fs::read(&path) {
-            Ok(existing) if hex_encode(&self.hasher.hash(&existing)) == hash => return Ok(false),
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == bytes.len() as u64 => return Ok(false),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        maki_storage::atomic_write(&path, bytes)
+        maki_storage::atomic_write_deferred(&path, bytes)
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(true)
+    }
+
+    /// Makes every object written since the last call durable. One flush for
+    /// the whole batch, ordered before the manifest that references them.
+    fn sync_objects(&self) {
+        maki_storage::sync_dir(&self.objects_dir());
     }
 
     fn write_manifest_path(&self, path: &Path, manifest: &Manifest) -> Result<(), SnapshotError> {
@@ -1738,6 +1760,43 @@ mod tests {
         store.snapshot(&root, source).unwrap();
         store.restore(&root, &[source], &[]).unwrap();
         assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), ALPHA);
+    }
+
+    /// Objects are named by their content hash, so `capture` trusts a
+    /// present object of the right length instead of re-reading every one.
+    /// That trade is only safe because restore still verifies, so pin both
+    /// halves: no repair on write, and no silent bad restore either.
+    #[test]
+    fn same_length_object_corruption_surfaces_on_restore() {
+        const SAME_LENGTH_GARBAGE: &str = "BRAVO";
+        assert_eq!(SAME_LENGTH_GARBAGE.len(), ALPHA.len());
+
+        let (_temp, root, snapshots) = setup();
+        write(&root, "keep.txt", ALPHA);
+        write(&root, "file.txt", ALPHA);
+        let store = SnapshotStore::new(snapshots);
+        let baseline = store.snapshot_session_start(&root).unwrap();
+        let object = store.objects_dir().join(&baseline["file.txt"].hash);
+        fs::write(&object, SAME_LENGTH_GARBAGE).unwrap();
+
+        // `keep.txt` still hashes to the corrupt object, so this capture sees
+        // it and must leave it alone rather than pay to re-read every object.
+        write(&root, "file.txt", BETA);
+        let source = checkpoint(1);
+        store.snapshot(&root, source).unwrap();
+        assert_eq!(fs::read_to_string(&object).unwrap(), SAME_LENGTH_GARBAGE);
+
+        // Restoring back to the session start needs those bytes, and verifies.
+        let error = store.restore(&root, &[source], &[]).unwrap_err();
+        assert!(
+            matches!(error, SnapshotError::CorruptObject(_)),
+            "expected corruption to surface, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            BETA,
+            "a failed restore must leave the workspace alone"
+        );
     }
 
     #[cfg(unix)]
