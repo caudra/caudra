@@ -6,11 +6,11 @@ use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -30,8 +30,16 @@ struct SearchMatch {
     display_line: String,
 }
 
+#[derive(Clone, Copy)]
+struct SearchRowHit {
+    area: Rect,
+    match_index: usize,
+    segment_index: usize,
+}
+
 pub enum SearchAction {
     Consumed,
+    QueryChanged,
     Navigate,
     Select(usize),
     Close(Option<(u16, bool)>),
@@ -46,6 +54,8 @@ pub struct SearchModal {
     open: bool,
     saved_scroll: Option<(u16, bool)>,
     matcher: Matcher,
+    row_hits: Vec<SearchRowHit>,
+    mouse_down: Option<usize>,
 }
 
 impl SearchModal {
@@ -59,6 +69,8 @@ impl SearchModal {
             open: false,
             saved_scroll: None,
             matcher: Matcher::new(Config::DEFAULT),
+            row_hits: Vec::new(),
+            mouse_down: None,
         }
     }
 
@@ -79,6 +91,7 @@ impl SearchModal {
         self.selected = 0;
         self.scroll_offset = 0;
         self.saved_scroll = None;
+        self.invalidate_mouse_geometry();
     }
 
     pub fn is_open(&self) -> bool {
@@ -87,6 +100,7 @@ impl SearchModal {
 
     pub fn handle_paste(&mut self, text: &str) {
         self.search.insert_text(text);
+        self.invalidate_mouse_geometry();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
@@ -113,8 +127,57 @@ impl SearchModal {
                 } else {
                     self.search.handle_key(key);
                 }
+                self.invalidate_mouse_geometry();
+                SearchAction::QueryChanged
+            }
+        }
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> SearchAction {
+        let position = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down = None;
+                if let Some(hit) = self
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .copied()
+                {
+                    self.selected = hit.match_index;
+                    self.mouse_down = Some(hit.segment_index);
+                    return SearchAction::Navigate;
+                }
                 SearchAction::Consumed
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_down = None;
+                SearchAction::Consumed
+            }
+            MouseEventKind::Moved => {
+                if let Some(hit) = self.row_hits.iter().find(|hit| hit.area.contains(position)) {
+                    self.selected = hit.match_index;
+                    SearchAction::Navigate
+                } else {
+                    SearchAction::Consumed
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pressed_segment) = self.mouse_down.take() else {
+                    return SearchAction::Consumed;
+                };
+                let released_segment = self
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .map(|hit| hit.segment_index);
+                if released_segment == Some(pressed_segment) {
+                    SearchAction::Select(pressed_segment)
+                } else {
+                    SearchAction::Consumed
+                }
+            }
+            _ => SearchAction::Consumed,
         }
     }
 
@@ -139,14 +202,19 @@ impl SearchModal {
         if self.viewport_height == 0 {
             return;
         }
+        let previous_offset = self.scroll_offset;
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
         } else if self.selected >= self.scroll_offset + self.viewport_height {
             self.scroll_offset = self.selected + 1 - self.viewport_height;
         }
+        if self.scroll_offset != previous_offset {
+            self.invalidate_mouse_geometry();
+        }
     }
 
     pub fn update_matches(&mut self, segment_texts: &[&str]) {
+        self.invalidate_mouse_geometry();
         let query = self.search.value();
         self.matches.clear();
         self.selected = 0;
@@ -191,6 +259,11 @@ impl SearchModal {
         self.matches.get(self.selected).map(|m| m.segment_index)
     }
 
+    #[cfg(test)]
+    pub(crate) fn row_area(&self, index: usize) -> Option<Rect> {
+        self.row_hits.get(index).map(|hit| hit.area)
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         if !self.open {
             return Rect::default();
@@ -214,6 +287,18 @@ impl SearchModal {
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
+        self.row_hits.clear();
+        let end = (self.scroll_offset + viewport_h).min(self.matches.len());
+        self.row_hits.extend(
+            self.matches[self.scroll_offset..end]
+                .iter()
+                .enumerate()
+                .map(|(row, m)| SearchRowHit {
+                    area: Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1),
+                    match_index: self.scroll_offset + row,
+                    segment_index: m.segment_index,
+                }),
+        );
         self.render_list(frame, list_area, viewport_h);
         self.render_search(frame, search_area);
 
@@ -223,6 +308,11 @@ impl SearchModal {
         }
 
         popup
+    }
+
+    fn invalidate_mouse_geometry(&mut self) {
+        self.row_hits.clear();
+        self.mouse_down = None;
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, viewport_height: usize) {
@@ -363,6 +453,25 @@ mod tests {
         }
     }
 
+    fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render(modal: &mut SearchModal) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area());
+            })
+            .unwrap();
+    }
+
     fn modal_with_query(query: &str, texts: &[&str]) -> SearchModal {
         let mut modal = SearchModal::new();
         modal.open(0, true);
@@ -457,5 +566,74 @@ mod tests {
         let modal = modal_with_query(query, texts);
         assert_eq!(modal.matches.len(), 1);
         assert_eq!(modal.matches[0].segment_index, expected_idx);
+    }
+
+    #[test]
+    fn hovering_search_result_navigates_to_it() {
+        let mut modal = modal_with_query("item", &["item a", "item b", "item c"]);
+        render(&mut modal);
+        let hit = modal.row_hits[2];
+
+        assert!(matches!(
+            modal.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
+            SearchAction::Navigate
+        ));
+        assert_eq!(modal.selected, hit.match_index);
+    }
+
+    #[test]
+    fn clicking_search_result_selects_its_segment() {
+        let mut modal = modal_with_query("item", &["item a", "item b", "item c"]);
+        render(&mut modal);
+        let hit = modal.row_hits[1];
+
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert!(matches!(
+            action,
+            SearchAction::Select(index) if index == hit.segment_index
+        ));
+    }
+
+    #[test]
+    fn releasing_on_another_search_result_does_not_select() {
+        let mut modal = modal_with_query("item", &["item a", "item b"]);
+        render(&mut modal);
+        let first = modal.row_hits[0];
+        let second = modal.row_hits[1];
+
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
+
+        assert!(matches!(action, SearchAction::Consumed));
+    }
+
+    #[test]
+    fn dragging_search_result_cancels_click() {
+        let mut modal = modal_with_query("item", &["item a", "item b"]);
+        render(&mut modal);
+        let hit = modal.row_hits[0];
+
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        modal.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit.area));
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert!(matches!(action, SearchAction::Consumed));
+    }
+
+    #[test]
+    fn replacing_search_matches_invalidates_armed_row() {
+        let mut modal = modal_with_query("item", &["item a", "item b"]);
+        render(&mut modal);
+        let stale = modal.row_hits[0];
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+
+        modal.update_matches(&["replacement item"]);
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
+
+        assert!(matches!(action, SearchAction::Consumed));
+        assert!(modal.row_hits.is_empty());
+        assert!(modal.mouse_down.is_none());
     }
 }

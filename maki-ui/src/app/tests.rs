@@ -2559,6 +2559,32 @@ fn click_queue_delivery_toggle(app: &mut App) {
     ));
 }
 
+fn admission_hit(
+    app: &mut App,
+    admission: maki_agent::PromptAdmission,
+) -> crate::components::input::AdmissionHit {
+    let _ = rendered(app);
+    app.admission_hits
+        .iter()
+        .find(|hit| hit.admission == admission)
+        .copied()
+        .expect("admission control was not rendered")
+}
+
+fn click_admission(app: &mut App, admission: maki_agent::PromptAdmission) -> Vec<Action> {
+    let hit = admission_hit(app, admission);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ))
+}
+
 fn status_hit(
     app: &mut App,
     target: StatusBarHitTarget,
@@ -2663,6 +2689,96 @@ fn hovering_status_control_tracks_highlight_target() {
 
     app.update(mouse_event(MouseEventKind::Moved, 0, hit.area.y));
     assert_eq!(app.status_hover, None);
+}
+
+#[test_case(maki_agent::PromptAdmission::Queue ; "next")]
+#[test_case(maki_agent::PromptAdmission::Steer ; "guide")]
+fn clicking_streaming_admission_submits_with_selected_delivery(
+    admission: maki_agent::PromptAdmission,
+) {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    app.input_box.set_input("follow up".into());
+
+    assert!(click_admission(&mut app, admission).is_empty());
+
+    assert_eq!(app.queue.pending_prompts().len(), 1);
+    assert_eq!(app.queue.pending_prompts()[0].admission, admission);
+    assert_eq!(app.queue.pending_prompts()[0].text, "follow up");
+}
+
+#[test]
+fn clicking_replace_admission_cancels_active_run() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    receiver.set_active_run(app.run_id);
+    app.input_box.set_input("replace by mouse".into());
+
+    let actions = click_admission(&mut app, maki_agent::PromptAdmission::Interrupt);
+
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert_eq!(
+        app.queue.pending_prompts()[0].admission,
+        maki_agent::PromptAdmission::Interrupt
+    );
+}
+
+#[test]
+fn admission_hover_excludes_leading_separator() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let hit = admission_hit(&mut app, maki_agent::PromptAdmission::Queue);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(
+        app.admission_hover,
+        Some(maki_agent::PromptAdmission::Queue)
+    );
+
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        hit.area.x.saturating_sub(1),
+        hit.area.y,
+    ));
+    assert_eq!(app.admission_hover, None);
+}
+
+#[test]
+fn admission_requires_matching_press_and_release() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    app.input_box.set_input("keep me".into());
+    let pressed = admission_hit(&mut app, maki_agent::PromptAdmission::Queue);
+    let released = admission_hit(&mut app, maki_agent::PromptAdmission::Steer);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        pressed.area.x,
+        pressed.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        released.area.x,
+        released.area.y,
+    ));
+
+    assert!(app.queue.pending_prompts().is_empty());
+    assert_eq!(app.input_box.buffer.value(), "keep me");
+}
+
+#[test]
+fn queue_edit_hides_streaming_admission_controls() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    app.queue_and_notify(queued_msg("queued"));
+    let id = app.queue.panel_entries()[0].id;
+    app.begin_queue_edit(id);
+
+    let _ = rendered(&mut app);
+
+    assert!(app.admission_hits.is_empty());
 }
 
 #[test]
@@ -3337,6 +3453,67 @@ fn mouse_delete_is_explicit_and_atomic() {
 
     assert!(app.queue.is_empty());
     assert!(app.queue.focus().is_none());
+}
+
+#[test]
+fn hovering_queue_row_tracks_exact_target() {
+    let mut app = app_with_queued_message();
+    let _ = rendered(&mut app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .unwrap();
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+
+    assert_eq!(app.queue_hover, Some(hit.target));
+    assert_eq!(app.status_hover, None);
+}
+
+#[test]
+fn dragging_cancels_pending_queue_activation_immediately() {
+    let mut app = app_with_queued_message();
+    let _ = rendered(&mut app);
+    let hit = app
+        .queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .unwrap();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    assert_eq!(app.queue_mouse_down, Some(hit));
+
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        hit.area.x.saturating_add(1),
+        hit.area.y,
+    ));
+
+    assert_eq!(app.queue_mouse_down, None);
+    assert_eq!(app.queue_hover, None);
 }
 
 #[test]
@@ -5918,6 +6095,119 @@ fn overlay_zone_click_gating() {
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 20, 5));
     let state = app.selection_state.as_ref().unwrap();
     assert_eq!(state.sel().zone, SelectionZone::Overlay);
+}
+
+#[test]
+fn top_modal_blocks_stale_plan_row_clicks() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.plan_form.on_plan_ready();
+    let _ = rendered(&mut app);
+    let row = app.plan_form.row_area(2).unwrap();
+    app.help_modal.toggle();
+    let _ = rendered(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+    let actions = app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+}
+
+#[test]
+fn picker_overlay_blocks_plan_row_clicks() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.plan_form.on_plan_ready();
+    let _ = rendered(&mut app);
+    let row = app.plan_form.row_area(2).unwrap();
+    app.model_picker.open(&app.state.model.spec());
+    let _ = rendered(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+    let actions = app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+}
+
+#[test]
+fn search_hover_outside_results_preserves_current_preview() {
+    let mut app = test_app();
+    for text in ["item zero", "item one", "item two"] {
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
+    }
+    let _ = rendered(&mut app);
+    app.run_builtin(BuiltinAction::Search);
+    app.route_text_paste("item");
+    let _ = rendered(&mut app);
+    let row = app.search_modal.row_area(2).unwrap();
+
+    app.update(mouse_event(MouseEventKind::Moved, row.x, row.y));
+    let selected = app.search_modal.current_segment_index();
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        row.x.saturating_sub(1),
+        row.y,
+    ));
+
+    assert_eq!(app.search_modal.current_segment_index(), selected);
+}
+
+#[test]
+fn dragging_picker_row_keeps_overlay_text_selection() {
+    let mut app = test_app();
+    app.main_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "searchable item".into(),
+    ));
+    let _ = rendered(&mut app);
+    app.run_builtin(BuiltinAction::Search);
+    app.route_text_paste("searchable");
+    let _ = rendered(&mut app);
+    let row = app.search_modal.row_area(0).unwrap();
+    let end = (row.x + 4).min(row.right().saturating_sub(1));
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        end,
+        row.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        end,
+        row.y,
+    ));
+
+    assert!(app.search_modal.is_open());
+    assert!(matches!(
+        app.selection_state,
+        Some(SelectionState::PendingCopy { .. })
+    ));
 }
 
 fn streaming_app_with_history() -> App {

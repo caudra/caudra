@@ -33,7 +33,7 @@ use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
-use crate::components::input::{InputAction, InputBox, Submission};
+use crate::components::input::{AdmissionHit, InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
@@ -43,7 +43,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::queue_panel::QueueHit;
+use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -234,6 +234,10 @@ pub struct App {
     pub(super) status_hover: Option<StatusBarHitTarget>,
     pub(super) queue_hits: Vec<QueueHit>,
     pub(super) queue_mouse_down: Option<QueueHit>,
+    pub(super) queue_hover: Option<QueueHitTarget>,
+    pub(super) admission_hits: Vec<AdmissionHit>,
+    pub(super) admission_mouse_down: Option<AdmissionHit>,
+    pub(super) admission_hover: Option<maki_agent::PromptAdmission>,
     pub(super) message_mouse_down: Option<MessageMouseDown>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -365,6 +369,10 @@ impl App {
             status_hover: None,
             queue_hits: Vec::new(),
             queue_mouse_down: None,
+            queue_hover: None,
+            admission_hits: Vec::new(),
+            admission_mouse_down: None,
+            admission_hover: None,
             message_mouse_down: None,
             status: Status::Idle,
             state,
@@ -883,51 +891,13 @@ impl App {
         }
 
         if self.search_modal.is_open() {
-            match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => {
-                    let chat = &mut self.chats[self.active_chat];
-                    let texts = chat.segment_search_texts();
-                    self.search_modal.update_matches(&texts);
-                    sync_search_highlight(&self.search_modal, chat);
-                }
-                SearchAction::Navigate => {
-                    sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-                }
-                SearchAction::Select(idx) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.scroll_to_segment(idx);
-                    chat.set_highlight_segment(None);
-                    self.search_modal.close();
-                }
-                SearchAction::Close(saved) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.set_highlight_segment(None);
-                    if let Some((top, auto)) = saved {
-                        chat.restore_scroll(top, auto);
-                    }
-                    self.search_modal.close();
-                }
-            }
-            return Some(vec![]);
+            let action = self.search_modal.handle_key(key);
+            return Some(self.handle_search_action(action));
         }
 
         if self.file_picker.is_open() {
-            return Some(match self.file_picker.handle_key(key) {
-                FilePickerModalAction::Consumed => vec![],
-                FilePickerModalAction::Select(path) => {
-                    self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
-                    }
-                    vec![]
-                }
-                FilePickerModalAction::Close => {
-                    self.file_picker.close();
-                    vec![]
-                }
-            });
+            let action = self.file_picker.handle_key(key);
+            return Some(self.handle_file_picker_action(action));
         }
 
         if self.queue_editor_active() {
@@ -980,46 +950,18 @@ impl App {
         }
 
         if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => vec![Action::RewindSession(entry)],
-                RewindPickerAction::Close => vec![],
-            });
+            let action = self.rewind_picker.handle_key(key);
+            return Some(self.handle_rewind_picker_action(action));
         }
 
         if self.message_actions.is_open() {
-            return Some(match self.message_actions.handle_key(key) {
-                MessageActionsAction::Consumed | MessageActionsAction::Close => vec![],
-                MessageActionsAction::Select { source, kind } => match kind {
-                    MessageActionKind::Fork => match self.fork_at(source) {
-                        Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
-                        Err(error) => {
-                            self.flash(error);
-                            vec![]
-                        }
-                    },
-                    MessageActionKind::RevertBoth => vec![Action::RevertSession {
-                        source,
-                        mode: RestoreMode::Both,
-                    }],
-                    MessageActionKind::RevertConversation => vec![Action::RevertSession {
-                        source,
-                        mode: RestoreMode::Conversation,
-                    }],
-                    MessageActionKind::RevertFiles => vec![Action::RevertSession {
-                        source,
-                        mode: RestoreMode::Files,
-                    }],
-                    MessageActionKind::Unrevert => vec![Action::UnrevertSession],
-                },
-            });
+            let action = self.message_actions.handle_key(key);
+            return Some(self.handle_message_actions_action(action));
         }
 
         if self.theme_picker.is_open() {
-            return Some(match self.theme_picker.handle_key(key) {
-                ThemePickerAction::Consumed => vec![],
-                ThemePickerAction::Closed => vec![],
-            });
+            let action = self.theme_picker.handle_key(key);
+            return Some(self.handle_theme_picker_action(action));
         }
 
         if self.model_picker.is_open() {
@@ -1028,29 +970,13 @@ impl App {
         }
 
         if self.login_picker.is_open() {
-            return Some(match self.login_picker.handle_key(key) {
-                LoginPickerAction::Consumed => vec![],
-                LoginPickerAction::Close => vec![],
-                LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
-                }
-                LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
-                }
-            });
+            let action = self.login_picker.handle_key(key);
+            return Some(self.handle_login_picker_action(action));
         }
 
         if self.mcp_picker.is_open() {
-            return Some(match self.mcp_picker.handle_key(key) {
-                McpPickerAction::Consumed => vec![],
-                McpPickerAction::Toggle {
-                    server_name,
-                    enabled,
-                } => {
-                    vec![Action::ToggleMcp(server_name, enabled)]
-                }
-                McpPickerAction::Close => vec![],
-            });
+            let action = self.mcp_picker.handle_key(key);
+            return Some(self.handle_mcp_picker_action(action));
         }
 
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
@@ -1074,6 +1000,130 @@ impl App {
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
             ModelPickerAction::ResetTier(tier) => vec![Action::ResetTier(tier)],
             ModelPickerAction::SetCompaction(target) => vec![Action::SetCompaction(target)],
+        }
+    }
+
+    fn handle_command_action(&mut self, action: CommandAction) -> Option<Vec<Action>> {
+        match action {
+            CommandAction::Consumed => Some(Vec::new()),
+            CommandAction::Execute(cmd) => {
+                self.input_box.discard();
+                Some(self.execute_command(cmd, 0))
+            }
+            CommandAction::Complete(text) => {
+                self.command_palette.sync(&text);
+                self.input_box.set_input(text);
+                self.input_box.buffer.move_to_end();
+                Some(Vec::new())
+            }
+            CommandAction::Passthrough => None,
+        }
+    }
+
+    fn handle_search_action(&mut self, action: SearchAction) -> Vec<Action> {
+        match action {
+            SearchAction::Consumed => {}
+            SearchAction::QueryChanged => {
+                let chat = &mut self.chats[self.active_chat];
+                let texts = chat.segment_search_texts();
+                self.search_modal.update_matches(&texts);
+                sync_search_highlight(&self.search_modal, chat);
+            }
+            SearchAction::Navigate => {
+                sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
+            }
+            SearchAction::Select(idx) => {
+                let chat = &mut self.chats[self.active_chat];
+                chat.scroll_to_segment(idx);
+                chat.set_highlight_segment(None);
+                self.search_modal.close();
+            }
+            SearchAction::Close(saved) => {
+                let chat = &mut self.chats[self.active_chat];
+                chat.set_highlight_segment(None);
+                if let Some((top, auto)) = saved {
+                    chat.restore_scroll(top, auto);
+                }
+                self.search_modal.close();
+            }
+        }
+        Vec::new()
+    }
+
+    fn handle_file_picker_action(&mut self, action: FilePickerModalAction) -> Vec<Action> {
+        match action {
+            FilePickerModalAction::Consumed => {}
+            FilePickerModalAction::Select(path) => {
+                self.file_picker.close();
+                if let InputAction::PaletteSync(val) =
+                    self.input_box.handle_paste_with_spaces(&path)
+                {
+                    self.command_palette.sync(&val);
+                }
+            }
+            FilePickerModalAction::Close => self.file_picker.close(),
+        }
+        Vec::new()
+    }
+
+    fn handle_rewind_picker_action(&mut self, action: RewindPickerAction) -> Vec<Action> {
+        match action {
+            RewindPickerAction::Consumed | RewindPickerAction::Close => Vec::new(),
+            RewindPickerAction::Select(entry) => vec![Action::RewindSession(entry)],
+        }
+    }
+
+    fn handle_message_actions_action(&mut self, action: MessageActionsAction) -> Vec<Action> {
+        let MessageActionsAction::Select { source, kind } = action else {
+            return Vec::new();
+        };
+        match kind {
+            MessageActionKind::Fork => match self.fork_at(source) {
+                Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
+                Err(error) => {
+                    self.flash(error);
+                    Vec::new()
+                }
+            },
+            MessageActionKind::RevertBoth => vec![Action::RevertSession {
+                source,
+                mode: RestoreMode::Both,
+            }],
+            MessageActionKind::RevertConversation => vec![Action::RevertSession {
+                source,
+                mode: RestoreMode::Conversation,
+            }],
+            MessageActionKind::RevertFiles => vec![Action::RevertSession {
+                source,
+                mode: RestoreMode::Files,
+            }],
+            MessageActionKind::Unrevert => vec![Action::UnrevertSession],
+        }
+    }
+
+    fn handle_theme_picker_action(&self, _action: ThemePickerAction) -> Vec<Action> {
+        Vec::new()
+    }
+
+    fn handle_login_picker_action(&self, action: LoginPickerAction) -> Vec<Action> {
+        match action {
+            LoginPickerAction::Consumed | LoginPickerAction::Close => Vec::new(),
+            LoginPickerAction::Authenticated { model_spec } => {
+                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+            }
+            LoginPickerAction::Configured { slug } => {
+                vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+            }
+        }
+    }
+
+    fn handle_mcp_picker_action(&self, action: McpPickerAction) -> Vec<Action> {
+        match action {
+            McpPickerAction::Consumed | McpPickerAction::Close => Vec::new(),
+            McpPickerAction::Toggle {
+                server_name,
+                enabled,
+            } => vec![Action::ToggleMcp(server_name, enabled)],
         }
     }
 
@@ -1128,11 +1178,13 @@ impl App {
             BuiltinAction::PrevChat => {
                 self.cancel_queue_edit();
                 self.unfocus_active_queue();
+                self.chats[self.active_chat].clear_hover();
                 self.active_chat = self.active_chat.saturating_sub(1);
             }
             BuiltinAction::NextChat => {
                 self.cancel_queue_edit();
                 self.unfocus_active_queue();
+                self.chats[self.active_chat].clear_hover();
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
@@ -1342,22 +1394,11 @@ impl App {
             return vec![];
         }
 
-        match self
+        let command_action = self
             .command_palette
-            .handle_key(key, &self.input_box.buffer.value())
-        {
-            CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => {
-                self.input_box.discard();
-                return self.execute_command(cmd, 0);
-            }
-            CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
-                self.input_box.set_input(text);
-                self.input_box.buffer.move_to_end();
-                return vec![];
-            }
-            CommandAction::Passthrough => {}
+            .handle_key(key, &self.input_box.buffer.value());
+        if let Some(actions) = self.handle_command_action(command_action) {
+            return actions;
         }
 
         if key.code == KeyCode::Enter
@@ -1381,22 +1422,7 @@ impl App {
                 None
             };
             if let Some(admission) = admission {
-                if !self.queue.is_connected() {
-                    self.flash(queue::NO_QUEUE_ERR.into());
-                    return Vec::new();
-                }
-                if admission == maki_agent::PromptAdmission::Interrupt
-                    && self.cancelling_run.is_some()
-                    && self.replacement_item.is_none()
-                {
-                    self.flash(queue::REPLACE_BUSY_ERR.into());
-                    return Vec::new();
-                }
-                let submission = self
-                    .input_box
-                    .take_submission()
-                    .unwrap_or_else(Submission::empty);
-                return self.handle_submit_with_admission(submission, admission);
+                return self.handle_streaming_admission(admission);
             }
         }
 
@@ -1470,6 +1496,31 @@ impl App {
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         self.handle_submit_with_admission(sub, maki_agent::PromptAdmission::Queue)
+    }
+
+    fn handle_streaming_admission(
+        &mut self,
+        admission: maki_agent::PromptAdmission,
+    ) -> Vec<Action> {
+        if !self.is_main_chat() || self.status != Status::Streaming || self.queue_editor_active() {
+            return Vec::new();
+        }
+        if !self.queue.is_connected() {
+            self.flash(queue::NO_QUEUE_ERR.into());
+            return Vec::new();
+        }
+        if admission == maki_agent::PromptAdmission::Interrupt
+            && self.cancelling_run.is_some()
+            && self.replacement_item.is_none()
+        {
+            self.flash(queue::REPLACE_BUSY_ERR.into());
+            return Vec::new();
+        }
+        let submission = self
+            .input_box
+            .take_submission()
+            .unwrap_or_else(Submission::empty);
+        self.handle_submit_with_admission(submission, admission)
     }
 
     fn handle_submit_with_admission(

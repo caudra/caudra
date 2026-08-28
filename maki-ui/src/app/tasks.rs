@@ -115,6 +115,7 @@ impl App {
         self.cancel_queue_edit();
         self.unfocus_active_queue();
         self.task_queue_viewport = 0;
+        self.chats[self.active_chat].clear_hover();
         self.active_chat = if id == MAIN_TASK_ID {
             0
         } else {

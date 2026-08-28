@@ -3,7 +3,7 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::repaint::Cadence;
 use crate::theme;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
@@ -50,7 +50,17 @@ impl ThemePicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ThemePickerAction {
-        match self.picker.handle_key(key) {
+        let action = self.picker.handle_key(key);
+        self.map_picker_action(action)
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> ThemePickerAction {
+        let action = self.picker.handle_mouse(event);
+        self.map_picker_action(action)
+    }
+
+    fn map_picker_action(&mut self, action: PickerAction<String>) -> ThemePickerAction {
+        match action {
             PickerAction::Consumed => {
                 self.apply_preview();
                 ThemePickerAction::Consumed

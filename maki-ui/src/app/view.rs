@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use crate::components::Overlay;
 use crate::components::input::{self, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -7,7 +8,6 @@ use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
-use crate::components::{Overlay, hint_line};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -38,6 +38,7 @@ impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         self.sync_subagent_input_target();
         self.queue_hits.clear();
+        self.admission_hits.clear();
         let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.active_chat;
@@ -171,9 +172,12 @@ impl App {
                 layout.queue_area,
                 &queue_title,
                 &queue_entries,
-                self.active_queue_focus(),
-                self.active_queue_viewport(),
-                together,
+                queue_panel::QueuePanelState {
+                    focus: self.active_queue_focus(),
+                    viewport: self.active_queue_viewport(),
+                    together,
+                    hovered: self.queue_hover,
+                },
             );
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
@@ -210,9 +214,12 @@ impl App {
                 layout.queue_area,
                 &queue_title,
                 &queue_entries,
-                self.queue.focus(),
-                self.queue.viewport(),
-                together,
+                queue_panel::QueuePanelState {
+                    focus: self.queue.focus(),
+                    viewport: self.queue.viewport(),
+                    together,
+                    hovered: self.queue_hover,
+                },
             );
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
@@ -226,12 +233,10 @@ impl App {
             } else {
                 Placeholder::Blank
             };
-            let panel_hint = if self.status == Status::Streaming {
-                Some(hint_line(&[
-                    ("Enter", "next"),
-                    ("Alt+S", "guide"),
-                    ("Alt+X", "replace"),
-                ]))
+            let panel_hint = if self.status == Status::Streaming && !self.queue_editor_active() {
+                let (hint, hits) = input::admission_hint(layout.input_area, self.admission_hover);
+                self.admission_hits = hits;
+                Some(hint)
             } else {
                 (self.state.mode == Mode::Plan)
                     .then(|| self.plan_form.hint_line())

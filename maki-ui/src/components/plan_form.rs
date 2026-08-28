@@ -3,9 +3,9 @@ use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -69,10 +69,18 @@ enum Visibility {
     UserDismissed,
 }
 
+#[derive(Clone, Copy)]
+struct PlanRowHit {
+    area: Rect,
+    menu_index: usize,
+}
+
 pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
+    row_hits: Vec<PlanRowHit>,
+    mouse_down: Option<usize>,
 }
 
 impl PlanForm {
@@ -81,6 +89,8 @@ impl PlanForm {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
+            row_hits: Vec::new(),
+            mouse_down: None,
         }
     }
 
@@ -90,16 +100,19 @@ impl PlanForm {
 
     pub fn on_plan_ready(&mut self) {
         if self.visibility != Visibility::UserDismissed {
+            self.invalidate_mouse_geometry();
             self.visibility = Visibility::Shown;
             self.selected = 0;
         }
     }
 
     pub fn on_plan_drafting(&mut self) {
+        self.invalidate_mouse_geometry();
         self.visibility = Visibility::Hidden;
     }
 
     pub fn toggle(&mut self) {
+        self.invalidate_mouse_geometry();
         self.visibility = if self.is_visible() {
             Visibility::UserDismissed
         } else {
@@ -110,6 +123,7 @@ impl PlanForm {
 
     pub fn hide(&mut self) {
         if self.is_visible() {
+            self.invalidate_mouse_geometry();
             self.visibility = Visibility::UserDismissed;
         }
     }
@@ -119,6 +133,7 @@ impl PlanForm {
     }
 
     pub fn reset(&mut self) {
+        self.invalidate_mouse_geometry();
         self.visibility = Visibility::Hidden;
         self.selected = 0;
     }
@@ -137,6 +152,11 @@ impl PlanForm {
 
     pub fn height(&self) -> u16 {
         if self.is_visible() { FORM_HEIGHT } else { 0 }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_area(&self, index: usize) -> Option<Rect> {
+        self.row_hits.get(index).map(|hit| hit.area)
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
@@ -173,8 +193,57 @@ impl PlanForm {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> PlanFormAction {
+        let position = Position::new(event.column, event.row);
+        let hit = self
+            .row_hits
+            .iter()
+            .find(|hit| hit.area.contains(position))
+            .copied();
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down = None;
+                if let Some(hit) = hit {
+                    self.selected = hit.menu_index;
+                    self.mouse_down = Some(hit.menu_index);
+                    PlanFormAction::Consumed
+                } else {
+                    PlanFormAction::Passthrough
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_down = None;
+                if hit.is_some() {
+                    PlanFormAction::Consumed
+                } else {
+                    PlanFormAction::Passthrough
+                }
+            }
+            MouseEventKind::Moved => {
+                if let Some(hit) = hit {
+                    self.selected = hit.menu_index;
+                    PlanFormAction::Consumed
+                } else {
+                    PlanFormAction::Passthrough
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let pressed = self.mouse_down.take();
+                match (pressed, hit) {
+                    (Some(pressed), Some(hit)) if pressed == hit.menu_index => {
+                        (MENU[pressed].action)()
+                    }
+                    (_, Some(_)) => PlanFormAction::Consumed,
+                    _ => PlanFormAction::Passthrough,
+                }
+            }
+            _ => PlanFormAction::Passthrough,
+        }
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) {
         if !self.is_visible() {
+            self.invalidate_mouse_geometry();
             return;
         }
 
@@ -197,6 +266,24 @@ impl PlanForm {
         lines.push(hint_line(HINT_PAIRS));
 
         render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+
+        self.row_hits.clear();
+        let content_bottom = area.bottom().saturating_sub(1);
+        for menu_index in 0..MENU.len() {
+            let y = area.y.saturating_add(1 + menu_index as u16);
+            if y >= content_bottom || area.width <= 2 {
+                break;
+            }
+            self.row_hits.push(PlanRowHit {
+                area: Rect::new(area.x + 1, y, area.width - 2, 1),
+                menu_index,
+            });
+        }
+    }
+
+    fn invalidate_mouse_geometry(&mut self) {
+        self.row_hits.clear();
+        self.mouse_down = None;
     }
 }
 
@@ -204,9 +291,29 @@ impl PlanForm {
 mod tests {
     use super::*;
     use crate::components::key;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use test_case::test_case;
 
     const LAST: usize = MENU.len() - 1;
+
+    fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render(form: &mut PlanForm) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                form.view(frame, Rect::new(2, 2, 76, FORM_HEIGHT));
+            })
+            .unwrap();
+    }
 
     #[test]
     fn on_plan_ready_shows_and_resets_selected() {
@@ -372,5 +479,96 @@ mod tests {
             form.handle_key(key::MODEL_PICKER_FALLBACK.to_key_event()),
             PlanFormAction::Passthrough
         );
+    }
+
+    #[test]
+    fn hovering_plan_row_moves_selection() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let hit = form.row_hits[2];
+
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
+            PlanFormAction::Consumed
+        );
+        assert_eq!(form.selected, 2);
+    }
+
+    #[test]
+    fn clicking_plan_row_dispatches_its_action() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let hit = form.row_hits[1];
+
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert_eq!(action, PlanFormAction::ClearAndImplement);
+    }
+
+    #[test]
+    fn releasing_on_another_plan_row_does_not_dispatch() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let first = form.row_hits[0];
+        let second = form.row_hits[1];
+
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
+
+        assert_eq!(action, PlanFormAction::Consumed);
+    }
+
+    #[test]
+    fn dragging_plan_row_cancels_click() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let hit = form.row_hits[0];
+
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        form.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit.area));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert_eq!(action, PlanFormAction::Consumed);
+    }
+
+    #[test]
+    fn plan_hint_line_is_passive() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let last_row = form.row_hits[LAST].area;
+        let hint = Rect::new(last_row.x, last_row.y + 2, last_row.width, 1);
+
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hint)),
+            PlanFormAction::Passthrough
+        );
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hint)),
+            PlanFormAction::Passthrough
+        );
+    }
+
+    #[test]
+    fn hiding_plan_form_invalidates_armed_row() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render(&mut form);
+        let stale = form.row_hits[0];
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+
+        form.hide();
+
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area)),
+            PlanFormAction::Passthrough
+        );
+        assert!(form.row_hits.is_empty());
+        assert!(form.mouse_down.is_none());
     }
 }

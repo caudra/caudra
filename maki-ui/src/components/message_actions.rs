@@ -2,7 +2,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::{DisplaySource, Overlay};
 use crate::repaint::Cadence;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -91,7 +91,20 @@ impl MessageActions {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MessageActionsAction {
-        match self.picker.handle_key(key) {
+        let action = self.picker.handle_key(key);
+        self.map_picker_action(action)
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> MessageActionsAction {
+        let action = self.picker.handle_mouse(event);
+        self.map_picker_action(action)
+    }
+
+    fn map_picker_action(
+        &mut self,
+        action: PickerAction<MessageActionKind>,
+    ) -> MessageActionsAction {
+        match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => MessageActionsAction::Consumed,
             PickerAction::Select(kind) => match self.source.take() {
                 Some(source) => MessageActionsAction::Select { source, kind },

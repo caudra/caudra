@@ -21,15 +21,96 @@ const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
         if self.paste_editor.is_open() {
+            self.clear_control_hovers();
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.paste_editor.handle_click(event.row, event.column);
             }
             return Vec::new();
         }
-        if self.model_picker.is_open() {
-            self.status_hover = None;
-            let action = self.model_picker.handle_mouse(event);
-            return self.handle_model_picker_action(action);
+        let passive_modal_open = self.help_modal.is_open()
+            || self.usage_modal.is_open()
+            || self.goal_modal.is_open()
+            || self.btw_modal.is_open()
+            || self.float_mgr.is_open();
+        if passive_modal_open || self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+        } else if self.mcp_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.mcp_picker.handle_mouse(event),
+                |app, action| app.handle_mcp_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.login_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.login_picker.handle_mouse(event),
+                |app, action| app.handle_login_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.model_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.model_picker.handle_mouse(event),
+                |app, action| app.handle_model_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.theme_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.theme_picker.handle_mouse(event),
+                |app, action| app.handle_theme_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.message_actions.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.message_actions.handle_mouse(event),
+                |app, action| app.handle_message_actions_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.rewind_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.rewind_picker.handle_mouse(event),
+                |app, action| app.handle_rewind_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.file_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.file_picker.handle_mouse(event),
+                |app, action| app.handle_file_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.search_modal.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.search_modal.handle_mouse(event),
+                |app, action| app.handle_search_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.plan_form_active() {
+            let action = self.plan_form.handle_mouse(event);
+            if action != crate::components::plan_form::PlanFormAction::Passthrough {
+                self.clear_control_hovers();
+                return self.handle_plan_form_action(action);
+            }
+        } else if self.command_palette.is_active() {
+            let input = self.input_box.buffer.value();
+            let action = self.command_palette.handle_mouse(event, &input);
+            if let Some(actions) = self.handle_command_action(action) {
+                self.clear_control_hovers();
+                return actions;
+            }
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -56,10 +137,12 @@ impl App {
                     .open(source, self.state.session.meta.pending_revert.is_some());
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.admission_mouse_down = None;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
                 if !self.has_modal_overlay() {
+                    self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
                     self.status_mouse_down = self.status_hit_at(event.row, event.column);
                     self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
                     if self.queue_mouse_down.is_none() {
@@ -110,12 +193,23 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                self.status_hover = None;
+                self.clear_control_hovers();
+                self.admission_mouse_down = None;
+                self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if !self.has_modal_overlay()
+                    && let Some(pressed) = self.admission_mouse_down.take()
+                    && self.admission_hit_at(event.row, event.column) == Some(pressed)
+                {
+                    self.queue_mouse_down = None;
+                    self.status_mouse_down = None;
+                    self.message_mouse_down = None;
+                    return self.handle_streaming_admission(pressed.admission);
+                }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
                     if !sel.is_empty() {
                         self.queue_mouse_down = None;
@@ -170,17 +264,27 @@ impl App {
                         }
                     }
                 }
+                self.admission_mouse_down = None;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
             }
             MouseEventKind::Moved => {
-                self.status_hover = if self.has_modal_overlay() {
-                    None
-                } else {
-                    self.status_hit_at(event.row, event.column)
-                        .map(|hit| hit.target)
-                };
+                if self.has_modal_overlay() {
+                    self.clear_control_hovers();
+                    return Vec::new();
+                }
+                self.admission_hover = self
+                    .admission_hit_at(event.row, event.column)
+                    .map(|hit| hit.admission);
+                self.queue_hover = self
+                    .queue_hit_at(event.row, event.column)
+                    .map(|hit| hit.target);
+                self.status_hover = self
+                    .status_hit_at(event.row, event.column)
+                    .map(|hit| hit.target);
+                self.update_input_hover(event.row, event.column);
+                self.update_transcript_hover(event.row, event.column);
             }
             _ => {}
         }
@@ -372,6 +476,18 @@ impl App {
             .copied()
     }
 
+    fn admission_hit_at(
+        &self,
+        row: u16,
+        col: u16,
+    ) -> Option<crate::components::input::AdmissionHit> {
+        let position = Position::new(col, row);
+        self.admission_hits
+            .iter()
+            .find(|hit| hit.area.contains(position))
+            .copied()
+    }
+
     fn status_hit_at(&self, row: u16, col: u16) -> Option<StatusBarHit> {
         let position = Position::new(col, row);
         self.status_hits
@@ -390,7 +506,7 @@ impl App {
                 self.toggle_mode()
             }
             StatusBarHitTarget::Model if self.is_main_chat() => {
-                self.status_hover = None;
+                self.clear_control_hovers();
                 self.run_builtin(maki_lua::BuiltinAction::ModelPicker)
             }
             StatusBarHitTarget::Thinking
@@ -404,6 +520,7 @@ impl App {
     }
 
     fn handle_queue_click(&mut self, hit: QueueHit) {
+        self.queue_hover = None;
         match hit.target {
             QueueHitTarget::ToggleTogether => self.toggle_active_queue_delivery(),
             QueueHitTarget::Item { .. } if self.queue_editor_active() => {}
@@ -419,6 +536,82 @@ impl App {
                 QueueAction::MoveMain => self.move_unsent_to_main(id),
             },
         }
+    }
+
+    fn route_overlay_mouse<T>(
+        &mut self,
+        event: MouseEvent,
+        dispatch: impl FnOnce(&mut Self, MouseEvent) -> T,
+        map: impl FnOnce(&mut Self, T) -> Vec<crate::components::Action>,
+    ) -> Option<Vec<crate::components::Action>> {
+        self.clear_control_hovers();
+        if event.kind == MouseEventKind::Up(MouseButton::Left)
+            && matches!(
+                &self.selection_state,
+                Some(SelectionState::Dragging { sel, .. }) if !sel.is_empty()
+            )
+        {
+            return None;
+        }
+
+        let action = dispatch(self, event);
+        let actions = map(self, action);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                (!actions.is_empty()).then_some(actions)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.selection_state = None;
+                Some(actions)
+            }
+            _ => Some(actions),
+        }
+    }
+
+    fn clear_control_hovers(&mut self) {
+        self.admission_hover = None;
+        self.queue_hover = None;
+        self.status_hover = None;
+        self.input_box.clear_hover();
+        self.subagent_input_box.clear_hover();
+        for chat in &mut self.chats {
+            chat.clear_hover();
+        }
+    }
+
+    fn update_input_hover(&mut self, row: u16, col: u16) {
+        let input_area = self
+            .zone_at(row, col)
+            .filter(|zone| zone.zone == SelectionZone::Input)
+            .map(|zone| zone.area);
+        self.input_box.clear_hover();
+        self.subagent_input_box.clear_hover();
+        if let Some(area) = input_area {
+            let focused = !self.any_overlay_open();
+            self.active_input_box_mut()
+                .update_paste_hover(area, row, col, focused);
+        }
+    }
+
+    fn update_transcript_hover(&mut self, row: u16, col: u16) {
+        let area = self.msg_area();
+        let known_task_target = if self.active_chat == 0 {
+            self.chats[0]
+                .tool_id_at(row, area)
+                .map(|tool_id| {
+                    self.parent_task_ids
+                        .get(tool_id)
+                        .map_or(tool_id, String::as_str)
+                })
+                .is_some_and(|task_id| {
+                    self.chats
+                        .iter()
+                        .any(|chat| chat.task_id().is_some_and(|id| &**id == task_id))
+                })
+        } else {
+            false
+        };
+        self.chats[self.active_chat].update_hover(row, col, area, known_task_target);
     }
 
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {

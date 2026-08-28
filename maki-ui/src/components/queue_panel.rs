@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use maki_agent::{PromptAdmission, QueueItemId};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
@@ -12,6 +12,7 @@ use crate::theme;
 
 const DELETE_LABEL: &str = "[Delete]";
 const DELETE_LABEL_COMPACT: &str = "[D]";
+const ACTION_SEPARATOR: &str = " ";
 const EDIT_LABEL: &str = "[Edit]";
 const EDIT_LABEL_COMPACT: &str = "[E]";
 const ELLIPSIS: &str = "...";
@@ -53,6 +54,14 @@ pub struct QueueHit {
     pub target: QueueHitTarget,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct QueuePanelState {
+    pub focus: Option<usize>,
+    pub viewport: usize,
+    pub together: Option<bool>,
+    pub hovered: Option<QueueHitTarget>,
+}
+
 pub fn height(queue_len: usize) -> u16 {
     if queue_len == 0 {
         0
@@ -70,9 +79,7 @@ pub fn view(
     area: Rect,
     title: &str,
     entries: &[QueueEntry],
-    focus: Option<usize>,
-    viewport: usize,
-    together: Option<bool>,
+    state: QueuePanelState,
 ) -> Vec<QueueHit> {
     if entries.is_empty() || area.width < 2 || area.height < 2 {
         return Vec::new();
@@ -93,7 +100,9 @@ pub fn view(
         area.height.saturating_sub(2),
     );
     let visible_rows = usize::from(content_area.height);
-    let viewport = viewport.min(entries.len().saturating_sub(visible_rows));
+    let viewport = state
+        .viewport
+        .min(entries.len().saturating_sub(visible_rows));
     let end = (viewport + visible_rows).min(entries.len());
     let content_width = content_area.width as usize;
     let mut hits = Vec::new();
@@ -102,32 +111,44 @@ pub fn view(
         .enumerate()
         .map(|(visible_index, entry)| {
             let index = viewport + visible_index;
-            let selected = focus == Some(index);
+            let selected = state.focus == Some(index);
+            let select_target = QueueHitTarget::Item {
+                id: entry.id,
+                action: QueueAction::Select,
+            };
             let row = content_area.y + visible_index as u16;
             let row_area = Rect::new(content_area.x, row, content_area.width, 1);
             hits.push(QueueHit {
                 area: row_area,
-                target: QueueHitTarget::Item {
-                    id: entry.id,
-                    action: QueueAction::Select,
-                },
+                target: select_target,
             });
 
-            let actions = if selected {
+            let mut actions = if selected {
                 actions(entry, content_width < 48)
             } else {
                 Vec::new()
             };
-            let action_width = actions
-                .iter()
-                .map(|(label, _)| label.width() + 1)
-                .sum::<usize>();
             let prefix = entry_prefix(entries, index);
+            let mut action_width = actions
+                .iter()
+                .map(|(label, _)| label.width() + ACTION_SEPARATOR.width())
+                .sum::<usize>();
+            while !actions.is_empty() && prefix.width() + action_width > content_width {
+                actions.remove(0);
+                action_width = actions
+                    .iter()
+                    .map(|(label, _)| label.width() + ACTION_SEPARATOR.width())
+                    .sum();
+            }
             let available = content_width
                 .saturating_sub(prefix.width())
                 .saturating_sub(action_width);
             let style = if selected {
                 theme::current().item_selected
+            } else if state.hovered == Some(select_target) {
+                Style::new()
+                    .fg(entry.color)
+                    .add_modifier(Modifier::REVERSED)
             } else {
                 Style::new().fg(entry.color)
             };
@@ -142,15 +163,24 @@ pub fn view(
 
             let mut action_x = content_area.right().saturating_sub(action_width as u16);
             for (label, action) in actions {
-                spans.push(Span::raw(" "));
+                spans.push(Span::raw(ACTION_SEPARATOR));
                 let action_style = if action == QueueAction::Delete {
                     theme::current().queue_delete
                 } else {
                     theme::current().keybind_key
                 };
+                let action_style = if state.hovered
+                    == Some(QueueHitTarget::Item {
+                        id: entry.id,
+                        action,
+                    }) {
+                    action_style.add_modifier(Modifier::REVERSED)
+                } else {
+                    action_style
+                };
                 spans.push(Span::styled(label, action_style));
                 let width = label.width() as u16;
-                action_x = action_x.saturating_add(1);
+                action_x = action_x.saturating_add(ACTION_SEPARATOR.width() as u16);
                 hits.push(QueueHit {
                     area: Rect::new(action_x, row, width, 1),
                     target: QueueHitTarget::Item {
@@ -165,7 +195,7 @@ pub fn view(
         .collect::<Vec<_>>();
 
     frame.render_widget(Block::default().style(theme::current().panel_style()), area);
-    let rail_style = if focus.is_some() {
+    let rail_style = if state.focus.is_some() {
         theme::current().item_selected
     } else {
         theme::current().panel_border
@@ -186,7 +216,7 @@ pub fn view(
             .style(theme::current().panel_title),
         header_area,
     );
-    if let Some(together) = together {
+    if let Some(together) = state.together {
         let label = if together {
             TOGETHER_LABEL
         } else {
@@ -197,7 +227,13 @@ pub fn view(
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     label,
-                    theme::current().keybind_key,
+                    if state.hovered == Some(QueueHitTarget::ToggleTogether) {
+                        theme::current()
+                            .keybind_key
+                            .add_modifier(Modifier::REVERSED)
+                    } else {
+                        theme::current().keybind_key
+                    },
                 )))
                 .right_aligned(),
                 header_area,
@@ -340,9 +376,10 @@ mod tests {
                     frame.area(),
                     "Queue - Main",
                     &entries,
-                    None,
-                    0,
-                    Some(false),
+                    QueuePanelState {
+                        together: Some(false),
+                        ..QueuePanelState::default()
+                    },
                 );
             })
             .unwrap();
@@ -363,5 +400,111 @@ mod tests {
                 }
             ) && hit.area.x == 3
         }));
+    }
+
+    #[test]
+    fn action_hover_reverses_label_without_leading_space() {
+        let id = QueueItemId::new();
+        let entries = [QueueEntry {
+            id,
+            text: Cow::Borrowed("queued prompt"),
+            color: theme::current().foreground,
+            editable: true,
+            movable: false,
+            admission: Some(PromptAdmission::Queue),
+        }];
+        let target = QueueHitTarget::Item {
+            id,
+            action: QueueAction::Edit,
+        };
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = view(
+                    frame,
+                    frame.area(),
+                    "Queue - Main",
+                    &entries,
+                    QueuePanelState {
+                        focus: Some(0),
+                        hovered: Some(target),
+                        ..QueuePanelState::default()
+                    },
+                );
+            })
+            .unwrap();
+        let hit = hits.iter().find(|hit| hit.target == target).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(
+            buffer
+                .cell((hit.area.x, hit.area.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer
+                .cell((hit.area.x - 1, hit.area.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn narrow_queue_drops_actions_that_cannot_match_their_hit_area() {
+        let id = QueueItemId::new();
+        let entries = [QueueEntry {
+            id,
+            text: Cow::Borrowed("queued prompt"),
+            color: theme::current().foreground,
+            editable: true,
+            movable: false,
+            admission: Some(PromptAdmission::Queue),
+        }];
+        let backend = TestBackend::new(16, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = view(
+                    frame,
+                    frame.area(),
+                    "Queue - Main",
+                    &entries,
+                    QueuePanelState {
+                        focus: Some(0),
+                        ..QueuePanelState::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.width)
+            .map(|x| buffer.cell((x, 1)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(!row.contains(EDIT_LABEL_COMPACT));
+        let delete = hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    hit.target,
+                    QueueHitTarget::Item {
+                        id: hit_id,
+                        action: QueueAction::Delete,
+                    } if hit_id == id
+                )
+            })
+            .unwrap();
+        let rendered_delete = (delete.area.x..delete.area.right())
+            .map(|x| buffer.cell((x, delete.area.y)).unwrap().symbol())
+            .collect::<String>();
+        assert_eq!(rendered_delete, DELETE_LABEL_COMPACT);
     }
 }

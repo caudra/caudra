@@ -2,7 +2,7 @@ use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use maki_providers::{HistoryItem, HistoryItemKind, UserOrigin};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -98,7 +98,17 @@ impl RewindPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
-        match self.picker.handle_key(key) {
+        let action = self.picker.handle_key(key);
+        Self::map_picker_action(action)
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> RewindPickerAction {
+        let action = self.picker.handle_mouse(event);
+        Self::map_picker_action(action)
+    }
+
+    fn map_picker_action(action: PickerAction<RewindEntry>) -> RewindPickerAction {
+        match action {
             PickerAction::Consumed => RewindPickerAction::Consumed,
             PickerAction::Select(entry) => RewindPickerAction::Select(entry),
             PickerAction::Close => RewindPickerAction::Close,

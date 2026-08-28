@@ -1,4 +1,4 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
@@ -125,7 +125,17 @@ impl McpPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> McpPickerAction {
-        match self.picker.handle_key(key) {
+        let action = self.picker.handle_key(key);
+        self.map_picker_action(action)
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> McpPickerAction {
+        let action = self.picker.handle_mouse(event);
+        self.map_picker_action(action)
+    }
+
+    fn map_picker_action(&self, action: PickerAction<McpEntry>) -> McpPickerAction {
+        match action {
             PickerAction::Consumed => McpPickerAction::Consumed,
             PickerAction::Toggle(idx, enabled) => {
                 let server_name = self

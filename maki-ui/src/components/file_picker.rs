@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -74,6 +74,12 @@ struct Match {
     indices: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct FileRowHit {
+    area: Rect,
+    match_index: usize,
+}
+
 struct Session {
     nucleo: Nucleo<()>,
     matcher: Matcher,
@@ -85,6 +91,8 @@ struct Session {
     scroll_offset: usize,
     viewport_height: usize,
     inner_area: Rect,
+    row_hits: Vec<FileRowHit>,
+    mouse_down: Option<String>,
 
     cancel: Arc<AtomicBool>,
     done_rx: flume::Receiver<Walk>,
@@ -183,6 +191,8 @@ impl FilePickerModal {
             scroll_offset: 0,
             viewport_height: 0,
             inner_area: Rect::default(),
+            row_hits: Vec::new(),
+            mouse_down: None,
             cancel: cancel_clone,
             done_rx,
             started_at: Instant::now(),
@@ -208,6 +218,7 @@ impl FilePickerModal {
 
     pub fn scroll(&mut self, delta: i32) {
         let Some(s) = &mut self.session else { return };
+        invalidate_mouse_geometry(s);
         if delta > 0 {
             move_selection(s, -(delta as isize));
         } else {
@@ -270,6 +281,55 @@ impl FilePickerModal {
             _ => {}
         }
         FilePickerModalAction::Consumed
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> FilePickerModalAction {
+        let Some(s) = &mut self.session else {
+            return FilePickerModalAction::Close;
+        };
+        let position = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                s.mouse_down = None;
+                if let Some(hit) = s
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .copied()
+                {
+                    s.selected = hit.match_index;
+                    s.mouse_down = s.matches.get(hit.match_index).map(|m| m.path.clone());
+                }
+                FilePickerModalAction::Consumed
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                s.mouse_down = None;
+                FilePickerModalAction::Consumed
+            }
+            MouseEventKind::Moved => {
+                if let Some(hit) = s.row_hits.iter().find(|hit| hit.area.contains(position)) {
+                    s.selected = hit.match_index;
+                }
+                FilePickerModalAction::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pressed_path) = s.mouse_down.take() else {
+                    return FilePickerModalAction::Consumed;
+                };
+                let released = s
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .and_then(|hit| s.matches.get(hit.match_index));
+                match released {
+                    Some(m) if m.path == pressed_path => {
+                        FilePickerModalAction::Select(m.path.clone())
+                    }
+                    _ => FilePickerModalAction::Consumed,
+                }
+            }
+            _ => FilePickerModalAction::Consumed,
+        }
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -368,6 +428,7 @@ impl FilePickerModal {
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
+        s.row_hits.clear();
         render_list(frame, list_area, s);
         render_search(frame, search_area, s);
 
@@ -407,6 +468,7 @@ fn walk_end(root: &Path) -> Walk {
 }
 
 fn reparse_pattern(s: &mut Session) {
+    invalidate_mouse_geometry(s);
     let query = s.search.value();
     s.nucleo
         .pattern
@@ -416,6 +478,7 @@ fn reparse_pattern(s: &mut Session) {
 }
 
 fn refresh_matches(s: &mut Session) {
+    invalidate_mouse_geometry(s);
     let snapshot = s.nucleo.snapshot();
     s.total_matches = snapshot.matched_item_count();
     let count = s.total_matches.min(MAX_MATERIALIZED);
@@ -464,6 +527,7 @@ fn clamp_selection(s: &mut Session) {
 }
 
 fn ensure_visible(s: &mut Session) {
+    let previous_offset = s.scroll_offset;
     let len = s.matches.len();
     if len > s.viewport_height {
         s.scroll_offset = s.scroll_offset.min(len - s.viewport_height);
@@ -476,9 +540,17 @@ fn ensure_visible(s: &mut Session) {
     } else if s.selected >= s.scroll_offset + s.viewport_height {
         s.scroll_offset = s.selected + 1 - s.viewport_height;
     }
+    if s.scroll_offset != previous_offset {
+        invalidate_mouse_geometry(s);
+    }
 }
 
-fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
+fn invalidate_mouse_geometry(s: &mut Session) {
+    s.row_hits.clear();
+    s.mouse_down = None;
+}
+
+fn render_list(frame: &mut Frame, area: Rect, s: &mut Session) {
     let t = theme::current();
 
     if s.matches.is_empty() {
@@ -501,14 +573,21 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
     let end = (s.scroll_offset + visible_rows).min(s.matches.len());
 
-    let mut lines: Vec<Line> = s.matches[s.scroll_offset..end]
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let selected = s.scroll_offset + i == s.selected;
-            build_highlighted_line(&m.path, &m.indices, max_label_width, selected, &t)
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows + hint_row);
+    for (i, m) in s.matches[s.scroll_offset..end].iter().enumerate() {
+        let match_index = s.scroll_offset + i;
+        s.row_hits.push(FileRowHit {
+            area: Rect::new(area.x, area.y + i as u16, area.width, 1),
+            match_index,
+        });
+        lines.push(build_highlighted_line(
+            &m.path,
+            &m.indices,
+            max_label_width,
+            match_index == s.selected,
+            &t,
+        ));
+    }
 
     if hint_row > 0 {
         let n = s.total_matches - MAX_MATERIALIZED;
@@ -638,6 +717,25 @@ mod tests {
         }
     }
 
+    fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render(picker: &mut FilePickerModal) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+    }
+
     fn pending_picker() -> (FilePickerModal, flume::Sender<Walk>) {
         let mut picker = FilePickerModal::new();
         let notify = Arc::new(|| {});
@@ -653,6 +751,8 @@ mod tests {
             scroll_offset: 0,
             viewport_height: 0,
             inner_area: Rect::default(),
+            row_hits: Vec::new(),
+            mouse_down: None,
             cancel: Arc::new(AtomicBool::new(false)),
             done_rx,
             started_at: Instant::now(),
@@ -799,7 +899,7 @@ mod tests {
         done_tx.send(Walk::Listed).unwrap();
 
         let deadline = Instant::now() + CONVERGE_TIMEOUT;
-        while picker.tick() != (Dirty::NO, None) {
+        while picker.tick() != (Dirty::NO, None) || picker.cadence() != Cadence::IDLE {
             assert!(Instant::now() < deadline, "the picker never stopped");
             std::thread::yield_now();
         }
@@ -1063,5 +1163,91 @@ mod tests {
     fn contains_returns_false_when_not_visible() {
         let (picker, _done_tx) = pending_picker();
         assert!(!picker.contains(Position::new(0, 0)));
+    }
+
+    #[test]
+    fn hovering_file_moves_selection() {
+        let mut picker = picker_with_matches(3);
+        render(&mut picker);
+        let hit = picker.session.as_ref().unwrap().row_hits[2];
+
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
+            FilePickerModalAction::Consumed
+        ));
+        assert_eq!(picker.session.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn clicking_file_returns_armed_path() {
+        let mut picker = picker_with_matches(3);
+        render(&mut picker);
+        let hit = picker.session.as_ref().unwrap().row_hits[1];
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert!(matches!(
+            action,
+            FilePickerModalAction::Select(path) if path == "file_001.rs"
+        ));
+    }
+
+    #[test]
+    fn releasing_on_another_file_does_not_select() {
+        let mut picker = picker_with_matches(2);
+        render(&mut picker);
+        let first = picker.session.as_ref().unwrap().row_hits[0];
+        let second = picker.session.as_ref().unwrap().row_hits[1];
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
+
+        assert!(matches!(action, FilePickerModalAction::Consumed));
+    }
+
+    #[test]
+    fn dragging_file_cancels_click() {
+        let mut picker = picker_with_matches(2);
+        render(&mut picker);
+        let hit = picker.session.as_ref().unwrap().row_hits[0];
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        picker.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert!(matches!(action, FilePickerModalAction::Consumed));
+    }
+
+    #[test]
+    fn filtering_invalidates_rendered_file_rows() {
+        let mut picker = picker_with_matches(2);
+        render(&mut picker);
+        let stale = picker.session.as_ref().unwrap().row_hits[0];
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+        picker.handle_key(key(KeyCode::Char('z')));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
+
+        assert!(matches!(action, FilePickerModalAction::Consumed));
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.row_hits.is_empty());
+        assert!(session.mouse_down.is_none());
+    }
+
+    #[test]
+    fn async_match_refresh_invalidates_armed_file_row() {
+        let mut picker = picker_with_matches(2);
+        render(&mut picker);
+        let stale = picker.session.as_ref().unwrap().row_hits[0];
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+
+        refresh_matches(picker.session.as_mut().unwrap());
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
+
+        assert!(matches!(action, FilePickerModalAction::Consumed));
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.row_hits.is_empty());
+        assert!(session.mouse_down.is_none());
     }
 }

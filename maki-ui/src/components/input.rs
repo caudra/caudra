@@ -3,12 +3,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::shell::parse_shell_prefix;
+use crate::components::keybindings::key;
 use crate::highlight;
 use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize_paste};
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_agent::PromptAdmission;
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
@@ -28,6 +30,8 @@ const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
+const ADMISSION_SEPARATOR: &str = "  ";
+const ADMISSION_DESCRIPTION_GAP: &str = " ";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -49,6 +53,21 @@ const STEER_PLACEHOLDER: &str = "Steer this task...";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
+const ADMISSION_OPTIONS: [(&str, &str, PromptAdmission); 3] = [
+    ("Enter", "next", PromptAdmission::Queue),
+    (key::STEER_PROMPT.label, "guide", PromptAdmission::Steer),
+    (
+        key::INTERRUPT_PROMPT.label,
+        "replace",
+        PromptAdmission::Interrupt,
+    ),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmissionHit {
+    pub area: Rect,
+    pub admission: PromptAdmission,
+}
 
 #[derive(Clone, Copy)]
 pub enum Placeholder {
@@ -116,6 +135,7 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    hovered_paste: Option<PasteId>,
 }
 
 impl InputBox {
@@ -230,6 +250,7 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            hovered_paste: None,
         }
     }
 
@@ -518,7 +539,12 @@ impl InputBox {
                     let styled_spans = if paste_ranges.is_empty() {
                         shell_spans
                     } else {
-                        Some(paste_token_spans(line, &paste_ranges, focused_paste))
+                        Some(paste_token_spans(
+                            line,
+                            &paste_ranges,
+                            focused_paste,
+                            self.hovered_paste,
+                        ))
                     };
                     wrap_line(
                         line,
@@ -555,12 +581,7 @@ impl InputBox {
             }
         }
         if let Some(hint) = top_right_hint {
-            let hint_area = Rect::new(
-                content_area.x,
-                area.y,
-                content_area.width,
-                COMPOSER_VERTICAL_PADDING.min(area.height),
-            );
+            let hint_area = top_right_hint_area(area);
             frame.render_widget(Paragraph::new(hint.right_aligned()), hint_area);
         }
         let text = Text::from(styled_lines);
@@ -610,6 +631,16 @@ impl InputBox {
         self.buffer.set_cursor(y, x);
         self.follow_cursor = true;
         None
+    }
+
+    pub(crate) fn update_paste_hover(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
+        self.hovered_paste = self
+            .click_position_with_hit(area, row, col, focused)
+            .and_then(|(y, x, text_hit)| text_hit.then(|| self.buffer.paste_at(y, x)).flatten());
+    }
+
+    pub(crate) fn clear_hover(&mut self) {
+        self.hovered_paste = None;
     }
 
     /// Convert a mouse click at terminal (row, col) within the input content
@@ -718,6 +749,79 @@ pub(crate) fn content_area(area: Rect) -> Rect {
         area.y.saturating_add(top),
         area.width.saturating_sub(left.saturating_add(right)),
         area.height.saturating_sub(top.saturating_add(bottom)),
+    )
+}
+
+pub(crate) fn admission_hint(
+    area: Rect,
+    hovered: Option<PromptAdmission>,
+) -> (Line<'static>, Vec<AdmissionHit>) {
+    let theme = theme::current();
+    let hint_area = top_right_hint_area(area);
+    let full_width = ADMISSION_OPTIONS
+        .iter()
+        .map(|(key, description, _)| {
+            ADMISSION_SEPARATOR.width()
+                + key.width()
+                + ADMISSION_DESCRIPTION_GAP.width()
+                + description.width()
+        })
+        .sum::<usize>();
+    let mut x = if full_width <= hint_area.width as usize {
+        hint_area.right().saturating_sub(full_width as u16)
+    } else {
+        hint_area.x
+    };
+    let mut spans = Vec::with_capacity(ADMISSION_OPTIONS.len() * 3);
+    let mut hits = Vec::with_capacity(ADMISSION_OPTIONS.len());
+
+    for (key, description, admission) in ADMISSION_OPTIONS {
+        spans.push(Span::raw(ADMISSION_SEPARATOR));
+        x = x.saturating_add(ADMISSION_SEPARATOR.width() as u16);
+        let key_width = key.width() as u16;
+        let description_width = description.width() as u16;
+        let control_width = key_width
+            .saturating_add(ADMISSION_DESCRIPTION_GAP.width() as u16)
+            .saturating_add(description_width);
+        let is_hovered = hovered == Some(admission);
+        let key_style = if is_hovered {
+            theme.keybind_key.add_modifier(Modifier::REVERSED)
+        } else {
+            theme.keybind_key
+        };
+        let description_style = if is_hovered {
+            theme.tool_dim.add_modifier(Modifier::REVERSED)
+        } else {
+            theme.tool_dim
+        };
+        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(
+            format!("{ADMISSION_DESCRIPTION_GAP}{description}"),
+            description_style,
+        ));
+        if hint_area.height > 0
+            && control_width > 0
+            && x >= hint_area.x
+            && x.saturating_add(control_width) <= hint_area.right()
+        {
+            hits.push(AdmissionHit {
+                area: Rect::new(x, hint_area.y, control_width, 1),
+                admission,
+            });
+        }
+        x = x.saturating_add(control_width);
+    }
+
+    (Line::from(spans), hits)
+}
+
+fn top_right_hint_area(area: Rect) -> Rect {
+    let content_area = content_area(area);
+    Rect::new(
+        content_area.x,
+        area.y,
+        content_area.width,
+        COMPOSER_VERTICAL_PADDING.min(area.height),
     )
 }
 
@@ -903,6 +1007,7 @@ fn paste_token_spans(
     line: &str,
     pastes: &[(std::ops::Range<usize>, PasteId)],
     focused: Option<PasteId>,
+    hovered: Option<PasteId>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(pastes.len() * 2 + 1);
     let mut cursor = 0;
@@ -918,6 +1023,8 @@ fn paste_token_spans(
         let text: String = line.chars().skip(range.start).take(range.len()).collect();
         let style = if focused == Some(*id) {
             theme::current().item_selected
+        } else if hovered == Some(*id) {
+            theme::current().active.add_modifier(Modifier::REVERSED)
         } else {
             theme::current().active
         };
@@ -1176,6 +1283,84 @@ mod tests {
         height: u16,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         render_input_with(input, width, height, Placeholder::Suggestion)
+    }
+
+    #[test]
+    fn admission_hint_hits_exclude_separators_and_hover_only_the_control() {
+        let area = Rect::new(0, 0, 80, 3);
+        let (hint, hits) = admission_hint(area, Some(PromptAdmission::Steer));
+        assert_eq!(hits.len(), ADMISSION_OPTIONS.len());
+        assert!(hits.iter().all(|hit| {
+            hit.area.width > 0 && hit.area.right() <= area.right() && hit.area.y == area.y
+        }));
+
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                input.view(
+                    frame,
+                    area,
+                    Placeholder::Queue,
+                    Style::new(),
+                    true,
+                    Some(hint.clone()),
+                );
+            })
+            .unwrap();
+        let steer = hits
+            .iter()
+            .find(|hit| hit.admission == PromptAdmission::Steer)
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(
+            buffer
+                .cell((steer.area.x, steer.area.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer
+                .cell((steer.area.x - 1, steer.area.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn paste_hover_reverses_only_the_summarized_token() {
+        let area = Rect::new(0, 0, 60, 3);
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("a\nb\nc");
+        let content = content_area(area);
+        let token_x = content.x + PREFIX_WIDTH;
+        input.update_paste_hover(content, content.y, token_x, true);
+        assert!(input.hovered_paste.is_some());
+
+        let terminal = render_input_with(&mut input, area.width, area.height, Placeholder::Blank);
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .cell((token_x, content.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer
+                .cell((token_x - 1, content.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     fn has_scrollbar_thumb(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {

@@ -1,14 +1,14 @@
 use std::mem;
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
 use maki_lua::{LuaCommandInfo, LuaCommandReader};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
@@ -157,6 +157,32 @@ struct Match {
     indices: Vec<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandRowKey {
+    Builtin(&'static str),
+    Custom(usize),
+    McpPrompt(usize),
+    Lua(usize),
+}
+
+impl CommandType {
+    fn row_key(&self) -> CommandRowKey {
+        match self {
+            Self::Builtin(command) => CommandRowKey::Builtin(command.name),
+            Self::Custom(index) => CommandRowKey::Custom(*index),
+            Self::McpPrompt(index) => CommandRowKey::McpPrompt(*index),
+            Self::Lua(index) => CommandRowKey::Lua(*index),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CommandRowHit {
+    area: Rect,
+    filtered_index: usize,
+    key: CommandRowKey,
+}
+
 pub struct CommandPalette {
     selected: usize,
     filtered: Vec<Match>,
@@ -170,6 +196,9 @@ pub struct CommandPalette {
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     current_arg_count: usize,
+    popup_area: Option<Rect>,
+    row_hits: Vec<CommandRowHit>,
+    mouse_down: Option<CommandRowKey>,
 }
 
 impl CommandPalette {
@@ -200,6 +229,9 @@ impl CommandPalette {
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
+            popup_area: None,
+            row_hits: Vec::new(),
+            mouse_down: None,
         }
     }
 
@@ -274,13 +306,7 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => match self.confirm(input) {
-                Some(cmd) => {
-                    self.close();
-                    CommandAction::Execute(cmd)
-                }
-                None => CommandAction::Consumed,
-            },
+            KeyCode::Enter => self.activate_selected(input),
             KeyCode::Tab => {
                 if let Some(item) = self.filtered.get(self.selected) {
                     let name = self.item_name(item);
@@ -298,11 +324,75 @@ impl CommandPalette {
         }
     }
 
+    pub fn handle_mouse(&mut self, event: MouseEvent, input: &str) -> CommandAction {
+        let position = Position::new(event.column, event.row);
+        let over_popup = self.popup_area.is_some_and(|area| area.contains(position));
+
+        if matches!(
+            event.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+        ) && !over_popup
+        {
+            self.mouse_down = None;
+        }
+        if !over_popup {
+            return CommandAction::Passthrough;
+        }
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down = None;
+                if let Some(hit) = self
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .copied()
+                {
+                    self.selected = hit.filtered_index;
+                    self.mouse_down = Some(hit.key);
+                }
+                CommandAction::Consumed
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_down = None;
+                CommandAction::Consumed
+            }
+            MouseEventKind::Moved => {
+                if let Some(hit) = self.row_hits.iter().find(|hit| hit.area.contains(position)) {
+                    self.selected = hit.filtered_index;
+                }
+                CommandAction::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pressed_key) = self.mouse_down.take() else {
+                    return CommandAction::Consumed;
+                };
+                let released = self
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .map(|hit| (hit.filtered_index, hit.key));
+                let Some((filtered_index, released_key)) = released else {
+                    return CommandAction::Consumed;
+                };
+                if released_key != pressed_key {
+                    return CommandAction::Consumed;
+                }
+                self.selected = filtered_index;
+                self.activate_selected(input)
+            }
+            _ => CommandAction::Consumed,
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         !self.filtered.is_empty()
     }
 
     pub fn sync(&mut self, input: &str) {
+        self.invalidate_mouse_geometry();
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();
         if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
@@ -353,6 +443,7 @@ impl CommandPalette {
     }
 
     fn refresh_matches(&mut self) {
+        self.invalidate_mouse_geometry();
         let snapshot = self.nucleo.snapshot();
         let pattern = snapshot.pattern();
         let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
@@ -391,6 +482,7 @@ impl CommandPalette {
     pub fn close(&mut self) {
         self.filtered.clear();
         self.current_arg_count = 0;
+        self.invalidate_mouse_geometry();
     }
 
     pub fn move_up(&mut self) {
@@ -456,6 +548,22 @@ impl CommandPalette {
         })
     }
 
+    fn activate_selected(&mut self, input: &str) -> CommandAction {
+        match self.confirm(input) {
+            Some(cmd) => {
+                self.close();
+                CommandAction::Execute(cmd)
+            }
+            None => CommandAction::Consumed,
+        }
+    }
+
+    fn invalidate_mouse_geometry(&mut self) {
+        self.popup_area = None;
+        self.row_hits.clear();
+        self.mouse_down = None;
+    }
+
     /// Name lookup for `maki.api.run_command`, returning the registered
     /// spelling that [`crate::app::App`] dispatches on. Case-insensitive like
     /// typing, but never fuzzy: an alias names one command on purpose, and a
@@ -481,14 +589,16 @@ impl CommandPalette {
         self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
-    pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+    pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
         let filtered = &self.filtered;
         if filtered.is_empty() {
+            self.invalidate_mouse_geometry();
             return None;
         }
 
         let popup_height = (filtered.len() as u16).min(input_area.y);
         if popup_height == 0 {
+            self.invalidate_mouse_geometry();
             return None;
         }
 
@@ -550,6 +660,18 @@ impl CommandPalette {
             popup,
         );
 
+        self.popup_area = Some(popup);
+        self.row_hits = filtered
+            .iter()
+            .take(popup_height as usize)
+            .enumerate()
+            .map(|(filtered_index, item)| CommandRowHit {
+                area: Rect::new(popup.x, popup.y + filtered_index as u16, popup.width, 1),
+                filtered_index,
+                key: item.command_type.row_key(),
+            })
+            .collect();
+
         Some(popup)
     }
 
@@ -590,6 +712,7 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use maki_agent::{McpPromptArg, McpSnapshot};
     use test_case::test_case;
 
@@ -601,6 +724,25 @@ mod tests {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
         p.sync(input);
         p
+    }
+
+    fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render(palette: &mut CommandPalette) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                palette.view(frame, Rect::new(0, 20, 80, 4));
+            })
+            .unwrap();
     }
 
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
@@ -678,6 +820,116 @@ mod tests {
         assert_eq!(p.selected, p.filtered.len() - 1);
         p.move_down();
         assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn hovering_command_moves_selection() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let hit = palette.row_hits[2];
+
+        assert!(matches!(
+            palette.handle_mouse(mouse(MouseEventKind::Moved, hit.area), "/"),
+            CommandAction::Consumed
+        ));
+        assert_eq!(palette.selected, hit.filtered_index);
+    }
+
+    #[test]
+    fn clicking_command_executes_with_enter_semantics() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let hit = palette.row_hits[1];
+        let expected_name = palette.item_name(&palette.filtered[hit.filtered_index]);
+
+        palette.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), hit.area),
+            "/",
+        );
+        let action =
+            palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area), "/");
+
+        assert!(matches!(
+            action,
+            CommandAction::Execute(ParsedCommand { name, args })
+                if name == expected_name && args.is_empty()
+        ));
+        assert!(!palette.is_active());
+    }
+
+    #[test]
+    fn releasing_on_another_command_does_not_execute() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let first = palette.row_hits[0];
+        let second = palette.row_hits[1];
+
+        palette.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), first.area),
+            "/",
+        );
+        let action = palette.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), second.area),
+            "/",
+        );
+
+        assert!(matches!(action, CommandAction::Consumed));
+        assert!(palette.is_active());
+    }
+
+    #[test]
+    fn dragging_command_cancels_click() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let hit = palette.row_hits[0];
+
+        palette.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), hit.area),
+            "/",
+        );
+        palette.handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), hit.area),
+            "/",
+        );
+        let action =
+            palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area), "/");
+
+        assert!(matches!(action, CommandAction::Consumed));
+        assert!(palette.is_active());
+    }
+
+    #[test]
+    fn command_filtering_invalidates_rendered_popup() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let stale = palette.row_hits[0];
+        palette.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), stale.area),
+            "/",
+        );
+
+        palette.sync("/goal");
+        let action = palette.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), stale.area),
+            "/goal",
+        );
+
+        assert!(matches!(action, CommandAction::Passthrough));
+        assert!(palette.popup_area.is_none());
+        assert!(palette.mouse_down.is_none());
+    }
+
+    #[test]
+    fn command_mouse_events_outside_popup_pass_through() {
+        let mut palette = synced("/");
+        render(&mut palette);
+        let popup = palette.popup_area.unwrap();
+        let outside = Rect::new(popup.right(), popup.y, 1, 1);
+
+        assert!(matches!(
+            palette.handle_mouse(mouse(MouseEventKind::Moved, outside), "/"),
+            CommandAction::Passthrough
+        ));
     }
 
     #[test]

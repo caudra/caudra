@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -278,67 +278,8 @@ impl LoginPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> LoginPickerAction {
         let action = match &mut self.step {
             Step::Closed => return LoginPickerAction::Consumed,
-            Step::PickProvider(picker) => match picker.handle_key(key) {
-                PickerAction::Select(item) => {
-                    if item.slug == CATALOG_UNAVAILABLE_SLUG {
-                        StepAction::None
-                    } else if item.slug == "custom" {
-                        StepAction::GoCustomName
-                    } else {
-                        let slug = item.slug.clone();
-                        let config = providers::ProvidersConfig::load();
-                        let def = config.get(&slug);
-                        let has_plans = providers::builtin_provider(&slug)
-                            .and_then(|b| b.plans)
-                            .is_some_and(|p| p.len() > 1);
-                        if has_plans {
-                            StepAction::GoPickPlan { slug }
-                        } else {
-                            let display_name =
-                                if providers::builtin_provider(&slug).is_some() || def.is_some() {
-                                    providers::resolve_display_name(&slug, def)
-                                } else {
-                                    item.display_name.clone()
-                                };
-                            let needs_url =
-                                providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
-                            if needs_url {
-                                StepAction::GoBuiltinUrl { slug, display_name }
-                            } else {
-                                StepAction::GoEnterKey {
-                                    slug,
-                                    plan: None,
-                                    display_name,
-                                    custom: None,
-                                    builtin_url: None,
-                                    api_key_optional: false,
-                                }
-                            }
-                        }
-                    }
-                }
-                PickerAction::Close => StepAction::Close,
-                PickerAction::Consumed | PickerAction::Toggle(..) => {
-                    return LoginPickerAction::Consumed;
-                }
-            },
-            Step::PickPlan { picker, slug } => match picker.handle_key(key) {
-                PickerAction::Select(item) => {
-                    let config = providers::ProvidersConfig::load();
-                    StepAction::GoEnterKey {
-                        slug: slug.clone(),
-                        plan: Some(item.key.clone()),
-                        display_name: providers::resolve_display_name(slug, config.get(slug)),
-                        custom: None,
-                        builtin_url: None,
-                        api_key_optional: false,
-                    }
-                }
-                PickerAction::Close => StepAction::Back,
-                PickerAction::Consumed | PickerAction::Toggle(..) => {
-                    return LoginPickerAction::Consumed;
-                }
-            },
+            Step::PickProvider(picker) => Self::map_provider_action(picker.handle_key(key)),
+            Step::PickPlan { picker, slug } => Self::map_plan_action(picker.handle_key(key), slug),
             Step::CustomName { input } => match key.code {
                 KeyCode::Enter => {
                     let name = input.value().trim().to_string();
@@ -354,16 +295,9 @@ impl LoginPicker {
                     return LoginPickerAction::Consumed;
                 }
             },
-            Step::CustomProtocol { picker, slug } => match picker.handle_key(key) {
-                PickerAction::Select(item) => StepAction::GoCustomUrl {
-                    slug: slug.clone(),
-                    protocol: item.0.to_string(),
-                },
-                PickerAction::Close => StepAction::Back,
-                PickerAction::Consumed | PickerAction::Toggle(..) => {
-                    return LoginPickerAction::Consumed;
-                }
-            },
+            Step::CustomProtocol { picker, slug } => {
+                Self::map_protocol_action(picker.handle_key(key), slug)
+            }
             Step::CustomUrl {
                 input,
                 slug,
@@ -549,6 +483,100 @@ impl LoginPicker {
         };
 
         self.transition(action)
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> LoginPickerAction {
+        let action = match &mut self.step {
+            Step::PickProvider(picker) => Self::map_provider_action(picker.handle_mouse(event)),
+            Step::PickPlan { picker, slug } => {
+                Self::map_plan_action(picker.handle_mouse(event), slug)
+            }
+            Step::CustomProtocol { picker, slug } => {
+                Self::map_protocol_action(picker.handle_mouse(event), slug)
+            }
+            Step::Closed
+            | Step::CustomName { .. }
+            | Step::CustomUrl { .. }
+            | Step::BuiltinUrl { .. }
+            | Step::EnterKey { .. }
+            | Step::Done { .. } => return LoginPickerAction::Consumed,
+        };
+
+        self.transition(action)
+    }
+
+    fn map_provider_action(action: PickerAction<ProviderItem>) -> StepAction {
+        match action {
+            PickerAction::Select(item) => {
+                if item.slug == CATALOG_UNAVAILABLE_SLUG {
+                    StepAction::None
+                } else if item.slug == "custom" {
+                    StepAction::GoCustomName
+                } else {
+                    let slug = item.slug.clone();
+                    let config = providers::ProvidersConfig::load();
+                    let def = config.get(&slug);
+                    let has_plans = providers::builtin_provider(&slug)
+                        .and_then(|b| b.plans)
+                        .is_some_and(|p| p.len() > 1);
+                    if has_plans {
+                        StepAction::GoPickPlan { slug }
+                    } else {
+                        let display_name =
+                            if providers::builtin_provider(&slug).is_some() || def.is_some() {
+                                providers::resolve_display_name(&slug, def)
+                            } else {
+                                item.display_name.clone()
+                            };
+                        let needs_url =
+                            providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
+                        if needs_url {
+                            StepAction::GoBuiltinUrl { slug, display_name }
+                        } else {
+                            StepAction::GoEnterKey {
+                                slug,
+                                plan: None,
+                                display_name,
+                                custom: None,
+                                builtin_url: None,
+                                api_key_optional: false,
+                            }
+                        }
+                    }
+                }
+            }
+            PickerAction::Close => StepAction::Close,
+            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+        }
+    }
+
+    fn map_plan_action(action: PickerAction<PlanItem>, slug: &str) -> StepAction {
+        match action {
+            PickerAction::Select(item) => {
+                let config = providers::ProvidersConfig::load();
+                StepAction::GoEnterKey {
+                    slug: slug.to_string(),
+                    plan: Some(item.key.clone()),
+                    display_name: providers::resolve_display_name(slug, config.get(slug)),
+                    custom: None,
+                    builtin_url: None,
+                    api_key_optional: false,
+                }
+            }
+            PickerAction::Close => StepAction::Back,
+            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+        }
+    }
+
+    fn map_protocol_action(action: PickerAction<ProtocolItem>, slug: &str) -> StepAction {
+        match action {
+            PickerAction::Select(item) => StepAction::GoCustomUrl {
+                slug: slug.to_string(),
+                protocol: item.0.to_string(),
+            },
+            PickerAction::Close => StepAction::Back,
+            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+        }
     }
 
     fn transition(&mut self, action: StepAction) -> LoginPickerAction {
@@ -800,4 +828,94 @@ pub enum LoginPickerAction {
     Close,
     Authenticated { model_spec: String },
     Configured { slug: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+
+    const TEST_WIDTH: u16 = 80;
+    const TEST_HEIGHT: u16 = 24;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render(picker: &mut LoginPicker) -> Rect {
+        let backend = ratatui::backend::TestBackend::new(TEST_WIDTH, TEST_HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = picker.view(frame, frame.area());
+            })
+            .unwrap();
+        popup
+    }
+
+    #[test]
+    fn mouse_selects_provider_through_provider_transition() {
+        let mut provider_picker = ListPicker::new();
+        provider_picker.open(
+            vec![ProviderItem {
+                slug: "custom".into(),
+                display_name: "Custom provider...".into(),
+                has_key: false,
+                has_env: false,
+                configured: false,
+                section: None,
+            }],
+            TITLE,
+        );
+        let mut picker = LoginPicker::new();
+        picker.step = Step::PickProvider(provider_picker);
+        let popup = render(&mut picker);
+        let column = popup.x + 1;
+        let row = popup.y + 1;
+
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row)),
+            LoginPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row)),
+            LoginPickerAction::Consumed
+        ));
+        assert!(matches!(picker.step, Step::CustomName { .. }));
+    }
+
+    #[test]
+    fn mouse_is_consumed_without_changing_non_list_steps() {
+        let mut picker = LoginPicker::new();
+        picker.step = Step::CustomName {
+            input: TextBuffer::new("unchanged".into()),
+        };
+
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Moved, 0, 0)),
+            LoginPickerAction::Consumed
+        ));
+        assert!(matches!(
+            &picker.step,
+            Step::CustomName { input } if input.value() == "unchanged"
+        ));
+
+        picker.step = Step::Done {
+            message: "complete".into(),
+        };
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Moved, 0, 0)),
+            LoginPickerAction::Consumed
+        ));
+        assert!(matches!(
+            &picker.step,
+            Step::Done { message } if message == "complete"
+        ));
+    }
 }

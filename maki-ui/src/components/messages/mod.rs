@@ -5,7 +5,7 @@ mod selection;
 #[cfg(test)]
 mod tests;
 
-use self::render::RenderCursor;
+use self::render::{EXPAND_AFFORDANCE, HoverFeedback, RenderCursor, RenderFeedback};
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use layout::{SegmentChrome, SegmentKind};
 
@@ -52,6 +52,13 @@ use tracing::warn;
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 
+#[derive(Debug, PartialEq, Eq)]
+enum HoverTarget {
+    CachedThinking(usize),
+    StreamingThinking,
+    Tool { id: String, feedback: HoverFeedback },
+}
+
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
     pub processed: u32,
@@ -68,6 +75,7 @@ pub struct MessagesPanel {
     auto_scroll: bool,
     viewport_height: u16,
     viewport_width: u16,
+    viewport_area: Rect,
     cache: SegmentCache,
     last_total_lines: u16,
     hl_worker: RenderWorker,
@@ -94,6 +102,7 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    hover: Option<HoverTarget>,
 }
 
 impl MessagesPanel {
@@ -120,6 +129,7 @@ impl MessagesPanel {
             auto_scroll: true,
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
+            viewport_area: Rect::default(),
             cache: SegmentCache::new(),
             last_total_lines: 0,
             hl_worker: RenderWorker::new(),
@@ -139,6 +149,7 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            hover: None,
         }
     }
 
@@ -598,6 +609,7 @@ impl MessagesPanel {
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
     pub fn set_scroll_top(&mut self, top: u16) {
+        self.clear_hover();
         self.scroll_top = top.min(self.max_scroll());
         self.auto_scroll = false;
     }
@@ -611,6 +623,7 @@ impl MessagesPanel {
     }
 
     pub fn enable_auto_scroll(&mut self) {
+        self.clear_hover();
         self.auto_scroll = true;
     }
 
@@ -628,6 +641,7 @@ impl MessagesPanel {
     }
 
     pub fn restore_scroll(&mut self, scroll_top: u16, auto_scroll: bool) {
+        self.clear_hover();
         self.scroll_top = scroll_top;
         self.auto_scroll = auto_scroll;
     }
@@ -681,10 +695,101 @@ impl MessagesPanel {
         })
     }
 
+    pub(crate) fn update_hover(&mut self, row: u16, col: u16, area: Rect, known_task_target: bool) {
+        self.hover = self.hover_target_at(row, col, area, known_task_target);
+    }
+
+    pub(crate) fn clear_hover(&mut self) {
+        self.hover = None;
+    }
+
+    fn hover_target_at(
+        &self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        known_task_target: bool,
+    ) -> Option<HoverTarget> {
+        if area.height == 0
+            || row < area.y
+            || row >= area.bottom()
+            || col < area.x
+            || col >= area.right()
+        {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
+            return self
+                .is_collapsed_streaming_thinking_row(doc_row, width)
+                .then_some(HoverTarget::StreamingThinking);
+        };
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(width).margin_top {
+            return None;
+        }
+        let Some(tool_id) = segment.tool_id.as_deref() else {
+            let msg_index = segment.msg_index?;
+            return self
+                .messages
+                .get(msg_index)
+                .is_some_and(|message| {
+                    matches!(message.role, DisplayRole::Thinking) && message.thinking_collapsed
+                })
+                .then_some(HoverTarget::CachedThinking(msg_index));
+        };
+
+        let expanded = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        let native_toggle =
+            !self.has_snapshot(tool_id) && (segment.truncation.any() || expanded.any());
+        if !native_toggle && !known_task_target {
+            return None;
+        }
+        let feedback = if native_toggle
+            && segment.lines().iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains(EXPAND_AFFORDANCE))
+            }) {
+            HoverFeedback::Affordance
+        } else {
+            HoverFeedback::Chrome
+        };
+        Some(HoverTarget::Tool {
+            id: tool_id.to_owned(),
+            feedback,
+        })
+    }
+
+    fn hover_feedback_for_segment(&self, segment: &Segment) -> Option<HoverFeedback> {
+        match &self.hover {
+            Some(HoverTarget::CachedThinking(msg_index))
+                if segment.msg_index == Some(*msg_index) && segment.tool_id.is_none() =>
+            {
+                Some(HoverFeedback::Affordance)
+            }
+            Some(HoverTarget::Tool { id, feedback })
+                if segment.tool_id.as_deref() == Some(id.as_str()) =>
+            {
+                Some(*feedback)
+            }
+            Some(HoverTarget::CachedThinking(_))
+            | Some(HoverTarget::StreamingThinking)
+            | Some(HoverTarget::Tool { .. })
+            | None => None,
+        }
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
         }
+        self.clear_hover();
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
         // Both fallbacks toggle thinking: a row past the cached segments
@@ -824,10 +929,19 @@ impl MessagesPanel {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
+        if self.viewport_area != area {
+            self.clear_hover();
+            self.viewport_area = area;
+        }
+        let previous_scroll_top = self.scroll_top;
+        let previous_total_lines = self.last_total_lines;
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
+        if self.viewport_width != width {
+            self.clear_hover();
+        }
         let width_changed = self.viewport_width != width || theme_changed;
         if width_changed {
             self.viewport_width = width;
@@ -910,6 +1024,9 @@ impl MessagesPanel {
         self.reflow_viewport(width, has_selection);
         self.cache.update_margins(width);
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
+        if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
+            self.clear_hover();
+        }
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll_top, viewport);
@@ -921,12 +1038,15 @@ impl MessagesPanel {
             }
             let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
+            let hover = self
+                .hover_feedback_for_segment(seg)
+                .map(|feedback| (feedback, accent));
             cursor.render(
                 seg.lines(),
                 h,
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent),
-                highlight,
+                RenderFeedback { highlight, hover },
                 frame,
             );
         }
@@ -952,7 +1072,7 @@ impl MessagesPanel {
                     h,
                     SegmentChrome::for_kind(SegmentKind::Assistant, width, 0),
                     (None, None),
-                    false,
+                    RenderFeedback::default(),
                     frame,
                 );
             }
@@ -960,12 +1080,17 @@ impl MessagesPanel {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 if collapsed {
+                    let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
+                        .then_some((HoverFeedback::Affordance, accent));
                     cursor.render(
                         &collapsed_thinking_lines,
                         h,
                         SegmentChrome::for_kind(kind, width, 0),
                         (None, None),
-                        false,
+                        RenderFeedback {
+                            hover,
+                            ..RenderFeedback::default()
+                        },
                         frame,
                     );
                 } else {
@@ -974,7 +1099,7 @@ impl MessagesPanel {
                         h,
                         SegmentChrome::for_kind(kind, width, 0),
                         (None, None),
-                        false,
+                        RenderFeedback::default(),
                         frame,
                     );
                 }
@@ -1282,6 +1407,14 @@ impl MessagesPanel {
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
+        if !self.is_collapsed_streaming_thinking_row(doc_row, width) {
+            return false;
+        }
+        self.thinking_collapsed = false;
+        true
+    }
+
+    fn is_collapsed_streaming_thinking_row(&self, doc_row: u32, width: u16) -> bool {
         if !self.streaming_thinking_collapsed() {
             return false;
         }
@@ -1292,11 +1425,7 @@ impl MessagesPanel {
             SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
         let height =
             wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width) as u32;
-        if doc_row >= thinking_start && doc_row < thinking_start + height {
-            self.thinking_collapsed = false;
-            return true;
-        }
-        false
+        doc_row >= thinking_start && doc_row < thinking_start + height
     }
 
     fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {

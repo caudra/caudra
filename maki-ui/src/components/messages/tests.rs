@@ -9,6 +9,7 @@ use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::time::Duration;
 use test_case::test_case;
@@ -1173,6 +1174,109 @@ fn toggle_expand_collapse_truncated_tool() {
 }
 
 #[test]
+fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache() {
+    let mut panel = panel_with_long_tool(200);
+    let area = Rect::new(0, 0, 80, 24);
+    let source = panel.messages[0].text.clone();
+    let cached = panel.cache.find_by_tool_id("t1").and_then(|index| {
+        panel
+            .cache
+            .get(index)
+            .map(|segment| segment.lines().to_vec())
+    });
+
+    panel.update_hover(area.y, area.right(), area, false);
+    assert!(panel.hover.is_none(), "outside columns are not hoverable");
+    panel.update_hover(area.y, area.x, area, false);
+    let terminal = render(&mut panel, area.width, area.height);
+
+    assert!(
+        style_of(&terminal, EXPAND_AFFORDANCE)
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert!(
+        !style_of(&terminal, "line 0")
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "tool output must not be reversed by hover"
+    );
+    assert_eq!(
+        panel
+            .cache
+            .find_by_tool_id("t1")
+            .and_then(|index| panel.cache.get(index))
+            .map(|segment| segment.lines()),
+        cached.as_deref(),
+        "paint-time hover must not rewrite cached lines"
+    );
+    assert_eq!(panel.messages[0].text, source);
+}
+
+#[test]
+fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
+    const HEIGHT: u16 = 240;
+
+    let mut panel = panel_with_long_tool(200);
+    assert!(panel.toggle_expansion("t1"));
+    let area = Rect::new(0, 0, 80, HEIGHT);
+    render(&mut panel, area.width, area.height);
+
+    panel.update_hover(area.y, area.x, area, false);
+    let terminal = render(&mut panel, area.width, area.height);
+    let buffer = terminal.backend().buffer();
+    let rail = buffer.cell((area.x, area.y)).unwrap().style();
+    let header = style_of(&terminal, "bash>");
+
+    assert_eq!(header.fg, rail.fg, "header and rail share the hover accent");
+    assert!(
+        !style_of(&terminal, "line 0")
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "expanded code/output body must not be reversed"
+    );
+}
+
+#[test]
+fn snapshot_tool_hovers_only_when_caller_confirms_a_known_task_card() {
+    let mut panel = bash_tool_with_snapshot("t1");
+    let area = Rect::new(0, 0, 80, 24);
+    render(&mut panel, area.width, area.height);
+
+    panel.update_hover(area.y, area.x, area, false);
+    assert!(
+        panel.hover.is_none(),
+        "ordinary Lua snapshot rows are excluded"
+    );
+
+    panel.update_hover(area.y, area.x, area, true);
+    assert!(matches!(
+        panel.hover,
+        Some(HoverTarget::Tool {
+            feedback: HoverFeedback::Chrome,
+            ..
+        })
+    ));
+    let terminal = render(&mut panel, area.width, area.height);
+    assert!(
+        !style_of(&terminal, "rendered")
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "task hover must leave snapshot body text alone"
+    );
+}
+
+#[test]
+fn ordinary_message_rows_never_become_transcript_hover_controls() {
+    let mut panel = panel_with_msgs(&["long-click context"], 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+
+    panel.update_hover(area.y, area.x, area, false);
+
+    assert!(panel.hover.is_none());
+}
+
+#[test]
 fn extract_selection_copies_visible_content_only() {
     let panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
@@ -2021,6 +2125,81 @@ fn hide_keeps_cached_thinking_as_indicator() {
         !text.contains("reasoning here"),
         "reasoning must stay hidden in the indicator; got: {text}"
     );
+}
+
+#[test]
+fn cached_collapsed_thinking_hover_reverses_only_its_affordance() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: false,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.thinking_delta("hidden cached reasoning");
+    panel.flush();
+    let area = Rect::new(0, 0, 80, 10);
+    render(&mut panel, area.width, area.height);
+
+    panel.update_hover(area.y, area.x, area, false);
+    let terminal = render(&mut panel, area.width, area.height);
+
+    assert!(matches!(panel.hover, Some(HoverTarget::CachedThinking(0))));
+    assert!(
+        style_of(&terminal, EXPAND_AFFORDANCE)
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert!(
+        !style_of(&terminal, THINKING_HIDDEN_HEADER)
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn streaming_collapsed_thinking_hover_reverses_its_affordance() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: false,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel
+        .streaming_thinking
+        .set_buffer("hidden streaming reasoning");
+    let area = Rect::new(0, 0, 80, 10);
+    render(&mut panel, area.width, area.height);
+
+    panel.update_hover(area.y, area.x, area, false);
+    let terminal = render(&mut panel, area.width, area.height);
+
+    assert!(matches!(panel.hover, Some(HoverTarget::StreamingThinking)));
+    assert!(
+        style_of(&terminal, EXPAND_AFFORDANCE)
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn transcript_hover_clears_explicitly_and_on_scroll_or_layout_change() {
+    let mut panel = panel_with_long_tool(200);
+    let area = Rect::new(0, 0, 80, 24);
+
+    panel.update_hover(area.y, area.x, area, false);
+    assert!(panel.hover.is_some());
+    panel.clear_hover();
+    assert!(panel.hover.is_none());
+
+    panel.update_hover(area.y, area.x, area, false);
+    panel.set_scroll_top(panel.scroll_top());
+    assert!(panel.hover.is_none());
+
+    panel.update_hover(area.y, area.x, area, false);
+    render(&mut panel, 79, area.height);
+    assert!(panel.hover.is_none());
 }
 
 #[test]

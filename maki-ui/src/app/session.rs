@@ -344,6 +344,10 @@ impl App {
         self.task_queue_viewport = 0;
         self.queue_hits.clear();
         self.queue_mouse_down = None;
+        self.queue_hover = None;
+        self.admission_hits.clear();
+        self.admission_mouse_down = None;
+        self.admission_hover = None;
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
         self.close_all_overlays();

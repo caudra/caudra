@@ -321,6 +321,15 @@ impl Chat {
         self.messages_panel.handle_click(row, area);
     }
 
+    pub(crate) fn update_hover(&mut self, row: u16, col: u16, area: Rect, known_task_target: bool) {
+        self.messages_panel
+            .update_hover(row, col, area, known_task_target);
+    }
+
+    pub(crate) fn clear_hover(&mut self) {
+        self.messages_panel.clear_hover();
+    }
+
     pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
         self.messages_panel.tool_id_at(row, area)
     }
