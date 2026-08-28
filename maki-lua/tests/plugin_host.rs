@@ -4022,7 +4022,10 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
 #[test]
 fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
     const STORE_MAX_BYTES: usize = 20 * 1024;
-    const PROBE: &str = "CAP-END";
+    // Split like `BASH_PARTIAL_PROBE`, so printf assembles the probe and it
+    // never appears in the command header the live buf carries from the start.
+    const PROBE_HEAD: &str = "CAP-";
+    const PROBE_TAIL: &str = "END";
 
     let (tx, events) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
@@ -4035,10 +4038,15 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
     let session = SessionRef::generate();
     let thread_store = Arc::clone(&store);
     let thread_session = session.clone();
+    let probe = format!("{PROBE_HEAD}{PROBE_TAIL}");
     let process_bytes = STORE_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
-    let zero_bytes = process_bytes - PROBE.len() - 1;
-    let process_output = format!("{}\n{PROBE}", "0".repeat(zero_bytes));
-    let command = format!("printf '%0{zero_bytes}d' 0; printf '\\n{PROBE}'; sleep 30");
+    // The probe ends on a newline because the view holds an unterminated line
+    // back, so without one it would never reach the buf the test polls.
+    let zero_bytes = process_bytes - probe.len() - 2;
+    let process_output = format!("{}\n{probe}\n", "0".repeat(zero_bytes));
+    let command = format!(
+        "printf '%0{zero_bytes}d' 0; printf '\\n%s%s\\n' '{PROBE_HEAD}' '{PROBE_TAIL}'; sleep 30"
+    );
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
         let (reg, host) = builtins_host();
@@ -4068,7 +4076,7 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
         recv_live_buf(&events, "bash-cancel-cap")
     });
     poll_until("bash cap probe never reached the live buf", || {
-        buf.take().text().contains(PROBE).then_some(())
+        buf.take().text().contains(&probe).then_some(())
     });
     trigger.cancel();
 
@@ -4081,9 +4089,11 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
             .is_none_or(|suffix| !suffix.contains("output limit"))
     );
     let output_ref = done.output_ref.unwrap();
+    // No separator before the marker: the process output already ends on a
+    // newline, so `append_control` adds none.
     assert_eq!(
         store.load_text(session.id(), output_ref.id).unwrap(),
-        format!("{process_output}\n{BASH_PARTIAL_MARKER}")
+        format!("{process_output}{BASH_PARTIAL_MARKER}")
     );
 }
 
