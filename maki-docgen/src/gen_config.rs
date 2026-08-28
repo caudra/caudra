@@ -12,31 +12,38 @@ use maki_lua::{PluginHost, PluginOptionSpecs};
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
 fn write_table(out: &mut String, fields: &[ConfigField]) {
-    let extra: Option<ExtraColumn> = if fields.iter().any(|f| f.env.is_some()) {
-        Some(("Env", |f| {
+    let mut extras: Vec<ExtraColumn> = Vec::new();
+    if fields.iter().any(|f| f.env.is_some()) {
+        extras.push(("Env", |f: &ConfigField| {
             f.env.map_or("-".to_string(), |e| {
                 e.split(", ")
                     .map(|v| format!("`{v}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
-        }))
-    } else if fields.iter().any(|f| f.min.is_some()) {
-        Some(("Min", |f| f.min.map_or("-".to_string(), |v| v.to_string())))
-    } else {
-        None
-    };
+        }));
+    }
+    if fields.iter().any(|f| f.min.is_some()) {
+        extras.push(("Min", |f: &ConfigField| {
+            f.min.map_or("-".to_string(), |v| v.to_string())
+        }));
+    }
 
-    let (header, rule) = extra.map_or((String::new(), ""), |(name, _)| {
-        (format!(" {name} |"), "-----|")
-    });
+    let header: String = extras
+        .iter()
+        .map(|(name, _)| format!(" {name} |"))
+        .collect();
+    let rule: String = extras.iter().map(|_| "-----|").collect();
     writeln!(out, "| Field | Type | Default |{header} Description |").unwrap();
     writeln!(out, "|-------|------|---------|{rule}-------------|").unwrap();
     for f in fields {
-        let cell = extra.map_or(String::new(), |(_, cell)| format!(" {} |", cell(f)));
+        let cells: String = extras
+            .iter()
+            .map(|(_, cell)| format!(" {} |", cell(f)))
+            .collect();
         writeln!(
             out,
-            "| `{name}` | {ty} | `{default}` |{cell} {desc} |",
+            "| `{name}` | {ty} | `{default}` |{cells} {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
             default = f.default.format_default(),
@@ -130,6 +137,27 @@ fn write_theme_section(out: &mut String) {
          classic terminal colors. If detection gets it wrong, set \
          `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
          the fallback.\n"
+    )
+    .unwrap();
+}
+
+fn write_update_check_section(out: &mut String) {
+    writeln!(out, "### `ui.update_check`\n").unwrap();
+    writeln!(
+        out,
+        "When on, Maki asks the GitHub releases API for the latest version \
+         once at startup and shows it in the splash when yours is older. The \
+         request carries a `maki` user agent and nothing else: no session id, \
+         no machine id, not even your current version.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "It is off by default, so a normal run reaches only the model \
+         provider you configured. Set `MAKI_ENABLE_UPDATE_CHECK=1` to turn it \
+         on for a single run, or `MAKI_ENABLE_UPDATE_CHECK=0` to turn it off \
+         when your config has it on. The `maki update` command always \
+         checks, because that is what you asked it to do.\n"
     )
     .unwrap();
 }
@@ -239,6 +267,7 @@ All fields are optional. Typos in field names cause an error right away.
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);
     write_theme_section(&mut out);
+    write_update_check_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);

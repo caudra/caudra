@@ -67,18 +67,19 @@ All fields are optional. Typos in field names cause an error right away.
 
 ### `ui`
 
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `splash_animation` | bool | `true` | - | Show splash animation on startup |
-| `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
-| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
-| `math` | string | `unicode` | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
-| `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
-| `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
-| `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
-| `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
-| `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+| Field | Type | Default | Env | Min | Description |
+|-------|------|---------|-----|-----|-------------|
+| `splash_animation` | bool | `true` | - | - | Show splash animation on startup |
+| `scrollbar` | bool | `true` | - | - | Show vertical scrollbar in scrollable areas |
+| `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off |
+| `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
+| `flash_duration_ms` | u64 | `1500` | - | - | Duration of flash messages (ms) |
+| `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
+| `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
+| `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
+| `show_thinking` | bool | `true` | - | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+| `update_check` | bool | `false` | `MAKI_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Maki makes no such request unless you turn this on |
 
 ### `ui.theme`
 
@@ -89,6 +90,12 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
 Themes use 24-bit colors, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
+
+### `ui.update_check`
+
+When on, Maki asks the GitHub releases API for the latest version once at startup and shows it in the splash when yours is older. The request carries a `maki` user agent and nothing else: no session id, no machine id, not even your current version.
+
+It is off by default, so a normal run reaches only the model provider you configured. Set `MAKI_ENABLE_UPDATE_CHECK=1` to turn it on for a single run, or `MAKI_ENABLE_UPDATE_CHECK=0` to turn it off when your config has it on. The `maki update` command always checks, because that is what you asked it to do.
 
 ### `ui.tool_output_lines`
 

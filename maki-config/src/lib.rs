@@ -349,6 +349,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub update_check: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -366,7 +367,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            update_check
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -911,6 +913,13 @@ pub struct UiConfig {
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
+    #[config(
+        default = false,
+        env = "MAKI_ENABLE_UPDATE_CHECK",
+        desc = "Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Maki makes no such request unless you turn this on"
+    )]
+    pub update_check: bool,
+
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
@@ -937,6 +946,7 @@ impl UiConfig {
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
+            update_check: f.update_check.unwrap_or(false),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
@@ -2952,6 +2962,30 @@ mod tests {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(false).unwrap();
         assert!(config.ui.show_thinking);
+    }
+
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn update_check_deserializes(enabled: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nupdate_check = {enabled}\n")).unwrap();
+        assert_eq!(raw.ui.update_check, Some(enabled));
+    }
+
+    #[test]
+    fn update_check_missing_defaults_off() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(
+            !config.ui.update_check,
+            "the release check must stay off until asked for"
+        );
+    }
+
+    #[test]
+    fn update_check_overlay_wins() {
+        let mut base: RawConfig = toml::from_str("[ui]\nupdate_check = false\n").unwrap();
+        base.merge(toml::from_str("[ui]\nupdate_check = true\n").unwrap());
+        assert_eq!(base.ui.update_check, Some(true));
     }
 
     #[test]
