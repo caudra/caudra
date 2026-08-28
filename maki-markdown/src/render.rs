@@ -7,12 +7,15 @@
 use std::borrow::Cow;
 use std::iter;
 use std::mem;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use maki_highlight::CodeHighlighter;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    Block, BlockKind, Emphasis, InlineSpan, LineBlock, SpanKind, block_prefix, parse, parse_inline,
+    Block, BlockKind, Emphasis, InlineSpan, LineBlock, Source, SpanKind, block_prefix, latex,
+    parse_at, parse_inline, parse_inline_at,
 };
 
 pub const CODE_BAR: &str = "│ ";
@@ -43,6 +46,60 @@ pub enum StyleToken {
     ListMarker,
     TableBorder,
     HorizontalRule,
+    Math,
+}
+
+/// How LaTeX is presented. Terminals cannot typeset maths, so the choice is
+/// between a Unicode approximation and the source itself. Fonts vary in how
+/// much of the maths block they cover, which is why this is configurable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MathStyle {
+    /// `$x^2$` renders as `x²`.
+    Unicode,
+    /// `$x^2$` renders as `x^2`, delimiters stripped.
+    Raw,
+}
+
+/// Renderers are built ad hoc all over the UI, including in draw paths that
+/// have no route to the config, so the choice lives here like the theme.
+static MATH_STYLE: AtomicU8 = AtomicU8::new(MathStyle::Unicode as u8);
+
+impl Default for MathStyle {
+    fn default() -> Self {
+        match MATH_STYLE.load(Ordering::Relaxed) {
+            x if x == Self::Raw as u8 => Self::Raw,
+            _ => Self::Unicode,
+        }
+    }
+}
+
+impl MathStyle {
+    /// Applies to renderers built after this call.
+    pub fn set_global(self) {
+        MATH_STYLE.store(self as u8, Ordering::Relaxed);
+    }
+}
+
+impl MathStyle {
+    fn apply(self, latex: &str) -> Option<String> {
+        match self {
+            Self::Unicode => latex::to_unicode(latex),
+            Self::Raw => None,
+        }
+    }
+}
+
+/// Where a rendered span's text came from. Selection reads this to rebuild
+/// the original markdown instead of scraping glyphs off the screen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpanSource {
+    /// A slice of the parsed text.
+    Range(Source),
+    /// Renderer chrome with no counterpart in the source: code gutters,
+    /// table borders, bullets, cell padding, rule fill. Dropped on copy.
+    Chrome,
+    /// No provenance available; consumers fall back to the rendered text.
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,14 +107,26 @@ pub struct Span {
     pub text: String,
     pub style: StyleToken,
     pub emphasis: Emphasis,
+    pub source: SpanSource,
 }
 
 impl Span {
+    /// For spans whose text has no source counterpart.
+    pub fn chrome(text: impl Into<String>, style: StyleToken) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            emphasis: Emphasis::default(),
+            source: SpanSource::Chrome,
+        }
+    }
+
     pub fn new(text: impl Into<String>, style: StyleToken) -> Self {
         Self {
             text: text.into(),
             style,
             emphasis: Emphasis::default(),
+            source: SpanSource::Unknown,
         }
     }
 
@@ -66,6 +135,42 @@ impl Span {
             text: text.into(),
             style,
             emphasis,
+            source: SpanSource::Unknown,
+        }
+    }
+
+    pub fn sourced(
+        text: impl Into<String>,
+        style: StyleToken,
+        emphasis: Emphasis,
+        source: Source,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            emphasis,
+            source: SpanSource::Range(source),
+        }
+    }
+
+    /// Byte sub-slice of this span. Verbatim ranges narrow with the text;
+    /// atomic ones keep the whole range, since any part of them still
+    /// stands for the entire construct.
+    fn slice(&self, start: usize, end: usize) -> Self {
+        let source = match &self.source {
+            SpanSource::Range(Source {
+                range,
+                verbatim: true,
+            }) => SpanSource::Range(Source::verbatim(
+                range.start + start as u32..range.start + end as u32,
+            )),
+            other => other.clone(),
+        };
+        Self {
+            text: self.text[start..end].to_owned(),
+            style: self.style.clone(),
+            emphasis: self.emphasis,
+            source,
         }
     }
 }
@@ -79,6 +184,7 @@ pub enum LineKind {
     TableBorder,
     TableRow,
     HorizontalRule,
+    Math,
     Blank,
 }
 
@@ -86,6 +192,10 @@ pub enum LineKind {
 pub struct Line {
     pub kind: LineKind,
     pub spans: Vec<Span>,
+    /// Source bytes for the whole row, including syntax the spans dropped:
+    /// heading hashes, list markers, emphasis delimiters, code fences, table
+    /// pipes. A selection covering the row copies this instead of the spans.
+    pub source: Option<Range<u32>>,
 }
 
 impl Line {
@@ -93,6 +203,7 @@ impl Line {
         Self {
             kind: LineKind::Blank,
             spans: Vec::new(),
+            source: None,
         }
     }
 
@@ -117,6 +228,7 @@ pub struct Renderer {
     table_col_widths: Vec<Vec<usize>>,
     theme_gen: u64,
     wrap_paragraphs: bool,
+    math: MathStyle,
 }
 
 impl Default for Renderer {
@@ -126,6 +238,7 @@ impl Default for Renderer {
             table_col_widths: Vec::new(),
             theme_gen: 0,
             wrap_paragraphs: true,
+            math: MathStyle::default(),
         }
     }
 }
@@ -144,13 +257,18 @@ impl Renderer {
         }
     }
 
+    pub fn with_math(mut self, math: MathStyle) -> Self {
+        self.math = math;
+        self
+    }
+
     pub fn render(&mut self, text: &str, width: u16, theme_gen: u64) -> Vec<Line> {
         if theme_gen != self.theme_gen {
             self.highlighters.clear();
             self.theme_gen = theme_gen;
         }
-        let text = text.trim_start_matches('\n');
-        let blocks = parse(text);
+        let trimmed = text.trim_start_matches('\n');
+        let blocks = parse_at(trimmed, text.len() - trimmed.len());
         let mut lines: Vec<Line> = Vec::new();
         let mut state = RenderState {
             code_idx: 0,
@@ -161,6 +279,7 @@ impl Renderer {
         let ctx = RenderCtx {
             width,
             wrap_paragraphs: self.wrap_paragraphs,
+            math: self.math,
         };
 
         for block in &blocks {
@@ -177,6 +296,7 @@ impl Renderer {
 struct RenderCtx {
     width: u16,
     wrap_paragraphs: bool,
+    math: MathStyle,
 }
 
 struct RenderState<'a> {
@@ -189,16 +309,39 @@ struct RenderState<'a> {
 /// Streaming can split tokens differently than a oneshot render because the
 /// highlighter sees partial input. Merging identical neighbours keeps the
 /// span shape stable.
+/// Only contiguous verbatim ranges can join; anything else has to stay split
+/// or the merged span would point at the wrong bytes.
+fn merge_sources(a: &SpanSource, b: &SpanSource) -> Option<SpanSource> {
+    match (a, b) {
+        (SpanSource::Chrome, SpanSource::Chrome) => Some(SpanSource::Chrome),
+        (SpanSource::Unknown, SpanSource::Unknown) => Some(SpanSource::Unknown),
+        (
+            SpanSource::Range(Source {
+                range: x,
+                verbatim: true,
+            }),
+            SpanSource::Range(Source {
+                range: y,
+                verbatim: true,
+            }),
+        ) if x.end == y.start => Some(SpanSource::Range(Source::verbatim(x.start..y.end))),
+        _ => None,
+    }
+}
+
 fn coalesce_adjacent_spans(spans: &mut Vec<Span>) {
     if spans.len() < 2 {
         return;
     }
     let mut write = 0;
     for read in 1..spans.len() {
-        if spans[write].style == spans[read].style && spans[write].emphasis == spans[read].emphasis
+        if spans[write].style == spans[read].style
+            && spans[write].emphasis == spans[read].emphasis
+            && let Some(source) = merge_sources(&spans[write].source, &spans[read].source)
         {
             let tail = mem::take(&mut spans[read].text);
             spans[write].text.push_str(&tail);
+            spans[write].source = source;
         } else {
             write += 1;
             if write != read {
@@ -221,17 +364,40 @@ fn render_block(
                 render_line_block(lb, lines, ctx);
             }
         }
-        Block::Code { lang, code } => {
+        Block::Code {
+            lang,
+            code,
+            source,
+            code_start,
+        } => {
             ensure_blank_line(lines);
             if state.code_idx >= state.highlighters.len() {
                 state.highlighters.push(CodeHighlighter::new(lang));
             }
             let segments: Vec<_> = state.highlighters[state.code_idx].update(code).to_vec();
             let start = lines.len();
-            for segs in segments {
-                let mut spans = vec![Span::new(CODE_BAR, StyleToken::CodeBar)];
+            let last = segments.len().saturating_sub(1);
+            // Highlighting expands tabs, so segment lengths do not track
+            // source bytes. Line ranges come from `code` itself, and the
+            // fences ride on the first and last rows so a full selection
+            // copies back a complete fenced block.
+            let mut at = *code_start;
+            let mut src_lines = code.split('\n');
+            for (i, segs) in segments.into_iter().enumerate() {
+                let src_len = src_lines.next().map_or(0, str::len) as u32;
+                let mut spans = vec![Span::chrome(CODE_BAR, StyleToken::CodeBar)];
+                // Tab expansion breaks the byte correspondence, so those
+                // lines fall back to one atomic range for the whole row.
+                let exact = segs.iter().map(|s| s.text.len()).sum::<usize>() == src_len as usize;
+                let mut col = at;
                 for seg in segs {
-                    spans.push(Span::new(
+                    let len = seg.text.len() as u32;
+                    let source = match exact {
+                        true => Source::verbatim(col..col + len),
+                        false => Source::atomic(at..at + src_len),
+                    };
+                    col += len;
+                    spans.push(Span::sourced(
                         seg.text,
                         StyleToken::Highlight {
                             fg: seg.fg,
@@ -239,19 +405,30 @@ fn render_block(
                             italic: seg.italic,
                             underline: seg.underline,
                         },
+                        Emphasis::default(),
+                        source,
                     ));
                 }
                 coalesce_adjacent_spans(&mut spans);
+                let from = if i == 0 { source.start } else { at };
+                let to = if i == last { source.end } else { at + src_len };
                 lines.push(Line {
                     kind: LineKind::Code,
                     spans,
+                    source: Some(from..to),
                 });
+                at += src_len + 1;
             }
             wrap_code_lines(lines, start, ctx.width);
             ensure_blank_line(lines);
             state.code_idx += 1;
         }
-        Block::Table { rows, header_end } => {
+        Block::Table {
+            rows,
+            header_end,
+            row_sources,
+            separator,
+        } => {
             ensure_blank_line(lines);
             if state.table_idx >= state.table_col_widths.len() {
                 state
@@ -259,23 +436,68 @@ fn render_block(
                     .resize_with(state.table_idx + 1, Vec::new);
             }
             let pw = &mut state.table_col_widths[state.table_idx];
-            lines.extend(render_table(rows, *header_end, ctx.width, pw));
+            let table = TableSource {
+                rows: row_sources,
+                separator,
+            };
+            lines.extend(render_table(
+                rows,
+                *header_end,
+                ctx.width,
+                pw,
+                &table,
+                ctx.math,
+            ));
             ensure_blank_line(lines);
             state.table_idx += 1;
+        }
+        Block::Math { latex, source } => {
+            ensure_blank_line(lines);
+            // Every row points at the whole block: the Unicode is not a
+            // slice of the source, and `\\` rows do not map to source lines.
+            let rows = match ctx.math {
+                MathStyle::Unicode => latex::to_unicode_rows(latex),
+                MathStyle::Raw => None,
+            };
+            let rows = rows
+                .filter(|r: &Vec<String>| !r.is_empty())
+                .unwrap_or_else(|| {
+                    latex
+                        .lines()
+                        .map(str::trim_end)
+                        .map(str::to_owned)
+                        .collect()
+                });
+            for row in rows {
+                lines.push(Line {
+                    kind: LineKind::Math,
+                    spans: vec![Span::sourced(
+                        row,
+                        StyleToken::Math,
+                        Emphasis::default(),
+                        Source::atomic(source.clone()),
+                    )],
+                    source: Some(source.clone()),
+                });
+            }
+            ensure_blank_line(lines);
         }
     }
 }
 
 fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
+    let source = Some(lb.source.clone());
+
     if matches!(lb.kind, BlockKind::HorizontalRule) {
         lines.push(Line {
             kind: LineKind::HorizontalRule,
-            spans: vec![Span::new(hr_text(ctx.width), StyleToken::HorizontalRule)],
+            spans: vec![Span::chrome(hr_text(ctx.width), StyleToken::HorizontalRule)],
+            source,
         });
         return;
     }
 
-    let marker = block_prefix(&lb.kind).map(|p| Span::new(p, StyleToken::ListMarker));
+    let marker = block_prefix(&lb.kind).map(|p| Span::chrome(p, StyleToken::ListMarker));
 
     let is_heading = matches!(lb.kind, BlockKind::Heading(_));
     let kind = match &lb.kind {
@@ -291,18 +513,18 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         text,
         kind: sk,
         emphasis,
-    } in parse_inline(&lb.inline)
+        source,
+    } in parse_inline_at(&lb.inline, lb.inline_start)
     {
-        // Code keeps its own token inside headings so consumers can layer
-        // code colours on top. The Lua bridge collapses to one name per span.
-        let style = if sk == SpanKind::Code {
-            StyleToken::InlineCode
-        } else if is_heading {
-            StyleToken::Heading
-        } else {
-            StyleToken::Text
+        // Code and maths keep their own token inside headings so consumers
+        // can layer colours on top. The Lua bridge collapses to one name.
+        let (style, text) = match sk {
+            SpanKind::Code => (StyleToken::InlineCode, text),
+            SpanKind::Math => (StyleToken::Math, ctx.math.apply(&text).unwrap_or(text)),
+            SpanKind::Text if is_heading => (StyleToken::Heading, text),
+            SpanKind::Text => (StyleToken::Text, text),
         };
-        content_spans.push(Span::with_emphasis(text, style, emphasis));
+        content_spans.push(Span::sourced(text, style, emphasis, source));
     }
 
     let marker_width = marker.as_ref().map_or(0, |m| m.text.width());
@@ -314,7 +536,11 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
             spans.push(m);
         }
         spans.extend(content_spans);
-        lines.push(Line { kind, spans });
+        lines.push(Line {
+            kind,
+            spans,
+            source,
+        });
         return;
     }
 
@@ -326,13 +552,14 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
             lines.push(Line {
                 kind: kind.clone(),
                 spans: vec![mk],
+                source: source.clone(),
             });
         }
         (None, None, width)
     } else {
         let indent = marker
             .as_ref()
-            .map(|_| Span::new(" ".repeat(marker_width), StyleToken::ListMarker));
+            .map(|_| Span::chrome(" ".repeat(marker_width), StyleToken::ListMarker));
         (marker, indent, width - marker_width)
     };
 
@@ -343,6 +570,7 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
             lines.push(Line {
                 kind,
                 spans: vec![m],
+                source,
             });
         }
         return;
@@ -362,6 +590,7 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         lines.push(Line {
             kind: kind.clone(),
             spans,
+            source: source.clone(),
         });
     }
 }
@@ -414,7 +643,13 @@ fn wrap_code_lines(lines: &mut Vec<Line>, start: usize, width: u16) {
         if line.width() <= width {
             lines.push(line);
         } else {
-            lines.extend(split_line_with_bar(line, width));
+            let source = line.source.clone();
+            lines.extend(split_line_with_bar(line, width).into_iter().map(|mut l| {
+                // Continuation rows stand for the same source line, so a
+                // selection across the wrap copies it once.
+                l.source = source.clone();
+                l
+            }));
         }
     }
 }
@@ -434,50 +669,44 @@ fn split_line_with_bar(line: Line, width: usize) -> Vec<Line> {
     let mut remaining = first_avail;
 
     for span in content_spans {
-        let mut text = span.text.as_str();
-        let style = span.style.clone();
-        let emphasis = span.emphasis;
+        let mut taken = 0;
 
-        while !text.is_empty() {
+        while taken < span.text.len() {
+            let text = &span.text[taken..];
             let fits = fit_width(text, remaining);
             if fits == 0 {
                 if current_spans.len() > 1 {
                     result.push(Line {
                         kind: LineKind::Code,
                         spans: mem::take(&mut current_spans),
+                        source: None,
                     });
-                    current_spans = vec![Span::new(CODE_BAR_WRAP, StyleToken::CodeBar)];
+                    current_spans = vec![Span::chrome(CODE_BAR_WRAP, StyleToken::CodeBar)];
                     remaining = cont_avail;
                     continue;
                 }
                 let ch_len = text.chars().next().map_or(1, char::len_utf8);
-                current_spans.push(Span::with_emphasis(
-                    text[..ch_len].to_owned(),
-                    style.clone(),
-                    emphasis,
-                ));
-                text = &text[ch_len..];
+                current_spans.push(span.slice(taken, taken + ch_len));
+                taken += ch_len;
                 result.push(Line {
                     kind: LineKind::Code,
                     spans: mem::take(&mut current_spans),
+                    source: None,
                 });
-                current_spans = vec![Span::new(CODE_BAR_WRAP, StyleToken::CodeBar)];
+                current_spans = vec![Span::chrome(CODE_BAR_WRAP, StyleToken::CodeBar)];
                 remaining = cont_avail;
                 continue;
             }
-            current_spans.push(Span::with_emphasis(
-                text[..fits].to_owned(),
-                style.clone(),
-                emphasis,
-            ));
+            current_spans.push(span.slice(taken, taken + fits));
             remaining -= text[..fits].width();
-            text = &text[fits..];
-            if !text.is_empty() {
+            taken += fits;
+            if taken < span.text.len() {
                 result.push(Line {
                     kind: LineKind::Code,
                     spans: mem::take(&mut current_spans),
+                    source: None,
                 });
-                current_spans = vec![Span::new(CODE_BAR_WRAP, StyleToken::CodeBar)];
+                current_spans = vec![Span::chrome(CODE_BAR_WRAP, StyleToken::CodeBar)];
                 remaining = cont_avail;
             }
         }
@@ -487,14 +716,20 @@ fn split_line_with_bar(line: Line, width: usize) -> Vec<Line> {
         result.push(Line {
             kind: LineKind::Code,
             spans: current_spans,
+            source: None,
         });
     }
 
     result
 }
 
-fn cell_display_width(cell: &str) -> usize {
-    parse_inline(cell).iter().map(|s| s.text.width()).sum()
+/// Measured from the spans that will be drawn, so a cell whose maths
+/// shrinks from `\pi r^2` to `πr²` is not allotted the width of its source.
+fn cell_display_width(cell: &str, math: MathStyle) -> usize {
+    cell_spans(cell, false, None, math)
+        .iter()
+        .map(|s| s.text.width())
+        .sum()
 }
 
 fn constrain_col_widths(col_widths: &mut [usize], available: usize) {
@@ -533,25 +768,22 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
     let mut remaining = max_width;
 
     for span in spans {
-        let mut text = span.text.as_str();
-        let style = span.style.clone();
-        let emphasis = span.emphasis;
+        let mut taken = 0;
 
-        while !text.is_empty() {
+        while taken < span.text.len() {
+            let text = &span.text[taken..];
             let fits = fit_width(text, remaining);
             if fits == 0 {
                 if current.is_empty() {
                     let ch_len = text.chars().next().map_or(1, char::len_utf8);
-                    current.push(Span::with_emphasis(
-                        text[..ch_len].to_owned(),
-                        style.clone(),
-                        emphasis,
-                    ));
-                    text = &text[ch_len..];
+                    current.push(span.slice(taken, taken + ch_len));
+                    taken += ch_len;
                 }
                 result.push(mem::take(&mut current));
                 remaining = max_width;
-                text = text.strip_prefix(' ').unwrap_or(text);
+                if span.text[taken..].starts_with(' ') {
+                    taken += 1;
+                }
                 continue;
             }
             let (take, skip) = if fits < text.len() {
@@ -562,14 +794,10 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
             } else {
                 (fits, fits)
             };
-            current.push(Span::with_emphasis(
-                text[..take].to_owned(),
-                style.clone(),
-                emphasis,
-            ));
+            current.push(span.slice(taken, taken + take));
             remaining -= text[..take].width();
-            text = &text[skip..];
-            if take < fits && !text.is_empty() {
+            taken += skip;
+            if take < fits && taken < span.text.len() {
                 result.push(mem::take(&mut current));
                 remaining = max_width;
             }
@@ -585,7 +813,10 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.text.width()).sum()
 }
 
-fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
+/// Cells arrive as owned strings with their pipe offsets already lost, so
+/// every cell span points atomically at the whole source row. Selecting into
+/// a table therefore copies parseable rows rather than bare cell text.
+fn cell_spans(cell: &str, header: bool, row: Option<&Range<u32>>, math: MathStyle) -> Vec<Span> {
     parse_inline(cell)
         .into_iter()
         .map(
@@ -593,20 +824,33 @@ fn cell_spans(cell: &str, header: bool) -> Vec<Span> {
                  text,
                  kind,
                  emphasis,
+                 source: _,
              }| {
                 let mut emphasis = emphasis;
                 if header {
                     emphasis.bold = true;
                 }
-                let style = if kind == SpanKind::Code {
-                    StyleToken::InlineCode
-                } else {
-                    StyleToken::Text
+                let (style, text) = match kind {
+                    SpanKind::Code => (StyleToken::InlineCode, text),
+                    SpanKind::Math => (StyleToken::Math, math.apply(&text).unwrap_or(text)),
+                    SpanKind::Text => (StyleToken::Text, text),
                 };
-                Span::with_emphasis(text, style, emphasis)
+                match row {
+                    Some(range) => {
+                        Span::sourced(text, style, emphasis, Source::atomic(range.clone()))
+                    }
+                    None => Span::with_emphasis(text, style, emphasis),
+                }
             },
         )
         .collect()
+}
+
+/// Source lines for a table. Cells are detached from the text by the time
+/// they reach the renderer, so provenance stays at row granularity.
+struct TableSource<'a> {
+    rows: &'a [Range<u32>],
+    separator: &'a Range<u32>,
 }
 
 fn render_table(
@@ -614,6 +858,8 @@ fn render_table(
     header_end: usize,
     width: u16,
     persistent_widths: &mut Vec<usize>,
+    table: &TableSource<'_>,
+    math: MathStyle,
 ) -> Vec<Line> {
     let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if col_count == 0 {
@@ -623,13 +869,13 @@ fn render_table(
     let overhead = col_count * 3 + 1;
     let min_box_width = overhead + col_count * MIN_COL_WIDTH;
     if (width as usize) < min_box_width {
-        return render_table_compact(rows, header_end, width);
+        return render_table_compact(rows, header_end, width, table, math);
     }
 
     let mut col_widths = vec![0usize; col_count];
     for row in rows {
         for (c, cell) in row.iter().enumerate() {
-            col_widths[c] = col_widths[c].max(cell_display_width(cell));
+            col_widths[c] = col_widths[c].max(cell_display_width(cell, math));
         }
     }
 
@@ -645,22 +891,23 @@ fn render_table(
 
     let mut lines = Vec::new();
 
-    let border = |left: &str, mid: &str, right: &str, fill: &str| -> Line {
-        let mut spans = vec![Span::new(left, StyleToken::TableBorder)];
+    let border = |left: &str, mid: &str, right: &str, source: Option<Range<u32>>| -> Line {
+        let mut spans = vec![Span::chrome(left, StyleToken::TableBorder)];
         for (i, &w) in col_widths.iter().enumerate() {
-            spans.push(Span::new(fill.repeat(w + 2), StyleToken::TableBorder));
+            spans.push(Span::chrome("─".repeat(w + 2), StyleToken::TableBorder));
             if i < col_count - 1 {
-                spans.push(Span::new(mid, StyleToken::TableBorder));
+                spans.push(Span::chrome(mid, StyleToken::TableBorder));
             }
         }
-        spans.push(Span::new(right, StyleToken::TableBorder));
+        spans.push(Span::chrome(right, StyleToken::TableBorder));
         Line {
             kind: LineKind::TableBorder,
             spans,
+            source,
         }
     };
 
-    lines.push(border("╭", "┬", "╮", "─"));
+    lines.push(border("╭", "┬", "╮", None));
 
     for (ri, row) in rows.iter().enumerate() {
         let header = ri < header_end;
@@ -668,7 +915,10 @@ fn render_table(
         let wrapped_cells: Vec<Vec<Vec<Span>>> = (0..col_count)
             .map(|c| {
                 let cell = row.get(c).map(String::as_str).unwrap_or("");
-                wrap_spans(cell_spans(cell, header), col_widths[c])
+                wrap_spans(
+                    cell_spans(cell, header, table.rows.get(ri), math),
+                    col_widths[c],
+                )
             })
             .collect();
 
@@ -680,7 +930,7 @@ fn render_table(
         };
 
         for line_idx in 0..row_height {
-            let mut spans = vec![Span::new("│ ", StyleToken::TableBorder)];
+            let mut spans = vec![Span::chrome("│ ", StyleToken::TableBorder)];
             for (c, &w) in col_widths.iter().enumerate() {
                 let sub_line = wrapped_cells[c].get(line_idx);
                 let content_width = sub_line.map_or(0, |sl| spans_width(sl));
@@ -690,35 +940,73 @@ fn render_table(
                 if let Some(sl) = sub_line {
                     spans.extend(sl.iter().cloned());
                 }
-                spans.push(Span::with_emphasis(
-                    " ".repeat(pad + 1),
-                    StyleToken::Text,
-                    row_emphasis,
-                ));
+                let mut padding = Span::chrome(" ".repeat(pad + 1), StyleToken::Text);
+                padding.emphasis = row_emphasis;
+                spans.push(padding);
                 if c < col_count - 1 {
-                    spans.push(Span::new("│ ", StyleToken::TableBorder));
+                    spans.push(Span::chrome("│ ", StyleToken::TableBorder));
                 } else {
-                    spans.push(Span::new("│", StyleToken::TableBorder));
+                    spans.push(Span::chrome("│", StyleToken::TableBorder));
                 }
             }
             lines.push(Line {
                 kind: LineKind::TableRow,
                 spans,
+                source: table.rows.get(ri).cloned(),
             });
         }
 
         if ri + 1 < rows.len() {
-            lines.push(border("├", "┼", "┤", "─"));
+            // The divider stands in for the `| --- |` line that `rows` drops,
+            // so copying a whole table yields parseable markdown.
+            let divider = (ri + 1 == header_end).then(|| table.separator.clone());
+            lines.push(border("├", "┼", "┤", divider));
         }
     }
 
-    lines.push(border("╰", "┴", "╯", "─"));
+    lines.push(border("╰", "┴", "╯", None));
 
     lines
 }
 
 pub fn hr_text(width: u16) -> String {
     iter::repeat_n(HR_CHAR, width as usize).collect()
+}
+
+/// Collapses source ranges into the fewest slices that reproduce the
+/// original text. Ranges separated only by whitespace merge, so the blank
+/// lines between blocks survive. Any other gap stays split: it holds content
+/// that was deliberately not rendered, such as collapsed tool output, and
+/// copying across it must not resurrect it.
+pub fn merge_source_ranges(
+    text: &str,
+    ranges: impl IntoIterator<Item = Range<u32>>,
+) -> Vec<Range<u32>> {
+    let mut merged: Vec<Range<u32>> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(prev)
+                if range.start <= prev.end
+                    || text
+                        .get(prev.end as usize..range.start as usize)
+                        .is_some_and(|gap| gap.chars().all(char::is_whitespace)) =>
+            {
+                prev.end = prev.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// The source behind a set of ranges. Non-contiguous runs join with a
+/// newline so unrendered content between them stays out.
+pub fn source_text(text: &str, ranges: impl IntoIterator<Item = Range<u32>>) -> String {
+    merge_source_ranges(text, ranges)
+        .into_iter()
+        .filter_map(|r| text.get(r.start as usize..r.end as usize))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn truncate_long_lines(text: &str) -> Cow<'_, str> {
@@ -752,22 +1040,38 @@ pub fn truncate_long_lines_at(text: &str, max_bytes: usize) -> Cow<'_, str> {
 }
 
 /// Fallback when the terminal is too narrow for box-drawing borders.
-fn render_table_compact(rows: &[Vec<String>], header_end: usize, width: u16) -> Vec<Line> {
+fn render_table_compact(
+    rows: &[Vec<String>],
+    header_end: usize,
+    width: u16,
+    table: &TableSource<'_>,
+    math: MathStyle,
+) -> Vec<Line> {
     const CELL_SEP: &str = " | ";
+    // No divider row exists here, so the `| --- |` line rides on the row it
+    // follows. Without it a copied table would not parse back.
+    let row_source = |ri: usize| -> Option<Range<u32>> {
+        let row = table.rows.get(ri)?.clone();
+        Some(match ri + 1 == header_end {
+            true => row.start..table.separator.end.max(row.end),
+            false => row,
+        })
+    };
     let mut lines = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
         let header = ri < header_end;
         let mut spans: Vec<Span> = Vec::new();
         for (c, cell) in row.iter().enumerate() {
             if c > 0 {
-                spans.push(Span::new(CELL_SEP, StyleToken::TableBorder));
+                spans.push(Span::chrome(CELL_SEP, StyleToken::TableBorder));
             }
-            spans.extend(cell_spans(cell, header));
+            spans.extend(cell_spans(cell, header, row_source(ri).as_ref(), math));
         }
         for row_spans in wrap_spans(spans, width as usize) {
             lines.push(Line {
                 kind: LineKind::TableRow,
                 spans: row_spans,
+                source: row_source(ri),
             });
         }
     }
@@ -798,6 +1102,188 @@ mod tests {
     #[test]
     fn render_empty_input_yields_no_lines() {
         assert!(render("", TEST_WIDTH).is_empty());
+    }
+
+    /// Merge the source ranges of every rendered row and slice them back out
+    /// of the input. Runs that are not contiguous join with a newline, which
+    /// is what the copy path does.
+    fn rebuild_from_line_sources(text: &str, width: u16) -> String {
+        let lines = render(text, width);
+        source_text(text, lines.iter().filter_map(|l| l.source.clone()))
+    }
+
+    const ROUND_TRIP_DOC: &str = "# Title with **bold**\n\nA paragraph with `code` and *italic*.\n\n- first item\n- second item\n\n1. ordered\n2. also ordered\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n| Name | Value |\n| --- | --- |\n| foo | 42 |\n\n---\n\nTrailing paragraph.";
+
+    #[test_case(ROUND_TRIP_DOC; "mixed_document")]
+    #[test_case("# Heading"; "heading_hashes")]
+    #[test_case("**bold** and _italic_"; "emphasis_delimiters")]
+    #[test_case("- a\n- b"; "bullets")]
+    #[test_case("```\ncode\n```"; "fenced_block")]
+    #[test_case("| a | b |\n| --- | --- |\n| 1 | 2 |"; "table_pipes")]
+    #[test_case("---"; "horizontal_rule")]
+    #[test_case("a `x|y` b"; "inline_code")]
+    fn line_sources_reconstruct_the_source(input: &str) {
+        assert_eq!(rebuild_from_line_sources(input, TEST_WIDTH), input);
+    }
+
+    #[test]
+    fn line_sources_survive_narrow_widths() {
+        // Wrapping splits rows but must not duplicate or drop source bytes.
+        for width in [10, 20, 40] {
+            assert_eq!(
+                rebuild_from_line_sources(ROUND_TRIP_DOC, width),
+                ROUND_TRIP_DOC,
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_newlines_do_not_shift_source_ranges() {
+        let input = "\n\n# Title";
+        assert_eq!(rebuild_from_line_sources(input, TEST_WIDTH), "# Title");
+    }
+
+    #[test]
+    fn span_sources_are_verbatim_slices_of_the_input() {
+        let lines = render(ROUND_TRIP_DOC, TEST_WIDTH);
+        let mut checked = 0;
+        for span in lines.iter().flat_map(|l| &l.spans) {
+            if let SpanSource::Range(Source {
+                range,
+                verbatim: true,
+            }) = &span.source
+            {
+                let slice = &ROUND_TRIP_DOC[range.start as usize..range.end as usize];
+                assert_eq!(
+                    slice, span.text,
+                    "span {:?} misreports its range",
+                    span.text
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected verbatim spans to check");
+    }
+
+    fn math_spans(lines: &[Line]) -> Vec<&str> {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.style == StyleToken::Math)
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    #[test_case("Value $x^2$ here", &["x²"]; "inline_dollar")]
+    #[test_case(r"Value \(x^2\) here", &["x²"]; "inline_paren")]
+    #[test_case("Both $$a+b$$ inline", &["a+b"]; "same_line_double_dollar")]
+    #[test_case(r"Sum $\sum_{i=1}^{n} i$", &["∑ᵢ₌₁ⁿ i"]; "inline_sum")]
+    #[test_case("$$\nE = mc^2\n$$", &["E = mc²"]; "display_block")]
+    #[test_case("\\[\nx^2\n\\]", &["x²"]; "display_bracket")]
+    #[test_case("$$a = b \\\\ c = d$$", &["a = b", "c = d"]; "display_rows")]
+    fn math_renders_as_unicode(input: &str, expected: &[&str]) {
+        assert_eq!(math_spans(&render(input, TEST_WIDTH)), expected);
+    }
+
+    #[test_case("It costs $5 and $10 total"; "currency_pair")]
+    #[test_case("Cost is $5 today"; "single_price")]
+    #[test_case("Empty $$ delimiters"; "empty_content")]
+    #[test_case("Unclosed $x^2 stays plain"; "unterminated")]
+    fn non_math_dollars_stay_plain(input: &str) {
+        let lines = render(input, TEST_WIDTH);
+        assert!(math_spans(&lines).is_empty(), "{input:?} became maths");
+        let visible: String = lines[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(visible, input);
+    }
+
+    /// Table cells are parsed separately from prose, so they need their own
+    /// maths handling and their own width measurement to match.
+    #[test]
+    fn table_cells_render_maths_and_size_to_it() {
+        let lines = render("| a | b |\n| --- | --- |\n| $\\pi r^2$ | x |", TEST_WIDTH);
+        assert_eq!(math_spans(&lines), ["π r²"]);
+        let body = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.text.contains("π r²")))
+            .expect("body row");
+        let header = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.text.contains('a')))
+            .expect("header row");
+        let width = |l: &Line| l.spans.iter().map(|s| s.text.width()).sum::<usize>();
+        assert_eq!(width(body), width(header), "columns must line up");
+    }
+
+    #[test]
+    fn latex_signal_beats_the_currency_heuristic() {
+        assert_eq!(math_spans(&render("Try $2^n$ here", TEST_WIDTH)), ["2ⁿ"]);
+    }
+
+    /// Before display maths was a block, the line classifier saw its rows:
+    /// `- x` became a bullet and `---` a horizontal rule.
+    #[test]
+    fn display_math_rows_are_not_classified_as_markdown() {
+        let lines = render("$$\n- x\n---\n# y\n$$", TEST_WIDTH);
+        assert!(
+            lines
+                .iter()
+                .all(|l| matches!(l.kind, LineKind::Math | LineKind::Blank)),
+            "maths rows leaked into the line classifier: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn math_inside_code_is_not_math() {
+        let lines = render("```\n$$\nx^2\n$$\n```", TEST_WIDTH);
+        assert!(math_spans(&lines).is_empty());
+        assert!(lines.iter().any(|l| l.kind == LineKind::Code));
+    }
+
+    #[test]
+    fn inline_math_is_atomic_and_reports_its_delimiters() {
+        let input = "a $x^2$ b";
+        let lines = render(input, TEST_WIDTH);
+        let span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.style == StyleToken::Math)
+            .expect("maths span");
+        let SpanSource::Range(source) = &span.source else {
+            panic!("maths span must carry a source")
+        };
+        assert!(!source.verbatim, "maths must copy atomically");
+        assert_eq!(
+            &input[source.range.start as usize..source.range.end as usize],
+            "$x^2$"
+        );
+    }
+
+    #[test_case("Value $x^2$ here"; "inline")]
+    #[test_case("$$\nE = mc^2\n$$"; "display")]
+    #[test_case("Text\n\n$$\n\\frac{a}{b}\n$$\n\nMore"; "display_between_paragraphs")]
+    fn math_round_trips_to_source(input: &str) {
+        assert_eq!(rebuild_from_line_sources(input, TEST_WIDTH), input);
+    }
+
+    #[test]
+    fn raw_style_shows_latex_source() {
+        let lines = Renderer::new().with_math(MathStyle::Raw).render(
+            "$x^2$ and\n\n$$\n\\alpha\n$$",
+            TEST_WIDTH,
+            0,
+        );
+        assert_eq!(math_spans(&lines), ["x^2", "\\alpha"]);
+    }
+
+    #[test]
+    fn chrome_spans_carry_no_source() {
+        let lines = render("- item\n\n```\nx\n```", TEST_WIDTH);
+        for span in lines.iter().flat_map(|l| &l.spans) {
+            if matches!(span.style, StyleToken::ListMarker | StyleToken::CodeBar) {
+                assert_eq!(span.source, SpanSource::Chrome, "{:?}", span.text);
+            }
+        }
     }
 
     #[test]
@@ -1021,6 +1507,7 @@ mod tests {
         let para = |t| Line {
             kind: LineKind::Paragraph,
             spans: vec![Span::new(t, StyleToken::Text)],
+            source: None,
         };
         let mut lines = vec![
             para("a"),

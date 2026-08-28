@@ -457,6 +457,7 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    CopyMessage,
 }
 
 pub enum UiAction {

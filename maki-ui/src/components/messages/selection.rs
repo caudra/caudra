@@ -43,12 +43,6 @@ pub(super) fn extract_selection_text(
         // The rows we copy come from that wrap, so measure and clamp against
         // it, and take the whole segment whenever the selection covers it.
         let drawn = seg.drawn_height(width);
-        let tmp_area = Rect::new(0, 0, width, drawn);
-        let mut tmp = Buffer::empty(tmp_area);
-        Paragraph::new(seg.lines().to_vec())
-            .wrap(Wrap { trim: false })
-            .render(tmp_area, &mut tmp);
-
         let rel_start = (doc_start.row.saturating_sub(seg_start) as u16).min(drawn);
         let rel_end = if doc_end.row + 1 >= seg_end {
             drawn
@@ -73,6 +67,22 @@ pub(super) fn extract_selection_text(
             end_row: rel_end.saturating_sub(1),
             end_col,
         };
+
+        // Markdown segments copy their source. Everything else (tool buffers,
+        // images, plain text) has no ranges to read, so it scrapes cells.
+        if let Some(text) = seg
+            .provenance()
+            .and_then(|p| p.extract(seg.lines(), width, &ss, rel_start, rel_end))
+        {
+            out.push_str(&text);
+            continue;
+        }
+
+        let tmp_area = Rect::new(0, 0, width, drawn);
+        let mut tmp = Buffer::empty(tmp_area);
+        Paragraph::new(seg.lines().to_vec())
+            .wrap(Wrap { trim: false })
+            .render(tmp_area, &mut tmp);
 
         let breaks = LineBreaks::from_lines(seg.lines(), width);
         selection::append_rows(&tmp, tmp_area, &ss, rel_start, rel_end, &mut out, &breaks);

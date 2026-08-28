@@ -948,6 +948,83 @@ fn extract_partial_column_selection() {
     assert_eq!(text, "world");
 }
 
+const MARKDOWN_DOC: &str = "# Title with **bold**\n\nA paragraph with `code` and *italic*.\n\n- first item\n- second item\n\n```rust\nfn main() {}\n```\n\n| Name | Value |\n| --- | --- |\n| foo | 42 |\n\nTrailing text.";
+
+/// Selecting a whole message copies the markdown that produced it, not the
+/// glyphs on screen. Without provenance this returns bullets, box-drawing
+/// borders and emphasis-stripped text.
+#[test_case(MARKDOWN_DOC; "mixed_document")]
+#[test_case("# Heading"; "heading_hashes")]
+#[test_case("**bold** and _italic_"; "emphasis_delimiters")]
+#[test_case("- alpha\n- beta"; "bullets")]
+#[test_case("```rust\nfn x() {}\n```"; "code_fences")]
+#[test_case("| a | b |\n| --- | --- |\n| 1 | 2 |"; "table_pipes")]
+#[test_case("Use `cargo test` now."; "inline_code_backticks")]
+#[test_case("Energy $E = mc^2$ today."; "inline_math")]
+#[test_case("$$\nE = mc^2\n$$"; "display_math")]
+#[test_case("It costs $5 and $10 total."; "currency_is_not_math")]
+fn select_all_copies_source_markdown(doc: &str) {
+    const WIDTH: u16 = 80;
+    let panel = panel_with_msgs(&[doc], WIDTH, 60);
+    let area = Rect::new(0, 0, WIDTH, 60);
+    let total = panel.segment_heights().iter().sum::<u16>();
+    let sel = make_sel(area, (0, 0), (total as u32, WIDTH - 1));
+    assert_eq!(panel.extract_selection_text(&sel, area), doc);
+}
+
+#[test]
+fn select_all_copies_source_at_narrow_widths() {
+    for width in [24u16, 40, 80] {
+        let panel = panel_with_msgs(&[MARKDOWN_DOC], width, 80);
+        let area = Rect::new(0, 0, width, 80);
+        let total = panel.segment_heights().iter().sum::<u16>();
+        let sel = make_sel(area, (0, 0), (total as u32, width - 1));
+        assert_eq!(
+            panel.extract_selection_text(&sel, area),
+            MARKDOWN_DOC,
+            "width {width}"
+        );
+    }
+}
+
+/// Maths renders as Unicode the source never contained, so the rendered
+/// glyphs must not be what lands on the clipboard.
+#[test]
+fn copied_math_is_latex_not_rendered_glyphs() {
+    const DOC: &str = "Energy $E = mc^2$ today.";
+    let width = 80;
+    let panel = panel_with_msgs(&[DOC], width, 24);
+    let area = Rect::new(0, 0, width, 24);
+    let sel = make_sel(area, (0, 0), (0, width - 1));
+    let copied = panel.extract_selection_text(&sel, area);
+    assert_eq!(copied, DOC);
+    assert!(
+        !copied.contains('\u{b2}'),
+        "rendered glyph leaked: {copied:?}"
+    );
+}
+
+/// The role prefix is UI chrome, so it never reaches the clipboard even when
+/// the selection starts on top of it.
+#[test]
+fn select_all_omits_the_role_prefix() {
+    let panel = panel_with_msgs(&["plain text"], 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let sel = make_sel(area, (0, 0), (0, 79));
+    assert_eq!(panel.extract_selection_text(&sel, area), "plain text");
+}
+
+/// Partial selections stay literal for verbatim spans, so dragging over part
+/// of a word still yields that part rather than the whole construct.
+#[test]
+fn partial_selection_inside_bold_keeps_sub_word_precision() {
+    let panel = panel_with_msgs(&["**bolded** tail"], 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let start = MESSAGE_START_COL;
+    let sel = make_sel(area, (0, start), (0, start + 2));
+    assert_eq!(panel.extract_selection_text(&sel, area), "bol");
+}
+
 #[test]
 fn extract_skips_out_of_range_segments() {
     let panel = panel_with_msgs(&["seg0", "seg1", "seg2"], 80, 24);

@@ -309,6 +309,10 @@ impl Chat {
         self.messages_panel.segment_search_texts()
     }
 
+    pub fn last_reply_source(&self) -> Option<String> {
+        self.messages_panel.last_reply_source()
+    }
+
     pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }

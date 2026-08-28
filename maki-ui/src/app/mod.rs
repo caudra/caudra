@@ -27,7 +27,7 @@ use crate::AppSession;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
-use crate::clipboard::ClipboardState;
+use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -1057,6 +1057,10 @@ impl App {
             return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
+        if key::COPY_MESSAGE.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::CopyMessage));
+        }
+
         None
     }
 
@@ -1091,6 +1095,18 @@ impl App {
                         vec![]
                     }
                 };
+            }
+            BuiltinAction::CopyMessage => {
+                let source = self.chats[self.active_chat].last_reply_source();
+                let message = match source {
+                    None => "Nothing to copy".to_owned(),
+                    Some(text) => match self.clipboard.copy_text(&text) {
+                        Ok(CopyResult::Noop) => "Nothing to copy".to_owned(),
+                        Ok(CopyResult::Copied) => "Copied reply as markdown".to_owned(),
+                        Err(e) => format!("Copy failed: {e}"),
+                    },
+                };
+                self.status_bar.flash(message);
             }
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
             BuiltinAction::PopQueue => {

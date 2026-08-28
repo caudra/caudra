@@ -1,3 +1,4 @@
+use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
@@ -48,6 +49,9 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
+    /// Set only for segments rendered from markdown. Selection uses it to
+    /// copy the source; without it copy falls back to scraping cells.
+    provenance: Option<Provenance>,
     pub search_text: String,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
@@ -102,8 +106,19 @@ impl Segment {
         &self.lines
     }
 
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
+    }
+
+    pub fn set_provenance(&mut self, provenance: Option<Provenance>) {
+        self.provenance = provenance;
+    }
+
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
+        // Line indices moved, so any provenance recorded for the old vector
+        // no longer lines up.
+        self.provenance = None;
         self.stale = false;
         self.invalidate_height();
     }

@@ -679,6 +679,12 @@ impl<'t> EventLoop<'t> {
         let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
+        match ui_config.math {
+            maki_config::MathStyle::Unicode => maki_markdown::render::MathStyle::Unicode,
+            maki_config::MathStyle::Raw => maki_markdown::render::MathStyle::Raw,
+        }
+        .set_global();
+
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
             storage,

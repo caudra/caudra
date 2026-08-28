@@ -17,6 +17,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+D Ctrl+D` | Exit |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
+| `Alt+C` | Copy last reply as markdown |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |

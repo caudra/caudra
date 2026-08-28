@@ -369,6 +369,7 @@ pub fn style_by_name(name: &str) -> Style {
         "italic" => t.italic,
         "bold_italic" => t.bold_italic,
         "inline_code" => t.inline_code,
+        "math" => t.math,
         "strikethrough" => t.strikethrough,
         "heading" => t.heading,
         "list_marker" => t.list_marker,
@@ -423,6 +424,7 @@ pub struct Theme {
     pub italic: Style,
     pub bold_italic: Style,
     pub inline_code: Style,
+    pub math: Style,
     pub code_block: Style,
     pub code_gutter: Style,
     pub strikethrough: Style,
@@ -774,6 +776,11 @@ impl Theme {
             inline_code: derived_style(
                 "inline_code",
                 &["function.call", "function"],
+                Modifier::empty(),
+            ),
+            math: derived_style(
+                "math",
+                &["constant.numeric", "constant", "function"],
                 Modifier::empty(),
             ),
             code_block: style("code_block"),

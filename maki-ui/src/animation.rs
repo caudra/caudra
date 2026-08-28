@@ -94,6 +94,11 @@ impl Typewriter {
         &self.buffer[..self.visible_byte_offset]
     }
 
+    /// Everything pushed so far, including text the reveal has not reached.
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
     pub fn is_animating(&self) -> bool {
         self.visible_len < self.anim_target
     }

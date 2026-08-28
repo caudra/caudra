@@ -164,6 +164,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
+    pub const COPY_MESSAGE: Bind = Bind {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+C",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -332,6 +337,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::COPY_MESSAGE.label),
+        description: "Copy last reply as markdown",
         context: KeybindContext::General,
         platform: Platform::All,
     },

@@ -3,13 +3,26 @@
 //! The parser separates two orthogonal axes: `SpanKind` (text vs code) and
 //! `Emphasis` (bold, italic, strike). They compose freely, so `***x***` is
 //! bold+italic, and code inside bold keeps both.
+//!
+//! Every span and line carries the byte range it came from so consumers can
+//! recover the original markdown on copy. Rendering drops syntax (heading
+//! hashes, emphasis delimiters, fences, list markers); the ranges put it
+//! back without storing a second copy of the text.
 
+pub mod latex;
 pub mod render;
+
+use std::ops::{Not, Range};
 
 const BULLET: &str = "• ";
 const LIST_INDENT_STEP: usize = 2;
 const MAX_HEADING_LEVEL: u8 = 6;
 const FENCE_MIN: usize = 3;
+const MATH_FENCE: &str = "$$";
+const MATH_PAREN_OPEN: &str = "\\(";
+const MATH_PAREN_CLOSE: &str = "\\)";
+const MATH_BRACKET_OPEN: &str = "\\[";
+const MATH_BRACKET_CLOSE: &str = "\\]";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Emphasis {
@@ -69,6 +82,37 @@ impl Emphasis {
 pub enum SpanKind {
     Text,
     Code,
+    /// LaTeX source. The renderer decides how to present it, so `text` here
+    /// is the math itself with its delimiters stripped.
+    Math,
+}
+
+/// Where a rendered span came from in the parsed text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Source {
+    pub range: Range<u32>,
+    /// `false` when the rendered text is not a byte-identical slice of
+    /// `range`, which makes the span atomic: any selection touching it
+    /// yields the whole range. Math and links set this; emphasis and code
+    /// do not, because their content is still a verbatim slice and only the
+    /// delimiters live outside it.
+    pub verbatim: bool,
+}
+
+impl Source {
+    pub fn verbatim(range: Range<u32>) -> Self {
+        Self {
+            range,
+            verbatim: true,
+        }
+    }
+
+    pub fn atomic(range: Range<u32>) -> Self {
+        Self {
+            range,
+            verbatim: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,22 +120,34 @@ pub struct InlineSpan {
     pub text: String,
     pub kind: SpanKind,
     pub emphasis: Emphasis,
+    pub source: Source,
 }
 
 impl InlineSpan {
-    pub fn text(text: impl Into<String>, emphasis: Emphasis) -> Self {
+    pub fn text(text: impl Into<String>, emphasis: Emphasis, source: Source) -> Self {
         Self {
             text: text.into(),
             kind: SpanKind::Text,
             emphasis,
+            source,
         }
     }
 
-    pub fn code(text: impl Into<String>, emphasis: Emphasis) -> Self {
+    pub fn code(text: impl Into<String>, emphasis: Emphasis, source: Source) -> Self {
         Self {
             text: text.into(),
             kind: SpanKind::Code,
             emphasis,
+            source,
+        }
+    }
+
+    pub fn math(text: impl Into<String>, emphasis: Emphasis, source: Source) -> Self {
+        Self {
+            text: text.into(),
+            kind: SpanKind::Math,
+            emphasis,
+            source,
         }
     }
 }
@@ -111,6 +167,12 @@ pub enum BlockKind {
 pub struct LineBlock {
     pub kind: BlockKind,
     pub inline: String,
+    /// The whole source line, including the heading hashes or list marker
+    /// that `inline` excludes.
+    pub source: Range<u32>,
+    /// Absolute offset where `inline` starts, so inline spans can report
+    /// positions in the original text.
+    pub inline_start: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,36 +181,170 @@ pub enum Block {
     Code {
         lang: String,
         code: String,
+        /// The fenced block including both fence lines.
+        source: Range<u32>,
+        /// Absolute offset of the first byte of `code`.
+        code_start: u32,
     },
     Table {
         rows: Vec<Vec<String>>,
         header_end: usize,
+        /// Source line per entry of `rows`.
+        row_sources: Vec<Range<u32>>,
+        /// The `| --- |` line, which `rows` drops.
+        separator: Range<u32>,
+    },
+    /// Display math. Parsed as one unit so the line classifier never sees
+    /// its contents: a `- x` row inside an equation is not a bullet, and
+    /// `---` is not a horizontal rule.
+    Math {
+        latex: String,
+        /// The block including both delimiters.
+        source: Range<u32>,
     },
 }
 
 pub fn parse(text: &str) -> Vec<Block> {
+    parse_at(text, 0)
+}
+
+/// `base` is the absolute offset of `text` in the document it was sliced
+/// from, so callers that trim before parsing still get ranges that index
+/// the untrimmed string.
+pub fn parse_at(text: &str, base: usize) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut rest = text;
-    while let Some(fence) = find_code_fence(rest) {
-        let before = rest[..fence.before_end].trim_end_matches('\n');
+    let mut base = base;
+    while let Some(found) = find_fenced_block(rest) {
+        let before = rest[..found.before_end()].trim_end_matches('\n');
         if !before.is_empty() {
-            blocks.extend(split_normal_blocks(before));
+            blocks.extend(split_normal_blocks(before, base));
         }
-        blocks.push(Block::Code {
-            lang: fence.lang.to_owned(),
-            code: fence.code.to_owned(),
-        });
-        let skip = fence.block_end + rest[fence.block_end..].len()
-            - rest[fence.block_end..].trim_start_matches('\n').len();
+        let block_end = match found {
+            Fenced::Code(fence) => {
+                blocks.push(Block::Code {
+                    lang: fence.lang.to_owned(),
+                    code: fence.code.to_owned(),
+                    source: range_at(base + fence.before_end, base + fence.block_end),
+                    code_start: (base + fence.code_start) as u32,
+                });
+                fence.block_end
+            }
+            Fenced::Math(fence) => {
+                blocks.push(Block::Math {
+                    latex: fence.latex.to_owned(),
+                    source: range_at(base + fence.before_end, base + fence.block_end),
+                });
+                fence.block_end
+            }
+        };
+        let skip =
+            block_end + rest[block_end..].len() - rest[block_end..].trim_start_matches('\n').len();
         rest = &rest[skip..];
+        base += skip;
     }
     if !rest.is_empty() {
-        blocks.extend(split_normal_blocks(rest));
+        blocks.extend(split_normal_blocks(rest, base));
     }
     blocks
 }
 
-fn split_normal_blocks(text: &str) -> Vec<Block> {
+enum Fenced<'a> {
+    Code(CodeFence<'a>),
+    Math(MathFence<'a>),
+}
+
+impl Fenced<'_> {
+    fn before_end(&self) -> usize {
+        match self {
+            Self::Code(f) => f.before_end,
+            Self::Math(f) => f.before_end,
+        }
+    }
+}
+
+/// Whichever of a code fence or a display-math block opens first. Order
+/// matters: `$$` inside a code block is not math, and ``` inside display
+/// math is not code.
+fn find_fenced_block(text: &str) -> Option<Fenced<'_>> {
+    match (find_code_fence(text), find_math_fence(text)) {
+        (Some(code), Some(math)) if math.before_end < code.before_end => Some(Fenced::Math(math)),
+        (Some(code), _) => Some(Fenced::Code(code)),
+        (None, Some(math)) => Some(Fenced::Math(math)),
+        (None, None) => None,
+    }
+}
+
+struct MathFence<'a> {
+    before_end: usize,
+    latex: &'a str,
+    block_end: usize,
+}
+
+fn find_math_fence(text: &str) -> Option<MathFence<'_>> {
+    let mut offset = 0;
+    let mut lines = text.split('\n');
+    while let Some(line) = lines.next() {
+        let line_start = offset;
+        offset += line.len() + 1;
+        let trimmed = line.trim();
+        let Some((open, close)) = math_block_opener(trimmed) else {
+            continue;
+        };
+
+        // `$$ E = mc^2 $$` all on one line.
+        let rest = &trimmed[open.len()..];
+        if let Some(inner) = rest.strip_suffix(close)
+            && !inner.trim().is_empty()
+        {
+            return Some(MathFence {
+                before_end: line_start,
+                latex: inner,
+                block_end: line_start + line.len(),
+            });
+        }
+        if !rest.trim().is_empty() {
+            continue;
+        }
+
+        let content_start = offset;
+        for next in lines.by_ref() {
+            let next_start = offset;
+            offset += next.len() + 1;
+            if next.trim() == close {
+                return Some(MathFence {
+                    before_end: line_start,
+                    latex: &text[content_start..next_start.saturating_sub(1).max(content_start)],
+                    block_end: next_start + next.len(),
+                });
+            }
+        }
+        // Unterminated: take the rest, which keeps a streaming equation from
+        // being re-parsed as headings and bullets on every chunk.
+        return Some(MathFence {
+            before_end: line_start,
+            latex: &text[content_start.min(text.len())..],
+            block_end: text.len(),
+        });
+    }
+    None
+}
+
+fn math_block_opener(trimmed: &str) -> Option<(&'static str, &'static str)> {
+    if trimmed.starts_with(MATH_FENCE) {
+        return Some((MATH_FENCE, MATH_FENCE));
+    }
+    if trimmed.starts_with(MATH_BRACKET_OPEN) {
+        return Some((MATH_BRACKET_OPEN, MATH_BRACKET_CLOSE));
+    }
+    None
+}
+
+fn range_at(start: usize, end: usize) -> Range<u32> {
+    start as u32..end as u32
+}
+
+fn split_normal_blocks(text: &str, base: usize) -> Vec<Block> {
     let mut lines_with_offsets: Vec<(usize, &str)> = Vec::new();
     let mut offset = 0;
     for line in text.split('\n') {
@@ -182,9 +378,11 @@ fn split_normal_blocks(text: &str) -> Vec<Block> {
                 if let Some(ns) = normal_start.take() {
                     let start = lines_with_offsets[ns].0;
                     let end = lines_with_offsets[table_start].0;
-                    let slice = text[start..end].trim_matches('\n');
+                    let raw = &text[start..end];
+                    let lead = raw.len() - raw.trim_start_matches('\n').len();
+                    let slice = raw.trim_matches('\n');
                     if !slice.is_empty() {
-                        blocks.push(Block::Lines(lines_to_blocks(slice)));
+                        blocks.push(Block::Lines(lines_to_blocks(slice, base + start + lead)));
                     }
                 }
 
@@ -198,17 +396,25 @@ fn split_normal_blocks(text: &str) -> Vec<Block> {
                 };
 
                 let mut rows = Vec::new();
-                for (k, &(_, line)) in lines_with_offsets[table_start..table_end]
+                let mut row_sources = Vec::new();
+                let mut separator = 0..0;
+                for (k, &(off, line)) in lines_with_offsets[table_start..table_end]
                     .iter()
                     .enumerate()
                 {
-                    if k != si {
+                    let source = range_at(base + off, base + off + line.len());
+                    if k == si {
+                        separator = source;
+                    } else {
                         rows.push(parse_table_cells(line));
+                        row_sources.push(source);
                     }
                 }
                 blocks.push(Block::Table {
                     rows,
                     header_end: si,
+                    row_sources,
+                    separator,
                 });
                 i = table_end;
                 continue;
@@ -223,34 +429,54 @@ fn split_normal_blocks(text: &str) -> Vec<Block> {
 
     if let Some(ns) = normal_start {
         let start = lines_with_offsets[ns].0;
-        let content = text[start..].trim_start_matches('\n');
+        let raw = &text[start..];
+        let lead = raw.len() - raw.trim_start_matches('\n').len();
+        let content = raw.trim_start_matches('\n');
         if !content.is_empty() {
-            blocks.push(Block::Lines(lines_to_blocks(content)));
+            blocks.push(Block::Lines(lines_to_blocks(content, base + start + lead)));
         }
     }
 
     if blocks.is_empty() {
-        blocks.push(Block::Lines(lines_to_blocks(text)));
+        blocks.push(Block::Lines(lines_to_blocks(text, base)));
     }
 
     blocks
 }
 
-fn lines_to_blocks(text: &str) -> Vec<LineBlock> {
-    text.split('\n').map(classify_line).collect()
+fn lines_to_blocks(text: &str, base: usize) -> Vec<LineBlock> {
+    let mut offset = base;
+    text.split('\n')
+        .map(|line| {
+            let block = classify_line(line, offset);
+            offset += line.len() + 1;
+            block
+        })
+        .collect()
 }
 
-fn classify_line(line: &str) -> LineBlock {
+/// `start` is the absolute offset of `line`. `inline_start` points past the
+/// marker or hashes so inline spans land in the original text.
+fn classify_line(line: &str, start: usize) -> LineBlock {
+    let source = range_at(start, start + line.len());
+    // Only valid for suffixes of `line`; headings trim their end and so
+    // report their own offset instead.
+    let at = |rest: &str| (start + line.len() - rest.len()) as u32;
+
     if is_horizontal_rule(line) {
         return LineBlock {
             kind: BlockKind::HorizontalRule,
             inline: String::new(),
+            source,
+            inline_start: start as u32,
         };
     }
-    if let Some((level, content)) = parse_heading(line) {
+    if let Some((level, content, content_start)) = parse_heading(line) {
         return LineBlock {
             kind: BlockKind::Heading(level),
             inline: content.to_owned(),
+            source,
+            inline_start: (start + content_start) as u32,
         };
     }
     if let Some((indent_spaces, rest)) = parse_unordered_marker(line) {
@@ -259,6 +485,8 @@ fn classify_line(line: &str) -> LineBlock {
                 depth: indent_spaces / LIST_INDENT_STEP,
             },
             inline: rest.to_owned(),
+            source,
+            inline_start: at(rest),
         };
     }
     if let Some((indent_spaces, marker, rest)) = parse_ordered_marker(line) {
@@ -268,11 +496,15 @@ fn classify_line(line: &str) -> LineBlock {
                 marker: marker.to_owned(),
             },
             inline: rest.to_owned(),
+            source,
+            inline_start: at(rest),
         };
     }
     LineBlock {
         kind: BlockKind::Paragraph,
         inline: line.to_owned(),
+        source,
+        inline_start: start as u32,
     }
 }
 
@@ -288,7 +520,10 @@ pub fn block_prefix(kind: &BlockKind) -> Option<String> {
     }
 }
 
-fn parse_heading(line: &str) -> Option<(u8, &str)> {
+/// Returns the level, the trimmed content, and the content's byte offset in
+/// `line`. The offset cannot be recovered from the content because trimming
+/// makes it a non-suffix slice.
+fn parse_heading(line: &str) -> Option<(u8, &str, usize)> {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     if hashes == 0 || hashes > MAX_HEADING_LEVEL as usize {
         return None;
@@ -296,9 +531,9 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     let rest = &line[hashes..];
     let level = hashes as u8;
     if let Some(stripped) = rest.strip_prefix(' ') {
-        Some((level, stripped.trim_end()))
+        Some((level, stripped.trim_end(), hashes + 1))
     } else if rest.is_empty() {
-        Some((level, ""))
+        Some((level, "", hashes))
     } else {
         None
     }
@@ -396,6 +631,7 @@ struct CodeFence<'a> {
     before_end: usize,
     lang: &'a str,
     code: &'a str,
+    code_start: usize,
     block_end: usize,
 }
 
@@ -462,6 +698,7 @@ fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
             before_end: abs,
             lang,
             code,
+            code_start,
             block_end,
         });
     }
@@ -471,7 +708,14 @@ fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
 /// Emphasis composes additively. Code spans are atomic and carry the
 /// surrounding emphasis as a separate modifier.
 pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
-    parse_inline_impl(text, Emphasis::default(), ParseMode::WithCode)
+    parse_inline_at(text, 0)
+}
+
+/// `offset` is the absolute position of `text` in the document. Every span
+/// reports its own slice of it, so consumers can map a rendered cell back to
+/// the markdown that produced it.
+pub fn parse_inline_at(text: &str, offset: u32) -> Vec<InlineSpan> {
+    parse_inline_impl(text, offset, Emphasis::default(), ParseMode::WithCode)
 }
 
 /// `EmphasisOnly` is for rescanning a region the outer pass already split on
@@ -482,33 +726,68 @@ enum ParseMode {
     EmphasisOnly,
 }
 
-fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineSpan> {
+fn parse_inline_impl(
+    text: &str,
+    offset: u32,
+    emphasis: Emphasis,
+    mode: ParseMode,
+) -> Vec<InlineSpan> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut pos = 0;
     let mut plain_start = 0;
 
-    let flush_plain =
-        |spans: &mut Vec<InlineSpan>, plain: &str, base: Emphasis, mode: ParseMode| {
-            if plain.is_empty() {
-                return;
-            }
-            match mode {
-                ParseMode::WithCode => {
-                    spans.extend(parse_inline_impl(plain, base, ParseMode::EmphasisOnly))
-                }
-                ParseMode::EmphasisOnly => spans.push(InlineSpan::text(plain.to_owned(), base)),
-            }
-        };
+    // Emphasis and code delimiters are dropped from the span text but stay
+    // inside the enclosing line's range, so spans stay verbatim slices.
+    let flush_plain = |spans: &mut Vec<InlineSpan>, plain: &str, at: usize| {
+        if plain.is_empty() {
+            return;
+        }
+        let at = offset + at as u32;
+        match mode {
+            ParseMode::WithCode => spans.extend(parse_inline_impl(
+                plain,
+                at,
+                emphasis,
+                ParseMode::EmphasisOnly,
+            )),
+            ParseMode::EmphasisOnly => spans.push(InlineSpan::text(
+                plain.to_owned(),
+                emphasis,
+                Source::verbatim(at..at + plain.len() as u32),
+            )),
+        }
+    };
 
     while pos < bytes.len() {
+        // Math is atomic like code, so it is recognised in the outer pass.
+        // That also means emphasis never runs inside it and `_`/`*` in an
+        // equation survive untouched.
+        if mode == ParseMode::WithCode
+            && let Some(math) = try_inline_math(text, pos)
+        {
+            flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+            spans.push(InlineSpan::math(
+                text[math.content].to_owned(),
+                emphasis,
+                Source::atomic(offset + pos as u32..offset + math.end as u32),
+            ));
+            pos = math.end;
+            plain_start = pos;
+            continue;
+        }
+
         if mode == ParseMode::WithCode && bytes[pos] == b'`' {
             let run_len = count_backtick_run(bytes, pos);
             if let Some((cs, ce, close_end)) = find_code_span_close(bytes, pos, run_len)
                 && ce > cs
             {
-                flush_plain(&mut spans, &text[plain_start..pos], base, mode);
-                spans.push(InlineSpan::code(text[cs..ce].to_owned(), base));
+                flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+                spans.push(InlineSpan::code(
+                    text[cs..ce].to_owned(),
+                    emphasis,
+                    Source::verbatim(offset + cs as u32..offset + ce as u32),
+                ));
                 pos = close_end;
                 plain_start = pos;
                 continue;
@@ -526,14 +805,18 @@ fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineS
 
         match outcome {
             InlineMatch::Found {
-                emphasis,
+                emphasis: found,
                 content_start,
                 close,
                 delim_len,
             } => {
-                flush_plain(&mut spans, &text[plain_start..pos], base, mode);
-                let inner = base.merge(emphasis);
-                spans.extend(parse_inline_impl(&text[content_start..close], inner, mode));
+                flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+                spans.extend(parse_inline_impl(
+                    &text[content_start..close],
+                    offset + content_start as u32,
+                    emphasis.merge(found),
+                    mode,
+                ));
                 pos = close + delim_len;
                 plain_start = pos;
             }
@@ -543,9 +826,63 @@ fn parse_inline_impl(text: &str, base: Emphasis, mode: ParseMode) -> Vec<InlineS
     }
 
     if plain_start < bytes.len() {
-        flush_plain(&mut spans, &text[plain_start..], base, mode);
+        flush_plain(&mut spans, &text[plain_start..], plain_start);
     }
     spans
+}
+
+struct InlineMath {
+    content: Range<usize>,
+    end: usize,
+}
+
+/// A run of digits with no LaTeX in sight is money, not maths: `$5 and $10`
+/// must not become an equation. Requiring a LaTeX signal keeps `$2^n$`.
+fn looks_like_currency(content: &str) -> bool {
+    content.starts_with(|c: char| c.is_ascii_digit()) && !content.contains(['\\', '^', '_', '{'])
+}
+
+/// Recognises `$..$`, `$$..$$` and `\(..\)` starting at `pos`. Unmatched
+/// delimiters return `None` and stay plain text, so a half-streamed equation
+/// never mangles the line around it.
+fn try_inline_math(text: &str, pos: usize) -> Option<InlineMath> {
+    let bytes = text.as_bytes();
+    let (open, close) = match bytes[pos] {
+        b'$' if bytes.get(pos + 1) == Some(&b'$') => (MATH_FENCE, MATH_FENCE),
+        b'$' => ("$", "$"),
+        b'\\' if bytes.get(pos + 1) == Some(&b'(') => (MATH_PAREN_OPEN, MATH_PAREN_CLOSE),
+        _ => return None,
+    };
+
+    let start = pos + open.len();
+    let mut at = start;
+    let end = loop {
+        let found = at + text[at..].find(close)?;
+        // A backslash escapes the delimiter, but `\\` is a literal backslash
+        // and so does not escape what follows.
+        let escaped = close == "$"
+            && text[..found]
+                .bytes()
+                .rev()
+                .take_while(|&b| b == b'\\')
+                .count()
+                .is_multiple_of(2)
+                .not();
+        if escaped {
+            at = found + close.len();
+            continue;
+        }
+        break found;
+    };
+
+    let content = &text[start..end];
+    if content.trim().is_empty() || looks_like_currency(content) {
+        return None;
+    }
+    Some(InlineMath {
+        content: start..end,
+        end: end + close.len(),
+    })
 }
 
 enum InlineMatch {
@@ -879,7 +1216,7 @@ mod tests {
     #[test_case(5, "##### h5"; "level_5")]
     #[test_case(6, "###### h6"; "level_6")]
     fn parse_heading_levels_1_through_6(level: u8, input: &str) {
-        let (got, content) = parse_heading(input).expect("heading parses");
+        let (got, content, _) = parse_heading(input).expect("heading parses");
         assert_eq!(got, level);
         assert_eq!(content, format!("h{level}"));
     }
@@ -923,7 +1260,7 @@ mod tests {
     fn parse_fenced_code_block_emits_code_block() {
         let blocks = parse("```rust\nfn x() {}\nlet y;\n```");
         assert_eq!(blocks.len(), 1);
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, .. } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "rust");
@@ -934,7 +1271,10 @@ mod tests {
     fn parse_table_emits_table_block_with_header_separator_dropped() {
         let blocks = parse("| Name | Value |\n| --- | --- |\n| foo | 42 |");
         assert_eq!(blocks.len(), 1);
-        let Block::Table { rows, header_end } = &blocks[0] else {
+        let Block::Table {
+            rows, header_end, ..
+        } = &blocks[0]
+        else {
             panic!("expected Table")
         };
         assert_eq!(*header_end, 1);
@@ -1104,7 +1444,7 @@ mod tests {
     #[test]
     fn four_backtick_fence_wraps_inner_three_backtick_block() {
         let blocks = parse(FOUR_BACKTICK_FENCE);
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, .. } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "");
@@ -1132,7 +1472,7 @@ mod tests {
     #[test]
     fn code_fence_language_is_optional() {
         let blocks = parse("```\ncode\n```");
-        let Block::Code { lang, code } = &blocks[0] else {
+        let Block::Code { lang, code, .. } = &blocks[0] else {
             panic!("expected Code")
         };
         assert_eq!(lang, "");
@@ -1181,7 +1521,10 @@ mod tests {
     #[test]
     fn table_cell_backslash_pipe_is_literal_pipe() {
         let blocks = parse("| a | b\\|c | d |\n| --- | --- | --- |\n| 1 | 2 | 3 |");
-        let Block::Table { rows, header_end } = &blocks[0] else {
+        let Block::Table {
+            rows, header_end, ..
+        } = &blocks[0]
+        else {
             panic!("expected Table")
         };
         assert_eq!(*header_end, 1);

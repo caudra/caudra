@@ -18,7 +18,8 @@ use super::{
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
-use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
+use crate::markdown::{hr_line, plain_lines, text_to_lines, text_to_painted, truncate_output};
+use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
@@ -990,6 +991,19 @@ impl MessagesPanel {
         }
     }
 
+    /// Raw markdown of the newest assistant reply. Streaming text has not
+    /// been committed yet, so it is preferred when present.
+    pub fn last_reply_source(&self) -> Option<String> {
+        if !self.streaming_text.is_empty() {
+            return Some(self.streaming_text.buffer().to_owned());
+        }
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, DisplayRole::Assistant))
+            .map(|m| m.text.clone())
+    }
+
     pub fn segment_heights(&self) -> Vec<u16> {
         let width = self.viewport_width;
         self.cache
@@ -1391,10 +1405,11 @@ impl MessagesPanel {
                         .push(Segment::with_lines(lines, search_text, Some(i)));
                     continue;
                 }
-                let (lines, search_text) = build_message_lines(msg, self.viewport_width);
+                let built = build_message_lines(msg, self.viewport_width);
                 self.cache.push_spacer_if_needed();
-                self.cache
-                    .push(Segment::with_lines(lines, search_text, Some(i)));
+                let mut segment = Segment::with_lines(built.lines, built.search_text, Some(i));
+                segment.set_provenance(built.provenance);
+                self.cache.push(segment);
             }
         }
         self.cache.mark_built(self.messages.len());
@@ -1528,12 +1543,13 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let (lines, search_text) = build_message_lines(msg, width);
+        let built = build_message_lines(msg, width);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
-        seg.set_lines(lines);
-        seg.search_text = search_text;
+        seg.set_lines(built.lines);
+        seg.set_provenance(built.provenance);
+        seg.search_text = built.search_text;
     }
 }
 
@@ -1584,7 +1600,7 @@ fn message_background(role: &DisplayRole) -> Option<Style> {
 /// given width, returning the lines and search text. Shared by
 /// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
 /// messages) so both paths produce identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16) -> (Vec<Line<'static>>, String) {
+fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
@@ -1598,19 +1614,29 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> (Vec<Line<'static>>,
     } else {
         style.prefix
     };
-    let mut lines = if style.use_markdown {
-        text_to_lines(
+    let (mut lines, mut provenance) = if style.use_markdown {
+        let (painted, parsed) = text_to_painted(
             &msg.text,
             prefix,
             style.text_style,
             style.prefix_style,
             width,
             style.max_line_bytes,
+        );
+        (
+            painted.lines,
+            Some(Provenance::new(parsed, painted.provenance)),
         )
     } else {
-        plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
+        (
+            plain_lines(&msg.text, prefix, style.text_style, style.prefix_style),
+            None,
+        )
     };
     if let Some(pp) = &msg.plan_path {
+        // Plan messages splice in rules and a footer, so the recorded line
+        // indices no longer match and provenance is dropped.
+        provenance = None;
         if !msg.text.is_empty() {
             let rule = hr_line(width, theme::current().plan_rule);
             lines.insert(0, rule.clone());
@@ -1634,5 +1660,15 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> (Vec<Line<'static>>,
         )));
     }
     let search_text = format!("{prefix}{}", msg.text);
-    (lines, search_text)
+    BuiltMessage {
+        lines,
+        search_text,
+        provenance,
+    }
+}
+
+struct BuiltMessage {
+    lines: Vec<Line<'static>>,
+    search_text: String,
+    provenance: Option<Provenance>,
 }

@@ -17,6 +17,7 @@ pub use highlight::highlight_ansi;
 pub mod image;
 mod input_document;
 mod markdown;
+mod provenance;
 mod render_worker;
 pub mod repaint;
 mod selection;

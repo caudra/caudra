@@ -7432,6 +7432,30 @@ fn run_builtin_file_picker_opens_modal() {
     assert!(app.file_picker.is_open());
 }
 
+const NOTHING_TO_COPY: &str = "Nothing to copy";
+
+#[test]
+fn copy_message_reports_when_there_is_no_reply() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::CopyMessage);
+    assert_eq!(app.status_bar.flash_text(), Some(NOTHING_TO_COPY));
+}
+
+/// The action reads the markdown source, not the rendered lines, so a reply
+/// is copyable whether or not the transcript has been drawn.
+#[test]
+fn copy_message_picks_the_last_assistant_reply() {
+    const REPLY: &str = "# Heading\n\n- **bold** item";
+    let mut app = test_app();
+    let chat = &mut app.chats[app.active_chat];
+    chat.push(DisplayMessage::new(DisplayRole::Assistant, "older".into()));
+    chat.push(DisplayMessage::new(DisplayRole::Assistant, REPLY.into()));
+
+    assert_eq!(chat.last_reply_source().as_deref(), Some(REPLY));
+    app.run_builtin(BuiltinAction::CopyMessage);
+    assert_ne!(app.status_bar.flash_text(), Some(NOTHING_TO_COPY));
+}
+
 #[test]
 fn run_builtin_model_picker_opens_and_refreshes() {
     let mut app = test_app();

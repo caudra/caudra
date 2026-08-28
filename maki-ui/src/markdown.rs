@@ -1,9 +1,11 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use crate::provenance::LineProvenance;
 use crate::theme;
 use crate::theme::Theme;
 use maki_markdown::Emphasis;
-use maki_markdown::render::{self, Line as RLine, LineKind, Span as RSpan, StyleToken};
+use maki_markdown::render::{self, Line as RLine, LineKind, Span as RSpan, SpanSource, StyleToken};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -86,6 +88,7 @@ fn style_for_token(
             }
             s
         }
+        StyleToken::Math => apply_emphasis(t.math, emphasis, true, t),
         StyleToken::CodeBar => t.code_gutter,
         StyleToken::ListMarker => t.list_marker,
         StyleToken::TableBorder => t.table_border,
@@ -109,6 +112,7 @@ fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
                  text,
                  style,
                  emphasis,
+                 source: _,
              }| {
                 Span::styled(
                     text.clone(),
@@ -118,6 +122,13 @@ fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
         )
         .collect::<Vec<_>>();
     Line::from(spans)
+}
+
+fn line_provenance(line: &RLine) -> LineProvenance {
+    LineProvenance {
+        line: line.source.clone(),
+        spans: line.spans.iter().map(|s| s.source.clone()).collect(),
+    }
 }
 
 pub fn should_truncate(hidden: usize) -> bool {
@@ -193,6 +204,13 @@ pub fn plain_lines(
     lines
 }
 
+/// Painted markdown together with the provenance that lets a selection copy
+/// the source instead of the glyphs.
+pub(crate) struct Painted {
+    pub lines: Vec<Line<'static>>,
+    pub provenance: Vec<LineProvenance>,
+}
+
 /// Paint semantic lines into ratatui lines, splicing the prefix onto
 /// the first line (or as a standalone leader for non-inline blocks).
 pub(crate) fn paint_semantic(
@@ -200,27 +218,55 @@ pub(crate) fn paint_semantic(
     prefix: &str,
     text_style: Style,
     prefix_style: Style,
-) -> Vec<Line<'static>> {
+) -> Painted {
     let t = theme::current();
     let mut lines: Vec<Line<'static>> = semantic
         .iter()
         .map(|l| paint_line(l, text_style, &t))
         .collect();
+    let mut provenance: Vec<LineProvenance> = semantic.iter().map(line_provenance).collect();
 
     if lines.is_empty() {
         lines.push(prefix_line(prefix, prefix_style));
-        return lines;
+        provenance.push(LineProvenance::chrome(lines[0].spans.len()));
+        return Painted { lines, provenance };
     }
 
+    // The prefix is UI chrome with no markdown behind it, so it is recorded
+    // as such and drops out of anything copied.
     if shares_line_with_prefix(&semantic[0].kind) {
         if !prefix.is_empty() {
             lines[0].spans.insert(0, prefix_span(prefix, prefix_style));
+            provenance[0].spans.insert(0, SpanSource::Chrome);
         }
     } else if !prefix.is_empty() {
-        lines.insert(0, prefix_line(prefix, prefix_style));
+        let leader = prefix_line(prefix, prefix_style);
+        provenance.insert(0, LineProvenance::chrome(leader.spans.len()));
+        lines.insert(0, leader);
     }
 
-    lines
+    Painted { lines, provenance }
+}
+
+/// Renders markdown and keeps the text the provenance ranges index. That is
+/// not always the caller's string: long lines are truncated before parsing.
+pub(crate) fn text_to_painted(
+    text: &str,
+    prefix: &str,
+    text_style: Style,
+    prefix_style: Style,
+    width: u16,
+    max_line_bytes: Option<usize>,
+) -> (Painted, Arc<str>) {
+    let parsed: Arc<str> = match max_line_bytes {
+        Some(limit) => render::truncate_long_lines_at(text, limit).as_ref().into(),
+        None => text.into(),
+    };
+    let semantic = render::Renderer::unwrapped().render(&parsed, width, 0);
+    (
+        paint_semantic(&semantic, prefix, text_style, prefix_style),
+        parsed,
+    )
 }
 
 pub fn text_to_lines(
@@ -231,16 +277,16 @@ pub fn text_to_lines(
     width: u16,
     max_line_bytes: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let truncated;
-    let text = match max_line_bytes {
-        Some(limit) => {
-            truncated = render::truncate_long_lines_at(text, limit);
-            truncated.as_ref()
-        }
-        None => text,
-    };
-    let semantic = render::Renderer::unwrapped().render(text, width, 0);
-    paint_semantic(&semantic, prefix, text_style, prefix_style)
+    text_to_painted(
+        text,
+        prefix,
+        text_style,
+        prefix_style,
+        width,
+        max_line_bytes,
+    )
+    .0
+    .lines
 }
 
 pub struct TruncatedOutput<'a> {

@@ -624,6 +624,7 @@ fn span_style_to_lua(lua: &Lua, span: &maki_markdown::render::Span) -> LuaResult
             mlua::Value::String(lua.create_string(name)?)
         }
         StyleToken::InlineCode => mlua::Value::String(lua.create_string("inline_code")?),
+        StyleToken::Math => mlua::Value::String(lua.create_string("math")?),
         StyleToken::Highlight {
             fg,
             bold,
@@ -1264,6 +1265,7 @@ mod tests {
                     underline,
                 },
                 emphasis: maki_markdown::Emphasis::default(),
+                source: maki_markdown::render::SpanSource::Unknown,
             };
             let val = span_style_to_lua(&lua, &span).unwrap();
             let tbl = match val {

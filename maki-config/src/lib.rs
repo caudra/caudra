@@ -340,6 +340,7 @@ pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
     pub scrollbar: Option<bool>,
     pub notifications: Option<NotificationMethod>,
+    pub math: Option<MathStyle>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -357,6 +358,7 @@ impl UiFileConfig {
             overlay,
             splash_animation,
             scrollbar,
+            math,
             notifications,
             flash_duration_ms,
             typewriter_ms_per_char,
@@ -372,6 +374,14 @@ impl UiFileConfig {
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MathStyle {
+    #[default]
+    Unicode,
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -872,6 +882,14 @@ pub struct UiConfig {
     )]
     pub notifications: NotificationMethod,
 
+    #[config(
+        default = MathStyle::Unicode,
+        ty = "string",
+        default_doc = "unicode",
+        desc = "How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source)"
+    )]
+    pub math: MathStyle,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
@@ -910,6 +928,7 @@ impl UiConfig {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
+            math: f.math.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char

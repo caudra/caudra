@@ -18,6 +18,9 @@ const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 /// alongside the hash because hashing alone could in principle collide;
 /// requiring both makes accidental reuse on different buffers
 /// astronomically unlikely.
+/// Streaming rows are painted outside the segment cache and are not
+/// selectable, so no provenance is kept here. It appears once the message
+/// is flushed into a segment.
 #[derive(Default)]
 struct StreamingCache {
     key: Option<CacheKey>,
@@ -70,7 +73,7 @@ impl StreamingCache {
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
         let semantic = renderer.render(text.as_ref(), width, theme_gen);
-        self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
+        self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style).lines;
         self.key = Some(key);
         true
     }
@@ -120,6 +123,10 @@ impl StreamingContent {
 
     pub fn is_empty(&self) -> bool {
         self.typewriter.is_empty()
+    }
+
+    pub fn buffer(&self) -> &str {
+        self.typewriter.buffer()
     }
 
     pub fn line_count(&self) -> usize {

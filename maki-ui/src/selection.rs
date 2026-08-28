@@ -384,11 +384,19 @@ impl LineBreaks {
     }
 }
 
-fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
+/// One continuation row produced by ratatui's `Wrap { trim: false }`.
+pub(crate) struct WrapBreak {
+    /// Char index in the line's concatenated text where the row starts.
+    pub start: usize,
+    /// The break landed on a word boundary, so copy reinserts a space.
+    pub word: bool,
+}
+
+/// Replays ratatui's wrapping so selection can map a display row back to the
+/// characters on it. Must stay in step with `Paragraph`'s algorithm.
+pub(crate) fn wrap_breaks(chars: &[char], width: u16) -> Vec<WrapBreak> {
     let w = width as usize;
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let chars: Vec<char> = text.chars().collect();
-    let mut wraps = Vec::new();
+    let mut breaks = Vec::new();
     let mut i = 0;
     let mut col = 0;
     let mut last_breakable: Option<usize> = None;
@@ -402,15 +410,14 @@ fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
         }
 
         if col + cw > w && col > 0 {
+            let word = last_breakable.is_some();
             if let Some(bp) = last_breakable {
-                wraps.push(true);
                 i = bp + 1;
                 while i < chars.len() && chars[i] == ' ' {
                     i += 1;
                 }
-            } else {
-                wraps.push(false);
             }
+            breaks.push(WrapBreak { start: i, word });
             col = 0;
             last_breakable = None;
             continue;
@@ -419,7 +426,18 @@ fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
         col += cw;
         i += 1;
     }
-    wraps
+    breaks
+}
+
+pub(crate) fn line_chars(line: &Line<'_>) -> Vec<char> {
+    line.spans.iter().flat_map(|s| s.content.chars()).collect()
+}
+
+fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
+    wrap_breaks(&line_chars(line), width)
+        .into_iter()
+        .map(|b| b.word)
+        .collect()
 }
 
 fn is_code_wrap_continuation(line: &Line<'_>) -> bool {
