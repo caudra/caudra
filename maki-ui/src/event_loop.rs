@@ -1961,12 +1961,24 @@ impl<'t> EventLoop<'t> {
         let join_agents_ms = lap();
 
         let mut tabs = Vec::with_capacity(apps.len());
+        // Split across the three operations so a slow exit points at one of
+        // them instead of at the whole phase.
+        let (mut snapshot_ms, mut checkpoint_ms, mut session_clone_ms) = (0, 0, 0);
         for mut app in apps {
+            let mut step = Instant::now();
+            let mut step_ms = || {
+                let elapsed = step.elapsed().as_millis() as u64;
+                step = Instant::now();
+                elapsed
+            };
             if let Err(error) = app.snapshot_history_head() {
                 warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed");
             }
+            snapshot_ms += step_ms();
             app.checkpoint_now();
+            checkpoint_ms += step_ms();
             tabs.push(Arc::unwrap_or_clone(app.state.session));
+            session_clone_ms += step_ms();
         }
         let save_sessions_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
@@ -1984,6 +1996,9 @@ impl<'t> EventLoop<'t> {
             kill_mcp_ms,
             join_agents_ms,
             save_sessions_ms,
+            snapshot_ms,
+            checkpoint_ms,
+            session_clone_ms,
             mcp_shutdown_ms,
             storage_drain_ms,
             total_ms = started.elapsed().as_millis() as u64,

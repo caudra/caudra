@@ -6,13 +6,14 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use ignore::WalkBuilder;
 use maki_storage::id::MakiId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 const OBJECTS_DIR: &str = "objects";
 const SESSION_START_NAME: &str = "session-start";
@@ -311,19 +312,51 @@ impl SnapshotStore {
         if self.has_session_start() {
             return self.load_session_start_manifest();
         }
-        let manifest = self.capture(&root)?;
-        self.write_manifest_path(&self.manifest_path(SnapshotKey::SessionStart), &manifest)?;
-        self.enforce_cap_preserving(None)?;
-        Ok(manifest)
+        let path = self.manifest_path(SnapshotKey::SessionStart);
+        self.capture_to(&root, &path, None, "session_start")
     }
 
     pub fn snapshot(&self, cwd: &Path, checkpoint: MakiId) -> Result<Manifest, SnapshotError> {
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         let path = self.manifest_path(SnapshotKey::Checkpoint(checkpoint));
-        let manifest = self.capture(&root)?;
-        self.write_manifest_path(&path, &manifest)?;
-        self.enforce_cap_preserving(Some(checkpoint))?;
+        self.capture_to(&root, &path, Some(checkpoint), "checkpoint")
+    }
+
+    /// Captures `root`, writes the manifest and enforces the store cap,
+    /// timing each part. Capture cost splits between hashing every file and
+    /// durably writing the ones whose content is new, and the two want very
+    /// different fixes, so they are reported apart.
+    fn capture_to(
+        &self,
+        root: &Path,
+        path: &Path,
+        preserve: Option<MakiId>,
+        kind: &'static str,
+    ) -> Result<Manifest, SnapshotError> {
+        let (manifest, stats) = self.capture(root)?;
+
+        let manifest_start = Instant::now();
+        self.write_manifest_path(path, &manifest)?;
+        let manifest_ms = elapsed_ms(manifest_start);
+
+        let gc_start = Instant::now();
+        self.enforce_cap_preserving(preserve)?;
+        let gc_ms = elapsed_ms(gc_start);
+
+        debug!(
+            kind,
+            files = stats.files,
+            bytes = stats.bytes,
+            walk_ms = stats.walk_ms,
+            hash_ms = stats.hash_ms,
+            objects_written = stats.objects_written,
+            object_write_ms = stats.object_write_ms,
+            manifest_ms,
+            gc_ms,
+            total_ms = stats.walk_ms + stats.hash_ms + stats.object_write_ms + manifest_ms + gc_ms,
+            "workspace snapshot"
+        );
         Ok(manifest)
     }
 
@@ -724,14 +757,27 @@ impl SnapshotStore {
         self.dir.join(UNREVERT_NAME)
     }
 
-    fn capture(&self, root: &Path) -> Result<Manifest, SnapshotError> {
+    fn capture(&self, root: &Path) -> Result<(Manifest, CaptureStats), SnapshotError> {
+        let start = Instant::now();
         let files = self.walk_working_tree(root)?;
+        let mut stats = CaptureStats {
+            walk_ms: elapsed_ms(start),
+            files: files.len() as u64,
+            ..CaptureStats::default()
+        };
         let mut manifest = Manifest::new();
 
         for file in files {
+            let read_start = Instant::now();
             let bytes = fs::read(&file.absolute)?;
             let hash = self.hasher.hash(&bytes);
-            self.write_object(&hash, &bytes)?;
+            stats.hash_ms += elapsed_ms(read_start);
+            stats.bytes += bytes.len() as u64;
+
+            let write_start = Instant::now();
+            stats.objects_written += u64::from(self.write_object(&hash, &bytes)?);
+            stats.object_write_ms += elapsed_ms(write_start);
+
             manifest.insert(
                 file.relative,
                 FileEntry {
@@ -740,7 +786,7 @@ impl SnapshotStore {
                 },
             );
         }
-        Ok(manifest)
+        Ok((manifest, stats))
     }
 
     fn walk_working_tree(&self, root: &Path) -> Result<Vec<WalkedFile>, SnapshotError> {
@@ -1089,20 +1135,24 @@ impl SnapshotStore {
         }))
     }
 
-    fn write_object(&self, hash: &[u8; HASH_LEN], bytes: &[u8]) -> Result<(), SnapshotError> {
+    fn write_object(&self, hash: &[u8; HASH_LEN], bytes: &[u8]) -> Result<bool, SnapshotError> {
         self.write_object_named(&hex_encode(hash), bytes)
     }
 
-    fn write_object_named(&self, hash: &str, bytes: &[u8]) -> Result<(), SnapshotError> {
+    /// Reports whether the object was written. Skipping an object that is
+    /// already present is the common case, so the count separates durable
+    /// writes from verification reads when a capture is slow.
+    fn write_object_named(&self, hash: &str, bytes: &[u8]) -> Result<bool, SnapshotError> {
         let path = self.objects_dir().join(hash);
         match fs::read(&path) {
-            Ok(existing) if hex_encode(&self.hasher.hash(&existing)) == hash => return Ok(()),
+            Ok(existing) if hex_encode(&self.hasher.hash(&existing)) == hash => return Ok(false),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         maki_storage::atomic_write(&path, bytes)
-            .map_err(|error| io::Error::other(error.to_string()).into())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(true)
     }
 
     fn write_manifest_path(&self, path: &Path, manifest: &Manifest) -> Result<(), SnapshotError> {
@@ -1281,6 +1331,23 @@ struct WalkedFile {
     relative: RelPath,
     absolute: PathBuf,
     metadata: fs::Metadata,
+}
+
+/// Where the time in one `capture` went.
+#[derive(Default)]
+struct CaptureStats {
+    files: u64,
+    bytes: u64,
+    walk_ms: u64,
+    /// Reading every file and hashing it.
+    hash_ms: u64,
+    /// Verifying present objects and durably writing absent ones.
+    object_write_ms: u64,
+    objects_written: u64,
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
 }
 
 fn hash_bytes(bytes: &[u8]) -> [u8; HASH_LEN] {
