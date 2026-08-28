@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ignore::WalkBuilder;
 use maki_storage::id::MakiId;
@@ -338,23 +338,23 @@ impl SnapshotStore {
 
         let manifest_start = Instant::now();
         self.write_manifest_path(path, &manifest)?;
-        let manifest_ms = elapsed_ms(manifest_start);
+        let manifest_write = manifest_start.elapsed();
 
         let gc_start = Instant::now();
         self.enforce_cap_preserving(preserve)?;
-        let gc_ms = elapsed_ms(gc_start);
+        let gc = gc_start.elapsed();
 
         debug!(
             kind,
             files = stats.files,
             bytes = stats.bytes,
-            walk_ms = stats.walk_ms,
-            hash_ms = stats.hash_ms,
+            walk_us = micros(stats.walk),
+            hash_us = micros(stats.hash),
             objects_written = stats.objects_written,
-            object_write_ms = stats.object_write_ms,
-            manifest_ms,
-            gc_ms,
-            total_ms = stats.walk_ms + stats.hash_ms + stats.object_write_ms + manifest_ms + gc_ms,
+            object_write_us = micros(stats.object_write),
+            manifest_us = micros(manifest_write),
+            gc_us = micros(gc),
+            total_us = micros(stats.walk + stats.hash + stats.object_write + manifest_write + gc),
             "workspace snapshot"
         );
         Ok(manifest)
@@ -763,7 +763,7 @@ impl SnapshotStore {
         let start = Instant::now();
         let files = self.walk_working_tree(root)?;
         let mut stats = CaptureStats {
-            walk_ms: elapsed_ms(start),
+            walk: start.elapsed(),
             files: files.len() as u64,
             ..CaptureStats::default()
         };
@@ -773,12 +773,12 @@ impl SnapshotStore {
             let read_start = Instant::now();
             let bytes = fs::read(&file.absolute)?;
             let hash = self.hasher.hash(&bytes);
-            stats.hash_ms += elapsed_ms(read_start);
+            stats.hash += read_start.elapsed();
             stats.bytes += bytes.len() as u64;
 
             let write_start = Instant::now();
             stats.objects_written += u64::from(self.write_object(&hash, &bytes)?);
-            stats.object_write_ms += elapsed_ms(write_start);
+            stats.object_write += write_start.elapsed();
 
             manifest.insert(
                 file.relative,
@@ -792,7 +792,7 @@ impl SnapshotStore {
         if stats.objects_written > 0 {
             let sync_start = Instant::now();
             self.sync_objects();
-            stats.object_write_ms += elapsed_ms(sync_start);
+            stats.object_write += sync_start.elapsed();
         }
         Ok((manifest, stats))
     }
@@ -1369,16 +1369,19 @@ struct WalkedFile {
 struct CaptureStats {
     files: u64,
     bytes: u64,
-    walk_ms: u64,
+    walk: Duration,
     /// Reading every file and hashing it.
-    hash_ms: u64,
+    hash: Duration,
     /// Verifying present objects and durably writing absent ones.
-    object_write_ms: u64,
+    object_write: Duration,
     objects_written: u64,
 }
 
-fn elapsed_ms(since: Instant) -> u64 {
-    since.elapsed().as_millis() as u64
+/// Microseconds, because the per-file phases accumulate hundreds of
+/// sub-millisecond samples and truncating each one to whole milliseconds
+/// reports close to zero for the dominant cost.
+fn micros(duration: Duration) -> u64 {
+    duration.as_micros() as u64
 }
 
 fn hash_bytes(bytes: &[u8]) -> [u8; HASH_LEN] {
