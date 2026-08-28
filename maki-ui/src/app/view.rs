@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::input::Placeholder;
+use crate::components::input::{self, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -17,6 +17,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, Mode, Status};
+
+const MAIN_GUTTER_WIDE: u16 = 2;
+const MAIN_GUTTER_NARROW: u16 = 1;
+const MESSAGE_VERTICAL_PADDING: u16 = 1;
 
 struct ViewLayout {
     msg_area: Rect,
@@ -66,7 +70,7 @@ impl App {
             .filter(|r| !(permission_open && r.split == Split::Below))
             .collect();
         let splits = carve(content, &reqs);
-        let inner = splits.inner;
+        let inner = main_content_area(splits.inner);
 
         let below_active = splits.rect(Split::Below).is_some();
         let bottom_takeover = form_visible || below_active;
@@ -95,8 +99,9 @@ impl App {
 
         // The `below` split lives outside `inner` (drawn by render_splits), so
         // the bottom panel only ever splits the chat region.
-        let [msg_area, bottom_area] =
+        let [msg_region, bottom_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
+        let msg_area = message_content_area(msg_region);
 
         let panel_reqs = if bottom_takeover {
             Vec::new()
@@ -130,7 +135,7 @@ impl App {
         ViewLayout {
             msg_area,
             bottom_area,
-            status_area,
+            status_area: main_content_area(status_area),
             queue_area,
             panel_windows,
             input_area,
@@ -368,12 +373,7 @@ impl App {
                 || self.active_subagent_can_steer()
                 || self.queue_editor_active())
         {
-            let input_inner = Rect::new(
-                layout.input_area.x,
-                layout.input_area.y + 1,
-                layout.input_area.width,
-                layout.input_area.height.saturating_sub(2),
-            );
+            let input_inner = input::content_area(layout.input_area);
             self.zones.push(SelectableZone {
                 area: input_inner,
                 zone: SelectionZone::Input,
@@ -497,5 +497,78 @@ impl App {
             contexts.push(KeybindContext::Editing);
         }
         contexts
+    }
+}
+
+pub(super) fn main_content_area(area: Rect) -> Rect {
+    let gutter = if area.width >= 60 {
+        MAIN_GUTTER_WIDE
+    } else if area.width >= 36 {
+        MAIN_GUTTER_NARROW
+    } else {
+        0
+    };
+    Rect::new(
+        area.x.saturating_add(gutter),
+        area.y,
+        area.width.saturating_sub(gutter.saturating_mul(2)),
+        area.height,
+    )
+}
+
+fn message_content_area(area: Rect) -> Rect {
+    let padding = if area.height
+        >= MIN_CHAT_ROWS.saturating_add(MESSAGE_VERTICAL_PADDING.saturating_mul(2))
+    {
+        MESSAGE_VERTICAL_PADDING
+    } else {
+        0
+    };
+    Rect::new(
+        area.x,
+        area.y.saturating_add(padding),
+        area.width,
+        area.height.saturating_sub(padding.saturating_mul(2)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case(35, 5, 35 ; "compact_has_no_gutter")]
+    #[test_case(36, 6, 34 ; "narrow_threshold")]
+    #[test_case(59, 6, 57 ; "narrow_upper_bound")]
+    #[test_case(60, 7, 56 ; "wide_threshold")]
+    fn main_content_gutter_is_responsive(width: u16, expected_x: u16, expected_width: u16) {
+        let area = Rect::new(5, 3, width, 10);
+
+        assert_eq!(
+            main_content_area(area),
+            Rect::new(expected_x, area.y, expected_width, area.height)
+        );
+    }
+
+    #[test_case(2, 0, 2 ; "minimum_height_keeps_content")]
+    #[test_case(3, 0, 3 ; "short_height_keeps_content")]
+    #[test_case(4, 1, 2 ; "padding_starts_with_two_content_rows")]
+    #[test_case(10, 1, 8 ; "regular_height_has_vertical_padding")]
+    fn message_area_preserves_vertical_breathing_room(
+        height: u16,
+        expected_y_offset: u16,
+        expected_height: u16,
+    ) {
+        let area = Rect::new(5, 3, 40, height);
+
+        assert_eq!(
+            message_content_area(area),
+            Rect::new(
+                area.x,
+                area.y + expected_y_offset,
+                area.width,
+                expected_height,
+            )
+        );
     }
 }

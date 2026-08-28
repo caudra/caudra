@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme;
@@ -77,10 +77,24 @@ pub fn view(
         return Vec::new();
     }
 
-    let visible_rows = usize::from(area.height.saturating_sub(2));
+    let left = if area.width >= 32 {
+        3
+    } else if area.width >= 16 {
+        2
+    } else {
+        1
+    };
+    let right = u16::from(area.width >= 32);
+    let content_area = Rect::new(
+        area.x.saturating_add(left),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(left.saturating_add(right)),
+        area.height.saturating_sub(2),
+    );
+    let visible_rows = usize::from(content_area.height);
     let viewport = viewport.min(entries.len().saturating_sub(visible_rows));
     let end = (viewport + visible_rows).min(entries.len());
-    let content_width = area.width.saturating_sub(2) as usize;
+    let content_width = content_area.width as usize;
     let mut hits = Vec::new();
     let lines = entries[viewport..end]
         .iter()
@@ -88,8 +102,8 @@ pub fn view(
         .map(|(visible_index, entry)| {
             let index = viewport + visible_index;
             let selected = focus == Some(index);
-            let row = area.y + 1 + visible_index as u16;
-            let row_area = Rect::new(area.x + 1, row, area.width.saturating_sub(2), 1);
+            let row = content_area.y + visible_index as u16;
+            let row_area = Rect::new(content_area.x, row, content_area.width, 1);
             hits.push(QueueHit {
                 area: row_area,
                 target: QueueHitTarget::Item {
@@ -129,7 +143,7 @@ pub fn view(
                 Span::raw(" ".repeat(padding)),
             ];
 
-            let mut action_x = area.right().saturating_sub(1 + action_width as u16);
+            let mut action_x = content_area.right().saturating_sub(action_width as u16);
             for (label, action) in actions {
                 spans.push(Span::raw(" "));
                 let action_style = if action == QueueAction::Delete {
@@ -153,16 +167,28 @@ pub fn view(
         })
         .collect::<Vec<_>>();
 
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(if focus.is_some() {
-            theme::current().item_selected
-        } else {
-            theme::current().panel_border
-        })
-        .title_top(Line::from(format!(" {title} ({}) ", entries.len())).left_aligned())
-        .title_style(theme::current().panel_title);
+    frame.render_widget(Block::default().style(theme::current().panel_style()), area);
+    let rail_style = if focus.is_some() {
+        theme::current().item_selected
+    } else {
+        theme::current().panel_border
+    };
+    for y in area.y..area.bottom() {
+        if let Some(cell) = frame.buffer_mut().cell_mut((area.x, y)) {
+            cell.set_char('┃').set_style(rail_style);
+        }
+    }
+    let header_area = Rect::new(
+        content_area.x,
+        area.y,
+        content_area.width,
+        1.min(area.height),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(format!("{title} · {}", entries.len())))
+            .style(theme::current().panel_title),
+        header_area,
+    );
     if let Some(together) = together {
         let label = if together {
             TOGETHER_LABEL
@@ -170,21 +196,24 @@ pub fn view(
             SEPARATE_LABEL
         };
         let width = label.width() as u16;
-        if area.width > width + 4 {
-            block = block.title_top(
-                Line::from(Span::styled(label, theme::current().keybind_key)).right_aligned(),
+        if content_area.width > width + 4 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    label,
+                    theme::current().keybind_key,
+                )))
+                .right_aligned(),
+                header_area,
             );
             hits.push(QueueHit {
-                area: Rect::new(area.right().saturating_sub(width + 1), area.y, width, 1),
+                area: Rect::new(content_area.right().saturating_sub(width), area.y, width, 1),
                 target: QueueHitTarget::ToggleTogether,
             });
         }
     }
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::new().fg(theme::current().foreground))
-            .block(block),
-        area,
+        Paragraph::new(lines).style(Style::new().fg(theme::current().foreground)),
+        content_area,
     );
     hits
 }
@@ -251,6 +280,7 @@ fn truncate_span(text: &str, max_width: usize, style: Style) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn height_is_bounded() {
@@ -267,5 +297,49 @@ mod tests {
             truncate_span("你好世界", 7, Style::new()).content,
             "你好..."
         );
+    }
+
+    #[test]
+    fn queue_uses_the_shared_panel_grid() {
+        let entries = [QueueEntry {
+            id: QueueItemId::new(),
+            text: Cow::Borrowed("queued prompt"),
+            color: theme::current().foreground,
+            editable: true,
+            movable: false,
+        }];
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = view(
+                    frame,
+                    frame.area(),
+                    "Queue - Main",
+                    &entries,
+                    None,
+                    0,
+                    Some(false),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "N");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == QueueHitTarget::ToggleTogether)
+        );
+        assert!(hits.iter().any(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            ) && hit.area.x == 3
+        }));
     }
 }

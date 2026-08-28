@@ -78,10 +78,13 @@ fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
     panel.set_scroll_top(0);
     let area = Rect::new(0, 0, 80, 20);
 
-    for (index, source) in sources.into_iter().enumerate() {
-        assert_eq!(panel.source_at(index as u16 * 2, area), Some(source));
+    let mut row = 0;
+    for (segment, source) in panel.cache.segments().iter().zip(sources) {
+        row += segment.chrome(panel.viewport_width).content_start();
+        assert_eq!(panel.source_at(row, area), Some(source));
+        row += segment.content_height(panel.viewport_width)
+            + segment.chrome(panel.viewport_width).bottom;
     }
-    assert_eq!(panel.source_at(1, area), None, "spacer is UI-only");
 }
 
 fn done(id: &str) -> ToolDoneEvent {
@@ -720,17 +723,17 @@ fn search_text_omits_author_labels() {
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
     assert_eq!(texts[0], "hello");
-    assert_eq!(texts[2], md);
-    assert_eq!(texts[4], "thinking> hmm");
+    assert_eq!(texts[1], md);
+    assert_eq!(texts[2], "thinking> hmm");
 }
 
 #[test]
-fn author_messages_render_as_unlabelled_background_bands() {
+fn author_messages_render_as_a_user_card_and_flat_assistant_prose() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, "world".into()));
 
-    let terminal = render(&mut panel, 24, 8);
+    let terminal = render(&mut panel, 40, 10);
     let buffer = terminal.backend().buffer();
     let rows = (0..buffer.area.height)
         .map(|y| {
@@ -750,29 +753,27 @@ fn author_messages_render_as_unlabelled_background_bands() {
         .find(|(_, text)| text.contains("world"))
         .unwrap()
         .0;
-    let content_right = panel.viewport_width - 1;
-    let user_bg = buffer.cell((0, user_row)).unwrap().style().bg;
-    let assistant_bg = buffer.cell((0, assistant_row)).unwrap().style().bg;
+    let user_bg = buffer.cell((3, user_row)).unwrap().style().bg;
+    let assistant_bg = buffer.cell((3, assistant_row)).unwrap().style().bg;
 
     assert_ne!(user_bg, assistant_bg);
-    assert_eq!(
-        buffer.cell((content_right, user_row)).unwrap().style().bg,
-        user_bg
-    );
+    assert_eq!(buffer.cell((0, user_row)).unwrap().symbol(), "┃");
+    assert_eq!(buffer.cell((0, assistant_row)).unwrap().symbol(), " ");
     assert_eq!(
         buffer
-            .cell((content_right, assistant_row))
+            .cell((panel.viewport_width - 1, user_row))
             .unwrap()
             .style()
             .bg,
-        assistant_bg
+        user_bg
     );
+    assert_eq!(rows[user_row.saturating_sub(1) as usize].1.trim(), "┃");
     assert!(rows.iter().all(|(_, text)| !text.contains("you>")));
     assert!(rows.iter().all(|(_, text)| !text.contains("maki>")));
 }
 
 #[test]
-fn streaming_assistant_uses_an_unlabelled_background_band() {
+fn streaming_assistant_uses_the_flat_assistant_inset() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer("streaming");
 
@@ -786,17 +787,20 @@ fn streaming_assistant_uses_an_unlabelled_background_band() {
                 .contains("streaming")
         })
         .unwrap();
-    let bg = buffer.cell((0, row)).unwrap().style().bg;
+    assert_eq!(buffer.cell((0, row)).unwrap().symbol(), " ");
+    assert_eq!(buffer.cell((1, row)).unwrap().symbol(), " ");
+    assert_eq!(buffer.cell((2, row)).unwrap().symbol(), "s");
+}
 
-    assert!(bg.is_some());
-    assert_eq!(
-        buffer
-            .cell((panel.viewport_width - 1, row))
-            .unwrap()
-            .style()
-            .bg,
-        bg
-    );
+#[test]
+fn selecting_only_user_card_padding_copies_nothing() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    render(&mut panel, 80, 10);
+    let area = Rect::new(0, 0, 80, 10);
+    let selection = make_sel(area, (0, 0), (0, 79));
+
+    assert!(panel.extract_selection_text(&selection, area).is_empty());
 }
 
 #[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]
@@ -915,7 +919,7 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
 
-const MESSAGE_START_COL: u16 = 0;
+const MESSAGE_START_COL: u16 = 3;
 
 fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
     let mut sel = Selection::start(
@@ -1119,7 +1123,7 @@ fn extract_partial_last_line_truncated() {
     let total: u16 = panel.segment_heights().iter().sum();
     let area = Rect::new(0, 0, 80, 24);
     let last_row = (total - 1) as u32;
-    let sel = make_sel(area, (0, 0), (last_row, 3));
+    let sel = make_sel(area, (0, 0), (last_row, MESSAGE_START_COL + 3));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text.lines().last().unwrap(), "ABCD");
 }
@@ -1308,13 +1312,19 @@ fn read_code_with_instructions(blocks: Vec<InstructionBlock>) -> ToolOutput {
     }
 }
 
-fn prev_segment_is_spacer(panel: &MessagesPanel, tool_id: &str) -> bool {
+fn segment_has_top_margin(panel: &MessagesPanel, tool_id: &str) -> bool {
     let idx = panel.cache.find_by_tool_id(tool_id).unwrap();
-    panel.cache.get(idx - 1).unwrap().tool_id.is_none()
+    panel
+        .cache
+        .get(idx)
+        .unwrap()
+        .chrome(panel.viewport_width)
+        .margin_top
+        > 0
 }
 
 #[test]
-fn instruction_segment_has_spacer_before_it() {
+fn instruction_segment_has_margin_before_it() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
@@ -1329,7 +1339,7 @@ fn instruction_segment_has_spacer_before_it() {
     rebuild(&mut panel);
 
     let inst_id = segment::instruction_id("t1");
-    assert!(prev_segment_is_spacer(&panel, &inst_id));
+    assert!(segment_has_top_margin(&panel, &inst_id));
 }
 
 fn seg_line_count(panel: &MessagesPanel, tool_id: &str) -> usize {
@@ -2123,11 +2133,11 @@ fn stream_reset_clears_thinking_expand_state() {
 
 #[test]
 fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
-    let long_line = Line::from("x".repeat(80));
+    let long_line = Line::from("x".repeat(77));
     let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
 
     let h_wide = seg.height(80);
-    assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
+    assert_eq!(h_wide, 1, "content fits the assistant inset at width 80");
 
     // Keeping the old height is what keeps a resize cheap: the document
     // layout stays put until the segment is really reflowed.
@@ -2140,12 +2150,16 @@ fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
     // Callers that re-wrap the lines themselves need the real number.
     assert_eq!(
         seg.drawn_height(40),
-        2,
+        3,
         "drawn_height must report what the lines really take at the new width"
     );
 
     seg.set_lines(vec![long_line]);
-    assert_eq!(seg.height(40), 2, "80 chars at width 40 wraps to two lines");
+    assert_eq!(
+        seg.height(40),
+        3,
+        "content reflows at the assistant inset width"
+    );
 }
 
 #[test]
@@ -2301,9 +2315,9 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
     });
     render(&mut panel, 80, 10);
 
-    // Tool + spacer + instruction segments are built up front.
+    // Tool and instruction segments are built up front.
     let seg_count = panel.cache.len();
-    assert!(seg_count >= 3);
+    assert!(seg_count >= 2);
 
     render(&mut panel, 40, 10);
 

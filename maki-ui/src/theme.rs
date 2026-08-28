@@ -13,6 +13,8 @@ use syntect::highlighting::{
 
 const DEFAULT_THEME: &str = "dracula";
 const MESSAGE_BACKGROUND_TINT: f32 = 0.08;
+const ELEMENT_BACKGROUND_TINT: f32 = 0.1;
+const PANEL_BACKGROUND_TINT: f32 = 0.04;
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
@@ -408,7 +410,6 @@ pub struct Theme {
 
     pub user: Style,
     pub assistant: Style,
-    pub assistant_prefix: Style,
     pub thinking: Style,
     pub tool_bg: Style,
     pub tool: Style,
@@ -660,14 +661,33 @@ fn build_syntax_theme(
 
 impl Theme {
     pub(crate) fn user_message_style(&self) -> Style {
-        tinted_background(self.background, self.user.fg.unwrap_or(self.foreground))
-    }
-
-    pub(crate) fn assistant_message_style(&self) -> Style {
         tinted_background(
             self.background,
-            self.assistant_prefix.fg.unwrap_or(self.foreground),
+            self.user.fg.unwrap_or(self.foreground),
+            MESSAGE_BACKGROUND_TINT,
         )
+    }
+
+    pub(crate) fn panel_style(&self) -> Style {
+        self.tool_bg.bg.map_or_else(
+            || tinted_background(self.background, self.foreground, PANEL_BACKGROUND_TINT),
+            |background| Style::new().bg(background),
+        )
+    }
+
+    pub(crate) fn element_style(&self) -> Style {
+        tinted_background(self.background, self.foreground, ELEMENT_BACKGROUND_TINT)
+    }
+
+    pub(crate) fn subtle_border_style(&self) -> Style {
+        match (self.panel_border.fg, self.background) {
+            (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => Style::new().fg(Color::Rgb(
+                lerp_u8(fr, br, 0.45),
+                lerp_u8(fg, bg, 0.45),
+                lerp_u8(fb, bb, 0.45),
+            )),
+            _ => self.panel_border,
+        }
     }
 
     fn from_toml(toml_str: &str) -> Result<Self, String> {
@@ -747,7 +767,6 @@ impl Theme {
 
             user: style("user"),
             assistant: style("assistant"),
-            assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
                 style("thinking"),
                 color("comment"),
@@ -897,12 +916,12 @@ pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
 
-fn tinted_background(background: Color, tint: Color) -> Style {
+fn tinted_background(background: Color, tint: Color, factor: f32) -> Style {
     match (background, tint) {
         (Color::Rgb(br, bg, bb), Color::Rgb(tr, tg, tb)) => Style::new().bg(Color::Rgb(
-            lerp_u8(br, tr, MESSAGE_BACKGROUND_TINT),
-            lerp_u8(bg, tg, MESSAGE_BACKGROUND_TINT),
-            lerp_u8(bb, tb, MESSAGE_BACKGROUND_TINT),
+            lerp_u8(br, tr, factor),
+            lerp_u8(bg, tg, factor),
+            lerp_u8(bb, tb, factor),
         )),
         _ => Style::new().bg(background),
     }
@@ -964,10 +983,8 @@ mod tests {
             t.user_message_style().bg,
             Some(Color::Rgb(0x2f, 0x39, 0x45))
         );
-        assert_eq!(
-            t.assistant_message_style().bg,
-            Some(Color::Rgb(0x39, 0x30, 0x41))
-        );
+        assert_eq!(t.panel_style().bg, Some(Color::Rgb(0x22, 0x24, 0x30)));
+        assert_eq!(t.element_style().bg, Some(Color::Rgb(0x3c, 0x3e, 0x48)));
     }
 
     #[test]

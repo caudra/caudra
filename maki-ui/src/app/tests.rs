@@ -6662,12 +6662,12 @@ fn below_split_reserves_bottom_and_suppresses_input() {
 }
 
 /// `carve` already tests the per-direction geometry; this pins the app wiring:
-/// a split shrinks the chat while the full-width status bar stays put. Below is
-/// tested separately since it also hides the input box.
+/// a split shrinks the chat while the status stays aligned to the main gutter.
+/// Below is tested separately since it also hides the input box.
 #[test_case(maki_lua::Split::Above ; "above")]
 #[test_case(maki_lua::Split::Left ; "left")]
 #[test_case(maki_lua::Split::Right ; "right")]
-fn non_below_split_reserves_band_and_keeps_status_full_width(dir: maki_lua::Split) {
+fn non_below_split_reserves_band_and_keeps_status_aligned(dir: maki_lua::Split) {
     let mut app = test_app();
     let (msg_before, _b, _s, _i, _sp) = app.layout_geometry(TEST_AREA);
 
@@ -6680,8 +6680,14 @@ fn non_below_split_reserves_band_and_keeps_status_full_width(dir: maki_lua::Spli
         "chat must shrink to make room for the split",
     );
     assert_eq!(
-        status_after.width, TEST_AREA.width,
-        "status bar stays full width regardless of the split",
+        status_after,
+        super::view::main_content_area(Rect::new(
+            TEST_AREA.x,
+            TEST_AREA.bottom() - 1,
+            TEST_AREA.width,
+            1,
+        )),
+        "status bar stays aligned to the main gutter regardless of the split",
     );
 }
 

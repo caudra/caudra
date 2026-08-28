@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::{apply_scroll_delta, visual_line_count};
@@ -26,6 +26,8 @@ use crate::selection::LineBreaks;
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
+const COMPOSER_RAIL_WIDTH: u16 = 1;
+const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -255,7 +257,7 @@ impl InputBox {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let ew = effective_width(width as usize);
+        let ew = effective_width(composer_content_width(width) as usize);
         let mut visual_lines =
             total_visual_lines(&self.buffer, ew, self.buffer.focused_paste().is_none());
         if !self.pending_images.is_empty() {
@@ -450,8 +452,9 @@ impl InputBox {
         focused: bool,
         top_right_hint: Option<Line<'_>>,
     ) {
-        let content_height = area.height.saturating_sub(2);
-        let ew = effective_width(area.width as usize);
+        let content_area = content_area(area);
+        let content_height = content_area.height;
+        let ew = effective_width(content_area.width as usize);
         let focused_paste = focused.then(|| self.buffer.focused_paste()).flatten();
         let cursor_visible = focused && focused_paste.is_none();
 
@@ -537,23 +540,33 @@ impl InputBox {
             )));
         }
 
-        let text = Text::from(styled_lines);
-        let mut block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_type(BorderType::Plain)
-            .border_style(border_style);
-        if let Some(hint) = top_right_hint {
-            block = block.title_top(hint.right_aligned());
+        frame.render_widget(
+            Block::default().style(theme::current().element_style()),
+            area,
+        );
+        let rail_style = border_style.patch(theme::current().element_style());
+        for y in area.y..area.bottom() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((area.x, y)) {
+                cell.set_char('┃').set_style(rail_style);
+            }
         }
+        if let Some(hint) = top_right_hint {
+            let hint_area = Rect::new(
+                content_area.x,
+                area.y,
+                content_area.width,
+                COMPOSER_VERTICAL_PADDING.min(area.height),
+            );
+            frame.render_widget(Paragraph::new(hint.right_aligned()), hint_area);
+        }
+        let text = Text::from(styled_lines);
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
-            .scroll((self.scroll_y, 0))
-            .block(block);
-        frame.render_widget(paragraph, area);
+            .scroll((self.scroll_y, 0));
+        frame.render_widget(paragraph, content_area);
 
         if max_scroll > 0 {
-            let inner = area.inner(ratatui::layout::Margin::new(0, 1));
-            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
+            render_vertical_scrollbar(frame, content_area, total_vl, self.scroll_y);
         }
     }
 
@@ -688,6 +701,39 @@ fn random_placeholder_hint() -> &'static str {
 
 fn effective_width(content_width: usize) -> usize {
     content_width.saturating_sub(PREFIX_WIDTH as usize)
+}
+
+pub(crate) fn content_area(area: Rect) -> Rect {
+    let padding = composer_horizontal_padding(area.width);
+    let left = COMPOSER_RAIL_WIDTH.saturating_add(padding).min(area.width);
+    let right = padding.min(area.width.saturating_sub(left));
+    let top = COMPOSER_VERTICAL_PADDING.min(area.height);
+    let bottom = COMPOSER_VERTICAL_PADDING.min(area.height.saturating_sub(top));
+    Rect::new(
+        area.x.saturating_add(left),
+        area.y.saturating_add(top),
+        area.width.saturating_sub(left.saturating_add(right)),
+        area.height.saturating_sub(top.saturating_add(bottom)),
+    )
+}
+
+fn composer_content_width(width: u16) -> u16 {
+    let padding = composer_horizontal_padding(width);
+    width.saturating_sub(
+        COMPOSER_RAIL_WIDTH
+            .saturating_add(padding)
+            .saturating_add(padding),
+    )
+}
+
+fn composer_horizontal_padding(width: u16) -> u16 {
+    if width >= 32 {
+        2
+    } else if width >= 16 {
+        1
+    } else {
+        0
+    }
 }
 
 fn wrap_line(
@@ -1087,7 +1133,7 @@ mod tests {
     #[test]
     fn cursor_adds_extra_wrap_row_at_boundary() {
         let width: u16 = 12;
-        let ew = effective_width(width as usize);
+        let ew = effective_width(composer_content_width(width) as usize);
 
         let mut at_boundary = InputBox::new(InputHistory::default(), 20);
         type_text(&mut at_boundary, &"x".repeat(ew));
@@ -1131,8 +1177,10 @@ mod tests {
     fn has_scrollbar_thumb(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {
         let buf = terminal.backend().buffer();
         (0..buf.area.height).any(|y| {
-            buf.cell((buf.area.width - 1, y))
-                .is_some_and(|c| c.symbol() == SCROLLBAR_THUMB)
+            (0..buf.area.width).any(|x| {
+                buf.cell((x, y))
+                    .is_some_and(|c| c.symbol() == SCROLLBAR_THUMB)
+            })
         })
     }
 
@@ -1186,7 +1234,8 @@ mod tests {
         row: u16,
     ) -> String {
         let buf = terminal.backend().buffer();
-        (0..buf.area.width)
+        let content = content_area(buf.area);
+        (content.x..content.right())
             .map(|col| buf.cell((col, row)).unwrap().symbol().to_string())
             .collect::<String>()
             .trim_end()
@@ -1201,6 +1250,23 @@ mod tests {
         let row = rendered_row(&terminal, 1);
         assert!(row.starts_with(CHEVRON), "row: {row:?}");
         assert!(row.contains("hello"));
+    }
+
+    #[test]
+    fn composer_uses_a_padded_panel_and_accent_rail() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "hello");
+        let terminal = render_input(&mut input, 40, 5);
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "❯");
+        assert_eq!(
+            buffer.cell((39, 1)).unwrap().style().bg,
+            theme::current().element_style().bg
+        );
     }
 
     #[test]
@@ -1219,7 +1285,7 @@ mod tests {
     #[test]
     fn wrapped_line_gets_no_padding() {
         let mut input = InputBox::new(InputHistory::default(), 20);
-        let ew = effective_width(14);
+        let ew = effective_width(composer_content_width(14) as usize);
         type_text(&mut input, &"x".repeat(ew + 3));
         let terminal = render_input(&mut input, 14, 5);
         let row0 = rendered_row(&terminal, 1);

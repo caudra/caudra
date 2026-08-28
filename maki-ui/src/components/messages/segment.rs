@@ -4,6 +4,7 @@ use crate::theme;
 
 use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
+use super::layout::{SegmentChrome, SegmentKind};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::cell::Cell;
@@ -59,6 +60,8 @@ pub(super) struct Segment {
     /// how the click finds its message. It looks unused; delete it and the
     /// show_thinking toggle breaks.
     pub msg_index: Option<usize>,
+    kind: SegmentKind,
+    margin_top: u16,
     pub truncation: SectionFlags,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,
@@ -75,16 +78,10 @@ pub(super) struct Segment {
 }
 
 impl Segment {
-    pub fn with_tool(tool_id: String) -> Self {
+    pub fn with_tool(tool_id: String, kind: SegmentKind) -> Self {
         Self {
             tool_id: Some(tool_id),
-            ..Self::default()
-        }
-    }
-
-    pub fn spacer() -> Self {
-        Self {
-            lines: vec![Line::default()],
+            kind,
             ..Self::default()
         }
     }
@@ -104,6 +101,36 @@ impl Segment {
 
     pub fn lines(&self) -> &[Line<'static>] {
         &self.lines
+    }
+
+    pub fn kind(&self) -> SegmentKind {
+        self.kind
+    }
+
+    pub fn set_kind(&mut self, kind: SegmentKind) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.invalidate_height();
+        }
+    }
+
+    pub fn set_margin_top(&mut self, margin_top: u16) {
+        if self.margin_top != margin_top {
+            self.margin_top = margin_top;
+            self.invalidate_height();
+        }
+    }
+
+    pub fn chrome(&self, width: u16) -> SegmentChrome {
+        SegmentChrome::for_kind(self.kind, width, self.margin_top)
+    }
+
+    pub fn content_width(&self, width: u16) -> u16 {
+        self.chrome(width).content_width(width)
+    }
+
+    pub fn content_height(&self, width: u16) -> u16 {
+        wrapped_line_count(&self.lines, self.content_width(width))
     }
 
     pub fn provenance(&self) -> Option<&Provenance> {
@@ -138,7 +165,11 @@ impl Segment {
         {
             return c.height;
         }
-        let h = wrapped_line_count(&self.lines, width);
+        let chrome = self.chrome(width);
+        let h = chrome
+            .content_start()
+            .saturating_add(self.content_height(width))
+            .saturating_add(chrome.bottom);
         self.cached_height.set(Some(CachedHeight {
             at_width: width,
             height: h,
@@ -149,11 +180,21 @@ impl Segment {
     /// Rows the lines really take at `width`, ignoring the cache. Same as
     /// `height` for any segment that is not stale.
     pub fn drawn_height(&self, width: u16) -> u16 {
-        wrapped_line_count(&self.lines, width)
+        let chrome = self.chrome(width);
+        chrome
+            .content_start()
+            .saturating_add(self.content_height(width))
+            .saturating_add(chrome.bottom)
     }
 
     /// Maps a display row (after wrapping) back to the source line index.
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
+        let chrome = self.chrome(width);
+        let rel_row = rel_row.checked_sub(chrome.content_start())?;
+        if rel_row >= self.content_height(width) {
+            return None;
+        }
+        let width = chrome.content_width(width);
         let mut acc = 0u16;
         for (i, line) in self.lines.iter().enumerate() {
             acc = acc.saturating_add(wrapped_line_count(std::slice::from_ref(line), width));
@@ -208,6 +249,9 @@ impl Segment {
     }
 
     pub fn apply_highlight(&mut self, tl: ToolLines, worker: &RenderWorker) {
+        if self.kind != SegmentKind::Instruction {
+            self.set_kind(tool_kind(&tl));
+        }
         self.pending_highlight = tl.send_highlight(worker);
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
@@ -219,6 +263,9 @@ impl Segment {
     }
 
     pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
+        if self.kind != SegmentKind::Instruction {
+            self.set_kind(tool_kind(&tl));
+        }
         let key = HighlightKey::from_request(tl.highlight.as_ref());
         let reused = tl.highlight.as_ref().and_then(|req| {
             let hl_lines = self.reuse_highlight(&key, req.range)?;
@@ -282,6 +329,18 @@ impl Segment {
         if let Some(base) = &mut self.snapshot_base {
             shift(base);
         }
+    }
+}
+
+fn tool_kind(lines: &ToolLines) -> SegmentKind {
+    if lines.lines.len() == 1
+        && lines.highlight.is_none()
+        && lines.snapshot_base.is_none()
+        && !lines.truncation.any()
+    {
+        SegmentKind::ToolInline
+    } else {
+        SegmentKind::ToolBlock
     }
 }
 
@@ -385,9 +444,20 @@ impl SegmentCache {
         self.segments.len()
     }
 
-    pub fn push_spacer_if_needed(&mut self) {
-        if !self.segments.is_empty() {
-            self.segments.push(Segment::spacer());
+    pub fn update_margins(&mut self, width: u16) {
+        let mut previous = None;
+        for segment in &mut self.segments {
+            let segment_height = segment.content_height(width);
+            let margin = previous.map_or(0, |(kind, previous_height)| {
+                u16::from(
+                    segment.kind() != SegmentKind::ToolInline
+                        || kind != SegmentKind::ToolInline
+                        || previous_height > 1
+                        || segment_height > 1,
+                )
+            });
+            segment.set_margin_top(margin);
+            previous = Some((segment.kind(), segment_height));
         }
     }
 
@@ -429,6 +499,46 @@ mod tests {
             snapshot_base: base,
             ..Segment::default()
         }
+    }
+
+    fn inline_tool(text: String) -> Segment {
+        let mut segment = Segment::with_lines(vec![Line::raw(text)], String::new(), None);
+        segment.set_kind(SegmentKind::ToolInline);
+        segment
+    }
+
+    #[test]
+    fn consecutive_single_line_tools_stay_dense() {
+        let mut cache = SegmentCache::new();
+        cache.push(inline_tool("first".into()));
+        cache.push(inline_tool("second".into()));
+
+        cache.update_margins(80);
+
+        assert_eq!(cache.segments[0].margin_top, 0);
+        assert_eq!(cache.segments[1].margin_top, 0);
+    }
+
+    #[test]
+    fn wrapped_tool_separates_the_next_inline_tool() {
+        let mut cache = SegmentCache::new();
+        cache.push(inline_tool("x".repeat(80)));
+        cache.push(inline_tool("next".into()));
+
+        cache.update_margins(40);
+
+        assert_eq!(cache.segments[1].margin_top, 1);
+    }
+
+    #[test]
+    fn wrapped_inline_tool_is_separated_from_the_previous_tool() {
+        let mut cache = SegmentCache::new();
+        cache.push(inline_tool("first".into()));
+        cache.push(inline_tool("x".repeat(80)));
+
+        cache.update_margins(40);
+
+        assert_eq!(cache.segments[1].margin_top, 1);
     }
 
     #[test_case(0, 0 ; "header_maps_to_zero")]

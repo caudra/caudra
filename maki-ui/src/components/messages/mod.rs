@@ -1,3 +1,4 @@
+mod layout;
 mod render;
 mod segment;
 mod selection;
@@ -6,6 +7,7 @@ mod tests;
 
 use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
+use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
@@ -394,19 +396,21 @@ impl MessagesPanel {
             .get(&inst_id)
             .copied()
             .unwrap_or_default();
-        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output);
+        let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
+            .content_width(self.viewport_width);
+        let tl = build_instructions_lines(blocks, width, exp.output);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let seg = self.cache.get_mut(seg_idx).unwrap();
             seg.search_text = tl.search_text.clone();
             seg.update_with_reuse(tl, &self.hl_worker);
         } else {
-            let mut seg = Segment::with_tool(inst_id);
+            let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction);
             seg.search_text = tl.search_text.clone();
             seg.apply_highlight(tl, &self.hl_worker);
-            self.cache.insert(parent_idx + 1, Segment::spacer());
-            self.cache.insert(parent_idx + 2, seg);
+            self.cache.insert(parent_idx + 1, seg);
         }
+        self.cache.update_margins(self.viewport_width);
     }
 
     fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
@@ -645,11 +649,11 @@ impl MessagesPanel {
             return None;
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
-        self.cache
-            .segment_at_row(doc_row, self.viewport_width)?
-            .1
-            .tool_id
-            .as_deref()
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        (rel >= segment.chrome(self.viewport_width).margin_top)
+            .then_some(segment.tool_id.as_deref())
+            .flatten()
     }
 
     pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
@@ -657,7 +661,11 @@ impl MessagesPanel {
             return None;
         }
         let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
-        let segment = self.cache.segment_at_row(doc_row, self.viewport_width)?.1;
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(self.viewport_width).margin_top {
+            return None;
+        }
         if let Some(index) = segment.msg_index {
             return self.messages.get(index)?.source;
         }
@@ -685,13 +693,16 @@ impl MessagesPanel {
         let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
             return self.try_toggle_collapsed_thinking(doc_row, width);
         };
+        let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
+        if rel < seg.chrome(width).margin_top {
+            return false;
+        }
         let Some(tool_id) = seg.tool_id.as_deref() else {
             let msg_idx = seg.msg_index;
             return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
         if self.has_snapshot(tool_id) {
-            let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
                 self.lua_event_handle
@@ -867,75 +878,105 @@ impl MessagesPanel {
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(collapsed_thinking_lines.len() as u16);
+            let content_width =
+                SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
+            streaming_heights.push(wrapped_line_count(&collapsed_thinking_lines, content_width));
         } else if !self.streaming_thinking.is_empty() {
-            let lines = self.streaming_thinking.render_lines(width);
+            let content_width =
+                SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
+            let lines = self.streaming_thinking.render_lines(content_width);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(wrapped_line_count(lines, width));
+            streaming_heights.push(wrapped_line_count(lines, content_width));
         }
 
         if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width);
+            let content_width =
+                SegmentChrome::for_kind(SegmentKind::Assistant, width, 0).content_width(width);
+            let lines = self.streaming_text.render_lines(content_width);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(wrapped_line_count(lines, width));
+            streaming_heights.push(wrapped_line_count(lines, content_width));
         }
 
         let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
         // The reflow window is picked from `scroll_top` and the bottom pin,
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
+        self.cache.update_margins(width);
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
+        self.cache.update_margins(width);
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll_top, viewport);
 
+        let accent = self.accent.resolve();
         for (i, seg) in self.cache.segments().iter().enumerate() {
             if cursor.past_bottom() {
                 break;
             }
             let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
-            let style = if seg.tool_id.is_some() {
-                Some(theme::current().tool_bg)
-            } else {
-                seg.msg_index
-                    .and_then(|index| self.messages.get(index))
-                    .and_then(|message| message_background(&message.role))
-            };
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            cursor.render(
+                seg.lines(),
+                h,
+                seg.chrome(width),
+                segment_styles(seg.kind(), accent),
+                highlight,
+                frame,
+            );
         }
 
         let mut height_idx = 0usize;
-        let streamed: [(&StreamingContent, bool, Option<Style>); 2] = [
-            (&self.streaming_thinking, thinking_collapsed, None),
+        let streamed: [(&StreamingContent, bool, SegmentKind); 2] = [
             (
-                &self.streaming_text,
-                false,
-                Some(theme::current().assistant_message_style()),
+                &self.streaming_thinking,
+                thinking_collapsed,
+                SegmentKind::Thinking,
             ),
+            (&self.streaming_text, false, SegmentKind::Assistant),
         ];
-        for (sc, collapsed, style) in streamed {
+        for (sc, collapsed, kind) in streamed {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
                 continue;
             }
             if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                cursor.render(&spacer_lines, h, None, false, frame);
+                cursor.render(
+                    &spacer_lines,
+                    h,
+                    SegmentChrome::for_kind(SegmentKind::Assistant, width, 0),
+                    (None, None),
+                    false,
+                    frame,
+                );
             }
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 if collapsed {
-                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
+                    cursor.render(
+                        &collapsed_thinking_lines,
+                        h,
+                        SegmentChrome::for_kind(kind, width, 0),
+                        (None, None),
+                        false,
+                        frame,
+                    );
                 } else {
-                    cursor.render(sc.cached_lines(), h, style, false, frame);
+                    cursor.render(
+                        sc.cached_lines(),
+                        h,
+                        SegmentChrome::for_kind(kind, width, 0),
+                        (None, None),
+                        false,
+                        frame,
+                    );
                 }
             }
         }
@@ -1174,7 +1215,8 @@ impl MessagesPanel {
     fn rctx(&self) -> RenderCtx<'_> {
         RenderCtx {
             started_at: self.started_at,
-            width: self.viewport_width,
+            width: SegmentChrome::for_kind(SegmentKind::ToolBlock, self.viewport_width, 0)
+                .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
         }
     }
@@ -1246,7 +1288,10 @@ impl MessagesPanel {
         let cached_height = self.cache.total_height(width);
         let spacer = if self.cache.len() > 0 { 1 } else { 0 };
         let thinking_start = cached_height + spacer;
-        let height = self.build_streaming_collapsed_lines().len() as u32;
+        let content_width =
+            SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
+        let height =
+            wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width) as u32;
         if doc_row >= thinking_start && doc_row < thinking_start + height {
             self.thinking_collapsed = false;
             return true;
@@ -1282,12 +1327,14 @@ impl MessagesPanel {
             self.build_cached_thinking_indicator(&text)
         } else {
             let style = thinking_style();
+            let content_width =
+                SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
             text_to_lines(
                 &text,
                 style.prefix,
                 style.text_style,
                 style.prefix_style,
-                width,
+                content_width,
                 None,
             )
         };
@@ -1366,6 +1413,7 @@ impl MessagesPanel {
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
+        self.cache.update_margins(self.viewport_width);
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -1381,8 +1429,7 @@ impl MessagesPanel {
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
-                self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_tool(id.clone());
+                let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock);
                 seg.search_text = search_text;
                 seg.apply_highlight(tl, &self.hl_worker);
                 self.cache.push(seg);
@@ -1400,18 +1447,19 @@ impl MessagesPanel {
                     let text = msg.text.clone();
                     let lines = self.build_cached_thinking_indicator(&text);
                     let search_text = format!("thinking> {text}");
-                    self.cache.push_spacer_if_needed();
-                    self.cache
-                        .push(Segment::with_lines(lines, search_text, Some(i)));
+                    let mut segment = Segment::with_lines(lines, search_text, Some(i));
+                    segment.set_kind(SegmentKind::Thinking);
+                    self.cache.push(segment);
                     continue;
                 }
                 let built = build_message_lines(msg, self.viewport_width);
-                self.cache.push_spacer_if_needed();
                 let mut segment = Segment::with_lines(built.lines, built.search_text, Some(i));
+                segment.set_kind(segment_kind(&msg.role));
                 segment.set_provenance(built.provenance);
                 self.cache.push(segment);
             }
         }
+        self.cache.update_margins(self.viewport_width);
         self.cache.mark_built(self.messages.len());
     }
 
@@ -1585,14 +1633,32 @@ fn logical_line_count(text: &str) -> usize {
     }
 }
 
-fn message_background(role: &DisplayRole) -> Option<Style> {
-    let theme = theme::current();
+fn segment_kind(role: &DisplayRole) -> SegmentKind {
     match role {
-        DisplayRole::User => Some(theme.user_message_style()),
-        DisplayRole::Assistant => Some(theme.assistant_message_style()),
-        DisplayRole::Thinking | DisplayRole::Error | DisplayRole::Done | DisplayRole::Tool(_) => {
-            None
+        DisplayRole::User => SegmentKind::User,
+        DisplayRole::Assistant => SegmentKind::Assistant,
+        DisplayRole::Thinking => SegmentKind::Thinking,
+        DisplayRole::Error => SegmentKind::Error,
+        DisplayRole::Done => SegmentKind::Done,
+        DisplayRole::Tool(_) => SegmentKind::ToolBlock,
+    }
+}
+
+fn segment_styles(kind: SegmentKind, accent: Color) -> (Option<Style>, Option<Style>) {
+    let theme = theme::current();
+    match kind {
+        SegmentKind::User => (
+            Some(theme.user_message_style()),
+            Some(Style::new().fg(accent)),
+        ),
+        SegmentKind::ToolBlock | SegmentKind::Instruction => {
+            (Some(theme.panel_style()), Some(theme.subtle_border_style()))
         }
+        SegmentKind::Error => (Some(theme.panel_style()), Some(theme.error)),
+        SegmentKind::Assistant
+        | SegmentKind::Thinking
+        | SegmentKind::ToolInline
+        | SegmentKind::Done => (None, None),
     }
 }
 
@@ -1601,6 +1667,7 @@ fn message_background(role: &DisplayRole) -> Option<Style> {
 /// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
 /// messages) so both paths produce identical segments.
 fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
+    let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
