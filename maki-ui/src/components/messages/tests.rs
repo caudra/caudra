@@ -1901,10 +1901,15 @@ fn header_snapshot_stamps_gen_on_top_level() {
 #[test]
 fn live_snapshot_uses_panel_generation() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let expected_generation = panel.theme_generation;
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
+    assert_eq!(
+        panel.snapshot_gen_of("t1"),
+        Some(expected_generation),
+        "{LIVE_PANEL_GEN_MSG}"
+    );
 }
 
 #[test]
