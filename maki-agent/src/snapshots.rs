@@ -1303,8 +1303,13 @@ impl SnapshotStore {
         Ok(manifests)
     }
 
+    /// Flushes once for the whole sweep rather than per file. An unreferenced
+    /// object is garbage, so a deletion that does not survive a crash costs
+    /// nothing but the next sweep, unlike a write whose manifest is already
+    /// on disk.
     fn gc_unreferenced_objects(&self) -> Result<(), SnapshotError> {
         let live = self.live_hashes()?;
+        let mut removed = false;
         for entry in fs::read_dir(self.objects_dir())? {
             let entry = entry?;
             let path = entry.path();
@@ -1312,8 +1317,12 @@ impl SnapshotStore {
                 && let Some(name) = path.file_name().and_then(OsStr::to_str)
                 && !live.contains(name)
             {
-                remove_file_durable(&path)?;
+                fs::remove_file(&path)?;
+                removed = true;
             }
+        }
+        if removed {
+            self.sync_objects();
         }
         Ok(())
     }
