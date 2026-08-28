@@ -466,11 +466,6 @@ mod tests {
             run_id_before + 2,
             "each respawn must bump run_id exactly once"
         );
-        assert_eq!(
-            app.queue.text_messages(),
-            [RESTORED_TEXT],
-            "the restored item lands in the new queue exactly once"
-        );
 
         pre_gen1_sender
             .send(AgentEvent::TextDelta {
@@ -478,23 +473,37 @@ mod tests {
             })
             .expect("pre-generation-1 sender must still deliver after two respawns");
 
+        // The respawned loop claims the restored item as soon as the flush
+        // wakes it, so reading the queue here races that claim. Count what
+        // the loop reports instead: `claim_idle` removes an item before
+        // `QueueItemConsumed` announces it, so the queue has settled by the
+        // time the event lands and a second copy would still be sitting in
+        // it.
         let mut probe_seen = false;
-        let mut consumed_seen = false;
-        while !(probe_seen && consumed_seen) {
+        let mut consumed = Vec::new();
+        while !(probe_seen && !consumed.is_empty()) {
             let envelope = handles
                 .agent_rx
                 .recv_timeout(LONG_TIMEOUT)
                 .expect("probe or restored queue item never reached the tab channel");
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
-                AgentEvent::QueueItemConsumed { ref text, .. } => {
-                    assert_eq!(text, RESTORED_TEXT);
+                AgentEvent::QueueItemConsumed { text, .. } => {
                     assert_eq!(envelope.run_id, app.run_id);
-                    consumed_seen = true;
+                    consumed.push(text);
                 }
                 _ => {}
             }
         }
+        assert_eq!(
+            consumed,
+            [RESTORED_TEXT],
+            "the restored item is delivered exactly once"
+        );
+        assert!(
+            app.queue.text_messages().is_empty(),
+            "no duplicate of the restored item is left queued"
+        );
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint
