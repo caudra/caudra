@@ -785,7 +785,11 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }))
     }
 
@@ -974,6 +978,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "ok".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -1018,6 +1023,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: result.into(),
                     is_error,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -1058,6 +1064,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "hi".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },

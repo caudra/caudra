@@ -3,13 +3,10 @@
 -- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
 -- `maki.agent.call_tool`); orchestration policy is here.
 
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
@@ -267,13 +264,14 @@ local function handler(input, ctx)
   end
 
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+  local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
   -- Memoized, because a cancel reaches us twice: once through the hook and
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    cut_reply = cut_reply or partial.cut(view, table.concat(output_parts, "\n"), reason, timeout)
+    cut_reply.output_limits = limits
     return cut_reply
   end
 
@@ -315,7 +313,7 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = err .. hint, is_error = true, body = buf }
+    return { llm_output = err .. hint, is_error = true, body = buf, output_limits = limits }
   end
 
   local output = result.stdout or ""
@@ -329,10 +327,9 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
-  return { llm_output = llm_output, body = buf }
+  return { llm_output = output, body = buf, output_limits = limits }
 end
 
 local function header(input)

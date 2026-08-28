@@ -117,8 +117,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
-| `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
+| `max_output_bytes` | usize | `51200` | 1024 | Host-enforced default max tool-result size (bytes) |
+| `max_output_lines` | usize | `2000` | 10 | Host-enforced default max tool-result lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
@@ -204,8 +204,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
@@ -213,8 +213,8 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
 ### `plugins.edit`
@@ -229,8 +229,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
 
 ### `plugins.grep`
@@ -238,8 +238,8 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
 
 ### `plugins.index`
@@ -253,7 +253,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 
 ### `plugins.skill`
 
@@ -272,16 +272,16 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ### `plugins.websearch`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ## Validation

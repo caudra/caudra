@@ -1,4 +1,3 @@
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local color = require("maki.color")
@@ -250,6 +249,7 @@ maki.api.register_tool({
     pattern = pattern:gsub('"$', "")
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
@@ -265,24 +265,22 @@ maki.api.register_tool({
     })
 
     if not entries then
-      return { llm_output = "error: " .. tostring(err), is_error = true }
+      return { llm_output = "error: " .. tostring(err), is_error = true, output_limits = limits }
     end
 
     if #entries == 0 then
-      return { llm_output = NO_MATCHES }
+      return { llm_output = NO_MATCHES, output_limits = limits }
     end
 
     for _, entry in ipairs(entries) do
       ctx:record_read(entry.path)
     end
 
-    local llm_output = format_llm_output(entries)
-    llm_output = truncate(llm_output, max_lines, max_bytes)
-
     return {
-      llm_output = llm_output,
+      llm_output = format_llm_output(entries),
       body = build_grep_view(entries, ctx),
       annotation = count_matches(entries),
+      output_limits = limits,
     }
   end,
 })

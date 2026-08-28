@@ -39,6 +39,7 @@ use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
+use maki_storage::tool_outputs::ToolOutputStore;
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
@@ -86,6 +87,24 @@ impl ToolFilter {
         }
     }
 
+    pub fn with_internal_companions(self) -> Self {
+        match self {
+            Self::All => Self::All,
+            Self::Only(mut allowed) => {
+                for &name in INTERNAL_COMPANION_TOOL_NAMES {
+                    if !allowed.iter().any(|allowed| allowed == name) {
+                        allowed.push(name.into());
+                    }
+                }
+                Self::Only(allowed)
+            }
+            Self::AllExcept(mut blocked) => {
+                blocked.retain(|name| !INTERNAL_COMPANION_TOOL_NAMES.contains(&name.as_str()));
+                Self::AllExcept(blocked)
+            }
+        }
+    }
+
     pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
         let base = if config.allowed_tools.is_empty() {
             Self::All
@@ -102,7 +121,7 @@ impl ToolFilter {
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
-        base.excluding(&exclude)
+        base.excluding(&exclude).with_internal_companions()
     }
 }
 
@@ -119,7 +138,7 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
 /// A tool is enabled unless named in `disabled_tools` (config, or the raw
 /// list a Lua caller holds, e.g. `maki.api.get_tools`).
 pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
-    !disabled_tools.iter().any(|s| s == name)
+    INTERNAL_COMPANION_TOOL_NAMES.contains(&name) || !disabled_tools.iter().any(|s| s == name)
 }
 
 pub const BASH_TOOL_NAME: &str = "bash";
@@ -132,8 +151,12 @@ pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
+pub const TOOL_OUTPUT_GREP_TOOL_NAME: &str = "tool_output_grep";
+pub const TOOL_OUTPUT_READ_TOOL_NAME: &str = "tool_output_read";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
+pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] =
+    &[TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME];
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
@@ -208,6 +231,7 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
@@ -378,13 +402,16 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    maki_config::DEFAULT_BUILTINS.contains(&name)
+        || maki_config::EDIT_SUB_TOOLS.contains(&name)
+        || INTERNAL_COMPANION_TOOL_NAMES.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
+        .chain(INTERNAL_COMPANION_TOOL_NAMES.iter())
         .copied()
         .collect()
 }
@@ -432,6 +459,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        tool_output_store: None,
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
@@ -612,6 +640,46 @@ mod tests {
             filter.matches(READ_TOOL_NAME),
             "unrelated tools stay enabled"
         );
+    }
+
+    #[test]
+    fn config_filters_always_keep_internal_output_companions() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec![READ_TOOL_NAME.into()],
+            disabled_tools: INTERNAL_COMPANION_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).into())
+                .collect(),
+            ..Default::default()
+        };
+
+        let filter = ToolFilter::from_config(&config, &model, INTERNAL_COMPANION_TOOL_NAMES);
+
+        assert!(filter.matches(READ_TOOL_NAME));
+        assert!(filter.matches(TOOL_OUTPUT_READ_TOOL_NAME));
+        assert!(filter.matches(TOOL_OUTPUT_GREP_TOOL_NAME));
+        assert!(!filter.matches(BASH_TOOL_NAME));
+        assert!(is_tool_enabled(
+            &config.disabled_tools,
+            TOOL_OUTPUT_READ_TOOL_NAME
+        ));
+    }
+
+    #[test]
+    fn explicit_empty_filter_stays_no_tools() {
+        let filter = ToolFilter::Only(Vec::new());
+
+        assert!(!filter.matches(TOOL_OUTPUT_READ_TOOL_NAME));
+        assert!(!filter.matches(TOOL_OUTPUT_GREP_TOOL_NAME));
+        assert!(!filter.matches(READ_TOOL_NAME));
+    }
+
+    #[test_case(TOOL_OUTPUT_READ_TOOL_NAME)]
+    #[test_case(TOOL_OUTPUT_GREP_TOOL_NAME)]
+    fn managed_output_companions_are_builtin_names(name: &str) {
+        assert!(is_builtin_tool(name));
+        assert!(all_builtin_tool_names().contains(&name));
     }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 pub use maki_storage::id::MakiId;
 use maki_storage::sessions::TitleSource;
+use maki_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -52,6 +53,10 @@ pub enum HistoryItemKind {
     AssistantText {
         text: String,
         state: AssistantTextState,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_output_refs: Vec<ToolOutputRef>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_compaction_summary: bool,
     },
     Reasoning {
         text: String,
@@ -71,6 +76,8 @@ pub enum HistoryItemKind {
         call_id: String,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_ref: Option<ToolOutputRef>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageSource>,
     },
@@ -383,6 +390,7 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
                 tool_use_id,
                 content,
                 is_error,
+                output_ref,
             } => {
                 if !pending_images.is_empty() {
                     kinds.push(user_kind(
@@ -396,6 +404,7 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
                     call_id: tool_use_id.clone(),
                     content: content.clone(),
                     is_error: *is_error,
+                    output_ref: output_ref.clone(),
                     images: Vec::new(),
                 });
                 last_tool_result = Some(kinds.len() - 1);
@@ -465,13 +474,27 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
         return vec![HistoryItemKind::AssistantText {
             text: String::new(),
             state: AssistantTextState::Complete,
+            retained_output_refs: message.retained_output_refs.clone(),
+            is_compaction_summary: message.is_compaction_summary,
         }];
     }
-    message
+    let mut kinds: Vec<_> = message
         .content
         .iter()
         .map(|block| assistant_kind(block, padding))
-        .collect()
+        .collect();
+    if let Some(HistoryItemKind::AssistantText {
+        retained_output_refs,
+        is_compaction_summary,
+        ..
+    }) = kinds
+        .iter_mut()
+        .find(|kind| matches!(kind, HistoryItemKind::AssistantText { .. }))
+    {
+        retained_output_refs.clone_from(&message.retained_output_refs);
+        *is_compaction_summary = message.is_compaction_summary;
+    }
+    kinds
 }
 
 fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
@@ -483,6 +506,8 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
             } else {
                 AssistantTextState::Complete
             },
+            retained_output_refs: Vec::new(),
+            is_compaction_summary: false,
         },
         ContentBlock::Thinking {
             thinking,
@@ -514,10 +539,12 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
             tool_use_id,
             content,
             is_error,
+            output_ref,
         } => HistoryItemKind::ToolResult {
             call_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: *is_error,
+            output_ref: output_ref.clone(),
             images: Vec::new(),
         },
         ContentBlock::Image { source } => HistoryItemKind::User {
@@ -700,7 +727,16 @@ fn project_group(items: &[HistoryItem]) -> Message {
                         .push(ContentBlock::Text { text: text.clone() });
                 }
             }
-            HistoryItemKind::AssistantText { text, state } => {
+            HistoryItemKind::AssistantText {
+                text,
+                state,
+                retained_output_refs,
+                is_compaction_summary,
+            } => {
+                message
+                    .retained_output_refs
+                    .extend(retained_output_refs.iter().cloned());
+                message.is_compaction_summary |= is_compaction_summary;
                 message.content.push(ContentBlock::Text {
                     text: if *state == AssistantTextState::Padding {
                         EMPTY_RESPONSE_MARKER.into()
@@ -741,12 +777,14 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 call_id,
                 content,
                 is_error,
+                output_ref,
                 images,
             } => {
                 message.content.push(ContentBlock::ToolResult {
                     tool_use_id: call_id.clone(),
                     content: content.clone(),
                     is_error: *is_error,
+                    output_ref: output_ref.clone(),
                 });
                 result_image_index = message.content.len();
                 result_images.extend(images.iter().cloned());
@@ -777,6 +815,7 @@ mod tests {
 
     const CALL_ONE: &str = "call-one";
     const CALL_TWO: &str = "call-two";
+    const STORED_OUTPUT: &str = "first\nsecond";
     const TOOL_NAME: &str = "read";
 
     fn image(data: &str) -> ImageSource {
@@ -803,6 +842,14 @@ mod tests {
             images: Vec::new(),
             display_text: None,
             origin: UserOrigin::Turn,
+        }
+    }
+
+    fn output_ref() -> ToolOutputRef {
+        ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: STORED_OUTPUT.len(),
+            line_count: STORED_OUTPUT.lines().count(),
         }
     }
 
@@ -842,6 +889,7 @@ mod tests {
                     tool_use_id: CALL_ONE.into(),
                     content: "result".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: image("tool-image"),
@@ -878,6 +926,94 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_ref_roundtrips_through_persisted_history() {
+        let output_ref = output_ref();
+        let messages = [
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(CALL_ONE, TOOL_NAME, json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL_ONE.into(),
+                    content: "result".into(),
+                    is_error: false,
+                    output_ref: Some(output_ref.clone()),
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut items = Vec::new();
+        for message in &messages {
+            append_message(&mut items, message);
+        }
+        let persisted = serde_json::to_value(items).unwrap();
+        assert_eq!(persisted[1]["output_ref"]["id"], output_ref.id.to_string());
+        let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
+
+        assert!(matches!(
+            &items[1].kind,
+            HistoryItemKind::ToolResult {
+                output_ref: Some(reference),
+                ..
+            } if reference == &output_ref
+        ));
+        let projected = project_messages(&items).unwrap();
+        assert!(matches!(
+            &projected[1].content[0],
+            ContentBlock::ToolResult {
+                output_ref: Some(reference),
+                ..
+            } if reference == &output_ref
+        ));
+        assert!(
+            serde_json::to_value(&projected[1]).unwrap()["content"][0]
+                .get("output_ref")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compacted_output_refs_roundtrip_without_public_serialization() {
+        let output_ref = output_ref();
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("retained output ID: {}", output_ref.id),
+            }],
+            retained_output_refs: vec![output_ref.clone()],
+            is_compaction_summary: true,
+            ..Default::default()
+        };
+
+        let items = expand_message(&message, None);
+        let persisted = serde_json::to_value(&items).unwrap();
+        assert_eq!(
+            persisted[0]["retained_output_refs"][0]["id"],
+            output_ref.id.to_string()
+        );
+
+        let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
+        let projected = project_messages(&items).unwrap();
+        assert_eq!(projected[0].retained_output_refs, [output_ref]);
+        assert!(projected[0].is_compaction_summary);
+        assert!(
+            serde_json::to_value(&projected[0])
+                .unwrap()
+                .get("retained_output_refs")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&projected[0])
+                .unwrap()
+                .get("is_compaction_summary")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn expansion_associates_positional_result_images_atomically() {
         let message = Message {
             role: Role::User,
@@ -886,11 +1022,13 @@ mod tests {
                     tool_use_id: CALL_ONE.into(),
                     content: "one".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: CALL_TWO.into(),
                     content: "two".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: image("first"),
@@ -924,11 +1062,13 @@ mod tests {
                     tool_use_id: CALL_ONE.into(),
                     content: "one".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: CALL_TWO.into(),
                     content: "two".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: image("first"),
@@ -1051,6 +1191,7 @@ mod tests {
                 call_id: CALL_ONE.into(),
                 content: "one".into(),
                 is_error: false,
+                output_ref: None,
                 images: vec![image("first")],
             },
             result_group,
@@ -1061,6 +1202,7 @@ mod tests {
                 call_id: CALL_TWO.into(),
                 content: "two".into(),
                 is_error: true,
+                output_ref: None,
                 images: vec![image("second")],
             },
             result_group,
@@ -1149,6 +1291,8 @@ mod tests {
             HistoryItemKind::AssistantText {
                 text: "two".into(),
                 state: AssistantTextState::Complete,
+                retained_output_refs: Vec::new(),
+                is_compaction_summary: false,
             },
             group_id,
             Some(user.id),
@@ -1168,6 +1312,7 @@ mod tests {
                 call_id: CALL_ONE.into(),
                 content: "orphan".into(),
                 is_error: false,
+                output_ref: None,
                 images: Vec::new(),
             },
             MakiId::generate(),
@@ -1203,6 +1348,7 @@ mod tests {
                     tool_use_id: CALL_ONE.into(),
                     content: "one".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -1238,11 +1384,13 @@ mod tests {
                         tool_use_id: CALL_ONE.into(),
                         content: "one".into(),
                         is_error: false,
+                        output_ref: None,
                     },
                     ContentBlock::ToolResult {
                         tool_use_id: CALL_ONE.into(),
                         content: "again".into(),
                         is_error: false,
+                        output_ref: None,
                     },
                 ],
                 ..Default::default()

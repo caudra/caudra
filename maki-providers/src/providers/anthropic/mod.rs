@@ -530,7 +530,10 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
+    use crate::{
+        ContentBlock, EMPTY_RESPONSE_MARKER, MakiId, ProviderEvent, Role, StopReason, TokenUsage,
+    };
+    use maki_storage::tool_outputs::ToolOutputRef;
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
@@ -538,6 +541,7 @@ mod tests {
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const STORED_OUTPUT: &str = "first\nsecond";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -814,6 +818,14 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         }
     }
 
+    fn output_ref() -> ToolOutputRef {
+        ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: STORED_OUTPUT.len(),
+            line_count: STORED_OUTPUT.lines().count(),
+        }
+    }
+
     fn message(role: Role, content: Vec<ContentBlock>) -> Message {
         Message {
             role,
@@ -833,6 +845,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                     tool_use_id: "t1".into(),
                     content: "ok".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 text_block("second"),
             ]),
@@ -896,6 +909,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                     tool_use_id: "t1".into(),
                     content: "[image: pic.png 1KB]".into(),
                     is_error: false,
+                    output_ref: Some(output_ref()),
                 },
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
@@ -909,8 +923,15 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         let wire = build_wire_messages(&messages);
         let json: Value = serde_json::to_value(&wire).unwrap();
 
-        assert_eq!(json[0]["content"][0]["type"], "tool_result");
-        assert_eq!(json[0]["content"][0]["tool_use_id"], "t1");
+        assert_eq!(
+            json[0]["content"][0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": "[image: pic.png 1KB]",
+            })
+        );
+        assert!(json[0]["content"][0].get("output_ref").is_none());
         assert_eq!(
             json[0]["content"][1],
             json!({

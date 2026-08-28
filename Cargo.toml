@@ -110,6 +110,7 @@ strum = { version = "0.27", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson", "hybrid", "unicode-perl", "unicode-word-boundary"] }
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"

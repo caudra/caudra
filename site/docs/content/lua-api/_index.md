@@ -206,7 +206,9 @@ committed to the registry once the plugin finishes loading.
 Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
-string or a table with richer output fields.
+string or a table with richer output fields. Normally return the complete
+`llm_output`: the host applies output limits and retains eligible full text
+for later retrieval. Truncate in the producer only when loss is intentional.
 
 **Parameters:**
 
@@ -231,6 +233,9 @@ string or a table with richer output fields.
     - `instructions` (`table`) Array of { path, content } blocks injected as context.
     - `state` (`any`) Serializable state forwarded to restore.
     - `model_suffix` (`string`) Extra parent-model context omitted from UI and direct tool calls.
+    - `output_limits` (`table`) Host-enforced limits for this result.
+      `max_lines` and `max_bytes` are required positive
+      integers. Overrides the agent defaults.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -1473,7 +1478,10 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
   - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
   - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
+  - `on_error` (`function?`) called with `(job_id, message)` on stream failures.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
+  - `raw_chunks` (`boolean?`) deliver bounded chunks with exact newlines instead
+    of line callbacks. Defaults to false.
   - `owner` (`string?`) job lifetime. `"task"` (default) ends the job with
     the current call. `"plugin"` keeps it alive until the plugin unloads
     or reloads.
@@ -1523,7 +1531,8 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 
 Wait for a job to finish and collect its output. Returns a result
 table with `stdout`, `stderr`, and `exit_code`. Returns `nil` if the
-job does not finish before the timeout.
+job does not finish before the timeout. Collection is limited to 16 MiB
+across stdout and stderr; larger output raises an explicit error.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -5275,33 +5284,11 @@ ListPicker.highlight_spans = highlight_spans
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
-
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-local DEFAULT_MAX_LINE_BYTES = 500
-
-local M = {}
-
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
-M.specs = {
-  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
-  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
-}
-
 function M.extend(spec)
-  for name, s in pairs(M.specs) do
-    spec[name] = s
-  end
-  return spec
-end
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
 function M.resolve(opts, ctx)
-  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
-    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-end
-
-return M
 ```
 
 ### `require("maki.partial")`
@@ -5312,8 +5299,8 @@ return M
 -- wording and the painting, so every tool says it the same way.
 
 --- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
+--- the tool streamed; empty means the view still shows a placeholder to drop.
+--- {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout").
 function M.cut(view, out, reason, timeout_secs)
 ```
@@ -5496,6 +5483,8 @@ function ToolView.restore_markdown(output, is_error, opts)
 ### `require("maki.truncate")`
 
 ```lua
+-- Truncate before host-managed output. Use only when producer-level loss is intentional.
+-- tool handlers should normally return complete llm_output.
 local function truncate(text, max_lines, max_bytes)
   if #text <= max_bytes then
     local n = 0

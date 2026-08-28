@@ -32,6 +32,7 @@ pub mod snapshots;
 mod stored_session;
 mod subagent_history;
 pub mod template;
+mod tool_output;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
@@ -54,7 +55,7 @@ pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
     GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, QueueConsumedItem, SharedBuf, SnapshotLine,
     SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

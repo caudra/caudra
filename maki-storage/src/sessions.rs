@@ -21,6 +21,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 use crate::id::{MakiId, MakiIdParseError};
+use crate::tool_outputs::delete_session_outputs;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,7 +47,7 @@ const LOG_BLOATED: &str = "too many stale meta records";
 /// read. Past this many, the log is rewritten and they all go away at once.
 const MAX_APPENDS: usize = 512;
 /// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
-const ARCHIVE_DIR: &str = "archive";
+pub(crate) const ARCHIVE_DIR: &str = "archive";
 /// Archives kept per session. The extra ones go on the next archive, not on a
 /// timer.
 const ARCHIVE_KEEP: usize = 3;
@@ -1446,6 +1447,16 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
         .collect())
 }
 
+pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<MakiId>, StorageError> {
+    let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
+    Ok(session_entries(&sessions_dir)?
+        .into_iter()
+        .filter_map(|path| path.file_stem()?.to_str()?.parse().ok())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect())
+}
+
 fn is_session_file(p: &Path) -> bool {
     p.file_stem()
         .and_then(|s| s.to_str())
@@ -1934,26 +1945,63 @@ where
 
     pub fn delete(id: MakiId, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::delete_from(id, &sessions_dir)
+        let session_result = match delete_session_files(id, &sessions_dir) {
+            Ok(true) => remove_from_cwd_index(&sessions_dir, id).map_err(SessionError::from),
+            Ok(false) => match remove_from_cwd_index(&sessions_dir, id) {
+                Ok(()) => Err(StorageError::NotFound(id.to_string()).into()),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => return Err(error),
+        };
+        finish_delete(id, dir, session_result)
     }
 
     pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
-        let mut removed = try_remove(&jsonl_path(dir, id))?;
-        removed |= remove_legacy_files(dir, id)?;
-        // Backups, not the session: failing to sweep them must not fail a
-        // delete whose log is already gone, and their presence alone does not
-        // make a session exist.
-        if let Err(e) = fs::remove_dir_all(dir.join(ARCHIVE_DIR).join(id.to_string()))
-            && e.kind() != ErrorKind::NotFound
-        {
-            warn!(error = %e, session_id = %id, "session archives remain after delete");
-        }
+        let removed = delete_session_files(id, dir)?;
+        remove_from_cwd_index(dir, id)?;
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
-        remove_from_cwd_index(dir, id)?;
         Ok(())
     }
+}
+
+fn finish_delete(
+    id: MakiId,
+    dir: &StateDir,
+    session_result: Result<(), SessionError>,
+) -> Result<(), SessionError> {
+    let output_result = delete_session_outputs(dir, id).map_err(StorageError::from);
+    match (session_result, output_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Err(output_error)) => {
+            warn!(
+                error = %output_error,
+                session_id = %id,
+                "managed outputs remain after session delete failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+fn delete_session_files(id: MakiId, dir: &Path) -> Result<bool, SessionError> {
+    let mut removed = try_remove(&jsonl_path(dir, id))?;
+    removed |= remove_legacy_files(dir, id)?;
+    let archive_dir = dir.join(ARCHIVE_DIR).join(id.to_string());
+    if let Err(error) = fs::remove_dir_all(&archive_dir) {
+        if error.kind() != ErrorKind::NotFound {
+            warn!(error = %error, session_id = %id, "session archives remain after delete");
+        }
+    } else {
+        crate::sync_parent_dir(&archive_dir);
+    }
+    if removed {
+        crate::sync_parent_dir(&jsonl_path(dir, id));
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1964,15 +2012,18 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         LOG_FORMAT_VERSION, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, PREVIOUS_LOG_FORMAT_VERSION,
-        SESSION_VERSION, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
-        StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index,
-        meta_record, next_epoch, update_cwd_index, write_full_session,
+        SESSION_VERSION, SESSIONS_DIR, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
+        StoredSubagent, TAIL_BUF, finish_delete, generate_title, json_path, jsonl_path,
+        load_cwd_index, meta_record, next_epoch, persisted_session_ids, update_cwd_index,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, PendingConversationRevert, SCAN_CACHE_FILE, Session, SessionError,
         SessionLog, SessionMeta, StorageError, TitleSource,
     };
+    use crate::StateDir;
     use crate::id::MakiId;
+    use crate::tool_outputs::{ToolOutputError, ToolOutputStore};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
@@ -1989,6 +2040,7 @@ mod tests {
     const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
     const PENDING_DRAFT: &str = "half typed thought";
+    const INDEX_CLEANUP_FAILURE: &str = "injected index cleanup failure";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
@@ -3088,6 +3140,123 @@ mod tests {
         let index = load_cwd_index(dir);
         assert!(!index.values().any(|v| *v == s1.id.to_string()));
         assert_eq!(index.get("/other"), Some(&s2.id.to_string()));
+    }
+
+    #[test]
+    fn public_delete_removes_managed_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: TestSession = Session::new("m", "/project");
+        session.save(&state_dir).unwrap();
+        let store = ToolOutputStore::new(state_dir.clone());
+        let output = store.put(session.id, "managed output").unwrap();
+
+        TestSession::delete(session.id, &state_dir).unwrap();
+
+        assert!(matches!(
+            store.read(session.id, output.id, 1, 1),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn public_delete_succeeds_without_managed_output_directory() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: TestSession = Session::new("m", "/project");
+        session.save(&state_dir).unwrap();
+
+        TestSession::delete(session.id, &state_dir).unwrap();
+
+        assert!(!state_dir.path().join("tool-output").exists());
+    }
+
+    #[test]
+    fn public_delete_retry_cleans_outputs_after_session_is_already_gone() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let session_id = MakiId::generate();
+        let store = ToolOutputStore::new(state_dir.clone());
+        let output = store.put(session_id, "leftover output").unwrap();
+
+        let error = TestSession::delete(session_id, &state_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::Storage(StorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.read(session_id, output.id, 1, 1),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn public_delete_retry_cleans_a_stale_cwd_index() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: TestSession = Session::new("m", "/project");
+        session.save(&state_dir).unwrap();
+        let sessions_dir = state_dir.path().join(SESSIONS_DIR);
+        fs::remove_file(jsonl_path(&sessions_dir, session.id)).unwrap();
+        let store = ToolOutputStore::new(state_dir.clone());
+        let output = store.put(session.id, "leftover output").unwrap();
+
+        let error = TestSession::delete(session.id, &state_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::Storage(StorageError::NotFound(_))
+        ));
+        assert!(
+            !load_cwd_index(&sessions_dir)
+                .values()
+                .any(|indexed| indexed == &session.id.to_string())
+        );
+        assert!(matches!(
+            store.read(session.id, output.id, 1, 1),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn index_cleanup_error_still_removes_managed_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let session_id = MakiId::generate();
+        let store = ToolOutputStore::new(state_dir.clone());
+        let output = store.put(session_id, "managed output").unwrap();
+        let index_error = SessionError::Storage(StorageError::Io(std::io::Error::other(
+            INDEX_CLEANUP_FAILURE,
+        )));
+
+        let error = finish_delete(session_id, &state_dir, Err(index_error)).unwrap_err();
+
+        assert!(matches!(error, SessionError::Storage(StorageError::Io(_))));
+        assert!(matches!(
+            store.read(session_id, output.id, 1, 1),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+    }
+
+    #[test_case(LEGACY_HEX_ID ; "hyphenated_legacy")]
+    #[test_case("550e8400e29b41d4a716446655440000" ; "compact_legacy")]
+    fn persisted_ids_include_canonical_and_legacy_session_names(legacy_name: &str) {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let sessions_dir = state_dir.ensure_subdir(SESSIONS_DIR).unwrap();
+        let mut canonical: TestSession = Session::new("m", "/canonical");
+        canonical.save(&state_dir).unwrap();
+        let legacy_id: MakiId = legacy_name.parse().unwrap();
+        let mut legacy: TestSession = Session::new("m", "/legacy");
+        legacy.id = legacy_id;
+        write_legacy_jsonl(&sessions_dir.join(format!("{legacy_name}.jsonl")), &legacy);
+
+        let ids = persisted_session_ids(&state_dir).unwrap();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&canonical.id));
+        assert!(ids.contains(&legacy_id));
     }
 
     #[test]

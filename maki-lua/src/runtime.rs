@@ -29,7 +29,7 @@ use maki_config::RawConfig;
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
-use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
+use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
@@ -460,6 +460,23 @@ pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), 
 }
 
 fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
+    let owner = JobOwner::Task(lock_cell(handle).id);
+    let receivers = with_jobs(lua, |store| store.stop_owner_receivers(&owner));
+    for (job_id, receiver) in receivers {
+        while let Ok(event) = receiver.recv() {
+            if matches!(event, JobEvent::Exit(_)) {
+                break;
+            }
+            if let Err(error) = deliver_job_event(lua, job_id, &event) {
+                tracing::warn!(
+                    error = %strip_traceback(&error),
+                    "job output callback failed while draining cancellation"
+                );
+            }
+        }
+        with_jobs(lua, |store| store.finish(lua, job_id));
+    }
+
     // Hooks word their partial-output marker from this string.
     let reason = match reason {
         KillReason::Cancelled => CANCELLED_MSG,
@@ -2997,10 +3014,30 @@ mod tests {
         let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
         with_jobs(&lua, |store| {
             store
-                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    task_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
                 .unwrap();
             store
-                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    plugin_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
                 .unwrap();
         });
 
@@ -3563,6 +3600,61 @@ mod tests {
         assert!(smol::block_on(poll_once(&mut fut)).is_none());
     }
 
+    #[test]
+    fn cancellation_delivers_queued_output_before_hooks_and_filters_exit() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let owner = JobOwner::Task(lock_cell(scope.handle()).id);
+        lua.globals().set("queued_output", "").unwrap();
+        lua.globals().set("normal_exit_fired", false).unwrap();
+        let stdout = lua
+            .create_function(|lua, (_, chunk): (u32, String)| {
+                lua.globals().set("queued_output", chunk)
+            })
+            .unwrap();
+        let exit = lua
+            .create_function(|lua, _: (u32, i32)| lua.globals().set("normal_exit_fired", true))
+            .unwrap();
+        let stdout = lua.create_registry_value(stdout).unwrap();
+        let exit = lua.create_registry_value(exit).unwrap();
+        with_jobs(&lua, |store| {
+            store
+                .start(
+                    owner.clone(),
+                    "printf 'queued\n'; sleep 30",
+                    None,
+                    None,
+                    Some(stdout),
+                    None,
+                    None,
+                    Some(exit),
+                    false,
+                )
+                .unwrap();
+        });
+        let deadline = Instant::now() + TEST_WAKE_TIMEOUT;
+        while with_jobs(&lua, |store| store.queued_event_count(&owner)) < 1 {
+            assert!(Instant::now() < deadline, "job events never queued");
+            thread::yield_now();
+        }
+
+        let (hook_tx, hook_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |lua, ()| {
+                hook_tx
+                    .send(lua.globals().get::<String>("queued_output")?)
+                    .ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        trigger.cancel();
+        poll_cancelled_scope_once(&scope);
+
+        assert_eq!(hook_rx.try_recv().unwrap(), "queued");
+        assert!(!lua.globals().get::<bool>("normal_exit_fired").unwrap());
+    }
+
     /// A hook armed after the token tripped has no transition left to ride, so
     /// it fires inline, whether a plugin or another hook armed it. The nested
     /// case also pins the lock discipline: `fire_cancel_hooks` must not hold
@@ -3898,7 +3990,17 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
             with_jobs(&lua, |store| {
-                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+                store.start(
+                    owner,
+                    DISPATCH_TEST_JOB,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
             })
             .unwrap();
             let (finish_tx, finish_rx) = flume::bounded(1);

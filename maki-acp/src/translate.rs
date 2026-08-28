@@ -322,6 +322,7 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
             MsgBlock::Image { source } => {
                 updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
@@ -463,6 +464,7 @@ mod tests {
                     tool_use_id: "tu-1".into(),
                     content: "file.rs".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 display_text: None,
                 ..Default::default()
@@ -522,6 +524,7 @@ mod tests {
                 tool_use_id: "tu-err".into(),
                 content: "boom".into(),
                 is_error: true,
+                output_ref: None,
             }],
             display_text: None,
             ..Default::default()
@@ -653,7 +656,11 @@ mod tests {
             is_error,
             annotation: None,
             written_path: written.map(str::to_owned),
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }
     }
 

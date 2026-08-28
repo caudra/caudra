@@ -91,14 +91,15 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
-    if !maki_otel::enabled() {
-        return run_inner(registry, mcp, id, name, input, ctx, emit).await;
-    }
-    let canonical = super::streaming::canonical_tool_name(name);
-    let source = tool_source(registry, ctx, canonical);
+    let telemetry = maki_otel::enabled();
+    let canonical = telemetry.then(|| super::streaming::canonical_tool_name(name));
+    let source = canonical.map(|name| tool_source(registry, ctx, name));
     let started = Instant::now();
-    let done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
-    report(&done, canonical, &source, input, started.elapsed());
+    let mut done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
+    crate::tool_output::limit(&mut done, ctx).await;
+    if let (Some(canonical), Some(source)) = (canonical, source) {
+        report(&done, canonical, &source, input, started.elapsed());
+    }
     done
 }
 
@@ -144,7 +145,11 @@ async fn run_inner(
         is_error: true,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     };
 
     if let Some(entry) = entry {
@@ -218,7 +223,11 @@ async fn run_inner(
                     is_error: false,
                     annotation: result.annotation,
                     written_path: result.written_path,
+                    output_ref: result.output_ref,
+                    output_limits: result.output_limits,
                     model_suffix: result.model_suffix,
+                    model_output: None,
+                    model_output_from_ref: result.model_output_from_ref,
                 }
             }
             Err(message) => {
@@ -229,7 +238,11 @@ async fn run_inner(
                     error = %message,
                     "tool failed"
                 );
-                done_error(message).with_model_suffix(result.model_suffix)
+                let mut done = done_error(message).with_model_suffix(result.model_suffix);
+                done.output_limits = result.output_limits;
+                done.output_ref = result.output_ref;
+                done.model_output_from_ref = result.model_output_from_ref;
+                done
             }
         }
     } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
@@ -300,7 +313,11 @@ fn run_tool_search(
         is_error,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }
 }
 
@@ -332,7 +349,11 @@ async fn run_local_tool(
         is_error,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }
 }
 
@@ -383,7 +404,11 @@ async fn execute_mcp_tool(
         is_error,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     };
 
     if ctx.mode.plan_path().is_some() {
@@ -494,19 +519,18 @@ pub(super) async fn process_tool_calls(
         });
     }
 
-    let results: Vec<ToolDoneEvent> = set
-        .join_all()
-        .await
-        .into_iter()
-        .zip(spawned_ids)
-        .map(|(r, id)| match r {
-            Ok(out) => out,
-            Err(e) => {
-                error!(error = %e, "tool task panicked");
-                ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"))
+    let mut results = Vec::with_capacity(spawned_ids.len());
+    for (result, id) in set.join_all().await.into_iter().zip(spawned_ids) {
+        match result {
+            Ok(done) => results.push(done),
+            Err(error) => {
+                error!(%error, "tool task panicked");
+                let done = limited_panic_result(id, error, ctx).await;
+                event_tx.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
+                results.push(done);
             }
-        })
-        .collect();
+        }
+    }
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
@@ -516,6 +540,12 @@ pub(super) async fn process_tool_calls(
     })?;
     history.push(tool_msg);
     Ok(())
+}
+
+async fn limited_panic_result(id: String, error: String, ctx: &ToolContext) -> ToolDoneEvent {
+    let mut done = ToolDoneEvent::error(id, format!("internal error: tool panicked: {error}"));
+    crate::tool_output::limit(&mut done, ctx).await;
+    done
 }
 
 fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'static, str> {
@@ -624,6 +654,9 @@ mod tests {
     use std::sync::Arc;
 
     use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use maki_storage::StateDir;
+    use maki_storage::id::SessionRef;
+    use maki_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -702,6 +735,74 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    #[test]
+    fn public_dispatch_limits_and_persists_local_tool_output() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+                temp.path().to_path_buf(),
+            )));
+            let session = SessionRef::generate();
+            let full_output = (0..20)
+                .map(|line| format!("dispatch-{line}-{}", "x".repeat(100)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tool_output = full_output.clone();
+            let mut ctx = local_ctx("large_local", move |_| Ok(tool_output.clone()));
+            ctx.config.max_output_lines = 10;
+            ctx.config.max_output_bytes = 320;
+            ctx.session_id = Some(session.clone());
+            ctx.tool_output_store = Some(Arc::clone(&store));
+
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "t1".into(),
+                "large_local",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(!done.is_error);
+            assert!(done.output.as_text().len() <= ctx.config.max_output_bytes);
+            assert!(done.model_output.as_ref().unwrap().len() <= ctx.config.max_output_bytes);
+            let output_ref = done.output_ref.as_ref().unwrap();
+            assert_eq!(
+                store
+                    .read(session.id(), output_ref.id, 1, 2_000)
+                    .unwrap()
+                    .text,
+                full_output
+            );
+        });
+    }
+
+    #[test]
+    fn synthesized_panic_result_is_centrally_limited() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.config.max_output_lines = 6;
+            ctx.config.max_output_bytes = 240;
+
+            let done = limited_panic_result(
+                "panic-1".into(),
+                format!("panic details\n{}", "backtrace\n".repeat(1_000)),
+                &ctx,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().len() <= ctx.config.max_output_bytes);
+            assert!(done.output.as_text().lines().count() <= ctx.config.max_output_lines);
+            let model_output = done.model_output.as_deref().unwrap();
+            assert!(model_output.len() <= ctx.config.max_output_bytes);
+            assert!(model_output.lines().count() <= ctx.config.max_output_lines);
+            assert!(model_output.contains("Full output was unavailable"));
         });
     }
 

@@ -4,14 +4,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
-    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
+    ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    timeout_annotation,
 };
+use maki_agent::{ToolOutput, ToolOutputLimits};
 use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::tool_outputs::ToolOutputStore;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
@@ -21,6 +24,80 @@ const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const TOOL_OUTPUT_PLUGIN: &str = include_str!("../../plugins/tool_output/init.lua");
+const BASH_PLUGIN: &str = include_str!("../../plugins/bash/init.lua");
+const TOOL_OUTPUT_SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000001";
+const OTHER_TOOL_OUTPUT_SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000002";
+const MANAGED_OUTPUT_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "managed_output_probe",
+    description = "streams managed output",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local sink, err = ctx:tool_output_sink()
+        if not sink then
+            return err
+        end
+        local ok
+        ok, err = sink:append("alpha\n")
+        if not ok then return err end
+        ok, err = sink:append("βeta")
+        if not ok then return err end
+        local managed_output
+        managed_output, err = sink:finish()
+        if not managed_output then return err end
+        return { llm_output = "placeholder", managed_output = managed_output }
+    end,
+})
+
+maki.api.register_tool({
+    name = "managed_output_spoof",
+    description = "tries to spoof managed output",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function()
+        return {
+            llm_output = "spoof",
+            managed_output = { id = "01965087-4c71-7f00-8000-000000000003" },
+        }
+    end,
+})
+
+local function managed_metadata_reply(fields)
+    return function(_, ctx)
+        local sink, err = ctx:tool_output_sink()
+        if not sink then return { llm_output = err, is_error = true } end
+        local ok
+        ok, err = sink:append("streamed metadata output")
+        if not ok then return { llm_output = err, is_error = true } end
+        local managed_output
+        managed_output, err = sink:finish()
+        if not managed_output then return { llm_output = err, is_error = true } end
+        fields.managed_output = managed_output
+        return fields
+    end
+end
+
+maki.api.register_tool({
+    name = "managed_output_bad_limits",
+    description = "returns malformed limits with managed output",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = managed_metadata_reply({ llm_output = "placeholder", output_limits = "bad" }),
+})
+
+maki.api.register_tool({
+    name = "managed_output_bad_image",
+    description = "returns a malformed image with managed output",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = managed_metadata_reply({ llm_output = "placeholder", image = "bad" }),
+})
+
+maki.api.register_tool({
+    name = "managed_output_intentional_error",
+    description = "returns an intentional error with managed output",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = managed_metadata_reply({ llm_output = "intentional", is_error = true }),
+})
+"#;
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
 /// a native stub stands in for one.
@@ -238,6 +315,81 @@ fn register_echo_tool() {
     assert_eq!(out, "hello");
 }
 
+const LIMITED_OUTPUT_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "limited_output",
+    description = "returns full output with host limits",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function()
+        local lines = {}
+        for i = 1, 30 do
+            lines[i] = "line-" .. i .. "-" .. string.rep("x", 40)
+        end
+        return {
+            llm_output = table.concat(lines, "\n"),
+            output_limits = { max_lines = 8, max_bytes = 360 },
+        }
+    end,
+})
+"#;
+
+#[test]
+fn lua_output_limits_are_applied_centrally_and_full_output_is_stored() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("limited_output_plugin", LIMITED_OUTPUT_PLUGIN)
+        .unwrap();
+    let input = json!({});
+    let expected = (1..=30)
+        .map(|line| format!("line-{line}-{}", "x".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let limits = ToolOutputLimits {
+        max_lines: 8,
+        max_bytes: 360,
+    };
+
+    let entry = reg.get("limited_output").unwrap();
+    let raw = smol::block_on(entry.tool.parse(&input).unwrap().execute(
+        &maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build),
+    ));
+    assert_eq!(raw.output_limits, Some(limits));
+    assert_eq!(raw.output.unwrap().as_text(), expected);
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session = SessionRef::generate();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.max_output_lines = 1_000;
+    ctx.config.max_output_bytes = 100_000;
+    ctx.session_id = Some(session.clone());
+    ctx.tool_output_store = Some(Arc::clone(&store));
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "limited-1".into(),
+        "limited_output",
+        &input,
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert_eq!(done.output_limits, Some(limits));
+    assert!(done.output.as_text().len() <= limits.max_bytes);
+    assert!(done.output.as_text().lines().count() <= limits.max_lines);
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store
+            .read(session.id(), output_ref.id, 1, 2_000)
+            .unwrap()
+            .text,
+        expected
+    );
+}
+
 const SESSION_PLUGIN: &str = r#"
 maki.api.register_tool({
     name = "whoami",
@@ -259,16 +411,25 @@ fn exec_with_ctx(
     input: serde_json::Value,
     ctx: &ToolContext,
 ) -> Result<String, String> {
-    let entry = reg
-        .get(name)
-        .unwrap_or_else(|| panic!("tool {name} not registered"));
-    let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    exec_result_with_ctx(reg, name, input, ctx)
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
+}
+
+fn exec_result_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> ToolExecResult {
+    let entry = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(async { inv.execute(ctx).await })
 }
 
 /// The point of the whole thing: a handler learns who called it without
@@ -309,6 +470,431 @@ fn handler_without_a_session_gets_nil_and_no_error() {
         exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap(),
         "id:nil"
     );
+}
+
+#[test]
+fn managed_output_sink_requires_session_and_store() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("managed_output_plugin", MANAGED_OUTPUT_PLUGIN)
+        .unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+
+    let without_session = exec_with_ctx(&reg, "managed_output_probe", json!({}), &ctx).unwrap();
+    assert!(
+        without_session.contains("requires a session"),
+        "got: {without_session}"
+    );
+
+    ctx.session_id = Some(TOOL_OUTPUT_SESSION_ID.parse().unwrap());
+    let without_store = exec_with_ctx(&reg, "managed_output_probe", json!({}), &ctx).unwrap();
+    assert!(
+        without_store.contains("store is unavailable"),
+        "got: {without_store}"
+    );
+}
+
+#[test]
+fn managed_output_finish_reference_propagates_from_lua() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("managed_output_plugin", MANAGED_OUTPUT_PLUGIN)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session: SessionRef = TOOL_OUTPUT_SESSION_ID.parse().unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session.clone());
+    ctx.tool_output_store = Some(Arc::clone(&store));
+
+    let result = exec_result_with_ctx(&reg, "managed_output_probe", json!({}), &ctx);
+
+    assert_eq!(result.output.unwrap().as_text(), "placeholder");
+    assert!(result.model_output_from_ref);
+    let output_ref = result.output_ref.unwrap();
+    assert_eq!(output_ref.byte_count, "alpha\nβeta".len());
+    assert_eq!(output_ref.line_count, 2);
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        "alpha\nβeta"
+    );
+}
+
+#[test]
+fn lua_table_cannot_spoof_managed_output_reference() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("managed_output_plugin", MANAGED_OUTPUT_PLUGIN)
+        .unwrap();
+
+    let result = exec_result_with_ctx(
+        &reg,
+        "managed_output_spoof",
+        json!({}),
+        &maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build),
+    );
+
+    assert_eq!(result.output.unwrap().as_text(), "spoof");
+    assert!(result.output_ref.is_none());
+    assert!(!result.model_output_from_ref);
+}
+
+#[test_case::test_case("managed_output_bad_limits", "output_limits" ; "limits")]
+#[test_case::test_case("managed_output_bad_image", "image" ; "image")]
+fn malformed_host_metadata_drops_managed_ref_without_overwriting_validation(
+    tool: &str,
+    expected: &str,
+) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("managed_output_plugin", MANAGED_OUTPUT_PLUGIN)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session = SessionRef::generate();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session);
+    ctx.tool_output_store = Some(store);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "managed-invalid".into(),
+        tool,
+        &json!({}),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert!(done.output.as_text().contains(expected));
+    assert!(
+        !done
+            .output
+            .as_text()
+            .contains("Failed to load streamed tool output")
+    );
+    assert!(done.output_ref.is_none());
+    assert!(!done.model_output_from_ref);
+}
+
+#[test]
+fn intentional_streamed_error_keeps_and_loads_managed_ref() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("managed_output_plugin", MANAGED_OUTPUT_PLUGIN)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session = SessionRef::generate();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session);
+    ctx.tool_output_store = Some(store);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "managed-error".into(),
+        "managed_output_intentional_error",
+        &json!({}),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert_eq!(done.output.as_text(), "streamed metadata output");
+    assert!(done.output_ref.is_some());
+    assert!(!done.model_output_from_ref);
+}
+
+fn tool_output_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_output", TOOL_OUTPUT_PLUGIN).unwrap();
+    (reg, host)
+}
+
+fn tool_output_fixture(text: &str) -> (tempfile::TempDir, ToolContext, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session: SessionRef = TOOL_OUTPUT_SESSION_ID.parse().unwrap();
+    let output = store.put(session.id(), text).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session);
+    ctx.tool_output_store = Some(store);
+    (temp, ctx, output.id.to_string())
+}
+
+#[test]
+fn managed_tool_output_read_requires_a_session() {
+    let (reg, _host) = tool_output_host();
+    let (_temp, mut ctx, output_id) = tool_output_fixture("output");
+    ctx.session_id = None;
+
+    let error = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": output_id }),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("tool output retrieval requires a session"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn managed_tool_output_rejects_invalid_ids() {
+    let (reg, _host) = tool_output_host();
+    let (_temp, ctx, _output_id) = tool_output_fixture("output");
+
+    let error = exec_with_ctx(
+        &reg,
+        "tool_output_grep",
+        json!({ "output_id": "not-an-output-id", "pattern": "output" }),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(error.contains("invalid tool output ID"), "got: {error}");
+}
+
+#[test]
+fn managed_tool_output_enforces_session_ownership() {
+    let (reg, _host) = tool_output_host();
+    let (_temp, mut ctx, output_id) = tool_output_fixture("private output");
+    ctx.session_id = Some(OTHER_TOOL_OUTPUT_SESSION_ID.parse().unwrap());
+
+    let error = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": output_id }),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(error.contains("does not exist for session"), "got: {error}");
+}
+
+#[test]
+fn managed_tool_output_read_paginates_with_exact_hint() {
+    const TEXT: &str = "one\ntwo\nthree\nfour\n";
+
+    let (reg, _host) = tool_output_host();
+    let (_temp, ctx, output_id) = tool_output_fixture(TEXT);
+    let first = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": &output_id, "limit": 2 }),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        first,
+        format!(
+            "Tool output {output_id}: lines 1-2 of 4 (19 bytes)\n\none\ntwo\n\nNext call: tool_output_read(output_id=\"{output_id}\", offset=3, limit=2)"
+        )
+    );
+
+    let second = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": &output_id, "offset": 3, "limit": 2 }),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        second,
+        format!("Tool output {output_id}: lines 3-4 of 4 (19 bytes)\n\nthree\nfour")
+    );
+}
+
+#[test]
+fn managed_tool_output_read_continues_within_a_long_utf8_line() {
+    let text = "蟹".repeat(1_000);
+    let (reg, _host) = tool_output_host();
+    let (_temp, ctx, output_id) = tool_output_fixture(&text);
+
+    let first = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": &output_id, "limit": 1 }),
+        &ctx,
+    )
+    .unwrap();
+    assert!(
+        first.contains(&format!(
+            "Next call: tool_output_read(output_id=\"{output_id}\", offset=1, byte_offset=1998, limit=1)"
+        )),
+        "got: {first}"
+    );
+    let second = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({
+            "output_id": &output_id,
+            "offset": 1,
+            "byte_offset": 1998,
+            "limit": 1,
+        }),
+        &ctx,
+    )
+    .unwrap();
+    let first_body = first
+        .split_once("\n\n")
+        .unwrap()
+        .1
+        .split_once("\n\nNext call:")
+        .unwrap()
+        .0;
+    let second_body = second.split_once("\n\n").unwrap().1;
+
+    assert_eq!(format!("{first_body}{second_body}"), text);
+}
+
+#[test]
+fn managed_tool_output_grep_formats_context_and_exact_hint() {
+    const TEXT: &str = "before\nerror 42\nbetween\nerror 7\nafter\n";
+
+    let (reg, _host) = tool_output_host();
+    let (_temp, ctx, output_id) = tool_output_fixture(TEXT);
+    let first = exec_with_ctx(
+        &reg,
+        "tool_output_grep",
+        json!({
+            "output_id": &output_id,
+            "pattern": "error",
+            "limit": 1,
+            "context_before": 1,
+            "context_after": 1,
+        }),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        first,
+        format!(
+            "1- before\n2: error 42\n3- between\n\nNext call: tool_output_grep(output_id=\"{output_id}\", pattern=\"error\", offset=4, limit=1, context_before=1, context_after=1)"
+        )
+    );
+
+    let second = exec_with_ctx(
+        &reg,
+        "tool_output_grep",
+        json!({
+            "output_id": &output_id,
+            "pattern": "error",
+            "offset": 4,
+            "limit": 1,
+            "context_before": 1,
+            "context_after": 1,
+        }),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(second, "3- between\n4: error 7\n5- after");
+}
+
+#[test]
+fn managed_tool_output_formatting_stays_within_store_caps() {
+    let text = (0..40)
+        .map(|_| "x".repeat(2_000))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (reg, _host) = tool_output_host();
+    let (_temp, ctx, output_id) = tool_output_fixture(&text);
+
+    let output = exec_with_ctx(
+        &reg,
+        "tool_output_read",
+        json!({ "output_id": &output_id, "limit": 200 }),
+        &ctx,
+    )
+    .unwrap();
+    assert!(output.len() <= 50 * 1024, "{} bytes", output.len());
+    assert!(output.lines().count() <= 2_000);
+    assert!(output.contains("Next call: tool_output_read"));
+
+    let output = exec_with_ctx(
+        &reg,
+        "tool_output_grep",
+        json!({ "output_id": output_id, "pattern": "x", "limit": 200 }),
+        &ctx,
+    )
+    .unwrap();
+    assert!(output.len() <= 50 * 1024, "{} bytes", output.len());
+    assert!(output.lines().count() <= 2_000);
+    assert!(output.contains("Next call: tool_output_grep"));
+}
+
+#[test]
+fn managed_tool_output_is_default_documentable_and_prompt_free() {
+    let (reg, _host) = builtins_host();
+
+    for (name, required, optional) in [
+        (
+            "tool_output_read",
+            &["output_id"][..],
+            &["offset", "byte_offset", "limit"][..],
+        ),
+        (
+            "tool_output_grep",
+            &["output_id", "pattern"][..],
+            &["offset", "limit", "context_before", "context_after"][..],
+        ),
+    ] {
+        let entry = reg
+            .get(name)
+            .unwrap_or_else(|| panic!("default builtin {name} was not registered"));
+        assert_eq!(entry.tool.audience(), ToolAudience::all());
+        assert!(
+            matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "tool_output")
+        );
+
+        let schema = entry.tool.schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        let properties = schema["properties"].as_object().unwrap();
+        let schema_required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        for field in required {
+            assert!(
+                schema_required.contains(field),
+                "{name}.{field} is optional"
+            );
+            assert_eq!(properties[*field]["type"], "string");
+        }
+        for field in optional {
+            assert!(properties.contains_key(*field), "missing {name}.{field}");
+            assert_eq!(properties[*field]["type"], "integer");
+            assert!(
+                properties[*field]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("default:"),
+                "{name}.{field} does not document its default"
+            );
+        }
+
+        let input = if name == "tool_output_read" {
+            json!({ "output_id": "not-an-output-id" })
+        } else {
+            json!({ "output_id": "not-an-output-id", "pattern": "x" })
+        };
+        let invocation = entry.tool.parse(&input).unwrap();
+        assert!(smol::block_on(invocation.permission_scopes()).is_none());
+    }
 }
 
 #[test]
@@ -1333,6 +1919,66 @@ fn jobwait_fires_callbacks_while_waiting() {
     host.load_source("job_stream", &src).unwrap();
     let out = exec_tool(&reg, "job_stream", serde_json::json!({})).unwrap();
     assert_eq!(out, "a,b exit=7 stdout=a,b");
+}
+
+#[test]
+fn raw_jobwait_and_callbacks_preserve_exact_chunks() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "raw_job_stream",
+            description = "streams exact chunks during jobwait",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local seen = {{}}
+                local id = maki.fn.jobstart("printf 'a\\nβ\\n'", {{
+                    raw_chunks = true,
+                    on_stdout = function(_, chunk) seen[#seen + 1] = chunk end,
+                }})
+                local res = maki.fn.jobwait(id)
+                return table.concat(seen, "") .. "|" .. res.stdout
+            end
+        }})"#,
+    );
+    host.load_source("raw_job_stream", &src).unwrap();
+
+    let out = exec_tool(&reg, "raw_job_stream", serde_json::json!({})).unwrap();
+
+    assert_eq!(out, "a\nβ\n|a\nβ\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_jobwait_reports_its_bounded_collection_cap() {
+    const JOBWAIT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "raw_job_cap",
+            description = "reports the jobwait collection cap",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                local id = maki.fn.jobstart(
+                    "head -c {} /dev/zero | tr '\\0' x",
+                    {{ raw_chunks = true }}
+                )
+                local ok, err = pcall(maki.fn.jobwait, id)
+                return ok and "missing cap error" or tostring(err)
+            end
+        }})"#,
+        JOBWAIT_MAX_OUTPUT_BYTES + 1
+    );
+    host.load_source("raw_job_cap", &src).unwrap();
+
+    let output = exec_tool(&reg, "raw_job_cap", json!({})).unwrap();
+
+    assert!(output.contains("jobwait output exceeded"), "got: {output}");
+    assert!(output.contains("collection limit"), "got: {output}");
 }
 
 #[test]
@@ -2881,11 +3527,431 @@ fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
 }
 
 const BASH_CANCEL_ID: &str = "bash-cancel-1";
+const BASH_CONTROL_RESERVE_BYTES: usize = 256;
+const BASH_OUTPUT_LIMIT_MARKER: &str = "[stopped: output limit exceeded]";
+const BASH_STREAM_FAILURE_MARKER: &str = "[stopped: stream failure]";
 /// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`.
 const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
 /// Assembled by printf so the probe never appears in the command header.
 const BASH_PARTIAL_PROBE: &str = "XY";
-const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
+const BASH_PARTIAL_CMD: &str = "sleep 1 && printf '%s%s\\n' X Y && sleep 30";
+
+fn bash_dispatch_context(
+    temp: &tempfile::TempDir,
+    max_store_bytes: usize,
+) -> (ToolContext, Arc<ToolOutputStore>, SessionRef) {
+    let store = Arc::new(ToolOutputStore::with_max_bytes(
+        StateDir::from_path(temp.path().to_path_buf()),
+        max_store_bytes,
+    ));
+    let session = SessionRef::generate();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.no_rtk = true;
+    ctx.session_id = Some(session.clone());
+    ctx.tool_output_store = Some(Arc::clone(&store));
+    (ctx, store, session)
+}
+
+#[test]
+fn bash_returns_full_raw_output_and_host_limits() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let config = PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::from([(
+            "bash".to_owned(),
+            json_obj(json!({ "max_output_lines": 4, "max_output_bytes": 1_000 })),
+        )]),
+    };
+    host.load_builtins(&config).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.no_rtk = true;
+
+    let result = exec_result_with_ctx(
+        &reg,
+        "bash",
+        json!({ "command": "printf 'one\\ntwo\\nthree\\nfour\\n'" }),
+        &ctx,
+    );
+
+    assert_eq!(
+        result.output_limits,
+        Some(ToolOutputLimits {
+            max_lines: 4,
+            max_bytes: 1_000,
+        })
+    );
+    let output = result.output.unwrap().as_text();
+    assert_eq!(output, "one\ntwo\nthree\nfour\n");
+    assert!(!output.contains("[truncated"));
+}
+
+#[test_case::test_case("printf foo; exit 7", "foo\nExit code: 7" ; "unterminated_output")]
+#[test_case::test_case("printf 'foo\\n'; exit 7", "foo\nExit code: 7" ; "trailing_newline")]
+fn bash_exit_code_separator_is_exact(command: &str, expected: &str) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.no_rtk = true;
+
+    let error = exec_result_with_ctx(&reg, "bash", json!({ "command": command }), &ctx)
+        .output
+        .unwrap_err();
+
+    assert_eq!(error, expected);
+}
+
+#[test]
+fn bash_small_output_discards_managed_artifact() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, _store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-small".into(),
+        "bash",
+        &json!({ "command": "printf small-output" }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(!done.is_error);
+    assert_eq!(done.output.as_text(), "small-output");
+    assert!(done.output_ref.is_none());
+    let session_dir = temp
+        .path()
+        .join("tool-output")
+        .join(session.id().to_string());
+    let artifact_count = std::fs::read_dir(session_dir).map_or(0, |entries| entries.count());
+    assert_eq!(artifact_count, 0);
+}
+
+#[test]
+fn bash_large_error_persists_complete_output_and_bounds_preview() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::from([(
+            "bash".to_owned(),
+            json_obj(json!({ "max_output_lines": 5, "max_output_bytes": 360 })),
+        )]),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
+    let expected = format!("{}\nExit code: 7", "0".repeat(9_000));
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-large".into(),
+        "bash",
+        &json!({ "command": "printf '%09000d' 0; exit 7" }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert!(done.output.as_text().len() <= 360);
+    assert!(done.model_output.as_ref().unwrap().len() <= 360);
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn bash_persists_a_single_line_larger_than_transport_chunks() {
+    const OUTPUT_BYTES: usize = 40_000;
+
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-long-line".into(),
+        "bash",
+        &json!({ "command": format!("printf '%0{OUTPUT_BYTES}d' 0") }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(!done.is_error);
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        "0".repeat(OUTPUT_BYTES)
+    );
+}
+
+#[test]
+fn bash_live_view_fragments_a_huge_line_with_bounded_rows() {
+    const OUTPUT_BYTES: usize = 40_000;
+    const DISPLAY_FRAGMENT_BYTES: usize = 500;
+    const TOOL_ID: &str = "bash-live-long-line";
+
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(TOOL_ID),
+    );
+    ctx.config.no_rtk = true;
+
+    let done = smol::block_on(
+        reg.get("bash")
+            .unwrap()
+            .tool
+            .parse(&json!({ "command": format!("printf '%0{OUTPUT_BYTES}d' 0") }))
+            .unwrap()
+            .execute(&ctx),
+    );
+
+    assert!(done.output.is_ok());
+    let buf = recv_live_buf(&events, TOOL_ID).expect("bash did not publish its live buffer");
+    let snapshot = buf.take();
+    let line_text = snapshot
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        line_text
+            .iter()
+            .all(|line| line.len() <= DISPLAY_FRAGMENT_BYTES),
+        "live row exceeded {DISPLAY_FRAGMENT_BYTES} bytes"
+    );
+    assert!(
+        line_text.iter().any(|line| {
+            line.len() == DISPLAY_FRAGMENT_BYTES && line.bytes().all(|byte| byte == b'0')
+        }),
+        "no full bounded output fragment was rendered"
+    );
+}
+
+#[test]
+fn bash_nonzero_exit_uses_control_reserve_at_process_output_cap() {
+    const STORE_MAX_BYTES: usize = 20 * 1024;
+    const EXIT_CODE: i32 = 7;
+
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, store, session) = bash_dispatch_context(&temp, STORE_MAX_BYTES);
+    let process_bytes = STORE_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-control-reserve".into(),
+        "bash",
+        &json!({
+            "command": format!("printf '%0{process_bytes}d' 0; exit {EXIT_CODE}")
+        }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert!(
+        done.model_suffix()
+            .is_none_or(|suffix| !suffix.contains("output limit"))
+    );
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        format!("{}\nExit code: {EXIT_CODE}", "0".repeat(process_bytes))
+    );
+}
+
+#[test]
+fn bash_invalid_utf8_is_an_explicit_tool_error() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.no_rtk = true;
+
+    let error = exec_result_with_ctx(&reg, "bash", json!({ "command": "printf '\\xFF'" }), &ctx)
+        .output
+        .unwrap_err();
+
+    assert!(error.contains("Bash job stream failed"), "got: {error}");
+    assert!(error.contains("not valid UTF-8"), "got: {error}");
+}
+
+#[test]
+fn bash_stream_failure_persists_a_reason_marker_after_partial_output() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-stream-failure".into(),
+        "bash",
+        &json!({ "command": "printf 'accepted\\xFF'" }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert!(
+        done.model_suffix()
+            .is_some_and(|suffix| suffix.contains("Bash job stream failed"))
+    );
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        format!("accepted\n{BASH_STREAM_FAILURE_MARKER}")
+    );
+}
+
+#[test]
+fn bash_no_session_fallback_enforces_cap_and_reserves_control() {
+    const TEST_FALLBACK_MAX_BYTES: usize = 512;
+
+    let test_limit = format!("local FALLBACK_MAX_OUTPUT_BYTES = {TEST_FALLBACK_MAX_BYTES}");
+    let source = BASH_PLUGIN.replacen(
+        "local FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024 * 1024",
+        &test_limit,
+        1,
+    );
+    assert_ne!(source, BASH_PLUGIN, "bash fallback limit fixture drifted");
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("bash", &source).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.config.no_rtk = true;
+    let process_bytes = TEST_FALLBACK_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
+
+    let at_cap = exec_result_with_ctx(
+        &reg,
+        "bash",
+        json!({
+            "command": format!("printf '%0{process_bytes}d' 0; exit 7")
+        }),
+        &ctx,
+    )
+    .output
+    .unwrap_err();
+    assert_eq!(
+        at_cap,
+        format!("{}\nExit code: 7", "0".repeat(process_bytes))
+    );
+
+    let over_cap = exec_result_with_ctx(
+        &reg,
+        "bash",
+        json!({ "command": format!("printf '%0{}d' 0", process_bytes + 1) }),
+        &ctx,
+    )
+    .output
+    .unwrap_err();
+    assert!(
+        over_cap.contains("Bash output limit exceeded; command stopped"),
+        "got: {over_cap}"
+    );
+}
+
+#[test]
+fn bash_output_limit_finishes_prefix_and_ignores_later_callbacks() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store_max_bytes = 16 * 1024 + BASH_CONTROL_RESERVE_BYTES;
+    let (ctx, store, session) = bash_dispatch_context(&temp, store_max_bytes);
+
+    let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+        &reg,
+        None,
+        "bash-limit".into(),
+        "bash",
+        &json!({ "command": "printf '%032768d' 0" }),
+        &ctx,
+        maki_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+
+    assert!(done.is_error);
+    assert!(
+        done.model_suffix()
+            .unwrap()
+            .contains("Bash output limit exceeded; command stopped")
+    );
+    let output_ref = done.output_ref.unwrap();
+    let accepted = store.load_text(session.id(), output_ref.id).unwrap();
+    let (process_output, marker) = accepted.rsplit_once('\n').unwrap();
+    assert_eq!(marker, BASH_OUTPUT_LIMIT_MARKER);
+    assert!(process_output.len() <= store_max_bytes - BASH_CONTROL_RESERVE_BYTES);
+    assert!(process_output.bytes().all(|byte| byte == b'0'));
+}
 
 /// Esc mid-stream on a real bash run: the lines printed so far come back as
 /// an error reply ending in the marker, not a bare "cancelled".
@@ -2894,6 +3960,13 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (tx, events) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let (trigger, token) = maki_agent::CancelToken::new();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+        temp.path().to_path_buf(),
+    )));
+    let session = SessionRef::generate();
+    let thread_store = Arc::clone(&store);
+    let thread_session = session.clone();
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
         let (reg, host) = builtins_host();
@@ -2903,13 +3976,22 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
             Some(BASH_CANCEL_ID),
         );
         ctx.cancel = token;
+        ctx.session_id = Some(thread_session);
+        ctx.tool_output_store = Some(thread_store);
         // The rtk probe costs up to two 2s job waits before the command even
         // starts: pointless here, and a flake risk under load.
         ctx.config.no_rtk = true;
         let input = json!({ "command": BASH_PARTIAL_CMD });
-        result_tx
-            .send(exec_with_ctx(&reg, "bash", input, &ctx))
-            .ok();
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &reg,
+            None,
+            BASH_CANCEL_ID.into(),
+            "bash",
+            &input,
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+        result_tx.send(done).ok();
         drop(host);
     });
 
@@ -2922,11 +4004,87 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
 
     trigger.cancel();
 
-    let err = result_rx
+    let done = result_rx
         .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("cancelled bash must settle")
-        .expect_err("a partial reply is an error reply");
-    assert_eq!(err, format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}"));
+        .expect("cancelled bash must settle");
+    assert!(done.is_error);
+    assert_eq!(
+        done.output.as_text(),
+        format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}")
+    );
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}")
+    );
+}
+
+#[test]
+fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
+    const STORE_MAX_BYTES: usize = 20 * 1024;
+    const PROBE: &str = "CAP-END";
+
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ToolOutputStore::with_max_bytes(
+        StateDir::from_path(temp.path().to_path_buf()),
+        STORE_MAX_BYTES,
+    ));
+    let session = SessionRef::generate();
+    let thread_store = Arc::clone(&store);
+    let thread_session = session.clone();
+    let process_bytes = STORE_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
+    let zero_bytes = process_bytes - PROBE.len() - 1;
+    let process_output = format!("{}\n{PROBE}", "0".repeat(zero_bytes));
+    let command = format!("printf '%0{zero_bytes}d' 0; printf '\\n{PROBE}'; sleep 30");
+    let (result_tx, result_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (reg, host) = builtins_host();
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some("bash-cancel-cap"),
+        );
+        ctx.cancel = token;
+        ctx.session_id = Some(thread_session);
+        ctx.tool_output_store = Some(thread_store);
+        ctx.config.no_rtk = true;
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &reg,
+            None,
+            "bash-cancel-cap".into(),
+            "bash",
+            &json!({ "command": command }),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+        result_tx.send(done).ok();
+        drop(host);
+    });
+
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, "bash-cancel-cap")
+    });
+    poll_until("bash cap probe never reached the live buf", || {
+        buf.take().text().contains(PROBE).then_some(())
+    });
+    trigger.cancel();
+
+    let done = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash at cap must settle");
+    assert!(done.is_error);
+    assert!(
+        done.model_suffix()
+            .is_none_or(|suffix| !suffix.contains("output limit"))
+    );
+    let output_ref = done.output_ref.unwrap();
+    assert_eq!(
+        store.load_text(session.id(), output_ref.id).unwrap(),
+        format!("{process_output}\n{BASH_PARTIAL_MARKER}")
+    );
 }
 
 #[test]

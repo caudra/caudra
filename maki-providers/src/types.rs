@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+use maki_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
@@ -164,6 +165,8 @@ pub enum ContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        #[serde(skip)]
+        output_ref: Option<ToolOutputRef>,
     },
     Image {
         source: ImageSource,
@@ -224,6 +227,13 @@ pub struct Message {
     /// legacy persisted messages.
     #[serde(skip)]
     pub tool_result_image_owners: Vec<String>,
+    /// Session-owned artifacts retained by a compacted summary. Host-only:
+    /// provider payloads must see retrieval IDs only when summary text cites them.
+    #[serde(skip)]
+    pub retained_output_refs: Vec<ToolOutputRef>,
+    /// Marks the host-generated summary that replaced prior conversation state.
+    #[serde(skip)]
+    pub is_compaction_summary: bool,
 }
 
 impl Message {
@@ -905,6 +915,35 @@ mod tests {
         assert_eq!(observation["kind"], "observation");
     }
 
+    #[test]
+    fn tool_output_ref_is_not_part_of_public_message_json() {
+        let output_ref = ToolOutputRef {
+            id: maki_storage::id::MakiId::generate()
+                .to_string()
+                .parse()
+                .unwrap(),
+            byte_count: 12,
+            line_count: 2,
+        };
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: "result".into(),
+            is_error: false,
+            output_ref: Some(output_ref),
+        };
+
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("output_ref").is_none());
+        let roundtrip: ContentBlock = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            roundtrip,
+            ContentBlock::ToolResult {
+                output_ref: None,
+                ..
+            }
+        ));
+    }
+
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]
     #[test_case(ImageMediaType::Jpeg, "image/jpeg" ; "jpeg")]
     #[test_case(ImageMediaType::Gif,  "image/gif"  ; "gif")]
@@ -956,6 +995,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "[image: pic.png 1KB]".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),

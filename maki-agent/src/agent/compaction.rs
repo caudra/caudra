@@ -13,6 +13,10 @@ use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
+const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
+const KEEP_LAST_TOOL_RESULTS: usize = 3;
+/// Byte cap for each retained compaction tool result; truncation stays on UTF-8 boundaries.
+const RETAINED_TOOL_RESULT_MAX_BYTES: usize = 2_000;
 
 fn normalize(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
@@ -87,7 +91,7 @@ pub(super) async fn compact_history(
 }
 
 fn finish_compact(
-    response: StreamResponse,
+    mut response: StreamResponse,
     history: &mut History,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
@@ -108,6 +112,9 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
+    response.message.retained_output_refs = retained_output_refs(history.as_slice());
+    response.message.is_compaction_summary = true;
+
     let new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
@@ -120,6 +127,28 @@ fn finish_compact(
     );
 
     Ok(response.usage)
+}
+
+fn retained_output_refs(messages: &[Message]) -> Vec<maki_storage::tool_outputs::ToolOutputRef> {
+    let mut retained_ids = std::collections::HashSet::new();
+    messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        output_ref: Some(output_ref),
+                        ..
+                    } => Some(output_ref),
+                    _ => None,
+                })
+                .chain(message.retained_output_refs.iter())
+        })
+        .filter(|output_ref| retained_ids.insert(output_ref.id))
+        .cloned()
+        .collect()
 }
 
 pub async fn compact(
@@ -169,27 +198,77 @@ fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
-const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
-const KEEP_LAST_TOOL_RESULTS: usize = 3;
-
 fn strip_old_tool_results(messages: &mut [Message]) {
-    let total: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        .count();
-
     let mut seen = 0;
-    for msg in messages {
-        for block in &mut msg.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                if seen < total.saturating_sub(KEEP_LAST_TOOL_RESULTS) {
-                    *content = TOOL_RESULT_PLACEHOLDER.into();
+    for message in messages.iter_mut().rev() {
+        for block in message.content.iter_mut().rev() {
+            if let ContentBlock::ToolResult {
+                content,
+                output_ref,
+                ..
+            } = block
+            {
+                if seen < KEEP_LAST_TOOL_RESULTS {
+                    bound_retained_tool_result(content, output_ref.as_ref());
+                } else {
+                    *content = output_ref.as_ref().map_or_else(
+                        || TOOL_RESULT_PLACEHOLDER.into(),
+                        |output_ref| format!("[tool result omitted; output ID: {}]", output_ref.id),
+                    );
                 }
                 seen += 1;
             }
         }
     }
+}
+
+fn bound_retained_tool_result(
+    content: &mut String,
+    output_ref: Option<&maki_storage::tool_outputs::ToolOutputRef>,
+) {
+    if content.len() <= RETAINED_TOOL_RESULT_MAX_BYTES {
+        return;
+    }
+
+    let marker = output_ref.map_or_else(
+        || "[tool result truncated for compaction; middle omitted]".into(),
+        |output_ref| {
+            format!(
+                "[tool result truncated for compaction; middle omitted; full output ID: {id}. Retain this ID in the resulting summary.]",
+                id = output_ref.id,
+            )
+        },
+    );
+    let separator = "\n\n";
+    let retained_budget = RETAINED_TOOL_RESULT_MAX_BYTES
+        .saturating_sub(separator.len() * 2)
+        .saturating_sub(marker.len());
+    let head_end = utf8_prefix_end(content, retained_budget.div_ceil(2));
+    let tail_start = utf8_suffix_start(content, retained_budget / 2);
+    *content = format!(
+        "{}{}{}{}{}",
+        &content[..head_end],
+        separator,
+        marker,
+        separator,
+        &content[tail_start..]
+    );
+}
+
+fn utf8_prefix_end(text: &str, max_bytes: usize) -> usize {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn utf8_suffix_start(text: &str, max_bytes: usize) -> usize {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -235,7 +314,8 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use maki_storage::id::SessionRef;
+    use maki_storage::id::{MakiId, SessionRef};
+    use maki_storage::tool_outputs::ToolOutputRef;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -565,26 +645,31 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "old result 1".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t2".into(),
                     content: "old result 2".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t3".into(),
                     content: "keep 1".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t4".into(),
                     content: "keep 2".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t5".into(),
                     content: "keep 3".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Text {
                     text: "keep me".into(),
@@ -614,6 +699,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strip_old_tool_results_uses_output_id_in_old_placeholder() {
+        let output_ref = ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: 10_000,
+            line_count: 100,
+        };
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: (0..4)
+                .map(|index| ContentBlock::ToolResult {
+                    tool_use_id: format!("t{index}"),
+                    content: format!("result {index}"),
+                    is_error: false,
+                    output_ref: (index == 0).then(|| output_ref.clone()),
+                })
+                .collect(),
+            ..Default::default()
+        }];
+
+        strip_old_tool_results(&mut messages);
+
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, output_ref: Some(actual), .. }
+                if content.contains(&output_ref.id.to_string()) && actual == &output_ref
+        ));
+        assert!(matches!(
+            &messages[0].content[1],
+            ContentBlock::ToolResult { content, .. } if content == "result 1"
+        ));
+    }
+
+    #[test]
+    fn strip_old_tool_results_bounds_utf8_newest_result_by_bytes() {
+        let output_ref = ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: 5_000,
+            line_count: 1,
+        };
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "newest".into(),
+                content: format!("HEAD{}TAIL", "é".repeat(RETAINED_TOOL_RESULT_MAX_BYTES)),
+                is_error: false,
+                output_ref: Some(output_ref.clone()),
+            }],
+            ..Default::default()
+        }];
+
+        strip_old_tool_results(&mut messages);
+
+        let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] else {
+            unreachable!();
+        };
+        assert!(content.len() <= RETAINED_TOOL_RESULT_MAX_BYTES);
+        assert!(content.starts_with("HEAD"));
+        assert!(content.ends_with("TAIL"));
+        assert!(content.contains(&output_ref.id.to_string()));
+        assert!(content.contains("Retain this ID in the resulting summary"));
+        assert!(!content.contains("tool_output_"));
+    }
+
+    #[test]
+    fn strip_old_tool_results_bounds_single_huge_newest_result_without_ref() {
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "newest".into(),
+                content: format!(
+                    "head{}tail",
+                    "x".repeat(RETAINED_TOOL_RESULT_MAX_BYTES * 100)
+                ),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        }];
+
+        strip_old_tool_results(&mut messages);
+
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content.len() <= RETAINED_TOOL_RESULT_MAX_BYTES
+                    && content.starts_with("head")
+                    && content.ends_with("tail")
+                    && content.contains("[tool result truncated for compaction; middle omitted]")
+        ));
+    }
+
     fn tool_use(id: &str) -> Message {
         Message {
             role: Role::Assistant,
@@ -627,7 +804,44 @@ mod tests {
             tool_use_id: id.into(),
             content: "output".into(),
             is_error: false,
+            output_ref: None,
         }
+    }
+
+    #[test]
+    fn compaction_carries_unique_current_and_prior_output_refs() {
+        let current = ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: 10,
+            line_count: 1,
+        };
+        let prior = ToolOutputRef {
+            id: MakiId::generate().to_string().parse().unwrap(),
+            byte_count: 20,
+            line_count: 2,
+        };
+        let messages = [
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call".into(),
+                    content: "bounded".into(),
+                    is_error: false,
+                    output_ref: Some(current.clone()),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+                retained_output_refs: vec![prior.clone(), current.clone()],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(retained_output_refs(&messages), [current, prior]);
     }
 
     #[track_caller]
@@ -785,6 +999,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "output".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -867,6 +1082,7 @@ mod tests {
                     tool_use_id: "t1".into(),
                     content: "output".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },

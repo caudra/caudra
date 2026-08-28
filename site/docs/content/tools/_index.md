@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -113,6 +113,30 @@ Search file contents using regex.
 | `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
+
+### `tool_output_read` {#tool_output_read}
+
+Read a page of managed tool output owned by the current session.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `byte_offset` | integer | no | 0; use continuation hints | Starting byte within the first line. |
+| `limit` | integer | no | 200; capped at 2000 | Maximum lines to return. |
+| `offset` | integer | no | 1 | Starting line, 1-indexed. |
+| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
+
+### `tool_output_grep` {#tool_output_grep}
+
+Search managed tool output owned by the current session using a regex.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
+| `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
+| `limit` | integer | no | 100; capped at 200 | Maximum matches to return. |
+| `offset` | integer | no | 1 | Starting line, 1-indexed. |
+| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
+| `pattern` | string | yes |  | Regex pattern. |
 
 ### `index` {#index}
 

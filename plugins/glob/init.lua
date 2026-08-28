@@ -1,4 +1,3 @@
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
@@ -54,6 +53,7 @@ maki.api.register_tool({
 
     local limit = opts.search_result_limit
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     local files, err = maki.fs.glob(pattern, {
       path = input.path,
@@ -63,11 +63,11 @@ maki.api.register_tool({
     })
 
     if not files then
-      return { llm_output = "error: " .. err, is_error = true }
+      return { llm_output = "error: " .. err, is_error = true, output_limits = limits }
     end
 
     if #files == 0 then
-      return { llm_output = NO_FILES_FOUND }
+      return { llm_output = NO_FILES_FOUND, output_limits = limits }
     end
 
     local lines = {}
@@ -75,7 +75,6 @@ maki.api.register_tool({
       lines[i] = shorten_path(f)
     end
     local text = table.concat(lines, "\n")
-    local llm_output = truncate(text, max_lines, max_bytes)
 
     local buf = maki.ui.buf()
     local view = ToolView.new(buf, glob_view_opts(ctx))
@@ -88,8 +87,9 @@ maki.api.register_tool({
     end)
 
     return {
-      llm_output = llm_output,
+      llm_output = text,
       body = buf,
+      output_limits = limits,
     }
   end,
 })

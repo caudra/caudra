@@ -4,11 +4,11 @@ use std::sync::Arc;
 use async_lock::Mutex;
 use flume::Receiver;
 use maki_config::ModelPolicy;
-#[cfg(test)]
-use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+#[cfg(test)]
+use maki_providers::{ContentBlock, HistoryItemKind, Message, Role};
 use maki_providers::{HistoryItem, merge_history_items};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -597,6 +597,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use maki_storage::sessions::generate_title;
+    use maki_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
 
     use super::*;
@@ -660,6 +661,47 @@ mod tests {
         assert_eq!(loaded.messages().len(), 2);
         let restored = History::restored(loaded.messages().to_vec()).unwrap();
         assert!(restored.as_slice()[1].is_observation());
+    }
+
+    #[test]
+    fn record_turn_round_trips_managed_output_ref() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let output_ref = ToolOutputStore::new(state_dir)
+            .put(session_id(), "full output")
+            .unwrap();
+        let mut store = store_in(&tmp);
+        let history = History::new(vec![
+            Message::user("inspect".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "read-1",
+                    "read",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read-1".into(),
+                    content: "preview".into(),
+                    is_error: false,
+                    output_ref: Some(output_ref.clone()),
+                }],
+                ..Default::default()
+            },
+        ]);
+
+        store.record_turn(&history, MODEL_SPEC.into());
+
+        let loaded = load(&tmp);
+        let restored = loaded.messages().iter().find_map(|item| match &item.kind {
+            HistoryItemKind::ToolResult { output_ref, .. } => output_ref.as_ref(),
+            _ => None,
+        });
+        assert_eq!(restored, Some(&output_ref));
     }
 
     #[test]

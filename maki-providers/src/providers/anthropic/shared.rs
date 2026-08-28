@@ -147,9 +147,40 @@ pub(crate) struct SystemBlock<'a> {
 #[derive(Serialize)]
 pub(super) struct WireContentBlock<'a> {
     #[serde(flatten)]
-    pub inner: &'a ContentBlock,
+    pub inner: WireContent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+}
+
+pub(super) struct WireContent<'a>(&'a ContentBlock);
+
+impl Serialize for WireContent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct ToolResult<'a> {
+            r#type: &'static str,
+            tool_use_id: &'a str,
+            content: &'a str,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            is_error: bool,
+        }
+
+        match self.0 {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => ToolResult {
+                r#type: "tool_result",
+                tool_use_id,
+                content,
+                is_error: *is_error,
+            }
+            .serialize(serializer),
+            block => block.serialize(serializer),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -166,14 +197,14 @@ fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
         .iter()
         .filter(|block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()))
         .map(|inner| WireContentBlock {
-            inner,
+            inner: WireContent(inner),
             cache_control: None,
         })
         .collect();
 
     if content.is_empty() {
         content.push(WireContentBlock {
-            inner: &EMPTY_CONTENT,
+            inner: WireContent(&EMPTY_CONTENT),
             cache_control: None,
         });
     }
@@ -193,7 +224,7 @@ pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> 
             // the last block that can carry it. All thinking means no breakpoint,
             // which beats a fatal one.
             if msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len
-                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.is_thinking())
+                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.0.is_thinking())
             {
                 block.cache_control = Some(EPHEMERAL);
             }

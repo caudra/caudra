@@ -11,8 +11,8 @@ local SOME_OUTPUT = "output above is partial"
 local NO_OUTPUT = "no output before the cut"
 
 --- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
+--- the tool streamed; empty means the view still shows a placeholder to drop.
+--- {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout").
 function M.cut(view, out, reason, timeout_secs)
   local tail = out ~= "" and SOME_OUTPUT or NO_OUTPUT

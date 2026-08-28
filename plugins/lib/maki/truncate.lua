@@ -1,3 +1,5 @@
+-- Truncate before host-managed output. Use only when producer-level loss is intentional.
+-- tool handlers should normally return complete llm_output.
 local function truncate(text, max_lines, max_bytes)
   if #text <= max_bytes then
     local n = 0

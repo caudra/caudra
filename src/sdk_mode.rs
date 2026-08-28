@@ -24,13 +24,17 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
-    PermissionsConfig,
+    PermissionsConfig, StoredSession,
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::{HistoryItem, ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
-use maki_storage::StateDir;
+use maki_providers::{
+    HistoryItem, HistoryItemKind, ImageSource, StopReason, Timeouts, TokenUsage, add_cost,
+};
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionError;
+use maki_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
+use maki_storage::{StateDir, StorageError};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -667,6 +671,16 @@ pub fn run(params: SdkParams) -> Result<()> {
 }
 
 fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<HistoryItem>)> {
+    let cli_session_id = cli
+        .session_id
+        .as_deref()
+        .map(|session_id| {
+            session_id
+                .parse::<SessionRef>()
+                .map_err(|error| eyre!("invalid session id {session_id:?}: {error}"))
+        })
+        .transpose()?;
+
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         let session_ref: SessionRef = id
@@ -676,13 +690,47 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Hist
             .map_err(|e| eyre!("load session {id}: {e}"))?;
         let history = crate::setup::active_session_history(&session)
             .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
-        let resumed = (!cli.fork_session).then_some(session_ref);
-        let history = if cli.fork_session {
-            rebase_history(history)?
+        if cli.fork_session {
+            let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
+            if target.id() == session_ref.id() {
+                return Err(eyre!(
+                    "fork session ID must differ from source session {id}"
+                ));
+            }
+            ensure_fork_target_available(&storage, &target)?;
+            let history = rebase_history(history)?;
+            let subagent_histories = session
+                .subagent_messages()
+                .iter()
+                .map(|(task_id, items)| {
+                    rebase_history(items.as_ref().clone()).map(|history| (task_id.clone(), history))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            copy_history_outputs(
+                &storage,
+                &session_ref,
+                &target,
+                std::iter::once(history.as_slice())
+                    .chain(subagent_histories.values().map(Vec::as_slice)),
+            )?;
+            if let Err(error) =
+                save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
+            {
+                let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
+                return Err(error);
+            }
+            (Some(target), history)
         } else {
-            history
-        };
-        (resumed, history)
+            if cli_session_id
+                .as_ref()
+                .is_some_and(|target| target.id() != session_ref.id())
+            {
+                return Err(eyre!(
+                    "--session-id cannot replace the resumed session ID without --fork-session"
+                ));
+            }
+            (Some(session_ref), history)
+        }
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match crate::setup::latest_session(cwd, &storage) {
@@ -696,22 +744,72 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Hist
         (None, Vec::new())
     };
 
-    let cli_session_id = cli.session_id.as_deref().map(|s| {
-        s.parse::<SessionRef>()
-            .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
-    });
-    let cli_session_id = match cli_session_id {
-        Some(Ok(id)) => Some(id),
-        Some(Err(e)) => return Err(e),
-        None => None,
-    };
-
     Ok((cli_session_id.or(resumed_id), history))
 }
 
 fn rebase_history(items: Vec<HistoryItem>) -> Result<Vec<HistoryItem>> {
     let messages = History::restored(items)?.into_vec();
     Ok(History::new(messages).into_items())
+}
+
+fn copy_history_outputs<'a>(
+    storage: &StateDir,
+    source: &SessionRef,
+    target: &SessionRef,
+    histories: impl IntoIterator<Item = &'a [HistoryItem]>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut references = Vec::new();
+    for item in histories.into_iter().flatten() {
+        let output_refs: &[ToolOutputRef] = match &item.kind {
+            HistoryItemKind::ToolResult {
+                output_ref: Some(output_ref),
+                ..
+            } => std::slice::from_ref(output_ref),
+            HistoryItemKind::AssistantText {
+                retained_output_refs,
+                ..
+            } => retained_output_refs,
+            _ => &[],
+        };
+        for output_ref in output_refs {
+            if seen.insert(output_ref.id) {
+                references.push(output_ref.clone());
+            }
+        }
+    }
+    ToolOutputStore::new(storage.clone())
+        .copy_session_outputs(source.id(), target.id(), &references)
+        .map_err(|error| eyre!("copy tool outputs from session {source} to fork {target}: {error}"))
+}
+
+fn ensure_fork_target_available(storage: &StateDir, target: &SessionRef) -> Result<()> {
+    match maki_agent::load_stored_session(target.id(), storage) {
+        Ok(_) => Err(eyre!("fork target session {target} already exists")),
+        Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
+        Err(error) => Err(eyre!(
+            "check whether fork target session {target} exists: {error}"
+        )),
+    }
+}
+
+fn save_sdk_fork(
+    storage: &StateDir,
+    source: &StoredSession,
+    target: &SessionRef,
+    history: &[HistoryItem],
+    subagent_histories: HashMap<String, Vec<HistoryItem>>,
+) -> Result<()> {
+    let mut fork = StoredSession::new(&source.model, &source.cwd);
+    fork.id = target.id();
+    fork.replace_messages(history.to_vec());
+    fork.set_title(format!("{} (fork)", source.title));
+    for (task_id, history) in subagent_histories {
+        fork.set_subagent_messages(task_id, history);
+    }
+    fork.set_subagents(source.subagents().to_vec());
+    fork.save(storage)
+        .map_err(|error| eyre!("save fork session {target}: {error}"))
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -1120,6 +1218,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use super::*;
     use maki_providers::{ContentBlock, Message, Role};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     fn history_messages(items: Vec<HistoryItem>) -> Vec<Message> {
@@ -1179,6 +1278,39 @@ mod tests {
     }
 
     #[test]
+    fn public_user_message_json_omits_managed_output_ref() {
+        let output_ref = ToolOutputRef {
+            id: maki_storage::id::MakiId::generate()
+                .to_string()
+                .parse()
+                .unwrap(),
+            byte_count: 12,
+            line_count: 2,
+        };
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "result".into(),
+                is_error: false,
+                output_ref: Some(output_ref),
+            }],
+            ..Default::default()
+        };
+        let payload = UserPayload {
+            message: UserMessage {
+                role: "user",
+                content: serde_json::to_value(&message.content).unwrap(),
+            },
+            parent_tool_use_id: None,
+        };
+
+        let json = serde_json::to_value(payload).unwrap();
+
+        assert!(json["message"]["content"][0].get("output_ref").is_none());
+    }
+
+    #[test]
     fn fork_rebases_item_identity_without_changing_provider_content() {
         let items = History::new(sample_messages()).into_items();
         let original_ids: Vec<_> = items.iter().map(|item| item.id).collect();
@@ -1191,6 +1323,101 @@ mod tests {
             serde_json::to_value(history_messages(forked)).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn fork_copies_rebased_history_output_refs_to_target_session() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let store = ToolOutputStore::new(storage.clone());
+        let source = SessionRef::generate();
+        let target = SessionRef::generate();
+        let output_ref = store.put(source.id(), "complete artifact").unwrap();
+        let retained_ref = store.put(source.id(), "nested artifact").unwrap();
+        let history = History::new(vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "call-1",
+                    "bash",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "preview".into(),
+                    is_error: false,
+                    output_ref: Some(output_ref.clone()),
+                }],
+                ..Default::default()
+            },
+        ])
+        .into_items();
+        let rebased = rebase_history(history).unwrap();
+        let compacted = rebase_history(
+            History::new(vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("retained output ID: {}", retained_ref.id),
+                }],
+                retained_output_refs: vec![retained_ref.clone()],
+                ..Default::default()
+            }])
+            .into_items(),
+        )
+        .unwrap();
+
+        copy_history_outputs(
+            &storage,
+            &source,
+            &target,
+            [rebased.as_slice(), compacted.as_slice()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.load_text(target.id(), output_ref.id).unwrap(),
+            "complete artifact"
+        );
+        assert_eq!(
+            store.load_text(target.id(), retained_ref.id).unwrap(),
+            "nested artifact"
+        );
+        assert!(rebased.iter().any(|item| matches!(
+            &item.kind,
+            HistoryItemKind::ToolResult {
+                output_ref: Some(reference),
+                ..
+            } if reference == &output_ref
+        )));
+    }
+
+    #[test]
+    fn saved_sdk_fork_restores_rebased_subagent_history_and_rejects_collision() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let source = StoredSession::new("provider/model", "/repo");
+        let target = SessionRef::generate();
+        let history = History::new(vec![Message::user("main".into())]).into_items();
+        let subagent = History::new(vec![Message::user("nested".into())]).into_items();
+
+        save_sdk_fork(
+            &storage,
+            &source,
+            &target,
+            &history,
+            HashMap::from([("task-1".into(), subagent.clone())]),
+        )
+        .unwrap();
+
+        let loaded = maki_agent::load_stored_session(target.id(), &storage).unwrap();
+        assert_eq!(loaded.messages(), history);
+        assert_eq!(loaded.subagent_messages()["task-1"].as_ref(), &subagent);
+        assert!(ensure_fork_target_available(&storage, &target).is_err());
+        assert!(ensure_fork_target_available(&storage, &SessionRef::generate()).is_ok());
     }
 
     const MODEL: &str = "test-model";

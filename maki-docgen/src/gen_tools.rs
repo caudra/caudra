@@ -25,6 +25,8 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "insert_lines",
             "glob",
             "grep",
+            "tool_output_read",
+            "tool_output_grep",
             "index",
             "view_image",
         ],

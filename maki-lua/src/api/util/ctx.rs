@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
@@ -9,16 +10,218 @@ use maki_agent::tools::{
     Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext, ToolLive,
 };
 use maki_config::{AgentConfig, ToolOutputLines};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::tool_outputs::{
+    TOOL_OUTPUT_CONTROL_RESERVE_BYTES, ToolOutputId, ToolOutputRef, ToolOutputSink, ToolOutputStore,
+};
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair};
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
+const TOOL_OUTPUT_SESSION_REQUIRED_MSG: &str = "tool output retrieval requires a session";
+const TOOL_OUTPUT_STORE_UNAVAILABLE_MSG: &str = "tool output store is unavailable";
+const TOOL_OUTPUT_SINK_CLOSED_MSG: &str = "tool output sink is already finished or discarded";
+const TOOL_OUTPUT_SINK_WORKER_FAILED_MSG: &str = "tool output sink writer stopped unexpectedly";
+const TOOL_OUTPUT_SINK_CHANNEL_CAPACITY: usize = 8;
+
+pub(crate) struct ManagedToolOutputRef(ToolOutputRef);
+
+impl ManagedToolOutputRef {
+    pub(crate) fn reference(&self) -> &ToolOutputRef {
+        &self.0
+    }
+}
+
+impl UserData for ManagedToolOutputRef {}
+
+enum ToolOutputSinkCommand {
+    Append {
+        text: String,
+        reserve_bytes: usize,
+        reply: flume::Sender<Result<(), String>>,
+    },
+    Finish(flume::Sender<Result<ToolOutputRef, String>>),
+    Discard(flume::Sender<Result<(), String>>),
+}
+
+struct ToolOutputSinkWriter {
+    tx: Option<flume::Sender<ToolOutputSinkCommand>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ToolOutputSinkWriter {
+    fn spawn(sink: ToolOutputSink) -> Result<Self, String> {
+        let (tx, rx) = flume::bounded(TOOL_OUTPUT_SINK_CHANNEL_CAPACITY);
+        let thread = thread::Builder::new()
+            .name("tool-output-writer".into())
+            .spawn(move || {
+                let mut sink = Some(sink);
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        ToolOutputSinkCommand::Append {
+                            text,
+                            reserve_bytes,
+                            reply,
+                        } => {
+                            let result = sink
+                                .as_mut()
+                                .ok_or_else(|| TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned())
+                                .and_then(|sink| {
+                                    sink.append_with_reserve(&text, reserve_bytes)
+                                        .map_err(|error| error.to_string())
+                                });
+                            let _ = reply.send(result);
+                        }
+                        ToolOutputSinkCommand::Finish(reply) => {
+                            let result = sink
+                                .take()
+                                .ok_or_else(|| TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned())
+                                .and_then(|sink| sink.finish().map_err(|error| error.to_string()));
+                            let _ = reply.send(result);
+                            return;
+                        }
+                        ToolOutputSinkCommand::Discard(reply) => {
+                            let result = sink
+                                .take()
+                                .ok_or_else(|| TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned())
+                                .and_then(|sink| sink.discard().map_err(|error| error.to_string()));
+                            let _ = reply.send(result);
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn append(&self, text: String, reserve_bytes: usize) -> Result<(), String> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned());
+        };
+        let (reply, result) = flume::bounded(1);
+        tx.send(ToolOutputSinkCommand::Append {
+            text,
+            reserve_bytes,
+            reply,
+        })
+        .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        result
+            .recv()
+            .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?
+    }
+
+    fn finish(mut self) -> Result<ToolOutputRef, String> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned());
+        };
+        let (reply, result) = flume::bounded(1);
+        tx.send(ToolOutputSinkCommand::Finish(reply))
+            .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        let result = result
+            .recv()
+            .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        self.close()?;
+        result
+    }
+
+    fn discard(mut self) -> Result<(), String> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned());
+        };
+        let (reply, result) = flume::bounded(1);
+        tx.send(ToolOutputSinkCommand::Discard(reply))
+            .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        let result = result
+            .recv()
+            .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        self.close()?;
+        result
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| TOOL_OUTPUT_SINK_WORKER_FAILED_MSG.to_owned())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ToolOutputSinkWriter {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+struct LuaToolOutputSink(Option<ToolOutputSinkWriter>);
+
+impl UserData for LuaToolOutputSink {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("append", |_, this, text: String| {
+            let Some(sink) = this.0.as_ref() else {
+                return Ok(err_pair(TOOL_OUTPUT_SINK_CLOSED_MSG));
+            };
+            match sink.append(text, 0) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+
+        methods.add_method_mut("append_process_output", |_, this, text: String| {
+            let Some(sink) = this.0.as_ref() else {
+                return Ok(err_pair(TOOL_OUTPUT_SINK_CLOSED_MSG));
+            };
+            match sink.append(text, TOOL_OUTPUT_CONTROL_RESERVE_BYTES) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+
+        methods.add_method_mut("append_control", |_, this, text: String| {
+            let Some(sink) = this.0.as_ref() else {
+                return Ok(err_pair(TOOL_OUTPUT_SINK_CLOSED_MSG));
+            };
+            match sink.append(text, 0) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+
+        methods.add_method_mut("finish", |lua, this, ()| {
+            let Some(sink) = this.0.take() else {
+                return Ok(err_pair(TOOL_OUTPUT_SINK_CLOSED_MSG));
+            };
+            match sink.finish() {
+                Ok(reference) => Ok((
+                    Some(lua.create_userdata(ManagedToolOutputRef(reference))?),
+                    None,
+                )),
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+
+        methods.add_method_mut("discard", |_, this, ()| {
+            let Some(sink) = this.0.take() else {
+                return Ok(err_pair(TOOL_OUTPUT_SINK_CLOSED_MSG));
+            };
+            match sink.discard() {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+    }
+}
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
@@ -228,6 +431,30 @@ impl LuaCtx {
     fn cap_err_pair<T>(&self, method: &str) -> Pair<T> {
         (None, Some(self.cap_err(method)))
     }
+
+    fn tool_output_access(&self, method: &str) -> Result<(MakiId, Arc<ToolOutputStore>), String> {
+        let Some(agent) = self.agent() else {
+            return Err(self.cap_err(method));
+        };
+        let Some(session_id) = &agent.session_id else {
+            return Err(TOOL_OUTPUT_SESSION_REQUIRED_MSG.into());
+        };
+        let Some(store) = &agent.tool_output_store else {
+            return Err(TOOL_OUTPUT_STORE_UNAVAILABLE_MSG.into());
+        };
+        Ok((session_id.id(), Arc::clone(store)))
+    }
+}
+
+fn positive_tool_output_arg(value: i64, name: &str) -> Result<usize, String> {
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} must be at least 1"))
+}
+
+fn tool_output_context_arg(value: i64, name: &str) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("{name} must be non-negative"))
 }
 
 impl UserData for LuaCtx {
@@ -297,6 +524,136 @@ impl UserData for LuaCtx {
         methods.add_method("tool_output_lines", |lua, this, ()| {
             lua.to_value(&this.tool_output_lines)
         });
+
+        methods.add_method("tool_output_sink", |lua, this, ()| {
+            let (session_id, store) = match this.tool_output_access("tool_output_sink") {
+                Ok(access) => access,
+                Err(error) => return Ok(err_pair(error)),
+            };
+            match store.begin(session_id) {
+                Ok(sink) => match ToolOutputSinkWriter::spawn(sink) {
+                    Ok(sink) => Ok((
+                        Some(lua.create_userdata(LuaToolOutputSink(Some(sink)))?),
+                        None,
+                    )),
+                    Err(error) => Ok(err_pair(error)),
+                },
+                Err(error) => Ok(err_pair(error)),
+            }
+        });
+
+        methods.add_async_method(
+            "tool_output_read",
+            |lua,
+             this,
+             (raw_id, offset, limit, byte_offset): (String, i64, i64, Option<i64>)| async move {
+                let (session_id, store) = match this.tool_output_access("tool_output_read") {
+                    Ok(access) => access,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let id = match raw_id.parse::<ToolOutputId>() {
+                    Ok(id) => id,
+                    Err(error) => return Ok(err_pair(format!("invalid tool output ID: {error}"))),
+                };
+                let offset = match positive_tool_output_arg(offset, "offset") {
+                    Ok(offset) => offset,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let limit = match positive_tool_output_arg(limit, "limit") {
+                    Ok(limit) => limit,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let byte_offset = match tool_output_context_arg(
+                    byte_offset.unwrap_or_default(),
+                    "byte_offset",
+                ) {
+                    Ok(byte_offset) => byte_offset,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                drop(this);
+
+                let result = smol::unblock(move || {
+                    store.read_at(session_id, id, offset, limit, byte_offset)
+                })
+                .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let json = serde_json::to_value(result).map_err(mlua::Error::external)?;
+                let LuaValue::Table(table) = json_to_lua(&lua, &json)? else {
+                    return Err(mlua::Error::runtime(
+                        "tool output read result did not serialize to a table",
+                    ));
+                };
+                Ok((Some(table), None))
+            },
+        );
+
+        methods.add_async_method(
+            "tool_output_grep",
+            |lua,
+             this,
+             (raw_id, pattern, offset, limit, context_before, context_after): (
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+                i64,
+            )| async move {
+                let (session_id, store) = match this.tool_output_access("tool_output_grep") {
+                    Ok(access) => access,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let id = match raw_id.parse::<ToolOutputId>() {
+                    Ok(id) => id,
+                    Err(error) => return Ok(err_pair(format!("invalid tool output ID: {error}"))),
+                };
+                let offset = match positive_tool_output_arg(offset, "offset") {
+                    Ok(offset) => offset,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let limit = match positive_tool_output_arg(limit, "limit") {
+                    Ok(limit) => limit,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let context_before = match tool_output_context_arg(context_before, "context_before")
+                {
+                    Ok(context) => context,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let context_after = match tool_output_context_arg(context_after, "context_after") {
+                    Ok(context) => context,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                drop(this);
+
+                let result = smol::unblock(move || {
+                    store.grep(
+                        session_id,
+                        id,
+                        &pattern,
+                        offset,
+                        limit,
+                        context_before,
+                        context_after,
+                    )
+                })
+                .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => return Ok(err_pair(error)),
+                };
+                let json = serde_json::to_value(result).map_err(mlua::Error::external)?;
+                let LuaValue::Table(table) = json_to_lua(&lua, &json)? else {
+                    return Err(mlua::Error::runtime(
+                        "tool output grep result did not serialize to a table",
+                    ));
+                };
+                Ok((Some(table), None))
+            },
+        );
 
         methods.add_method("state", |lua, this, ()| match this.state() {
             Some(v) => json_to_lua(lua, v),
@@ -511,6 +868,29 @@ mod tests {
                 .expect("handler has instructions")
                 .contains_or_insert(PathBuf::from(INSTRUCTION_PATH)),
             "handler must share the parent's set; AgentContext resets its own copy"
+        );
+    }
+
+    #[test]
+    fn tool_output_access_is_handler_only() {
+        let ctx = populated_ctx();
+        assert_eq!(
+            LuaCtx::start(&ctx)
+                .tool_output_access("tool_output_sink")
+                .unwrap_err(),
+            "tool_output_sink not available in start ctx"
+        );
+        assert_eq!(
+            LuaCtx::start(&ctx)
+                .tool_output_access("tool_output_read")
+                .unwrap_err(),
+            "tool_output_read not available in start ctx"
+        );
+        assert_eq!(
+            LuaCtx::restore(ToolOutputLines::default(), None)
+                .tool_output_access("tool_output_grep")
+                .unwrap_err(),
+            "tool_output_grep not available in restore ctx"
         );
     }
 }

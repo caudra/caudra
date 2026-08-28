@@ -721,6 +721,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
                     tool_use_id: "tc_1".to_string(),
                     content: "file.txt".to_string(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },

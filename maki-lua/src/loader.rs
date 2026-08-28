@@ -19,6 +19,7 @@ use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const ALWAYS_LOADED_BUILTINS: &[&str] = &["tool_output"];
 
 struct BundledPlugin {
     name: &'static str,
@@ -75,6 +76,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "todo_write",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    },
+    BundledPlugin {
+        name: "tool_output",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_output"),
     },
     BundledPlugin {
         name: "read",
@@ -272,7 +277,13 @@ impl PluginHost {
                 );
             }
         }
-        for builtin in &config.names {
+        let mut builtins = config.names.clone();
+        for builtin in ALWAYS_LOADED_BUILTINS {
+            if !builtins.iter().any(|name| name == builtin) {
+                builtins.push((*builtin).to_owned());
+            }
+        }
+        for builtin in &builtins {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
                 Some(p) => &p.dir,
                 None => {

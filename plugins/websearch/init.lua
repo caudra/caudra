@@ -3,7 +3,6 @@ local REQUEST_TIMEOUT_SECS = 25
 local DEFAULT_NUM_RESULTS = 8
 
 local parse_sse_response = require("parse_sse")
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
@@ -78,6 +77,7 @@ maki.api.register_tool({
     end
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     local headers = {
       ["Content-Type"] = "application/json",
@@ -96,24 +96,27 @@ maki.api.register_tool({
       max_bytes = opts.max_response_bytes,
     })
     if not resp then
-      return { llm_output = "error: " .. tostring(err), is_error = true }
+      return { llm_output = "error: " .. tostring(err), is_error = true, output_limits = limits }
     end
 
     if resp.status < 200 or resp.status >= 300 then
       local preview = resp.body:sub(1, 200)
-      return { llm_output = "error: HTTP " .. tostring(resp.status) .. ": " .. preview, is_error = true }
+      return {
+        llm_output = "error: HTTP " .. tostring(resp.status) .. ": " .. preview,
+        is_error = true,
+        output_limits = limits,
+      }
     end
 
     local text, parse_err = parse_sse_response(resp.body)
     if not text then
-      return { llm_output = "error: " .. tostring(parse_err), is_error = true }
+      return { llm_output = "error: " .. tostring(parse_err), is_error = true, output_limits = limits }
     end
 
-    local llm_output = truncate(text, max_lines, max_bytes)
-
     return {
-      llm_output = llm_output,
+      llm_output = text,
       body = ToolView.restore(text, web_view_opts(ctx)),
+      output_limits = limits,
     }
   end,
 })

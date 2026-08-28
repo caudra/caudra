@@ -33,6 +33,7 @@ use maki_storage::sessions::{
     Session, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
     StoredSubagent, StoredThinking,
 };
+use maki_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -551,7 +552,11 @@ fn tool_done_transitions_plan_to_ready(
         is_error: false,
         annotation: None,
         written_path,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
@@ -1230,7 +1235,11 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         is_error: false,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
@@ -1655,7 +1664,11 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         is_error,
         annotation: None,
         written_path: None,
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
 }
 
@@ -5187,6 +5200,7 @@ fn tool_revert_uses_last_atomic_completed_item(completed: bool) {
                 tool_use_id: "call-1".into(),
                 content: "result".into(),
                 is_error: false,
+                output_ref: None,
             }],
             ..Default::default()
         });
@@ -5228,11 +5242,13 @@ fn fork_and_revert_through_parallel_result_include_the_whole_result_group() {
                     tool_use_id: "call-1".into(),
                     content: "one".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "call-2".into(),
                     content: "two".into(),
                     is_error: false,
+                    output_ref: None,
                 },
             ],
             ..Default::default()
@@ -5424,6 +5440,7 @@ fn fork_targets_every_display_source_with_user_before_and_other_items_inclusive(
                 tool_use_id: "call-1".into(),
                 content: "result".into(),
                 is_error: false,
+                output_ref: None,
             }],
             ..Default::default()
         },
@@ -5512,6 +5529,7 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
                 tool_use_id: "task-live".into(),
                 content: "done".into(),
                 is_error: false,
+                output_ref: None,
             }],
             ..Default::default()
         },
@@ -5584,6 +5602,223 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
     assert!(forked.session.meta.pending_revert.is_none());
     assert!(forked.session.meta.queued_messages.is_empty());
     assert!(forked.session.meta.active_goal.is_none());
+}
+
+#[test]
+fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
+    let (_temp, storage, _, mut app) = tempdir_app();
+    let source_session_id = app.state.session.id;
+    let store = ToolOutputStore::new(storage);
+    let main_ref = store.put(source_session_id, "main full output").unwrap();
+    let subagent_ref = store
+        .put(source_session_id, "subagent full output")
+        .unwrap();
+    let nested_ref = store.put(source_session_id, "nested full output").unwrap();
+    let outside_ref = store.put(source_session_id, "outside full output").unwrap();
+    let items = crate::history_items(&[
+        Message::user("delegate".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "task-live",
+                "task",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "task-live".into(),
+                content: "main preview".into(),
+                is_error: false,
+                output_ref: Some(main_ref.clone()),
+            }],
+            ..Default::default()
+        },
+        Message::user("later".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "outside",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "outside".into(),
+                content: "outside preview".into(),
+                is_error: false,
+                output_ref: Some(outside_ref.clone()),
+            }],
+            ..Default::default()
+        },
+    ]);
+    let subagent = crate::history_items(&[
+        Message::user("inspect".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "task-nested",
+                "task",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "task-nested".into(),
+                content: "subagent preview".into(),
+                is_error: false,
+                output_ref: Some(subagent_ref.clone()),
+            }],
+            ..Default::default()
+        },
+    ]);
+    let nested_subagent = crate::history_items(&[
+        Message::user("inspect deeper".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "nested-read",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "nested-read".into(),
+                content: "nested preview".into(),
+                is_error: false,
+                output_ref: Some(nested_ref.clone()),
+            }],
+            ..Default::default()
+        },
+    ]);
+    let session = app.state.session_mut();
+    session.replace_messages(items.clone());
+    session.set_subagent_messages("task-live".into(), subagent.clone());
+    session.set_subagent_messages("task-nested".into(), nested_subagent.clone());
+
+    let forked = app.fork_at(DisplaySource::ToolResult(items[2].id)).unwrap();
+
+    assert_eq!(forked.session.messages(), &items[..3]);
+    assert_eq!(
+        forked.session.subagent_messages()["task-live"].as_ref(),
+        &subagent
+    );
+    assert_eq!(
+        forked.session.subagent_messages()["task-nested"].as_ref(),
+        &nested_subagent
+    );
+    for (output_ref, expected) in [
+        (&main_ref, "main full output"),
+        (&subagent_ref, "subagent full output"),
+        (&nested_ref, "nested full output"),
+    ] {
+        assert_eq!(
+            store
+                .read(forked.session.id, output_ref.id, 1, 10)
+                .unwrap()
+                .text,
+            expected
+        );
+    }
+    assert!(matches!(
+        store.read(forked.session.id, outside_ref.id, 1, 10),
+        Err(ToolOutputError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
+    let (_temp, storage, _, mut app) = tempdir_app();
+    let store = ToolOutputStore::new(storage);
+    let output_ref = store
+        .put(app.state.session.id, "nested full output")
+        .unwrap();
+    let items = crate::history_items(&[
+        Message::user("What did we do so far?".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("Nested output ID: {}", output_ref.id),
+            }],
+            is_compaction_summary: true,
+            ..Default::default()
+        },
+    ]);
+    let subagent = crate::history_items(&[Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "nested-read".into(),
+            content: "preview".into(),
+            is_error: false,
+            output_ref: Some(output_ref.clone()),
+        }],
+        ..Default::default()
+    }]);
+    let session = app.state.session_mut();
+    session.replace_messages(items.clone());
+    session.set_subagent_messages("old-task".into(), subagent);
+
+    let forked = app
+        .fork_at(DisplaySource::AssistantText(items[1].id))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .read(forked.session.id, output_ref.id, 1, 10)
+            .unwrap()
+            .text,
+        "nested full output"
+    );
+}
+
+#[test]
+fn fork_fails_when_referenced_managed_output_is_missing() {
+    let (_temp, storage, _, mut app) = tempdir_app();
+    let source_session_id = app.state.session.id;
+    let store = ToolOutputStore::new(storage);
+    let missing_ref = store.put(source_session_id, "missing full output").unwrap();
+    store.delete_session(source_session_id).unwrap();
+    let items = crate::history_items(&[
+        Message::user("inspect".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "read-1",
+                "read",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "read-1".into(),
+                content: "preview".into(),
+                is_error: false,
+                output_ref: Some(missing_ref.clone()),
+            }],
+            ..Default::default()
+        },
+    ]);
+    app.state.session_mut().replace_messages(items.clone());
+
+    let Err(error) = app.fork_at(DisplaySource::ToolResult(items[2].id)) else {
+        panic!("fork unexpectedly succeeded with a missing managed output");
+    };
+
+    assert!(error.contains("Failed to copy managed tool outputs for fork"));
+    assert!(error.contains(&missing_ref.id.to_string()));
+    assert!(error.contains(&source_session_id.to_string()));
 }
 
 #[test]
@@ -6374,6 +6609,8 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
         output: String::new(),
         is_error: false,
         visible: false,
+        max_output_lines: 10,
+        max_output_bytes: 1_024,
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&id));
@@ -6426,6 +6663,8 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
         output: String::new(),
         is_error: false,
         visible: false,
+        max_output_lines: 10,
+        max_output_bytes: 1_024,
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&shell_id));
@@ -6533,7 +6772,11 @@ fn plan_app() -> App {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
     app
 }
@@ -6553,7 +6796,11 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
     if expect_form {
@@ -6586,7 +6833,11 @@ fn re_edit_keeps_plan_form_visible() {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
@@ -6655,7 +6906,11 @@ fn rewrite_plan(app: &mut App) {
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
+        output_ref: None,
+        output_limits: None,
         model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
     }))));
 }
 
@@ -7699,6 +7954,7 @@ fn tool_result_msg(id: &str, text: &str) -> Message {
             tool_use_id: id.into(),
             content: text.into(),
             is_error: false,
+            output_ref: None,
         }],
         display_text: Some(String::new()),
         ..Default::default()
@@ -8098,7 +8354,11 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             is_error: false,
             annotation: None,
             written_path: None,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }))));
         app.checkpoint();
     }

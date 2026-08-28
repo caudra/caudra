@@ -10,10 +10,11 @@ use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
+use maki_storage::tool_outputs::ToolOutputRef;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput};
+use crate::{BufferSnapshot, ToolOutput, ToolOutputLimits};
 
 use super::{DescriptionContext, ToolContext};
 
@@ -80,6 +81,9 @@ pub struct ToolExecResult {
     pub annotation: Option<String>,
     pub written_path: Option<String>,
     pub model_suffix: Option<String>,
+    pub output_limits: Option<ToolOutputLimits>,
+    pub output_ref: Option<ToolOutputRef>,
+    pub model_output_from_ref: bool,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -89,6 +93,9 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             annotation: None,
             written_path: None,
             model_suffix: None,
+            output_limits: None,
+            output_ref: None,
+            model_output_from_ref: false,
         }
     }
 }
@@ -772,6 +779,55 @@ mod tests {
         );
         assert_eq!(names_for(ToolAudience::RESEARCH_SUB), vec!["everywhere"]);
         assert_eq!(names_for(ToolAudience::GENERAL_SUB), vec!["everywhere"]);
+    }
+
+    #[test]
+    fn definitions_keep_internal_companions_with_restrictive_config() {
+        use crate::tools::{
+            READ_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME,
+        };
+
+        let reg = ToolRegistry::new();
+        for name in [
+            READ_TOOL_NAME,
+            TOOL_OUTPUT_READ_TOOL_NAME,
+            TOOL_OUTPUT_GREP_TOOL_NAME,
+            "bash",
+        ] {
+            reg.register(mock(name), lua_source("p")).unwrap();
+        }
+        let config = crate::AgentConfig {
+            allowed_tools: vec![READ_TOOL_NAME.into()],
+            disabled_tools: vec![
+                TOOL_OUTPUT_READ_TOOL_NAME.into(),
+                TOOL_OUTPUT_GREP_TOOL_NAME.into(),
+            ],
+            ..Default::default()
+        };
+        let model = maki_providers::Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let filter = crate::tools::ToolFilter::from_config(&config, &model, &[]);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+
+        let definitions = reg.definitions(&Vars::new(), &ctx, false);
+        let names: Vec<_> = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                READ_TOOL_NAME,
+                TOOL_OUTPUT_READ_TOOL_NAME,
+                TOOL_OUTPUT_GREP_TOOL_NAME
+            ]
+        );
     }
 
     #[test_case(Err("boom".into()), Some("/tmp/foo".into()), None          ; "clears_on_error")]

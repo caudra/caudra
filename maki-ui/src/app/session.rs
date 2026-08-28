@@ -23,6 +23,7 @@ use maki_storage::sessions::{
     SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
     StoredPromptAdmission, StoredQueuedDraft, StoredSubagent,
 };
+use maki_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
@@ -1086,6 +1087,23 @@ impl App {
         child.replace_messages(ancestor.clone());
         child.set_title(self.next_fork_title()?);
 
+        let mut output_ids = HashSet::new();
+        let mut output_refs = Vec::new();
+        collect_tool_output_refs(&ancestor, &mut output_ids, &mut output_refs);
+        let compacted = ancestor.iter().any(|item| {
+            matches!(
+                &item.kind,
+                HistoryItemKind::AssistantText {
+                    is_compaction_summary: true,
+                    ..
+                }
+            )
+        });
+        if compacted {
+            for history in self.state.session.subagent_messages().values() {
+                collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
+            }
+        }
         let mut reachable = tool_call_ids(&ancestor);
         let mut copied_subagents = HashSet::new();
         while let Some(task_id) = reachable
@@ -1102,6 +1120,7 @@ impl App {
         {
             let history = self.state.session.subagent_messages()[&task_id].as_ref();
             reachable.extend(tool_call_ids(history));
+            collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
             child.set_subagent_messages(task_id.clone(), history.to_vec());
             copied_subagents.insert(task_id);
         }
@@ -1119,6 +1138,14 @@ impl App {
                 .cloned()
                 .collect(),
         );
+
+        if !output_refs.is_empty() {
+            ToolOutputStore::new(self.storage.clone())
+                .copy_session_outputs(self.state.session.id, child.id, &output_refs)
+                .map_err(|error| {
+                    format!("Failed to copy managed tool outputs for fork: {error}")
+                })?;
+        }
 
         let child_snapshots =
             Self::snapshot_store_for(&self.storage, child.id, std::path::Path::new(&child.cwd))
@@ -1381,6 +1408,40 @@ fn tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
         .collect()
 }
 
+fn collect_tool_output_refs(
+    items: &[HistoryItem],
+    ids: &mut HashSet<ToolOutputId>,
+    references: &mut Vec<ToolOutputRef>,
+) {
+    for item in items {
+        match &item.kind {
+            HistoryItemKind::ToolResult {
+                output_ref: Some(output_ref),
+                ..
+            } => push_tool_output_ref(output_ref, ids, references),
+            HistoryItemKind::AssistantText {
+                retained_output_refs,
+                ..
+            } => {
+                for output_ref in retained_output_refs {
+                    push_tool_output_ref(output_ref, ids, references);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_tool_output_ref(
+    output_ref: &ToolOutputRef,
+    ids: &mut HashSet<ToolOutputId>,
+    references: &mut Vec<ToolOutputRef>,
+) {
+    if ids.insert(output_ref.id) {
+        references.push(output_ref.clone());
+    }
+}
+
 fn split_fork_title(title: &str) -> (&str, Option<u32>) {
     let Some((base, suffix)) = title.rsplit_once(" (fork #") else {
         return (title, None);
@@ -1566,6 +1627,7 @@ fn is_sanitizer_only_unavailable_extension(
                     content,
                     is_error: true,
                     images,
+                    ..
                 } if content == maki_agent::UNAVAILABLE_RESULT
                     && images.is_empty()
                     && call_ids.remove(call_id.as_str())

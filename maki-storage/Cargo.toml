@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 getrandom = { workspace = true }
 isahc = { workspace = true }
+regex = { workspace = true }
+regex-automata = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -14,6 +16,9 @@ tracing = { workspace = true }
 etcetera = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 test-case = { workspace = true }

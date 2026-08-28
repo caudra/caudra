@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_config::ToolKey;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use maki_storage::tool_outputs::ToolOutputRef;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -462,6 +463,12 @@ pub struct ToolStartEvent {
     pub output: Option<ToolOutput>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolOutputLimits {
+    pub max_lines: usize,
+    pub max_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDoneEvent {
     pub id: String,
@@ -470,8 +477,15 @@ pub struct ToolDoneEvent {
     pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    pub output_ref: Option<ToolOutputRef>,
+    #[serde(skip)]
+    pub output_limits: Option<ToolOutputLimits>,
     #[serde(skip)]
     pub model_suffix: Option<String>,
+    #[serde(skip)]
+    pub model_output: Option<String>,
+    #[serde(skip)]
+    pub model_output_from_ref: bool,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -487,7 +501,11 @@ impl ToolDoneEvent {
             is_error: true,
             annotation: None,
             written_path: None,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }
     }
 
@@ -507,6 +525,14 @@ impl ToolDoneEvent {
     pub fn with_model_suffix(mut self, model_suffix: Option<String>) -> Self {
         self.model_suffix = model_suffix;
         self
+    }
+
+    pub(crate) fn composed_model_output(&self) -> String {
+        let mut content = self.output.as_text();
+        if let Some(model_suffix) = self.model_suffix() {
+            append_model_suffix(&mut content, model_suffix);
+        }
+        content
     }
 
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
@@ -532,11 +558,11 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
     let mut tool_result_image_owners = Vec::new();
-    for r in results {
-        let mut result_content = r.output.as_text();
-        if let Some(model_suffix) = r.model_suffix() {
-            append_model_suffix(&mut result_content, model_suffix);
-        }
+    for mut r in results {
+        let result_content = r
+            .model_output
+            .take()
+            .unwrap_or_else(|| r.composed_model_output());
         if let ToolOutput::Image { source, .. } = &r.output {
             images.push(ContentBlock::Image {
                 source: source.clone(),
@@ -547,6 +573,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
             tool_use_id: r.id,
             content: result_content,
             is_error: r.is_error,
+            output_ref: r.output_ref,
         });
     }
     // Anthropic wants every tool_result before other content in the user
@@ -1006,6 +1033,10 @@ pub struct Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::StateDir;
+    use maki_storage::id::SessionRef;
+    use maki_storage::tool_outputs::ToolOutputStore;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
@@ -1159,7 +1190,11 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
+                output_ref: None,
+                output_limits: None,
                 model_suffix: None,
+                model_output: None,
+                model_output_from_ref: false,
             },
             ToolDoneEvent {
                 id: "t2".into(),
@@ -1168,7 +1203,11 @@ mod tests {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                output_ref: None,
+                output_limits: None,
                 model_suffix: None,
+                model_output: None,
+                model_output_from_ref: false,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -1191,7 +1230,11 @@ mod tests {
                 is_error,
                 annotation: None,
                 written_path: None,
+                output_ref: None,
+                output_limits: None,
                 model_suffix: None,
+                model_output: None,
+                model_output_from_ref: false,
             }
             .with_model_suffix(Some(suffix.into()))
         };
@@ -1211,6 +1254,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_prefers_bounded_model_output_and_attaches_output_ref() {
+        let temp = TempDir::new().unwrap();
+        let store = ToolOutputStore::new(StateDir::from_path(temp.path().to_path_buf()));
+        let session = SessionRef::generate();
+        let output_ref = store
+            .put(session.id(), "full output\n\nmodel context")
+            .unwrap();
+        let done = ToolDoneEvent {
+            id: "t1".into(),
+            tool: Arc::from("test"),
+            output: ToolOutput::Plain("presentation preview".into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            output_ref: Some(output_ref.clone()),
+            output_limits: None,
+            model_suffix: Some("model context".into()),
+            model_output: Some("bounded preview\n\nmodel context".into()),
+            model_output_from_ref: false,
+        };
+
+        let serialized = serde_json::to_value(&done).unwrap();
+        assert_eq!(serialized["output_ref"]["id"], output_ref.id.to_string());
+        assert!(serialized.get("model_output").is_none());
+        assert!(serialized.get("model_suffix").is_none());
+        assert!(serialized.get("output_limits").is_none());
+
+        let message = tool_results(vec![done]);
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolResult {
+                content,
+                output_ref: Some(actual_ref),
+                ..
+            } if content == "bounded preview\n\nmodel context"
+                && content.matches("model context").count() == 1
+                && actual_ref == &output_ref
+        ));
+    }
+
+    #[test]
     fn tool_done_model_suffix_preserves_path_and_is_not_serialized() {
         const MODEL_SUFFIX: &str = "internal model context";
 
@@ -1221,7 +1305,11 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/tmp/file.rs".into()),
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }
         .with_model_suffix(Some(MODEL_SUFFIX.into()));
 
@@ -1229,7 +1317,9 @@ mod tests {
         assert_eq!(done.model_suffix(), Some(MODEL_SUFFIX));
         let json = serde_json::to_string(&done).unwrap();
         assert!(json.contains(r#""written_path":"/tmp/file.rs""#));
+        assert!(json.contains(r#""output_ref":null"#));
         assert!(!json.contains("model_suffix"));
+        assert!(!json.contains("model_output"));
         assert!(!json.contains(MODEL_SUFFIX));
     }
 
@@ -1249,7 +1339,11 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         };
 
         let msg = tool_results(vec![
@@ -1339,7 +1433,11 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         };
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
@@ -1583,7 +1681,11 @@ mod tests {
             is_error,
             annotation: None,
             written_path,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         };
         assert_eq!(event.written_path(), expected);
     }

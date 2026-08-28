@@ -140,13 +140,15 @@ the interpreter, with full debug info.
 
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
+- Return complete `llm_output` from tool handlers. The host applies output limits and retains eligible full text for later retrieval.
+- Set `output_limits = { max_lines = ..., max_bytes = ... }` only to override the host limits for one result. Use `maki.truncate` only when producer-level loss is intentional.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
 
 The bundled `glob` tool, verbatim: schema, header and restore hooks, error
-handling, LLM output truncation, collapsible UI view. It is a bundled plugin,
+handling, host-managed output limits, collapsible UI view. It is a bundled plugin,
 so it opens with `register_options`, which your own plugin skips:
 
 ```lua

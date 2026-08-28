@@ -298,6 +298,7 @@ fn append_unavailable_results(items: &mut Vec<HistoryItem>, group_id: MakiId, ca
             call_id: call_id.clone(),
             content: UNAVAILABLE_RESULT.into(),
             is_error: true,
+            output_ref: None,
             images: Vec::new(),
         },
     }));
@@ -380,6 +381,7 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
             tool_use_id: id.to_owned(),
             content: note.to_owned(),
             is_error: true,
+            output_ref: None,
         })
         .collect();
     messages.push(Message {
@@ -442,6 +444,7 @@ mod tests {
                     tool_use_id: id.to_string(),
                     content: "ok".into(),
                     is_error: false,
+                    output_ref: None,
                 })
                 .collect(),
             display_text: Some(String::new()),

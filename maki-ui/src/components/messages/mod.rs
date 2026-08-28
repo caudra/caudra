@@ -466,7 +466,11 @@ impl MessagesPanel {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                output_ref: None,
+                output_limits: None,
                 model_suffix: None,
+                model_output: None,
+                model_output_from_ref: false,
             });
         }
     }

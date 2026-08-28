@@ -874,6 +874,7 @@ data: [DONE]\n";
                     tool_use_id: "tc_1".to_string(),
                     content: "file.txt".to_string(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -1111,6 +1112,7 @@ data: [DONE]\n";
                     tool_use_id: "t1".into(),
                     content: "[image: pic.png 1KB]".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),

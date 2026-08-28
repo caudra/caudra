@@ -377,6 +377,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let parsed = serde_json::from_str::<Value>(content);
                     let mut response_val = match parsed {
@@ -827,6 +828,7 @@ mod tests {
                     tool_use_id: "call_1".into(),
                     content: "file contents".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -856,6 +858,7 @@ mod tests {
                     tool_use_id: "call_1".into(),
                     content: content.into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -881,6 +884,7 @@ mod tests {
                     tool_use_id: "call_1".into(),
                     content: "boom".into(),
                     is_error: true,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },
@@ -924,6 +928,7 @@ mod tests {
                     tool_use_id: "call_1".into(),
                     content: "[image: pic.png 1KB]".into(),
                     is_error: false,
+                    output_ref: None,
                 },
                 ContentBlock::Image {
                     source: crate::ImageSource::new(

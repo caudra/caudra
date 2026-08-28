@@ -111,6 +111,7 @@ mod tests {
                 tool_use_id: "orphan".into(),
                 content: "legacy".into(),
                 is_error: false,
+                output_ref: None,
             }],
             ..Default::default()
         }

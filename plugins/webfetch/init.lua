@@ -60,7 +60,6 @@ local function strip_html(html)
   return result:match("^%s*(.-)%s*$")
 end
 
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
@@ -121,6 +120,7 @@ maki.api.register_tool({
     end
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     local resp, err = maki.net.request(url, {
       timeout = input.timeout or 30,
@@ -130,16 +130,20 @@ maki.api.register_tool({
       },
     })
     if not resp then
-      return { llm_output = "error: " .. tostring(err), is_error = true }
+      return { llm_output = "error: " .. tostring(err), is_error = true, output_limits = limits }
     end
 
     if resp.status < 200 or resp.status >= 300 then
-      return { llm_output = "error: HTTP " .. tostring(resp.status), is_error = true }
+      return { llm_output = "error: HTTP " .. tostring(resp.status), is_error = true, output_limits = limits }
     end
 
     local ct = resp.content_type or ""
     if ct:find("^image/") and not ct:find("svg") then
-      return { llm_output = "error: image content cannot be displayed as text", is_error = true }
+      return {
+        llm_output = "error: image content cannot be displayed as text",
+        is_error = true,
+        output_limits = limits,
+      }
     end
 
     local body = resp.body
@@ -152,11 +156,10 @@ maki.api.register_tool({
       body = strip_html(body)
     end
 
-    local llm_output = truncate(body, max_lines, max_bytes)
-
     return {
-      llm_output = llm_output,
+      llm_output = body,
       body = ToolView.restore(body, web_view_opts(ctx)),
+      output_limits = limits,
     }
   end,
 })

@@ -256,7 +256,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         .collect();
     let filter = base
         .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
+        .excluding(maki_agent::tools::capability_exclusions(model))
+        .with_internal_companions();
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -1007,6 +1008,7 @@ mod tests {
                     tool_use_id: CALL_ID.into(),
                     content: "contents".into(),
                     is_error: false,
+                    output_ref: None,
                 }],
                 ..Default::default()
             },

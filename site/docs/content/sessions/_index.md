@@ -37,6 +37,14 @@ The child receives a new session ID and a title such as `Original title (fork #1
 
 Forking does not restore files. The child uses the same working directory and sees its current contents. Use a revert action first when the workspace must match an older conversation point.
 
+## Managed tool outputs
+
+Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Maki state directory. An output ID can be read or searched only from its owning session. Live sessions have no age-based expiry for these results.
+
+Each retained output is capped at 100 MiB. Deleting a session deletes its retained outputs. A fork copies the outputs referenced by its selected ancestor path and reachable subagent histories into the child session, preserving their opaque IDs there.
+
+If a failed deletion or interrupted write leaves output without a session, output-store startup cleanup removes it after a seven-day grace period. Retained outputs belonging to a live session remain untouched.
+
 ## Conversation revert
 
 A conversation revert changes the active head rather than deleting items. Selecting a user prompt lands before that prompt and restores it to the composer. Other item types are inclusive.

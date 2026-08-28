@@ -18,10 +18,11 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
-    TextOutput, ToolOutput,
+    TextOutput, ToolOutput, ToolOutputLimits,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::tool_outputs::ToolOutputRef;
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -35,7 +36,7 @@ use crate::api::util::command::{
     ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::ctx::LuaCtx;
+use crate::api::util::ctx::{LuaCtx, ManagedToolOutputRef};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
@@ -473,6 +474,9 @@ impl ToolInvocation for LuaToolInvocation {
                     let image = reply.image;
                     let state = reply.state;
                     let model_suffix = reply.model_suffix;
+                    let output_limits = reply.output_limits;
+                    let output_ref = reply.output_ref;
+                    let model_output_from_ref = reply.model_output_from_ref;
                     ToolExecResult {
                         output: reply.result.map(|s| {
                             if let Some(source) = image {
@@ -499,6 +503,9 @@ impl ToolInvocation for LuaToolInvocation {
                         annotation: reply.annotation,
                         written_path: reply.written_path,
                         model_suffix,
+                        output_limits,
+                        output_ref,
+                        model_output_from_ref,
                     }
                 }
             }
@@ -596,7 +603,9 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 /// Your {spec} table must include a name, a description (the model reads it
 /// to decide when to use the tool), a JSON Schema for the input, and a handler
 /// function. The handler receives `(input, ctx)` and returns either a plain
-/// string or a table with richer output fields.
+/// string or a table with richer output fields. Normally return the complete
+/// `llm_output`: the host applies output limits and retains eligible full text
+/// for later retrieval. Truncate in the producer only when loss is intentional.
 ///
 /// @param spec table Tool specification:
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
@@ -619,6 +628,9 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///                                model_suffix (string) Extra parent-model context omitted from UI and direct tool calls.
+///                                output_limits (table) Host-enforced limits for this result.
+///                                                      `max_lines` and `max_bytes` are required positive
+///                                                      integers. Overrides the agent defaults.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -1442,6 +1454,9 @@ pub(crate) struct ToolCallReply {
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
     pub model_suffix: Option<String>,
+    pub output_limits: Option<ToolOutputLimits>,
+    pub output_ref: Option<ToolOutputRef>,
+    pub model_output_from_ref: bool,
 }
 
 impl ToolCallReply {
@@ -1458,6 +1473,15 @@ impl ToolCallReply {
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
         let model_suffix = t.get::<String>("model_suffix").ok();
+        let mut host_metadata_error = false;
+        let output_limits = match extract_output_limits(t) {
+            Ok(output_limits) => output_limits,
+            Err(e) => {
+                result = Err(e);
+                host_metadata_error = true;
+                None
+            }
+        };
         let instructions = extract_instructions(t);
         let written_path = t.get::<String>("written_path").ok();
         let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
@@ -1471,9 +1495,14 @@ impl ToolCallReply {
             Ok(image) => image,
             Err(e) => {
                 result = Err(e);
+                host_metadata_error = true;
                 None
             }
         };
+        let output_ref = (!host_metadata_error)
+            .then(|| extract_managed_output(t))
+            .flatten();
+        let model_output_from_ref = output_ref.is_some();
         let state = match t.get::<LuaValue>("state") {
             Ok(LuaValue::Nil) | Err(_) => None,
             Ok(v) => crate::api::util::convert::lua_to_json(lua, &v)
@@ -1493,6 +1522,9 @@ impl ToolCallReply {
             image,
             state,
             model_suffix,
+            output_limits,
+            output_ref,
+            model_output_from_ref,
         }
     }
 
@@ -1527,12 +1559,47 @@ impl ToolCallReply {
             image: None,
             state: None,
             model_suffix: None,
+            output_limits: None,
+            output_ref: None,
+            model_output_from_ref: false,
         }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
         Self::plain(Err(msg.into()))
     }
+}
+
+fn extract_managed_output(t: &mlua::Table) -> Option<ToolOutputRef> {
+    let LuaValue::UserData(userdata) = t.get::<LuaValue>("managed_output").ok()? else {
+        return None;
+    };
+    let reference = userdata.borrow::<ManagedToolOutputRef>().ok()?;
+    Some(reference.reference().clone())
+}
+
+fn extract_output_limits(t: &mlua::Table) -> Result<Option<ToolOutputLimits>, String> {
+    let limits = match t.get::<LuaValue>("output_limits") {
+        Ok(LuaValue::Table(limits)) => limits,
+        Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(other) => {
+            return Err(format!(
+                "tool 'output_limits' field must be a table {{ max_lines, max_bytes }}, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let positive = |field| match limits.get::<LuaValue>(field) {
+        Ok(LuaValue::Integer(value)) if value > 0 => usize::try_from(value)
+            .map_err(|_| format!("tool output_limits '{field}' must fit in usize")),
+        _ => Err(format!(
+            "tool output_limits '{field}' must be a positive integer"
+        )),
+    };
+    Ok(Some(ToolOutputLimits {
+        max_lines: positive("max_lines")?,
+        max_bytes: positive("max_bytes")?,
+    }))
 }
 
 fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
@@ -1678,6 +1745,59 @@ mod tests {
         let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert!(reply.image.is_none());
         let err = reply.result.expect_err("malformed image must error");
+        assert!(err.contains(expected), "got: {err}");
+    }
+
+    #[test]
+    fn output_limits_are_parsed() {
+        let lua = Lua::new();
+        let val: LuaValue = lua
+            .load(r#"return { llm_output = "full", output_limits = { max_lines = 12, max_bytes = 345 } }"#)
+            .eval()
+            .unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+
+        assert_eq!(reply.result, Ok("full".into()));
+        assert_eq!(
+            reply.output_limits,
+            Some(ToolOutputLimits {
+                max_lines: 12,
+                max_bytes: 345,
+            })
+        );
+    }
+
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = "bad" }"#,
+        "must be a table" ; "not_a_table"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1 } }"#,
+        "'max_bytes' must be a positive integer" ; "missing_field"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 0, max_bytes = 1 } }"#,
+        "'max_lines' must be a positive integer" ; "zero"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1, max_bytes = -1 } }"#,
+        "'max_bytes' must be a positive integer" ; "negative"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1.5, max_bytes = 1 } }"#,
+        "'max_lines' must be a positive integer" ; "non_integer"
+    )]
+    fn malformed_output_limits_fail_the_call(src: &str, expected: &str) {
+        let lua = Lua::new();
+        let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+
+        assert!(reply.output_limits.is_none());
+        let err = reply
+            .result
+            .expect_err("malformed output limits must error");
         assert!(err.contains(expected), "got: {err}");
     }
 

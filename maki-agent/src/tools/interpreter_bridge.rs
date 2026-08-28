@@ -95,7 +95,11 @@ mod tests {
             is_error,
             annotation: None,
             written_path: None,
+            output_ref: None,
+            output_limits: None,
             model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
         }
         .with_model_suffix(Some("model-only context".into()));
 
@@ -105,5 +109,31 @@ mod tests {
         } else {
             assert_eq!(result.unwrap(), "visible output");
         }
+    }
+
+    #[test]
+    fn flatten_returns_bounded_presentation_after_dispatch_limiting() {
+        let mut done = crate::ToolDoneEvent {
+            id: "t1".into(),
+            tool: Arc::from("test"),
+            output: crate::ToolOutput::Plain("x".repeat(2_000).into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            output_ref: None,
+            output_limits: None,
+            model_suffix: Some("model-only context".into()),
+            model_output: None,
+            model_output_from_ref: false,
+        };
+        let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
+        ctx.config.max_output_lines = 10;
+        ctx.config.max_output_bytes = 220;
+        smol::block_on(crate::tool_output::limit(&mut done, &ctx));
+
+        let flattened = flatten(&done).unwrap();
+        assert!(flattened.len() <= ctx.config.max_output_bytes);
+        assert!(!flattened.contains("model-only context"));
+        assert!(flattened.contains("Full output was unavailable"));
     }
 }
