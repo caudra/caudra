@@ -4,8 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::num::NonZero;
+use std::panic::resume_unwind;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use ignore::WalkBuilder;
@@ -349,12 +353,13 @@ impl SnapshotStore {
             files = stats.files,
             bytes = stats.bytes,
             walk_us = micros(stats.walk),
+            content_us = micros(stats.content),
             hash_us = micros(stats.hash),
             objects_written = stats.objects_written,
             object_write_us = micros(stats.object_write),
             manifest_us = micros(manifest_write),
             gc_us = micros(gc),
-            total_us = micros(stats.walk + stats.hash + stats.object_write + manifest_write + gc),
+            total_us = micros(stats.walk + stats.content + manifest_write + gc),
             "workspace snapshot"
         );
         Ok(manifest)
@@ -767,26 +772,14 @@ impl SnapshotStore {
             files: files.len() as u64,
             ..CaptureStats::default()
         };
+        let content_start = Instant::now();
         let mut manifest = Manifest::new();
-
-        for file in files {
-            let read_start = Instant::now();
-            let bytes = fs::read(&file.absolute)?;
-            let hash = self.hasher.hash(&bytes);
-            stats.hash += read_start.elapsed();
-            stats.bytes += bytes.len() as u64;
-
-            let write_start = Instant::now();
-            stats.objects_written += u64::from(self.write_object(&hash, &bytes)?);
-            stats.object_write += write_start.elapsed();
-
-            manifest.insert(
-                file.relative,
-                FileEntry {
-                    hash: hex_encode(&hash),
-                    mode: file_mode(&file.metadata),
-                },
-            );
+        for part in self.read_content(&files)? {
+            stats.bytes += part.bytes;
+            stats.hash += part.hash;
+            stats.object_write += part.object_write;
+            stats.objects_written += part.objects_written;
+            manifest.extend(part.entries);
         }
 
         if stats.objects_written > 0 {
@@ -794,7 +787,66 @@ impl SnapshotStore {
             self.sync_objects();
             stats.object_write += sync_start.elapsed();
         }
+        stats.content = content_start.elapsed();
         Ok((manifest, stats))
+    }
+
+    /// Hashing the working tree is the bulk of a capture and every file is
+    /// independent, so the read and hash of one must not wait on another.
+    /// Objects are content addressed, so two workers landing on the same
+    /// hash stage separate temp files and rename identical bytes into place.
+    fn read_content(&self, files: &[WalkedFile]) -> Result<Vec<CapturePart>, SnapshotError> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(files.len());
+        let next = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..workers)
+                .map(|_| scope.spawn(|| self.read_claimed(files, &next)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap_or_else(|panic| resume_unwind(panic)))
+                .collect()
+        })
+    }
+
+    /// Workers claim one file at a time rather than splitting the list up
+    /// front, because a working tree is a handful of large files among many
+    /// small ones and any fixed split leaves everyone waiting on whoever
+    /// drew the largest.
+    fn read_claimed(
+        &self,
+        files: &[WalkedFile],
+        next: &AtomicUsize,
+    ) -> Result<CapturePart, SnapshotError> {
+        let mut part = CapturePart::default();
+        loop {
+            let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                return Ok(part);
+            };
+
+            let read_start = Instant::now();
+            let bytes = fs::read(&file.absolute)?;
+            let hash = self.hasher.hash(&bytes);
+            part.hash += read_start.elapsed();
+            part.bytes += bytes.len() as u64;
+
+            let write_start = Instant::now();
+            part.objects_written += u64::from(self.write_object(&hash, &bytes)?);
+            part.object_write += write_start.elapsed();
+
+            part.entries.push((
+                file.relative.clone(),
+                FileEntry {
+                    hash: hex_encode(&hash),
+                    mode: file_mode(&file.metadata),
+                },
+            ));
+        }
     }
 
     fn walk_working_tree(&self, root: &Path) -> Result<Vec<WalkedFile>, SnapshotError> {
@@ -1378,9 +1430,21 @@ struct CaptureStats {
     files: u64,
     bytes: u64,
     walk: Duration,
+    /// Wall time of the whole parallel read, hash and write phase, against
+    /// which `hash` and `object_write` are the work summed across workers.
+    content: Duration,
     /// Reading every file and hashing it.
     hash: Duration,
     /// Verifying present objects and durably writing absent ones.
+    object_write: Duration,
+    objects_written: u64,
+}
+
+#[derive(Default)]
+struct CapturePart {
+    entries: Vec<(RelPath, FileEntry)>,
+    bytes: u64,
+    hash: Duration,
     object_write: Duration,
     objects_written: u64,
 }
