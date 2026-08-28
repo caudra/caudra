@@ -237,7 +237,8 @@ impl<T> EditableQueueReceiver<T> {
     }
 
     pub fn publish_if_empty(&self, publish: impl FnOnce()) {
-        if lock(&self.state).items.is_empty() {
+        let state = lock(&self.state);
+        if state.items.is_empty() {
             publish();
         }
     }
