@@ -57,7 +57,7 @@ container APIs, tenant identity, or host authentication.
 
 ## Coding Rules
 
-- Use stable Rust 1.97 and forbid unsafe code.
+- Use stable Rust 1.98 and forbid unsafe code.
 - Keep changes minimal and focused; avoid speculative abstractions.
 - Prefer bounded inputs, outputs, queues, concurrency, deadlines, and retained state.
 - Use structured, redacted error variants instead of attaching arbitrary I/O or parser errors.

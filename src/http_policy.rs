@@ -104,6 +104,9 @@ pub async fn enforce(
     response
 }
 
+// Boxing the `Err` variant would not shrink this `Result`: the `Ok` variant `Request` is larger than
+// `Response`, so the allocation would cost a heap indirection per rejected request for no benefit.
+#[allow(clippy::result_large_err)]
 async fn bounded_body(request: Request, modern_only: bool) -> Result<Request, Response> {
     if let Some(declared) = request.headers().get(CONTENT_LENGTH) {
         let declared = declared

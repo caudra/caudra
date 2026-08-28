@@ -76,7 +76,7 @@ still win under `--yolo`.
 
 ## Requirements
 
-- Rust 1.97 for source builds
+- Rust 1.98 for source builds
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
 
