@@ -7,10 +7,12 @@
 //! set it.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use maki_agent::{
     AgentInput, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
-    InterruptSource, QueueDelivery, QueueItemId, QueuedInterrupt, editable_queue,
+    InterruptSource, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt, editable_queue,
 };
 
 use crate::components::input::Submission;
@@ -22,6 +24,12 @@ const COMPACT_LABEL: &str = "/compact";
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPrompt {
+    pub(crate) text: String,
+    pub(crate) admission: PromptAdmission,
 }
 
 impl From<Submission> for QueuedMessage {
@@ -39,6 +47,7 @@ pub(crate) enum QueueItem {
         image_count: usize,
         input: AgentInput,
         run_id: u64,
+        admission: PromptAdmission,
         /// `true` when the UI already drew the bubble (immediate dispatch).
         /// The agent then skips `QueueItemConsumed` so we don't draw it twice.
         /// `false` when the user typed while the agent was busy: the UI waits
@@ -57,14 +66,30 @@ impl QueueItem {
         }
     }
 
+    fn set_run_id(&mut self, next: u64) {
+        match self {
+            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id = next,
+        }
+    }
+
+    fn admission(&self) -> PromptAdmission {
+        match self {
+            Self::Message { admission, .. } => *admission,
+            Self::Compact { .. } => PromptAdmission::Queue,
+        }
+    }
+
     fn as_queue_entry(&self, id: QueueItemId) -> QueueEntry<'static> {
         match self {
-            Self::Message { text, .. } => QueueEntry {
+            Self::Message {
+                text, admission, ..
+            } => QueueEntry {
                 id,
                 text: Cow::Owned(text.clone()),
                 color: theme::current().foreground,
                 editable: true,
                 movable: false,
+                admission: Some(*admission),
             },
             Self::Compact { .. } => QueueEntry {
                 id,
@@ -75,6 +100,7 @@ impl QueueItem {
                     .unwrap_or(theme::current().foreground),
                 editable: false,
                 movable: false,
+                admission: None,
             },
         }
     }
@@ -100,15 +126,42 @@ impl QueueItem {
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     queue: EditableQueue<QueueItem>,
+    paused: Arc<AtomicBool>,
+    claim_gate: Arc<Mutex<()>>,
+    active: Arc<AtomicBool>,
+    active_run_id: Arc<AtomicU64>,
 }
 
 pub(crate) struct QueueReceiver {
     queue: EditableQueueReceiver<QueueItem>,
+    paused: Arc<AtomicBool>,
+    claim_gate: Arc<Mutex<()>>,
+    active: Arc<AtomicBool>,
+    active_run_id: Arc<AtomicU64>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let (queue, receiver) = editable_queue();
-    (QueueSender { queue }, QueueReceiver { queue: receiver })
+    let paused = Arc::new(AtomicBool::new(false));
+    let claim_gate = Arc::new(Mutex::new(()));
+    let active = Arc::new(AtomicBool::new(false));
+    let active_run_id = Arc::new(AtomicU64::new(0));
+    (
+        QueueSender {
+            queue,
+            paused: Arc::clone(&paused),
+            claim_gate: Arc::clone(&claim_gate),
+            active: Arc::clone(&active),
+            active_run_id: Arc::clone(&active_run_id),
+        },
+        QueueReceiver {
+            queue: receiver,
+            paused,
+            claim_gate,
+            active,
+            active_run_id,
+        },
+    )
 }
 
 impl QueueSender {
@@ -117,7 +170,16 @@ impl QueueSender {
     }
 
     pub(crate) fn remove_id(&self, id: QueueItemId) -> Option<QueueItem> {
-        self.queue.remove(id)
+        self.queue.remove_with_delivery_guard(id, |item| {
+            matches!(
+                item,
+                QueueItem::Message {
+                    admission: PromptAdmission::Queue,
+                    displayed: false,
+                    ..
+                }
+            )
+        })
     }
 
     pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<String> {
@@ -145,6 +207,30 @@ impl QueueSender {
         self.queue.cancel_edit(id)
     }
 
+    pub(crate) fn set_admission(&self, id: QueueItemId, admission: PromptAdmission) -> bool {
+        self.queue.update_with_delivery_guard(
+            id,
+            |item| {
+                if let QueueItem::Message {
+                    admission: current, ..
+                } = item
+                {
+                    *current = admission;
+                }
+            },
+            |item| {
+                matches!(
+                    item,
+                    QueueItem::Message {
+                        admission: PromptAdmission::Queue,
+                        displayed: false,
+                        ..
+                    }
+                )
+            },
+        )
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
@@ -155,6 +241,69 @@ impl QueueSender {
 
     pub(crate) fn clear(&self) {
         self.queue.clear();
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn replace(
+        &self,
+        cancelled_run_id: u64,
+        run_id: u64,
+        mut replacement: QueueItem,
+    ) -> (QueueItemId, bool) {
+        let _claim = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = self.active.load(Ordering::Acquire)
+            && self.active_run_id.load(Ordering::Relaxed) == cancelled_run_id;
+        replacement.set_run_id(run_id);
+        let id = self.queue.retain_mut_and_push(replacement, |item| {
+            if item.admission() == PromptAdmission::Interrupt {
+                return false;
+            }
+            if matches!(
+                item,
+                QueueItem::Message {
+                    run_id,
+                    displayed: true,
+                    ..
+                } if *run_id == cancelled_run_id
+            ) {
+                return false;
+            }
+            item.set_run_id(run_id);
+            true
+        });
+        (id, active)
+    }
+
+    pub(crate) fn update_pending_replacement(
+        &self,
+        run_id: u64,
+        replacement: QueueItem,
+    ) -> Result<QueueItemId, Box<QueueItem>> {
+        let _claim = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self
+            .queue
+            .has_matching(|item| item.admission() == PromptAdmission::Interrupt)
+        {
+            return Err(Box::new(replacement));
+        }
+        Ok(self.queue.retain_mut_and_push(replacement, |item| {
+            if item.admission() == PromptAdmission::Interrupt {
+                return false;
+            }
+            item.set_run_id(run_id);
+            true
+        }))
+    }
+
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.queue.wake();
     }
 
     pub(crate) fn delivery(&self) -> QueueDelivery {
@@ -169,12 +318,26 @@ impl QueueSender {
         self.queue.toggle_delivery()
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
+        self.pending_prompts()
+            .into_iter()
+            .map(|prompt| prompt.text)
+            .collect()
+    }
+
+    pub(crate) fn pending_prompts(&self) -> Vec<PendingPrompt> {
         self.queue
             .entries(|_, item, _| match item {
                 QueueItem::Message {
-                    text, displayed, ..
-                } if !displayed => Some(text.clone()),
+                    text,
+                    admission,
+                    displayed: false,
+                    ..
+                } => Some(PendingPrompt {
+                    text: text.clone(),
+                    admission: *admission,
+                }),
                 QueueItem::Message { .. } | QueueItem::Compact { .. } => None,
             })
             .into_iter()
@@ -191,31 +354,142 @@ impl QueueSender {
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        self.queue
+        let mut entries = self
+            .queue
             .entries(|id, item, _| item.visible_in_panel().then(|| item.as_queue_entry(id)))
             .into_iter()
             .flatten()
-            .collect()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| match entry.admission {
+            Some(PromptAdmission::Interrupt) => 0,
+            Some(PromptAdmission::Steer) => 1,
+            Some(PromptAdmission::Queue) | None => 2,
+        });
+        entries
     }
 }
 
 impl QueueReceiver {
-    pub(crate) fn claim(&self) -> Vec<(QueueItemId, QueueItem)> {
-        self.queue.claim(|item| {
-            matches!(
-                item,
-                QueueItem::Message {
-                    displayed: false,
-                    ..
+    pub(crate) fn claim_idle(&self, min_run_id: u64) -> Vec<(QueueItemId, QueueItem)> {
+        let _claim = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.paused.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        loop {
+            let immediate = self.queue.claim_one_matching(|item| {
+                matches!(
+                    item,
+                    QueueItem::Message {
+                        displayed: true,
+                        ..
+                    }
+                )
+            });
+            let claimed = if !immediate.is_empty() {
+                immediate
+            } else if self
+                .queue
+                .has_matching(|item| item.admission() == PromptAdmission::Interrupt)
+            {
+                let mut replacement = self.queue.claim_all_matching(|item| {
+                    matches!(
+                        item.admission(),
+                        PromptAdmission::Steer | PromptAdmission::Interrupt
+                    )
+                });
+                replacement.sort_by_key(|(_, item)| {
+                    usize::from(item.admission() == PromptAdmission::Interrupt)
+                });
+                replacement
+            } else {
+                let steered = self
+                    .queue
+                    .claim_one_matching(|item| item.admission() == PromptAdmission::Steer);
+                if !steered.is_empty() {
+                    steered
+                } else if self
+                    .queue
+                    .has_matching(|item| item.admission() == PromptAdmission::Steer)
+                {
+                    return Vec::new();
+                } else {
+                    self.queue.claim(|item| {
+                        matches!(
+                            item,
+                            QueueItem::Message {
+                                admission: PromptAdmission::Queue,
+                                displayed: false,
+                                ..
+                            }
+                        )
+                    })
                 }
-            )
+            };
+            if claimed.is_empty() {
+                return claimed;
+            }
+            let claimed = claimed
+                .into_iter()
+                .filter(|(_, item)| item.run_id() >= min_run_id)
+                .collect::<Vec<_>>();
+            if claimed.is_empty() {
+                continue;
+            }
+            if let Some(run_id) = claimed.iter().rev().find_map(|(_, item)| match item {
+                QueueItem::Message { run_id, .. } => Some(*run_id),
+                QueueItem::Compact { .. } => None,
+            }) {
+                self.active_run_id.store(run_id, Ordering::Relaxed);
+                self.active.store(true, Ordering::Release);
+            }
+            return claimed;
+        }
+    }
+
+    fn claim_steers(&self) -> Vec<(QueueItemId, QueueItem)> {
+        let _claim = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.paused.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let run_id = self.active_run_id.load(Ordering::Relaxed);
+        self.queue.claim_all_matching(|item| {
+            item.admission() == PromptAdmission::Steer && item.run_id() == run_id
+        })
+    }
+
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_active_run(&self, run_id: u64) {
+        self.active_run_id.store(run_id, Ordering::Relaxed);
+        self.active.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_active_run(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn has_newer_interrupt(&self, run_id: u64) -> bool {
+        self.queue.has_matching(|item| {
+            item.admission() == PromptAdmission::Interrupt && item.run_id() > run_id
         })
     }
 
     /// Runs `publish` under the queue lock, so a drain event can never
     /// interleave with a concurrent push.
-    pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) {
-        self.queue.publish_if_empty(publish);
+    pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) -> bool {
+        self.queue.publish_if_empty(publish)
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
@@ -225,7 +499,7 @@ impl QueueReceiver {
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        let mut claimed = self.claim();
+        let mut claimed = self.claim_steers();
         match claimed.len() {
             0 => None,
             1 => claimed
@@ -270,6 +544,7 @@ mod tests {
                 prompt: None,
             },
             run_id: 0,
+            admission: PromptAdmission::Queue,
             displayed,
         }
     }
@@ -325,9 +600,9 @@ mod tests {
         tx.push(msg(false));
         tx.set_delivery(QueueDelivery::TogetherNextTurn);
 
-        assert_eq!(rx.claim().len(), 1);
+        assert_eq!(rx.claim_idle(0).len(), 1);
         assert_eq!(tx.delivery(), QueueDelivery::TogetherNextTurn);
-        assert_eq!(rx.claim().len(), 2);
+        assert_eq!(rx.claim_idle(0).len(), 2);
         assert_eq!(tx.delivery(), QueueDelivery::Separate);
     }
 
@@ -340,10 +615,162 @@ mod tests {
         tx.set_delivery(QueueDelivery::TogetherNextTurn);
 
         assert!(matches!(
-            rx.claim().as_slice(),
+            rx.claim_idle(0).as_slice(),
             [(_, QueueItem::Compact { .. })]
         ));
         assert_eq!(tx.delivery(), QueueDelivery::TogetherNextTurn);
-        assert_eq!(rx.claim().len(), 2);
+        assert_eq!(rx.claim_idle(0).len(), 2);
+    }
+
+    #[test]
+    fn active_poll_claims_steers_without_consuming_queued_prompts() {
+        let (tx, rx) = queue();
+        tx.push(msg(false));
+        let mut steer = msg(false);
+        if let QueueItem::Message { admission, .. } = &mut steer {
+            *admission = PromptAdmission::Steer;
+        }
+        tx.push(steer);
+        rx.set_active_run(0);
+
+        assert!(matches!(rx.poll(), Some(ExtractedCommand::Interrupt(..))));
+        assert_eq!(tx.len(), 1);
+        assert_eq!(rx.claim_idle(0).len(), 1);
+    }
+
+    #[test]
+    fn active_poll_batches_all_current_steers() {
+        let (tx, rx) = queue();
+        for _ in 0..2 {
+            let mut item = msg(false);
+            if let QueueItem::Message { admission, .. } = &mut item {
+                *admission = PromptAdmission::Steer;
+            }
+            tx.push(item);
+        }
+        rx.set_active_run(0);
+
+        let Some(ExtractedCommand::InterruptBatch(inputs)) = rx.poll() else {
+            panic!("expected steering batch");
+        };
+        assert_eq!(inputs.len(), 2);
+        assert!(tx.is_empty());
+    }
+
+    #[test]
+    fn immediate_dispatch_is_claimed_before_later_priority_work() {
+        let (tx, rx) = queue();
+        tx.push(msg(true));
+        let mut interrupt = msg(false);
+        if let QueueItem::Message { admission, .. } = &mut interrupt {
+            *admission = PromptAdmission::Interrupt;
+        }
+        tx.push(interrupt);
+
+        let claimed = rx.claim_idle(0);
+
+        assert!(matches!(
+            claimed[0].1,
+            QueueItem::Message {
+                displayed: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            rx.claim_idle(0)[0].1.admission(),
+            PromptAdmission::Interrupt
+        );
+    }
+
+    #[test]
+    fn active_poll_cannot_claim_steers_for_a_newer_run() {
+        let (tx, rx) = queue();
+        let mut steer = msg(false);
+        if let QueueItem::Message {
+            admission, run_id, ..
+        } = &mut steer
+        {
+            *admission = PromptAdmission::Steer;
+            *run_id = 2;
+        }
+        tx.push(steer);
+        rx.set_active_run(1);
+
+        assert!(rx.poll().is_none());
+        assert_eq!(tx.len(), 1);
+    }
+
+    #[test]
+    fn replacement_removes_unclaimed_immediate_dispatch_and_retags_pending_work() {
+        let (tx, rx) = queue();
+        let mut immediate = msg(true);
+        immediate.set_run_id(1);
+        tx.push(immediate);
+        let mut pending = msg(false);
+        pending.set_run_id(1);
+        tx.push(pending);
+        let mut old_replacement = msg(false);
+        old_replacement.set_run_id(1);
+        if let QueueItem::Message { admission, .. } = &mut old_replacement {
+            *admission = PromptAdmission::Interrupt;
+        }
+        tx.push(old_replacement);
+        let mut replacement = msg(false);
+        replacement.set_run_id(2);
+        if let QueueItem::Message { admission, .. } = &mut replacement {
+            *admission = PromptAdmission::Interrupt;
+        }
+
+        tx.replace(1, 2, replacement);
+
+        assert!(rx.has_newer_interrupt(1));
+        let replacement = rx.claim_idle(0);
+        assert_eq!(replacement[0].1.admission(), PromptAdmission::Interrupt);
+        let pending = rx.claim_idle(0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.run_id(), 2);
+        assert!(tx.is_empty());
+    }
+
+    #[test]
+    fn replacement_claim_batches_guidance_before_interrupt() {
+        let (tx, rx) = queue();
+        tx.push(msg(false));
+        for admission in [PromptAdmission::Steer, PromptAdmission::Interrupt] {
+            let mut item = msg(false);
+            if let QueueItem::Message {
+                admission: current, ..
+            } = &mut item
+            {
+                *current = admission;
+            }
+            tx.push(item);
+        }
+        let mut late_steer = msg(false);
+        if let QueueItem::Message { admission, .. } = &mut late_steer {
+            *admission = PromptAdmission::Steer;
+        }
+        tx.push(late_steer);
+
+        let replacement = rx.claim_idle(0);
+        assert_eq!(replacement.len(), 3);
+        assert_eq!(replacement[0].1.admission(), PromptAdmission::Steer);
+        assert_eq!(replacement[1].1.admission(), PromptAdmission::Steer);
+        assert_eq!(replacement[2].1.admission(), PromptAdmission::Interrupt);
+        assert_eq!(rx.claim_idle(0)[0].1.admission(), PromptAdmission::Queue);
+    }
+
+    #[test]
+    fn paused_queue_waits_for_ui_clear_before_accepting_new_work() {
+        let (tx, rx) = queue();
+        tx.push(msg(false));
+        rx.pause();
+
+        assert!(rx.claim_idle(0).is_empty());
+        assert_eq!(tx.len(), 1);
+
+        tx.clear();
+        tx.push(msg(false));
+        assert_eq!(rx.claim_idle(0).len(), 1);
     }
 }

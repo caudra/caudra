@@ -21,7 +21,7 @@ use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
-    StoredQueuedDraft, StoredSubagent,
+    StoredPromptAdmission, StoredQueuedDraft, StoredSubagent,
 };
 
 use crate::AppSession;
@@ -192,6 +192,11 @@ impl App {
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
         let draft = self.input_box.draft();
+        let queued_prompts = if self.recoverable_queue.is_empty() {
+            self.queue.pending_prompts()
+        } else {
+            self.recoverable_queue.clone()
+        };
         SessionMeta {
             history_head: state.session.meta.history_head,
             pending_revert: state.session.meta.pending_revert.clone(),
@@ -218,11 +223,18 @@ impl App {
                     end: range.end,
                 })
                 .collect(),
-            queued_messages: if self.recoverable_queue.is_empty() {
-                self.queue.text_messages()
-            } else {
-                self.recoverable_queue.clone()
-            },
+            queued_messages: queued_prompts
+                .iter()
+                .map(|prompt| prompt.text.clone())
+                .collect(),
+            queued_message_admissions: queued_prompts
+                .iter()
+                .map(|prompt| match prompt.admission {
+                    maki_agent::PromptAdmission::Queue => StoredPromptAdmission::Queue,
+                    maki_agent::PromptAdmission::Steer => StoredPromptAdmission::Steer,
+                    maki_agent::PromptAdmission::Interrupt => StoredPromptAdmission::Interrupt,
+                })
+                .collect(),
             queued_messages_together: if self.recoverable_queue.is_empty() {
                 self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn
             } else {
@@ -337,6 +349,7 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.cancelling_run = None;
+        self.replacement_item = None;
         self.status_bar.clear_flash();
         self.last_esc = None;
         self.last_exit = None;

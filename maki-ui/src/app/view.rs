@@ -1,6 +1,5 @@
 use std::sync::atomic::Ordering;
 
-use crate::components::Overlay;
 use crate::components::input::{self, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -8,6 +7,7 @@ use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
+use crate::components::{Overlay, hint_line};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -226,10 +226,18 @@ impl App {
             } else {
                 Placeholder::Blank
             };
-            let panel_hint = (self.state.mode == Mode::Plan)
-                .then(|| self.plan_form.hint_line())
-                .flatten()
-                .or_else(|| self.lua_hint_line());
+            let panel_hint = if self.status == Status::Streaming {
+                Some(hint_line(&[
+                    ("Enter", "next"),
+                    ("Alt+S", "guide"),
+                    ("Alt+X", "replace"),
+                ]))
+            } else {
+                (self.state.mode == Mode::Plan)
+                    .then(|| self.plan_form.hint_line())
+                    .flatten()
+                    .or_else(|| self.lua_hint_line())
+            };
             self.input_box.view(
                 frame,
                 layout.input_area,

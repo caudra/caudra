@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use maki_agent::QueueItemId;
+use maki_agent::{PromptAdmission, QueueItemId};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -27,6 +27,7 @@ pub struct QueueEntry<'a> {
     pub color: ratatui::style::Color,
     pub editable: bool,
     pub movable: bool,
+    pub admission: Option<PromptAdmission>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +122,7 @@ pub fn view(
                 .iter()
                 .map(|(label, _)| label.width() + 1)
                 .sum::<usize>();
-            let prefix = if index == 0 {
-                "Next ".to_string()
-            } else {
-                format!("{} ", index + 1)
-            };
+            let prefix = entry_prefix(entries, index);
             let available = content_width
                 .saturating_sub(prefix.width())
                 .saturating_sub(action_width);
@@ -251,6 +248,30 @@ fn actions(entry: &QueueEntry<'_>, compact: bool) -> Vec<(&'static str, QueueAct
     actions
 }
 
+fn entry_prefix(entries: &[QueueEntry<'_>], index: usize) -> String {
+    let admission = entries[index].admission;
+    let position = entries[..index]
+        .iter()
+        .filter(|entry| admission_group(entry.admission) == admission_group(admission))
+        .count()
+        + 1;
+    match admission {
+        Some(PromptAdmission::Queue) | None if position == 1 => "Up next ".into(),
+        Some(PromptAdmission::Queue) | None => format!("Up next {position} "),
+        Some(PromptAdmission::Steer) if position == 1 => "Guide ".into(),
+        Some(PromptAdmission::Steer) => format!("Guide {position} "),
+        Some(PromptAdmission::Interrupt) => "Replacing ".into(),
+    }
+}
+
+fn admission_group(admission: Option<PromptAdmission>) -> u8 {
+    match admission {
+        Some(PromptAdmission::Interrupt) => 0,
+        Some(PromptAdmission::Steer) => 1,
+        Some(PromptAdmission::Queue) | None => 2,
+    }
+}
+
 fn truncate_span(text: &str, max_width: usize, style: Style) -> Span<'static> {
     if text.width() <= max_width {
         return Span::styled(text.to_string(), style);
@@ -307,6 +328,7 @@ mod tests {
             color: theme::current().foreground,
             editable: true,
             movable: false,
+            admission: Some(PromptAdmission::Queue),
         }];
         let backend = TestBackend::new(60, 3);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -327,7 +349,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "┃");
-        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "N");
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), "U");
         assert!(
             hits.iter()
                 .any(|hit| hit.target == QueueHitTarget::ToggleTogether)

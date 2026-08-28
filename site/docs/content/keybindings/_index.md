@@ -65,6 +65,9 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `↑` / `↓` | Navigate input history |
 | `Esc Esc` | Cancel agent |
+| `Enter` | Send prompt next |
+| `Alt+S` | Guide current run |
+| `Alt+X` | Stop and replace current run |
 
 ## Form
 
@@ -94,6 +97,8 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `Enter` | Edit item |
 | Queue | `d` / `Delete` | Delete item |
 | Queue | `m` | Move unsent item to Main |
+| Queue | `g` | Guide current run |
+| Queue | `n` | Move prompt to Up next |
 | Queue | `b` | Toggle send together |
 | Commands | `Tab` | Complete command |
 | Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |

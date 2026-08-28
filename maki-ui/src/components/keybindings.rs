@@ -169,6 +169,16 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+C",
     };
+    pub const STEER_PROMPT: Bind = Bind {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+S",
+    };
+    pub const INTERRUPT_PROMPT: Bind = Bind {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+X",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -518,6 +528,24 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Send prompt next",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::STEER_PROMPT.label),
+        description: "Guide current run",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::INTERRUPT_PROMPT.label),
+        description: "Stop and replace current run",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate options",
         context: KeybindContext::FormInput,
@@ -586,6 +614,18 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("m"),
         description: "Move unsent item to Main",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("g"),
+        description: "Guide current run",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("n"),
+        description: "Move prompt to Up next",
         context: KeybindContext::QueueFocus,
         platform: Platform::All,
     },

@@ -46,7 +46,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/queue",
-        description: "Remove items from queue",
+        description: "Inspect and edit queued prompts",
         max_args: 0,
     },
     BuiltinCommand {

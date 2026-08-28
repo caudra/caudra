@@ -171,6 +171,15 @@ pub struct StoredQueuedDraft {
     pub paste_ranges: Vec<StoredPasteRange>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredPromptAdmission {
+    #[default]
+    Queue,
+    Steer,
+    Interrupt,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +204,8 @@ pub struct SessionMeta {
     pub input_draft_pastes: Vec<StoredPasteRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_message_admissions: Vec<StoredPromptAdmission>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub queued_messages_together: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1953,9 +1964,9 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         LOG_FORMAT_VERSION, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, PREVIOUS_LOG_FORMAT_VERSION,
-        SESSION_VERSION, StoredPasteRange, StoredQueuedDraft, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, meta_record, next_epoch,
-        update_cwd_index, write_full_session,
+        SESSION_VERSION, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
+        StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index,
+        meta_record, next_epoch, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, PendingConversationRevert, SCAN_CACHE_FILE, Session, SessionError,
@@ -3469,6 +3480,7 @@ mod tests {
         assert!(!meta.fast);
         assert!(!meta.workflow);
         assert!(!meta.queued_messages_together);
+        assert!(meta.queued_message_admissions.is_empty());
         assert!(meta.unsent_subagent_messages.is_empty());
         assert!(meta.yolo.is_none());
     }
@@ -3482,6 +3494,9 @@ mod tests {
         session.meta.fast = true;
         session.meta.workflow = true;
         session.meta.queued_messages_together = true;
+        session.meta.queued_messages = vec!["guide".into(), "next".into()];
+        session.meta.queued_message_admissions =
+            vec![StoredPromptAdmission::Steer, StoredPromptAdmission::Queue];
         session.meta.unsent_subagent_messages.insert(
             "task-1".into(),
             vec![StoredQueuedDraft {
@@ -3500,6 +3515,10 @@ mod tests {
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
         assert!(loaded.meta.queued_messages_together);
+        assert_eq!(
+            loaded.meta.queued_message_admissions,
+            [StoredPromptAdmission::Steer, StoredPromptAdmission::Queue]
+        );
         assert_eq!(
             loaded.meta.unsent_subagent_messages["task-1"][0].text,
             "follow up"

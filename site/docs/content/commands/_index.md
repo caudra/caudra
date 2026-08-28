@@ -17,7 +17,7 @@ Type `/` in the input box to open the command palette.
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
-| `/queue` | Remove items from queue |
+| `/queue` | Inspect and edit queued prompts |
 | `/model` | Switch model |
 | `/theme` | Switch color theme |
 | `/mcp` | Configure MCP servers |

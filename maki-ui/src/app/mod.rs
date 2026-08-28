@@ -243,13 +243,14 @@ pub struct App {
     queue_editor: Option<queue::QueueEditor>,
     task_queue_selection: Option<(String, QueueItemId)>,
     task_queue_viewport: usize,
-    recoverable_queue: Vec<String>,
+    recoverable_queue: Vec<crate::agent::shared_queue::PendingPrompt>,
     recoverable_queue_together: bool,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(crate) cancelling_run: Option<u64>,
+    replacement_item: Option<QueueItemId>,
     pub(super) retry_info: Option<RetryInfo>,
     goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
@@ -380,6 +381,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             cancelling_run: None,
+            replacement_item: None,
             retry_info: None,
             goal_deferred: false,
             zones: ZoneRegistry::new(),
@@ -960,6 +962,12 @@ impl App {
                         self.move_unsent_to_main(id);
                     }
                 }
+                KeyCode::Char('g') if key.modifiers.is_empty() => {
+                    self.set_focused_queue_admission(maki_agent::PromptAdmission::Steer);
+                }
+                KeyCode::Char('n') if key.modifiers.is_empty() => {
+                    self.set_focused_queue_admission(maki_agent::PromptAdmission::Queue);
+                }
                 KeyCode::Char('b') if key.modifiers.is_empty() => {
                     self.toggle_active_queue_delivery();
                 }
@@ -1364,6 +1372,34 @@ impl App {
             return vec![];
         }
 
+        if self.status == Status::Streaming {
+            let admission = if key::STEER_PROMPT.matches(key) {
+                Some(maki_agent::PromptAdmission::Steer)
+            } else if key::INTERRUPT_PROMPT.matches(key) {
+                Some(maki_agent::PromptAdmission::Interrupt)
+            } else {
+                None
+            };
+            if let Some(admission) = admission {
+                if !self.queue.is_connected() {
+                    self.flash(queue::NO_QUEUE_ERR.into());
+                    return Vec::new();
+                }
+                if admission == maki_agent::PromptAdmission::Interrupt
+                    && self.cancelling_run.is_some()
+                    && self.replacement_item.is_none()
+                {
+                    self.flash(queue::REPLACE_BUSY_ERR.into());
+                    return Vec::new();
+                }
+                let submission = self
+                    .input_box
+                    .take_submission()
+                    .unwrap_or_else(Submission::empty);
+                return self.handle_submit_with_admission(submission, admission);
+            }
+        }
+
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
@@ -1433,6 +1469,14 @@ impl App {
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
+        self.handle_submit_with_admission(sub, maki_agent::PromptAdmission::Queue)
+    }
+
+    fn handle_submit_with_admission(
+        &mut self,
+        sub: Submission,
+        admission: maki_agent::PromptAdmission,
+    ) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { subagent_id } => {
                 self.send_to_agent(subagent_id.as_deref(), String::new());
@@ -1462,17 +1506,24 @@ impl App {
                 visible: prefix.visible,
             }];
         }
-        self.submit_or_queue(sub.into())
+        self.submit_or_queue_with_admission(sub.into(), admission)
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
         if self.cancelling_run.is_some() {
             return Vec::new();
         }
+        let cancelled_run = self.begin_main_cancel(false, true);
+        vec![Action::CancelAgent {
+            run_id: cancelled_run,
+        }]
+    }
+
+    pub(super) fn begin_main_cancel(&mut self, preserve_queue: bool, await_terminal: bool) -> u64 {
         self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
-        self.cancelling_run = Some(cancelled_run);
+        self.cancelling_run = await_terminal.then_some(cancelled_run);
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -1488,12 +1539,13 @@ impl App {
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.queue.clear();
+        if !preserve_queue {
+            self.queue.clear();
+            self.replacement_item = None;
+        }
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
-        vec![Action::CancelAgent {
-            run_id: cancelled_run,
-        }]
+        cancelled_run
     }
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
@@ -1544,10 +1596,18 @@ impl App {
                     AgentEvent::Done { .. } | AgentEvent::Error { .. }
                 );
             if cancelled_terminal {
+                let cancelled_error = matches!(&envelope.event, AgentEvent::Error { .. });
                 self.cancelling_run = None;
-                self.status = Status::Idle;
+                self.status = if self.replacement_item.is_some() || self.queue.panel_len() > 0 {
+                    Status::Streaming
+                } else {
+                    Status::Idle
+                };
                 if let Err(error) = self.snapshot_history_head() {
                     self.flash(format!("Failed to snapshot cancelled run: {error}"));
+                }
+                if cancelled_error {
+                    self.queue.resume();
                 }
             }
             // A snapshot dropped here degrades the tool body to llm_output.
@@ -1828,7 +1888,7 @@ impl App {
         } = result
         {
             if chat_idx == 0 {
-                self.on_queue_item_consumed(&text, image_count);
+                self.on_queue_item_consumed(id, &text, image_count);
             } else if let Some(task_id) = subagent_id {
                 self.chats[chat_idx].show_user_message(text.clone());
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
@@ -1888,7 +1948,7 @@ impl App {
                     self.terminalize_turn(&message);
                     self.preserve_all_unconsumed_steers();
                     self.subagent_steers.clear();
-                    self.recoverable_queue = self.queue.text_messages();
+                    self.recoverable_queue = self.queue.pending_prompts();
                     self.recoverable_queue_together =
                         self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn;
                     self.queue.clear();
@@ -2355,7 +2415,7 @@ impl App {
 
     pub(crate) fn prepare_shutdown(&mut self) {
         if self.recoverable_queue.is_empty() {
-            self.recoverable_queue = self.queue.text_messages();
+            self.recoverable_queue = self.queue.pending_prompts();
             self.recoverable_queue_together =
                 self.queue.delivery() == maki_agent::QueueDelivery::TogetherNextTurn;
         }

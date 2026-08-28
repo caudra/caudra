@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{AgentInput, ExtractedCommand, InterruptSource};
 
@@ -40,6 +40,15 @@ pub enum QueueDelivery {
     #[default]
     Separate,
     TogetherNextTurn,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAdmission {
+    #[default]
+    Queue,
+    Steer,
+    Interrupt,
 }
 
 pub struct EditableQueue<T> {
@@ -112,16 +121,49 @@ impl<T> EditableQueue<T> {
         let mut state = lock(&self.state);
         state.items.clear();
         state.delivery = QueueDelivery::Separate;
+        drop(state);
+        self.notify();
     }
 
     pub fn remove(&self, id: QueueItemId) -> Option<T> {
+        self.remove_with_delivery_guard(id, |_| true)
+    }
+
+    pub fn remove_with_delivery_guard(
+        &self,
+        id: QueueItemId,
+        keeps_delivery: impl Fn(&T) -> bool,
+    ) -> Option<T> {
         let mut state = lock(&self.state);
         let index = state.items.iter().position(|item| item.id == id)?;
         let value = state.items.remove(index).map(|item| item.value);
-        if state.items.is_empty() {
+        if !state.items.iter().any(|item| keeps_delivery(&item.value)) {
             state.delivery = QueueDelivery::Separate;
         }
         value
+    }
+
+    pub fn update_with_delivery_guard(
+        &self,
+        id: QueueItemId,
+        update: impl FnOnce(&mut T),
+        keeps_delivery: impl Fn(&T) -> bool,
+    ) -> bool {
+        let mut state = lock(&self.state);
+        let Some(item) = state
+            .items
+            .iter_mut()
+            .find(|item| item.id == id && !item.editing)
+        else {
+            return false;
+        };
+        update(&mut item.value);
+        if !state.items.iter().any(|item| keeps_delivery(&item.value)) {
+            state.delivery = QueueDelivery::Separate;
+        }
+        drop(state);
+        self.notify();
+        true
     }
 
     pub fn begin_edit<R>(
@@ -165,6 +207,35 @@ impl<T> EditableQueue<T> {
             .iter()
             .map(|item| map(item.id, &item.value, item.editing))
             .collect()
+    }
+
+    pub fn has_matching(&self, matches: impl Fn(&T) -> bool) -> bool {
+        lock(&self.state)
+            .items
+            .iter()
+            .any(|item| matches(&item.value))
+    }
+
+    pub fn retain_mut_and_push(
+        &self,
+        value: T,
+        mut retain: impl FnMut(&mut T) -> bool,
+    ) -> QueueItemId {
+        let id = QueueItemId::new();
+        let mut state = lock(&self.state);
+        state.items.retain_mut(|item| retain(&mut item.value));
+        state.items.push_back(Item {
+            id,
+            value,
+            editing: false,
+        });
+        drop(state);
+        self.notify();
+        id
+    }
+
+    pub fn wake(&self) {
+        self.notify();
     }
 
     pub fn drain(&self) -> Vec<(QueueItemId, T)> {
@@ -236,11 +307,64 @@ impl<T> EditableQueueReceiver<T> {
             .collect()
     }
 
-    pub fn publish_if_empty(&self, publish: impl FnOnce()) {
+    pub fn claim_one_matching(&self, matches: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
+        let mut state = lock(&self.state);
+        let Some(index) = state.items.iter().position(|item| matches(&item.value)) else {
+            return Vec::new();
+        };
+        if state.items[index].editing {
+            return Vec::new();
+        }
+        let claimed = state
+            .items
+            .remove(index)
+            .map(|item| vec![(item.id, item.value)])
+            .unwrap_or_default();
+        if state.items.is_empty() {
+            state.delivery = QueueDelivery::Separate;
+        }
+        claimed
+    }
+
+    pub fn claim_all_matching(&self, matches: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
+        let mut state = lock(&self.state);
+        let indices = state
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| matches(&item.value).then_some(index))
+            .collect::<Vec<_>>();
+        if indices.is_empty() || indices.iter().any(|index| state.items[*index].editing) {
+            return Vec::new();
+        }
+        let mut claimed = indices
+            .into_iter()
+            .rev()
+            .filter_map(|index| state.items.remove(index))
+            .map(|item| (item.id, item.value))
+            .collect::<Vec<_>>();
+        claimed.reverse();
+        if state.items.is_empty() {
+            state.delivery = QueueDelivery::Separate;
+        }
+        claimed
+    }
+
+    pub fn publish_if_empty(&self, publish: impl FnOnce()) -> bool {
         let state = lock(&self.state);
         if state.items.is_empty() {
             publish();
+            true
+        } else {
+            false
         }
+    }
+
+    pub fn has_matching(&self, matches: impl Fn(&T) -> bool) -> bool {
+        lock(&self.state)
+            .items
+            .iter()
+            .any(|item| matches(&item.value))
     }
 
     pub async fn recv_notify(&self) -> Result<(), flume::RecvError> {
@@ -432,6 +556,52 @@ mod tests {
         queue.set_delivery(QueueDelivery::TogetherNextTurn);
 
         assert_eq!(queue.remove(id), Some("only"));
+        assert_eq!(queue.delivery(), QueueDelivery::Separate);
+    }
+
+    #[test]
+    fn matching_claims_skip_other_items_without_reordering_them() {
+        let (queue, receiver) = editable_queue();
+        let queued = queue.push((PromptAdmission::Queue, "queued"));
+        let first_steer = queue.push((PromptAdmission::Steer, "first steer"));
+        let second_steer = queue.push((PromptAdmission::Steer, "second steer"));
+
+        assert_eq!(
+            receiver.claim_all_matching(|(admission, _)| *admission == PromptAdmission::Steer),
+            [
+                (first_steer, (PromptAdmission::Steer, "first steer")),
+                (second_steer, (PromptAdmission::Steer, "second steer")),
+            ]
+        );
+        assert_eq!(
+            receiver.pop(),
+            Some((queued, (PromptAdmission::Queue, "queued")))
+        );
+    }
+
+    #[test]
+    fn editing_matching_item_blocks_atomic_matching_batch() {
+        let (queue, receiver) = editable_queue();
+        queue.push((PromptAdmission::Steer, "first"));
+        let editing = queue.push((PromptAdmission::Steer, "second"));
+        queue.begin_edit(editing, |_| Some(()));
+
+        assert!(
+            receiver
+                .claim_all_matching(|(admission, _)| *admission == PromptAdmission::Steer)
+                .is_empty()
+        );
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn matching_claim_resets_together_after_emptying_queue() {
+        let (queue, receiver) = editable_queue();
+        queue.push(PromptAdmission::Steer);
+        queue.set_delivery(QueueDelivery::TogetherNextTurn);
+
+        receiver.claim_all_matching(|admission| *admission == PromptAdmission::Steer);
+
         assert_eq!(queue.delivery(), QueueDelivery::Separate);
     }
 }

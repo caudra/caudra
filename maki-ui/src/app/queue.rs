@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use maki_agent::AgentInput;
-use maki_agent::{QueueDelivery, QueueItemId};
+use maki_agent::{PromptAdmission, QueueDelivery, QueueItemId};
 
 use super::{Action, App, Status, format_with_images};
 
@@ -17,10 +17,12 @@ pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
+pub(crate) const REPLACE_BUSY_ERR: &str = "session is already stopping a run";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
     Queued,
+    Replacing(Vec<Action>),
     Rejected(&'static str),
 }
 
@@ -45,6 +47,10 @@ pub(crate) struct MessageQueue {
 impl MessageQueue {
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.shared.is_some()
     }
 
     #[cfg(test)]
@@ -76,6 +82,12 @@ impl MessageQueue {
         self.viewport = 0;
     }
 
+    pub(crate) fn resume(&self) {
+        if let Some(shared) = &self.shared {
+            shared.resume();
+        }
+    }
+
     pub(crate) fn disconnect(&mut self) {
         self.clear();
         self.shared = None;
@@ -100,8 +112,15 @@ impl MessageQueue {
         self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
         self.shared.as_ref().map_or(vec![], |s| s.text_messages())
+    }
+
+    pub(crate) fn pending_prompts(&self) -> Vec<crate::agent::shared_queue::PendingPrompt> {
+        self.shared
+            .as_ref()
+            .map_or(vec![], QueueSender::pending_prompts)
     }
 
     pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<String> {
@@ -118,6 +137,12 @@ impl MessageQueue {
         self.shared
             .as_ref()
             .is_some_and(|shared| shared.cancel_edit(id))
+    }
+
+    pub(crate) fn set_admission(&self, id: QueueItemId, admission: PromptAdmission) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.set_admission(id, admission))
     }
 
     pub(crate) fn delivery(&self) -> QueueDelivery {
@@ -215,6 +240,7 @@ impl App {
                 color: theme::current().foreground,
                 editable: true,
                 movable: false,
+                admission: Some(PromptAdmission::Steer),
             })
             .collect::<Vec<_>>();
         entries.extend(
@@ -228,6 +254,7 @@ impl App {
                     color: theme::current().foreground,
                     editable: true,
                     movable: true,
+                    admission: Some(PromptAdmission::Steer),
                 }),
         );
         entries
@@ -247,16 +274,18 @@ impl App {
     }
 
     pub(super) fn active_queue_delivery(&self) -> Option<QueueDelivery> {
-        if self.queue_editor_active()
-            || !self
-                .active_queue_entries()
-                .iter()
-                .any(|entry| entry.editable)
-        {
+        if self.queue_editor_active() {
             return None;
         }
+        let entries = self.active_queue_entries();
         if self.is_main_chat() {
-            return Some(self.queue.delivery());
+            return entries
+                .iter()
+                .any(|entry| entry.admission == Some(PromptAdmission::Queue))
+                .then(|| self.queue.delivery());
+        }
+        if !entries.iter().any(|entry| entry.editable) {
+            return None;
         }
         self.active_subagent_id()
             .and_then(|task_id| self.subagent_steers.get(task_id))
@@ -278,10 +307,14 @@ impl App {
             };
             queue.toggle_delivery()
         };
-        let count = self
-            .active_queue_entries()
+        let entries = self.active_queue_entries();
+        let count = entries
             .iter()
-            .filter(|entry| entry.editable && !entry.movable)
+            .filter(|entry| {
+                entry.editable
+                    && !entry.movable
+                    && (!self.is_main_chat() || entry.admission == Some(PromptAdmission::Queue))
+            })
             .count();
         self.flash(match delivery {
             QueueDelivery::Separate => "Queued messages will be sent separately".into(),
@@ -415,6 +448,14 @@ impl App {
             }
         };
         if removed {
+            if self.replacement_item == Some(id) {
+                self.replacement_item = None;
+                self.status = if self.cancelling_run.is_some() || self.queue.panel_len() > 0 {
+                    Status::Streaming
+                } else {
+                    Status::Idle
+                };
+            }
             self.clamp_active_queue_focus();
         }
         removed
@@ -426,6 +467,33 @@ impl App {
             .get(self.active_queue_focus().unwrap_or(0))
         {
             self.delete_active_queue_item(id.id);
+        }
+    }
+
+    pub(super) fn set_focused_queue_admission(&mut self, admission: PromptAdmission) {
+        if !self.is_main_chat() {
+            return;
+        }
+        let Some(id) = self
+            .active_queue_entries()
+            .get(self.active_queue_focus().unwrap_or(0))
+            .filter(|entry| {
+                matches!(
+                    entry.admission,
+                    Some(PromptAdmission::Queue | PromptAdmission::Steer)
+                )
+            })
+            .map(|entry| entry.id)
+        else {
+            return;
+        };
+        if self.queue.set_admission(id, admission) {
+            self.queue.select(id);
+            self.flash(match admission {
+                PromptAdmission::Queue => "Prompt moved to Up next".into(),
+                PromptAdmission::Steer => "Prompt will guide the current run".into(),
+                PromptAdmission::Interrupt => return,
+            });
         }
     }
 
@@ -578,10 +646,13 @@ impl App {
         else {
             return;
         };
-        if !self.queue_and_notify(QueuedMessage {
-            text: item.text.clone(),
-            images: Vec::new(),
-        }) {
+        if !self.queue_with_admission(
+            QueuedMessage {
+                text: item.text.clone(),
+                images: Vec::new(),
+            },
+            PromptAdmission::Queue,
+        ) {
             self.unsent_subagent_steers
                 .entry(task_id)
                 .or_default()
@@ -636,7 +707,16 @@ impl App {
     /// The one queue-or-start decision, shared by the keyboard and Lua
     /// paths so they cannot drift. Expects raw text: interpretation (slash
     /// commands, `exit`, `!`) is the caller's job, or skipped on purpose.
+    #[cfg(test)]
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        self.submit_prompt_with_admission(msg, PromptAdmission::Queue)
+    }
+
+    pub(crate) fn submit_prompt_with_admission(
+        &mut self,
+        msg: QueuedMessage,
+        admission: PromptAdmission,
+    ) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
         }
@@ -651,7 +731,10 @@ impl App {
             return SubmitOutcome::Rejected(super::REVERT_BUSY_MSG);
         }
         if self.status == Status::Streaming {
-            if self.queue_and_notify(msg) {
+            if admission == PromptAdmission::Interrupt {
+                return self.replace_and_notify(msg);
+            }
+            if self.queue_with_admission(msg, admission) {
                 SubmitOutcome::Queued
             } else {
                 SubmitOutcome::Rejected(NO_QUEUE_ERR)
@@ -664,9 +747,18 @@ impl App {
     /// Keyboard path: nobody is around to receive an `Err`, so
     /// rejections flash on screen instead.
     pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
-        match self.submit_prompt(msg) {
+        self.submit_or_queue_with_admission(msg, PromptAdmission::Queue)
+    }
+
+    pub(super) fn submit_or_queue_with_admission(
+        &mut self,
+        msg: QueuedMessage,
+        admission: PromptAdmission,
+    ) -> Vec<Action> {
+        match self.submit_prompt_with_admission(msg, admission) {
             SubmitOutcome::Started(actions) => actions,
             SubmitOutcome::Queued => vec![],
+            SubmitOutcome::Replacing(actions) => actions,
             SubmitOutcome::Rejected(e) => {
                 self.flash(e.into());
                 vec![]
@@ -693,6 +785,7 @@ impl App {
                 image_count: 0,
                 input,
                 run_id: self.run_id,
+                admission: PromptAdmission::Queue,
                 displayed: false,
             });
             vec![]
@@ -704,7 +797,16 @@ impl App {
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
+    #[cfg(test)]
     pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
+        self.queue_with_admission(msg, PromptAdmission::Queue)
+    }
+
+    pub(super) fn queue_with_admission(
+        &mut self,
+        msg: QueuedMessage,
+        admission: PromptAdmission,
+    ) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
         };
@@ -714,9 +816,55 @@ impl App {
             image_count: msg.images.len(),
             input,
             run_id: self.run_id,
+            admission,
             displayed: false,
         });
         true
+    }
+
+    fn replace_and_notify(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        let Some(shared) = self.queue.shared.clone() else {
+            return SubmitOutcome::Rejected(NO_QUEUE_ERR);
+        };
+        let input = self.build_agent_input(&msg);
+        let mut replacement = QueueItem::Message {
+            text: msg.text,
+            image_count: msg.images.len(),
+            input,
+            run_id: self.run_id,
+            admission: PromptAdmission::Interrupt,
+            displayed: false,
+        };
+        if self.replacement_item.is_some() {
+            match shared.update_pending_replacement(self.run_id, replacement) {
+                Ok(id) => {
+                    self.replacement_item = Some(id);
+                    return SubmitOutcome::Replacing(Vec::new());
+                }
+                Err(item) => {
+                    replacement = *item;
+                    self.replacement_item = None;
+                    self.cancelling_run = None;
+                }
+            }
+        }
+        if self.cancelling_run.is_some() {
+            return SubmitOutcome::Rejected(REPLACE_BUSY_ERR);
+        }
+        let cancelled_run = self.run_id;
+        let replacement_run = cancelled_run + 1;
+        let (id, active) = shared.replace(cancelled_run, replacement_run, replacement);
+        let cancelled_run = self.begin_main_cancel(true, active);
+        debug_assert_eq!(self.run_id, replacement_run);
+        self.replacement_item = Some(id);
+        SubmitOutcome::Replacing(
+            active
+                .then_some(Action::CancelAgent {
+                    run_id: cancelled_run,
+                })
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Push restored queue items only here, never in `restore_display`: on
@@ -735,11 +883,37 @@ impl App {
         }
         // Read, not taken: the live queue is what the next checkpoint mirrors
         // back into the session, so emptying it here changes nothing on disk.
-        for text in self.state.session.meta.queued_messages.clone() {
-            self.queue_and_notify(QueuedMessage {
-                text,
-                images: Vec::new(),
-            });
+        for (index, text) in self
+            .state
+            .session
+            .meta
+            .queued_messages
+            .clone()
+            .into_iter()
+            .enumerate()
+        {
+            let admission = match self
+                .state
+                .session
+                .meta
+                .queued_message_admissions
+                .get(index)
+                .copied()
+                .unwrap_or_default()
+            {
+                maki_storage::sessions::StoredPromptAdmission::Queue => PromptAdmission::Queue,
+                maki_storage::sessions::StoredPromptAdmission::Steer => PromptAdmission::Steer,
+                maki_storage::sessions::StoredPromptAdmission::Interrupt => {
+                    PromptAdmission::Interrupt
+                }
+            };
+            self.queue_with_admission(
+                QueuedMessage {
+                    text,
+                    images: Vec::new(),
+                },
+                admission,
+            );
         }
     }
 
@@ -756,7 +930,16 @@ impl App {
     /// queue items start runs without `start_run`, so this is where the app
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
-    pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
+    pub(super) fn on_queue_item_consumed(
+        &mut self,
+        id: QueueItemId,
+        text: &str,
+        image_count: usize,
+    ) {
+        if self.replacement_item == Some(id) {
+            self.replacement_item = None;
+            self.cancelling_run = None;
+        }
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         self.main_chat()
@@ -764,6 +947,13 @@ impl App {
     }
 
     pub(super) fn on_queue_batch_consumed(&mut self, items: &[maki_agent::QueueConsumedItem]) {
+        if self
+            .replacement_item
+            .is_some_and(|id| items.iter().any(|item| item.id == id))
+        {
+            self.replacement_item = None;
+            self.cancelling_run = None;
+        }
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         let messages = items

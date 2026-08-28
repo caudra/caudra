@@ -2927,17 +2927,21 @@ maki.session.prompt({text}, {opts?})
 Sends {text} as a regular user prompt to a live session. The text is
 never interpreted: slash commands, `exit`, and `!` shell prefixes are
 all sent to the model verbatim. If the session is currently streaming,
-the prompt is queued and picked up when the agent reaches it.
+admission controls when the prompt is picked up.
 
 **Parameters:**
 
 - `{text}` (`string`) The prompt to send. Must not be blank.
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
 
-  session; defaults to the focused one.
+  session; defaults to the focused one. admission (string) is "queue",
 
 
-**Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
+  "steer", or "interrupt"; defaults to "queue".
+
+
+**Returns:** (`string|nil`, `string|nil`) "started", "queued", "steered", or
+  "replacing", or nil and an error.
 
 **Example:**
 

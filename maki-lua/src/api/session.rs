@@ -2,7 +2,7 @@
 //! the UI event loop, which owns live runtimes and storage. `notify` posts
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
-use maki_agent::SessionMailbox;
+use maki_agent::{PromptAdmission, SessionMailbox};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
@@ -112,12 +112,14 @@ async fn new(
 /// Sends {text} as a regular user prompt to a live session. The text is
 /// never interpreted: slash commands, `exit`, and `!` shell prefixes are
 /// all sent to the model verbatim. If the session is currently streaming,
-/// the prompt is queued and picked up when the agent reaches it.
+/// admission controls when the prompt is picked up.
 ///
 /// @param text string The prompt to send. Must not be blank.
 /// @param opts table? Optional fields: session (string) id of a live
-///   session; defaults to the focused one.
-/// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
+///   session; defaults to the focused one. admission (string) is "queue",
+///   "steer", or "interrupt"; defaults to "queue".
+/// @return (string|nil, string|nil) "started", "queued", "steered", or
+///   "replacing", or nil and an error.
 /// @example
 /// local state, err = maki.session.prompt("run the tests", { session = id })
 #[lua_fn]
@@ -127,11 +129,32 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    let id = match opts {
-        Some(opts) => opts.get("session")?,
-        None => None,
+    let (id, admission) = match opts {
+        Some(opts) => {
+            let admission = match opts.get::<Option<String>>("admission")?.as_deref() {
+                None | Some("queue") => PromptAdmission::Queue,
+                Some("steer") => PromptAdmission::Steer,
+                Some("interrupt") => PromptAdmission::Interrupt,
+                Some(value) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "invalid admission {value:?}: expected queue, steer, or interrupt"
+                    )));
+                }
+            };
+            (opts.get("session")?, admission)
+        }
+        None => (None, PromptAdmission::Queue),
     };
-    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
+    roundtrip(
+        lua,
+        tx,
+        SessionRequest::Prompt {
+            id,
+            text,
+            admission,
+        },
+    )
+    .await
 }
 
 /// Reports {text} to a live session without creating a user turn. The
@@ -248,7 +271,12 @@ mod tests {
         let expected_id = expected_id.map(str::to_owned);
         let checker = std::thread::spawn(move || {
             let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text },
+                req:
+                    SessionRequest::Prompt {
+                        id,
+                        text,
+                        admission,
+                    },
                 reply_tx,
             }) = rx.recv()
             else {
@@ -256,6 +284,7 @@ mod tests {
             };
             assert_eq!(id, expected_id);
             assert_eq!(text, "hi");
+            assert_eq!(admission, PromptAdmission::Queue);
             reply_tx.send(Ok(json!("queued"))).unwrap();
         });
         let (val, err): (String, Option<String>) =
@@ -263,6 +292,28 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    #[test_case("steer", PromptAdmission::Steer ; "steer")]
+    #[test_case("interrupt", PromptAdmission::Interrupt ; "interrupt")]
+    fn prompt_forwards_admission(value: &str, expected: PromptAdmission) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Prompt { admission, .. },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected prompt request");
+            };
+            assert_eq!(admission, expected);
+            reply_tx.send(Ok(json!("queued"))).unwrap();
+        });
+
+        let code = format!("return session.prompt('hi', {{ admission = '{value}' }})");
+        let _: (String, Option<String>) = smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
     }
 
     #[test]

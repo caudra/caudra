@@ -1238,14 +1238,18 @@ impl<'t> EventLoop<'t> {
                     Some(&id.to_string()),
                 );
                 if let Some(prompt) = prompt {
-                    let _ = self.submit_text(idx, prompt);
+                    let _ = self.submit_text(idx, prompt, maki_agent::PromptAdmission::Queue);
                 }
                 if focus {
                     self.focused = idx;
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Prompt { id, text } => {
+            SessionRequest::Prompt {
+                id,
+                text,
+                admission,
+            } => {
                 let idx = match id {
                     None => Ok(self.focused),
                     Some(id) => parse_session_id(&id).and_then(|id| {
@@ -1253,7 +1257,7 @@ impl<'t> EventLoop<'t> {
                             .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
                     }),
                 };
-                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
+                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text, admission)));
             }
             SessionRequest::Focus { id } => {
                 let reply = parse_session_id(&id)
@@ -1318,17 +1322,33 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
+    fn submit_text(
+        &mut self,
+        idx: usize,
+        text: String,
+        admission: maki_agent::PromptAdmission,
+    ) -> UiReply {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
         };
-        match self.sessions[idx].app.submit_prompt(msg) {
+        match self.sessions[idx]
+            .app
+            .submit_prompt_with_admission(msg, admission)
+        {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
                 Ok(json!("started"))
             }
-            SubmitOutcome::Queued => Ok(json!("queued")),
+            SubmitOutcome::Queued => Ok(json!(match admission {
+                maki_agent::PromptAdmission::Queue => "queued",
+                maki_agent::PromptAdmission::Steer => "steered",
+                maki_agent::PromptAdmission::Interrupt => unreachable!(),
+            })),
+            SubmitOutcome::Replacing(actions) => {
+                self.dispatch(idx, actions);
+                Ok(json!("replacing"))
+            }
             SubmitOutcome::Rejected(e) => Err(e.into()),
         }
     }
@@ -1609,6 +1629,7 @@ impl<'t> EventLoop<'t> {
                     image_count: input.images.len(),
                     input,
                     run_id,
+                    admission: maki_agent::PromptAdmission::Queue,
                     displayed: true,
                 });
             }

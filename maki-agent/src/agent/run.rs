@@ -243,6 +243,17 @@ impl<'h> Agent<'h> {
         self.run_inputs(inputs, true).await
     }
 
+    pub async fn run_initial_batch(
+        &mut self,
+        first: AgentInput,
+        rest: Vec<AgentInput>,
+    ) -> Result<DoneReason, AgentError> {
+        let mut inputs = Vec::with_capacity(rest.len() + 1);
+        inputs.push(first);
+        inputs.extend(rest);
+        self.run_inputs(inputs, false).await
+    }
+
     async fn run_inputs(
         &mut self,
         inputs: Vec<AgentInput>,
@@ -1488,6 +1499,31 @@ mod tests {
                 history.as_slice()[0].content.first(),
                 Some(ContentBlock::Image { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn initial_batch_preserves_plain_user_messages() {
+        smol::block_on(async {
+            let mut first = default_input();
+            first.message = "guide".into();
+            let mut replacement = default_input();
+            replacement.message = "replace".into();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+
+            agent
+                .run_initial_batch(first, vec![replacement])
+                .await
+                .unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some("guide"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("replace"));
+            assert!(!has_interrupt_in_history(history.as_slice()));
         });
     }
 

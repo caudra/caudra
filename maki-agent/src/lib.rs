@@ -44,8 +44,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub use editable_queue::{
-    EditableQueue, EditableQueueReceiver, QueueDelivery, QueueItemId, SteeringQueue,
-    SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
+    EditableQueue, EditableQueueReceiver, PromptAdmission, QueueDelivery, QueueItemId,
+    SteeringQueue, SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
 };
 pub use maki_providers::AgentError;
 use maki_providers::Message;

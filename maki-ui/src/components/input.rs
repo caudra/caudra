@@ -295,6 +295,10 @@ impl InputBox {
         self.submit_inner(true)
     }
 
+    pub(crate) fn take_submission(&mut self) -> Option<Submission> {
+        self.submit_inner(true)
+    }
+
     fn submit_inner(&mut self, record_history: bool) -> Option<Submission> {
         let draft = self.buffer.draft();
         let text = draft.text.trim().to_string();

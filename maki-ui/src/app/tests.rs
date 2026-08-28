@@ -30,7 +30,8 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    Session, StoredMode, StoredPasteRange, StoredQueuedDraft, StoredSubagent, StoredThinking,
+    Session, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
+    StoredSubagent, StoredThinking,
 };
 use ratatui::layout::Rect;
 use std::env;
@@ -715,6 +716,175 @@ fn submit_during_streaming_queues_message() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
+    assert_eq!(
+        app.queue.pending_prompts()[0].admission,
+        maki_agent::PromptAdmission::Queue
+    );
+}
+
+#[test]
+fn alt_s_steers_the_active_run() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    app.input_box.set_input("guide this run".into());
+
+    let actions = app.update(Msg::Key(kb::STEER_PROMPT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.queue.pending_prompts(),
+        [shared_queue::PendingPrompt {
+            text: "guide this run".into(),
+            admission: maki_agent::PromptAdmission::Steer,
+        }]
+    );
+    assert!(rendered(&mut app).contains("Guide"));
+    assert!(!rendered(&mut app).contains("Mode:"));
+}
+
+#[test]
+fn alt_x_replaces_active_run_and_preserves_pending_queue() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    receiver.set_active_run(1);
+    app.queue_and_notify(queued_msg("still needed"));
+    app.input_box.set_input("replace now".into());
+
+    let actions = app.update(Msg::Key(kb::INTERRUPT_PROMPT.to_key_event()));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.run_id, 2);
+    assert_eq!(app.cancelling_run, Some(1));
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| prompt.admission)
+            .collect::<Vec<_>>(),
+        [
+            maki_agent::PromptAdmission::Queue,
+            maki_agent::PromptAdmission::Interrupt,
+        ]
+    );
+    assert!(rendered(&mut app).contains("Replacing"));
+
+    let replacement_id = app
+        .queue
+        .panel_entries()
+        .into_iter()
+        .find(|entry| entry.admission == Some(maki_agent::PromptAdmission::Interrupt))
+        .unwrap()
+        .id;
+    app.on_queue_item_consumed(replacement_id, "replace now", 0);
+
+    assert_eq!(app.cancelling_run, None);
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn newest_pending_replacement_wins() {
+    let mut app = test_app();
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    receiver.set_active_run(1);
+    assert!(matches!(
+        app.submit_prompt_with_admission(
+            queued_msg("first replacement"),
+            maki_agent::PromptAdmission::Interrupt,
+        ),
+        SubmitOutcome::Replacing(_)
+    ));
+
+    let outcome = app.submit_prompt_with_admission(
+        queued_msg("latest replacement"),
+        maki_agent::PromptAdmission::Interrupt,
+    );
+
+    assert!(matches!(outcome, SubmitOutcome::Replacing(ref actions) if actions.is_empty()));
+    let replacements = app
+        .queue
+        .pending_prompts()
+        .into_iter()
+        .filter(|prompt| prompt.admission == maki_agent::PromptAdmission::Interrupt)
+        .collect::<Vec<_>>();
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(replacements[0].text, "latest replacement");
+    assert_eq!(app.cancelling_run, Some(1));
+}
+
+#[test]
+fn replacement_claimed_before_ui_consumption_is_cancelled_by_newer_replacement() {
+    let mut app = test_app();
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    receiver.set_active_run(1);
+    assert!(matches!(
+        app.submit_prompt_with_admission(
+            queued_msg("first replacement"),
+            maki_agent::PromptAdmission::Interrupt,
+        ),
+        SubmitOutcome::Replacing(_)
+    ));
+    let claimed = receiver.claim_idle(0);
+    assert_eq!(claimed.len(), 1);
+
+    let outcome = app.submit_prompt_with_admission(
+        queued_msg("newer replacement"),
+        maki_agent::PromptAdmission::Interrupt,
+    );
+
+    assert!(matches!(
+        outcome,
+        SubmitOutcome::Replacing(ref actions)
+            if matches!(actions.as_slice(), [Action::CancelAgent { run_id: 2 }])
+    ));
+    assert_eq!(app.run_id, 3);
+    assert_eq!(app.cancelling_run, Some(2));
+    assert_eq!(
+        app.queue.pending_prompts()[0].admission,
+        maki_agent::PromptAdmission::Interrupt
+    );
+}
+
+#[test]
+fn rejected_second_replacement_preserves_input() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.cancelling_run = Some(1);
+    app.input_box.set_input("keep this replacement".into());
+
+    let actions = app.update(Msg::Key(kb::INTERRUPT_PROMPT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.input_box.buffer.value(), "keep this replacement");
+    assert_eq!(app.status_bar.flash_text(), Some(queue::REPLACE_BUSY_ERR));
+}
+
+#[test]
+fn replacement_without_an_active_run_starts_without_waiting_for_a_terminal_event() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let SubmitOutcome::Replacing(actions) = app.submit_prompt_with_admission(
+        queued_msg("replace queued startup work"),
+        maki_agent::PromptAdmission::Interrupt,
+    ) else {
+        panic!("expected replacement");
+    };
+
+    assert!(actions.is_empty());
+    assert_eq!(app.cancelling_run, None);
+    assert_eq!(app.run_id, 2);
 }
 
 #[test]
@@ -745,6 +915,47 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
     );
+}
+
+#[test]
+fn deleting_replacement_still_resumes_a_late_superseded_error() {
+    let mut app = test_app();
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    receiver.set_active_run(1);
+    let outcome = app.submit_prompt_with_admission(
+        queued_msg("replacement"),
+        maki_agent::PromptAdmission::Interrupt,
+    );
+    assert!(matches!(outcome, SubmitOutcome::Replacing(_)));
+    let replacement = app
+        .queue
+        .panel_entries()
+        .into_iter()
+        .find(|entry| entry.admission == Some(maki_agent::PromptAdmission::Interrupt))
+        .unwrap();
+    assert!(app.delete_active_queue_item(replacement.id));
+    assert_eq!(app.cancelling_run, Some(1));
+    assert!(matches!(
+        app.submit_prompt_with_admission(
+            queued_msg("another replacement"),
+            maki_agent::PromptAdmission::Interrupt,
+        ),
+        SubmitOutcome::Rejected(queue::REPLACE_BUSY_ERR)
+    ));
+    app.queue_and_notify(queued_msg("new work"));
+    receiver.pause();
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Error {
+            message: "cancel race".into(),
+        },
+        1,
+    ));
+
+    assert_eq!(receiver.claim_idle(0).len(), 1);
 }
 
 /// Restored queue items start runs without `start_run`, so the consumed
@@ -3014,6 +3225,49 @@ fn queue_batch_key_toggles_one_shot_delivery() {
 }
 
 #[test]
+fn focused_prompt_moves_between_up_next_and_guide() {
+    let mut app = app_with_queued_message();
+    let id = app.queue.panel_entries()[0].id;
+    app.queue.select(id);
+
+    app.update(Msg::Key(key(KeyCode::Char('g'))));
+
+    assert_eq!(
+        app.queue.panel_entries()[0].admission,
+        Some(maki_agent::PromptAdmission::Steer)
+    );
+    assert!(rendered(&mut app).contains("Guide"));
+    assert_eq!(app.active_queue_delivery(), None);
+
+    app.update(Msg::Key(key(KeyCode::Char('n'))));
+
+    assert_eq!(
+        app.queue.panel_entries()[0].admission,
+        Some(maki_agent::PromptAdmission::Queue)
+    );
+    assert!(rendered(&mut app).contains("Up next"));
+}
+
+#[test]
+fn deleting_last_next_prompt_resets_hidden_together_mode() {
+    let mut app = app_with_queued_message();
+    app.queue_with_admission(queued_msg("guide"), maki_agent::PromptAdmission::Steer);
+    app.queue
+        .set_delivery(maki_agent::QueueDelivery::TogetherNextTurn);
+    let queued = app
+        .queue
+        .panel_entries()
+        .into_iter()
+        .find(|entry| entry.admission == Some(maki_agent::PromptAdmission::Queue))
+        .unwrap();
+
+    assert!(app.delete_active_queue_item(queued.id));
+
+    assert_eq!(app.queue.delivery(), maki_agent::QueueDelivery::Separate);
+    assert_eq!(app.active_queue_delivery(), None);
+}
+
+#[test]
 fn queue_title_mouse_toggle_switches_delivery_mode() {
     let mut app = app_with_queued_message();
 
@@ -3305,7 +3559,7 @@ fn stale_done_does_not_drain_queue() {
 
     app.update(agent_msg_with_run_id(done(), 1));
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
     assert_eq!(app.cancelling_run, None);
 }
 
@@ -3630,13 +3884,30 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
 fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
     let mut app = test_app();
     app.state.session_mut().meta.queued_messages = vec!["q1".into(), "q2".into()];
+    app.state.session_mut().meta.queued_message_admissions =
+        vec![StoredPromptAdmission::Steer, StoredPromptAdmission::Queue];
 
     app.restore_resumed_session();
     assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| prompt.admission)
+            .collect::<Vec<_>>(),
+        [
+            maki_agent::PromptAdmission::Steer,
+            maki_agent::PromptAdmission::Queue,
+        ]
+    );
     assert_eq!(app.status, Status::Streaming);
 
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
+    assert_eq!(
+        app.state.session.meta.queued_message_admissions,
+        [StoredPromptAdmission::Steer, StoredPromptAdmission::Queue]
+    );
 }
 
 #[test]
@@ -4518,7 +4789,8 @@ fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event(
     ));
 
     assert_eq!(app.cancelling_run, None);
-    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.queue.text_messages(), ["new work"]);
     let captured = app.snapshot_store.load_manifest(head).unwrap();
     std::fs::write(path, CURRENT_CONTENT).unwrap();
     app.update(agent_msg_with_run_id(done(), 7));
