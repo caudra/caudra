@@ -1252,7 +1252,15 @@ impl SnapshotStore {
         }
     }
 
+    /// Sweeping costs a parse of every manifest in the store, so it is worth
+    /// doing only once the objects it could reclaim actually matter. An object
+    /// is unreferenced only after the manifest naming it is replaced or
+    /// evicted, and eviction happens here, so gating the sweep on the cap
+    /// leaves nothing to collect in the common case.
     fn enforce_cap_preserving(&self, preserve: Option<MakiId>) -> Result<(), SnapshotError> {
+        if self.object_bytes()? <= self.cap_bytes {
+            return Ok(());
+        }
         self.gc_unreferenced_objects()?;
         if self.object_bytes()? <= self.cap_bytes {
             return Ok(());
@@ -2544,6 +2552,24 @@ mod tests {
         assert_eq!(store.load_manifest(checkpoint).unwrap(), second);
         assert!(!first_object.exists());
         assert_eq!(store.object_bytes().unwrap(), BETA.len() as u64);
+    }
+
+    #[test]
+    fn garbage_is_swept_only_under_cap_pressure() {
+        let (_temp, root, snapshots) = setup();
+        write(&root, "file.txt", ALPHA);
+        let roomy = SnapshotStore::with_cap(snapshots.clone(), u64::MAX);
+        let checkpoint = checkpoint(1);
+        let first = roomy.snapshot(&root, checkpoint).unwrap();
+        let orphan = roomy.objects_dir().join(&first["file.txt"].hash);
+
+        write(&root, "file.txt", BETA);
+        roomy.snapshot(&root, checkpoint).unwrap();
+        assert!(orphan.exists());
+
+        let tight = SnapshotStore::with_cap(snapshots, BETA.len() as u64);
+        tight.enforce_cap().unwrap();
+        assert!(!orphan.exists());
     }
 
     #[test]
