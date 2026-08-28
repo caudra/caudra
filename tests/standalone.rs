@@ -7,9 +7,10 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use workcell_mcp::{
     cli::{HttpBindMode, ToolGroup},
-    server::{ServerBehavior, WorkcellServer},
+    server::{ServerBehavior, ToolConfiguration, WorkcellServer},
     transports::http::{HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome},
 };
+use workcell_mcp_code::CodeConfiguration;
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
 
@@ -38,15 +39,21 @@ async fn fixture_server_with_options(
         .expect("fixture file");
     let server = WorkcellServer::configured(
         Some(root.path()),
-        false,
-        WebsearchExecutionConfiguration::unconfigured(),
-        false,
         &[ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
         ServerBehavior {
             expose_execution_environment: true,
             modern_only,
         },
-        shell_policy,
+        ToolConfiguration {
+            allow_write: false,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            shell_policy,
+            code: CodeConfiguration {
+                worker: None,
+                type_check: true,
+            },
+        },
     )
     .await
     .expect("server");
@@ -324,7 +331,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     assert_environment_descriptor(&environment["result"]["structuredContent"]);
     assert_eq!(
         environment["result"]["structuredContent"]["toolGroups"],
-        json!({"files": true, "web": true, "shell": true})
+        json!({"files": true, "web": true, "shell": true, "code": false})
     );
 
     write_json(
@@ -949,4 +956,129 @@ where
         .expect("response timeout")
         .expect("read response");
     serde_json::from_str(&line).expect("JSON-RPC response")
+}
+
+/// Locates the `monty` worker the way the server does, plus the in-repo build location so a
+/// developer who ran `make code-worker` needs no extra configuration.
+fn code_worker() -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
+        return workcell_mcp_code::resolve_worker(Some(&std::path::PathBuf::from(configured)));
+    }
+    let installed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/code-worker/bin")
+        .join(workcell_mcp_code::WORKER_FILE_NAME);
+    workcell_mcp_code::resolve_worker(Some(&installed))
+        .or_else(|| workcell_mcp_code::resolve_worker(None))
+}
+
+/// Exercises the full catalog, including the code group, over a real stdio session.
+///
+/// The code group needs the separately built worker binary, so this skips with an explicit message
+/// rather than silently passing when it is absent. CI builds the worker and sets the environment
+/// variable, so the skip only applies to a local checkout that has not run `make code-worker`.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_serves_the_full_catalog_including_code_execution() {
+    let Some(worker) = code_worker() else {
+        eprintln!(
+            "skipping: no `monty` worker found. Run `make code-worker` or set WORKCELL_MCP_CODE_WORKER."
+        );
+        return;
+    };
+    let root = tempfile::tempdir().expect("temporary root");
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[
+            ToolGroup::Files,
+            ToolGroup::Web,
+            ToolGroup::Shell,
+            ToolGroup::Code,
+        ],
+        ServerBehavior {
+            expose_execution_environment: true,
+            modern_only: false,
+        },
+        ToolConfiguration {
+            allow_write: false,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            shell_policy: ShellPermissionPolicy::restricted(),
+            code: CodeConfiguration {
+                worker: Some(&worker),
+                type_check: true,
+            },
+        },
+    )
+    .await
+    .expect("server with a code worker");
+
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("start MCP service")
+            .waiting()
+            .await
+            .expect("MCP service")
+    });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(&mut write, &discover_request(1, json!({}))).await;
+    let _ = read_json(&mut read).await;
+
+    write_json(&mut write, &mcp_request(2, "tools/list", json!({}))).await;
+    let listed = read_json(&mut read).await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    // Catalog order is a compatibility contract; `code_execution` sits after `shell`.
+    assert_eq!(
+        names,
+        [
+            "file_read",
+            "file_glob",
+            "file_grep",
+            "file_write",
+            "file_edit",
+            "file_apply_patch",
+            "websearch",
+            "webfetch",
+            "shell",
+            "code_execution",
+            "execution_environment",
+        ]
+    );
+
+    write_json(
+        &mut write,
+        &mcp_request(
+            3,
+            "tools/call",
+            json!({"name": "code_execution", "arguments": {"code": "sum([1, 2, 3, 4])"}}),
+        ),
+    )
+    .await;
+    let called = read_json(&mut read).await;
+    let structured = &called["result"]["structuredContent"];
+    assert_eq!(structured["outcome"], "completed");
+    assert_eq!(structured["result"], json!(10));
+    assert_eq!(structured["version"], json!(1));
+
+    // The tool must also be discoverable as isolated, which is what lets a client skip a prompt.
+    let code_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "code_execution")
+        .expect("code tool listed");
+    assert_eq!(code_tool["annotations"]["readOnlyHint"], json!(true));
+    assert_eq!(code_tool["annotations"]["openWorldHint"], json!(false));
+
+    drop(write);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
 }

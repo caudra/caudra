@@ -2,46 +2,56 @@
   "fixtureVersion": 1,
   "caseID": "catalog.shell.sdk-emitted.v1",
   "catalogKind": "sdk-emitted",
-  "server": { "name": "workcell-shell", "version": "0.1.0" },
-  "provenance": ["rust/crates/mcp-shell/src/catalog.rs", "rust/crates/mcp-shell/src/group.rs"],
+  "server": {
+    "name": "workcell-shell",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-shell/src/catalog.rs",
+    "rust/crates/mcp-shell/src/group.rs"
+  ],
   "expected": {
     "tools": [
       {
-        "name": "shell",
-        "title": "Execute shell command",
-        "description": "Execute a Bash command on the MCP server host.\n\nUsage notes:\n- The command parameter is required.\n- Commands must be valid MCP JSON strings, are bounded to 65536 UTF-8 bytes, and are authorized by immutable operator policy before execution. Malformed JSON or non-UTF-8 request payloads are rejected by the MCP transport before tool dispatch.\n- timeout is optional, measured in milliseconds, defaults to 120000, and is capped at 600000.\n- Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to \".\".\n- Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.\n- Prefer the dedicated file tools when they are available and fit the operation.\n- Always quote file paths that contain spaces.\n- Non-zero exits are completed results with an exit code so the caller can inspect and continue.\n- Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.\n- Background execution is unsupported; descendants that retain output pipes are terminated.",
+        "_meta": {
+          "ai.workcell/presentation-profile": "shell.result.v1"
+        },
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": true,
+          "readOnlyHint": false
+        },
+        "description": "Execute a Bash command on the MCP server host.\n\nUsage notes:\n- The command parameter is required.\n- Commands must be valid MCP JSON strings, are bounded to 65536 UTF-8 bytes, and are authorized by immutable operator policy before execution. Malformed JSON or non-UTF-8 request payloads are rejected by the MCP transport before tool dispatch.\n- timeout is optional, measured in milliseconds, defaults to 120000, and is capped at 600000.\n- Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to \".\".\n- Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.\n- Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.\n- Always quote file paths that contain spaces.\n- Non-zero exits are completed results with an exit code so the caller can inspect and continue.\n- Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.\n- Background execution is unsupported; descendants that retain output pipes are terminated.",
         "inputSchema": {
-          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
           "additionalProperties": false,
           "properties": {
             "command": {
-              "type": "string",
+              "description": "Bash command to execute on the MCP server host.",
               "minLength": 1,
-              "description": "Bash command to execute on the MCP server host."
+              "type": "string"
             },
             "timeout": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 600000,
               "default": 120000,
-              "description": "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."
+              "description": "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000.",
+              "maximum": 600000,
+              "minimum": 1,
+              "type": "integer"
             },
             "workdir": {
-              "type": "string",
+              "description": "Optional configured-root-relative or absolute initial working directory inside the configured root.",
               "minLength": 1,
-              "description": "Optional configured-root-relative or absolute initial working directory inside the configured root."
+              "type": "string"
             }
           },
-          "required": ["command"],
-          "$schema": "http://json-schema.org/draft-07/schema#"
+          "required": [
+            "command"
+          ],
+          "type": "object"
         },
-        "annotations": {
-          "readOnlyHint": false,
-          "destructiveHint": true,
-          "idempotentHint": false,
-          "openWorldHint": true
-        },
-        "_meta": { "ai.workcell/presentation-profile": "shell.result.v1" }
+        "name": "shell",
+        "title": "Execute shell command"
       }
     ]
   }

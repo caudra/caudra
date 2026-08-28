@@ -11,6 +11,7 @@ pub enum ToolGroup {
     Files,
     Web,
     Shell,
+    Code,
 }
 
 impl ToolGroup {
@@ -20,6 +21,7 @@ impl ToolGroup {
             Self::Files => "files",
             Self::Web => "web",
             Self::Shell => "shell",
+            Self::Code => "code",
         }
     }
 }
@@ -89,6 +91,14 @@ pub struct RawOptions {
     #[arg(long)]
     pub yolo: bool,
 
+    /// Path to the `monty` worker binary used by the code tool group.
+    #[arg(long)]
+    pub code_worker: Option<PathBuf>,
+
+    /// Skip type checking code snippets before executing them.
+    #[arg(long)]
+    pub no_code_type_check: bool,
+
     /// Select an existing relative directory beneath root.
     #[arg(long, default_value = ".")]
     pub root_relative_subdirectory: String,
@@ -134,6 +144,8 @@ pub struct CliOptions {
     pub web_icons: bool,
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
+    pub code_worker: Option<PathBuf>,
+    pub code_type_check: bool,
     pub env_file: Option<PathBuf>,
     pub transport: Transport,
     pub port: u16,
@@ -157,6 +169,11 @@ impl fmt::Debug for CliOptions {
                 &self.shell_policy_file.as_ref().map(|_| "[CONFIGURED]"),
             )
             .field("yolo", &self.yolo)
+            .field(
+                "code_worker",
+                &self.code_worker.as_ref().map(|_| "[CONFIGURED]"),
+            )
+            .field("code_type_check", &self.code_type_check)
             .field("env_file", &self.env_file.as_ref().map(|_| "[CONFIGURED]"))
             .field("transport", &self.transport)
             .field("port", &self.port)
@@ -185,6 +202,7 @@ pub enum CliError {
     AllowWriteRequiresFiles,
     WebIconsRequireWeb,
     ShellOptionRequiresShell,
+    CodeOptionRequiresCode,
     HttpOptionRequiresHttp,
     InvalidAllowedHost,
 }
@@ -194,7 +212,7 @@ impl fmt::Display for CliError {
         formatter.write_str(match self {
             Self::InvalidEnvironment => "Workcell environment configuration is invalid",
             Self::InvalidToolGroup => {
-                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, and shell"
+                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, and code"
             }
             Self::DuplicateToolGroup => "each tool group may be selected only once",
             Self::RootRequired => "files and shell tools require a root directory",
@@ -203,6 +221,9 @@ impl fmt::Display for CliError {
             Self::WebIconsRequireWeb => "--web-icons requires the web tool group",
             Self::ShellOptionRequiresShell => {
                 "--shell-policy and --yolo require the shell tool group"
+            }
+            Self::CodeOptionRequiresCode => {
+                "--code-worker and --no-code-type-check require the code tool group"
             }
             Self::HttpOptionRequiresHttp => "HTTP options require --transport http",
             Self::InvalidAllowedHost => {
@@ -221,10 +242,16 @@ impl RawOptions {
             || self.http_token_file.is_some()
             || !self.allowed_hosts.is_empty();
         let explicit_shell_options = self.shell_policy.is_some() || self.yolo;
+        let explicit_code_options = self.code_worker.is_some() || self.no_code_type_check;
         let groups = if self.groups.is_empty() {
             match environment_value(environment, "WORKCELL_MCP_TOOL_GROUPS")? {
                 Some(value) => parse_groups(&value)?,
-                None => vec![ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
+                None => vec![
+                    ToolGroup::Files,
+                    ToolGroup::Web,
+                    ToolGroup::Shell,
+                    ToolGroup::Code,
+                ],
             }
         } else {
             self.groups
@@ -314,6 +341,20 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let code_worker =
+            self.code_worker
+                .or(environment_value(environment, "WORKCELL_MCP_CODE_WORKER")?.map(PathBuf::from));
+        // Type checking is on by default: it turns an unsupported API into a diagnostic issued
+        // before the snippet runs, which is the difference between one wasted turn and several.
+        let code_type_check = if self.no_code_type_check {
+            false
+        } else {
+            match environment_value(environment, "WORKCELL_MCP_CODE_TYPE_CHECK")?.as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(_) => return Err(CliError::InvalidEnvironment),
+            }
+        };
 
         let has_local = groups.contains(&ToolGroup::Files) || groups.contains(&ToolGroup::Shell);
         if has_local && self.root.is_none() {
@@ -333,6 +374,11 @@ impl RawOptions {
         {
             return Err(CliError::ShellOptionRequiresShell);
         }
+        if !groups.contains(&ToolGroup::Code)
+            && (explicit_code_options || code_worker.is_some() || !code_type_check)
+        {
+            return Err(CliError::CodeOptionRequiresCode);
+        }
         if transport == Transport::Stdio && (explicit_http_options || http_token_file.is_some()) {
             return Err(CliError::HttpOptionRequiresHttp);
         }
@@ -345,6 +391,8 @@ impl RawOptions {
             web_icons,
             shell_policy_file,
             yolo,
+            code_worker,
+            code_type_check,
             env_file: self.env_file,
             transport,
             port,
@@ -376,6 +424,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "files" => Ok(ToolGroup::Files),
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
+            "code" => Ok(ToolGroup::Code),
             _ => Err(CliError::InvalidToolGroup),
         })
         .collect()

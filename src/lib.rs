@@ -11,8 +11,9 @@ pub mod server;
 pub mod transports;
 
 use cli::{CliOptions, Transport};
-use server::{ServerBehavior, WorkcellServer};
+use server::{ServerBehavior, ToolConfiguration, WorkcellServer};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
+use workcell_mcp_code::CodeConfiguration;
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
 
@@ -26,21 +27,29 @@ pub async fn run(
         root::resolve_effective_root(options.root.as_deref(), &options.root_relative_subdirectory)?;
     let server = WorkcellServer::configured(
         root.as_deref(),
-        options.allow_write,
-        web,
-        options.web_icons,
         &options.groups,
         ServerBehavior {
             expose_execution_environment: options.expose_execution_environment,
             modern_only: options.modern_only,
         },
-        shell_policy,
+        ToolConfiguration {
+            allow_write: options.allow_write,
+            web,
+            web_icons: options.web_icons,
+            shell_policy,
+            code: CodeConfiguration {
+                worker: options.code_worker.as_deref(),
+                type_check: options.code_type_check,
+            },
+        },
     )
     .await?;
-    match options.transport {
-        Transport::Stdio => transports::stdio::run(server).await.map_err(Into::into),
+    let outcome = match options.transport {
+        Transport::Stdio => transports::stdio::run(server.clone())
+            .await
+            .map_err(Into::into),
         Transport::Http => transports::http::run(
-            server,
+            server.clone(),
             options.port,
             transports::http::HttpConfiguration {
                 bind_mode: options.http_bind,
@@ -50,7 +59,11 @@ pub async fn run(
         )
         .await
         .map_err(Into::into),
-    }
+    };
+    // Ask pooled workers to exit cleanly. Dropping the server would kill them, which is equally
+    // safe but leaves a SIGKILL in the operator's logs for an ordinary shutdown.
+    server.shutdown().await;
+    outcome
 }
 
 pub fn resolve_shell_policy(

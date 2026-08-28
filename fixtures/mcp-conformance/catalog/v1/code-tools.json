@@ -1,0 +1,48 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.code.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": { "name": "workcell-code", "version": "0.1.0" },
+  "provenance": ["rust/crates/mcp-code/src/catalog.rs", "rust/crates/mcp-code/src/group.rs"],
+  "expected": {
+    "tools": [
+      {
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.result.v1"
+        },
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Execute a short Python script in an isolated interpreter and return its value and printed output.\n\nUse this for computation: arithmetic and math, summary statistics computed directly since there is no statistics module, date arithmetic, string and text processing, JSON reshaping, regex extraction, sorting and aggregation, base64 and hex encoding. Prefer this over the shell tool for anything that is pure computation, because this tool cannot reach the host.\n\nIsolation:\n- No filesystem, no network, no environment variables, and no subprocesses. Use the file tools, webfetch, or shell when the task needs any of those.\n- Runs in a separate worker process under enforced time, memory, and recursion limits.\n\nThis is a Python subset, not CPython. It rejects or fails on:\n- Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.\n- yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.\n- str.format() and %-formatting. Use f-strings.\n- eval, exec, compile, globals, locals, vars, dir, input, super, callable, issubclass, bytearray, complex, memoryview, object, format, and ascii.\n- User-defined exception classes, and function attributes such as __name__.\n\nOnly these standard library modules exist, each covering part of its CPython surface: asyncio, base64, binascii, collections, dataclasses, datetime, functools, itertools, json, math, os, pathlib, re, sys, typing, unicodedata. There are no third-party packages, and no random, time, io, copy, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.\n\nBehaviour that differs from CPython even where the API exists:\n- enumerate, zip, map, filter, and reversed are eager and return lists, so an infinite iterator never terminates.\n- re is backed by fancy-regex: no bytes patterns and no VERBOSE flag.\n- Only the utf-8, ascii, utf-16, and utf-32 codecs exist.\n\nUsage notes:\n- The code parameter is required and is bounded to 65536 UTF-8 bytes.\n- The value of the final expression is returned. Use print() for intermediate output.\n- timeout is optional, measured in milliseconds, defaults to 5000, and is capped at 30000.\n- Each call is independent. No variables, definitions, or imports persist between calls.\n- Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.\n- Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Python source to execute. The value of the final expression is returned.",
+              "maxLength": 65536,
+              "minLength": 1,
+              "type": "string"
+            },
+            "timeout": {
+              "default": 5000,
+              "description": "Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000.",
+              "maximum": 30000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        },
+        "name": "code_execution",
+        "title": "Execute Python code"
+      }
+    ]
+  }
+}

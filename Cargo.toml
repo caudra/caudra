@@ -11,6 +11,7 @@ version.workspace = true
 [workspace]
 members = [
   ".",
+  "crates/mcp-code",
   "crates/mcp-files",
   "crates/mcp-shell",
   "crates/mcp-web",
@@ -39,6 +40,17 @@ futures-util = "0.3.32"
 http = "1.4.2"
 image = { version = "0.25.10", default-features = false }
 lru = "0.18.1"
+# Monty's wire protocol is version-coupled: this host-side pool and the `monty` worker binary must
+# come from one release. Keep these pins and MONTY_VERSION in the Makefile in lockstep; `make
+# code-worker` fails the build if they diverge. Skew that slips through is still caught at runtime,
+# where the pool reports it as a FatalError on the first checkout rather than misbehaving silently.
+#
+# The worker is installed as its own executable rather than built here on purpose. Monty's
+# interpreter and type checker pull a large ruff/ty tree that only resolves correctly under Monty's
+# own lockfile, and making it a workspace member would unify `monty-proto/worker` across the
+# workspace, linking the interpreter into the server binary for every `--workspace` build.
+monty-pool = "=0.0.21"
+monty-types = "=0.0.21"
 proptest = "1.11.0"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
@@ -85,6 +97,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+workcell-mcp-code = { path = "crates/mcp-code" }
 workcell-mcp-files = { path = "crates/mcp-files" }
 workcell-mcp-shell = { path = "crates/mcp-shell" }
 workcell-mcp-web = { path = "crates/mcp-web" }
@@ -92,6 +105,7 @@ workcell-mcp-web = { path = "crates/mcp-web" }
 [dev-dependencies]
 reqwest.workspace = true
 tempfile.workspace = true
+workcell-mcp-code = { path = "crates/mcp-code" }
 
 [lints]
 workspace = true

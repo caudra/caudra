@@ -56,6 +56,7 @@ pub(crate) struct ToolGroupDisclosure {
     pub(crate) files: bool,
     pub(crate) web: bool,
     pub(crate) shell: bool,
+    pub(crate) code: bool,
 }
 
 #[derive(Serialize)]
@@ -539,11 +540,12 @@ fn output_schema() -> Arc<JsonObject> {
             "toolGroups": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["files", "web", "shell"],
+                "required": ["files", "web", "shell", "code"],
                 "properties": {
                     "files": {"type": "boolean"},
                     "web": {"type": "boolean"},
-                    "shell": {"type": "boolean"}
+                    "shell": {"type": "boolean"},
+                    "code": {"type": "boolean"}
                 }
             },
             "commands": {
@@ -1743,6 +1745,7 @@ mod tests {
             files: true,
             web: false,
             shell: true,
+            code: false,
         };
         let first = disclosure
             .call_tool(json!({}), groups, CancellationToken::new())
@@ -1816,6 +1819,7 @@ mod tests {
             files: true,
             web: false,
             shell: false,
+            code: false,
         };
         let first = snapshot.descriptor(groups);
         let second = snapshot.descriptor(groups);

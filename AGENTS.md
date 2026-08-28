@@ -16,6 +16,8 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 - `crates/mcp-shell` owns immutable shell permission policy, command execution, process cleanup,
   output bounds, and progress streaming.
 - `crates/mcp-web` owns web tool schemas, provider lowering, fetch extraction, and parser bounds.
+- `crates/mcp-code` owns code tool schemas, worker-process supervision, interpreter isolation, value
+  rendering, and the failure taxonomy.
 - `crates/net` owns outbound URL, DNS, redirect, retry, and response-body policy.
 - `crates/source-icons` owns bounded source-icon discovery and normalization.
 - `fixtures/mcp-conformance` contains committed public-contract fixtures.

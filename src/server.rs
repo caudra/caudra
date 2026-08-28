@@ -3,6 +3,7 @@ use std::{
     collections::HashSet,
     fmt,
     path::Path,
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +20,7 @@ use rmcp::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeToolGroup};
 use workcell_mcp_files::FileToolGroup;
 use workcell_mcp_shell::{ShellPermissionPolicy, ShellToolGroup};
 use workcell_mcp_web::{WebToolGroup, WebsearchExecutionConfiguration};
@@ -49,11 +51,26 @@ pub struct ServerBehavior {
     pub modern_only: bool,
 }
 
+/// Per-group startup configuration, all of it operator-chosen and unreachable from tool input.
+///
+/// Grouped into one value because each field belongs to exactly one tool group; passing them
+/// positionally made the relationship between a flag and its group easy to get wrong.
+pub struct ToolConfiguration<'a> {
+    pub allow_write: bool,
+    pub web: WebsearchExecutionConfiguration,
+    pub web_icons: bool,
+    pub shell_policy: ShellPermissionPolicy,
+    pub code: CodeConfiguration<'a>,
+}
+
 #[derive(Clone)]
 pub struct WorkcellServer {
     files: Option<FileToolGroup>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
+    // The code group owns a worker pool, which is shared rather than cloned so every server clone
+    // draws on the same bounded set of subprocesses.
+    code: Option<Arc<CodeToolGroup>>,
     execution_environment: Option<ExecutionEnvironmentDisclosure>,
     modern_only: bool,
 }
@@ -61,15 +78,22 @@ pub struct WorkcellServer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerBuildError {
     Filesystem,
+    CodeWorker(CodeBuildError),
     DuplicateToolName,
 }
 
 impl fmt::Display for ServerBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Filesystem => "filesystem or shell tools could not be initialized",
-            Self::DuplicateToolName => "tool catalog contains a duplicate name",
-        })
+        match self {
+            Self::Filesystem => {
+                formatter.write_str("filesystem or shell tools could not be initialized")
+            }
+            // The inner message names the missing configuration, which is what an operator needs.
+            Self::CodeWorker(error) => write!(formatter, "{error}"),
+            Self::DuplicateToolName => {
+                formatter.write_str("tool catalog contains a duplicate name")
+            }
+        }
     }
 }
 
@@ -78,34 +102,46 @@ impl std::error::Error for ServerBuildError {}
 impl WorkcellServer {
     pub async fn configured(
         root: Option<&Path>,
-        allow_write: bool,
-        web_configuration: WebsearchExecutionConfiguration,
-        web_icons: bool,
         groups: &[ToolGroup],
         behavior: ServerBehavior,
-        shell_policy: ShellPermissionPolicy,
+        tools: ToolConfiguration<'_>,
     ) -> Result<Self, ServerBuildError> {
         let files = if groups.contains(&ToolGroup::Files) {
             Some(
-                FileToolGroup::new(root.ok_or(ServerBuildError::Filesystem)?, allow_write, None)
-                    .await
-                    .map_err(|_| ServerBuildError::Filesystem)?,
+                FileToolGroup::new(
+                    root.ok_or(ServerBuildError::Filesystem)?,
+                    tools.allow_write,
+                    None,
+                )
+                .await
+                .map_err(|_| ServerBuildError::Filesystem)?,
             )
         } else {
             None
         };
         let web = groups
             .contains(&ToolGroup::Web)
-            .then(|| WebToolGroup::production_with_source_icons(web_configuration, web_icons));
+            .then(|| WebToolGroup::production_with_source_icons(tools.web, tools.web_icons));
         let shell = if groups.contains(&ToolGroup::Shell) {
             Some(
                 ShellToolGroup::with_policy(
                     root.ok_or(ServerBuildError::Filesystem)?,
-                    shell_policy,
+                    tools.shell_policy,
                 )
                 .await
                 .map_err(|_| ServerBuildError::Filesystem)?,
             )
+        } else {
+            None
+        };
+        // Building the group starts a worker, so a missing or mismatched binary fails here rather
+        // than on the first tool call.
+        let code = if groups.contains(&ToolGroup::Code) {
+            Some(Arc::new(
+                CodeToolGroup::new(tools.code)
+                    .await
+                    .map_err(ServerBuildError::CodeWorker)?,
+            ))
         } else {
             None
         };
@@ -116,6 +152,7 @@ impl WorkcellServer {
             shell
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
+            code.as_ref().map_or_else(Vec::new, |group| group.catalog()),
             if behavior.expose_execution_environment {
                 vec![execution_environment_tool()]
             } else {
@@ -131,9 +168,17 @@ impl WorkcellServer {
             files,
             web,
             shell,
+            code,
             execution_environment,
             modern_only: behavior.modern_only,
         })
+    }
+
+    /// Releases pooled worker processes during graceful shutdown.
+    pub async fn shutdown(&self) {
+        if let Some(code) = &self.code {
+            code.shutdown().await;
+        }
     }
 
     #[must_use]
@@ -148,6 +193,9 @@ impl WorkcellServer {
             self.shell
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
+            self.code
+                .as_ref()
+                .map_or_else(Vec::new, |group| group.catalog()),
             self.execution_environment
                 .as_ref()
                 .map_or_else(Vec::new, |_| vec![execution_environment_tool()]),
@@ -221,6 +269,13 @@ impl WorkcellServer {
         {
             return result;
         }
+        if let Some(code) = &self.code
+            && let Some(result) = code
+                .dispatch(name, arguments.clone(), cancellation.clone())
+                .await
+        {
+            return result;
+        }
         if name == EXECUTION_ENVIRONMENT_TOOL
             && let Some(execution_environment) = &self.execution_environment
         {
@@ -252,6 +307,7 @@ impl WorkcellServer {
             files: self.files.is_some(),
             web: self.web.is_some(),
             shell: self.shell.is_some(),
+            code: self.code.is_some(),
         }
     }
 
@@ -470,18 +526,35 @@ mod tests {
 
     use super::*;
 
+    /// Tool configuration for cases that select no groups, so no group is actually constructed.
+    fn test_tools() -> ToolConfiguration<'static> {
+        ToolConfiguration {
+            allow_write: false,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            shell_policy: ShellPermissionPolicy::restricted(),
+            code: CodeConfiguration {
+                worker: None,
+                type_check: true,
+            },
+        }
+    }
+
     #[test]
     fn composed_catalog_is_exact_and_ordered() {
         let names = compose_catalog([
             file_catalog(),
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
+            workcell_mcp_code::catalog(),
             vec![execution_environment_tool()],
         ])
         .unwrap()
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
+        // Order is a compatibility contract. `code_execution` follows `shell` so the documented
+        // files/web/shell prefix is unchanged, and precedes the host-owned disclosure tool.
         assert_eq!(
             names,
             [
@@ -494,6 +567,7 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
+                "code_execution",
                 "execution_environment",
             ]
         );
@@ -509,15 +583,12 @@ mod tests {
     async fn execution_environment_tool_follows_disclosure_switch() {
         let disabled = WorkcellServer::configured(
             None,
-            false,
-            WebsearchExecutionConfiguration::unconfigured(),
-            false,
             &[],
             ServerBehavior {
                 expose_execution_environment: false,
                 modern_only: false,
             },
-            ShellPermissionPolicy::restricted(),
+            test_tools(),
         )
         .await
         .unwrap();
@@ -535,15 +606,12 @@ mod tests {
 
         let enabled = WorkcellServer::configured(
             None,
-            false,
-            WebsearchExecutionConfiguration::unconfigured(),
-            false,
             &[],
             ServerBehavior {
                 expose_execution_environment: true,
                 modern_only: false,
             },
-            ShellPermissionPolicy::restricted(),
+            test_tools(),
         )
         .await
         .unwrap();

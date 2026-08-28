@@ -29,9 +29,11 @@ flowchart LR
         Server --> Files[Filesystem tools]
         Server --> Web[Web tools]
         Server --> Shell[Shell tool]
+        Server --> Code[Code execution tool]
         Files --> Root[Configured root]
         Shell --> OS[Processes and host-visible resources]
         Web --> Network[Policy-checked outbound network]
+        Code --> Worker[Separate monty worker process]
     end
 ```
 
@@ -48,7 +50,7 @@ sequenceDiagram
     H->>W: server/discover
     W-->>H: capabilities and tool catalog
     H->>W: tools/call
-    W->>E: filesystem, web, or shell operation
+    W->>E: filesystem, web, shell, or code operation
     E-->>W: bounded result or progress
     W-->>H: MCP result
 ```
@@ -61,10 +63,11 @@ sequenceDiagram
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Preview-only unless `--allow-write` is set. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
+| Code | `code_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
-All groups are enabled by default. Use repeatable `--tool-group files|web|shell` arguments to expose a
-subset. Files and shell require a positional root.
+All groups are enabled by default. Use repeatable `--tool-group files|web|shell|code` arguments to
+expose a subset. Files and shell require a positional root.
 
 The filesystem tools enforce a canonical root. The shell tool uses that root as its initial working
 directory, but shell commands can deliberately access any path, network, or process visible inside the
@@ -74,9 +77,18 @@ Shell execution is denied by default. Configure `--shell-policy` for explicit al
 `--yolo` inside an appropriate isolation boundary to permit unmatched commands. Explicit policy denies
 still win under `--yolo`.
 
+The code tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
+that has no filesystem, no network, no subprocesses, and an empty environment, so it needs no root
+and no policy. It is for computation, not for reaching the host. It requires the `monty` worker
+binary, which is installed from a pinned release rather than built with the workspace; the container
+ships one, and a source build produces it with `make code-worker`. Workcell resolves it from
+`--code-worker`, then beside the server executable, then `PATH`. When no worker is found, startup
+fails rather than exposing a tool that cannot run.
+
 ## Requirements
 
 - Rust 1.98 for source builds
+- The code tool group needs the pinned `monty` worker binary: `make code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
 
@@ -386,6 +398,7 @@ tool schemas and bounded behavior. Update fixtures deliberately when a public to
 src/                   Workcell host, transports, CLI, and process policy
 crates/mcp-files/      Filesystem tools
 crates/mcp-shell/      Shell tool and progress streaming
+crates/mcp-code/       Code execution tool and worker-process supervision
 crates/mcp-web/        Search, fetch, extraction, and PDF handling
 crates/net/            Outbound URL, DNS, redirect, retry, and body policy
 crates/source-icons/   Bounded favicon discovery and normalization
@@ -403,8 +416,9 @@ Workcell also publishes MCP tool annotations as presentation hints. Filesystem r
 closed-world. Web search and fetch are read-only but open-world because they contact external services.
 Environment inspection is non-destructive but not read-only, idempotent, or closed-world because its
 sudo probe may update authentication state or invoke external policy plugins. Filesystem mutations and
-shell execution are marked potentially destructive. These annotations do not replace client consent,
-Workcell admission checks, or deployment isolation.
+shell execution are marked potentially destructive. Code execution is read-only and closed-world
+because the worker cannot reach the filesystem, the network, or the host environment. These
+annotations do not replace client consent, Workcell admission checks, or deployment isolation.
 
 ### Filesystem tools
 
@@ -594,6 +608,33 @@ where possible so icon discovery does not refetch the page body.
 
 At most four shell calls execute concurrently within one process. Queued calls remain cancellable.
 
+### `code_execution`
+
+`code_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
+value of its final expression along with anything it printed.
+
+- `code` is required and limited to 65,536 UTF-8 bytes. `timeout_ms` is optional, defaults to 5,000,
+  and is capped at 30,000. Unknown fields are rejected.
+- Each call is independent. No variables, definitions, imports, or printed output carry over, and
+  there is no session to resume.
+- The worker has no filesystem access, no network access, no subprocesses, and an empty environment.
+  `open`, `os.getenv`, and `os.environ` do not reach the host; attempts raise `PermissionError` or
+  observe an empty environment. The result explains which tool to use instead.
+- Only Monty's built-in module subset is importable. There are no third-party packages and no
+  `pip install`. Importing anything else raises `ModuleNotFoundError` and the result lists what is
+  available.
+- Snippets are type-checked before execution by default, so a type error is reported without running
+  any code. Use `--no-code-type-check` to execute unchecked.
+- The interpreter is Monty, not CPython. It implements a large but incomplete subset: notably no
+  `str.format()`, `match` statements, generators, or class inheritance. The tool description
+  enumerates the divergences that most often cost a caller a wasted turn.
+- The structured result reports the outcome, the final value as JSON with a `repr` fallback for values
+  JSON cannot express, bounded stdout and stderr, and, when execution fails, the exception type,
+  message, and traceback plus targeted guidance.
+- Exhausting the timeout or the 256 MiB memory ceiling ends the call and returns a `limited` outcome.
+  A worker that aborts is replaced; it cannot take the server down with it.
+- At most two code calls execute concurrently within one process. Queued calls remain cancellable.
+
 ### `execution_environment`
 
 `execution_environment` collects a fresh, sanitized description of the current Workcell environment.
@@ -640,3 +681,7 @@ the discovery descriptor and this tool.
 ## License
 
 Apache-2.0. See [`LICENSE.md`](LICENSE.md).
+
+The code execution tool runs [Monty](https://github.com/pydantic/monty), a separate MIT-licensed
+project by Pydantic. Workcell installs it as its own executable rather than linking it, so the two
+are distributed as separate programs under their own licenses.

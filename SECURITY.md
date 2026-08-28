@@ -30,6 +30,18 @@ syntax fails closed because Workcell cannot prove that a hidden executable is un
 application policy layer, not an OS security boundary: allowed programs can still execute indirect
 behavior, so isolation remains mandatory for untrusted commands.
 
+The code tool group is the one place where Workcell adds isolation rather than assuming it. Snippets
+run in a separate `monty` worker process, never in the server process. The worker is given no
+filesystem access, no network access, no ability to spawn processes, and an explicitly empty
+environment, so `os.getenv` and `os.environ` observe nothing from the host and file access raises
+`PermissionError`. Each call is fed a fresh interpreter state, so nothing persists between calls.
+Snippets are bounded by a caller-supplied timeout capped at 30 seconds, a 256 MiB memory ceiling
+enforced by the worker's global allocator, bounded captured output, and a cap on interpreter
+suspensions. A worker that exhausts memory, overflows its stack, or otherwise aborts terminates only
+itself; the supervising server replaces it. This is process isolation for a language runtime, not an
+OS sandbox: the worker still runs with the identity and namespace of the deployment, so operator
+isolation remains mandatory.
+
 Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
 `execution_environment` tool is called. A non-root Unix process actively runs
 `sudo -n -- <resolved-true>` during each inspection; this may create audit records, update external
@@ -91,3 +103,19 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
   execution boundary, and normalized results can still contain inaccurate or malicious web content.
 - A bearer token authenticates one process endpoint. It does not express per-tool, per-user, or
   per-request authorization.
+- Monty is pre-1.0 software on a `0.0.x` line with a version-coupled worker protocol. Workcell pins the
+  `monty-pool` dependency and the installed worker to the same release and they must be upgraded
+  together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal
+  error on the first checkout. Treat interpreter escape as possible and do not rely on the code tool
+  as the only barrier protecting anything sensitive to the deployment.
+- The worker binary is resolved at startup from `--code-worker`, then beside the server executable,
+  then `PATH`. The `PATH` fallback trusts the deployment's `PATH`: an operator who leaves it writable
+  by a lower-privileged account lets that account supply the process that receives every snippet.
+  Configure `--code-worker` explicitly where `PATH` is not fully controlled.
+- The `monty-pool` client links a TLS stack and a WebSocket implementation into the server binary to
+  support a remote worker transport that Workcell never configures. Workcell only ever constructs the
+  local subprocess transport, so that code is unreachable at runtime, but it is present in the binary
+  and contributes third-party unsafe code that `forbid(unsafe_code)` in this workspace does not cover.
+- The code worker's isolation comes from what the interpreter is not given, not from a kernel boundary.
+  A defect in Monty's builtins or in Workcell's suspension handling could expose host capability that
+  the design intends to withhold.

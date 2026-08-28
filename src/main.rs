@@ -47,6 +47,9 @@ async fn main() -> ExitCode {
         web_icons = options.web_icons,
         shell_policy_configured = options.shell_policy_file.is_some(),
         shell_yolo = options.yolo,
+        // The worker path is operator configuration and is never logged, only its presence.
+        code_worker_configured = options.code_worker.is_some(),
+        code_type_check = options.code_type_check,
         websearch_backend = web.backend().map(WebsearchBackend::as_str),
         websearch_status = web.status(),
         authenticated_http = authentication.is_some(),

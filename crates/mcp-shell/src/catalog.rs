@@ -20,7 +20,7 @@ Usage notes:
 - timeout is optional, measured in milliseconds, defaults to 120000, and is capped at 600000.
 - Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to ".".
 - Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.
-- Prefer the dedicated file tools when they are available and fit the operation.
+- Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.
 - Always quote file paths that contain spaces.
 - Non-zero exits are completed results with an exit code so the caller can inspect and continue.
 - Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.
@@ -65,6 +65,8 @@ mod tests {
         let description = tools[0].description.as_deref().expect("tool description");
         assert!(description.contains("Only the initial working directory"));
         assert!(description.contains("unsafe and unsandboxed"));
+        // Cross-tool steering only works when both descriptions agree on the preference.
+        assert!(description.contains("prefer the code execution tool for pure computation"));
         assert_eq!(
             tools[0].input_schema["properties"]["timeout"]["description"],
             "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."
