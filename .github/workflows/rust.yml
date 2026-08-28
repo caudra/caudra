@@ -26,6 +26,7 @@ jobs:
             code:
               - "Cargo.toml"
               - "Cargo.lock"
+              - "rust-toolchain.toml"
               - "src/**"
               - "maki-*/src/**"
               - "plugins/**"
