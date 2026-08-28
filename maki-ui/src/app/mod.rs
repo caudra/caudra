@@ -111,7 +111,6 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
-const UNREVERT_RECORD_FILE: &str = "unrevert.json";
 
 /// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
 /// in practice; the cap only exists so a command aliasing itself reports an
@@ -453,17 +452,7 @@ impl App {
     }
 
     pub(super) fn discard_workspace_unrevert(&self) -> Result<(), SnapshotError> {
-        let path = Self::snapshot_store_path(
-            &self.storage,
-            self.state.session.id,
-            std::path::Path::new(&self.state.session.cwd),
-        )?
-        .join(UNREVERT_RECORD_FILE);
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.snapshot_store.discard_unrevert()
     }
 
     pub(super) fn snapshot_history_head(&mut self) -> Result<(), SnapshotError> {

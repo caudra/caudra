@@ -1296,6 +1296,14 @@ impl SnapshotStore {
         self.write_unrevert(&record)
     }
 
+    /// Takes the store lock: a capture reads the unrevert record to build
+    /// the set of live objects, so a delete racing that read lets the sweep
+    /// collect objects only the unrevert still needs.
+    pub fn discard_unrevert(&self) -> Result<(), SnapshotError> {
+        let _guard = lock_store()?;
+        self.remove_unrevert()
+    }
+
     fn remove_unrevert(&self) -> Result<(), SnapshotError> {
         match remove_file_durable(&self.unrevert_path()) {
             Ok(()) => Ok(()),
@@ -2657,6 +2665,23 @@ mod tests {
 
         store.unrevert(&root).unwrap();
         assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), BETA);
+    }
+
+    #[test]
+    fn discarding_the_unrevert_record_tolerates_its_absence() {
+        let (_temp, root, snapshots) = setup();
+        write(&root, "file.txt", ALPHA);
+        let store = SnapshotStore::new(snapshots);
+        let source = checkpoint(1);
+        store.snapshot_session_start(&root).unwrap();
+        write(&root, "file.txt", BETA);
+        store.snapshot(&root, source).unwrap();
+        store.restore(&root, &[source], &[]).unwrap();
+        assert!(store.unrevert_path().exists());
+
+        store.discard_unrevert().unwrap();
+        assert!(!store.unrevert_path().exists());
+        store.discard_unrevert().unwrap();
     }
 
     #[test]
