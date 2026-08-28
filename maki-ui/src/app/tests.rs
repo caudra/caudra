@@ -7,6 +7,7 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::{DisplaySource, ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -2347,6 +2348,145 @@ fn click_queue_delivery_toggle(app: &mut App) {
     ));
 }
 
+fn status_hit(
+    app: &mut App,
+    target: StatusBarHitTarget,
+) -> crate::components::status_bar::StatusBarHit {
+    let _ = rendered(app);
+    app.status_hits
+        .iter()
+        .find(|hit| hit.target == target)
+        .copied()
+        .expect("status control was not rendered")
+}
+
+fn click_status(app: &mut App, target: StatusBarHitTarget) -> Vec<Action> {
+    let hit = status_hit(app, target);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ))
+}
+
+#[test]
+fn clicking_status_mode_toggles_build_and_plan() {
+    let mut app = test_app();
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Mode).is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(click_status(&mut app, StatusBarHitTarget::Mode).is_empty());
+    assert_eq!(app.state.mode, Mode::Build);
+}
+
+#[test]
+fn clicking_status_model_opens_picker_and_refreshes() {
+    let mut app = test_app();
+
+    let actions = click_status(&mut app, StatusBarHitTarget::Model);
+
+    assert!(app.model_picker.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn opening_model_picker_clears_footer_hover() {
+    let mut app = test_app();
+    let hit = status_hit(&mut app, StatusBarHitTarget::Model);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Model));
+
+    click_status(&mut app, StatusBarHitTarget::Model);
+
+    assert!(app.model_picker.is_open());
+    assert_eq!(app.status_hover, None);
+}
+
+#[test]
+fn clicking_status_thinking_cycles_from_visible_off_state() {
+    let mut app = test_app();
+    assert!(rendered(&mut app).contains("[thinking: off]"));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Thinking).is_empty());
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+}
+
+#[test]
+fn status_controls_are_read_only_in_subagent_chat() {
+    let mut app = app_with_subagent();
+    app.focus_task(TASK_ID).unwrap();
+    let _ = rendered(&mut app);
+
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target == StatusBarHitTarget::BackToMain)
+    );
+}
+
+#[test]
+fn required_thinking_click_advances_from_effective_minimal() {
+    let mut app = test_app();
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+    app.state.thinking = ThinkingConfig::Off;
+    assert!(rendered(&mut app).contains("[thinking: minimal]"));
+
+    click_status(&mut app, StatusBarHitTarget::Thinking);
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Low));
+}
+
+#[test]
+fn hovering_status_control_tracks_highlight_target() {
+    let mut app = test_app();
+    let hit = status_hit(&mut app, StatusBarHitTarget::Model);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Model));
+
+    app.update(mouse_event(MouseEventKind::Moved, 0, hit.area.y));
+    assert_eq!(app.status_hover, None);
+}
+
+#[test]
+fn bash_status_has_no_mode_toggle() {
+    let mut app = test_app();
+    app.input_box.set_input("! ls".into());
+    let _ = rendered(&mut app);
+
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Mode)
+    );
+}
+
+#[test]
+fn cached_mode_hit_revalidates_bash_state() {
+    let mut app = test_app();
+    let hit = status_hit(&mut app, StatusBarHitTarget::Mode);
+    app.input_box.set_input("! ls".into());
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+
+    assert_eq!(app.state.mode, Mode::Build);
+}
+
 /// When the picker gives up on a directory it cannot list, the flash is the
 /// only trace the user gets. Forwarding it moved from `view` into `tick`, and
 /// dropping that hop closes the picker with no explanation at all. The loop
@@ -2499,10 +2639,18 @@ fn task_status_back_button_focuses_main_chat() {
 
     assert!(buffer_text(terminal.backend().buffer()).contains("[< Main] research"));
     let area = app
-        .task_back_area
-        .expect("task back button should be visible");
+        .status_hits
+        .iter()
+        .find(|hit| hit.target == StatusBarHitTarget::BackToMain)
+        .expect("task back button should be visible")
+        .area;
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
         area.x,
         area.y,
     ));
@@ -2518,12 +2666,20 @@ fn modal_blocks_task_status_back_button() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     let area = app
-        .task_back_area
-        .expect("task back button should be visible");
+        .status_hits
+        .iter()
+        .find(|hit| hit.target == StatusBarHitTarget::BackToMain)
+        .expect("task back button should be visible")
+        .area;
     app.help_modal.toggle();
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
         area.x,
         area.y,
     ));

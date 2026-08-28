@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
+use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -24,6 +25,11 @@ impl App {
                 self.paste_editor.handle_click(event.row, event.column);
             }
             return Vec::new();
+        }
+        if self.model_picker.is_open() {
+            self.status_hover = None;
+            let action = self.model_picker.handle_mouse(event);
+            return self.handle_model_picker_action(action);
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -51,18 +57,10 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.queue_mouse_down = None;
+                self.status_mouse_down = None;
                 self.message_mouse_down = None;
-                if !self.is_main_chat()
-                    && !self.has_modal_overlay()
-                    && self
-                        .task_back_area
-                        .is_some_and(|area| area.contains(Position::new(event.column, event.row)))
-                {
-                    self.selection_state = None;
-                    let _ = self.focus_task(MAIN_TASK_ID);
-                    return Vec::new();
-                }
                 if !self.has_modal_overlay() {
+                    self.status_mouse_down = self.status_hit_at(event.row, event.column);
                     self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
                     if self.queue_mouse_down.is_none() {
                         self.unfocus_active_queue();
@@ -112,6 +110,8 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.status_hover = None;
+                self.status_mouse_down = None;
                 self.message_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
@@ -139,6 +139,13 @@ impl App {
                         }
                         self.message_mouse_down = None;
                         if !self.has_modal_overlay()
+                            && let Some(pressed) = self.status_mouse_down.take()
+                            && self.status_hit_at(event.row, event.column) == Some(pressed)
+                        {
+                            self.queue_mouse_down = None;
+                            return self.handle_status_click(pressed);
+                        }
+                        if !self.has_modal_overlay()
                             && let Some(pressed) = self.queue_mouse_down.take()
                             && self.queue_hit_at(event.row, event.column) == Some(pressed)
                         {
@@ -164,7 +171,16 @@ impl App {
                     }
                 }
                 self.queue_mouse_down = None;
+                self.status_mouse_down = None;
                 self.message_mouse_down = None;
+            }
+            MouseEventKind::Moved => {
+                self.status_hover = if self.has_modal_overlay() {
+                    None
+                } else {
+                    self.status_hit_at(event.row, event.column)
+                        .map(|hit| hit.target)
+                };
             }
             _ => {}
         }
@@ -354,6 +370,37 @@ impl App {
             .rev()
             .find(|hit| hit.area.contains(position))
             .copied()
+    }
+
+    fn status_hit_at(&self, row: u16, col: u16) -> Option<StatusBarHit> {
+        let position = Position::new(col, row);
+        self.status_hits
+            .iter()
+            .find(|hit| hit.area.contains(position))
+            .copied()
+    }
+
+    fn handle_status_click(&mut self, hit: StatusBarHit) -> Vec<crate::components::Action> {
+        match hit.target {
+            StatusBarHitTarget::BackToMain if !self.is_main_chat() => {
+                let _ = self.focus_task(MAIN_TASK_ID);
+                Vec::new()
+            }
+            StatusBarHitTarget::Mode if self.is_main_chat() && !self.is_bash_input() => {
+                self.toggle_mode()
+            }
+            StatusBarHitTarget::Model if self.is_main_chat() => {
+                self.status_hover = None;
+                self.run_builtin(maki_lua::BuiltinAction::ModelPicker)
+            }
+            StatusBarHitTarget::Thinking
+                if self.is_main_chat() && self.state.model.supports_thinking() =>
+            {
+                self.cycle_reasoning_effort();
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn handle_queue_click(&mut self, hit: QueueHit) {

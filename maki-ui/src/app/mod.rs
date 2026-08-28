@@ -47,7 +47,7 @@ use crate::components::queue_panel::QueueHit;
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
-use crate::components::status_bar::StatusBar;
+use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -76,7 +76,7 @@ use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
@@ -229,7 +229,9 @@ pub struct App {
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
-    pub(super) task_back_area: Option<Rect>,
+    pub(super) status_hits: Vec<StatusBarHit>,
+    pub(super) status_mouse_down: Option<StatusBarHit>,
+    pub(super) status_hover: Option<StatusBarHitTarget>,
     pub(super) queue_hits: Vec<QueueHit>,
     pub(super) queue_mouse_down: Option<QueueHit>,
     pub(super) message_mouse_down: Option<MessageMouseDown>,
@@ -357,7 +359,9 @@ impl App {
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
-            task_back_area: None,
+            status_hits: Vec::new(),
+            status_mouse_down: None,
+            status_hover: None,
             queue_hits: Vec::new(),
             queue_mouse_down: None,
             message_mouse_down: None,
@@ -550,7 +554,12 @@ impl App {
             return;
         }
         let first = Effort::ALL[0];
-        self.state.thinking = match self.state.thinking {
+        let current = if self.state.model.requires_thinking() && !self.state.thinking.is_enabled() {
+            ThinkingConfig::Effort(first)
+        } else {
+            self.state.thinking
+        };
+        self.state.thinking = match current {
             ThinkingConfig::Effort(current) => Effort::ALL
                 .iter()
                 .position(|effort| *effort == current)
@@ -1006,25 +1015,8 @@ impl App {
         }
 
         if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
-                ModelPickerAction::Consumed => vec![],
-                ModelPickerAction::Select(spec) => {
-                    vec![Action::ChangeModel(spec)]
-                }
-                ModelPickerAction::SetGoalEvaluator(target) => {
-                    vec![Action::SetGoalEvaluator(target)]
-                }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
-                }
-                ModelPickerAction::ResetTier(tier) => {
-                    vec![Action::ResetTier(tier)]
-                }
-                ModelPickerAction::SetCompaction(target) => {
-                    vec![Action::SetCompaction(target)]
-                }
-                ModelPickerAction::Close => vec![],
-            });
+            let action = self.model_picker.handle_key(key);
+            return Some(self.handle_model_picker_action(action));
         }
 
         if self.login_picker.is_open() {
@@ -1062,6 +1054,19 @@ impl App {
         }
 
         None
+    }
+
+    fn handle_model_picker_action(&mut self, action: ModelPickerAction) -> Vec<Action> {
+        match action {
+            ModelPickerAction::Consumed | ModelPickerAction::Close => vec![],
+            ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
+            ModelPickerAction::SetGoalEvaluator(target) => {
+                vec![Action::SetGoalEvaluator(target)]
+            }
+            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
+            ModelPickerAction::ResetTier(tier) => vec![Action::ResetTier(tier)],
+            ModelPickerAction::SetCompaction(target) => vec![Action::SetCompaction(target)],
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {

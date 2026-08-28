@@ -11,7 +11,7 @@ use crate::theme;
 use maki_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -25,6 +25,20 @@ const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const YOLO_LABEL: &str = " [yolo]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusBarHitTarget {
+    BackToMain,
+    Mode,
+    Model,
+    Thinking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusBarHit {
+    pub area: Rect,
+    pub target: StatusBarHitTarget,
+}
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -52,6 +66,9 @@ pub struct StatusBarContext<'a> {
     pub yolo: bool,
     pub restoring: bool,
     pub goal: Option<&'a GoalSnapshot>,
+    pub mode_clickable: bool,
+    pub settings_clickable: bool,
+    pub hovered: Option<StatusBarHitTarget>,
 }
 
 pub struct StatusBar {
@@ -128,7 +145,7 @@ impl StatusBar {
         ])
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Option<Rect> {
+    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<StatusBarHit> {
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -144,15 +161,27 @@ impl StatusBar {
             ));
         }
 
-        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
+        let mode_offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            ctx.mode_label.clone(),
+            hover_style(
+                ctx.mode_style,
+                ctx.mode_clickable && ctx.hovered == Some(StatusBarHitTarget::Mode),
+            ),
+        ));
 
         let back_offset = ctx
             .back_to_main
             .then(|| left_spans.iter().map(Span::width).sum::<usize>() + " ".width());
         if ctx.back_to_main {
+            left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(
-                format!(" {BACK_TO_MAIN_LABEL}"),
-                theme::current().status_notice,
+                BACK_TO_MAIN_LABEL,
+                hover_style(
+                    theme::current().status_notice,
+                    ctx.hovered == Some(StatusBarHitTarget::BackToMain),
+                ),
             ));
         }
 
@@ -201,6 +230,8 @@ impl StatusBar {
         }
 
         let mut right_spans = Vec::new();
+        let mut model_hit = None;
+        let mut thinking_hit = None;
 
         match ctx.status {
             Status::Error { message: e, .. } => {
@@ -213,22 +244,71 @@ impl StatusBar {
                     0
                 };
 
-                let mut rest_spans = Vec::new();
+                let left_width = left_spans.iter().map(Span::width).sum::<usize>();
+                let right_budget = (area.width as usize).saturating_sub(left_width);
+                let min_model_width = if ctx.settings_clickable { 3 } else { 1 };
+                let thinking_width = ctx
+                    .thinking_label
+                    .as_ref()
+                    .map_or(0, |label| label.width() + 3);
+                let mut show_thinking = ctx.thinking_label.is_some();
+                let mut show_fast = ctx.fast;
+                let mut show_workflow = ctx.workflow;
+                let mut show_yolo = ctx.yolo;
+                let core_width = |thinking, fast, workflow, yolo| {
+                    thinking_width * usize::from(thinking)
+                        + FAST_LABEL.width() * usize::from(fast)
+                        + WORKFLOW_LABEL.width() * usize::from(workflow)
+                        + YOLO_LABEL.width() * usize::from(yolo)
+                };
+                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
+                    > right_budget
+                {
+                    show_workflow = false;
+                }
+                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
+                    > right_budget
+                {
+                    show_fast = false;
+                }
+                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
+                    > right_budget
+                {
+                    show_thinking = false;
+                }
+                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
+                    > right_budget
+                {
+                    show_yolo = false;
+                }
 
-                if let Some(ref label) = ctx.thinking_label {
+                let mut rest_spans = Vec::new();
+                let mut thinking_offset = None;
+
+                if show_thinking && let Some(ref label) = ctx.thinking_label {
+                    thinking_offset = Some(rest_spans.iter().map(Span::width).sum::<usize>() + 1);
+                    rest_spans.push(Span::raw(" "));
                     rest_spans.push(Span::styled(
-                        format!(" [{label}]"),
-                        theme::current().status_dim,
+                        format!("[{label}]"),
+                        hover_style(
+                            if ctx.settings_clickable {
+                                theme::current().status_notice
+                            } else {
+                                theme::current().status_dim
+                            },
+                            ctx.settings_clickable
+                                && ctx.hovered == Some(StatusBarHitTarget::Thinking),
+                        ),
                     ));
                 }
 
-                if ctx.fast {
+                if show_fast {
                     rest_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
                 }
-                if ctx.workflow {
+                if show_workflow {
                     rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
                 }
-                if ctx.yolo {
+                if show_yolo {
                     rest_spans.push(Span::styled(YOLO_LABEL, theme::current().error));
                 }
 
@@ -242,33 +322,87 @@ impl StatusBar {
                     Some(cost) => format!("{context_text} ${cost:.3} "),
                     None => format!("{context_text} "),
                 };
-                rest_spans.push(Span::styled(
-                    rest_text,
-                    Style::new().fg(theme::current().foreground),
-                ));
-
-                if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
-                    let global_text = format!(" \u{03a3}${global:.3} ");
+                let global_text = ctx
+                    .stats
+                    .global_cost
+                    .filter(|_| ctx.stats.show_global)
+                    .map(|global| format!(" \u{03a3}${global:.3} "));
+                let core_width = rest_spans.iter().map(Span::width).sum::<usize>();
+                let full_width = rest_text.width();
+                let global_width = global_text.as_ref().map_or(0, |text| text.width());
+                if core_width + min_model_width + full_width + global_width <= right_budget {
                     rest_spans.push(Span::styled(
-                        global_text,
+                        rest_text,
                         Style::new().fg(theme::current().foreground),
                     ));
+                    if let Some(global_text) = global_text {
+                        rest_spans.push(Span::styled(
+                            global_text,
+                            Style::new().fg(theme::current().foreground),
+                        ));
+                    }
+                } else if core_width + min_model_width + full_width <= right_budget {
+                    rest_spans.push(Span::styled(
+                        rest_text,
+                        Style::new().fg(theme::current().foreground),
+                    ));
+                } else {
+                    let compact_context = format!("  {pct}% ");
+                    if core_width + min_model_width + compact_context.width() <= right_budget {
+                        rest_spans.push(Span::styled(
+                            compact_context,
+                            Style::new().fg(theme::current().foreground),
+                        ));
+                    }
                 }
 
                 let reserved = left_spans
                     .iter()
                     .chain(rest_spans.iter())
                     .map(Span::width)
-                    .sum::<usize>()
-                    + CWD_MODEL_SEPARATOR.width();
+                    .sum::<usize>();
                 let available = (area.width as usize).saturating_sub(reserved);
-                let model = truncate_tail(ctx.model_id, available / 2);
-                let cwd = truncate_tail(&self.cwd_branch, available.saturating_sub(model.width()));
+                let model_budget = (available / 2).max(min_model_width).min(available);
+                let model = if ctx.settings_clickable {
+                    bracketed_tail(ctx.model_id, model_budget)
+                } else {
+                    truncate_tail(ctx.model_id, model_budget)
+                };
+                let separator = if model.is_empty() {
+                    ""
+                } else {
+                    CWD_MODEL_SEPARATOR
+                };
+                let cwd = truncate_tail(
+                    &self.cwd_branch,
+                    available
+                        .saturating_sub(model.width())
+                        .saturating_sub(separator.width()),
+                );
+                let separator = if cwd.is_empty() { "" } else { separator };
+
+                let model_offset = cwd.width() + separator.width();
+                let model_width = model.width();
+                let thinking_offset =
+                    thinking_offset.map(|offset| model_offset + model_width + offset);
 
                 right_spans.push(Span::styled(cwd, theme::current().status_dim));
-                right_spans.push(Span::raw(CWD_MODEL_SEPARATOR));
-                right_spans.push(Span::styled(model, theme::current().status_dim));
+                right_spans.push(Span::raw(separator));
+                right_spans.push(Span::styled(
+                    model,
+                    hover_style(
+                        if ctx.settings_clickable {
+                            theme::current().status_notice
+                        } else {
+                            theme::current().status_dim
+                        },
+                        ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Model),
+                    ),
+                ));
                 right_spans.append(&mut rest_spans);
+                model_hit = Some((model_offset, model_width));
+                thinking_hit =
+                    thinking_offset.zip(ctx.thinking_label.as_ref().map(|label| label.width() + 2));
             }
         }
 
@@ -279,11 +413,7 @@ impl StatusBar {
             ));
         }
 
-        let [left_area, right_area] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
-        ])
-        .areas(area);
+        let [left_area, right_area] = status_areas(area, &right_spans);
 
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
@@ -291,13 +421,82 @@ impl StatusBar {
             right_area,
         );
 
-        back_offset.and_then(|offset| {
-            let offset = u16::try_from(offset).ok()?;
-            let width = u16::try_from(BACK_TO_MAIN_LABEL.width()).ok()?;
-            let x = area.x.checked_add(offset)?;
-            (area.height > 0 && x.checked_add(width)? <= left_area.right())
-                .then(|| Rect::new(x, area.y, width, 1))
-        })
+        let mut hits = Vec::with_capacity(2);
+        push_hit(
+            &mut hits,
+            left_area,
+            mode_offset,
+            ctx.mode_label.width(),
+            ctx.mode_clickable,
+            StatusBarHitTarget::Mode,
+        );
+        push_hit(
+            &mut hits,
+            left_area,
+            back_offset.unwrap_or_default(),
+            BACK_TO_MAIN_LABEL.width(),
+            ctx.back_to_main,
+            StatusBarHitTarget::BackToMain,
+        );
+        if let Some((offset, width)) = model_hit {
+            push_hit(
+                &mut hits,
+                right_area,
+                offset,
+                width,
+                ctx.settings_clickable,
+                StatusBarHitTarget::Model,
+            );
+        }
+        if let Some((offset, width)) = thinking_hit {
+            push_hit(
+                &mut hits,
+                right_area,
+                offset,
+                width,
+                ctx.settings_clickable,
+                StatusBarHitTarget::Thinking,
+            );
+        }
+        hits
+    }
+}
+
+fn hover_style(style: Style, hovered: bool) -> Style {
+    if hovered {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
+}
+
+fn status_areas(area: Rect, right_spans: &[Span<'_>]) -> [Rect; 2] {
+    Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(right_spans.iter().map(|span| span.width() as u16).sum()),
+    ])
+    .areas(area)
+}
+
+fn push_hit(
+    hits: &mut Vec<StatusBarHit>,
+    area: Rect,
+    offset: usize,
+    width: usize,
+    enabled: bool,
+    target: StatusBarHitTarget,
+) {
+    let (Ok(offset), Ok(width)) = (u16::try_from(offset), u16::try_from(width)) else {
+        return;
+    };
+    let Some(x) = area.x.checked_add(offset) else {
+        return;
+    };
+    if enabled && area.height > 0 && width > 0 && x.saturating_add(width) <= area.right() {
+        hits.push(StatusBarHit {
+            area: Rect::new(x, area.y, width, 1),
+            target,
+        });
     }
 }
 
@@ -316,6 +515,9 @@ fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
     if s.width() <= max_width {
         return Cow::Borrowed(s);
     }
+    if max_width <= TRUNCATE_PREFIX.width() {
+        return Cow::Owned(".".repeat(max_width));
+    }
     let budget = max_width.saturating_sub(TRUNCATE_PREFIX.width());
     let mut used = 0;
     let mut start = s.len();
@@ -328,6 +530,13 @@ fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
         start = i;
     }
     Cow::Owned(format!("{TRUNCATE_PREFIX}{}", &s[start..]))
+}
+
+fn bracketed_tail(s: &str, max_width: usize) -> Cow<'_, str> {
+    if max_width < 3 {
+        return Cow::Borrowed("");
+    }
+    Cow::Owned(format!("[{}]", truncate_tail(s, max_width - 2)))
 }
 
 fn collapse_home(path: &str) -> String {
@@ -417,13 +626,19 @@ mod tests {
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
 
-    fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
+    fn render_at(
+        width: u16,
+        global_cost: Option<f64>,
+        show_global: bool,
+        yolo: bool,
+        hovered: Option<StatusBarHitTarget>,
+    ) -> (String, Vec<StatusBarHit>, Vec<Style>) {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let ctx = StatusBarContext {
             status: &Status::Idle,
-            mode_label: "build".into(),
+            mode_label: "[BUILD]".into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
             stats: UsageStats {
@@ -437,19 +652,31 @@ mod tests {
             chat_name: None,
             back_to_main: false,
             retry_info: None,
-            thinking_label: None,
+            thinking_label: Some("thinking: off".into()),
             fast: false,
             workflow: false,
             yolo,
             restoring: false,
             goal: None,
+            mode_clickable: true,
+            settings_clickable: true,
+            hovered,
         };
+        let mut hits = Vec::new();
         terminal
             .draw(|f| {
-                bar.view(f, f.area(), &ctx);
+                hits = bar.view(f, f.area(), &ctx);
             })
             .unwrap();
-        crate::components::buffer_text(terminal.backend().buffer())
+        let buffer = terminal.backend().buffer();
+        let styles = (0..width)
+            .map(|column| buffer.cell((column, 0)).unwrap().style())
+            .collect();
+        (crate::components::buffer_text(buffer), hits, styles)
+    }
+
+    fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
+        render_at(BAR_WIDTH, global_cost, show_global, yolo, None).0
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -482,6 +709,70 @@ mod tests {
         render(None, false, yolo).contains(YOLO_LABEL.trim())
     }
 
+    #[test_case(0 ; "zero_width")]
+    #[test_case(1 ; "one_column")]
+    #[test_case(2 ; "two_columns")]
+    #[test_case(20 ; "compact")]
+    #[test_case(40 ; "medium")]
+    #[test_case(BAR_WIDTH ; "wide")]
+    fn status_hits_stay_inside_the_rendered_area(width: u16) {
+        let (_, hits, _) = render_at(width, Some(SESSION_COST), true, true, None);
+        let area = Rect::new(0, 0, width, 1);
+        assert!(hits.iter().all(|hit| {
+            hit.area.width > 0
+                && area.contains(ratatui::layout::Position::new(hit.area.x, hit.area.y))
+                && hit.area.right() <= area.right()
+        }));
+    }
+
+    #[test]
+    fn compact_status_preserves_mode_control() {
+        let (_, hits, _) = render_at(20, None, false, false, None);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::Mode)
+        );
+    }
+
+    #[test]
+    fn wide_status_exposes_all_main_controls() {
+        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None);
+        for target in [
+            StatusBarHitTarget::Mode,
+            StatusBarHitTarget::Model,
+            StatusBarHitTarget::Thinking,
+        ] {
+            assert!(hits.iter().any(|hit| hit.target == target));
+        }
+    }
+
+    #[test]
+    fn hovered_control_style_is_reversed() {
+        let style = hover_style(Style::new(), true);
+        assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn hover_highlights_labels_without_their_leading_spaces() {
+        for target in [
+            StatusBarHitTarget::Mode,
+            StatusBarHitTarget::Model,
+            StatusBarHitTarget::Thinking,
+        ] {
+            let (_, hits, styles) = render_at(BAR_WIDTH, None, false, false, Some(target));
+            let hit = hits.iter().find(|hit| hit.target == target).unwrap();
+            let start = usize::from(hit.area.x);
+            let end = usize::from(hit.area.right());
+
+            assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+            assert!(
+                styles[start..end]
+                    .iter()
+                    .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+            );
+        }
+    }
+
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]
     #[test_case("/home/user", "/home/user", "~"                           ; "exact_home")]
@@ -494,9 +785,18 @@ mod tests {
     #[test_case("~/文档/proj:分支", 8, "..j:分支"                  ; "cjk_path_and_branch")]
     #[test_case("release/🚀-v2", 6, "..-v2"                        ; "emoji_branch")]
     #[test_case("abc", 2, ".."                                     ; "prefix_only")]
+    #[test_case("abc", 1, "."                                      ; "single_column")]
+    #[test_case("abc", 0, ""                                       ; "zero_columns")]
     #[test_case("", 0, ""                                          ; "empty")]
     fn truncate_tail_cases(input: &str, max_width: usize, expected: &str) {
         assert_eq!(truncate_tail(input, max_width), expected);
+    }
+
+    #[test_case("model", 7, "[model]" ; "fits")]
+    #[test_case("model", 5, "[..l]"   ; "truncates_inside_brackets")]
+    #[test_case("model", 2, ""        ; "cannot_fit_button")]
+    fn bracketed_tail_cases(input: &str, max_width: usize, expected: &str) {
+        assert_eq!(bracketed_tail(input, max_width), expected);
     }
 
     fn tmp_with_head(content: Option<&str>) -> (TempDir, String) {

@@ -11,6 +11,7 @@ use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
+use maki_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -329,6 +330,16 @@ impl App {
         let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
+        let main_chat = render_chat == 0;
+        let thinking_label = (main_chat && self.state.model.supports_thinking()).then(|| {
+            let effective = RequestOptions {
+                thinking: self.state.thinking,
+                fast: self.state.fast,
+            }
+            .clamped(&self.state.model)
+            .thinking;
+            format!("thinking: {effective}").into()
+        });
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
@@ -348,14 +359,19 @@ impl App {
             chat_name,
             back_to_main: render_chat != 0,
             retry_info: self.retry_info.as_ref(),
-            thinking_label: self.state.thinking.status_label(),
+            thinking_label,
             fast: self.state.fast,
             workflow: self.state.workflow,
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
             goal: goal.as_ref(),
+            mode_clickable: main_chat && !self.is_bash_input(),
+            settings_clickable: main_chat,
+            hovered: (!self.has_modal_overlay())
+                .then_some(self.status_hover)
+                .flatten(),
         };
-        self.task_back_area = self.status_bar.view(frame, status_area, &ctx);
+        self.status_hits = self.status_bar.view(frame, status_area, &ctx);
     }
 
     fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect) {

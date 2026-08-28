@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -20,13 +20,15 @@ const TARGET_SECTION: &str = "Evaluator target";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
+const LOADING_MODELS: &str = "Loading models...";
+const NO_MATCHES: &str = "No matches";
 
 fn model_footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
-        Span::styled("  Tab/S-Tab", t.keybind_key),
+        Span::styled("  Tab/Shift+Tab", t.keybind_key),
         Span::styled(" purpose", t.tool_dim),
     ])
 }
@@ -38,7 +40,7 @@ fn assignment_footer_line() -> Line<'static> {
         Span::styled(" assign", t.tool_dim),
         Span::styled("  R", t.keybind_key),
         Span::styled(" reset", t.tool_dim),
-        Span::styled("  Tab/S-Tab", t.keybind_key),
+        Span::styled("  Tab/Shift+Tab", t.keybind_key),
         Span::styled(" purpose", t.tool_dim),
     ])
 }
@@ -191,6 +193,7 @@ impl ModelPicker {
         self.needs_rebuild = false;
         self.picker.set_footer_builder(model_footer_line);
         let _ = self.available.poll(self.models.load_full());
+        self.sync_empty_text();
         let entries = self.load_entries();
         self.picker.open(entries, self.mode.title());
         self.preselect_mode();
@@ -205,6 +208,7 @@ impl ModelPicker {
         self.needs_rebuild = false;
         self.picker.set_footer_builder(assignment_footer_line);
         let _ = self.available.poll(self.models.load_full());
+        self.sync_empty_text();
         let entries = self.load_entries();
         self.picker.open(entries, self.mode.title());
         self.preselect_mode();
@@ -223,6 +227,7 @@ impl ModelPicker {
             return Dirty::NO;
         }
         self.needs_rebuild = false;
+        self.sync_empty_text();
         let entries = self.load_entries();
         self.picker.replace_items(entries);
         if let Some((was_recent, spec)) = &self.anchor {
@@ -232,6 +237,15 @@ impl ModelPicker {
             self.preselect_mode();
         }
         Dirty::YES
+    }
+
+    fn sync_empty_text(&mut self) {
+        self.picker
+            .set_empty_text(if self.available.get().is_some() {
+                NO_MATCHES
+            } else {
+                LOADING_MODELS
+            });
     }
 
     fn load_entries(&self) -> Vec<ModelEntry> {
@@ -285,6 +299,15 @@ impl ModelPicker {
                     .collect()
             })
             .unwrap_or_default();
+        if self.mode == PickerMode::Chat
+            && !self.current_spec.is_empty()
+            && !entries.iter().any(|entry| entry.spec == self.current_spec)
+            && !full.iter().any(|entry| entry.spec == self.current_spec)
+            && let Some(mut current) = parse_model_entry(&self.current_spec)
+        {
+            self.mark_assignment(&mut current);
+            full.push(current);
+        }
         sort_models(&mut full);
         entries.extend(full);
         if let Some(spec) = self.assigned_spec()
@@ -377,6 +400,13 @@ impl ModelPicker {
         self.track_anchor(|p| p.handle_key_inner(key))
     }
 
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> ModelPickerAction {
+        self.track_anchor(|picker| {
+            let action = picker.picker.handle_mouse(event);
+            picker.map_picker_action(action)
+        })
+    }
+
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
         let backwards = match key.code {
             KeyCode::BackTab => Some(true),
@@ -420,7 +450,12 @@ impl ModelPicker {
                 ),
             };
         }
-        match self.picker.handle_key(key) {
+        let action = self.picker.handle_key(key);
+        self.map_picker_action(action)
+    }
+
+    fn map_picker_action(&self, action: PickerAction<ModelEntry>) -> ModelPickerAction {
+        match action {
             PickerAction::Consumed => ModelPickerAction::Consumed,
             PickerAction::Select(entry) => match self.mode {
                 PickerMode::Chat => ModelPickerAction::Select(entry.spec),
@@ -589,6 +624,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::buffer_text;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -629,6 +665,30 @@ mod tests {
             "zai/glm-5".into(),
         ])));
         models
+    }
+
+    fn render(picker: &mut ModelPicker) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn empty_picker_distinguishes_loading_from_no_matches() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut picker = ModelPicker::new(Arc::clone(&models));
+        picker.open("");
+        assert!(render(&mut picker).contains(LOADING_MODELS));
+
+        models.store(Some(Arc::new(Vec::new())));
+        assert_eq!(picker.refresh(), Dirty::YES);
+
+        assert!(render(&mut picker).contains(NO_MATCHES));
     }
 
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
@@ -674,6 +734,18 @@ mod tests {
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101")
         );
+    }
+
+    #[test]
+    fn open_retains_current_model_missing_from_discovery() {
+        let current = "anthropic/claude-sonnet-4-20250514";
+        let models = Arc::new(ArcSwapOption::from_pointee(Vec::new()));
+        let mut picker = ModelPicker::new(models);
+
+        picker.open(current);
+        let action = picker.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, ModelPickerAction::Select(spec) if spec == current));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
@@ -65,6 +65,7 @@ pub struct ListPicker<T> {
     max_visible: Option<u16>,
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<String>,
+    empty_text: &'static str,
     width_percent: u16,
 }
 
@@ -76,14 +77,24 @@ struct State<T> {
     scroll_offset: usize,
     viewport_height: usize,
     inner_area: Rect,
+    row_hits: Vec<PickerRowHit>,
+    mouse_down: Option<usize>,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
 }
 
 #[derive(Clone, Copy)]
-struct RenderOptions {
+struct PickerRowHit {
+    area: Rect,
+    filtered_index: usize,
+    item_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RenderOptions<'a> {
     max_visible: Option<u16>,
     width_percent: u16,
+    empty_text: &'a str,
 }
 
 impl<T: PickerItem> State<T> {
@@ -97,6 +108,8 @@ impl<T: PickerItem> State<T> {
             scroll_offset: 0,
             viewport_height: 20,
             inner_area: Rect::default(),
+            row_hits: Vec::new(),
+            mouse_down: None,
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
         }
@@ -104,8 +117,14 @@ impl<T: PickerItem> State<T> {
 
     fn replace_items(&mut self, items: Vec<T>) {
         self.items = items;
+        self.invalidate_mouse_geometry();
         self.rebuild_filter();
         self.clamp_selection();
+    }
+
+    fn invalidate_mouse_geometry(&mut self) {
+        self.row_hits.clear();
+        self.mouse_down = None;
     }
 
     fn rebuild_filter(&mut self) {
@@ -151,6 +170,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn update_search_and_clamp(&mut self) {
+        self.invalidate_mouse_geometry();
         self.rebuild_filter();
         self.clamp_selection();
     }
@@ -240,6 +260,7 @@ impl<T: PickerItem> ListPicker<T> {
             max_visible: None,
             footer: None,
             error_text: None,
+            empty_text: NO_MATCHES,
             width_percent: MIN_WIDTH_PERCENT,
         }
     }
@@ -286,6 +307,7 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn select(&mut self, index: usize) {
         if let Some(s) = self.state.as_mut() {
+            s.invalidate_mouse_geometry();
             s.selected = index.min(s.filtered.len().saturating_sub(1));
             s.ensure_visible();
         }
@@ -295,6 +317,7 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(s) = self.state.as_mut() else {
             return false;
         };
+        s.invalidate_mouse_geometry();
         let Some(selected) = s
             .filtered
             .iter()
@@ -309,6 +332,10 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn set_error_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    pub fn set_empty_text(&mut self, text: &'static str) {
+        self.empty_text = text;
     }
 
     pub fn clear_search(&mut self) {
@@ -361,11 +388,68 @@ impl<T: PickerItem> ListPicker<T> {
         self.handle_ready_key(key)
     }
 
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> PickerAction<T> {
+        let Some(state) = self.state.as_mut() else {
+            return PickerAction::Close;
+        };
+        let position = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.mouse_down = None;
+                if let Some(hit) = state
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .copied()
+                {
+                    state.selected = hit.filtered_index;
+                    state.mouse_down = Some(hit.item_index);
+                }
+                PickerAction::Consumed
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                state.mouse_down = None;
+                PickerAction::Consumed
+            }
+            MouseEventKind::Moved => {
+                if let Some(hit) = state
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                {
+                    state.selected = hit.filtered_index;
+                }
+                PickerAction::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pressed) = state.mouse_down.take() else {
+                    return PickerAction::Consumed;
+                };
+                let released = state
+                    .row_hits
+                    .iter()
+                    .find(|hit| hit.area.contains(position))
+                    .map(|hit| hit.item_index);
+                if released != Some(pressed) {
+                    return PickerAction::Consumed;
+                }
+                if let Some(enabled) = &mut state.enabled {
+                    enabled[pressed] = !enabled[pressed];
+                    return PickerAction::Toggle(pressed, enabled[pressed]);
+                }
+                let mut state = self.state.take().expect("picker state disappeared");
+                PickerAction::Select(state.items.swap_remove(pressed))
+            }
+            _ => PickerAction::Consumed,
+        }
+    }
+
     fn handle_ready_key(&mut self, key: KeyEvent) -> PickerAction<T> {
         let s = self
             .state
             .as_mut()
             .expect("handle_ready_key called without state");
+        s.invalidate_mouse_geometry();
 
         if key::QUIT.matches(key) {
             self.state = None;
@@ -481,6 +565,7 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(s) = self.state.as_mut() else {
             return;
         };
+        s.invalidate_mouse_geometry();
         if delta > 0 {
             s.scroll_offset = s.scroll_offset.saturating_sub(delta as usize);
         } else {
@@ -506,6 +591,7 @@ impl<T: PickerItem> ListPicker<T> {
                 RenderOptions {
                     max_visible: self.max_visible,
                     width_percent: self.width_percent,
+                    empty_text: self.empty_text,
                 },
                 footer,
                 self.error_text.as_deref(),
@@ -533,7 +619,7 @@ fn render_ready<T: PickerItem>(
     area: Rect,
     s: &mut State<T>,
     title: &str,
-    options: RenderOptions,
+    options: RenderOptions<'_>,
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<&str>,
 ) -> Rect {
@@ -593,6 +679,7 @@ fn render_ready<T: PickerItem>(
     let search_area = areas[area_idx];
     area_idx += 1;
 
+    s.row_hits.clear();
     render_list(
         frame,
         list_area,
@@ -602,6 +689,8 @@ fn render_ready<T: PickerItem>(
         s.scroll_offset,
         s.viewport_height,
         s.enabled.as_deref(),
+        &mut s.row_hits,
+        options.empty_text,
     );
     render_search(frame, search_area, &s.search);
 
@@ -676,6 +765,9 @@ fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
     }
+    if max_width == 0 {
+        return String::new();
+    }
     let target = max_width.saturating_sub(1);
     let mut width = 0;
     let mut result = String::with_capacity(label.len());
@@ -701,10 +793,12 @@ fn render_list<T: PickerItem>(
     scroll_offset: usize,
     viewport_height: usize,
     enabled: Option<&[bool]>,
+    row_hits: &mut Vec<PickerRowHit>,
+    empty_text: &str,
 ) {
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
-            format!("  {NO_MATCHES}"),
+            format!("  {empty_text}"),
             theme::current().item_desc,
         ));
         frame.render_widget(Paragraph::new(vec![line]), area);
@@ -737,6 +831,12 @@ fn render_list<T: PickerItem>(
         if lines.len() >= viewport_height {
             break;
         }
+
+        row_hits.push(PickerRowHit {
+            area: Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+            filtered_index: i,
+            item_index: item_idx,
+        });
 
         let highlighted = item.is_highlighted();
         let t = theme::current();
@@ -836,7 +936,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use test_case::test_case;
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
@@ -845,6 +945,25 @@ mod tests {
 
     fn ready_state_mut<T>(p: &mut ListPicker<T>) -> &mut State<T> {
         p.state.as_mut().expect("expected open state")
+    }
+
+    fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn render<T: PickerItem>(picker: &mut ListPicker<T>) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
     }
 
     struct Entry {
@@ -1020,6 +1139,81 @@ mod tests {
         assert!(!p.is_open());
     }
 
+    #[test]
+    fn clicking_item_returns_it() {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["A", "B", "C"]), " Test ");
+        render(&mut picker);
+        let hit = ready_state(&picker).row_hits[1];
+
+        assert!(matches!(
+            picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area)),
+            PickerAction::Consumed
+        ));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+
+        assert!(matches!(action, PickerAction::Select(ref entry) if entry.label == "B"));
+        assert!(!picker.is_open());
+    }
+
+    #[test]
+    fn hovering_item_moves_visible_selection() {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["A", "B", "C"]), " Test ");
+        render(&mut picker);
+        let hit = ready_state(&picker).row_hits[2];
+
+        picker.handle_mouse(mouse(MouseEventKind::Moved, hit.area));
+
+        assert_eq!(ready_state(&picker).selected, 2);
+    }
+
+    #[test]
+    fn mouse_release_on_another_item_does_not_select() {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["A", "B"]), " Test ");
+        render(&mut picker);
+        let first = ready_state(&picker).row_hits[0];
+        let second = ready_state(&picker).row_hits[1];
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
+
+        assert!(matches!(action, PickerAction::Consumed));
+        assert!(picker.is_open());
+    }
+
+    #[test]
+    fn filtering_invalidates_rendered_mouse_rows() {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["Alpha", "Beta"]), " Test ");
+        render(&mut picker);
+        let stale = ready_state(&picker).row_hits[0];
+
+        picker.handle_key(key(KeyCode::Char('z')));
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
+
+        assert!(matches!(action, PickerAction::Consumed));
+        assert!(picker.is_open());
+    }
+
+    #[test]
+    fn scrolling_invalidates_rendered_mouse_rows() {
+        let items: Vec<Entry> = (0..30).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut picker = ListPicker::new();
+        picker.open(items, " Test ");
+        render(&mut picker);
+        let stale = ready_state(&picker).row_hits[0];
+
+        picker.scroll(-3);
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
+
+        assert!(matches!(action, PickerAction::Consumed));
+        assert!(picker.is_open());
+    }
+
     #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_returns_close")]
     fn cancel_returns_close(cancel_key: KeyEvent) {
@@ -1121,6 +1315,21 @@ mod tests {
     }
 
     #[test]
+    fn section_headers_are_not_clickable() {
+        let mut picker = ListPicker::new();
+        picker.open(section_entries(), " Test ");
+        render(&mut picker);
+        let first_item = ready_state(&picker).row_hits[0].area;
+        let header = Rect::new(first_item.x, first_item.y - 1, first_item.width, 1);
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), header));
+        let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), header));
+
+        assert!(matches!(action, PickerAction::Consumed));
+        assert!(picker.is_open());
+    }
+
+    #[test]
     fn ensure_visible_clamps_scroll_offset_after_filter() {
         let mut p = ListPicker::new();
         let items: Vec<Entry> = (0..20).map(|i| Entry::new(&format!("Item {i}"))).collect();
@@ -1157,6 +1366,7 @@ mod tests {
     #[test_case("short", 10 => "short" ; "no_truncation_needed")]
     #[test_case("abcdefghijklmno", 10 => "abcdefghi\u{2026}" ; "long_ascii_truncated")]
     #[test_case("ab\u{4e16}\u{754c}cde", 6 => "ab\u{4e16}\u{2026}" ; "wide_chars_truncated")]
+    #[test_case("long", 0 => "" ; "zero_width_is_empty")]
     fn truncate_label_cases(label: &str, max_width: usize) -> String {
         truncate_label(label, max_width)
     }
