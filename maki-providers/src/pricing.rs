@@ -144,6 +144,9 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
     if let Some(cost) = usage.cost {
         return Some(cost);
     }
+    if current.provider.as_ref() == "anthropic" && current.pricing.is_zero() {
+        return None;
+    }
     if id == current.id {
         return current.list_cost(&(*usage).into(), fast);
     }
@@ -360,6 +363,13 @@ mod tests {
         let cost = model_cost(sibling_id, &usage, &current, false);
         assert_eq!(cost, sibling.list_cost(&usage.into(), false));
         assert_ne!(cost, current.list_cost(&usage.into(), false));
+    }
+
+    #[test]
+    fn anthropic_oauth_keeps_sibling_models_unpriced() {
+        let current = model("claude-sonnet-4-6", UNPRICED);
+        let usage = stored(None);
+        assert_eq!(model_cost("claude-opus-4-8", &usage, &current, false), None);
     }
 
     /// What was paid is what was paid, even for an id the table prices

@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,13 +6,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::{StateDir, StorageError, atomic_write_permissions};
+use crate::{StateDir, StorageError, atomic_write_permissions, exclusive_state_lock};
 
 const AUTH_DIR: &str = "auth";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access: String,
     pub refresh: String,
@@ -119,6 +119,13 @@ pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageErro
     delete_auth(&auth_path(dir, provider))
 }
 
+pub fn lock_provider_auth(dir: &StateDir, provider: &str) -> Result<File, StorageError> {
+    exclusive_state_lock(
+        &dir.path().join(AUTH_DIR).join(format!("{provider}.lock")),
+        AUTH_FILE_MODE,
+    )
+}
+
 pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> Option<McpAuthData> {
     let data: McpAuthData = load_auth(&auth_path(dir, &format!("mcp-{server_name}")))?;
     if data.server_url != expected_url {
@@ -153,6 +160,7 @@ pub fn save_provider_credentials(
     slug: &str,
     creds: &ProviderCredentials,
 ) -> Result<(), StorageError> {
+    let _lock = lock_provider_auth(dir, slug)?;
     save_auth(&auth_path(dir, slug), creds)
 }
 

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
@@ -25,6 +27,9 @@ pub(crate) const FALLBACK_MAX_TOKENS: u32 = 32_000;
 pub(crate) const LONG_CONTEXT_SUFFIX: &str = "-1m";
 pub(crate) const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
 pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
+
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const BILLING_PREFIX: &str = "59cf53e54c78";
 
 pub(crate) fn strip_long_context(model_id: &str) -> &str {
     model_id
@@ -269,22 +274,152 @@ pub(crate) fn build_request_body_with_system(
     body
 }
 
+pub(super) fn apply_oauth_request_profile(
+    body: &mut Value,
+    system: &str,
+    version: &str,
+) -> HashMap<String, String> {
+    let first_user_text = first_user_text(body).unwrap_or_default();
+    let billing = billing_header(first_user_text, version);
+    body["system"] = json!([
+        {"type": "text", "text": billing},
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+    ]);
+
+    if !system.is_empty()
+        && let Some(messages) = body["messages"].as_array_mut()
+    {
+        let instruction = json!({"type": "text", "text": system});
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|message| message["role"].as_str() == Some("user"))
+            && let Some(content) = message["content"].as_array_mut()
+        {
+            content.insert(0, instruction);
+        } else {
+            messages.insert(0, json!({"role": "user", "content": [instruction]}));
+        }
+    }
+
+    let mut tool_names = HashMap::new();
+    if let Some(tools) = body["tools"].as_array_mut() {
+        for tool in tools {
+            if let Some(name) = tool["name"].as_str() {
+                tool["name"] = json!(mapped_oauth_tool_name(name, &mut tool_names));
+            }
+        }
+    }
+    if let Some(messages) = body["messages"].as_array_mut() {
+        for message in messages {
+            let Some(content) = message["content"].as_array_mut() else {
+                continue;
+            };
+            for block in content {
+                if block["type"].as_str() == Some("tool_use")
+                    && let Some(name) = block["name"].as_str()
+                {
+                    block["name"] = json!(mapped_oauth_tool_name(name, &mut tool_names));
+                }
+            }
+        }
+    }
+    tool_names
+}
+
+fn first_user_text(body: &Value) -> Option<&str> {
+    body["messages"].as_array()?.iter().find_map(|message| {
+        if message["role"].as_str() != Some("user") {
+            return None;
+        }
+        message["content"].as_array()?.iter().find_map(|block| {
+            (block["type"].as_str() == Some("text"))
+                .then(|| block["text"].as_str())
+                .flatten()
+        })
+    })
+}
+
+fn billing_header(first_user_text: &str, version: &str) -> String {
+    let chars: Vec<char> = first_user_text.chars().collect();
+    let sampled: String = [4, 7, 20]
+        .into_iter()
+        .map(|index| chars.get(index).copied().unwrap_or('0'))
+        .collect();
+    let version_hash = format!(
+        "{:x}",
+        Sha256::digest(format!("{BILLING_PREFIX}{sampled}{version}").as_bytes())
+    );
+    format!(
+        "x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=cli; cch=00000;",
+        &version_hash[..3]
+    )
+}
+
+fn oauth_tool_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return "mcp_".into();
+    };
+    format!("mcp_{}{}", first.to_uppercase(), chars.as_str())
+}
+
+fn mapped_oauth_tool_name(name: &str, names: &mut HashMap<String, String>) -> String {
+    if let Some((wire, _)) = names.iter().find(|(_, original)| original.as_str() == name) {
+        return wire.clone();
+    }
+    let mut wire = oauth_tool_name(name);
+    if wire.len() > 64 || names.contains_key(&wire) {
+        let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+        let suffix = format!("_{}", &digest[..12]);
+        let max_prefix = 64 - suffix.len();
+        let mut truncate_at = max_prefix.min(wire.len());
+        while !wire.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        wire.truncate(truncate_at);
+        wire.push_str(&suffix);
+    }
+    names.insert(wire.clone(), name.to_string());
+    wire
+}
+
+fn canonical_tool_name(name: &str) -> String {
+    let Some(name) = name.strip_prefix("mcp_") else {
+        return name.to_string();
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!("{}{}", first.to_lowercase(), chars.as_str())
+}
+
 pub(super) struct EventParser {
     content_blocks: Vec<ContentBlock>,
     current_tool_json: String,
     current_block_idx: usize,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    oauth_tool_names: Option<HashMap<String, String>>,
 }
 
 impl EventParser {
     pub fn new() -> Self {
+        Self::with_oauth_tool_names(None)
+    }
+
+    pub fn new_oauth(tool_names: HashMap<String, String>) -> Self {
+        Self::with_oauth_tool_names(Some(tool_names))
+    }
+
+    fn with_oauth_tool_names(oauth_tool_names: Option<HashMap<String, String>>) -> Self {
         Self {
             content_blocks: Vec::new(),
             current_tool_json: String::new(),
             current_block_idx: 0,
             usage: TokenUsage::default(),
             stop_reason: None,
+            oauth_tool_names,
         }
     }
 
@@ -322,6 +457,13 @@ impl EventParser {
                                 .push(ContentBlock::RedactedThinking { data });
                         }
                         SseContentBlock::ToolUse { id, name } => {
+                            let name = match &self.oauth_tool_names {
+                                Some(names) => names
+                                    .get(&name)
+                                    .cloned()
+                                    .unwrap_or_else(|| canonical_tool_name(&name)),
+                                None => name,
+                            };
                             self.current_tool_json.clear();
                             event_tx
                                 .send_async(ProviderEvent::ToolUseStart {
@@ -646,7 +788,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, canonical_tool_name, long_context_window,
+        oauth_tool_name, strip_long_context,
     };
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
@@ -660,5 +803,11 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    #[test_case("bash" ; "builtin")]
+    #[test_case("mcp_fetch" ; "already_prefixed")]
+    fn oauth_tool_names_round_trip(name: &str) {
+        assert_eq!(canonical_tool_name(&oauth_tool_name(name)), name);
     }
 }

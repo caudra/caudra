@@ -88,7 +88,9 @@ maki auth logout <provider>
 maki auth status
 ```
 
-`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). OpenAI and Copilot have dedicated flows; other providers prompt for a key (and a plan when the provider has more than one). Custom providers can be created from the interactive picker.
+`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). Anthropic, OpenAI, xAI, and Copilot have dedicated flows when named explicitly. Other providers prompt for a key and a plan when the provider has more than one. Custom providers can be created from the interactive picker.
+
+`maki auth login anthropic` starts experimental Claude subscription OAuth. The command explains the Anthropic terms limitation before opening the browser. Use the interactive picker or `ANTHROPIC_API_KEY` for API-key auth.
 
 `status` shows each provider as configured (key on disk), env-only, or missing.
 

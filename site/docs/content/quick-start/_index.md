@@ -73,6 +73,7 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/tontint
 
 ```bash
 maki auth login              # interactive picker (OAuth or API key)
+maki auth login anthropic    # Claude subscription OAuth
 export ANTHROPIC_API_KEY=... # or just export a key
 ```
 

@@ -22,6 +22,7 @@ pub use model::{
 };
 pub use pricing::{model_cost, settle_session};
 pub use providers::Timeouts;
+pub use providers::anthropic::auth as anthropic_auth;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,

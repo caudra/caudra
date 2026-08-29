@@ -37,7 +37,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 ## Supported providers
 
-* Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS). Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
+* Anthropic - `ANTHROPIC_API_KEY` or experimental Claude subscription OAuth via `maki auth login anthropic`. This uses Claude Code's public client registration and may conflict with Anthropic's subscription terms. Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
 * OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
 * xAI - `XAI_API_KEY` and OAuth via `maki auth login xai`.
 * Google - `GEMINI_API_KEY`.

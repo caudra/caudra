@@ -30,7 +30,7 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Three exceptions apply. `ANTHROPIC_BASE_URL` never receives Claude subscription tokens. `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -42,6 +42,10 @@ base_url = "http://xxxx:1234/v1"
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
+
+const ANTHROPIC_OAUTH_NOTE: &str = r#"Run `maki auth login anthropic` to sign in to a Claude subscription through browser OAuth. Maki stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
+
+This experimental flow uses Claude Code's public client registration. Anthropic limits Pro and Max subscription tokens to official clients in its terms. The flow may stop working when Anthropic changes its OAuth or request protocol."#;
 
 const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
 
@@ -393,6 +397,19 @@ fn build_sections() -> Vec<ProviderSection> {
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
             }
+            ProviderKind::Anthropic => {
+                sections.push(ProviderSection {
+                    kind,
+                    name: kind.display_name(),
+                    auth_line: format!(
+                        "{} (also supports subscription OAuth via `maki auth login anthropic`)",
+                        format_auth(kind)
+                    ),
+                    urls: vec![kind.base_url()],
+                    features: kind.features(),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                });
+            }
             ProviderKind::Xai => {
                 sections.push(ProviderSection {
                     kind,
@@ -544,6 +561,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     }
 
     if section.name == "Anthropic" {
+        let _ = writeln!(out, "\n{ANTHROPIC_OAUTH_NOTE}");
         let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
     }
