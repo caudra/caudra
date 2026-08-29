@@ -251,7 +251,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
-        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
+        let prompt_slots = stack
+            .plugin_host
+            .event_handle()
+            .collect_prompt_slots(&stack.config.agent);
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,

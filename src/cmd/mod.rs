@@ -52,7 +52,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             tools,
             names,
         }) => {
-            subcmd::prompt(&variant, plan, tools, names, cli.no_plugins, cli.no_jit)?;
+            subcmd::prompt(
+                &variant,
+                plan,
+                tools,
+                names,
+                cli.no_plugins,
+                cli.no_jit,
+                cli.no_rtk,
+            )?;
         }
         None => {
             tui::run(cli)?;

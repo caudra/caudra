@@ -658,6 +658,7 @@ pub fn prompt(
     names: bool,
     no_plugins: bool,
     no_jit: bool,
+    no_rtk: bool,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
@@ -682,7 +683,7 @@ pub fn prompt(
         .context("load init.lua files")?;
     let config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(no_rtk)
         .context("invalid config")?;
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -711,7 +712,7 @@ pub fn prompt(
 
     let cwd_str = cwd.to_string_lossy();
     let instructions = load_instruction_text(&cwd_str);
-    let slots = host.event_handle().collect_prompt_slots();
+    let slots = host.event_handle().collect_prompt_slots(&config.agent);
 
     let output = match variant {
         PromptVariant::System => {

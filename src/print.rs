@@ -167,7 +167,7 @@ pub fn run(
     let images = load_images(&image_paths)?;
     let (prompt, goal) = print_goal(prompt)?;
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));

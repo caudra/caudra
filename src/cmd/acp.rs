@@ -53,7 +53,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
+    let prompt_slots = plugin_host
+        .event_handle()
+        .collect_prompt_slots(&config.agent);
 
     maki_acp::run(maki_acp::AcpParams {
         model,

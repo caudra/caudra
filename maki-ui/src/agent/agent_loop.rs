@@ -373,7 +373,10 @@ impl AgentLoop {
             }
         }
 
-        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
+        let prompt_slots = self
+            .lua_handle
+            .collect_prompt_slots_async(&self.config)
+            .await;
         let system = agent::build_system_prompt(
             &self.vars,
             &input.mode,

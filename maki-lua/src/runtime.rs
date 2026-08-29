@@ -24,10 +24,13 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
+use mlua::{
+    Chunk, ChunkMode, Compiler, Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue,
+    ffi,
+};
 use serde_json::{Value, json};
 
-use maki_config::RawConfig;
+use maki_config::{AgentConfig, RawConfig};
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
@@ -216,6 +219,7 @@ pub enum Request {
         depth: u8,
     },
     CollectPromptSlots {
+        config: AgentConfig,
         reply: flume::Sender<ResolvedSlots>,
     },
     CollectPluginOptions {
@@ -1614,10 +1618,22 @@ impl LuaRuntime {
         }
     }
 
-    async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
+    async fn run_hint_callback(
+        &self,
+        plugin: &str,
+        func: Function,
+        config: &AgentConfig,
+    ) -> Option<String> {
+        let config = match self.lua.to_value(config) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(plugin, error = %e, "failed to serialize prompt hint config");
+                return None;
+            }
+        };
         let result: mlua::Result<LuaValue> = run_detached(&self.lua, async {
             let thread = self.lua.create_thread(func)?;
-            thread.into_async::<LuaValue>(())?.await
+            thread.into_async::<LuaValue>(config)?.await
         })
         .await;
         match result {
@@ -1634,7 +1650,7 @@ impl LuaRuntime {
         }
     }
 
-    async fn collect_prompt_slots(&self) -> ResolvedSlots {
+    async fn collect_prompt_slots(&self, config: &AgentConfig) -> ResolvedSlots {
         struct Pending {
             plugin: Arc<str>,
             prompts: Option<Vec<PromptId>>,
@@ -1678,7 +1694,9 @@ impl LuaRuntime {
         for item in pending {
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),
-                PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
+                PendingContent::Callback(func) => {
+                    self.run_hint_callback(&item.plugin, func, config).await
+                }
             };
             let Some(content) = content else { continue };
             let explicit = item.prompts.is_some();
@@ -2895,8 +2913,8 @@ pub fn spawn(
                             let res = rt.run_init_lua(&source, &source_name, plugin_dir, rule_policy).await;
                             let _ = reply.send(res);
                         }
-                        Request::CollectPromptSlots { reply } => {
-                            let slots = rt.collect_prompt_slots().await;
+                        Request::CollectPromptSlots { config, reply } => {
+                            let slots = rt.collect_prompt_slots(&config).await;
                             let _ = reply.send(slots);
                         }
                         Request::CollectPluginOptions { reply } => {

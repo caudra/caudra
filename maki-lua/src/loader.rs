@@ -8,7 +8,7 @@ use std::time::Duration;
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, canonical_json_sha256};
 use maki_agent::tools::ToolRegistry;
-use maki_config::{PluginsConfig, RawConfig};
+use maki_config::{AgentConfig, PluginsConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -582,15 +582,21 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+    pub fn collect_prompt_slots(&self, config: &AgentConfig) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            config: config.clone(),
+            reply: tx,
+        });
         rx.recv().unwrap_or_default()
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+    pub async fn collect_prompt_slots_async(&self, config: &AgentConfig) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            config: config.clone(),
+            reply: tx,
+        });
         rx.recv_async().await.unwrap_or_default()
     }
 
@@ -668,6 +674,9 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    const BASH_SOURCE: &str = include_str!("../../plugins/bash/init.lua");
+    const RTK_PROMPT_HINT: &str = "- RTK is active and transparently compacts output from many Bash commands, so results may differ from regular shell output. To bypass RTK for one command, prefix it with `RTK_DISABLED=1`; only do this when uncompacted output would be valuable.";
+
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
@@ -708,14 +717,14 @@ mod tests {
         let handle = host.event_handle();
         host.begin_shutdown();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
         assert!(
             contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
             "dead host must yield defaults, not real slots"
         );
 
         drop(host);
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
@@ -724,7 +733,41 @@ mod tests {
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
+        (host, slots)
+    }
+
+    fn bash_prompt_slots(
+        probe_exit_code: i32,
+        globally_disabled: bool,
+        config: &AgentConfig,
+    ) -> (PluginHost, ResolvedSlots) {
+        let disabled_value = if globally_disabled { r#""1""# } else { "nil" };
+        let stubs = format!(
+            r#"
+            local probe_count = 0
+            maki.uv.os_getenv = function(name)
+              if name == "RTK_DISABLED" then return {disabled_value} end
+              return nil
+            end
+            maki.fn.jobstart = function(command, opts)
+              assert(command == "rtk --version")
+              assert(opts and opts.owner == "plugin")
+              probe_count = probe_count + 1
+              assert(probe_count == 1, "rtk availability must be cached")
+              return probe_count
+            end
+            maki.fn.jobwait = function()
+              return {{ exit_code = {probe_exit_code}, stdout = "", stderr = "" }}
+            end
+            "#
+        );
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("bash_prompt_test", &(stubs + BASH_SOURCE))
+            .unwrap();
+        let slots = host.event_handle().collect_prompt_slots(config);
         (host, slots)
     }
 
@@ -974,6 +1017,79 @@ mod tests {
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
+    #[test]
+    fn callback_receives_effective_agent_config() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "config_cb",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(config)
+                    return config.no_rtk and "disabled" or "enabled"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let mut config = AgentConfig::default();
+        let slots = host.event_handle().collect_prompt_slots(&config);
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["enabled"]
+        );
+
+        config.no_rtk = true;
+        let slots = host.event_handle().collect_prompt_slots(&config);
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["disabled"]
+        );
+    }
+
+    #[test]
+    fn available_rtk_hint_lands_in_every_tool_usage_prompt_and_probe_is_cached() {
+        let config = AgentConfig::default();
+        let (host, slots) = bash_prompt_slots(0, false, &config);
+        for &prompt in PromptId::ALL {
+            assert!(
+                contents(&slots, prompt, Slot::ToolUsage).contains(&RTK_PROMPT_HINT),
+                "missing RTK hint from {prompt}"
+            );
+        }
+
+        let slots = host.event_handle().collect_prompt_slots(&config);
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+    }
+
+    #[test]
+    fn unavailable_or_disabled_rtk_contributes_no_hint() {
+        let default_config = AgentConfig::default();
+        let (_, slots) = bash_prompt_slots(1, false, &default_config);
+        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+
+        let (_, slots) = bash_prompt_slots(0, true, &default_config);
+        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+
+        let no_rtk = AgentConfig {
+            no_rtk: true,
+            ..AgentConfig::default()
+        };
+        let (_, slots) = bash_prompt_slots(0, false, &no_rtk);
+        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+
+        let mut disabled_bash = AgentConfig::default();
+        disabled_bash.disabled_tools.push("bash".to_owned());
+        let (_, slots) = bash_prompt_slots(0, false, &disabled_bash);
+        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+
+        let mut excluded_bash = AgentConfig::default();
+        excluded_bash.allowed_tools.push("read".to_owned());
+        let (_, slots) = bash_prompt_slots(0, false, &excluded_bash);
+        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
+    }
+
     /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.
     #[test]
     fn static_no_prompt_lands_on_all_prompts_with_slot() {
@@ -1069,7 +1185,9 @@ mod tests {
             )
             .unwrap();
         }
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
@@ -1091,7 +1209,7 @@ mod tests {
         .unwrap();
         let handle = host.event_handle();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["usage"]
@@ -1102,7 +1220,7 @@ mod tests {
         );
 
         host.unload("multi").unwrap();
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
         assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
@@ -1171,7 +1289,9 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
         let entries = slots.get(PromptId::System, Slot::Identity);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.last().unwrap().content, "ZZZ");
@@ -1262,7 +1382,9 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["HINT"]

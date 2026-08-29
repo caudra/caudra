@@ -873,7 +873,7 @@ async fn run_command(
 ///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
-///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
+///   content (string|function) Required. Static text, or a `function(config)` that receives the effective agent config and returns a string or nil. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
 /// @example
@@ -918,7 +918,7 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///
 /// @param spec table Spec fields mirror `register_prompt_hint`:
 ///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
-///   content (string|function) Required. Static text or a `function()` returning a string. Max 1 MiB.
+///   content (string|function) Required. Static text, or a `function(config)` that receives the effective agent config and returns a string or nil. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
 /// @return
 /// @example

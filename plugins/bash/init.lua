@@ -2,6 +2,8 @@ local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
+local RTK_PROMPT_HINT =
+  "- RTK is active and transparently compacts output from many Bash commands, so results may differ from regular shell output. To bypass RTK for one command, prefix it with `RTK_DISABLED=1`; only do this when uncompacted output would be valuable."
 local SMALL_OUTPUT_MAX_BYTES = 8 * 1024
 local FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 local CONTROL_RESERVE_BYTES = 256
@@ -116,14 +118,32 @@ local function rtk_find_unsupported(cmd)
   return false
 end
 
-local function rtk_rewrite(command, ctx)
-  local config = ctx:config()
-  if config and config.no_rtk then
-    return nil
+local function includes(values, expected)
+  for _, value in ipairs(values or {}) do
+    if value == expected then
+      return true
+    end
   end
+  return false
+end
 
+local function rtk_enabled(config)
+  if maki.uv.os_getenv("RTK_DISABLED") == "1" then
+    return false
+  end
+  if not config then
+    return true
+  end
+  if config.no_rtk or includes(config.disabled_tools, "bash") then
+    return false
+  end
+  local allowed_tools = config.allowed_tools or {}
+  return #allowed_tools == 0 or includes(allowed_tools, "bash")
+end
+
+local function rtk_is_available()
   if rtk_available == nil then
-    local id = maki.fn.jobstart("rtk --version")
+    local id = maki.fn.jobstart("rtk --version", { owner = "plugin" })
     local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
     if result then
       rtk_available = (result.exit_code == 0)
@@ -132,8 +152,11 @@ local function rtk_rewrite(command, ctx)
       rtk_available = false
     end
   end
+  return rtk_available
+end
 
-  if not rtk_available then
+local function rtk_rewrite(command, ctx)
+  if not rtk_enabled(ctx:config()) or not rtk_is_available() then
     return nil
   end
 
@@ -294,6 +317,16 @@ Commands run in the current working directory by default.
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+})
+
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = function(config)
+    if rtk_enabled(config) and rtk_is_available() then
+      return RTK_PROMPT_HINT
+    end
+    return nil
+  end,
 })
 
 local opts = maki.api.register_options(output_limits.extend({
