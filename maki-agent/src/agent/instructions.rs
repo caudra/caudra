@@ -7,6 +7,7 @@ use maki_providers::model::Model;
 
 use crate::AgentMode;
 use crate::command::find_project_ancestor_dirs;
+use crate::prompt::profile::SystemPromptProfile;
 use crate::template::Vars;
 
 const INSTRUCTION_FILES: &[&str] = &[
@@ -57,20 +58,20 @@ pub fn build_system_prompt(
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     model: &Model,
+    profile: Option<&SystemPromptProfile>,
 ) -> String {
     let env = vars.apply(
         "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
     );
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
-
-    if let Some(plan_path) = mode.plan_path() {
+    let plan = if let Some(plan_path) = mode.plan_path() {
         let plan_vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
-        out.push_str(&plan_vars.apply(crate::prompt::PLAN_PROMPT));
-    }
-
-    out
+        plan_vars.apply(crate::prompt::PLAN_PROMPT).into_owned()
+    } else {
+        String::new()
+    };
+    crate::prompt::assemble_system(slots, &instructions, &plan, profile)
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -227,7 +228,7 @@ mod tests {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(&vars, mode, "", &slots, &model);
+        let prompt = build_system_prompt(&vars, mode, "", &slots, &model, None);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
@@ -255,6 +256,7 @@ mod tests {
             &format!("\n{INSTR}"),
             &slots,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            None,
         );
         let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
         assert!(

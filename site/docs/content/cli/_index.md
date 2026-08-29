@@ -24,6 +24,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
+| `--system-prompt-profile` | yes | yes | yes |
 | `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
@@ -52,6 +53,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
+| `--system-prompt-profile <NAME>` | Select a profile from the user `system-prompts` config directory. See [System Prompt Profiles](/docs/system-prompts/) |
 | `--session-id <ID>` | Session id for SDK mode |
 | `--fork-session` | Load a session's history under a new id (SDK) |
 | `--max-turns <N>` | Cap agent turns (SDK) |

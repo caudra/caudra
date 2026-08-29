@@ -41,7 +41,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo, cli.no_plugins, cli.no_jit)?;
+            acp::run(
+                model,
+                yolo,
+                cli.no_plugins,
+                cli.no_jit,
+                cli.system_prompt_profile,
+            )?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
@@ -60,6 +66,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.no_plugins,
                 cli.no_jit,
                 cli.no_rtk,
+                cli.system_prompt_profile.as_deref(),
             )?;
         }
         None => {

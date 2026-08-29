@@ -501,6 +501,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
+    pub system_prompt_profile: Option<String>,
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
@@ -515,6 +516,7 @@ impl AgentFileConfig {
         merge_option!(
             self,
             overlay,
+            system_prompt_profile,
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
@@ -1095,6 +1097,14 @@ impl Default for ToolOutputLines {
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
+    #[config(
+        ty = "String",
+        default = "None",
+        default_doc = "builtin",
+        desc = "Default user system prompt profile from the system-prompts config directory"
+    )]
+    pub system_prompt_profile: Option<String>,
+
     #[config(default = DEFAULT_MAX_OUTPUT_BYTES, min = MIN_OUTPUT_BYTES, desc = "Host-enforced default max tool-result size (bytes)")]
     pub max_output_bytes: usize,
 
@@ -1144,6 +1154,9 @@ impl AgentConfig {
     fn from_file(file: AgentFileConfig, no_rtk: bool, disabled_tools: Vec<String>) -> Self {
         Self {
             no_rtk,
+            system_prompt_profile: file
+                .system_prompt_profile
+                .filter(|profile| profile != "builtin"),
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
             max_continuation_turns: file
@@ -2331,6 +2344,32 @@ mod tests {
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn builtin_system_prompt_profile_clears_global_selection() {
+        let mut global = RawConfig {
+            agent: AgentFileConfig {
+                system_prompt_profile: Some("review".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        global.merge(RawConfig {
+            agent: AgentFileConfig {
+                system_prompt_profile: Some("builtin".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            global
+                .into_config(false)
+                .unwrap()
+                .agent
+                .system_prompt_profile,
+            None
+        );
     }
 
     #[test]

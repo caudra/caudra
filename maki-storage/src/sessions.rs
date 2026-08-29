@@ -185,6 +185,8 @@ pub enum StoredPromptAdmission {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_head: Option<MakiId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_revert: Option<PendingConversationRevert>,

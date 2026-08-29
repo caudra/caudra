@@ -44,6 +44,7 @@ use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEdito
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -63,6 +64,7 @@ use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, RevokedRuleScope};
+use maki_agent::prompt::profile::PromptProfileCatalog;
 use maki_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
@@ -216,6 +218,7 @@ pub struct App {
     subagent_drafts: HashMap<String, InputDraft>,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
+    pub(super) prompt_profile_picker: PromptProfilePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -325,6 +328,7 @@ impl App {
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
         model_policy: Arc<ModelPolicy>,
+        prompt_profiles: Arc<PromptProfileCatalog>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
@@ -353,6 +357,7 @@ impl App {
                 lua_command_reader,
             ),
             theme_picker: ThemePicker::new(),
+            prompt_profile_picker: PromptProfilePicker::new(Arc::clone(&prompt_profiles)),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
@@ -753,6 +758,7 @@ impl App {
         try_picker!(self.message_actions);
         try_picker!(self.review);
         try_picker!(self.model_picker);
+        try_picker!(self.prompt_profile_picker);
         try_picker!(self.file_picker);
         try_picker!(self.permissions_picker);
         let zone = self.zone_at(row, column)?.zone;
@@ -984,6 +990,11 @@ impl App {
             return Some(self.handle_theme_picker_action(action));
         }
 
+        if self.prompt_profile_picker.is_open() {
+            let action = self.prompt_profile_picker.handle_key(key);
+            return Some(self.handle_prompt_profile_picker_action(action));
+        }
+
         if self.model_picker.is_open() {
             let action = self.model_picker.handle_key(key);
             return Some(self.handle_model_picker_action(action));
@@ -1167,6 +1178,18 @@ impl App {
 
     fn handle_theme_picker_action(&self, _action: ThemePickerAction) -> Vec<Action> {
         Vec::new()
+    }
+
+    fn handle_prompt_profile_picker_action(
+        &mut self,
+        action: PromptProfilePickerAction,
+    ) -> Vec<Action> {
+        match action {
+            PromptProfilePickerAction::Consumed | PromptProfilePickerAction::Closed => Vec::new(),
+            PromptProfilePickerAction::Select(name) => {
+                vec![Action::ChangeSystemPromptProfile(name)]
+            }
+        }
     }
 
     fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
@@ -2293,6 +2316,11 @@ impl App {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
             }
+            "/system-prompt" => {
+                self.prompt_profile_picker
+                    .open(&self.state.system_prompt_profile_name);
+                vec![]
+            }
             "/review" => self.run_builtin(BuiltinAction::Review),
             "/theme" => {
                 self.theme_picker.open();
@@ -2552,7 +2580,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 17] {
+    fn overlays(&self) -> [&dyn Overlay; 18] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2566,6 +2594,7 @@ impl App {
             &self.message_actions,
             &self.review,
             &self.theme_picker,
+            &self.prompt_profile_picker,
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
@@ -2574,7 +2603,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 17] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2588,6 +2617,7 @@ impl App {
             &mut self.message_actions,
             &mut self.review,
             &mut self.theme_picker,
+            &mut self.prompt_profile_picker,
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
@@ -2771,6 +2801,7 @@ impl App {
         try_picker!(self.message_actions);
         try_picker!(self.review);
         try_picker!(self.theme_picker);
+        try_picker!(self.prompt_profile_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.permissions_picker);

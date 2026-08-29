@@ -119,6 +119,7 @@ fn build_app_with_lua(
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),
         Arc::new(maki_config::ModelPolicy::default()),
+        Arc::new(maki_agent::prompt::profile::PromptProfileCatalog::default()),
     )
 }
 
@@ -2478,6 +2479,13 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     });
 }
 
+#[test]
+fn system_prompt_command_opens_profile_picker() {
+    let mut app = test_app();
+    app.execute_command(cmd("/system-prompt"), 0);
+    assert!(app.prompt_profile_picker.is_open());
+}
+
 /// Tool output streams into a subagent's chat while the parent chat is the one
 /// on screen. Draining only the active chat would lose it, and the task picker
 /// and a later switch would show nothing.
@@ -3919,6 +3927,11 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.unsent_subagent_messages.clear();
 
+    session.meta.system_prompt_profile = Some("review".into());
+    assert!(session_has_content(&session));
+    session.meta.system_prompt_profile = Some("builtin".into());
+    assert!(!session_has_content(&session));
+
     session.meta.mode = Some(StoredMode::Plan);
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
@@ -3972,6 +3985,17 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     let mut app = test_app();
     app.checkpoint();
     assert!(!session_has_content(&app.state.session));
+    assert_eq!(
+        app.state.session.meta.system_prompt_profile.as_deref(),
+        Some("builtin")
+    );
+
+    app.state.system_prompt_profile_name = "review".into();
+    app.checkpoint();
+    assert!(session_has_content(&app.state.session));
+    app.state.system_prompt_profile_name = "builtin".into();
+    app.checkpoint();
+    assert!(!session_has_content(&app.state.session));
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     app.checkpoint();
@@ -3995,6 +4019,21 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
     assert!(session_has_content(session));
+}
+
+#[test]
+fn invocation_profile_override_does_not_replace_stored_selection() {
+    let mut app = test_app();
+    app.state.session_mut().meta.system_prompt_profile = Some("stored".into());
+    app.state.system_prompt_profile_name = "override".into();
+    app.state.system_prompt_profile_override = true;
+
+    app.checkpoint();
+
+    assert_eq!(
+        app.state.session.meta.system_prompt_profile.as_deref(),
+        Some("stored")
+    );
 }
 
 #[test]
@@ -5912,6 +5951,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.thinking = ThinkingConfig::Adaptive;
     app.state.fast = true;
     app.state.workflow = true;
+    app.state.system_prompt_profile_name = "review".into();
     app.permissions.load_session_rules(vec![PermissionRule {
         tool: ToolKey::parse("bash").unwrap(),
         scope: Some("cargo test".into()),
@@ -5937,6 +5977,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert_eq!(child.meta.thinking, Some(StoredThinking::Adaptive));
     assert!(child.meta.fast);
     assert!(child.meta.workflow);
+    assert_eq!(child.meta.system_prompt_profile.as_deref(), Some("review"));
     assert!(child.meta.session_rules.is_empty());
     assert_eq!(child.meta.yolo, None);
     assert_eq!(child.token_usage, TokenUsage::default());

@@ -20,6 +20,7 @@ pub(crate) mod permission_prompt;
 pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
+pub(crate) mod prompt_profile_picker;
 pub mod queue_panel;
 pub(crate) mod review;
 pub(crate) mod rewind_picker;
@@ -226,6 +227,7 @@ pub enum Action {
     UnrevertSession,
     ChangeWorkingDirectory(PathBuf),
     ChangeModel(String),
+    ChangeSystemPromptProfile(String),
     RefreshProvider {
         slug: String,
     },

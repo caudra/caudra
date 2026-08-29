@@ -4,6 +4,7 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_agent::prompt::profile::PromptProfileCatalog;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
@@ -11,7 +12,13 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
-pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn run(
+    model_arg: Option<String>,
+    yolo: bool,
+    no_plugins: bool,
+    no_jit: bool,
+    profile_arg: Option<String>,
+) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -56,6 +63,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     let prompt_slots = plugin_host
         .event_handle()
         .collect_prompt_slots(&config.agent);
+    let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
 
     maki_acp::run(maki_acp::AcpParams {
         model,
@@ -64,6 +72,8 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         timeouts,
         initial_wd: cwd,
         prompt_slots: Arc::new(prompt_slots),
+        prompt_profiles,
+        system_prompt_profile_override: profile_arg,
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),

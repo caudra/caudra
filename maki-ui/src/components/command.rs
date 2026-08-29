@@ -55,6 +55,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/system-prompt",
+        description: "Switch system prompt profile",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/review",
         description: "Review the last reply passage by passage",
         max_args: 0,

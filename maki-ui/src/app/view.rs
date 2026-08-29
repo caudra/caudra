@@ -287,6 +287,7 @@ impl App {
         render_if_open!(self.message_actions);
         render_if_open!(self.review);
         render_if_open!(self.theme_picker);
+        render_if_open!(self.prompt_profile_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
@@ -513,7 +514,7 @@ impl App {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
-        } else if self.theme_picker.is_open() {
+        } else if self.theme_picker.is_open() || self.prompt_profile_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);

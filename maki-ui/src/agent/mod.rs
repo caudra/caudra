@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::profile::SystemPromptProfile;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
     McpHandle, McpSnapshotReader, SessionMailbox, SharedHistory, SubagentHistoryStore,
@@ -81,6 +82,7 @@ impl AgentHandles {
         model_policy: Arc<ModelPolicy>,
         goal: maki_agent::GoalHandle,
         subagent_history: SubagentHistoryStore,
+        system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -97,6 +99,7 @@ impl AgentHandles {
             model_policy,
             goal,
             subagent_history,
+            system_prompt_profile,
         )
     }
 
@@ -197,6 +200,7 @@ impl AgentHandles {
             Arc::clone(&self.model_policy),
             app.state.goal.clone(),
             subagent_history,
+            app.state.system_prompt_profile.clone(),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -263,6 +267,7 @@ fn spawn_agent_internal(
     model_policy: Arc<ModelPolicy>,
     goal: maki_agent::GoalHandle,
     subagent_history: SubagentHistoryStore,
+    system_prompt_profile: Option<Arc<SystemPromptProfile>>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -309,6 +314,7 @@ fn spawn_agent_internal(
         subagent_history.clone(),
         Arc::clone(&model_policy),
         goal.clone(),
+        system_prompt_profile,
     );
 
     let task = smol::spawn(agent_loop.run());
@@ -424,6 +430,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             maki_agent::GoalHandle::default(),
             SubagentHistoryStore::default(),
+            None,
         );
         (handles, model_slot, permissions)
     }

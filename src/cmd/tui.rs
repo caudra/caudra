@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
+use maki_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
@@ -32,7 +33,16 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    prompt_profiles: Arc<PromptProfileCatalog>,
+    default_prompt_profile: Option<Arc<SystemPromptProfile>>,
 }
+
+type StackFallback = (
+    Config,
+    Model,
+    Arc<PromptProfileCatalog>,
+    Option<Arc<SystemPromptProfile>>,
+);
 
 impl Stack {
     fn timeouts(&self) -> maki_providers::Timeouts {
@@ -113,11 +123,11 @@ fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config
     Ok(config)
 }
 
-fn config_or_fallback(
-    loaded: Result<Config>,
-    fallback: Option<Config>,
+fn config_or_fallback<T>(
+    loaded: Result<T>,
+    fallback: Option<T>,
     warnings: &mut Vec<String>,
-) -> Result<Config> {
+) -> Result<T> {
     match (loaded, fallback) {
         (Ok(config), _) => Ok(config),
         (Err(e), Some(last_good)) => {
@@ -135,20 +145,37 @@ fn build_stack(
     cli: &Cli,
     cwd: &Path,
     storage: &StateDir,
-    fallback: Option<(Config, Model)>,
+    fallback: Option<StackFallback>,
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
-    let (fallback_config, fallback_model) = fallback.unzip();
+    let (fallback_config, fallback_model) = match fallback {
+        Some((config, model, profiles, selected)) => {
+            (Some((config, profiles, selected)), Some(model))
+        }
+        None => (None, None),
+    };
     let reloading = fallback_model.is_some();
-    let config = config_or_fallback(
-        load_config(&plugin_host, cli, cwd),
-        fallback_config,
-        &mut warnings,
-    )?;
+    let loaded = load_config(&plugin_host, cli, cwd).and_then(|config| {
+        let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
+        let selected_name = cli
+            .system_prompt_profile
+            .as_deref()
+            .or(config.agent.system_prompt_profile.as_deref());
+        let default_prompt_profile = if cli.is_sdk_mode() {
+            None
+        } else {
+            prompt_profiles
+                .resolve(selected_name)
+                .context("resolve system prompt profile")?
+        };
+        Ok((config, prompt_profiles, default_prompt_profile))
+    });
+    let (config, prompt_profiles, default_prompt_profile) =
+        config_or_fallback(loaded, fallback_config, &mut warnings)?;
 
     if let Err(e) = plugin_host.load_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
@@ -182,6 +209,8 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            prompt_profiles,
+            default_prompt_profile,
         },
         warnings,
     ))
@@ -263,6 +292,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             permissions_config: stack.config.permissions,
             timeouts,
             prompt_slots,
+            prompt_profiles: stack.prompt_profiles,
             fast,
             workflow: stack.config.always_workflow,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
@@ -286,6 +316,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.event_handle(),
             fast,
             stack.config.always_workflow,
+            stack.default_prompt_profile,
             Arc::new(stack.config.provider.model_policy.clone()),
             stack.plugin_host.plugin_rules(),
         )
@@ -354,6 +385,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                prompt_profiles: Arc::clone(&stack.prompt_profiles),
+                default_prompt_profile: stack.default_prompt_profile.clone(),
+                prompt_profile_override: cli.system_prompt_profile.clone(),
             },
             initial_prompt.take(),
         )
@@ -384,7 +418,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 focused: f,
             } => {
                 let started = Instant::now();
-                let last_good = (stack.config.clone(), stack.model.clone());
+                let last_good = (
+                    stack.config.clone(),
+                    stack.model.clone(),
+                    Arc::clone(&stack.prompt_profiles),
+                    stack.default_prompt_profile.clone(),
+                );
                 // Shut the old host down first so nothing can repopulate
                 // the registry after the clear: its senders disconnect, the
                 // watchdog aborts in-flight callbacks, and only this thread
@@ -501,7 +540,7 @@ mod tests {
     #[test]
     fn broken_config_without_fallback_is_fatal() {
         let mut warnings = Vec::new();
-        let err = match config_or_fallback(Err(eyre!("boom")), None, &mut warnings) {
+        let err = match config_or_fallback::<Config>(Err(eyre!("boom")), None, &mut warnings) {
             Err(e) => e,
             Ok(_) => panic!("expected error without fallback"),
         };

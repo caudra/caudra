@@ -152,6 +152,7 @@ pub fn run(
     lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
+    system_prompt_profile: Option<Arc<maki_agent::prompt::profile::SystemPromptProfile>>,
     model_policy: Arc<ModelPolicy>,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<()> {
@@ -199,6 +200,7 @@ pub fn run(
         prompt,
         images,
         prompt_slots,
+        system_prompt_profile,
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,

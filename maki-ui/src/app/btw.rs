@@ -17,9 +17,6 @@ single response.\n- You have NO tools: you cannot read files, run commands, or t
 context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
 say so; do not offer to look it up.\n</system-reminder>";
 
-const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
-from the conversation context.";
-
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 pub(crate) fn btw_question(question: &str) -> Message {
     Message::user(format!("{BTW_REMINDER}\n\n{question}"))
@@ -48,12 +45,16 @@ impl App {
             }
         };
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
-        let system = self
+        let Some(system) = self
             .btw_system
             .as_ref()
             .map(|s| String::clone(&s.load()))
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
+        else {
+            self.status_bar
+                .flash("System prompt is still initializing".into());
+            return;
+        };
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);

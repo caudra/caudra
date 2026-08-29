@@ -65,6 +65,11 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
         || session.meta.goal_result.is_some()
         || session.meta.pending_revert.is_some()
         || !session.meta.structured_permission_rules.is_empty()
+        || session
+            .meta
+            .system_prompt_profile
+            .as_deref()
+            .is_some_and(|profile| profile != maki_agent::prompt::profile::BUILTIN_PROFILE_NAME)
         || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
@@ -200,6 +205,11 @@ impl App {
             self.recoverable_queue.clone()
         };
         SessionMeta {
+            system_prompt_profile: if state.system_prompt_profile_override {
+                state.session.meta.system_prompt_profile.clone()
+            } else {
+                Some(state.system_prompt_profile_name.clone())
+            },
             history_head: state.session.meta.history_head,
             pending_revert: state.session.meta.pending_revert.clone(),
             mode: Some(state.mode.into()),
@@ -1079,6 +1089,11 @@ impl App {
             .map_err(|error| format!("Failed to read session history: {error}"))?;
         let mut child = AppSession::new(&self.state.session.model, &self.state.session.cwd);
         child.meta = SessionMeta {
+            system_prompt_profile: if self.state.system_prompt_profile_override {
+                self.state.session.meta.system_prompt_profile.clone()
+            } else {
+                Some(self.state.system_prompt_profile_name.clone())
+            },
             mode: Some(self.state.mode.into()),
             plan_path: self
                 .state

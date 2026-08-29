@@ -14,14 +14,14 @@ Everything the model knows about your project passes through one context window,
 ```
 session start (paid every request)   on demand (paid when used)
 ──────────────────────────────────   ─────────────────────────────────
-system prompt                        file contents   read / index / grep
+effective system prompt              file contents   read / index / grep
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
 memory tag names                     subdir rules    first read there
 skill names + descriptions           MCP tool defs   tool_search
 ```
 
-The left column is the fixed overhead of every single request, so Maki keeps it small on purpose: a skill contributes one description line, memories one list of tags, a big MCP server one search tool. The bodies stay on disk until the agent asks.
+The left column is the fixed overhead of every single request, so Maki keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memories one list of tags, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
 
 ## Instruction files
 

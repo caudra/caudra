@@ -113,6 +113,10 @@ pub struct Cli {
     #[arg(long)]
     pub system_prompt: Option<String>,
 
+    /// Select a user system prompt profile
+    #[arg(long, value_name = "NAME", conflicts_with = "system_prompt")]
+    pub system_prompt_profile: Option<String>,
+
     /// Append to system prompt
     #[arg(long)]
     pub append_system_prompt: Option<String>,
@@ -340,5 +344,21 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    #[test]
+    fn system_prompt_profile_parses_and_conflicts_with_raw_override() {
+        let cli = Cli::try_parse_from(["maki", "--system-prompt-profile", "review"]).unwrap();
+        assert_eq!(cli.system_prompt_profile.as_deref(), Some("review"));
+        assert!(
+            Cli::try_parse_from([
+                "maki",
+                "--system-prompt-profile",
+                "review",
+                "--system-prompt",
+                "raw",
+            ])
+            .is_err()
+        );
     }
 }

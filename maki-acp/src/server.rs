@@ -23,6 +23,7 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{McpServerStatus, RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, PermissionRequest as MakiPermissionRequest};
+use maki_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
@@ -265,6 +266,7 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
+    let (profile_name, profile) = resolve_prompt_profile(params, None)?;
     preflight_mcp(&req.cwd, &req.mcp_servers).await?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await?;
@@ -272,11 +274,14 @@ async fn new_session(
     let (handle, pending) = spawn_session(
         srv,
         params,
-        req.cwd,
-        None,
-        Vec::new(),
-        (Vec::new(), Vec::new(), None),
-        mcp.clone(),
+        SessionStart {
+            cwd: req.cwd,
+            session_id: None,
+            history: Vec::new(),
+            permissions: (Vec::new(), Vec::new(), None),
+            profile: (profile_name, profile),
+            mcp_handle: mcp.clone(),
+        },
     );
     maki_otel::emit::session_started(
         maki_otel::emit::START_FRESH,
@@ -301,6 +306,8 @@ async fn load_session(
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
+    let (profile_name, profile) =
+        resolve_prompt_profile(params, restored.system_prompt_profile.as_deref())?;
     preflight_mcp(&req.cwd, &req.mcp_servers).await?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await?;
@@ -316,15 +323,18 @@ async fn load_session(
     let (handle, pending) = spawn_session(
         srv,
         params,
-        req.cwd,
-        Some(session_ref),
-        history.into_items(),
-        (
-            std::mem::take(&mut restored.session_rules),
-            std::mem::take(&mut restored.structured_permission_rules),
-            restored.yolo,
-        ),
-        mcp.clone(),
+        SessionStart {
+            cwd: req.cwd,
+            session_id: Some(session_ref),
+            history: history.into_items(),
+            permissions: (
+                std::mem::take(&mut restored.session_rules),
+                std::mem::take(&mut restored.structured_permission_rules),
+                restored.yolo,
+            ),
+            profile: (profile_name, profile),
+            mcp_handle: mcp.clone(),
+        },
     );
     maki_otel::emit::session_started(
         maki_otel::emit::START_RESUME,
@@ -346,14 +356,19 @@ async fn load_session(
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
-fn spawn_session(
-    srv: &Server,
-    params: &AcpParams,
+struct SessionStart {
     cwd: PathBuf,
     session_id: Option<SessionRef>,
     history: Vec<HistoryItem>,
-    session_permissions: (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>),
+    permissions: (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>),
+    profile: (String, Option<Arc<SystemPromptProfile>>),
     mcp_handle: Option<McpHandle>,
+}
+
+fn spawn_session(
+    srv: &Server,
+    params: &AcpParams,
+    start: SessionStart,
 ) -> (InteractiveHandle, PendingState) {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
@@ -366,18 +381,21 @@ fn spawn_session(
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
-    let (session_rules, structured_permission_rules, session_yolo) = session_permissions;
+    let (session_rules, structured_permission_rules, session_yolo) = start.permissions;
+    let (system_prompt_profile_name, system_prompt_profile) = start.profile;
     let handle = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
+        system_prompt_profile,
+        system_prompt_profile_name: Some(system_prompt_profile_name),
         excluded_tools,
-        mcp_handle,
-        initial_wd: cwd,
-        session_id,
-        initial_history: history,
+        mcp_handle: start.mcp_handle,
+        initial_wd: start.cwd,
+        session_id: start.session_id,
+        initial_history: start.history,
         yolo: params.yolo,
         session_rules,
         structured_permission_rules,
@@ -390,6 +408,25 @@ fn spawn_session(
         local_tools,
     });
     (handle, pending)
+}
+
+fn resolve_prompt_profile(
+    params: &AcpParams,
+    stored_name: Option<&str>,
+) -> Result<(String, Option<Arc<SystemPromptProfile>>), AcpError> {
+    let requested_name = params
+        .system_prompt_profile_override
+        .as_deref()
+        .or(stored_name)
+        .or(params.config.system_prompt_profile.as_deref());
+    let profile = params
+        .prompt_profiles
+        .resolve(requested_name)
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    Ok((
+        requested_name.unwrap_or(BUILTIN_PROFILE_NAME).to_owned(),
+        profile,
+    ))
 }
 
 /// Sends a request the client must answer, registering it first so the
@@ -601,6 +638,7 @@ struct Restored {
     session_rules: Vec<StoredRule>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
     yolo: Option<bool>,
+    system_prompt_profile: Option<String>,
 }
 
 fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
@@ -639,6 +677,7 @@ fn load_history_from(
         session_rules: session.meta.session_rules.clone(),
         structured_permission_rules: session.meta.structured_permission_rules.clone(),
         yolo: session.meta.yolo,
+        system_prompt_profile: session.meta.system_prompt_profile.clone(),
         history,
     })
 }
@@ -1358,6 +1397,7 @@ mod tests {
             .unwrap(),
         ];
         session.meta.yolo = Some(true);
+        session.meta.system_prompt_profile = Some("review".into());
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
@@ -1372,6 +1412,7 @@ mod tests {
             session.meta.structured_permission_rules
         );
         assert_eq!(restored.yolo, Some(true));
+        assert_eq!(restored.system_prompt_profile.as_deref(), Some("review"));
     }
 
     #[test]

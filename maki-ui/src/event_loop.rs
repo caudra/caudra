@@ -20,6 +20,9 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::profile::{
+    BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
+};
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -104,6 +107,9 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
+    pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    pub prompt_profile_override: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -308,7 +314,7 @@ impl SessionRuntime {
     fn quiescent(&self) -> bool {
         runtime_state_quiescent(
             SessionStatus::of(&self.app),
-            self.handles.queue.is_empty(),
+            self.handles.queue.is_empty() && !self.handles.queue.is_processing(),
             self.handles.active_background_tasks(),
             self.app.shell.active_ids().len(),
             self.app.holds_recovery_text(),
@@ -446,9 +452,42 @@ struct SpawnCtx {
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
+    prompt_profiles: Arc<PromptProfileCatalog>,
+    default_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    prompt_profile_override: Option<String>,
 }
 
 impl SpawnCtx {
+    fn resolve_prompt_profile(
+        &self,
+        session: &AppSession,
+    ) -> (String, Option<Arc<SystemPromptProfile>>, Option<String>) {
+        let requested_name = self
+            .prompt_profile_override
+            .as_deref()
+            .or(session.meta.system_prompt_profile.as_deref())
+            .or_else(|| {
+                self.default_prompt_profile
+                    .as_deref()
+                    .map(SystemPromptProfile::name)
+            });
+        match self.prompt_profiles.resolve(requested_name) {
+            Ok(profile) => (
+                requested_name.unwrap_or(BUILTIN_PROFILE_NAME).to_owned(),
+                profile,
+                None,
+            ),
+            Err(error) => (
+                BUILTIN_PROFILE_NAME.to_owned(),
+                None,
+                Some(format!(
+                    "Could not use system prompt profile {:?}: {error}. Using built-in prompt.",
+                    requested_name.unwrap_or(BUILTIN_PROFILE_NAME)
+                )),
+            ),
+        }
+    }
+
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime, String> {
         let (session, snapshot_store) =
             prepare_session_for_runtime(&self.storage, &self.storage_writer, session)?;
@@ -460,6 +499,8 @@ impl SpawnCtx {
             }
         };
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
+        let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
+            self.resolve_prompt_profile(&session);
         let permissions = Arc::new(self.permissions.fork());
         permissions.load_session_rules(stored_to_rules(&session.meta.session_rules));
         permissions.set_session_yolo(session.meta.yolo);
@@ -479,6 +520,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             goal,
             subagent_history,
+            system_prompt_profile.clone(),
         );
         let mut app = App::new(
             &self.model_slot.load().model,
@@ -498,7 +540,14 @@ impl SpawnCtx {
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
+            Arc::clone(&self.prompt_profiles),
         );
+        app.state.system_prompt_profile_name = system_prompt_profile_name;
+        app.state.system_prompt_profile = system_prompt_profile;
+        app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
+        if let Some(warning) = profile_warning {
+            app.state.warnings.push(warning);
+        }
         handles.apply_to_app(&mut app);
         if restore_session {
             app.restore_resumed_session();
@@ -642,6 +691,9 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            prompt_profiles,
+            default_prompt_profile,
+            prompt_profile_override,
         } = params;
 
         // Apply the config theme before the warmup thread spawns, or warmup
@@ -707,6 +759,9 @@ impl<'t> EventLoop<'t> {
             available_models: bg.available,
             storage_writer,
             model_policy,
+            prompt_profiles,
+            default_prompt_profile,
+            prompt_profile_override,
         };
 
         recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd)
@@ -1398,10 +1453,18 @@ impl<'t> EventLoop<'t> {
                 .map_err(|error| format!("failed to read current directory: {error}"))?,
         )?;
         validate_session_cwd(&session, &process_cwd)?;
+        let (profile_name, profile, profile_warning) = self.ctx.resolve_prompt_profile(&session);
         let focused = &mut self.sessions[self.focused];
         if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
             let model = focused.app.state.model.clone();
             let loaded = focused.app.apply_loaded_session(session, &model)?;
+            focused.app.state.system_prompt_profile_name = profile_name;
+            focused.app.state.system_prompt_profile = profile;
+            focused.app.state.system_prompt_profile_override =
+                self.ctx.prompt_profile_override.is_some();
+            if let Some(warning) = profile_warning {
+                focused.app.flash(warning);
+            }
             self.dispatch(self.focused, vec![Action::LoadSession(Box::new(loaded))]);
             return Ok(());
         }
@@ -1724,6 +1787,9 @@ impl<'t> EventLoop<'t> {
                     self.focused_app().flash(e);
                 }
             }
+            Action::ChangeSystemPromptProfile(name) => {
+                self.change_system_prompt_profile(idx, &name);
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(
@@ -1858,6 +1924,44 @@ impl<'t> EventLoop<'t> {
             provider: Arc::from(new_provider),
         }));
         Ok(())
+    }
+
+    fn change_system_prompt_profile(&mut self, idx: usize, name: &str) {
+        if self.sessions[idx].app.state.system_prompt_profile_name == name {
+            return;
+        }
+        if self.ctx.prompt_profile_override.is_some() {
+            self.sessions[idx].app.flash(
+                "System prompt is fixed by --system-prompt-profile for this invocation".into(),
+            );
+            return;
+        }
+        if !self.sessions[idx].quiescent() {
+            self.sessions[idx].app.flash(
+                "Cannot switch system prompt while the session has active or queued work".into(),
+            );
+            return;
+        }
+        let profile = match self.ctx.prompt_profiles.resolve(Some(name)) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.sessions[idx].app.flash(error.to_string());
+                return;
+            }
+        };
+        let history = self.sessions[idx]
+            .app
+            .shared_history
+            .as_ref()
+            .map(|history| history.load().messages.as_ref().clone())
+            .unwrap_or_default();
+        self.sessions[idx].app.state.system_prompt_profile_name = name.to_owned();
+        self.sessions[idx].app.state.system_prompt_profile = profile;
+        self.sessions[idx].app.checkpoint_now();
+        self.sessions[idx]
+            .app
+            .flash(format!("System prompt: {name}"));
+        self.respawn_agent(idx, history);
     }
 
     fn refresh_models(&self) {

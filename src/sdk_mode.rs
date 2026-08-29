@@ -23,6 +23,7 @@ use maki_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PluginRuleStore,
 };
 use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
@@ -461,6 +462,7 @@ pub struct SdkParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub fast: bool,
     pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
@@ -482,6 +484,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
+        prompt_profiles,
         fast,
         workflow,
         model_policy,
@@ -493,6 +496,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
     let requested_permission_mode =
         PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let system_prompt_override = cli.system_prompt.clone().filter(|s| !s.is_empty());
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
@@ -502,7 +506,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_rules,
         structured_permission_rules,
         session_yolo,
-    } = resolve_session(&cli, &working_dir)?;
+        stored_system_prompt_profile,
+    } = resolve_session(
+        &cli,
+        &working_dir,
+        &prompt_profiles,
+        config.system_prompt_profile.as_deref(),
+        system_prompt_override.is_some(),
+    )?;
     crate::setup::report_session_start(
         if initial_history.is_empty() {
             maki_otel::emit::START_FRESH
@@ -555,6 +566,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         })
         .unwrap_or_default();
 
+    let (system_prompt_profile_name, system_prompt_profile) = resolve_prompt_profile(
+        &prompt_profiles,
+        cli.system_prompt_profile.as_deref(),
+        stored_system_prompt_profile.as_deref(),
+        config.system_prompt_profile.as_deref(),
+        system_prompt_override.is_some(),
+    )?;
+
     let startup_model = model.clone();
     let handle = headless::spawn_interactive(InteractiveParams {
         model,
@@ -562,6 +581,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots: Arc::new(prompt_slots),
+        system_prompt_profile,
+        system_prompt_profile_name,
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd.clone(),
@@ -571,7 +592,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_rules,
         structured_permission_rules,
         session_yolo,
-        system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
+        system_prompt_override,
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
         model_policy: Arc::clone(&model_policy),
@@ -732,6 +753,7 @@ struct ResolvedSession {
     session_rules: Vec<StoredRule>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
     session_yolo: Option<bool>,
+    stored_system_prompt_profile: Option<String>,
 }
 
 fn session_permissions(
@@ -749,7 +771,13 @@ fn session_permissions(
     }
 }
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<ResolvedSession> {
+fn resolve_session(
+    cli: &Cli,
+    cwd: &str,
+    prompt_profiles: &PromptProfileCatalog,
+    configured_profile: Option<&str>,
+    raw_prompt_override: bool,
+) -> Result<ResolvedSession> {
     let cli_session_id = cli
         .session_id
         .as_deref()
@@ -760,94 +788,109 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<ResolvedSession> {
         })
         .transpose()?;
 
-    let (resumed_id, initial_history, session_rules, structured_permission_rules, session_yolo) =
-        if let Some(id) = &cli.session {
-            let storage = StateDir::resolve().context("resolve state dir")?;
-            let session_ref: SessionRef = id
-                .parse()
-                .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
-            let session = crate::setup::load_session(session_ref.id(), &storage)
-                .map_err(|e| eyre!("load session {id}: {e}"))?;
-            let history = crate::setup::active_session_history(&session)
-                .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
-            if cli.fork_session {
-                let (session_rules, structured_permission_rules, session_yolo) =
-                    session_permissions(&session, true);
-                let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
-                if target.id() == session_ref.id() {
-                    return Err(eyre!(
-                        "fork session ID must differ from source session {id}"
-                    ));
-                }
-                ensure_fork_target_available(&storage, &target)?;
-                let history = rebase_history(history)?;
-                let subagent_histories = session
-                    .subagent_messages()
-                    .iter()
-                    .map(|(task_id, items)| {
-                        rebase_history(items.as_ref().clone())
-                            .map(|history| (task_id.clone(), history))
-                    })
-                    .collect::<Result<HashMap<_, _>>>()?;
-                copy_history_outputs(
-                    &storage,
-                    &session_ref,
-                    &target,
-                    std::iter::once(history.as_slice())
-                        .chain(subagent_histories.values().map(Vec::as_slice)),
-                )?;
-                if let Err(error) =
-                    save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
-                {
-                    let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
-                    return Err(error);
-                }
-                (
-                    Some(target),
-                    history,
-                    session_rules,
-                    structured_permission_rules,
-                    session_yolo,
-                )
-            } else {
-                if cli_session_id
-                    .as_ref()
-                    .is_some_and(|target| target.id() != session_ref.id())
-                {
-                    return Err(eyre!(
-                        "--session-id cannot replace the resumed session ID without --fork-session"
-                    ));
-                }
+    let (
+        resumed_id,
+        initial_history,
+        session_rules,
+        structured_permission_rules,
+        session_yolo,
+        stored_system_prompt_profile,
+    ) = if let Some(id) = &cli.session {
+        let storage = StateDir::resolve().context("resolve state dir")?;
+        let session_ref: SessionRef = id
+            .parse()
+            .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
+        let session = crate::setup::load_session(session_ref.id(), &storage)
+            .map_err(|e| eyre!("load session {id}: {e}"))?;
+        let history = crate::setup::active_session_history(&session)
+            .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
+        if cli.fork_session {
+            resolve_prompt_profile(
+                prompt_profiles,
+                cli.system_prompt_profile.as_deref(),
+                session.meta.system_prompt_profile.as_deref(),
+                configured_profile,
+                raw_prompt_override,
+            )?;
+            let (session_rules, structured_permission_rules, session_yolo) =
+                session_permissions(&session, true);
+            let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
+            if target.id() == session_ref.id() {
+                return Err(eyre!(
+                    "fork session ID must differ from source session {id}"
+                ));
+            }
+            ensure_fork_target_available(&storage, &target)?;
+            let history = rebase_history(history)?;
+            let subagent_histories = session
+                .subagent_messages()
+                .iter()
+                .map(|(task_id, items)| {
+                    rebase_history(items.as_ref().clone()).map(|history| (task_id.clone(), history))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            copy_history_outputs(
+                &storage,
+                &session_ref,
+                &target,
+                std::iter::once(history.as_slice())
+                    .chain(subagent_histories.values().map(Vec::as_slice)),
+            )?;
+            if let Err(error) =
+                save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
+            {
+                let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
+                return Err(error);
+            }
+            (
+                Some(target),
+                history,
+                session_rules,
+                structured_permission_rules,
+                session_yolo,
+                session.meta.system_prompt_profile.clone(),
+            )
+        } else {
+            if cli_session_id
+                .as_ref()
+                .is_some_and(|target| target.id() != session_ref.id())
+            {
+                return Err(eyre!(
+                    "--session-id cannot replace the resumed session ID without --fork-session"
+                ));
+            }
+            let (session_rules, structured_permission_rules, session_yolo) =
+                session_permissions(&session, false);
+            (
+                Some(session_ref),
+                history,
+                session_rules,
+                structured_permission_rules,
+                session_yolo,
+                session.meta.system_prompt_profile.clone(),
+            )
+        }
+    } else if cli.continue_session {
+        let storage = StateDir::resolve().context("resolve state dir")?;
+        match crate::setup::latest_session(cwd, &storage) {
+            Ok(Some(session)) => {
+                let history = crate::setup::active_session_history(&session)?;
                 let (session_rules, structured_permission_rules, session_yolo) =
                     session_permissions(&session, false);
                 (
-                    Some(session_ref),
+                    Some(SessionRef::from(session.id)),
                     history,
                     session_rules,
                     structured_permission_rules,
                     session_yolo,
+                    session.meta.system_prompt_profile.clone(),
                 )
             }
-        } else if cli.continue_session {
-            let storage = StateDir::resolve().context("resolve state dir")?;
-            match crate::setup::latest_session(cwd, &storage) {
-                Ok(Some(session)) => {
-                    let history = crate::setup::active_session_history(&session)?;
-                    let (session_rules, structured_permission_rules, session_yolo) =
-                        session_permissions(&session, false);
-                    (
-                        Some(SessionRef::from(session.id)),
-                        history,
-                        session_rules,
-                        structured_permission_rules,
-                        session_yolo,
-                    )
-                }
-                _ => (None, Vec::new(), Vec::new(), Vec::new(), None),
-            }
-        } else {
-            (None, Vec::new(), Vec::new(), Vec::new(), None)
-        };
+            _ => (None, Vec::new(), Vec::new(), Vec::new(), None, None),
+        }
+    } else {
+        (None, Vec::new(), Vec::new(), Vec::new(), None, None)
+    };
 
     Ok(ResolvedSession {
         session_id: cli_session_id.or(resumed_id),
@@ -855,7 +898,31 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<ResolvedSession> {
         session_rules,
         structured_permission_rules,
         session_yolo,
+        stored_system_prompt_profile,
     })
+}
+
+fn resolve_prompt_profile(
+    catalog: &PromptProfileCatalog,
+    cli_name: Option<&str>,
+    stored_name: Option<&str>,
+    configured_name: Option<&str>,
+    raw_prompt_override: bool,
+) -> Result<(
+    Option<String>,
+    Option<Arc<maki_agent::prompt::profile::SystemPromptProfile>>,
+)> {
+    if raw_prompt_override {
+        return Ok((None, None));
+    }
+    let requested_name = cli_name.or(stored_name).or(configured_name);
+    let profile = catalog
+        .resolve(requested_name)
+        .context("resolve system prompt profile")?;
+    Ok((
+        Some(requested_name.unwrap_or(BUILTIN_PROFILE_NAME).to_owned()),
+        profile,
+    ))
 }
 
 fn effective_permission_mode(requested: PermissionMode, yolo: bool) -> PermissionMode {
@@ -921,6 +988,7 @@ fn save_sdk_fork(
 ) -> Result<()> {
     let mut fork = StoredSession::new(&source.model, &source.cwd);
     fork.id = target.id();
+    fork.meta.system_prompt_profile = source.meta.system_prompt_profile.clone();
     fork.replace_messages(history.to_vec());
     fork.set_title(format!("{} (fork)", source.title));
     for (task_id, history) in subagent_histories {
@@ -1761,6 +1829,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let mut source = StoredSession::new("provider/model", "/repo");
+        source.meta.system_prompt_profile = Some("review".into());
         source.meta.session_rules = vec![stored_session_rule()];
         source.meta.structured_permission_rules = vec![stored_structured_rule()];
         source.meta.yolo = Some(true);
@@ -1783,6 +1852,7 @@ mod tests {
         assert!(loaded.meta.session_rules.is_empty());
         assert!(loaded.meta.structured_permission_rules.is_empty());
         assert_eq!(loaded.meta.yolo, None);
+        assert_eq!(loaded.meta.system_prompt_profile.as_deref(), Some("review"));
         assert!(ensure_fork_target_available(&storage, &target).is_err());
         assert!(ensure_fork_target_available(&storage, &SessionRef::generate()).is_ok());
     }
@@ -1806,6 +1876,33 @@ mod tests {
             )
         );
         assert_eq!(forked, (Vec::new(), Vec::new(), None));
+    }
+
+    #[test]
+    fn sdk_profile_precedence_and_raw_override_are_explicit() {
+        let catalog = PromptProfileCatalog::default();
+
+        let (name, profile) = resolve_prompt_profile(
+            &catalog,
+            Some(BUILTIN_PROFILE_NAME),
+            Some("missing-stored"),
+            Some("missing-config"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(name.as_deref(), Some(BUILTIN_PROFILE_NAME));
+        assert!(profile.is_none());
+
+        let (name, profile) = resolve_prompt_profile(
+            &catalog,
+            Some("missing-cli"),
+            Some("missing-stored"),
+            Some("missing-config"),
+            true,
+        )
+        .unwrap();
+        assert!(name.is_none());
+        assert!(profile.is_none());
     }
 
     const MODEL: &str = "test-model";

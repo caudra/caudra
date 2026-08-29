@@ -651,6 +651,7 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prompt(
     variant: &crate::cli::PromptVariant,
     plan: bool,
@@ -659,6 +660,7 @@ pub fn prompt(
     no_plugins: bool,
     no_jit: bool,
     no_rtk: bool,
+    profile_arg: Option<&str>,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
@@ -669,6 +671,9 @@ pub fn prompt(
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
+    }
+    if profile_arg.is_some() && !matches!(variant, PromptVariant::System) && !tools {
+        bail!("--system-prompt-profile can only be used with the 'system' prompt variant");
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
@@ -716,6 +721,12 @@ pub fn prompt(
 
     let output = match variant {
         PromptVariant::System => {
+            let prompt_profiles =
+                maki_agent::prompt::profile::PromptProfileCatalog::discover_user();
+            let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
+            let system_prompt_profile = prompt_profiles
+                .resolve(profile_name)
+                .context("resolve system prompt profile")?;
             let mode = if plan {
                 maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
             } else {
@@ -727,7 +738,14 @@ pub fn prompt(
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
             let model = Model::from_spec(model_spec).context("invalid default model")?;
-            build_system_prompt(&vars, &mode, &instructions, &slots, &model)
+            build_system_prompt(
+                &vars,
+                &mode,
+                &instructions,
+                &slots,
+                &model,
+                system_prompt_profile.as_deref(),
+            )
         }
         PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
         PromptVariant::General => assemble(PromptId::General, &slots, &instructions),

@@ -5,6 +5,7 @@ use maki_agent::agent;
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::profile::SystemPromptProfile;
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
@@ -54,6 +55,7 @@ pub(super) struct AgentLoop {
     subagent_history: SubagentHistoryStore,
     model_policy: Arc<ModelPolicy>,
     goal: GoalHandle,
+    system_prompt_profile: Option<Arc<SystemPromptProfile>>,
 }
 
 impl AgentLoop {
@@ -80,6 +82,7 @@ impl AgentLoop {
         subagent_history: SubagentHistoryStore,
         model_policy: Arc<ModelPolicy>,
         goal: GoalHandle,
+        system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     ) -> Self {
         let restored_history = History::restored(initial_history);
         let initial_messages = restored_history
@@ -118,6 +121,7 @@ impl AgentLoop {
             subagent_history,
             model_policy,
             goal,
+            system_prompt_profile,
         }
     }
 
@@ -247,6 +251,7 @@ impl AgentLoop {
             inputs.push(input);
         }
         if inputs.is_empty() {
+            self.queue.clear_active_run();
             return true;
         }
         let _ = event_tx.send(AgentEvent::QueueBatchConsumed { items: consumed });
@@ -383,6 +388,7 @@ impl AgentLoop {
             &self.instructions.text,
             &prompt_slots,
             &slot.model,
+            self.system_prompt_profile.as_deref(),
         );
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
@@ -478,6 +484,7 @@ impl AgentLoop {
             &self.instructions.text,
             prompt_slots,
             &slot.model,
+            self.system_prompt_profile.as_deref(),
         );
         self.btw_system.store(Arc::new(system));
     }

@@ -117,6 +117,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `system_prompt_profile` | String | `builtin` | - | Default user system prompt profile from the system-prompts config directory |
 | `max_output_bytes` | usize | `51200` | 1024 | Host-enforced default max tool-result size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Host-enforced default max tool-result lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |

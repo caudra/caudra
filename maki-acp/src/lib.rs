@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::profile::PromptProfileCatalog;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_config::ModelPolicy;
 use maki_providers::Timeouts;
@@ -21,6 +22,8 @@ pub struct AcpParams {
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
     pub prompt_slots: Arc<ResolvedSlots>,
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
+    pub system_prompt_profile_override: Option<String>,
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,

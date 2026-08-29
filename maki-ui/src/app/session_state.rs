@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use maki_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use maki_agent::{GoalHandle, GoalResult, GoalVerdict};
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::adjust_model;
@@ -28,6 +29,9 @@ pub(crate) struct SessionState {
     pub thinking: ThinkingConfig,
     pub fast: bool,
     pub workflow: bool,
+    pub system_prompt_profile_name: String,
+    pub system_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    pub system_prompt_profile_override: bool,
     pub goal: GoalHandle,
 }
 
@@ -114,6 +118,9 @@ impl SessionState {
                 .unwrap_or_default(),
             fast,
             workflow: session.meta.workflow,
+            system_prompt_profile_name: BUILTIN_PROFILE_NAME.to_owned(),
+            system_prompt_profile: None,
+            system_prompt_profile_override: false,
             goal,
             session: Arc::new(session),
             model,

@@ -97,6 +97,12 @@ impl SessionStore {
         self.session.meta.yolo = permissions.persisted_yolo();
     }
 
+    fn set_system_prompt_profile(&mut self, name: Option<&str>) {
+        if let Some(name) = name {
+            self.session.meta.system_prompt_profile = Some(name.to_owned());
+        }
+    }
+
     fn record_turn(
         &mut self,
         history: &History,
@@ -179,6 +185,7 @@ pub struct HeadlessParams {
     pub prompt: String,
     pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
+    pub system_prompt_profile: Option<Arc<crate::prompt::profile::SystemPromptProfile>>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -280,6 +287,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &instructions.text,
         &params.prompt_slots,
         &params.model,
+        params.system_prompt_profile.as_deref(),
     );
 
     let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
@@ -391,6 +399,8 @@ pub struct InteractiveParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: Arc<ResolvedSlots>,
+    pub system_prompt_profile: Option<Arc<crate::prompt::profile::SystemPromptProfile>>,
+    pub system_prompt_profile_name: Option<String>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -504,6 +514,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
 
             let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
+            if let Some(store) = &mut store {
+                store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
+                store.save();
+            }
             let subagent_history = store
                 .as_ref()
                 .map(|store| store.subagent_history.clone())
@@ -573,6 +587,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &instructions.text,
                         &params.prompt_slots,
                         &model,
+                        params.system_prompt_profile.as_deref(),
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
@@ -890,6 +905,21 @@ mod tests {
         );
         assert!(restored.is_yolo());
         assert_eq!(restored.persisted_yolo(), Some(true));
+    }
+
+    #[test]
+    fn selected_system_prompt_profile_is_persisted() {
+        const PROFILE: &str = "review";
+
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.set_system_prompt_profile(Some(PROFILE));
+        store.save();
+
+        assert_eq!(
+            load(&tmp).meta.system_prompt_profile.as_deref(),
+            Some(PROFILE)
+        );
     }
 
     #[test]

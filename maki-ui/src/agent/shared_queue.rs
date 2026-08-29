@@ -130,6 +130,7 @@ pub(crate) struct QueueSender {
     claim_gate: Arc<Mutex<()>>,
     active: Arc<AtomicBool>,
     active_run_id: Arc<AtomicU64>,
+    processing: Arc<AtomicBool>,
 }
 
 pub(crate) struct QueueReceiver {
@@ -138,6 +139,7 @@ pub(crate) struct QueueReceiver {
     claim_gate: Arc<Mutex<()>>,
     active: Arc<AtomicBool>,
     active_run_id: Arc<AtomicU64>,
+    processing: Arc<AtomicBool>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
@@ -146,6 +148,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let claim_gate = Arc::new(Mutex::new(()));
     let active = Arc::new(AtomicBool::new(false));
     let active_run_id = Arc::new(AtomicU64::new(0));
+    let processing = Arc::new(AtomicBool::new(false));
     (
         QueueSender {
             queue,
@@ -153,6 +156,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             claim_gate: Arc::clone(&claim_gate),
             active: Arc::clone(&active),
             active_run_id: Arc::clone(&active_run_id),
+            processing: Arc::clone(&processing),
         },
         QueueReceiver {
             queue: receiver,
@@ -160,6 +164,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             claim_gate,
             active,
             active_run_id,
+            processing,
         },
     )
 }
@@ -237,6 +242,10 @@ impl QueueSender {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub(crate) fn is_processing(&self) -> bool {
+        self.processing.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear(&self) {
@@ -438,6 +447,7 @@ impl QueueReceiver {
             if claimed.is_empty() {
                 continue;
             }
+            self.processing.store(true, Ordering::Release);
             if let Some(run_id) = claimed.iter().rev().find_map(|(_, item)| match item {
                 QueueItem::Message { run_id, .. } => Some(*run_id),
                 QueueItem::Compact { .. } => None,
@@ -478,6 +488,7 @@ impl QueueReceiver {
 
     pub(crate) fn clear_active_run(&self) {
         self.active.store(false, Ordering::Release);
+        self.processing.store(false, Ordering::Release);
     }
 
     pub(crate) fn has_newer_interrupt(&self, run_id: u64) -> bool {
@@ -620,6 +631,18 @@ mod tests {
         ));
         assert_eq!(tx.delivery(), QueueDelivery::TogetherNextTurn);
         assert_eq!(rx.claim_idle(0).len(), 2);
+    }
+
+    #[test]
+    fn claimed_work_stays_processing_until_cleared() {
+        let (tx, rx) = queue();
+        tx.push(QueueItem::Compact { run_id: 0 });
+
+        assert!(!tx.is_processing());
+        assert_eq!(rx.claim_idle(0).len(), 1);
+        assert!(tx.is_processing());
+        rx.clear_active_run();
+        assert!(!tx.is_processing());
     }
 
     #[test]

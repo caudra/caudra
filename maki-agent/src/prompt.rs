@@ -3,6 +3,10 @@ use std::sync::Arc;
 
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
+pub mod profile;
+
+use profile::{PromptProfileLayout, SystemPromptProfile};
+
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
     fn valid_names() -> String {
         Self::iter()
@@ -13,6 +17,10 @@ pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
 }
 
 pub const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
+const SYSTEM_STYLE: &str = include_str!("prompts/system_style.md");
+const SYSTEM_TOOLS: &str = include_str!("prompts/system_tools.md");
+const SYSTEM_CONVENTIONS: &str = include_str!("prompts/system_conventions.md");
+const SYSTEM_COMPLETION: &str = include_str!("prompts/system_completion.md");
 pub const PLAN_PROMPT: &str = include_str!("prompts/plan.md");
 pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
@@ -31,7 +39,16 @@ pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CL
 - NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
 
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];
-const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
+const SYSTEM_COMPONENTS: &[&str] = &[
+    "default",
+    "identity",
+    "style",
+    "tools",
+    "conventions",
+    "completion",
+    "context",
+    "plan",
+];
 
 /// Singleton: alphabetically last plugin wins, discarding all prior content
 /// and built-in defaults.  Used for slots with opinionated defaults where
@@ -152,7 +169,10 @@ impl PromptId {
     /// Markers that are absent get no content (and we warn at collection time
     /// when a plugin targets them explicitly).
     pub fn has_slot(self, slot: Slot) -> bool {
-        self.template().contains(slot.marker())
+        match self {
+            PromptId::System => true,
+            PromptId::Research | PromptId::General => self.template().contains(slot.marker()),
+        }
     }
 }
 
@@ -193,26 +213,202 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
     format!("Most efficient tools: {names}.")
 }
 
-/// Fill each `{{slot}}` marker in the template with its rendered content and
-/// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
-pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
-    let mut out = id.template().to_string();
-    for slot in Slot::iter() {
-        out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
-    }
-    out.replace(INSTRUCTIONS_MARKER, instructions)
+pub(crate) fn is_system_component(name: &str) -> bool {
+    SYSTEM_COMPONENTS.contains(&name)
 }
 
-/// Replace a slot marker with its content. When the content is empty, also drop
-/// the marker's own line (the trailing newline) so empty slots leave no blank
-/// gap, without touching any other whitespace in the prompt.
-fn fill_marker(template: &str, marker: &str, content: &str) -> String {
-    if content.is_empty() {
-        return template
-            .replace(&format!("{marker}\n"), "")
-            .replace(marker, "");
+struct SystemParts {
+    identity: String,
+    style: String,
+    tools: String,
+    conventions: String,
+    completion: String,
+    context: String,
+    plan: String,
+}
+
+impl SystemParts {
+    fn get(&self, name: &str) -> Option<&str> {
+        match name {
+            "identity" => Some(&self.identity),
+            "style" => Some(&self.style),
+            "tools" => Some(&self.tools),
+            "conventions" => Some(&self.conventions),
+            "completion" => Some(&self.completion),
+            "context" => Some(&self.context),
+            "plan" => Some(&self.plan),
+            _ => None,
+        }
     }
-    template.replace(marker, content)
+}
+
+fn render_lines<'a>(template: &str, mut resolve: impl FnMut(&str) -> Option<&'a str>) -> String {
+    let mut output = String::with_capacity(template.len());
+    for line in template.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        if let Some(content) = resolve(body) {
+            if !content.is_empty() {
+                output.push_str(content);
+                output.push_str(ending);
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
+fn render_prompt_template(
+    template: &str,
+    slots: &ResolvedSlots,
+    prompt: PromptId,
+    instructions: &str,
+) -> String {
+    let rendered_slots = Slot::iter()
+        .map(|slot| (slot.marker(), render_slot(slots, prompt, slot)))
+        .collect::<Vec<_>>();
+    render_lines(template, |marker| {
+        if marker == "{{instructions}}" {
+            return Some(instructions);
+        }
+        rendered_slots
+            .iter()
+            .find_map(|(candidate, content)| (*candidate == marker).then_some(content.as_str()))
+    })
+}
+
+fn system_parts(slots: &ResolvedSlots, instructions: &str, plan: &str) -> SystemParts {
+    SystemParts {
+        identity: render_slot(slots, PromptId::System, Slot::Identity),
+        style: remove_template_line_ending(render_prompt_template(
+            SYSTEM_STYLE,
+            slots,
+            PromptId::System,
+            "",
+        )),
+        tools: remove_template_line_ending(render_prompt_template(
+            SYSTEM_TOOLS,
+            slots,
+            PromptId::System,
+            "",
+        )),
+        conventions: remove_template_line_ending(render_prompt_template(
+            SYSTEM_CONVENTIONS,
+            slots,
+            PromptId::System,
+            "",
+        )),
+        completion: remove_template_line_ending(SYSTEM_COMPLETION.to_owned()),
+        context: format!(
+            "{}{}",
+            instructions,
+            render_slot(slots, PromptId::System, Slot::AfterInstructions)
+        ),
+        plan: plan.to_owned(),
+    }
+}
+
+fn remove_template_line_ending(mut rendered: String) -> String {
+    let bytes = rendered.as_bytes();
+    let ending_bytes = if bytes.ends_with(b"\r\n") {
+        2
+    } else if bytes.ends_with(b"\n") {
+        1
+    } else {
+        0
+    };
+    rendered.truncate(rendered.len() - ending_bytes);
+    rendered
+}
+
+fn render_system_layout(template: &str, parts: &SystemParts) -> String {
+    render_lines(template, |marker| {
+        let name = marker
+            .strip_prefix("{{maki.")
+            .and_then(|marker| marker.strip_suffix("}}"))?;
+        parts.get(name)
+    })
+}
+
+fn render_custom_layout(template: &str, parts: &SystemParts, default: &str) -> String {
+    let mut output = String::with_capacity(template.len() + default.len());
+    for line in template.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        if let Some(literal) = body.strip_prefix("\\{{maki.")
+            && literal.ends_with("}}")
+        {
+            output.push_str("{{maki.");
+            output.push_str(literal);
+            output.push_str(ending);
+            continue;
+        }
+        let component = body
+            .strip_prefix("{{maki.")
+            .and_then(|body| body.strip_suffix("}}"));
+        let content = match component {
+            Some("default") => Some(default),
+            Some(name) => parts.get(name),
+            None => None,
+        };
+        if let Some(content) = content {
+            if !content.is_empty() {
+                output.push_str(content);
+                if !content.ends_with('\n') {
+                    output.push_str(ending);
+                }
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
+pub fn assemble_system(
+    slots: &ResolvedSlots,
+    instructions: &str,
+    plan: &str,
+    profile: Option<&SystemPromptProfile>,
+) -> String {
+    let parts = system_parts(slots, instructions, plan);
+    let mut default = render_system_layout(SYSTEM_PROMPT.trim_end_matches(['\r', '\n']), &parts);
+    let Some(profile) = profile else {
+        default.push_str(&parts.plan);
+        return default;
+    };
+    match profile.layout() {
+        PromptProfileLayout::Overlay => {
+            default.push_str("\n\n");
+            default.push_str(profile.body());
+            default.push_str(&parts.plan);
+            default
+        }
+        PromptProfileLayout::Custom => {
+            default.push_str(&parts.plan);
+            render_custom_layout(profile.body(), &parts, &default)
+        }
+    }
+}
+
+/// Fill each host template marker once. Inserted content is opaque and is not
+/// scanned again for markers.
+pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
+    if id == PromptId::System {
+        return assemble_system(slots, instructions, "", None);
+    }
+    render_prompt_template(id.template(), slots, id, instructions)
 }
 
 #[cfg(test)]
@@ -466,5 +662,40 @@ mod tests {
         let out = assemble(PromptId::System, &s, "");
         assert!(out.contains("Never assume a library is available"));
         assert!(out.contains("- Extra rule"));
+    }
+
+    #[test]
+    fn inserted_content_is_not_scanned_for_markers() {
+        let mut slots = ResolvedSlots::default();
+        slots.insert(
+            PromptId::System,
+            Slot::Identity,
+            SlotEntry {
+                plugin: Arc::from("plugin"),
+                content: "Literal {{tone}} and {{instructions}}".into(),
+            },
+        );
+        let output = assemble(PromptId::System, &slots, "RUNTIME");
+        assert!(output.contains("Literal {{tone}} and {{instructions}}"));
+        assert!(output.contains("RUNTIME"));
+    }
+
+    #[test]
+    fn built_in_context_and_plan_keep_legacy_boundaries() {
+        let slots = slots(PromptId::System, &[(Slot::AfterInstructions, "AFTER")]);
+
+        let build = assemble_system(&slots, "INSTRUCTIONS", "", None);
+        assert!(build.ends_with("INSTRUCTIONSAFTER"));
+
+        let plan = assemble_system(&slots, "INSTRUCTIONS", "\n\nPLAN", None);
+        assert!(plan.ends_with("INSTRUCTIONSAFTER\n\nPLAN"));
+    }
+
+    #[test]
+    fn newline_terminated_slots_keep_template_spacing() {
+        let slots = slots(PromptId::System, &[(Slot::Conventions, "EXTRA\n")]);
+
+        let output = assemble_system(&slots, "", "", None);
+        assert!(output.contains("EXTRA\n\n\n# When done"));
     }
 }

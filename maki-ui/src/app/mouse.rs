@@ -74,6 +74,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.prompt_profile_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.prompt_profile_picker.handle_mouse(event),
+                |app, action| app.handle_prompt_profile_picker_action(action),
+            ) {
+                return actions;
+            }
         } else if self.message_actions.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
