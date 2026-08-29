@@ -82,6 +82,12 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.review.is_open() {
+            let action = self.review.handle_mouse(event);
+            if !matches!(action, crate::components::review::ReviewAction::Passthrough) {
+                self.clear_control_hovers();
+                return self.handle_review_action(action);
+            }
         } else if self.rewind_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,

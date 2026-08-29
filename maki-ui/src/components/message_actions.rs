@@ -7,11 +7,12 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Message Actions ";
-const MAX_VISIBLE: u16 = 5;
+const MAX_VISIBLE: u16 = 6;
 const WIDTH_PERCENT: u16 = 38;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageActionKind {
+    Review,
     Fork,
     RevertBoth,
     RevertConversation,
@@ -22,6 +23,7 @@ pub enum MessageActionKind {
 impl PickerItem for MessageActionKind {
     fn label(&self) -> &str {
         match self {
+            Self::Review => "Review passages",
             Self::Fork => "Fork here",
             Self::RevertBoth => "Revert both",
             Self::RevertConversation => "Revert conversation",
@@ -57,6 +59,7 @@ impl MessageActions {
 
     pub fn open(&mut self, source: DisplaySource, pending_revert: bool) {
         let mut actions = vec![
+            MessageActionKind::Review,
             MessageActionKind::Fork,
             MessageActionKind::RevertBoth,
             MessageActionKind::RevertConversation,
@@ -146,19 +149,21 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
     }
 
+    const UNREVERT_INDEX: usize = 5;
+
     #[test]
     fn selection_preserves_source() {
         let source = DisplaySource::Reasoning(MakiId::generate());
         let mut actions = MessageActions::new();
         actions.open(source, false);
 
-        assert!(matches!(
-            actions.handle_key(enter()),
-            MessageActionsAction::Select {
-                source: selected,
-                kind: MessageActionKind::Fork,
-            } if selected == source
-        ));
+        let MessageActionsAction::Select {
+            source: selected, ..
+        } = actions.handle_key(enter())
+        else {
+            panic!("expected a selection");
+        };
+        assert_eq!(selected, source);
     }
 
     #[test]
@@ -167,9 +172,12 @@ mod tests {
         let mut actions = MessageActions::new();
         actions.open(source, false);
         assert_eq!(actions.picker.selected_index(), Some(0));
-        assert!(actions.picker.item(4).is_none());
+        assert!(actions.picker.item(UNREVERT_INDEX).is_none());
 
         actions.open(source, true);
-        assert_eq!(actions.picker.item(4), Some(&MessageActionKind::Unrevert));
+        assert_eq!(
+            actions.picker.item(UNREVERT_INDEX),
+            Some(&MessageActionKind::Unrevert)
+        );
     }
 }

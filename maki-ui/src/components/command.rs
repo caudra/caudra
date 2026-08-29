@@ -55,6 +55,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/review",
+        description: "Review the last reply passage by passage",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/theme",
         description: "Switch color theme",
         max_args: 0,
@@ -814,8 +819,11 @@ mod tests {
     fn filter_custom_by_substring() {
         let p = synced_with_custom("/review", sample_custom());
         assert!(p.is_active());
-        assert_eq!(p.filtered.len(), 1);
-        assert!(matches!(p.filtered[0].command_type, CommandType::Custom(0)));
+        assert!(
+            p.filtered
+                .iter()
+                .any(|item| matches!(item.command_type, CommandType::Custom(0)))
+        );
     }
 
     #[test]

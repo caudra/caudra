@@ -472,6 +472,7 @@ pub enum BuiltinAction {
     NextChat,
     ModelPicker,
     CopyMessage,
+    Review,
 }
 
 pub enum UiAction {

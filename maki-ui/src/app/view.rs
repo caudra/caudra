@@ -285,6 +285,7 @@ impl App {
 
         render_if_open!(self.rewind_picker);
         render_if_open!(self.message_actions);
+        render_if_open!(self.review);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
@@ -502,6 +503,8 @@ impl App {
         let mut contexts = vec![KeybindContext::General];
         if self.paste_editor.is_open() {
             contexts.push(KeybindContext::PasteEditor);
+        } else if self.review.is_open() {
+            contexts.push(KeybindContext::Review);
         } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue_editor_active() {

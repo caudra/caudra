@@ -45,6 +45,7 @@ use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
+use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -106,6 +107,8 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
+const REVIEW_READY_MSG: &str = "Review notes added to the prompt";
+const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
 const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
@@ -218,6 +221,7 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) message_actions: MessageActions,
+    pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) goal_modal: GoalModal,
@@ -354,6 +358,7 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             message_actions: MessageActions::new(),
+            review: ReviewModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             goal_modal: GoalModal::default(),
@@ -746,6 +751,7 @@ impl App {
         }
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
+        try_picker!(self.review);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
         try_picker!(self.permissions_picker);
@@ -968,6 +974,11 @@ impl App {
             return Some(self.handle_message_actions_action(action));
         }
 
+        if self.review.is_open() {
+            let action = self.review.handle_key(key);
+            return Some(self.handle_review_action(action));
+        }
+
         if self.theme_picker.is_open() {
             let action = self.theme_picker.handle_key(key);
             return Some(self.handle_theme_picker_action(action));
@@ -999,6 +1010,10 @@ impl App {
 
         if key::COPY_MESSAGE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::CopyMessage));
+        }
+
+        if key::REVIEW.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::Review));
         }
 
         None
@@ -1112,6 +1127,41 @@ impl App {
                 mode: RestoreMode::Files,
             }],
             MessageActionKind::Unrevert => vec![Action::UnrevertSession],
+            MessageActionKind::Review => {
+                self.open_review(source);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Compiled notes land in the prompt editor as a collapsed paste, so the
+    /// user can add context or drop the batch before sending it.
+    fn handle_review_action(&mut self, action: ReviewAction) -> Vec<Action> {
+        match action {
+            ReviewAction::Consumed | ReviewAction::Passthrough => {}
+            ReviewAction::Submit(text) => {
+                self.input_box.handle_paste(&text);
+                self.flash(REVIEW_READY_MSG.into());
+            }
+            ReviewAction::Close => {
+                self.review.close();
+                let pending = self.review.notes_pending();
+                if pending > 0 {
+                    self.flash(format!(
+                        "{pending} review note{} pending. {} to resume.",
+                        if pending == 1 { "" } else { "s" },
+                        key::REVIEW.label
+                    ));
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub(crate) fn open_review(&mut self, source: DisplaySource) {
+        match self.chats[self.active_chat].review_target(source) {
+            Some(target) => self.review.open(source, target),
+            None => self.flash(REVIEW_UNAVAILABLE_MSG.into()),
         }
     }
 
@@ -1251,6 +1301,10 @@ impl App {
                 };
                 self.status_bar.flash(message);
             }
+            BuiltinAction::Review => match self.chats[self.active_chat].last_assistant_source() {
+                Some(source) => self.open_review(source),
+                None => self.flash(REVIEW_UNAVAILABLE_MSG.into()),
+            },
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
             BuiltinAction::PopQueue => {
                 self.pop_active_queue();
@@ -2239,6 +2293,7 @@ impl App {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
             }
+            "/review" => self.run_builtin(BuiltinAction::Review),
             "/theme" => {
                 self.theme_picker.open();
                 vec![]
@@ -2497,7 +2552,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 16] {
+    fn overlays(&self) -> [&dyn Overlay; 17] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2509,6 +2564,7 @@ impl App {
             &self.paste_editor,
             &self.rewind_picker,
             &self.message_actions,
+            &self.review,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -2518,7 +2574,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 16] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 17] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2530,6 +2586,7 @@ impl App {
             &mut self.paste_editor,
             &mut self.rewind_picker,
             &mut self.message_actions,
+            &mut self.review,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -2712,6 +2769,7 @@ impl App {
         try_picker!(self.file_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
+        try_picker!(self.review);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

@@ -16,7 +16,7 @@ use super::tool_display::{
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, apply_scroll_delta,
-    code_view::SectionFlags,
+    code_view::SectionFlags, review,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -57,6 +57,28 @@ enum HoverTarget {
     CachedThinking(usize),
     StreamingThinking,
     Tool { id: String, feedback: HoverFeedback },
+}
+
+/// A rendered segment handed to the review modal. `provenance` is absent for
+/// segments with no markdown behind them, such as tool buffers.
+pub(crate) struct ReviewTarget {
+    pub lines: Vec<Line<'static>>,
+    pub provenance: Option<Provenance>,
+    pub label: &'static str,
+}
+
+/// The default review surface. Notes carrying it compile without a surface
+/// attribute, so the constant is shared with the review modal.
+pub(crate) const ASSISTANT_LABEL: &str = "assistant reply";
+
+fn review_label(source: DisplaySource) -> &'static str {
+    match source {
+        DisplaySource::User(_) => "your message",
+        DisplaySource::AssistantText(_) => ASSISTANT_LABEL,
+        DisplaySource::Reasoning(_) => "thinking",
+        DisplaySource::ToolCall { .. } => "tool call",
+        DisplaySource::ToolResult(_) => "tool result",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -684,6 +706,10 @@ impl MessagesPanel {
         if rel < segment.chrome(self.viewport_width).margin_top {
             return None;
         }
+        self.segment_source(segment)
+    }
+
+    fn segment_source(&self, segment: &Segment) -> Option<DisplaySource> {
         if let Some(index) = segment.msg_index {
             return self.messages.get(index)?.source;
         }
@@ -1172,6 +1198,35 @@ impl MessagesPanel {
             .rev()
             .find(|m| matches!(m.role, DisplayRole::Assistant))
             .map(|m| m.text.clone())
+    }
+
+    /// Newest committed assistant reply, the default target for a review.
+    /// Streaming text has no segment yet, so it cannot be reviewed.
+    pub fn last_assistant_source(&self) -> Option<DisplaySource> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, DisplayRole::Assistant))
+            .and_then(|m| m.source)
+    }
+
+    /// Painted lines and provenance for the segment behind `source`, so the
+    /// review modal can re-lay them at its own width and quote the markdown
+    /// that produced them.
+    pub(crate) fn review_target(&self, source: DisplaySource) -> Option<ReviewTarget> {
+        let segment = self
+            .cache
+            .segments()
+            .iter()
+            .find(|segment| self.segment_source(segment) == Some(source))?;
+        if segment.lines().is_empty() {
+            return None;
+        }
+        Some(ReviewTarget {
+            lines: segment.lines().to_vec(),
+            provenance: segment.provenance().cloned(),
+            label: review_label(source),
+        })
     }
 
     pub fn segment_heights(&self) -> Vec<u16> {
@@ -1814,6 +1869,17 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
     } else {
         style.prefix
     };
+    if let Some(notes) = matches!(msg.role, DisplayRole::User)
+        .then(|| review::parse(&msg.text))
+        .flatten()
+    {
+        let (lines, provenance) = review::card_lines(&notes, width, style.text_style);
+        return BuiltMessage {
+            search_text: review_search_text(&notes),
+            lines,
+            provenance: Some(Provenance::new(msg.text.as_str().into(), provenance)),
+        };
+    }
     let (mut lines, mut provenance) = if style.use_markdown {
         let (painted, parsed) = text_to_painted(
             &msg.text,
@@ -1871,4 +1937,13 @@ struct BuiltMessage {
     lines: Vec<Line<'static>>,
     search_text: String,
     provenance: Option<Provenance>,
+}
+
+/// Search should reach what the card shows, not the tags behind it.
+fn review_search_text(notes: &[review::ParsedNote]) -> String {
+    notes
+        .iter()
+        .map(review::ParsedNote::search_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }

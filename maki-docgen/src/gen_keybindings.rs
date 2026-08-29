@@ -22,6 +22,7 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
     KeybindContext::PasteEditor,
+    KeybindContext::Review,
     KeybindContext::Streaming,
     KeybindContext::FormInput,
     KeybindContext::Picker,
@@ -32,7 +33,7 @@ fn label_str(label: KeyLabel) -> String {
         KeyLabel::Single(s) => format!("`{s}`"),
         KeyLabel::Alt(a, b) => format!("`{a}`{ALT_SEP}`{b}`"),
         KeyLabel::MacAlt(a, _) => format!("`{a}`"),
-        KeyLabel::MacMulti(normal, _) => normal
+        KeyLabel::Multi(keys) | KeyLabel::MacMulti(keys, _) => keys
             .iter()
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()

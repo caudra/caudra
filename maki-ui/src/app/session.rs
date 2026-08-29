@@ -322,6 +322,7 @@ impl App {
 
     pub(super) fn reset_ui_chrome(&mut self) {
         self.cancel_queue_edit();
+        self.review.discard();
         self.chats.clear();
         let mut main = Chat::new(
             "Main".into(),

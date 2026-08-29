@@ -335,6 +335,17 @@ impl Chat {
         self.messages_panel.source_at(row, area)
     }
 
+    pub fn last_assistant_source(&self) -> Option<DisplaySource> {
+        self.messages_panel.last_assistant_source()
+    }
+
+    pub(crate) fn review_target(
+        &self,
+        source: DisplaySource,
+    ) -> Option<crate::components::messages::ReviewTarget> {
+        self.messages_panel.review_target(source)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,

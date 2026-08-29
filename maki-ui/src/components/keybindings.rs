@@ -169,6 +169,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+C",
     };
+    pub const REVIEW: Bind = Bind {
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+A",
+    };
     pub const STEER_PROMPT: Bind = Bind {
         code: KeyCode::Char('s'),
         modifiers: KeyModifiers::ALT,
@@ -194,6 +199,7 @@ pub enum KeybindContext {
     QueueFocus,
     CommandPalette,
     PasteEditor,
+    Review,
     Search,
     FilePicker,
 }
@@ -212,6 +218,7 @@ impl KeybindContext {
             Self::QueueFocus => "Queue",
             Self::CommandPalette => "Commands",
             Self::PasteEditor => "Pasted Text",
+            Self::Review => "Review",
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
         }
@@ -252,6 +259,7 @@ impl Platform {
 pub enum KeyLabel {
     Single(&'static str),
     Alt(&'static str, &'static str),
+    Multi(&'static [&'static str]),
     /// Alt on Mac, Single (first) on other platforms
     MacAlt(&'static str, &'static str),
     /// Multi on Mac, Multi (first slice) on other platforms
@@ -291,6 +299,7 @@ impl KeyLabel {
         match self {
             Self::Single(s) => ResolvedLabel::Single(s),
             Self::Alt(a, b) => ResolvedLabel::Alt(a, b),
+            Self::Multi(keys) => ResolvedLabel::Multi(keys),
             Self::MacAlt(a, b) => {
                 if cfg!(target_os = "macos") {
                     ResolvedLabel::Alt(a, b)
@@ -353,6 +362,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::COPY_MESSAGE.label),
         description: "Copy last reply as markdown",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::REVIEW.label),
+        description: "Review the last reply",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -513,6 +528,42 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Esc"),
         description: "Cancel editing",
         context: KeybindContext::PasteEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["j", "k", "g", "G"]),
+        description: "Move the row cursor",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("v"),
+        description: "Extend the passage",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Write a note on the passage",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["e", "d"]),
+        description: "Edit or delete the note under the cursor",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["n", "p"]),
+        description: "Jump between notes",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+S"),
+        description: "Send notes to the prompt",
+        context: KeybindContext::Review,
         platform: Platform::All,
     },
     Keybind {

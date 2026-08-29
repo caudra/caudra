@@ -19,6 +19,7 @@ Type `/` in the input box to open the command palette.
 | `/usage` | Show token usage breakdown |
 | `/queue` | Inspect and edit queued prompts |
 | `/model` | Switch model |
+| `/review` | Review the last reply passage by passage |
 | `/theme` | Switch color theme |
 | `/mcp` | Configure MCP servers |
 | `/permissions` | Inspect active conversation permission rules |

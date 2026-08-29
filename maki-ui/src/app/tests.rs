@@ -5556,6 +5556,7 @@ fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
     };
     app.state.session_mut().replace_messages(items.clone());
     app.message_actions.open(source, false);
+    app.update(Msg::Key(key(KeyCode::Down)));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
 

@@ -269,6 +269,26 @@ pub(crate) fn text_to_painted(
     )
 }
 
+/// Paints a fragment whose provenance has to point into a larger document.
+/// Every recorded range is shifted by `base`, the offset of `text` inside that
+/// document, so a copy reaches the original bytes.
+pub(crate) fn text_to_painted_at(text: &str, style: Style, width: u16, base: u32) -> Painted {
+    let semantic = render::Renderer::unwrapped().render(text, width, 0);
+    let mut painted = paint_semantic(&semantic, "", style, style);
+    for line in &mut painted.provenance {
+        line.line = line
+            .line
+            .as_ref()
+            .map(|range| range.start + base..range.end + base);
+        for span in &mut line.spans {
+            if let SpanSource::Range(source) = span {
+                source.range = source.range.start + base..source.range.end + base;
+            }
+        }
+    }
+    painted
+}
+
 pub fn text_to_lines(
     text: &str,
     prefix: &str,

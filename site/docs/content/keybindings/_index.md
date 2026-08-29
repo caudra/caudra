@@ -18,6 +18,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Alt+C` | Copy last reply as markdown |
+| `Alt+A` | Review the last reply |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
@@ -58,6 +59,17 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Enter` | Insert newline |
 | `Ctrl+S` | Save pasted text |
 | `Esc` | Cancel editing |
+
+## Review
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `g` / `G` | Move the row cursor |
+| `v` | Extend the passage |
+| `Enter` | Write a note on the passage |
+| `e` / `d` | Edit or delete the note under the cursor |
+| `n` / `p` | Jump between notes |
+| `Ctrl+S` | Send notes to the prompt |
 
 ## While Streaming
 

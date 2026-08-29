@@ -793,6 +793,33 @@ fn search_text_omits_author_labels() {
 }
 
 #[test]
+fn a_compiled_review_renders_as_a_card_instead_of_tags() {
+    const COMPILED: &str = "<review>\nAddress each note on my previous message.\n\n\
+         <note>\n> - **Independent lap controls**\n> - **Race-distance guidance**\n\
+         cool features\n</note>\n</review>";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, COMPILED.into()));
+
+    let terminal = render(&mut panel, 60, 12);
+    let buffer = terminal.backend().buffer();
+    let screen = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("Review · 1 note"));
+    assert!(screen.contains("Independent lap controls"));
+    assert!(screen.contains("cool features"));
+    assert!(!screen.contains("<review>"));
+    assert!(!screen.contains("<note>"));
+}
+
+#[test]
 fn author_messages_render_as_a_user_card_and_flat_assistant_prose() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -1005,6 +1032,29 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
     }
     render(&mut panel, width, height);
     panel
+}
+
+#[test]
+fn copying_a_review_card_yields_the_source_block() {
+    const QUOTE: &str = "> - **Independent lap controls**";
+    const COMPILED: &str = "<review>\nAddress each note on my previous message.\n\n\
+         <note>\n> - **Independent lap controls**\ncool features\n</note>\n</review>";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, COMPILED.into()));
+    let area = Rect::new(0, 0, 80, 24);
+    render(&mut panel, area.width, area.height);
+
+    let rows = panel.cache.segments()[0].drawn_height(panel.viewport_width);
+    let sel = make_sel(area, (0, 0), (rows as u32, area.width - 1));
+    let copied = panel.extract_selection_text(&sel, area);
+
+    assert!(
+        copied.contains(QUOTE),
+        "quote source missing from {copied:?}"
+    );
+    assert!(copied.contains("cool features"));
+    assert!(!copied.contains('▏'));
 }
 
 #[test]
