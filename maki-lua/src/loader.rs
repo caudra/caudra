@@ -294,14 +294,26 @@ impl PluginHost {
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        let result = self.send_builtin_loads(config);
+        let result = self.send_builtin_loads(config, None);
         // Armed even when a load failed, so a caller that only warns about the
         // error is not left interpreting for the rest of the session.
         let _ = self.inner.tx.send(Request::WarmJit);
         result
     }
 
-    fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
+    pub fn load_production_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        let result = self.send_builtin_loads(config, Some(maki_config::ACTIVE_DEFAULT_LUA_PLUGINS));
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    fn send_builtin_loads(
+        &self,
+        config: &PluginsConfig,
+        allowlist: Option<&[&str]>,
+    ) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
             let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
             if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
@@ -319,7 +331,12 @@ impl PluginHost {
                 );
             }
         }
-        let mut builtins = config.names.clone();
+        let mut builtins: Vec<String> = config
+            .names
+            .iter()
+            .filter(|name| allowlist.is_none_or(|active| active.contains(&name.as_str())))
+            .cloned()
+            .collect();
         for builtin in ALWAYS_LOADED_BUILTINS {
             if !builtins.iter().any(|name| name == builtin) {
                 builtins.push((*builtin).to_owned());
@@ -694,6 +711,31 @@ mod tests {
             reg.get("glob").unwrap().source,
             maki_agent::tools::ToolSource::Lua { bundled: true, .. }
         ));
+    }
+
+    #[test]
+    fn production_builtins_exclude_workcell_replacements() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+
+        assert!(reg.get("index").is_some());
+        assert!(reg.get("tool_output_read").is_some());
+        for name in [
+            "bash",
+            "code_execution",
+            "edit",
+            "glob",
+            "grep",
+            "list",
+            "read",
+            "webfetch",
+            "websearch",
+            "write",
+        ] {
+            assert!(reg.get(name).is_none(), "legacy tool {name} was registered");
+        }
     }
 
     #[test]

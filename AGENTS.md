@@ -59,7 +59,9 @@ Rust workspace, key crates in root dir:
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
 
-Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, websearch, webfetch, shell, code_execution, and execution_environment.
+
+Active built-in Lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources remain in-tree for tests and reference but are not loaded in production.
 
 ## Docs
 

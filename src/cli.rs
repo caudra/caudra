@@ -326,9 +326,10 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    #[test_case("Read", "read")]
-    #[test_case("Bash", "bash")]
+    #[test_case("FileRead", "file_read")]
+    #[test_case("Shell", "shell")]
     #[test_case("CodeExecution", "code_execution")]
+    #[test_case("ExecutionEnvironment", "execution_environment")]
     #[test_case("code_execution", "code_execution"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
@@ -342,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_name_multi_edit_rejects_snake_variant() {
+    fn normalize_tool_name_rejects_removed_lua_tool() {
         assert!(normalize_tool_name("MultiEdit").is_err());
     }
 

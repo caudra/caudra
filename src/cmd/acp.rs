@@ -24,6 +24,7 @@ pub fn run(
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
+    let _workcell_host = super::register_workcell(&cwd)?;
 
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -44,7 +45,7 @@ pub fn run(
     config.validate()?;
 
     plugin_host
-        .load_builtins(&config.plugins)
+        .load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
     let timeouts = maki_providers::Timeouts {

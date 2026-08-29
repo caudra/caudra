@@ -7,112 +7,69 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 21 built-in tools in this reference (21 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
-### `bash` {#bash}
+### `file_read` {#file_read}
 
-Execute a bash command.
-Commands run in the current working directory by default.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
-| `timeout` | integer | no | 120 | Timeout in seconds |
-| `workdir` | string | no | cwd | Working directory |
-
-### `list` {#list}
-
-List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
+Read a file or directory from the local filesystem. If the path does not exist, an error is returned.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `path` | string | yes | Absolute path to the directory |
+| `filePath` | string | yes | Root-relative or absolute path inside the configured root. |
+| `offset` | integer | no | 1-indexed starting line. |
+| `limit` | integer | no | Maximum lines to return. |
 
-### `read` {#read}
+### `file_write` {#file_write}
 
-Read a file. Returns contents with line numbers (1-indexed).
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
-| `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
-| `path` | string | yes | Absolute path to the file |
-
-### `write` {#write}
-
-Write content to a file, replacing existing content.
+Writes a file to the local filesystem.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `content` | string | yes | The complete file content to write |
-| `path` | string | yes | Absolute path to the file |
+| `filePath` | string | yes | File path inside the configured root. |
+| `content` | string | yes | Complete UTF-8 text content. |
+| `dryRun` | boolean | no | Preview the diff without changing the filesystem. |
 
-### `edit` {#edit}
+### `file_edit` {#file_edit}
 
-Replace an exact string match in a file.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `new_string` | string | yes |  | Replacement string |
-| `old_string` | string | yes |  | Exact string to find (must match uniquely unless replace_all is true) |
-| `path` | string | yes |  | Absolute path to the file |
-| `replace_all` | boolean | no | false | Replace all occurrences |
-
-### `multiedit` {#multiedit}
-
-Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when making multiple changes to the same file.
+Performs exact string replacements in files.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `edits` | array | yes | Array of edit operations to apply sequentially |
-| `path` | string | yes | Absolute path to the file |
+| `filePath` | string | yes | File path inside the configured root. |
+| `oldString` | string | yes | Exact text to replace. |
+| `newString` | string | yes | Replacement text. |
+| `replaceAll` | boolean | no | Replace every exact match. |
+| `dryRun` | boolean | no | Preview the diff without changing the filesystem. |
 
-### `edit_lines` {#edit_lines}
+### `file_apply_patch` {#file_apply_patch}
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `end` | integer | yes | Last line, inclusive |
-| `new_string` | string | yes | Replacement text |
-| `path` | string | yes | Absolute path to the file |
-| `start` | integer | yes | First line (1-indexed) |
-
-### `insert_lines` <span class="badge badge-optin">opt-in</span> {#insert_lines}
-
-Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.
+Use file_apply_patch to edit files with a stripped-down, file-oriented diff format. The patch language is designed to be easy to parse and safe to review.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `line` | integer | yes | Line number to insert after (1-indexed). Use 0 to insert at the top. |
-| `new_string` | string | yes | Text to insert |
-| `path` | string | yes | Absolute path to the file |
+| `patchText` | string | yes | Complete stripped-down file patch. |
+| `dryRun` | boolean | no | Validate and preview the patch without changing files. |
 
-### `glob` {#glob}
+### `file_glob` {#file_glob}
 
-Find files by glob pattern.
+Fast file pattern matching tool for files under the file root.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pattern` | string | yes | Glob pattern supporting *, **, ?, and brace alternatives. |
+| `path` | string | no | Optional directory under the configured root. |
 
-### `grep` {#grep}
+### `file_grep` {#file_grep}
 
-Search file contents using regex.
+Fast content search tool for files under the file root.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `context_after` | integer | no |  | Context lines after match |
-| `context_before` | integer | no |  | Context lines before match |
-| `include` | string | no |  | File glob filter (e.g. *.c) |
-| `limit` | integer | no |  | Max match groups to return |
-| `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | yes |  | Regex pattern |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pattern` | string | yes | Linear-time regular expression without look-around or backreferences. |
+| `path` | string | no | Optional file or directory under the root. |
+| `include` | string | no | Optional file glob filter. |
 
 ### `tool_output_read` {#tool_output_read}
 
@@ -120,10 +77,10 @@ Read a page of managed tool output owned by the current session.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
 | `byte_offset` | integer | no | 0; use continuation hints | Starting byte within the first line. |
 | `limit` | integer | no | 200; capped at 2000 | Maximum lines to return. |
 | `offset` | integer | no | 1 | Starting line, 1-indexed. |
-| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
 
 ### `tool_output_grep` {#tool_output_grep}
 
@@ -131,12 +88,12 @@ Search managed tool output owned by the current session using a regex.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `offset` | integer | no | 1 | Starting line, 1-indexed. |
+| `pattern` | string | yes |  | Regex pattern. |
+| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
 | `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
 | `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
 | `limit` | integer | no | 100; capped at 200 | Maximum matches to return. |
-| `offset` | integer | no | 1 | Starting line, 1-indexed. |
-| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
-| `pattern` | string | yes |  | Regex pattern. |
 
 ### `index` {#index}
 
@@ -148,7 +105,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
 ### `view_image` {#view_image}
 
-View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
+View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `file_read` for images.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -164,14 +121,33 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 |-----------|------|----------|-------------|
 | `tool_calls` | array | yes | Array of tool calls to execute in parallel |
 
+### `shell` {#shell}
+
+Execute a Bash command on the MCP server host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | yes | Bash command to execute on the MCP server host. |
+| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000. |
+| `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
+
 ### `code_execution` {#code_execution}
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Execute a short Python script in an isolated interpreter and return its value and printed output.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency. |
-| `timeout` | integer | no | 30 | Script execution timeout in seconds |
+Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `code` | string | yes | Python source to execute. The value of the final expression is returned. |
+| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000. |
+
+### `execution_environment` {#execution_environment}
+
+Inspect the execution host's current sanitized environment.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
 
 ### `question` {#question}
 
@@ -194,11 +170,11 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
-| `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 | `task_id` | string | no | A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh. |
+| `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 
 ### `todo_write` {#todo_write}
 
@@ -215,8 +191,8 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
-| `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
+| `content` | string | no | Body for write (frontmatter added automatically). |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
 ### `skill` {#skill}
@@ -231,19 +207,21 @@ Load a skill that provides instructions and workflows for specific tasks.
 
 ### `webfetch` {#webfetch}
 
-Fetch a URL and return its contents.
+Fetch content from a URL and return model-facing text.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `format` | string | no |  | Output format: markdown (default), text, or html |
-| `timeout` | integer | no | 30, max 120 | Timeout in seconds |
-| `url` | string | yes |  | URL to fetch (http:// or https://) |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | yes | HTTP(S) URL to fetch. |
+| `format` | string | no | Output format. |
+| `pdfMode` | string | no | PDF handling mode. Defaults to extract. |
+| `timeout` | integer | no | Timeout in seconds. Defaults to 30, max 60. |
 
 ### `websearch` {#websearch}
 
-Search the web for real-time information using Exa AI.
+Search the web using Exa's credential-free hosted MCP service.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `num_results` | integer | no | 8 | Number of results to return |
-| `query` | string | yes |  | Search query |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | yes | Natural-language search query sent to Exa's hosted MCP service. Maximum 512 characters. |
+| `limit` | integer | no | Maximum results to return. Defaults to 10. |
+| `timeoutSec` | integer | no | Request timeout in seconds. Defaults to 10. |

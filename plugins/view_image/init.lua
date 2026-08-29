@@ -1,7 +1,7 @@
 local shorten_path = require("maki.shorten_path")
 
 local DESCRIPTION =
-  [[View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
+  [[View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `file_read` for images.
 
 - Paths: absolute, relative, or ~/.
 - Oversized images are downscaled automatically (animated gif/webp keep only the first frame).]]

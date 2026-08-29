@@ -26,12 +26,13 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
 /// Both the interpreter and `maki.agent.call_tool` come through here,
 /// so the two can never drift apart.
 pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
-    let text = match &done.output {
+    let text = match (&done.model_output, &done.output) {
         // The pixels are dropped here; say so instead of implying they were seen.
-        crate::ToolOutput::Image { text, .. } if !done.is_error => {
+        (_, crate::ToolOutput::Image { text, .. }) if !done.is_error => {
             format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")
         }
-        out => out.as_text(),
+        (Some(model_output), _) => model_output.clone(),
+        (None, output) => output.as_text(),
     };
     if done.is_error { Err(text) } else { Ok(text) }
 }
@@ -95,6 +96,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -120,6 +122,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: Some("model-only context".into()),
@@ -133,7 +136,29 @@ mod tests {
 
         let flattened = flatten(&done).unwrap();
         assert!(flattened.len() <= ctx.config.max_output_bytes);
-        assert!(!flattened.contains("model-only context"));
+        assert!(flattened.contains("model-only context"));
         assert!(flattened.contains("Full output was unavailable"));
+    }
+
+    #[test]
+    fn flatten_prefers_exact_model_output() {
+        let mut done = crate::ToolDoneEvent {
+            id: "t1".into(),
+            tool: Arc::from("test"),
+            output: crate::ToolOutput::Plain("presentation".into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            written_paths: Vec::new(),
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: Some("exact model output".into()),
+            model_output_from_ref: false,
+        };
+
+        assert_eq!(flatten(&done).unwrap(), "exact model output");
+        done.is_error = true;
+        assert_eq!(flatten(&done).unwrap_err(), "exact model output");
     }
 }

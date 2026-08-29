@@ -35,7 +35,7 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CLI rendered in monospace. Use GitHub-flavored markdown.
 - Only use emojis if explicitly requested.
 - Do not add comments to code unless asked.
-- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
+- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use shell commands to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
 - NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
 
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];

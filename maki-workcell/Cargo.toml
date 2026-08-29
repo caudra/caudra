@@ -1,0 +1,32 @@
+[package]
+name = "maki-workcell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maki-agent = { workspace = true }
+maki-storage = { workspace = true }
+async-trait = { workspace = true }
+futures-lite = { workspace = true }
+flume = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+workcell = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+maki-config = { workspace = true }
+smol = { workspace = true }
+tempfile = { workspace = true }

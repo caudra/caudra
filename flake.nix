@@ -115,6 +115,25 @@
         let
           craneLib = mkCraneLib pkgs;
           workspaceSrc = mkWorkspaceSrc craneLib;
+          montySrc = pkgs.fetchgit {
+            url = "https://github.com/pydantic/monty.git";
+            rev = "70fe3f5781381eb33579e45046f8cb3845953373";
+            hash = "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
+          };
+          montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
+          montyWorker = craneLib.buildPackage {
+            pname = "maki-monty-worker";
+            version = "0.0.21";
+            src = montySrc;
+            cargoVendorDir = montyVendorDeps;
+            cargoExtraArgs = "--package monty-runtime --no-default-features";
+            doCheck = false;
+            installPhaseCommand = ''
+              mkdir -p $out/bin
+              cp target/release/monty $out/bin/monty
+              $out/bin/monty --version | grep -q '0.0.21'
+            '';
+          };
 
           # TODO: Upstream monty includes a relative README path that doesn't
           # survive nix vendoring. Remove this once `monty` stops including
@@ -150,6 +169,7 @@
               stdenv.cc.cc.lib
             ];
             inherit cargoVendorDir;
+            MAKI_MONTY_WORKER = "${montyWorker}/bin/monty";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly (
@@ -171,6 +191,11 @@
               cargoArtifacts = cargoArtifacts;
               cargoExtraArgs = "--package ${packageName}";
               doCheck = false;
+              doInstallCheck = true;
+              installCheckPhaseCommand = ''
+                XDG_CACHE_HOME="$TMPDIR/cache" $out/bin/maki prompt --tools --names \
+                  | grep -qx code_execution
+              '';
             }
           );
         }

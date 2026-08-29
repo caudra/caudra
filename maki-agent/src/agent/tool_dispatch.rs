@@ -32,6 +32,7 @@ const SOURCE_UNKNOWN: &str = "unknown";
 /// A name that still carries one means the MCP server behind it is gone.
 const MCP_NAME_SEPARATOR: &str = "__";
 const BASH_TOOL: &str = "bash";
+const SHELL_TOOL: &str = "shell";
 const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
@@ -143,6 +144,7 @@ async fn run_inner(
         is_error: true,
         annotation: None,
         written_path: None,
+        written_paths: Vec::new(),
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -177,8 +179,21 @@ async fn run_inner(
             }
         };
 
-        if let Some(target) = invocation.mutable_path() {
-            let is_plan_target = ctx.mode.plan_path().is_some_and(|pp| target == pp);
+        let prepared_intent = match invocation.preflight(ctx).await {
+            Ok(intent) => intent,
+            Err(error) => return done_error(error),
+        };
+
+        if ctx.mode.plan_path().is_some() && invocation.blocked_in_plan_mode() {
+            warn!(tool = %name, "blocked tool in plan mode");
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+
+        for target in invocation.mutation_targets(ctx) {
+            let is_plan_target = ctx
+                .mode
+                .plan_path()
+                .is_some_and(|plan_path| target == plan_path);
             if !is_plan_target {
                 if ctx.mode.plan_path().is_some() {
                     warn!(
@@ -188,14 +203,22 @@ async fn run_inner(
                     );
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
-                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
                     return done_error(reason);
                 }
             }
         }
 
-        if let Err(e) =
-            enforce_permission(invocation.as_ref(), &entry.source, name, input, ctx, &id).await
+        if let Err(e) = enforce_permission(
+            invocation.as_ref(),
+            prepared_intent.as_ref(),
+            &entry.source,
+            name,
+            input,
+            ctx,
+            &id,
+        )
+        .await
         {
             return done_error(e);
         }
@@ -207,7 +230,7 @@ async fn run_inner(
             summary: header_result.text(),
             render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
-            input: None,
+            input: invocation.start_input(ctx),
             raw_input: Some(input.clone()),
             output: invocation.start_output(ctx),
         };
@@ -222,6 +245,9 @@ async fn run_inner(
         let elapsed = started.elapsed();
         match result.output {
             Ok(output) => {
+                let written_path = result
+                    .written_path
+                    .or_else(|| result.written_paths.first().cloned());
                 debug!(
                     tool = %name,
                     source = %entry.source.as_log_field(),
@@ -232,13 +258,14 @@ async fn run_inner(
                     id,
                     tool: tool_id,
                     output,
-                    is_error: false,
+                    is_error: result.is_error,
                     annotation: result.annotation,
-                    written_path: result.written_path,
+                    written_path,
+                    written_paths: result.written_paths,
                     output_ref: result.output_ref,
                     output_limits: result.output_limits,
                     model_suffix: result.model_suffix,
-                    model_output: None,
+                    model_output: result.model_output,
                     model_output_from_ref: result.model_output_from_ref,
                 }
             }
@@ -253,6 +280,7 @@ async fn run_inner(
                 let mut done = done_error(message).with_model_suffix(result.model_suffix);
                 done.output_limits = result.output_limits;
                 done.output_ref = result.output_ref;
+                done.model_output = result.model_output;
                 done.model_output_from_ref = result.model_output_from_ref;
                 done
             }
@@ -325,6 +353,7 @@ fn run_tool_search(
         is_error,
         annotation: None,
         written_path: None,
+        written_paths: Vec::new(),
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -361,6 +390,7 @@ async fn run_local_tool(
         is_error,
         annotation: None,
         written_path: None,
+        written_paths: Vec::new(),
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -369,12 +399,13 @@ async fn run_local_tool(
     }
 }
 
-/// Enforce permission for a native tool. MCP tools bypass this — they go
+/// Enforce permission for a registry tool. MCP tools bypass this — they go
 /// through `execute_mcp_tool` which handles permission checking internally.
 ///
 /// Returns an error if `name` contains dots (not a valid native tool name).
 async fn enforce_permission(
     inv: &dyn ToolInvocation,
+    prepared_intent: Option<&crate::tools::PermissionIntent>,
     source: &crate::tools::ToolSource,
     name: &str,
     input: &Value,
@@ -387,11 +418,17 @@ async fn enforce_permission(
         ));
     }
     let input = inv.permission_input().unwrap_or(input);
-    let scopes = inv.permission_scopes().await.unwrap_or_else(|| {
-        crate::tools::PermissionScopes::single(crate::permissions::canonical_json(input))
-    });
     let tool_key = ToolKey::native(name);
     let identity = match source {
+        crate::tools::ToolSource::Native {
+            owner, contract, ..
+        } => Some((
+            crate::permissions::PermissionSubject::Native {
+                owner: owner.to_string(),
+                contract: contract.to_string(),
+            },
+            crate::permissions::PermissionExecutorKind::Native,
+        )),
         crate::tools::ToolSource::Lua {
             plugin,
             contract,
@@ -406,21 +443,55 @@ async fn enforce_permission(
         )),
         crate::tools::ToolSource::Mcp { .. } => None,
     };
-    ctx.permissions
-        .enforce_with_identity(
-            &tool_key,
-            &scopes,
-            input,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            identity,
-            matches!(source, crate::tools::ToolSource::Lua { bundled: true, .. }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let include_builtin_allows = matches!(
+        source,
+        crate::tools::ToolSource::Native { trusted: true, .. }
+            | crate::tools::ToolSource::Lua { bundled: true, .. }
+    );
+    let computed_intent;
+    let intent = match prepared_intent {
+        Some(intent) => Some(intent),
+        None => {
+            computed_intent = inv.permission_intent(ctx).await;
+            computed_intent.as_ref()
+        }
+    };
+    if let Some(intent) = intent {
+        ctx.permissions
+            .enforce_with_intent(
+                &tool_key,
+                intent,
+                input,
+                &ctx.event_tx,
+                ctx.user_response_rx.as_deref(),
+                id,
+                &ctx.cancel,
+                ctx.mode.plan_path(),
+                identity,
+                include_builtin_allows,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        let scopes = inv.permission_scopes().await.unwrap_or_else(|| {
+            crate::tools::PermissionScopes::single(crate::permissions::canonical_json(input))
+        });
+        ctx.permissions
+            .enforce_with_identity(
+                &tool_key,
+                &scopes,
+                input,
+                &ctx.event_tx,
+                ctx.user_response_rx.as_deref(),
+                id,
+                &ctx.cancel,
+                ctx.mode.plan_path(),
+                identity,
+                include_builtin_allows,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -438,6 +509,7 @@ async fn execute_mcp_tool(
         is_error,
         annotation: None,
         written_path: None,
+        written_paths: Vec::new(),
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -640,7 +712,7 @@ fn changed_lines(before: &str, after: &str) -> (u64, u64) {
 /// The same heuristic Claude Code uses: look at what the shell was asked to
 /// do, not at what it printed.
 fn git_activity(name: &str, input: &Value) {
-    if name != BASH_TOOL {
+    if !matches!(name, BASH_TOOL | SHELL_TOOL) {
         return;
     }
     let Some(command) = input.get(BASH_COMMAND_FIELD).and_then(Value::as_str) else {
@@ -1168,6 +1240,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use crate::ToolInput;
     use crate::tools::{
         BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
         PermissionScopes, Tool, ToolExecResult,
@@ -1229,6 +1302,72 @@ mod tests {
 
     struct ReplacementTaskInvocation {
         executed: Arc<AtomicBool>,
+    }
+
+    struct NativeProbe {
+        name: &'static str,
+        executed: Arc<AtomicBool>,
+        targets: Vec<PathBuf>,
+        rich_result: bool,
+    }
+
+    struct NativeProbeInvocation {
+        executed: Arc<AtomicBool>,
+        targets: Vec<PathBuf>,
+        rich_result: bool,
+    }
+
+    impl ToolInvocation for NativeProbeInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("native probe".into()))
+        }
+
+        fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+            Some(ToolInput::Code {
+                language: "rust".into(),
+                code: "fn main() {}".into(),
+            })
+        }
+
+        fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+            self.targets.clone()
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            self.executed.store(true, Ordering::SeqCst);
+            Box::pin(async move {
+                let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())));
+                if self.rich_result {
+                    result
+                        .with_written_paths(vec!["first.rs".into(), "second.rs".into()])
+                        .with_model_output(Some("native model output".into()))
+                } else {
+                    result
+                }
+            })
+        }
+    }
+
+    impl Tool for NativeProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "native probe".into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(NativeProbeInvocation {
+                executed: Arc::clone(&self.executed),
+                targets: self.targets.clone(),
+                rich_result: self.rich_result,
+            }))
+        }
     }
 
     impl ToolInvocation for ReplacementTaskInvocation {
@@ -1306,6 +1445,216 @@ mod tests {
             assert!(done.is_error);
             assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
             assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn native_trust_controls_builtin_allows() {
+        smol::block_on(async {
+            for (trusted, expected_error) in [(false, true), (true, false)] {
+                let dir = TempDir::new().unwrap();
+                let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                    PermissionsConfig::default(),
+                    dir.path().to_path_buf(),
+                    Arc::default(),
+                ));
+                let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                    &AgentMode::Build,
+                    permissions,
+                );
+                let executed = Arc::new(AtomicBool::new(false));
+                let registry = ToolRegistry::new();
+                registry
+                    .register(
+                        Arc::new(ReplacementTaskProbe {
+                            executed: Arc::clone(&executed),
+                        }),
+                        ToolSource::Native {
+                            owner: "maki".into(),
+                            contract: "task/v1".into(),
+                            trusted,
+                        },
+                    )
+                    .unwrap();
+
+                let done = run(
+                    &registry,
+                    None,
+                    "native-trust".into(),
+                    "task",
+                    &serde_json::json!({"prompt": "do something"}),
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await;
+
+                assert_eq!(done.is_error, expected_error);
+                assert_eq!(executed.load(Ordering::SeqCst), !expected_error);
+            }
+        });
+    }
+
+    #[test]
+    fn dispatcher_uses_native_owner_and_contract_identity() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                Arc::clone(&permissions),
+            );
+            let (event_tx, event_rx) = flume::unbounded();
+            ctx.event_tx = crate::EventSender::new(event_tx, 0);
+            let (_response_tx, response_rx) = flume::unbounded();
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            let registry = Arc::new(ToolRegistry::new());
+            registry
+                .register(
+                    Arc::new(GuardedMock),
+                    ToolSource::Native {
+                        owner: "first-party".into(),
+                        contract: "guarded/v1".into(),
+                        trusted: false,
+                    },
+                )
+                .unwrap();
+            let task = smol::spawn({
+                let registry = Arc::clone(&registry);
+                async move {
+                    run(
+                        &registry,
+                        None,
+                        "native-identity".into(),
+                        GUARDED_TOOL_NAME,
+                        &serde_json::json!({}),
+                        &ctx,
+                        Emit::Silent,
+                    )
+                    .await
+                }
+            });
+
+            let event = event_rx.recv_async().await.unwrap().event;
+            let AgentEvent::PermissionRequest(request) = event else {
+                panic!("expected permission request, got {event:?}");
+            };
+            assert_eq!(
+                request.subject,
+                crate::permissions::PermissionSubject::Native {
+                    owner: "first-party".into(),
+                    contract: "guarded/v1".into(),
+                }
+            );
+            assert_eq!(
+                request.executor,
+                crate::permissions::PermissionExecutorKind::Native
+            );
+            assert!(permissions.answer(
+                "native-identity",
+                crate::permissions::PermissionAnswer::Deny
+            ));
+            assert!(task.await.is_error);
+        });
+    }
+
+    #[test]
+    fn every_mutation_target_is_checked_in_plan_mode() {
+        smol::block_on(async {
+            let plan_path = PathBuf::from("/tmp/plan.md");
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(NativeProbe {
+                        name: "native_patch",
+                        executed: Arc::clone(&executed),
+                        targets: vec![plan_path.clone(), PathBuf::from("/tmp/other.rs")],
+                        rich_result: false,
+                    }),
+                    ToolSource::Native {
+                        owner: "maki".into(),
+                        contract: "patch/v1".into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Plan(plan_path));
+
+            let done = run(
+                &registry,
+                None,
+                "mutation-targets".into(),
+                "native_patch",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), crate::tools::PLAN_WRITE_RESTRICTED);
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn native_start_input_and_result_metadata_reach_events() {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(NativeProbe {
+                        name: "native_result",
+                        executed: Arc::clone(&executed),
+                        targets: Vec::new(),
+                        rich_result: true,
+                    }),
+                    ToolSource::Native {
+                        owner: "maki".into(),
+                        contract: "result/v1".into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let (event_tx, event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+
+            let done = run(
+                &registry,
+                None,
+                "native-result".into(),
+                "native_result",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Notify,
+            )
+            .await;
+
+            let event = event_rx.recv_async().await.unwrap().event;
+            let AgentEvent::ToolStart(start) = event else {
+                panic!("expected tool start, got {event:?}");
+            };
+            assert_eq!(
+                start.input,
+                Some(ToolInput::Code {
+                    language: "rust".into(),
+                    code: "fn main() {}".into(),
+                })
+            );
+            assert_eq!(done.written_path(), Some("first.rs"));
+            assert_eq!(
+                done.written_paths().collect::<Vec<_>>(),
+                ["first.rs", "second.rs"]
+            );
+            assert_eq!(done.model_output.as_deref(), Some("native model output"));
+            assert!(executed.load(Ordering::SeqCst));
         });
     }
 

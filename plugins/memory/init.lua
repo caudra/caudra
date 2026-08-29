@@ -2,7 +2,7 @@ local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
 
-local MEMORY_POLICY_TOOLS = { "memory", "write", "edit", "multiedit", "edit_lines", "insert_lines" }
+local MEMORY_POLICY_TOOLS = { "memory", "file_write", "file_edit", "file_apply_patch" }
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -67,7 +67,7 @@ maki.api.register_prompt_hint({
     if not tag_line then
       return nil
     end
-    return "\n\nMemory tags (memory tool, `read tags=[...]`): " .. tag_line .. "\n"
+    return '\n\nMemory tags (`memory` with `command="read"` and `tags=[...]`): ' .. tag_line .. "\n"
   end,
 })
 
@@ -189,7 +189,7 @@ maki.api.register_tool({
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
     .. "- Save important context before compaction or to build up project knowledge.\n"
     .. "- Keep entries concise and current. Delete outdated information.\n"
-    .. "- Notes are plain files; `list` and `read` report the dir, so use the edit tool on `<dir>/<name>` for targeted changes.",
+    .. "- The memory `list` and `read` commands report the notes dir; use `file_edit` on `<dir>/<name>` for targeted changes.",
 
   schema = {
     type = "object",

@@ -89,7 +89,7 @@ maki
 
 Type what you want done, press Enter, watch it work. Worth knowing on day one:
 
-- **Permissions.** File edits inside the repo run freely. `bash` and web tools ask first: `y` allows once, `s` remembers the exact call for the conversation, and `a` remembers it for the project. Deny rules always win. `/yolo` skips prompts after deny checks. Details in [Permissions](/docs/permissions/).
+- **Permissions.** File edits inside the repo run freely. `shell` and web tools ask first: `y` allows once, `s` remembers the exact call for the conversation, and `a` remembers it for the project. Deny rules always win. `/yolo` skips prompts after deny checks. Details in [Permissions](/docs/permissions/).
 - **Plan mode.** `Tab` toggles it. The agent may only write the plan file until you approve, then back to build mode.
 - **Models.** `/model` switches mid-session.
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `maki --continue` resumes where you left off.

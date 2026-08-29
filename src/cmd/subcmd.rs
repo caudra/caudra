@@ -573,6 +573,7 @@ fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Res
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
+    let _workcell_host = super::register_workcell(&cwd)?;
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -587,7 +588,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
-    host.load_builtins(&config.plugins)
+    host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
     let abs_path = Path::new(path)
@@ -678,6 +679,7 @@ pub fn prompt(
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
+    let _workcell_host = super::register_workcell(&cwd)?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
@@ -690,7 +692,7 @@ pub fn prompt(
         .unwrap_or_default()
         .into_config(no_rtk)
         .context("invalid config")?;
-    host.load_builtins(&config.plugins)
+    host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
     if tools {

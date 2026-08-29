@@ -14,6 +14,7 @@ use tracing::warn;
 
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
+const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
 
 pub mod providers;
 
@@ -79,12 +80,47 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
+pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[
+    "batch",
+    "index",
+    "memory",
+    "question",
+    "sessions",
+    "skill",
+    "task",
+    "todo_write",
+    "view_image",
+];
+
+pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
+    "file_apply_patch",
+    "file_edit",
+    "file_glob",
+    "file_grep",
+    "file_read",
+    "file_write",
+    "websearch",
+    "webfetch",
+    "shell",
+    "code_execution",
+    "execution_environment",
+];
+
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
 /// pointer to the new one.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
-pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+pub const FILE_WRITE_TOOLS: &[&str] = &[
+    "file_apply_patch",
+    "file_edit",
+    "file_write",
+    "write",
+    "edit",
+    "multiedit",
+    "edit_lines",
+    "insert_lines",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -2072,7 +2108,7 @@ fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
     collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
 
     for (key, value) in vars {
-        if std::env::var_os(&key).is_none() {
+        if !PROCESS_ONLY_ENV_VARS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
             // SAFETY: single-threaded at startup, before any async runtime
             unsafe { std::env::set_var(&key, &value) };
         }
@@ -3220,6 +3256,21 @@ mod tests {
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::remove_var(PROCESS_WINS);
         }
+    }
+
+    #[test]
+    fn project_env_cannot_select_an_executable_worker() {
+        const WORKER: &str = "WORKCELL_MCP_CODE_WORKER";
+
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join(".env"), format!("{WORKER}=/tmp/untrusted")).unwrap();
+        unsafe { std::env::remove_var(WORKER) };
+
+        load_env_files_with_global(dir.path(), None);
+
+        assert!(std::env::var_os(WORKER).is_none());
     }
 
     #[test]

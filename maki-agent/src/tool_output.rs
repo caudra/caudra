@@ -79,7 +79,10 @@ pub(crate) async fn limit(done: &mut ToolDoneEvent, ctx: &ToolContext) {
         .model_suffix()
         .map(|suffix| suffix.trim_matches(['\r', '\n']))
         .filter(|suffix| !suffix.is_empty());
-    let mut source = done.output.as_text();
+    let mut source = done
+        .model_output
+        .clone()
+        .unwrap_or_else(|| done.output.as_text());
     if suffix.is_some() {
         source.truncate(source.trim_end_matches(['\r', '\n']).len());
     }
@@ -402,6 +405,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -476,6 +480,22 @@ mod tests {
         assert!(model_output.len() <= ctx.config.max_output_bytes);
         assert!(model_output.starts_with("start-"));
         assert!(model_output.contains("-end"));
+    }
+
+    #[test]
+    fn limits_and_persists_exact_model_output_instead_of_presentation() {
+        let model = format!("MODEL-{}-TAIL", "x".repeat(1_000));
+        let mut event = done("short presentation".into(), false);
+        event.model_output = Some(model);
+        let ctx = context(100, 240);
+
+        smol::block_on(limit(&mut event, &ctx));
+
+        let bounded = event.model_output.expect("bounded model output");
+        assert!(bounded.starts_with("MODEL-"));
+        assert!(bounded.contains("-TAIL"));
+        assert!(!bounded.contains("short presentation"));
+        assert_eq!(event.output.as_text(), "short presentation");
     }
 
     #[test]

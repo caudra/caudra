@@ -1,5 +1,14 @@
+monty_worker_name := if os_family() == "windows" { "monty.exe" } else { "monty" }
+monty_worker := justfile_directory() + "/target/code-worker/bin/" + monty_worker_name
+export MAKI_MONTY_WORKER := monty_worker
+
 default:
     @just --list
+
+# Build the pinned worker that maki-workcell embeds at compile time.
+code-worker:
+    cargo install monty-runtime --version "=0.0.21" --locked --no-default-features --root target/code-worker --target-dir target/code-worker-build
+    "{{monty_worker}}" --version
 
 build *ARGS:
     cargo build {{ARGS}}
@@ -42,4 +51,4 @@ machete:
     cargo machete
 
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check machete
+ci: code-worker fmt-check lint pylint test gen-docs-check machete

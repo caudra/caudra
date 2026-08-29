@@ -13,7 +13,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use maki_agent::permissions::PermissionRequest;
-use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::tools::{FILE_WRITE_TOOL_NAME, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::WinView;
@@ -128,7 +128,7 @@ impl Chat {
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
-                let is_full_write = &*e.tool == WRITE_TOOL_NAME;
+                let is_full_write = matches!(&*e.tool, WRITE_TOOL_NAME | FILE_WRITE_TOOL_NAME);
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -793,6 +793,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,

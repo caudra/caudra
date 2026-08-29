@@ -21,21 +21,21 @@ So Maki attacks the two multipliers: how much each step adds to context, and how
 
 ## Smaller results
 
-**index instead of read.** The `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+**index instead of file_read.** The `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
 
 ```
-read main.rs                 index main.rs
-────────────                 ─────────────────────────────
+file_read main.rs            index main.rs
+─────────────────            ─────────────────────────────
 1400 lines in context        60 lines of signatures
-                             + read offset=812 limit=40
+                             + file_read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can grep, read, and hit dead ends as much as it wants while only its final summary enters the main conversation. Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
+**Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends as much as it wants while only its final summary enters the main conversation. Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
 
 ```
 main context                subagent context (isolated)
 ────────────                ────────────────────────────
-task("find auth") ───────►  glob, grep ×6, read ×9, ...
+task("find auth") ───────►  file_glob, file_grep ×6, file_read ×9, ...
                   ◄───────  "JWT middleware, auth.rs:120"
 one line stays              ~20k tokens stay outside main
 ```
@@ -48,7 +48,7 @@ Successful text results larger than 8 KiB are retained. This lets Maki prune old
 
 Use `tool_output_grep` with that ID and a regex to find relevant lines. Its `offset` is the first line to search, `limit` caps matches, and `context_before` and `context_after` add nearby lines. Then use `tool_output_read` with a 1-indexed `offset` and line `limit` to page through the needed range. Both tools include an exact next-call hint when more results remain. IDs belong to the current session. [Sessions](/docs/sessions/#managed-tool-outputs) covers retention and cleanup.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
 ## Fewer round-trips
 
@@ -56,15 +56,14 @@ Every round-trip re-sends the context, so round-trips are the other half of the 
 
 **batch** runs independent tool calls in one turn: one request, N results.
 
-**code_execution** goes further: a Python sandbox where tools are async functions. Chained calls, loops, and filtering happen inside the sandbox; only what the script prints enters context.
+**code_execution** runs pure computation in an isolated Python subset. It can reshape JSON, aggregate values, process text, and perform calculations without host filesystem or network access.
 
 ```
-without                          with code_execution
+manual calculation              with code_execution
 ─────────────────────            ─────────────────────────────
-glob        → 300 paths          results = gather(read × 300)
-read × 300  → 300 files          filter in python
-300 turns, every file            print("3 files call foo_v1")
-in context forever               1 turn, 1 line in context
+inspect a large JSON result      data = json.loads(source)
+reason over every value          print(sum(row["cost"] for row in data))
+more context and mistakes        one bounded result
 ```
 
 **Compaction** resets the multiplier when a session runs long: older turns are summarized and dropped. [Context](/docs/context/#when-the-window-fills) has the details.

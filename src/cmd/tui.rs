@@ -177,7 +177,7 @@ fn build_stack(
     let (config, prompt_profiles, default_prompt_profile) =
         config_or_fallback(loaded, fallback_config, &mut warnings)?;
 
-    if let Err(e) = plugin_host.load_builtins(&config.plugins) {
+    if let Err(e) = plugin_host.load_production_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         if reloading {
             warnings.push(format!("{e:#}"));
@@ -269,6 +269,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     load_env_files(&cwd);
+    let _workcell_host = super::register_workcell(&cwd)?;
     warn_stale_config_toml(&cwd);
 
     let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
@@ -580,7 +581,7 @@ mod tests {
         );
 
         plugin_host
-            .load_builtins(&config.plugins)
+            .load_production_builtins(&config.plugins)
             .expect("builtins load on the live host under --no-plugins");
 
         plugin_host.begin_shutdown();

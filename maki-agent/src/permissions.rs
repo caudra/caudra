@@ -34,7 +34,17 @@ pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const BASH_WORKDIR_SCOPE_MARKER: &str = " # maki-workdir[";
 const BASH_WORKDIR_FRAME_MARKER: &str = " # maki-frame[";
-const PROJECT_READ_TOOLS: &[&str] = &["glob", "grep", "index", "list", "read", "view_image"];
+const PROJECT_READ_TOOLS: &[&str] = &[
+    "file_glob",
+    "file_grep",
+    "file_read",
+    "glob",
+    "grep",
+    "index",
+    "list",
+    "read",
+    "view_image",
+];
 const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "batch",
     "code_execution",
@@ -518,6 +528,15 @@ impl PermissionManager {
             warn!("permission project mutex was poisoned, recovering");
             error.into_inner()
         })
+    }
+
+    /// Canonical session project root, independent of the process working directory.
+    pub fn project_cwd(&self) -> PathBuf {
+        let project = self.project();
+        project
+            .canonical_project
+            .clone()
+            .unwrap_or_else(|| maki_storage::paths::canonicalize_clean(&project.cwd))
     }
 
     pub fn set_project(&self, cwd: &Path) {
@@ -1253,6 +1272,67 @@ impl PermissionManager {
         identity: Option<(PermissionSubject, PermissionExecutorKind)>,
         include_builtin_allows: bool,
     ) -> Result<(), PermissionError> {
+        self.enforce_inner(
+            tool,
+            scopes,
+            input,
+            event_tx,
+            user_response_rx,
+            request_id,
+            cancel,
+            plan_path,
+            identity,
+            include_builtin_allows,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enforce_with_intent(
+        &self,
+        tool: &ToolKey,
+        intent: &crate::tools::PermissionIntent,
+        input: &serde_json::Value,
+        event_tx: &EventSender,
+        user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+        request_id: &str,
+        cancel: &crate::CancelToken,
+        plan_path: Option<&Path>,
+        identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+        include_builtin_allows: bool,
+    ) -> Result<(), PermissionError> {
+        self.enforce_inner(
+            tool,
+            &intent.scopes,
+            input,
+            event_tx,
+            user_response_rx,
+            request_id,
+            cancel,
+            plan_path,
+            identity,
+            include_builtin_allows,
+            Some(intent),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_inner(
+        &self,
+        tool: &ToolKey,
+        scopes: &crate::tools::PermissionScopes,
+        input: &serde_json::Value,
+        event_tx: &EventSender,
+        user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+        request_id: &str,
+        cancel: &crate::CancelToken,
+        plan_path: Option<&Path>,
+        identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+        include_builtin_allows: bool,
+        intent: Option<&crate::tools::PermissionIntent>,
+    ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let cwd = self.project().cwd.clone();
         let tool_string = tool.to_string();
@@ -1278,8 +1358,31 @@ impl PermissionManager {
             }
         };
 
-        let make_request =
-            |tool: ToolKey, request_scopes: Vec<String>, force_prompt: bool| match &identity {
+        let make_request = |tool: ToolKey, request_scopes: Vec<String>, force_prompt: bool| {
+            if let Some(intent) = intent {
+                let mut intent = intent.clone();
+                intent.scopes.scopes = request_scopes;
+                intent.scopes.force_prompt = force_prompt;
+                return match &identity {
+                    Some((subject, executor)) => PermissionRequest::from_intent_with_identity(
+                        request_id.to_owned(),
+                        tool,
+                        &intent,
+                        input.clone(),
+                        &cwd,
+                        subject.clone(),
+                        executor.clone(),
+                    ),
+                    None => PermissionRequest::from_intent(
+                        request_id.to_owned(),
+                        tool,
+                        &intent,
+                        input.clone(),
+                        &cwd,
+                    ),
+                };
+            }
+            match &identity {
                 Some((subject, executor)) => PermissionRequest::from_legacy_with_identity(
                     request_id.to_owned(),
                     tool,
@@ -1298,14 +1401,25 @@ impl PermissionManager {
                     &cwd,
                     force_prompt,
                 ),
-            };
+            }
+        };
         let initial_request =
             make_request(tool.clone(), scopes.scopes.clone(), scopes.force_prompt);
+        let exact_plan_write = plan_path.is_some_and(|plan_path| {
+            matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
+                && !initial_request.resources.is_empty()
+                && initial_request.resources.iter().all(|resource| {
+                    resource.access == Some(PermissionResourceAccess::Write)
+                        && normalize_scope_path(&resource.value)
+                            == normalize_scope_path(&plan_path.display().to_string())
+                })
+        });
         let force_prompt = scopes.force_prompt
-            || initial_request
-                .resources
-                .iter()
-                .any(|resource| resource.requires_prompt);
+            || (!exact_plan_write
+                && initial_request
+                    .resources
+                    .iter()
+                    .any(|resource| resource.requires_prompt));
         let full_request = if force_prompt == scopes.force_prompt {
             initial_request
         } else {
@@ -1448,11 +1562,20 @@ fn rule_matches_scope(rule: &PermissionRule, tool: &ToolKey, scope: &str) -> boo
         }
         Some(pattern) => {
             scope_matches(pattern, scope)
-                || matches!(tool, ToolKey::Native(name) if name.as_ref() == "bash")
+                || matches!(tool, ToolKey::Native(name) if matches!(name.as_ref(), "bash" | "shell"))
                     && bash_command_scope(scope)
                         .is_some_and(|command| scope_matches(pattern, command))
         }
     }
+}
+
+pub fn shell_permission_scope(command: &str, workdir: &Path) -> String {
+    let workdir = workdir.to_string_lossy();
+    format!(
+        "{command}{BASH_WORKDIR_SCOPE_MARKER}{}]={workdir}{BASH_WORKDIR_FRAME_MARKER}{}]",
+        workdir.len(),
+        workdir.len()
+    )
 }
 
 fn bash_command_scope(scope: &str) -> Option<&str> {
@@ -1542,6 +1665,8 @@ pub fn physical_boundary_check(parent: &Path, child: &Path) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use maki_storage::permission_state::PERMISSION_STATE_FILE;
     use test_case::test_case;
@@ -1575,6 +1700,97 @@ mod tests {
 
     fn default_mgr() -> PermissionManager {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn project_cwd_returns_the_canonical_session_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let manager = mgr_with(PermissionsConfig::default(), project.clone());
+
+        assert_eq!(manager.project_cwd(), project.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn explicit_intent_enforcement_uses_typed_resources_and_strict_identity() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes::single("legacy-scope".into()),
+                vec![PermissionResource {
+                    kind: PermissionResourceKind::Custom {
+                        name: "platform".into(),
+                    },
+                    value: "resource".into(),
+                    access: Some(PermissionResourceAccess::Execute),
+                    protected: false,
+                    requires_prompt: false,
+                    attributes: BTreeMap::new(),
+                }],
+                PermissionRisk::High,
+            );
+            let subject = PermissionSubject::Native {
+                owner: "first-party".into(),
+                contract: "platform/v1".into(),
+            };
+            let input = serde_json::json!({"value": "resource"});
+            let request = PermissionRequest::from_intent_with_identity(
+                "seed".into(),
+                ToolKey::native("platform_tool"),
+                &intent,
+                input.clone(),
+                Path::new("/tmp"),
+                subject.clone(),
+                PermissionExecutorKind::Native,
+            );
+            let rule = request
+                .option_rule("allow_exact", PermissionLifetime::Conversation)
+                .unwrap();
+            manager.load_structured_conversation_rules(vec![
+                PermissionRuleRecord::conversation(rule).unwrap(),
+            ]);
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+
+            let allowed = manager
+                .enforce_with_intent(
+                    &ToolKey::native("platform_tool"),
+                    &intent,
+                    &input,
+                    &event_tx,
+                    None,
+                    "matching",
+                    &crate::CancelToken::none(),
+                    None,
+                    Some((subject, PermissionExecutorKind::Native)),
+                    false,
+                )
+                .await;
+            assert!(allowed.is_ok());
+
+            let denied = manager
+                .enforce_with_intent(
+                    &ToolKey::native("platform_tool"),
+                    &intent,
+                    &input,
+                    &event_tx,
+                    None,
+                    "different-contract",
+                    &crate::CancelToken::none(),
+                    None,
+                    Some((
+                        PermissionSubject::Native {
+                            owner: "first-party".into(),
+                            contract: "platform/v2".into(),
+                        },
+                        PermissionExecutorKind::Native,
+                    )),
+                    false,
+                )
+                .await;
+            assert!(denied.is_err());
+        });
     }
 
     fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {

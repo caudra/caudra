@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::tools::PermissionIntent;
+
 pub use maki_storage::permission_state::{
     PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
     PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
@@ -21,9 +23,9 @@ const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
-const FILE_READ_TOOLS: &[&str] = &["index", "read", "view_image"];
+const FILE_READ_TOOLS: &[&str] = &["file_read", "index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
-const FILE_SEARCH_TOOLS: &[&str] = &["glob", "grep"];
+const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +35,18 @@ pub enum PermissionRisk {
     High,
     Critical,
     Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PermissionAuthorityProfile {
+    #[default]
+    ExactOnly,
+    Filesystem {
+        input_pointers: Vec<String>,
+    },
+    Url,
+    Query,
+    Shell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +168,60 @@ impl PermissionRequest {
     ) -> Self {
         let risk = risk_for(&tool, force_prompt);
         let resources = resources_for(&tool, &scopes, &input, cwd, force_prompt);
+        let authority = legacy_authority_profile(&tool);
+        Self::from_parts(
+            id, tool, scopes, input, cwd, subject, executor, risk, resources, &authority,
+        )
+    }
+
+    pub fn from_intent(
+        id: String,
+        tool: ToolKey,
+        intent: &PermissionIntent,
+        input: Value,
+        cwd: &Path,
+    ) -> Self {
+        let (subject, executor) = subject_and_executor(&tool);
+        Self::from_intent_with_identity(id, tool, intent, input, cwd, subject, executor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_intent_with_identity(
+        id: String,
+        tool: ToolKey,
+        intent: &PermissionIntent,
+        input: Value,
+        cwd: &Path,
+        subject: PermissionSubject,
+        executor: PermissionExecutorKind,
+    ) -> Self {
+        Self::from_parts(
+            id,
+            tool,
+            intent.scopes.scopes.clone(),
+            input,
+            cwd,
+            subject,
+            executor,
+            intent.risk.clone(),
+            intent.resources.clone(),
+            &intent.authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        id: String,
+        tool: ToolKey,
+        scopes: Vec<String>,
+        input: Value,
+        cwd: &Path,
+        subject: PermissionSubject,
+        executor: PermissionExecutorKind,
+        risk: PermissionRisk,
+        resources: Vec<PermissionResource>,
+        authority: &PermissionAuthorityProfile,
+    ) -> Self {
         let input_digest = canonical_json_sha256(&input);
         let options = rule_options(
             &tool,
@@ -163,6 +231,7 @@ impl PermissionRequest {
             &input,
             &input_digest,
             cwd,
+            authority,
         );
         let presentation = presentation_for(&tool, &risk, &resources);
         Self {
@@ -859,6 +928,29 @@ fn risk_for(tool: &ToolKey, force_prompt: bool) -> PermissionRisk {
     }
 }
 
+fn legacy_authority_profile(tool: &ToolKey) -> PermissionAuthorityProfile {
+    match tool {
+        ToolKey::Native(name) if name.as_ref() == "webfetch" => PermissionAuthorityProfile::Url,
+        ToolKey::Native(name) if name.as_ref() == "websearch" => PermissionAuthorityProfile::Query,
+        ToolKey::Native(name) if name.as_ref() == "bash" => PermissionAuthorityProfile::Shell,
+        ToolKey::Native(name) if FILE_SEARCH_TOOLS.contains(&name.as_ref()) => {
+            PermissionAuthorityProfile::Filesystem {
+                input_pointers: vec!["/pattern".into()],
+            }
+        }
+        ToolKey::Native(name)
+            if FILE_WRITE_TOOLS.contains(&name.as_ref())
+                || FILE_READ_TOOLS.contains(&name.as_ref())
+                || DIRECTORY_READ_TOOLS.contains(&name.as_ref()) =>
+        {
+            PermissionAuthorityProfile::Filesystem {
+                input_pointers: Vec::new(),
+            }
+        }
+        _ => PermissionAuthorityProfile::ExactOnly,
+    }
+}
+
 fn resources_for(
     tool: &ToolKey,
     scopes: &[String],
@@ -1055,6 +1147,15 @@ fn filesystem_resource(
     }
 }
 
+pub fn filesystem_permission_resource(
+    kind: PermissionResourceKind,
+    path: &Path,
+    access: PermissionResourceAccess,
+    cwd: &Path,
+) -> PermissionResource {
+    filesystem_resource(kind, &path.to_string_lossy(), access, cwd)
+}
+
 fn filesystem_resource_flags(value: &str, cwd: &Path) -> (bool, bool) {
     let Some(value) = normalized_filesystem_path(value) else {
         return (true, true);
@@ -1107,6 +1208,7 @@ fn exact_resource_constraints(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rule_options(
     tool: &ToolKey,
     subject: &PermissionSubject,
@@ -1115,6 +1217,7 @@ fn rule_options(
     input: &Value,
     input_digest: &str,
     cwd: &Path,
+    authority: &PermissionAuthorityProfile,
 ) -> Vec<PermissionRuleOption> {
     let exact_arguments = PermissionArgumentConstraint::Exact {
         digest: input_digest.into(),
@@ -1180,7 +1283,7 @@ fn rule_options(
         ),
     ];
 
-    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "webfetch")
+    if matches!(authority, PermissionAuthorityProfile::Url)
         && let [resource] = resources
         && resource.kind == PermissionResourceKind::Url
         && let Some(strict) = strict_http_url(&resource.value)
@@ -1257,7 +1360,7 @@ fn rule_options(
         options.push(option(
             "allow_any_url",
             "Any public HTTP(S) URL",
-            "Allow any public HTTP(S) URL accepted by this exact webfetch contract.",
+            "Allow any public HTTP(S) URL accepted by this exact tool contract.",
             StructuredPermissionEffect::Allow,
             vec![PermissionResourceConstraint {
                 kind: PermissionResourceKind::Url,
@@ -1274,7 +1377,7 @@ fn rule_options(
         ));
     }
 
-    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "websearch")
+    if matches!(authority, PermissionAuthorityProfile::Query)
         && let [resource] = resources
         && resource.kind == PermissionResourceKind::Query
     {
@@ -1293,7 +1396,7 @@ fn rule_options(
         options.push(option(
             "allow_any_query",
             "Any search query",
-            "Allow any future query through this exact websearch contract.",
+            "Allow any future query through this exact tool contract.",
             StructuredPermissionEffect::Allow,
             vec![PermissionResourceConstraint {
                 kind: PermissionResourceKind::Query,
@@ -1310,7 +1413,7 @@ fn rule_options(
         ));
     }
 
-    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "bash")
+    if matches!(authority, PermissionAuthorityProfile::Shell)
         && !resources.is_empty()
         && resources
             .iter()
@@ -1385,13 +1488,13 @@ fn rule_options(
 
     add_filesystem_options(
         &mut options,
-        tool,
         resources,
         input,
         cwd,
         subject,
         executor,
         &reusable,
+        authority,
     );
     if tool.is_mcp() {
         options.push(option(
@@ -1413,13 +1516,13 @@ fn rule_options(
 #[allow(clippy::too_many_arguments)]
 fn add_filesystem_options(
     options: &mut Vec<PermissionRuleOption>,
-    tool: &ToolKey,
     resources: &[PermissionResource],
     input: &Value,
     cwd: &Path,
     subject: &PermissionSubject,
     executor: &PermissionExecutorKind,
     reusable: &[PermissionLifetime],
+    authority: &PermissionAuthorityProfile,
 ) {
     if resources.is_empty()
         || resources.iter().any(|resource| {
@@ -1432,25 +1535,22 @@ fn add_filesystem_options(
     {
         return;
     }
-    let ToolKey::Native(name) = tool else {
+    let PermissionAuthorityProfile::Filesystem { input_pointers } = authority else {
         return;
     };
-    let write = FILE_WRITE_TOOLS.contains(&name.as_ref());
-    let search = FILE_SEARCH_TOOLS.contains(&name.as_ref());
-    if !write
-        && !search
-        && !FILE_READ_TOOLS.contains(&name.as_ref())
-        && !DIRECTORY_READ_TOOLS.contains(&name.as_ref())
-    {
-        return;
-    }
+    let write = resources
+        .iter()
+        .any(|resource| resource.access == Some(PermissionResourceAccess::Write));
+    let search = !input_pointers.is_empty();
 
     let arguments = if search {
-        let pointers = vec!["/pattern".to_owned()];
-        let Ok(digest) = selected_input_digest(input, &pointers) else {
+        let Ok(digest) = selected_input_digest(input, input_pointers) else {
             return;
         };
-        PermissionArgumentConstraint::SelectedDigest { pointers, digest }
+        PermissionArgumentConstraint::SelectedDigest {
+            pointers: input_pointers.clone(),
+            digest,
+        }
     } else {
         PermissionArgumentConstraint::Unconstrained
     };
@@ -1681,6 +1781,7 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use crate::tools::PermissionScopes;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1725,6 +1826,31 @@ mod tests {
         }
     }
 
+    fn explicit_request(
+        authority: PermissionAuthorityProfile,
+        resources: Vec<PermissionResource>,
+        input: Value,
+    ) -> PermissionRequest {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single("legacy-scope".into()),
+            resources,
+            PermissionRisk::Medium,
+        )
+        .with_authority(authority);
+        PermissionRequest::from_intent_with_identity(
+            "request".into(),
+            ToolKey::native("generic_platform_tool"),
+            &intent,
+            input,
+            Path::new("/project"),
+            PermissionSubject::Native {
+                owner: "first-party".into(),
+                contract: "platform/v1".into(),
+            },
+            PermissionExecutorKind::Native,
+        )
+    }
+
     fn exact_constraint(resource: &PermissionResource) -> PermissionResourceConstraint {
         PermissionResourceConstraint {
             kind: resource.kind.clone(),
@@ -1735,6 +1861,108 @@ mod tests {
             protected: Some(resource.protected),
             attributes: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn explicit_authority_profiles_do_not_depend_on_tool_names() {
+        let filesystem = explicit_request(
+            PermissionAuthorityProfile::Filesystem {
+                input_pointers: vec!["/pattern".into()],
+            },
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Directory,
+                value: "/project/src".into(),
+                access: Some(PermissionResourceAccess::Search),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            json!({"pattern": "needle", "limit": 10}),
+        );
+        let url = explicit_request(
+            PermissionAuthorityProfile::Url,
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Url,
+                value: "https://example.com/docs/page".into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            json!({"url": "https://example.com/docs/page"}),
+        );
+        let query = explicit_request(
+            PermissionAuthorityProfile::Query,
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Query,
+                value: "rust permissions".into(),
+                access: Some(PermissionResourceAccess::Search),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            json!({"query": "rust permissions"}),
+        );
+        let shell = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Command,
+                value: "cargo test".into(),
+                access: Some(PermissionResourceAccess::Execute),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::from([("workdir".into(), "/project".into())]),
+            }],
+            json!({"command": "cargo test", "timeout": 30}),
+        );
+        let exact = explicit_request(
+            PermissionAuthorityProfile::ExactOnly,
+            vec![custom_resource("opaque")],
+            json!({"value": "opaque"}),
+        );
+
+        for (request, option) in [
+            (&filesystem, "allow_exact_resources"),
+            (&url, "allow_exact_url"),
+            (&query, "allow_exact_query"),
+            (&shell, "allow_exact_commands"),
+        ] {
+            assert!(
+                request
+                    .options
+                    .iter()
+                    .any(|candidate| candidate.id == option)
+            );
+            assert_eq!(request.risk, PermissionRisk::Medium);
+        }
+        assert_eq!(
+            exact
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["allow_exact", "deny_exact"]
+        );
+    }
+
+    #[test]
+    fn native_contract_identity_is_strict_for_explicit_intents() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::ExactOnly,
+            vec![custom_resource("opaque")],
+            json!({"value": "opaque"}),
+        );
+        let rule = request
+            .option_rule("allow_exact", PermissionLifetime::Conversation)
+            .unwrap();
+        let mut other_contract = request.clone();
+        other_contract.subject = PermissionSubject::Native {
+            owner: "first-party".into(),
+            contract: "platform/v2".into(),
+        };
+
+        assert!(permission_rule_covers_request(&rule, &request));
+        assert!(!permission_rule_covers_request(&rule, &other_contract));
     }
 
     fn rule(

@@ -331,6 +331,9 @@ pub enum ToolInputErrorKind {
     InternalBug {
         detail: String,
     },
+    Custom {
+        detail: String,
+    },
 }
 
 impl ToolInputError {
@@ -338,6 +341,15 @@ impl ToolInputError {
         Self {
             path: path.clone(),
             kind,
+        }
+    }
+
+    pub fn custom(detail: impl Into<String>) -> Self {
+        Self {
+            path: JsonPath::default(),
+            kind: ToolInputErrorKind::Custom {
+                detail: detail.into(),
+            },
         }
     }
 }
@@ -385,6 +397,7 @@ impl Display for ToolInputError {
             ToolInputErrorKind::InternalBug { detail } => {
                 write!(f, "internal validator bug: {detail}")
             }
+            ToolInputErrorKind::Custom { detail } => f.write_str(detail),
         }
     }
 }

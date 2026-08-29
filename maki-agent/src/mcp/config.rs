@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test_case("srv",       stdio_raw(&[]),            "empty command"        ; "empty_command")]
-    #[test_case("bash",      stdio_raw(&["echo"]),      "conflicts with built-in" ; "builtin_name_collision")]
+    #[test_case("shell",     stdio_raw(&["echo"]),      "conflicts with built-in" ; "builtin_name_collision")]
     #[test_case("bad name!", stdio_raw(&["echo"]),      "ASCII alphanumeric"   ; "invalid_server_name")]
     #[test_case("srv",       http_raw("ftp://bad.com"), "http://"              ; "invalid_http_url")]
     fn parse_server_rejects(name: &str, cfg: RawServerConfig, expected_msg: &str) {

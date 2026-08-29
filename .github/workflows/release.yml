@@ -57,10 +57,17 @@ jobs:
             alpine:3.21 sh -c '
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
-              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal --target ${{ matrix.target }}
-              source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
-            '
+               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal --target ${{ matrix.target }}
+               source "$HOME/.cargo/env"
+               cargo install monty-runtime --version "=0.0.21" --locked --no-default-features \
+                 --root target/code-worker --target-dir target/code-worker-build --target ${{ matrix.target }}
+               worker="$PWD/target/code-worker/bin/monty"
+               strip "$worker"
+               "$worker" --version | grep -q '0.0.21'
+               MAKI_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
+               XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+                 target/${{ matrix.target }}/release/maki prompt --tools --names | grep -qx code_execution
+             '
           sudo chown -R $(id -u):$(id -g) target/
 
       - name: Package
@@ -68,7 +75,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -100,7 +107,25 @@ jobs:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo install monty-runtime --version "=0.0.21" --locked --no-default-features \
+            --root target/code-worker --target-dir target/code-worker-build --target ${{ matrix.target }}
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            worker="$PWD/target/code-worker/bin/monty.exe"
+          else
+            worker="$PWD/target/code-worker/bin/monty"
+            strip -x "$worker"
+          fi
+          "$worker" --version | grep -q '0.0.21'
+          MAKI_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            binary="target/${{ matrix.target }}/release/maki.exe"
+          else
+            binary="target/${{ matrix.target }}/release/maki"
+          fi
+          XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+            "$binary" prompt --tools --names | grep -qx code_execution
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -108,7 +133,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -118,7 +143,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe"
+          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact

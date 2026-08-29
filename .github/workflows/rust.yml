@@ -29,7 +29,9 @@ jobs:
               - "rust-toolchain.toml"
               - "src/**"
               - "maki-*/src/**"
+              - "maki-*/build.rs"
               - "plugins/**"
+              - "THIRD_PARTY_LICENSES/**"
               - "justfile"
               - ".github/workflows/rust.yml"
 
@@ -74,6 +76,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - run: just code-worker
       - run: just lint
 
   test:
@@ -90,6 +93,7 @@ jobs:
         with:
           tool: just,cargo-nextest
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
+      - run: just code-worker
       - run: just test
       # Lives here to reuse the warm target dir instead of building the graph twice.
       - run: just gen-docs-check
@@ -119,6 +123,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - run: just code-worker
       - run: just build
 
   windows:
@@ -132,6 +137,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - run: just code-worker
       - run: just lint
       - run: just build
 

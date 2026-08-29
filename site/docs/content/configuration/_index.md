@@ -201,60 +201,11 @@ maki.setup({
 })
 ```
 
-### `plugins.bash`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
-
-### `plugins.code_execution`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
-
-### `plugins.edit`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `edit_lines` | boolean | `true` | - | Provide the `edit_lines` tool. |
-| `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
-| `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
-
-### `plugins.glob`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
-
-### `plugins.grep`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
-
 ### `plugins.index`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
-
-### `plugins.read`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
 
 ### `plugins.skill`
 
@@ -268,22 +219,6 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
-
-### `plugins.webfetch`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
-
-### `plugins.websearch`
-
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | 256 | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | 4 | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ## Validation
 

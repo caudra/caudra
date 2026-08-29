@@ -165,6 +165,7 @@ impl App {
                     is_error,
                     annotation: None,
                     written_path: None,
+                    written_paths: Vec::new(),
                     output_ref: None,
                     output_limits: None,
                     model_suffix: None,

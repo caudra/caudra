@@ -23,6 +23,9 @@ const FILE_TOOLS: &[&str] = &[
     "multiedit",
     "edit_lines",
     "insert_lines",
+    "file_edit",
+    "file_read",
+    "file_write",
     "index",
     "view_image",
 ];
@@ -132,12 +135,12 @@ fn tool_locations(
     vec![location(resolved, input_line(tool, raw))]
 }
 
-/// The target file: `path`, or its schema alias `file_path` when the model
-/// used that spelling.
+/// The target file under the native or legacy schema spelling.
 fn input_path(raw_input: &serde_json::Value) -> Option<&str> {
     raw_input
         .get("path")
-        .or_else(|| raw_input.get("file_path"))?
+        .or_else(|| raw_input.get("file_path"))
+        .or_else(|| raw_input.get("filePath"))?
         .as_str()
         .filter(|s| !s.is_empty())
 }
@@ -165,7 +168,7 @@ fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 /// 0-based (Zed uses it as a buffer row), but tool inputs are 1-based.
 fn input_line(tool: &str, raw_input: &serde_json::Value) -> Option<u32> {
     let key = match tool {
-        "read" => "offset",
+        "read" | "file_read" => "offset",
         "edit_lines" => "start",
         // insert_lines writes *after* `line`, so the new text's 0-based row
         // is the raw value itself, and 0 (insert at the top) is valid.
@@ -204,13 +207,11 @@ fn done_locations(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Vec
     if event.is_error || FILE_TOOLS.contains(&&*event.tool) {
         return Vec::new();
     }
-    let Some(path) = event.written_path() else {
-        return Vec::new();
-    };
-    let Some(resolved) = resolve_path(path, cwd, home) else {
-        return Vec::new();
-    };
-    vec![location(resolved, None)]
+    event
+        .written_paths()
+        .filter_map(|path| resolve_path(path, cwd, home))
+        .map(|path| location(path, None))
+        .collect()
 }
 
 pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
@@ -606,9 +607,12 @@ mod tests {
     #[test_case("read", Some(json!({"path": "~", "offset": 1, "limit": 0})), Some(json!([{"path": "/home/user", "line": 0}])) ; "read_bare_tilde_expands_to_home")]
     #[test_case("read", Some(json!({"path": "~other/x", "offset": 1, "limit": 0})), None ; "read_tilde_user_prefix_unresolvable")]
     #[test_case("read", Some(json!({"file_path": "/a/b.rs", "offset": 7, "limit": 5})), Some(json!([{"path": "/a/b.rs", "line": 6}])) ; "read_file_path_alias")]
+    #[test_case("file_read", Some(json!({"filePath": "/a/b.rs", "offset": 7, "limit": 5})), Some(json!([{"path": "/a/b.rs", "line": 6}])) ; "native_read_file_path")]
     #[test_case("read", Some(json!({"path": "/a/b.rs", "offset": "42", "limit": 5})), Some(json!([{"path": "/a/b.rs", "line": 41}])) ; "read_string_offset_coerced")]
     #[test_case("write", Some(json!({"path": "/a/b.rs", "content": "x"})), Some(json!([{"path": "/a/b.rs"}])) ; "write_no_line")]
     #[test_case("edit", Some(json!({"path": "c.rs", "old_string": "a", "new_string": "b"})), Some(json!([{"path": "/home/user/project/c.rs"}])) ; "edit_relative_no_line")]
+    #[test_case("file_edit", Some(json!({"filePath": "c.rs", "oldString": "a", "newString": "b"})), Some(json!([{"path": "/home/user/project/c.rs"}])) ; "native_edit_relative")]
+    #[test_case("file_write", Some(json!({"filePath": "/a/b.rs", "content": "x"})), Some(json!([{"path": "/a/b.rs"}])) ; "native_write")]
     #[test_case("multiedit", Some(json!({"path": "c.rs", "edits": []})), Some(json!([{"path": "/home/user/project/c.rs"}])) ; "multiedit_relative_no_line")]
     #[test_case("edit_lines", Some(json!({"path": "/a", "start": 3, "end": 9, "new_string": "n"})), Some(json!([{"path": "/a", "line": 2}])) ; "edit_lines_start_becomes_line")]
     #[test_case("insert_lines", Some(json!({"path": "/a", "line": 5, "new_string": "n"})), Some(json!([{"path": "/a", "line": 5}])) ; "insert_lines_reports_the_inserted_row")]
@@ -656,6 +660,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path: written.map(str::to_owned),
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -683,6 +688,28 @@ mod tests {
         assert_eq!(
             done_locations_of(&event),
             Some(json!([{"path": "/home/user/project/a.rs"}]))
+        );
+    }
+
+    #[test]
+    fn done_plural_written_paths_report_every_location() {
+        let mut event = done_event(
+            "patch",
+            ToolOutput::Plain("patched files".into()),
+            false,
+            Some("/home/user/project/a.rs"),
+        );
+        event.written_paths = vec![
+            "/home/user/project/a.rs".into(),
+            "/home/user/project/b.rs".into(),
+        ];
+
+        assert_eq!(
+            done_locations_of(&event),
+            Some(json!([
+                {"path": "/home/user/project/a.rs"},
+                {"path": "/home/user/project/b.rs"}
+            ]))
         );
     }
 

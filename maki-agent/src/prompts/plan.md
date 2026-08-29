@@ -3,7 +3,7 @@
 <system-reminder>
 # Plan Mode
 
-CRITICAL: Plan mode ACTIVE. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file EXCEPT the plan file below. Do NOT use bash to manipulate files - commands may ONLY read/inspect. You may use write, edit, or multiedit ONLY on the plan file. Any modification to other files is a critical violation. ZERO exceptions.
+CRITICAL: Plan mode ACTIVE. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file EXCEPT the plan file below. The `shell` tool is unavailable in plan mode. You may use `file_write`, `file_edit`, or `file_apply_patch` ONLY on the plan file. Any modification to other files is a critical violation. ZERO exceptions.
 
 ---
 

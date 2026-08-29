@@ -1,9 +1,9 @@
-//! Single source of truth for all tools (Lua plugins and MCP servers). One registry, one lookup
-//! path, no parallel lists that can drift.
+//! Single source of truth for native, Lua, and MCP tools. One registry, one lookup path, no
+//! parallel lists that can drift.
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
@@ -13,8 +13,9 @@ use bitflags::bitflags;
 use maki_storage::tool_outputs::ToolOutputRef;
 use serde_json::{Value, json};
 
+use crate::permissions::{PermissionAuthorityProfile, PermissionResource, PermissionRisk};
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput, ToolOutputLimits};
+use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
 use super::{DescriptionContext, ToolContext};
 
@@ -61,6 +62,11 @@ impl ToolAudience {
 
 #[derive(Clone, Debug)]
 pub enum ToolSource {
+    Native {
+        owner: Arc<str>,
+        contract: Arc<str>,
+        trusted: bool,
+    },
     Mcp {
         server: Arc<str>,
     },
@@ -74,6 +80,7 @@ pub enum ToolSource {
 impl ToolSource {
     pub fn as_log_field(&self) -> Cow<'static, str> {
         match self {
+            Self::Native { owner, .. } => Cow::Owned(format!("native:{owner}")),
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
             Self::Lua { plugin, .. } => Cow::Owned(format!("lua:{plugin}")),
         }
@@ -84,9 +91,12 @@ pub type ParseError = super::schema::ToolInputError;
 
 pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
+    pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    pub written_paths: Vec<String>,
     pub model_suffix: Option<String>,
+    pub model_output: Option<String>,
     pub output_limits: Option<ToolOutputLimits>,
     pub output_ref: Option<ToolOutputRef>,
     pub model_output_from_ref: bool,
@@ -94,11 +104,15 @@ pub struct ToolExecResult {
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
     fn from(output: Result<ToolOutput, String>) -> Self {
+        let is_error = output.is_err();
         Self {
             output,
+            is_error,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             model_suffix: None,
+            model_output: None,
             output_limits: None,
             output_ref: None,
             model_output_from_ref: false,
@@ -108,9 +122,27 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
 
 impl ToolExecResult {
     pub fn with_written_path(mut self, path: Option<String>) -> Self {
-        if self.output.is_ok() {
+        if self.output.is_ok() && !self.is_error {
             self.written_path = path;
         }
+        self
+    }
+
+    pub fn with_written_paths(mut self, paths: Vec<String>) -> Self {
+        if self.output.is_ok() && !self.is_error {
+            self.written_path = paths.first().cloned();
+            self.written_paths = paths;
+        }
+        self
+    }
+
+    pub fn with_model_output(mut self, model_output: Option<String>) -> Self {
+        self.model_output = model_output;
+        self
+    }
+
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
         self
     }
 }
@@ -178,7 +210,7 @@ impl Future for HeaderFuture {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
     pub force_prompt: bool,
@@ -200,11 +232,39 @@ impl PermissionScopes {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PermissionIntent {
+    pub scopes: PermissionScopes,
+    pub resources: Vec<PermissionResource>,
+    pub risk: PermissionRisk,
+    pub authority: PermissionAuthorityProfile,
+}
+
+impl PermissionIntent {
+    pub fn new(
+        scopes: PermissionScopes,
+        resources: Vec<PermissionResource>,
+        risk: PermissionRisk,
+    ) -> Self {
+        Self {
+            scopes,
+            resources,
+            risk,
+            authority: PermissionAuthorityProfile::default(),
+        }
+    }
+
+    pub fn with_authority(mut self, authority: PermissionAuthorityProfile) -> Self {
+        self.authority = authority;
+        self
+    }
+}
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Holds the parsed input so start-event and `execute` share one parse pass.
-/// `permission_scopes` and `mutable_path` belong here because only the parsed
-/// call knows which file it will touch.
+/// Permission and mutation metadata belongs here because only the parsed call
+/// knows which authorities and files it will touch.
 pub trait ToolInvocation: Send + Sync {
     fn start_header(&self) -> HeaderFuture;
     fn start_annotation(&self) -> Option<String> {
@@ -213,8 +273,35 @@ pub trait ToolInvocation: Send + Sync {
     fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
         None
     }
+    fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+        None
+    }
     fn mutable_path(&self) -> Option<&Path> {
         None
+    }
+    fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+        self.mutable_path()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect()
+    }
+    fn blocked_in_plan_mode(&self) -> bool {
+        false
+    }
+    /// Performs non-effectful native inspection before plan and boundary
+    /// checks. Legacy tools leave this unset and retain the existing
+    /// permission lifecycle.
+    fn preflight<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
+    fn permission_intent<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<PermissionIntent>> {
+        Box::pin(std::future::ready(None))
     }
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
@@ -287,8 +374,7 @@ impl ToolRegistry {
         }
     }
 
-    /// The process-wide registry. Every tool in it comes from a Lua plugin
-    /// or an MCP server; Rust itself registers nothing.
+    /// The process-wide registry shared by native, Lua, and MCP tools.
     pub fn global() -> &'static Self {
         Self::global_arc()
     }
@@ -592,6 +678,17 @@ mod tests {
         assert!(matches!(err, RegistryError::NameConflict { .. }));
     }
 
+    #[test]
+    fn native_source_logs_its_actual_owner() {
+        let source = ToolSource::Native {
+            owner: "maki".into(),
+            contract: "patch/v1".into(),
+            trusted: true,
+        };
+
+        assert_eq!(source.as_log_field(), "native:maki");
+    }
+
     /// Tools added mid-session must show up in the next `definitions()` call.
     /// That is the whole reason we build schemas per-request.
     #[test]
@@ -800,20 +897,21 @@ mod tests {
     #[test]
     fn definitions_keep_internal_companions_with_restrictive_config() {
         use crate::tools::{
-            READ_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME,
+            FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME,
+            TOOL_OUTPUT_READ_TOOL_NAME,
         };
 
         let reg = ToolRegistry::new();
         for name in [
-            READ_TOOL_NAME,
+            FILE_READ_TOOL_NAME,
             TOOL_OUTPUT_READ_TOOL_NAME,
             TOOL_OUTPUT_GREP_TOOL_NAME,
-            "bash",
+            SHELL_TOOL_NAME,
         ] {
             reg.register(mock(name), lua_source("p")).unwrap();
         }
         let config = crate::AgentConfig {
-            allowed_tools: vec![READ_TOOL_NAME.into()],
+            allowed_tools: vec![FILE_READ_TOOL_NAME.into()],
             disabled_tools: vec![
                 TOOL_OUTPUT_READ_TOOL_NAME.into(),
                 TOOL_OUTPUT_GREP_TOOL_NAME.into(),
@@ -839,7 +937,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                READ_TOOL_NAME,
+                FILE_READ_TOOL_NAME,
                 TOOL_OUTPUT_READ_TOOL_NAME,
                 TOOL_OUTPUT_GREP_TOOL_NAME
             ]
@@ -856,5 +954,16 @@ mod tests {
         let result: ToolExecResult = base.into();
         let result = result.with_written_path(path);
         assert_eq!(result.written_path.as_deref(), expected);
+    }
+
+    #[test]
+    fn plural_paths_and_model_output_are_carried_by_exec_result() {
+        let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            .with_written_paths(vec!["first.rs".into(), "second.rs".into()])
+            .with_model_output(Some("model-only".into()));
+
+        assert_eq!(result.written_path.as_deref(), Some("first.rs"));
+        assert_eq!(result.written_paths, ["first.rs", "second.rs"]);
+        assert_eq!(result.model_output.as_deref(), Some("model-only"));
     }
 }

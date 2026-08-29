@@ -25,6 +25,7 @@ maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
 maki-otel = { workspace = true }
+maki-workcell = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
@@ -60,6 +61,7 @@ members = [
   "maki-config-macro",
   "maki-lua-macro",
   "maki-ui",
+  "maki-workcell",
 ]
 resolver = "3"
 
@@ -85,6 +87,10 @@ maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }
+maki-workcell = { path = "maki-workcell" }
+# Temporary cross-repository development dependency. Replace `path` with a
+# pinned git `rev` once the Workcell API changes are published.
+workcell = { path = "../workcell-mcp/crates/workcell", default-features = false, features = ["files", "web", "shell", "code", "environment"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bs58 = "0.5"
@@ -191,6 +197,9 @@ notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = { version = "0.13", features = ["unstable_elicitation"] }
+async-trait = "0.1"
+tokio = { version = "1.52.3", features = ["fs", "io-util", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
 
 wait-timeout = "0.2"
 inventory = "0.3"

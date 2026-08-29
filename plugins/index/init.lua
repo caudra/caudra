@@ -143,7 +143,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
+  content = "- Use the **index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.",
 })
 
 maki.api.register_prompt_hint({
@@ -157,9 +157,9 @@ maki.api.register_tool({
   description = [[
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 
-- Use this FIRST to understand file structure before using read with offset/limit.
+- Use this FIRST to understand file structure before using file_read with offset/limit.
 - Supports source files in different programming languages and markdown.
-- Falls back with an error on unsupported languages. Use read instead.]],
+- Falls back with an error on unsupported languages. Use file_read instead.]],
   permission_scopes = function(input)
     return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
   end,
@@ -215,12 +215,12 @@ Return a compact overview of a source file: imports, type definitions, function 
     if not lang then
       local ext = path:match("%.([^%.]+)$")
       if not ext then
-        return { llm_output = "Unsupported file type: (no extension). Use the read tool instead.", is_error = true }
+        return { llm_output = "Unsupported file type: (no extension). Use file_read instead.", is_error = true }
       end
 
       lang = indexer.EXT_TO_LANG[ext]
       if not lang then
-        return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
+        return { llm_output = "Unsupported file type: ." .. ext .. ". Use file_read instead.", is_error = true }
       end
     end
 
@@ -231,7 +231,7 @@ Return a compact overview of a source file: imports, type definitions, function 
           .. meta.size
           .. " bytes, max "
           .. max_file_size
-          .. "). Use read with offset/limit instead.",
+          .. "). Use file_read with offset/limit instead.",
         is_error = true,
       }
     end

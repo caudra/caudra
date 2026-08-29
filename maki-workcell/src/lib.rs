@@ -1,0 +1,2118 @@
+#![forbid(unsafe_code)]
+
+mod worker;
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use futures_lite::future;
+use maki_agent::permissions::{
+    PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
+    PermissionResourceKind, PermissionRisk, filesystem_permission_resource, shell_permission_scope,
+};
+use maki_agent::tools::{
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    PermissionIntent, PermissionScopes, RegistryError, Tool, ToolAudience, ToolContext,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+};
+use maki_agent::{
+    AgentEvent, GrepFileEntry, GrepMatchGroup, SnapshotLine, TextOutput, ToolInput, ToolOutput,
+};
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use tokio::runtime::{Builder, Runtime};
+use tokio_util::sync::CancellationToken;
+use workcell::ToolSpec;
+use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome};
+use workcell::environment::{
+    ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
+};
+use workcell::files::{
+    FileApplyPatchInput, FileApplyPatchOutput, FileEditInput, FileEditOutput, FileGlobInput,
+    FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
+    FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput, PreparedFilePatch,
+};
+use workcell::shell::{
+    PreparedShell, ShellExecution, ShellInput, ShellProgressChunk, ShellProgressSink,
+    ShellToolGroup,
+};
+use workcell::web::{
+    PreparedWebfetch, PreparedWebsearch, WebExecution, WebToolGroup, WebfetchInput, WebfetchOutput,
+    WebsearchExecutionConfiguration, WebsearchInput, WebsearchOutput,
+};
+use workcell::{CodeToolGroup, ExecutionEnvironment};
+
+pub const OWNER: &str = "workcell";
+pub const NATIVE_TOOL_NAMES: &[&str] = &[
+    "file_read",
+    "file_glob",
+    "file_grep",
+    "file_write",
+    "file_edit",
+    "file_apply_patch",
+    "websearch",
+    "webfetch",
+    "shell",
+    "code_execution",
+    "execution_environment",
+];
+const CODE_WORKER_UNAVAILABLE: &str =
+    "Workcell code_execution is unavailable: no code worker path was supplied";
+const PROGRESS_MAX_BYTES: usize = 64 * 1024;
+const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
+
+#[derive(Debug, thiserror::Error)]
+pub enum HostError {
+    #[error("create Workcell Tokio runtime: {0}")]
+    Runtime(#[source] std::io::Error),
+    #[error("initialize Workcell filesystem tools: {0}")]
+    Files(String),
+    #[error("initialize Workcell shell tool: {0}")]
+    Shell(String),
+}
+
+#[derive(Clone)]
+struct ProjectGroups {
+    files: FileToolGroup,
+    shell: ShellToolGroup,
+    environment: Arc<ExecutionEnvironment>,
+}
+
+struct HostInner {
+    runtime: Runtime,
+    projects: tokio::sync::Mutex<HashMap<PathBuf, ProjectGroups>>,
+    web: WebToolGroup,
+    code: Option<Arc<CodeToolGroup>>,
+    _worker_lease: Mutex<Option<worker::WorkerLease>>,
+}
+
+impl HostInner {
+    async fn project_groups(&self, cwd: PathBuf) -> Result<ProjectGroups, String> {
+        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let mut projects = self.projects.lock().await;
+        if let Some(groups) = projects.get(&cwd) {
+            return Ok(groups.clone());
+        }
+        let files = FileToolGroup::new_unconfined(&cwd, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let shell = ShellToolGroup::new_unconfined(&cwd)
+            .await
+            .map_err(|error| error.to_string())?;
+        let environment = Arc::new(ExecutionEnvironment::collect(Some(&cwd)).await);
+        let groups = ProjectGroups {
+            files,
+            shell,
+            environment,
+        };
+        projects.insert(cwd, groups.clone());
+        Ok(groups)
+    }
+
+    async fn run<T, F, Fut>(&self, ctx: &ToolContext, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let deadline = ctx.deadline.remaining()?;
+        let cancellation = CancellationToken::new();
+        if ctx.cancel.is_cancelled() {
+            cancellation.cancel();
+        }
+        let operation_cancellation = cancellation.clone();
+        let operation = operation(operation_cancellation.clone());
+        let mut task = Box::pin(self.runtime.spawn(async move {
+            tokio::pin!(operation);
+            let Some(deadline) = deadline else {
+                return Ok(operation.await);
+            };
+            tokio::select! {
+                output = &mut operation => Ok(output),
+                () = tokio::time::sleep(deadline) => {
+                    operation_cancellation.cancel();
+                    let _ = operation.await;
+                    Err(maki_agent::tools::DEADLINE_EXCEEDED.to_owned())
+                }
+            }
+        }));
+        enum Completion<T> {
+            Done(Result<T, tokio::task::JoinError>),
+            Cancelled,
+        }
+        let completion = future::race(async { Completion::Done(task.as_mut().await) }, async {
+            ctx.cancel.cancelled().await;
+            cancellation.cancel();
+            Completion::Cancelled
+        })
+        .await;
+        let result = match completion {
+            Completion::Done(result) => result,
+            Completion::Cancelled => task.await,
+        };
+        result.map_err(|error| format!("Workcell runtime task failed: {error}"))?
+    }
+}
+
+impl Drop for HostInner {
+    fn drop(&mut self) {
+        if let Some(code) = &self.code {
+            self.runtime.block_on(code.shutdown());
+        }
+    }
+}
+
+pub struct WorkcellHost {
+    inner: Arc<HostInner>,
+    warnings: Vec<String>,
+    reserve_code: bool,
+}
+
+impl WorkcellHost {
+    pub fn new(
+        project_cwd: impl AsRef<Path>,
+        worker_path: Option<&Path>,
+    ) -> Result<Self, HostError> {
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("maki-workcell")
+            .build()
+            .map_err(HostError::Runtime)?;
+        let project_cwd = std::fs::canonicalize(project_cwd.as_ref())
+            .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
+        let worker_exists = worker_path.is_some_and(Path::is_file);
+        let (files, shell, environment, code_result) = runtime.block_on(async {
+            let files = FileToolGroup::new_unconfined(&project_cwd, None).await;
+            let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
+            let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
+            let code = if worker_exists {
+                Some(
+                    CodeToolGroup::new(CodeConfiguration {
+                        worker: worker_path,
+                        type_check: true,
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
+            (files, shell, environment, code)
+        });
+        let files = files.map_err(|error| HostError::Files(error.to_string()))?;
+        let shell = shell.map_err(|error| HostError::Shell(error.to_string()))?;
+        let mut warnings = Vec::new();
+        let code = match code_result {
+            Some(Ok(code)) => Some(Arc::new(code)),
+            Some(Err(error)) => {
+                warnings.push(format!(
+                    "Workcell code_execution is unavailable: code worker initialization failed: {error}"
+                ));
+                None
+            }
+            None => {
+                warnings.push(match worker_path {
+                    Some(path) => format!(
+                        "Workcell code_execution is unavailable: code worker does not exist at {}",
+                        path.display()
+                    ),
+                    None => CODE_WORKER_UNAVAILABLE.to_owned(),
+                });
+                None
+            }
+        };
+        let projects = HashMap::from([(
+            project_cwd,
+            ProjectGroups {
+                files,
+                shell,
+                environment: Arc::new(environment),
+            },
+        )]);
+        Ok(Self {
+            inner: Arc::new(HostInner {
+                runtime,
+                projects: tokio::sync::Mutex::new(projects),
+                web: WebToolGroup::new(WebsearchExecutionConfiguration::default()),
+                code,
+                _worker_lease: Mutex::new(None),
+            }),
+            warnings,
+            reserve_code: false,
+        })
+    }
+
+    pub fn new_production(
+        project_cwd: impl AsRef<Path>,
+        configured_worker: Option<&Path>,
+    ) -> Result<Self, HostError> {
+        if let Some(worker) = configured_worker {
+            let mut host = Self::new(project_cwd, Some(worker))?;
+            host.reserve_code = true;
+            return Ok(host);
+        }
+        match worker::extract() {
+            Ok(lease) => {
+                let mut host = Self::new(project_cwd, Some(lease.path()))?;
+                host.reserve_code = true;
+                *host
+                    .inner
+                    ._worker_lease
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(lease);
+                Ok(host)
+            }
+            Err(error) => {
+                let mut host = Self::new(project_cwd, None)?;
+                host.reserve_code = true;
+                host.warnings.clear();
+                host.warnings
+                    .push(format!("Workcell code_execution is unavailable: {error}"));
+                Ok(host)
+            }
+        }
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn register(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
+        registry.register_many(self.entries(false))
+    }
+
+    pub fn register_documented_tools(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
+        registry.register_many(self.entries(true))
+    }
+
+    fn entries(&self, include_unavailable_code: bool) -> Vec<(Arc<dyn Tool>, ToolSource)> {
+        let mut specs = workcell::files::specs();
+        let year = jiff::Timestamp::now()
+            .strftime("%Y")
+            .to_string()
+            .parse()
+            .unwrap_or(2026);
+        specs.extend(workcell::web::specs(
+            year,
+            &self.inner.web.snapshot().configuration,
+        ));
+        specs.extend(workcell::shell::specs());
+        if self.inner.code.is_some() || self.reserve_code || include_unavailable_code {
+            specs.extend(workcell::code::specs());
+        }
+        specs.push(workcell::environment::spec());
+        specs
+            .into_iter()
+            .map(|spec| {
+                let source = ToolSource::Native {
+                    owner: OWNER.into(),
+                    contract: spec.contract_id.into(),
+                    trusted: true,
+                };
+                (
+                    Arc::new(WorkcellTool {
+                        kind: ToolKind::from_name(spec.name),
+                        spec,
+                        host: Arc::clone(&self.inner),
+                    }) as Arc<dyn Tool>,
+                    source,
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolKind {
+    FileRead,
+    FileGlob,
+    FileGrep,
+    FileWrite,
+    FileEdit,
+    FileApplyPatch,
+    Websearch,
+    Webfetch,
+    Shell,
+    Code,
+    Environment,
+}
+
+impl ToolKind {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "file_read" => Self::FileRead,
+            "file_glob" => Self::FileGlob,
+            "file_grep" => Self::FileGrep,
+            "file_write" => Self::FileWrite,
+            "file_edit" => Self::FileEdit,
+            "file_apply_patch" => Self::FileApplyPatch,
+            "websearch" => Self::Websearch,
+            "webfetch" => Self::Webfetch,
+            "shell" => Self::Shell,
+            "code_execution" => Self::Code,
+            "execution_environment" => Self::Environment,
+            _ => unreachable!("specs contain only known Workcell tools"),
+        }
+    }
+
+    fn audience(self) -> ToolAudience {
+        let read = ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB;
+        match self {
+            Self::FileWrite | Self::FileEdit | Self::FileApplyPatch | Self::Shell => {
+                ToolAudience::MAIN | ToolAudience::GENERAL_SUB
+            }
+            _ => read,
+        }
+    }
+
+    fn presentation_kind(self) -> &'static str {
+        match self {
+            Self::FileRead => "read",
+            Self::FileGlob | Self::FileGrep | Self::Websearch => "search",
+            Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
+            Self::Webfetch => "fetch",
+            Self::Shell | Self::Code | Self::Environment => "execute",
+        }
+    }
+}
+
+struct WorkcellTool {
+    kind: ToolKind,
+    spec: ToolSpec,
+    host: Arc<HostInner>,
+}
+
+impl Tool for WorkcellTool {
+    fn name(&self) -> &str {
+        self.spec.name
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        Cow::Borrowed(&self.spec.description)
+    }
+
+    fn schema(&self) -> Value {
+        Value::Object(self.spec.input_schema.clone())
+    }
+
+    fn audience(&self) -> ToolAudience {
+        self.kind.audience()
+    }
+
+    fn tool_kind(&self) -> Option<&str> {
+        Some(self.kind.presentation_kind())
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        reject_unknown_fields(&self.spec, input).map_err(ParseError::custom)?;
+        let input = Input::parse(self.kind, input.clone()).map_err(ParseError::custom)?;
+        Ok(Box::new(WorkcellInvocation {
+            host: Arc::clone(&self.host),
+            input,
+            prepared: Mutex::new(None),
+        }))
+    }
+}
+
+fn reject_unknown_fields(spec: &ToolSpec, input: &Value) -> Result<(), String> {
+    let Some(input) = input.as_object() else {
+        return Ok(());
+    };
+    let properties = spec
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    if let Some(field) = input
+        .keys()
+        .find(|field| properties.is_none_or(|properties| !properties.contains_key(*field)))
+    {
+        return Err(format!(
+            "Invalid arguments for tool {}: unknown field `{field}`",
+            spec.name
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+enum Input {
+    FileRead(FileReadInput),
+    FileGlob(FileGlobInput),
+    FileGrep(FileGrepInput),
+    FileWrite(FileWriteInput),
+    FileEdit(FileEditInput),
+    FileApplyPatch(FileApplyPatchInput),
+    Websearch(WebsearchInput),
+    Webfetch(WebfetchInput),
+    Shell(ShellInput),
+    Code(CodeInput),
+    Environment,
+}
+
+impl Input {
+    fn parse(kind: ToolKind, input: Value) -> Result<Self, String> {
+        match kind {
+            ToolKind::FileRead => parse_input("file_read", input).map(Self::FileRead),
+            ToolKind::FileGlob => parse_input("file_glob", input).map(Self::FileGlob),
+            ToolKind::FileGrep => parse_input("file_grep", input).map(Self::FileGrep),
+            ToolKind::FileWrite => parse_input("file_write", input).map(Self::FileWrite),
+            ToolKind::FileEdit => parse_input("file_edit", input).map(Self::FileEdit),
+            ToolKind::FileApplyPatch => {
+                parse_input("file_apply_patch", input).map(Self::FileApplyPatch)
+            }
+            ToolKind::Websearch => parse_input("websearch", input).map(Self::Websearch),
+            ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
+            ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
+            ToolKind::Code => parse_input("code_execution", input).map(Self::Code),
+            ToolKind::Environment => match input {
+                Value::Object(values) if values.is_empty() => Ok(Self::Environment),
+                _ => Err(
+                    "Invalid arguments for tool execution_environment: expected an empty object"
+                        .into(),
+                ),
+            },
+        }
+    }
+}
+
+fn parse_input<T: DeserializeOwned>(name: &str, input: Value) -> Result<T, String> {
+    serde_json::from_value(input)
+        .map_err(|error| format!("Invalid arguments for tool {name}: {error}"))
+}
+
+enum PreparedExecution {
+    File(FileToolGroup, Input),
+    FilePatch(FileToolGroup, PreparedFilePatch),
+    Websearch(PreparedWebsearch),
+    Webfetch(PreparedWebfetch),
+    Shell(ShellToolGroup, PreparedShell),
+    Environment(Arc<ExecutionEnvironment>),
+    None,
+}
+
+struct PreparedInvocation {
+    intent: PermissionIntent,
+    execution: PreparedExecution,
+    mutation_targets: Vec<PathBuf>,
+}
+
+struct WorkcellInvocation {
+    host: Arc<HostInner>,
+    input: Input,
+    prepared: Mutex<Option<PreparedInvocation>>,
+}
+
+impl WorkcellInvocation {
+    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, String> {
+        if let Some(prepared) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            return Ok(prepared.intent.clone());
+        }
+        let project = ctx.permissions.project_cwd();
+        let prepared = match &self.input {
+            Input::FileRead(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let inspection_input = input.clone();
+                let (group, resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_read(&inspection_input)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                let mut authorized = input.clone();
+                authorized.file_path = resource.path.to_string_lossy().into_owned();
+                file_prepared(
+                    vec![resource],
+                    &project,
+                    group,
+                    Input::FileRead(authorized),
+                    &[],
+                )
+            }
+            Input::FileGlob(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let inspection_input = input.clone();
+                let (group, resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_glob(&inspection_input)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                let mut authorized = input.clone();
+                authorized.path = Some(resource.path.to_string_lossy().into_owned());
+                file_prepared(
+                    vec![resource],
+                    &project,
+                    group,
+                    Input::FileGlob(authorized),
+                    &["/pattern"],
+                )
+            }
+            Input::FileGrep(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let inspection_input = input.clone();
+                let (group, resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_grep(&inspection_input)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                let mut authorized = input.clone();
+                authorized.path = Some(resource.path.to_string_lossy().into_owned());
+                file_prepared(
+                    vec![resource],
+                    &project,
+                    group,
+                    Input::FileGrep(authorized),
+                    &["/pattern", "/include"],
+                )
+            }
+            Input::FileWrite(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let inspection_input = input.clone();
+                let (group, mut resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_write(&inspection_input)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                if input.dry_run.unwrap_or(false) {
+                    resource.access = FileResourceAccess::Read;
+                }
+                check_stale(ctx, std::slice::from_ref(&resource.path))?;
+                let mut authorized = input.clone();
+                authorized.file_path = resource.path.to_string_lossy().into_owned();
+                file_prepared(
+                    vec![resource],
+                    &project,
+                    group,
+                    Input::FileWrite(authorized),
+                    &[],
+                )
+            }
+            Input::FileEdit(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let inspection_input = input.clone();
+                let (group, mut resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_edit(&inspection_input)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                if input.dry_run.unwrap_or(false) {
+                    resource.access = FileResourceAccess::Read;
+                }
+                check_stale(ctx, std::slice::from_ref(&resource.path))?;
+                let mut authorized = input.clone();
+                authorized.file_path = resource.path.to_string_lossy().into_owned();
+                file_prepared(
+                    vec![resource],
+                    &project,
+                    group,
+                    Input::FileEdit(authorized),
+                    &[],
+                )
+            }
+            Input::FileApplyPatch(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let patch_input = input.clone();
+                let (group, patch) = self
+                    .host
+                    .run(ctx, move |token| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let patch = groups
+                            .files
+                            .prepare_apply_patch(patch_input, &token)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((groups.files, patch))
+                    })
+                    .await??;
+                let mut resources = patch.resources().to_vec();
+                if input.dry_run.unwrap_or(false) {
+                    for resource in &mut resources {
+                        resource.access = FileResourceAccess::Read;
+                    }
+                }
+                let stale_paths = resources
+                    .iter()
+                    .filter(|resource| {
+                        matches!(
+                            resource.access,
+                            FileResourceAccess::ReadWrite | FileResourceAccess::Delete
+                        )
+                    })
+                    .map(|resource| resource.path.clone())
+                    .collect::<Vec<_>>();
+                check_stale(ctx, &stale_paths)?;
+                file_patch_prepared(resources, &project, group, patch)
+            }
+            Input::Websearch(input) => {
+                let prepared = self.host.web.prepare_websearch(input.clone())?;
+                let intent = PermissionIntent::new(
+                    PermissionScopes::single(prepared.permission_query.clone()),
+                    vec![PermissionResource {
+                        kind: PermissionResourceKind::Query,
+                        value: prepared.permission_query.clone(),
+                        access: Some(PermissionResourceAccess::Search),
+                        protected: false,
+                        requires_prompt: false,
+                        attributes: BTreeMap::new(),
+                    }],
+                    PermissionRisk::Low,
+                )
+                .with_authority(PermissionAuthorityProfile::Query);
+                PreparedInvocation {
+                    intent,
+                    execution: PreparedExecution::Websearch(prepared),
+                    mutation_targets: Vec::new(),
+                }
+            }
+            Input::Webfetch(input) => {
+                let prepared = self
+                    .host
+                    .web
+                    .prepare_webfetch(input.clone())
+                    .map_err(|error| error.to_string())?;
+                let intent = PermissionIntent::new(
+                    PermissionScopes::single(prepared.permission_url.clone()),
+                    vec![PermissionResource {
+                        kind: PermissionResourceKind::Url,
+                        value: prepared.permission_url.clone(),
+                        access: Some(PermissionResourceAccess::Read),
+                        protected: false,
+                        requires_prompt: false,
+                        attributes: BTreeMap::new(),
+                    }],
+                    PermissionRisk::Medium,
+                )
+                .with_authority(PermissionAuthorityProfile::Url);
+                PreparedInvocation {
+                    intent,
+                    execution: PreparedExecution::Webfetch(prepared),
+                    mutation_targets: Vec::new(),
+                }
+            }
+            Input::Shell(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let input = input.clone();
+                let (group, shell) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let prepared = groups.shell.prepare(input).await?;
+                        Ok::<_, String>((groups.shell, prepared))
+                    })
+                    .await??;
+                shell_prepared(group, shell)
+            }
+            Input::Code(_) => exact_custom_prepared(
+                "isolated_compute",
+                "python",
+                PermissionResourceAccess::Execute,
+                PermissionRisk::Low,
+            ),
+            Input::Environment => {
+                let host = Arc::clone(&self.host);
+                let environment = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        Ok::<_, String>(host.project_groups(project).await?.environment)
+                    })
+                    .await??;
+                let mut prepared = exact_custom_prepared(
+                    "host_inspection",
+                    "execution_environment",
+                    PermissionResourceAccess::Read,
+                    PermissionRisk::Medium,
+                );
+                prepared.execution = PreparedExecution::Environment(environment);
+                prepared
+            }
+        };
+        let intent = prepared.intent.clone();
+        *self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(prepared);
+        Ok(intent)
+    }
+
+    async fn take_prepared(&self, ctx: &ToolContext) -> Result<PreparedInvocation, String> {
+        self.prepare(ctx).await?;
+        self.prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| "Workcell invocation preparation was already consumed".into())
+    }
+}
+
+impl ToolInvocation for WorkcellInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(match &self.input {
+            Input::FileRead(input) => input.file_path.clone(),
+            Input::FileGlob(input) => input.pattern.clone(),
+            Input::FileGrep(input) => input.pattern.clone(),
+            Input::FileWrite(input) => input.file_path.clone(),
+            Input::FileEdit(input) => input.file_path.clone(),
+            Input::FileApplyPatch(_) => "file patch".into(),
+            Input::Websearch(input) => input.query.clone(),
+            Input::Webfetch(input) => input.url.clone(),
+            Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
+            Input::Code(input) => format!("{} lines", input.code.lines().count()),
+            Input::Environment => "execution environment".into(),
+        }))
+    }
+
+    fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+        match &self.input {
+            Input::FileApplyPatch(input) => Some(ToolInput::Code {
+                language: "diff".into(),
+                code: input.patch_text.clone(),
+            }),
+            Input::Shell(input) => Some(ToolInput::Code {
+                language: "bash".into(),
+                code: input.command.clone(),
+            }),
+            Input::Code(input) => Some(ToolInput::Code {
+                language: "python".into(),
+                code: input.code.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|prepared| prepared.mutation_targets.clone())
+            .unwrap_or_default()
+    }
+
+    fn blocked_in_plan_mode(&self) -> bool {
+        matches!(self.input, Input::Shell(_))
+    }
+
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        Box::pin(async move { self.prepare(ctx).await.map(Some) })
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let prepared = match self.take_prepared(ctx).await {
+                Ok(prepared) => prepared,
+                Err(error) => return Err(error).into(),
+            };
+            self.execute_prepared(ctx, prepared).await
+        })
+    }
+}
+
+impl WorkcellInvocation {
+    async fn execute_prepared(
+        &self,
+        ctx: &ToolContext,
+        prepared: PreparedInvocation,
+    ) -> ToolExecResult {
+        match (&self.input, prepared.execution) {
+            (Input::FileRead(_), PreparedExecution::File(group, Input::FileRead(input))) => {
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.file_read(input, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        if let FileReadOutput::File { path, .. } = &output {
+                            ctx.file_tracker.record_read(Path::new(path));
+                        }
+                        file_read_result(output)
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::FileGlob(_), PreparedExecution::File(group, Input::FileGlob(input))) => {
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.file_glob(input, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => file_glob_result(output),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::FileGrep(_), PreparedExecution::File(group, Input::FileGrep(input))) => {
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.file_grep(input, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        let mut paths = HashSet::new();
+                        for row in &output.rows {
+                            if paths.insert(&row.path) {
+                                ctx.file_tracker.record_read(Path::new(&row.path));
+                            }
+                        }
+                        file_grep_result(output)
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (
+                Input::FileWrite(original),
+                PreparedExecution::File(group, Input::FileWrite(input)),
+            ) => {
+                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
+                    return Err(error).into();
+                }
+                let content = original.content.clone();
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.file_write(input, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        if output.applied {
+                            ctx.file_tracker.record_read(Path::new(&output.path));
+                        }
+                        file_write_result(output, content)
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::FileEdit(original), PreparedExecution::File(group, Input::FileEdit(input))) => {
+                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
+                    return Err(error).into();
+                }
+                let old_string = original.old_string.clone();
+                let new_string = original.new_string.clone();
+                let replace_all = original.replace_all.unwrap_or(false);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.file_edit(input, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        if output.applied {
+                            ctx.file_tracker.record_read(Path::new(&output.path));
+                        }
+                        file_edit_result(output, old_string, new_string, replace_all)
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::FileApplyPatch(input), PreparedExecution::FilePatch(group, patch)) => {
+                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
+                    return Err(error).into();
+                }
+                let dry_run = input.dry_run.unwrap_or(false);
+                let result = if dry_run {
+                    Ok(patch.preview().clone())
+                } else {
+                    self.host
+                        .run(ctx, move |token| async move {
+                            group.execute_prepared_patch(patch, &token).await
+                        })
+                        .await
+                        .and_then(|result| result.map_err(|error| error.to_string()))
+                };
+                match result {
+                    Ok(output) => {
+                        if output.applied {
+                            for path in applied_patch_paths(&output) {
+                                ctx.file_tracker.record_read(Path::new(&path));
+                            }
+                        }
+                        file_patch_result(output)
+                    }
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::Websearch(_), PreparedExecution::Websearch(prepared)) => {
+                match self
+                    .host
+                    .run(ctx, {
+                        let web = self.host.web.clone();
+                        move |token| async move { web.execute_websearch(prepared, token).await }
+                    })
+                    .await
+                {
+                    Ok(Ok(execution)) => websearch_result(execution),
+                    Ok(Err(error)) => Err(error).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::Webfetch(_), PreparedExecution::Webfetch(prepared)) => {
+                match self
+                    .host
+                    .run(ctx, {
+                        let web = self.host.web.clone();
+                        move |token| async move { web.execute_webfetch(prepared, token).await }
+                    })
+                    .await
+                {
+                    Ok(Ok(execution)) => webfetch_result(execution),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::Shell(_), PreparedExecution::Shell(group, prepared)) => {
+                let progress = Arc::new(NativeProgressSink::new(ctx));
+                progress.publish_live_buf(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group
+                            .execute_prepared(prepared, token, Some(progress))
+                            .await
+                    })
+                    .await
+                {
+                    Ok(Ok(Some(execution))) => shell_result(execution),
+                    Ok(Ok(None)) => Err("Shell execution cancelled".into()).into(),
+                    Ok(Err(error)) => Err(error).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::Code(input), PreparedExecution::None) => {
+                let Some(code) = self.host.code.clone() else {
+                    return Err(CODE_WORKER_UNAVAILABLE.into()).into();
+                };
+                let input = input.clone();
+                match self
+                    .host
+                    .run(
+                        ctx,
+                        move |token| async move { code.execute(input, token).await },
+                    )
+                    .await
+                {
+                    Ok(Ok(Some(execution))) => code_result(execution),
+                    Ok(Ok(None)) => Err("Code execution cancelled".into()).into(),
+                    Ok(Err(error)) => Err(error).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::Environment, PreparedExecution::Environment(environment)) => {
+                let groups = ToolGroupDisclosure {
+                    files: true,
+                    web: true,
+                    shell: true,
+                    code: self.host.code.is_some(),
+                };
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        environment.inspect(groups, token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(result)) => environment_result(result),
+                    Ok(Err(error)) => Err(environment_error(error)).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            _ => Err("Workcell invocation preparation did not match its typed input".into()).into(),
+        }
+    }
+}
+
+fn check_stale(ctx: &ToolContext, paths: &[PathBuf]) -> Result<(), String> {
+    if !ctx.config.stale_read_check {
+        return Ok(());
+    }
+    for path in paths {
+        ctx.file_tracker.check_before_edit(path)?;
+    }
+    Ok(())
+}
+
+fn file_prepared(
+    resources: Vec<FileResource>,
+    project: &Path,
+    group: FileToolGroup,
+    input: Input,
+    input_pointers: &[&str],
+) -> PreparedInvocation {
+    let (scopes, permission_resources, mutation_targets) = file_permissions(&resources, project);
+    let mutation = !mutation_targets.is_empty();
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes {
+                scopes,
+                force_prompt: false,
+            },
+            permission_resources,
+            if mutation {
+                PermissionRisk::High
+            } else {
+                PermissionRisk::Low
+            },
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: input_pointers
+                .iter()
+                .map(|pointer| (*pointer).into())
+                .collect(),
+        }),
+        execution: PreparedExecution::File(group, input),
+        mutation_targets,
+    }
+}
+
+fn file_patch_prepared(
+    resources: Vec<FileResource>,
+    project: &Path,
+    group: FileToolGroup,
+    patch: PreparedFilePatch,
+) -> PreparedInvocation {
+    let (scopes, permission_resources, mutation_targets) = file_permissions(&resources, project);
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes {
+                scopes,
+                force_prompt: false,
+            },
+            permission_resources,
+            if mutation_targets.is_empty() {
+                PermissionRisk::Low
+            } else {
+                PermissionRisk::High
+            },
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        }),
+        execution: PreparedExecution::FilePatch(group, patch),
+        mutation_targets,
+    }
+}
+
+fn file_permissions(
+    resources: &[FileResource],
+    project: &Path,
+) -> (Vec<String>, Vec<PermissionResource>, Vec<PathBuf>) {
+    let mut scopes = Vec::with_capacity(resources.len());
+    let mut permission_resources = Vec::with_capacity(resources.len());
+    let mut mutation_targets = Vec::new();
+    for resource in resources {
+        let (kind, access, mutation) = match resource.access {
+            FileResourceAccess::Read => (
+                if resource.path.is_dir() {
+                    PermissionResourceKind::Directory
+                } else {
+                    PermissionResourceKind::File
+                },
+                PermissionResourceAccess::Read,
+                false,
+            ),
+            FileResourceAccess::Traverse => (
+                PermissionResourceKind::Directory,
+                PermissionResourceAccess::Search,
+                false,
+            ),
+            FileResourceAccess::Write
+            | FileResourceAccess::ReadWrite
+            | FileResourceAccess::Delete => (
+                PermissionResourceKind::File,
+                PermissionResourceAccess::Write,
+                true,
+            ),
+        };
+        let value = resource.path.to_string_lossy().into_owned();
+        scopes.push(if kind == PermissionResourceKind::Directory {
+            format!("{}/**", value.trim_end_matches(['/', '\\']))
+        } else {
+            value
+        });
+        permission_resources.push(filesystem_permission_resource(
+            kind,
+            &resource.path,
+            access,
+            project,
+        ));
+        if mutation {
+            mutation_targets.push(resource.path.clone());
+        }
+    }
+    mutation_targets.sort();
+    mutation_targets.dedup();
+    (scopes, permission_resources, mutation_targets)
+}
+
+fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvocation {
+    let opaque = shell.analysis().opaque;
+    let workdir = shell.workdir().to_string_lossy().into_owned();
+    let scopes = if shell.analysis().scopes.is_empty() {
+        vec![shell_permission_scope(shell.command(), shell.workdir())]
+    } else {
+        shell
+            .analysis()
+            .scopes
+            .iter()
+            .map(|scope| shell_permission_scope(&scope.source, shell.workdir()))
+            .collect()
+    };
+    let commands: Vec<String> = if shell.analysis().scopes.is_empty() {
+        vec![shell.command().into()]
+    } else {
+        shell
+            .analysis()
+            .scopes
+            .iter()
+            .map(|scope| scope.normalized.clone())
+            .collect()
+    };
+    let resources = commands
+        .into_iter()
+        .map(|command| PermissionResource {
+            kind: PermissionResourceKind::Command,
+            value: command,
+            access: Some(PermissionResourceAccess::Execute),
+            protected: opaque,
+            requires_prompt: opaque,
+            attributes: BTreeMap::from([("workdir".into(), workdir.clone())]),
+        })
+        .collect();
+    let authority = if opaque {
+        PermissionAuthorityProfile::ExactOnly
+    } else {
+        PermissionAuthorityProfile::Shell
+    };
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes {
+                scopes,
+                force_prompt: opaque,
+            },
+            resources,
+            if opaque {
+                PermissionRisk::Critical
+            } else {
+                PermissionRisk::High
+            },
+        )
+        .with_authority(authority),
+        execution: PreparedExecution::Shell(group, shell),
+        mutation_targets: Vec::new(),
+    }
+}
+
+fn exact_custom_prepared(
+    name: &str,
+    value: &str,
+    access: PermissionResourceAccess,
+    risk: PermissionRisk,
+) -> PreparedInvocation {
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes::single(value.into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Custom { name: name.into() },
+                value: value.into(),
+                access: Some(access),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            risk,
+        ),
+        execution: PreparedExecution::None,
+        mutation_targets: Vec::new(),
+    }
+}
+
+fn model_text(output: &impl Serialize) -> String {
+    serde_json::to_string_pretty(output).expect("Workcell structured output serializes")
+}
+
+fn text_output(text: String, state: Value) -> TextOutput {
+    TextOutput {
+        text,
+        instructions: None,
+        state: Some(state),
+    }
+}
+
+fn text_result(
+    output: &impl Serialize,
+    text: String,
+    markdown: bool,
+    exact_model_text: String,
+) -> ToolExecResult {
+    let state = serde_json::to_value(output).expect("Workcell structured output serializes");
+    let output = if markdown {
+        ToolOutput::Markdown(text_output(text, state))
+    } else {
+        ToolOutput::Plain(text_output(text, state))
+    };
+    ToolExecResult::from(Ok::<_, String>(output)).with_model_output(Some(exact_model_text))
+}
+
+fn markdown_code(language: &str, text: &str) -> String {
+    format!("```{language}\n{}\n```", text.trim_end())
+}
+
+fn file_read_result(output: FileReadOutput) -> ToolExecResult {
+    let exact = model_text(&output);
+    let state = serde_json::to_value(&output).expect("file read output serializes");
+    let tool_output = match output {
+        FileReadOutput::Directory { entries, .. } => {
+            ToolOutput::ReadDir(text_output(entries.join("\n"), state))
+        }
+        FileReadOutput::File {
+            path,
+            text,
+            line_start,
+            total_lines,
+            ..
+        } => ToolOutput::ReadCode {
+            path,
+            start_line: line_start,
+            lines: text.split('\n').map(str::to_owned).collect(),
+            total_lines,
+            instructions: None,
+        },
+    };
+    ToolExecResult::from(Ok::<_, String>(tool_output)).with_model_output(Some(exact))
+}
+
+fn file_glob_result(output: FileGlobOutput) -> ToolExecResult {
+    let exact = model_text(&output);
+    let text = if output.files.is_empty() {
+        maki_agent::NO_FILES_FOUND.into()
+    } else {
+        output
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    text_result(&output, text, false, exact)
+}
+
+fn file_grep_result(output: FileGrepOutput) -> ToolExecResult {
+    let exact = model_text(&output);
+    let mut entries: Vec<GrepFileEntry> = Vec::new();
+    for row in output.rows {
+        let group = GrepMatchGroup::single(row.line, row.text);
+        if let Some(entry) = entries
+            .last_mut()
+            .filter(|entry| entry.path == row.relative_path)
+        {
+            entry.groups.push(group);
+        } else {
+            entries.push(GrepFileEntry {
+                path: row.relative_path,
+                groups: vec![group],
+            });
+        }
+    }
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::GrepResult { entries }))
+        .with_model_output(Some(exact))
+}
+
+fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult {
+    let exact = model_text(&output);
+    let written = output.applied.then(|| output.path.clone());
+    let result = if output.applied {
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::WriteCode {
+            path: output.path.clone(),
+            byte_count: content.len(),
+            lines: content.lines().map(str::to_owned).collect(),
+        }))
+        .with_model_output(Some(exact))
+    } else {
+        let patch = markdown_code("diff", &output.diff.patch);
+        text_result(&output, patch, true, exact)
+    };
+    result.with_written_paths(written.into_iter().collect())
+}
+
+fn file_edit_result(
+    output: FileEditOutput,
+    old_string: String,
+    new_string: String,
+    replace_all: bool,
+) -> ToolExecResult {
+    let exact = model_text(&output);
+    let written = output.applied.then(|| output.path.clone());
+    let result = if replace_all {
+        let patch = markdown_code("diff", &output.diff.patch);
+        text_result(&output, patch, true, exact)
+    } else {
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::Diff {
+            path: output.path.clone(),
+            before: old_string,
+            after: new_string,
+            summary: output.diff.patch.clone(),
+        }))
+        .with_model_output(Some(exact))
+    };
+    result.with_written_paths(written.into_iter().collect())
+}
+
+fn applied_patch_paths(output: &FileApplyPatchOutput) -> Vec<String> {
+    if !output.applied {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for file in &output.files {
+        paths.push(file.file_path.clone());
+        if let Some(path) = &file.move_path {
+            paths.push(path.clone());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn file_patch_result(output: FileApplyPatchOutput) -> ToolExecResult {
+    let exact = model_text(&output);
+    let written = applied_patch_paths(&output);
+    let diff = markdown_code("diff", &output.diff);
+    text_result(&output, diff, true, exact).with_written_paths(written)
+}
+
+fn websearch_result(execution: WebExecution<WebsearchOutput>) -> ToolExecResult {
+    text_result(
+        &execution.output,
+        execution.model_text.clone(),
+        true,
+        execution.model_text,
+    )
+}
+
+fn webfetch_result(execution: WebExecution<WebfetchOutput>) -> ToolExecResult {
+    let markdown = matches!(
+        execution.output.format,
+        workcell::web::WebfetchFormat::Markdown
+    );
+    text_result(
+        &execution.output,
+        execution.model_text.clone(),
+        markdown,
+        execution.model_text,
+    )
+}
+
+fn shell_result(execution: ShellExecution) -> ToolExecResult {
+    text_result(
+        &execution.output,
+        execution.model_text.clone(),
+        false,
+        execution.model_text,
+    )
+}
+
+fn code_result(execution: CodeExecution) -> ToolExecResult {
+    let is_error = execution.output.outcome != Outcome::Completed;
+    text_result(
+        &execution.output,
+        execution.model_text.clone(),
+        false,
+        execution.model_text,
+    )
+    .with_error(is_error)
+}
+
+fn environment_result(result: ExecutionEnvironmentResult) -> ToolExecResult {
+    let display = markdown_code("json", &result.model_text);
+    text_result(&result.output, display, true, result.model_text)
+}
+
+fn environment_error(error: ExecutionEnvironmentError) -> String {
+    error.to_string()
+}
+
+struct NativeProgressSink {
+    id: Option<String>,
+    event_tx: maki_agent::EventSender,
+    live_sink: Option<flume::Sender<ToolLive>>,
+    body: Arc<maki_agent::SharedBuf>,
+    text: Mutex<String>,
+}
+
+impl NativeProgressSink {
+    fn new(ctx: &ToolContext) -> Self {
+        Self {
+            id: ctx.tool_use_id.clone(),
+            event_tx: ctx.event_tx.clone(),
+            live_sink: ctx.live_sink.clone(),
+            body: Arc::new(maki_agent::SharedBuf::new()),
+            text: Mutex::new(String::new()),
+        }
+    }
+
+    fn publish_live_buf(&self, _ctx: &ToolContext) {
+        if let Some(sink) = &self.live_sink {
+            let _ = sink.try_send(ToolLive::Buf(Arc::clone(&self.body)));
+        }
+    }
+
+    fn append_bounded(&self, chunk: &ShellProgressChunk) -> String {
+        let mut text = self.text.lock().unwrap_or_else(|error| error.into_inner());
+        text.push_str(&chunk.text);
+        if text.len() > PROGRESS_MAX_BYTES {
+            let keep = PROGRESS_MAX_BYTES.saturating_sub(PROGRESS_TRUNCATED.len());
+            let mut start = text.len().saturating_sub(keep);
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            *text = format!("{PROGRESS_TRUNCATED}{}", &text[start..]);
+        }
+        text.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ShellProgressSink for NativeProgressSink {
+    async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
+        let text = self.append_bounded(&chunk);
+        self.body.set_lines(
+            text.lines()
+                .map(|line| SnapshotLine::plain(line.to_owned()))
+                .collect(),
+        );
+        if let Some(id) = &self.id {
+            self.event_tx.try_send(AgentEvent::ToolOutput {
+                id: id.clone(),
+                content: text,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_agent::cancel::CancelToken;
+    use maki_agent::permissions::{PermissionManager, PermissionResourceAccess};
+    use maki_agent::tools::{FileReadTracker, interpreter_ctx};
+    use maki_agent::{AgentMode, Envelope, EventSender};
+    use maki_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+
+    fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
+        context_with_mode(
+            root,
+            registry,
+            cancel,
+            AgentMode::Build,
+            DefaultEffect::Allow,
+        )
+    }
+
+    fn context_with_mode(
+        root: &Path,
+        registry: Arc<ToolRegistry>,
+        cancel: CancelToken,
+        mode: AgentMode,
+        default_effect: DefaultEffect,
+    ) -> ToolContext {
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let permissions = PermissionManager::new_nonpersistent(
+            PermissionsConfig {
+                default: default_effect,
+                rules: (default_effect == DefaultEffect::Deny)
+                    .then(|| PermissionRule {
+                        tool: ToolKey::native("file_apply_patch"),
+                        scope: Some("*".into()),
+                        effect: Effect::Deny,
+                    })
+                    .into_iter()
+                    .collect(),
+                ..PermissionsConfig::default()
+            },
+            root.to_path_buf(),
+            Arc::default(),
+        );
+        let mut ctx = interpreter_ctx(
+            &mode,
+            &event_tx,
+            cancel,
+            Arc::new(permissions),
+            Arc::new(FileReadTracker::new()),
+            None,
+            registry,
+        );
+        ctx.config.stale_read_check = false;
+        ctx
+    }
+
+    fn host_and_registry(root: &Path) -> (WorkcellHost, Arc<ToolRegistry>) {
+        let host = WorkcellHost::new(root, None).expect("Workcell host");
+        let registry = Arc::new(ToolRegistry::new());
+        host.register(&registry).expect("Workcell registration");
+        (host, registry)
+    }
+
+    #[test]
+    fn missing_worker_omits_code_without_affecting_other_tools() {
+        let root = TempDir::new().expect("tempdir");
+        let (host, registry) = host_and_registry(root.path());
+
+        assert!(registry.get("code_execution").is_none());
+        assert!(registry.get("file_read").is_some());
+        assert!(registry.get("shell").is_some());
+        assert!(registry.get("execution_environment").is_some());
+        assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len() - 1);
+        assert!(
+            host.warnings()
+                .iter()
+                .any(|warning| warning.contains("code_execution"))
+        );
+    }
+
+    #[cfg(embedded_monty_worker)]
+    #[test]
+    fn production_host_executes_code_with_the_embedded_worker() {
+        let root = TempDir::new().expect("tempdir");
+        let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
+        assert!(host.warnings().is_empty());
+        let registry = Arc::new(ToolRegistry::new());
+        host.register(&registry).expect("Workcell registration");
+        drop(host);
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("code_execution")
+            .expect("registered code execution")
+            .tool
+            .parse(&json!({"code": "sum([1, 2, 3, 4])"}))
+            .expect("valid code input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("code preflight");
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert!(!result.is_error);
+        assert_eq!(result.model_output.as_deref(), Some("result: 10"));
+        let output = result.output.expect("successful tool output");
+        let state = output.state().expect("structured code output");
+        assert_eq!(state["outcome"], "completed");
+        assert_eq!(state["result"], 10);
+    }
+
+    #[test]
+    fn registered_schema_is_the_workcell_schema_and_parsing_is_strict() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let expected = workcell::files::specs()
+            .into_iter()
+            .find(|spec| spec.name == "file_read")
+            .expect("file_read spec");
+        let registered = registry.get("file_read").expect("registered file_read");
+
+        assert_eq!(
+            registered.tool.schema(),
+            Value::Object(expected.input_schema)
+        );
+        assert!(
+            registered
+                .tool
+                .parse(&json!({"filePath": "a.txt", "unknown": true}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn file_results_use_syntax_aware_presentations() {
+        let read = file_read_result(FileReadOutput::File {
+            path: "/project/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            text: "fn main() {}".into(),
+            numbered_text: "1: fn main() {}".into(),
+            line_start: 1,
+            line_end: 1,
+            total_lines: 1,
+            truncated: false,
+        })
+        .output
+        .expect("read output");
+        assert!(matches!(
+            read,
+            ToolOutput::ReadCode { path, .. } if path.ends_with("lib.rs")
+        ));
+
+        let grep = file_grep_result(FileGrepOutput {
+            cwd: "/project".into(),
+            relative_path: ".".into(),
+            pattern: "main".into(),
+            include: Some("*.rs".into()),
+            rows: vec![workcell::files::FileGrepRow {
+                path: "/project/src/lib.rs".into(),
+                relative_path: "src/lib.rs".into(),
+                line: 1,
+                text: "fn main() {}".into(),
+            }],
+            matches: 1,
+            truncated: false,
+        })
+        .output
+        .expect("grep output");
+        assert!(matches!(
+            grep,
+            ToolOutput::GrepResult { entries }
+                if entries.first().is_some_and(|entry| entry.path == "src/lib.rs")
+        ));
+
+        let diff = workcell::files::FileDiff {
+            file: "/project/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            patch: "-fn old() {}\n+fn new() {}".into(),
+            additions: 1,
+            deletions: 1,
+            truncated: false,
+        };
+        let write = file_write_result(
+            FileWriteOutput {
+                kind: workcell::files::FileWriteKind::Write,
+                path: "/project/src/lib.rs".into(),
+                relative_path: "src/lib.rs".into(),
+                existed: true,
+                applied: true,
+                diff: diff.clone(),
+            },
+            "fn new() {}\n".into(),
+        )
+        .output
+        .expect("write output");
+        assert!(matches!(
+            write,
+            ToolOutput::WriteCode { path, .. } if path.ends_with("lib.rs")
+        ));
+
+        let edit = file_edit_result(
+            FileEditOutput {
+                kind: workcell::files::FileEditKind::Edit,
+                path: "/project/src/lib.rs".into(),
+                relative_path: "src/lib.rs".into(),
+                applied: true,
+                diff,
+            },
+            "fn old() {}".into(),
+            "fn new() {}".into(),
+            false,
+        )
+        .output
+        .expect("edit output");
+        assert!(matches!(
+            edit,
+            ToolOutput::Diff { path, .. } if path.ends_with("lib.rs")
+        ));
+
+        let patch = file_patch_result(FileApplyPatchOutput {
+            kind: workcell::files::FilePatchKind::Patch,
+            applied: false,
+            diff: "--- a/src/lib.rs\n+++ b/src/lib.rs".into(),
+            files: Vec::new(),
+            truncated: false,
+        })
+        .output
+        .expect("patch output");
+        assert!(matches!(
+            patch,
+            ToolOutput::Markdown(text) if text.text.starts_with("```diff\n")
+        ));
+    }
+
+    #[test]
+    fn production_reserves_code_execution_when_an_override_is_invalid() {
+        let root = TempDir::new().expect("tempdir");
+        let missing = root.path().join("missing-worker");
+        let host =
+            WorkcellHost::new_production(root.path(), Some(&missing)).expect("Workcell host");
+        let registry = Arc::new(ToolRegistry::new());
+        host.register(&registry).expect("Workcell registration");
+
+        assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len());
+        assert!(registry.get("code_execution").is_some());
+        assert!(
+            host.warnings()
+                .iter()
+                .any(|warning| warning.contains("code_execution"))
+        );
+    }
+
+    #[test]
+    fn dry_run_file_write_has_read_intent_and_no_mutation_target() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("file_write")
+            .expect("registered file write")
+            .tool
+            .parse(&json!({
+                "filePath": "preview.txt",
+                "content": "preview",
+                "dryRun": true
+            }))
+            .expect("valid write input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("write preflight")
+            .expect("permission intent");
+
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(
+            intent.resources[0].access,
+            Some(PermissionResourceAccess::Read)
+        );
+        assert!(invocation.mutation_targets(&ctx).is_empty());
+    }
+
+    #[test]
+    fn expired_caller_deadline_stops_preflight() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::ZERO);
+        let invocation = registry
+            .get("file_read")
+            .expect("registered file read")
+            .tool
+            .parse(&json!({"filePath": "missing.txt"}))
+            .expect("valid read input");
+
+        assert_eq!(
+            smol::block_on(invocation.preflight(&ctx)).unwrap_err(),
+            maki_agent::tools::DEADLINE_EXCEEDED
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_execution_stays_bound_to_the_path_authorized_during_preflight() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let authorized = root.path().join("authorized.txt");
+        let unauthorized = outside.path().join("unauthorized.txt");
+        let link = root.path().join("link.txt");
+        std::fs::write(&authorized, "authorized").unwrap();
+        std::fs::write(&unauthorized, "unauthorized").unwrap();
+        symlink(&authorized, &link).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("file_read")
+            .expect("registered file read")
+            .tool
+            .parse(&json!({"filePath": "link.txt"}))
+            .expect("valid read input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("read preflight");
+        std::fs::remove_file(&link).unwrap();
+        symlink(&unauthorized, &link).unwrap();
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        let output = result.output.expect("successful read");
+        let ToolOutput::ReadCode { path, lines, .. } = output else {
+            panic!("expected syntax-aware read output");
+        };
+        assert_eq!(path, authorized.to_string_lossy());
+        assert_eq!(lines, ["authorized"]);
+    }
+
+    #[test]
+    fn broad_grep_excludes_protected_files() {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(root.path().join("visible.txt"), "needle").unwrap();
+        std::fs::write(root.path().join(".env"), "SECRET=needle").unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("file_grep")
+            .expect("registered file grep")
+            .tool
+            .parse(&json!({"pattern": "needle", "path": "."}))
+            .expect("valid grep input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("grep preflight");
+        let result = smol::block_on(invocation.execute(&ctx));
+        let output = result.output.expect("successful grep");
+        let ToolOutput::GrepResult { entries } = output else {
+            panic!("expected syntax-aware grep output");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "visible.txt");
+        assert_eq!(entries[0].groups[0].lines[0].text, "needle");
+    }
+
+    #[test]
+    fn execution_environment_uses_the_active_session_working_directory() {
+        let startup_root = TempDir::new().expect("startup tempdir");
+        let session_root = TempDir::new().expect("session tempdir");
+        std::fs::write(session_root.path().join("package-lock.json"), "{}").unwrap();
+        let (_host, registry) = host_and_registry(startup_root.path());
+        let ctx = context(
+            session_root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+        );
+        let invocation = registry
+            .get("execution_environment")
+            .expect("registered environment")
+            .tool
+            .parse(&json!({}))
+            .expect("valid environment input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("environment preflight");
+        let result = smol::block_on(invocation.execute(&ctx));
+        let output = result.output.expect("successful environment inspection");
+        let ToolOutput::Markdown(text) = &output else {
+            panic!("expected highlighted JSON environment output");
+        };
+        assert!(text.text.starts_with("```json\n{"));
+        assert!(text.text.ends_with("\n```"));
+        let lockfiles = output.state().expect("structured environment")["workspace"]
+            ["packageManager"]["lockfiles"]
+            .as_array()
+            .expect("lockfiles");
+
+        assert!(lockfiles.iter().any(|name| name == "package-lock.json"));
+    }
+
+    #[test]
+    fn patch_preflight_is_non_mutating_and_execution_reuses_prepared_patch() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let entry = registry.get("file_apply_patch").expect("registered patch");
+        let invocation = entry
+            .tool
+            .parse(&json!({"patchText": PATCH}))
+            .expect("valid patch");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("patch preflight")
+            .expect("permission intent");
+        assert!(!root.path().join("created.txt").exists());
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(
+            intent.resources[0].access,
+            Some(PermissionResourceAccess::Write)
+        );
+        assert_eq!(
+            invocation.mutation_targets(&ctx),
+            [root.path().join("created.txt")]
+        );
+
+        let result = smol::block_on(invocation.execute(&ctx));
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            result.written_paths,
+            [root.path().join("created.txt").display().to_string()]
+        );
+        let model_output: Value = serde_json::from_str(
+            result
+                .model_output
+                .as_deref()
+                .expect("exact Workcell model output"),
+        )
+        .expect("structured model output");
+        assert_eq!(model_output["applied"], true);
+    }
+
+    #[test]
+    fn cancelled_shell_sets_error_marker() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let (trigger, token) = CancelToken::new();
+        let ctx = context(root.path(), Arc::clone(&registry), token);
+        let entry = registry.get("shell").expect("registered shell");
+        let invocation = entry
+            .tool
+            .parse(&json!({"command": "sleep 30"}))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        trigger.cancel();
+
+        let result = smol::block_on(invocation.execute(&ctx));
+        assert!(result.is_error);
+        assert!(result.output.is_err());
+    }
+
+    #[test]
+    fn dispatcher_permission_denial_does_not_apply_prepared_patch() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Build,
+            DefaultEffect::Deny,
+        );
+
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "patch-denied".into(),
+            "file_apply_patch",
+            &json!({"patchText": PATCH}),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(done.is_error);
+        assert!(!root.path().join("created.txt").exists());
+    }
+
+    #[test]
+    fn plan_mode_blocks_non_plan_patch_after_preflight() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Plan(root.path().join("plan.md")),
+            DefaultEffect::Allow,
+        );
+
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "patch-plan-blocked".into(),
+            "file_apply_patch",
+            &json!({"patchText": PATCH}),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(done.is_error);
+        assert!(!root.path().join("created.txt").exists());
+    }
+
+    #[test]
+    fn plan_mode_blocks_shell_before_execution() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Plan(root.path().join("plan.md")),
+            DefaultEffect::Allow,
+        );
+
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "shell-plan-blocked".into(),
+            "shell",
+            &json!({"command": "touch should-not-exist"}),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(done.is_error);
+        assert!(!root.path().join("should-not-exist").exists());
+    }
+
+    #[test]
+    fn plan_mode_auto_allows_the_exact_external_plan_file() {
+        let root = TempDir::new().expect("tempdir");
+        let plans = TempDir::new().expect("plans tempdir");
+        let plan = plans.path().join("plan.md");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Plan(plan.clone()),
+            DefaultEffect::Prompt,
+        );
+
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "plan-write".into(),
+            "file_write",
+            &json!({"filePath": plan, "content": "approved plan"}),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(!done.is_error, "{}", done.output.as_text());
+        assert_eq!(std::fs::read_to_string(plan).unwrap(), "approved plan");
+    }
+}

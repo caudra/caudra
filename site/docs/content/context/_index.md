@@ -14,10 +14,10 @@ Everything the model knows about your project passes through one context window,
 ```
 session start (paid every request)   on demand (paid when used)
 ──────────────────────────────────   ─────────────────────────────────
-effective system prompt              file contents   read / index / grep
+effective system prompt              file contents   file_read / index / file_grep
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
-memory tag names                     subdir rules    first read there
+memory tag names                     subdir rules    first file_read there
 skill names + descriptions           MCP tool defs   tool_search
 ```
 
@@ -50,7 +50,7 @@ After the match it always loads `AGENTS.local.md` from the same directory if pre
 ~/.config/maki/AGENTS.md   loaded (global)
 ```
 
-That `web/AGENTS.md` is not dead weight. The first time the agent `read`s a file under a subdirectory whose instruction file was never loaded, Maki pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
+That `web/AGENTS.md` is not dead weight. The first time `file_read` opens a file under a subdirectory whose instruction file was never loaded, Maki pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
 

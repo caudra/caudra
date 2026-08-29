@@ -16,7 +16,7 @@ const NAME: &str = "maki-plugin-dev";
 const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI. Authoring guide, real example, indexed maki Lua API reference. Load before any maki plugin work.";
 const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
 
-const EXAMPLE: &str = include_str!("../../plugins/glob/init.lua");
+const EXAMPLE: &str = include_str!("../../plugins/view_image/init.lua");
 
 const PERMISSIONS_ANCHOR: &str = "plugin-permissions";
 const REFERENCE_URL: &str = "/docs/lua-api/";
@@ -147,7 +147,7 @@ the interpreter, with full debug info.
 
 ## A complete real example
 
-The bundled `glob` tool, verbatim: schema, header and restore hooks, error
+The bundled `view_image` tool, verbatim: schema, header and restore hooks, error
 handling, host-managed output limits, collapsible UI view. It is a bundled plugin,
 so it opens with `register_options`, which your own plugin skips:
 
@@ -167,7 +167,7 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
 - Both global config dirs can exist, and `~/.maki/` wins, so look before you
   write.
 - The config dir sits outside the project, but it is an ordinary directory:
-  create files there with the normal write and edit tools.
+  create files there with `file_write` and `file_edit`.
 - You cannot run slash commands or restart maki, so ask the user to run
   `/reload` and to reproduce the problem, then read the log yourself.
 

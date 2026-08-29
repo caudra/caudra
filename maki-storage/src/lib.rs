@@ -102,11 +102,7 @@ fn staged_write(path: &Path, data: &[u8]) -> Result<NamedTempFile, StorageError>
     Ok(tmp)
 }
 
-pub(crate) fn atomic_write_permissions(
-    path: &Path,
-    data: &[u8],
-    mode: u32,
-) -> Result<(), StorageError> {
+pub fn atomic_write_permissions(path: &Path, data: &[u8], mode: u32) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;

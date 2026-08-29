@@ -1,6 +1,6 @@
 use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
-use maki_config::{PluginFileConfig, PluginsConfig};
+use maki_config::PluginsConfig;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -15,16 +15,12 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "File Operations",
         &[
-            "bash",
-            "list",
-            "read",
-            "write",
-            "edit",
-            "multiedit",
-            "edit_lines",
-            "insert_lines",
-            "glob",
-            "grep",
+            "file_read",
+            "file_write",
+            "file_edit",
+            "file_apply_patch",
+            "file_glob",
+            "file_grep",
             "tool_output_read",
             "tool_output_grep",
             "index",
@@ -33,7 +29,13 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Execution & Control",
-        &["batch", "code_execution", "question"],
+        &[
+            "batch",
+            "shell",
+            "code_execution",
+            "execution_environment",
+            "question",
+        ],
     ),
     (
         "Agent & Knowledge",
@@ -159,6 +161,14 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
+    if name == "code_execution" {
+        writeln!(
+            out,
+            "Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary."
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+    }
     write_param_table(out, &params);
 }
 
@@ -230,15 +240,14 @@ fn collect_tool_info(
 /// option defaulting to false, so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let registry = Arc::new(ToolRegistry::new());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let workcell = maki_workcell::WorkcellHost::new(cwd, None).expect("Workcell host");
+    workcell
+        .register_documented_tools(&registry)
+        .expect("Workcell tools");
     let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
 
-    let mut plugins = HashMap::new();
-    let mut edit = PluginFileConfig::default();
-    for &sub in maki_config::EDIT_SUB_TOOLS {
-        edit.opts.insert(sub.to_owned(), Value::Bool(true));
-    }
-    plugins.insert("edit".to_owned(), edit);
-    host.load_builtins(&PluginsConfig::from_plugins(plugins))
+    host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
         .expect("loading builtin plugins");
 
     let opt_in = host

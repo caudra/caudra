@@ -497,6 +497,7 @@ impl ToolInvocation for LuaToolInvocation {
                     let output_limits = reply.output_limits;
                     let output_ref = reply.output_ref;
                     let model_output_from_ref = reply.model_output_from_ref;
+                    let is_error = reply.result.is_err();
                     ToolExecResult {
                         output: reply.result.map(|s| {
                             if let Some(source) = image {
@@ -520,9 +521,12 @@ impl ToolInvocation for LuaToolInvocation {
                                 }
                             }
                         }),
+                        is_error,
                         annotation: reply.annotation,
                         written_path: reply.written_path,
+                        written_paths: Vec::new(),
                         model_suffix,
+                        model_output: None,
                         output_limits,
                         output_ref,
                         model_output_from_ref,

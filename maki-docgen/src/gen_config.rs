@@ -96,8 +96,17 @@ fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
 }
 
 fn collect_plugin_options() -> PluginOptionSpecs {
-    let host =
-        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let registry = Arc::new(ToolRegistry::new());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let workcell = maki_workcell::WorkcellHost::new(cwd, None).expect("Workcell host");
+    workcell
+        .register_documented_tools(&registry)
+        .expect("Workcell tools");
+    let mut host = PluginHost::new(registry).expect("plugin host");
+    host.load_production_builtins(&maki_config::PluginsConfig::from_plugins(
+        std::collections::HashMap::new(),
+    ))
+    .expect("loading builtins");
     let specs = host.plugin_options().expect("collecting plugin options");
     assert!(
         !specs.is_empty(),

@@ -88,7 +88,7 @@ A project `prompt` default cannot weaken a global `deny` default, including per-
 ```toml
 default = "prompt"
 
-[bash]
+[shell]
 deny = [
     "sudo *",
     "rm -rf *",
@@ -121,7 +121,7 @@ Structured requests distinguish files, directories, URLs, commands, queries, and
 - Shell authority includes the initial working directory.
 - A deny that intersects any resource blocks the complete call.
 
-File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted bundled policy allows them by default. Explicit deny rules can therefore block read, glob, grep, index, list, skill, or image access without adding normal prompt noise.
+File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `index`, `skill`, or image access without adding normal prompt noise.
 
 Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. Container tools such as `batch` and `code_execution` route inner calls through the same manager.
 
@@ -135,7 +135,7 @@ Generic field names such as `path` or `command` do not create reusable resource 
 
 The TUI can select broad whole-tool MCP authority for the current conversation. It requires the `ALLOW MCP TOOL` confirmation phrase and cannot be stored for a project or globally. ACP and SDK clients remain exact-only.
 
-## Bash parsing
+## Shell parsing
 
 Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, functions, and redirects so nested commands and redirect targets remain visible to deny rules.
 
@@ -147,7 +147,7 @@ The initial working directory is context, not confinement. An approved shell com
 
 ## Plugin rules
 
-Bundled plugins can declare trusted host policy for resources they own. Builtin allows apply only to implementations marked as bundled by the loader. A user plugin that replaces `read`, `task`, or another builtin name does not inherit that trust. Global user plugins need a valid `plugin.toml` before they can register allow policy. Project plugins can register deny rules only. Remembered Lua decisions bind to the plugin name, tool name, entry source, required Lua modules, description, and schema. A reload during review cannot switch the approved handler generation.
+Bundled plugins can declare trusted host policy for resources they own. Builtin allows apply only to implementations marked as bundled by the loader. User plugins do not inherit native or bundled trust. Global user plugins need a valid `plugin.toml` before they can register allow policy. Project plugins can register deny rules only. Remembered Lua decisions bind to the plugin name, tool name, entry source, required Lua modules, description, and schema. A reload during review cannot switch the approved handler generation.
 
 Lua plugin API capabilities remain separate. `plugin.toml` controls whether plugin code may call filesystem, network, process, and environment APIs. Tool-call permissions control whether the agent may invoke a registered tool.
 

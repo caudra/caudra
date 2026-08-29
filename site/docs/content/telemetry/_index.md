@@ -27,7 +27,7 @@ Two signals:
 
 - No prompt text and no tool input, unless you ask with `log_user_prompts` or
   `log_tool_details`. Tool input is the whole
-  input: `bash` commands, `write` content, `edit` strings, file paths. Only
+  input: `shell` commands, `file_write` content, `file_edit` strings, and file paths. Only
   turn these on while debugging.
 - No model output, and no provider error bodies: an API failure reports its
   status code, because the body is often the request echoed back.

@@ -477,6 +477,8 @@ pub struct ToolDoneEvent {
     pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub written_paths: Vec<String>,
     pub output_ref: Option<ToolOutputRef>,
     #[serde(skip)]
     pub output_limits: Option<ToolOutputLimits>,
@@ -501,6 +503,7 @@ impl ToolDoneEvent {
             is_error: true,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -515,7 +518,22 @@ impl ToolDoneEvent {
         }
         self.written_path
             .as_deref()
+            .or_else(|| self.written_paths.first().map(String::as_str))
             .or_else(|| self.output.written_path())
+    }
+
+    pub fn written_paths(&self) -> impl Iterator<Item = &str> {
+        let legacy = self.written_path().filter(|path| {
+            !self
+                .written_paths
+                .iter()
+                .any(|candidate| candidate == *path)
+        });
+        self.written_paths
+            .iter()
+            .map(String::as_str)
+            .chain(legacy)
+            .filter(|_| !self.is_error)
     }
 
     pub fn model_suffix(&self) -> Option<&str> {
@@ -528,7 +546,10 @@ impl ToolDoneEvent {
     }
 
     pub(crate) fn composed_model_output(&self) -> String {
-        let mut content = self.output.as_text();
+        let mut content = self
+            .model_output
+            .clone()
+            .unwrap_or_else(|| self.output.as_text());
         if let Some(model_suffix) = self.model_suffix() {
             append_model_suffix(&mut content, model_suffix);
         }
@@ -536,8 +557,8 @@ impl ToolDoneEvent {
     }
 
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
-        self.written_path()
-            .is_some_and(|wp| Path::new(wp) == plan_path)
+        self.written_paths()
+            .any(|written_path| Path::new(written_path) == plan_path)
     }
 }
 
@@ -1186,6 +1207,7 @@ mod tests {
                 is_error: false,
                 annotation: None,
                 written_path: None,
+                written_paths: Vec::new(),
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -1199,6 +1221,7 @@ mod tests {
                 is_error: true,
                 annotation: None,
                 written_path: None,
+                written_paths: Vec::new(),
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -1226,6 +1249,7 @@ mod tests {
                 is_error,
                 annotation: None,
                 written_path: None,
+                written_paths: Vec::new(),
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -1264,6 +1288,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: Some(output_ref.clone()),
             output_limits: None,
             model_suffix: Some("model context".into()),
@@ -1301,6 +1326,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/tmp/file.rs".into()),
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -1313,6 +1339,7 @@ mod tests {
         assert_eq!(done.model_suffix(), Some(MODEL_SUFFIX));
         let json = serde_json::to_string(&done).unwrap();
         assert!(json.contains(r#""written_path":"/tmp/file.rs""#));
+        assert!(!json.contains("written_paths"));
         assert!(json.contains(r#""output_ref":null"#));
         assert!(!json.contains("model_suffix"));
         assert!(!json.contains("model_output"));
@@ -1335,6 +1362,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -1429,6 +1457,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -1442,6 +1471,37 @@ mod tests {
             ..ok_event
         };
         assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
+    }
+
+    #[test]
+    fn plural_written_paths_keep_singular_compatibility() {
+        let event = ToolDoneEvent {
+            id: "id".into(),
+            tool: Arc::from("patch"),
+            output: ToolOutput::Plain("patched".into()),
+            is_error: false,
+            annotation: None,
+            written_path: Some("/project/first.rs".into()),
+            written_paths: vec!["/project/first.rs".into(), "/project/second.rs".into()],
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
+        };
+
+        assert_eq!(event.written_path(), Some("/project/first.rs"));
+        assert_eq!(
+            event.written_paths().collect::<Vec<_>>(),
+            ["/project/first.rs", "/project/second.rs"]
+        );
+        assert!(event.wrote_to(Path::new("/project/second.rs")));
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["written_path"], "/project/first.rs");
+        assert_eq!(
+            serialized["written_paths"],
+            serde_json::json!(["/project/first.rs", "/project/second.rs"])
+        );
     }
 
     #[test]
@@ -1677,6 +1737,7 @@ mod tests {
             is_error,
             annotation: None,
             written_path,
+            written_paths: Vec::new(),
             output_ref: None,
             output_limits: None,
             model_suffix: None,

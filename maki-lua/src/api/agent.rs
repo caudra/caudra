@@ -274,7 +274,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
-/// tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
+/// tools (like `file_read`, `shell`, `file_glob`) from Lua without going through the LLM.
 ///
 /// Live events (streaming output, annotations, cumulative usage) are delivered
 /// through optional callbacks while the tool runs.

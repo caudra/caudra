@@ -46,18 +46,19 @@ use tracing::warn;
 use crate::cli::Cli;
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
-    ("bash", "Bash"),
-    ("read", "Read"),
-    ("edit", "Edit"),
-    ("write", "Write"),
-    ("grep", "Grep"),
-    ("glob", "Glob"),
+    ("file_apply_patch", "FileApplyPatch"),
+    ("file_edit", "FileEdit"),
+    ("file_glob", "FileGlob"),
+    ("file_grep", "FileGrep"),
+    ("file_read", "FileRead"),
+    ("file_write", "FileWrite"),
+    ("shell", "Shell"),
     ("todo_write", "TodoWrite"),
     ("webfetch", "WebFetch"),
     ("websearch", "WebSearch"),
     ("task", "Task"),
-    ("multiedit", "MultiEdit"),
     ("code_execution", "CodeExecution"),
+    ("execution_environment", "ExecutionEnvironment"),
     ("index", "Index"),
     ("memory", "Memory"),
     ("question", "Question"),
@@ -1567,7 +1568,7 @@ mod tests {
             let legacy_rx = smol::lock::Mutex::new(legacy_rx);
             manager
                 .enforce(
-                    &maki_config::ToolKey::native("bash"),
+                    &maki_config::ToolKey::native("shell"),
                     &scopes,
                     &input,
                     &event_tx,
@@ -1586,7 +1587,7 @@ mod tests {
         let (event_tx, _) = flume::unbounded();
         manager
             .enforce(
-                &maki_config::ToolKey::native("bash"),
+                &maki_config::ToolKey::native("shell"),
                 &PermissionScopes::single(scope.to_owned()),
                 &serde_json::json!({"command": scope}),
                 &maki_agent::EventSender::new(event_tx, 0),
@@ -1680,18 +1681,19 @@ mod tests {
             .unwrap_or(name)
     }
 
-    #[test_case("bash", "Bash")]
-    #[test_case("read", "Read")]
-    #[test_case("edit", "Edit")]
-    #[test_case("write", "Write")]
-    #[test_case("grep", "Grep")]
-    #[test_case("glob", "Glob")]
+    #[test_case("file_apply_patch", "FileApplyPatch")]
+    #[test_case("file_edit", "FileEdit")]
+    #[test_case("file_glob", "FileGlob")]
+    #[test_case("file_grep", "FileGrep")]
+    #[test_case("file_read", "FileRead")]
+    #[test_case("file_write", "FileWrite")]
+    #[test_case("shell", "Shell")]
     #[test_case("todo_write", "TodoWrite")]
     #[test_case("webfetch", "WebFetch")]
     #[test_case("websearch", "WebSearch")]
     #[test_case("task", "Task")]
-    #[test_case("multiedit", "MultiEdit")]
     #[test_case("code_execution", "CodeExecution")]
+    #[test_case("execution_environment", "ExecutionEnvironment")]
     #[test_case("index", "Index")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
@@ -2376,7 +2378,7 @@ mod tests {
                         "behavior": "allow",
                         "updatedPermissions": [{
                             "type": "addRules",
-                            "rules": [{"toolName": "Bash"}],
+                            "rules": [{"toolName": "Shell"}],
                             "behavior": "allow",
                             "destination": "session"
                         }]
@@ -2487,12 +2489,12 @@ mod tests {
     fn map_tool_names_in_content_maps_known_and_preserves_rest() {
         let content = serde_json::json!([
             {"type": "text", "text": "hello"},
-            {"type": "tool_use", "name": "read", "id": "1", "input": {}},
+            {"type": "tool_use", "name": "file_read", "id": "1", "input": {}},
             {"type": "tool_use", "name": "unknown_native", "id": "2", "input": {}},
         ]);
         let mapped = map_tool_names_in_content(&content);
         assert_eq!(mapped[0]["type"], "text");
-        assert_eq!(mapped[1]["name"], "Read");
+        assert_eq!(mapped[1]["name"], "FileRead");
         assert_eq!(mapped[2]["name"], "unknown_native");
     }
 }
