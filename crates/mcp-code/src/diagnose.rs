@@ -9,28 +9,10 @@
 
 use monty_types::{ExcType, MontyException};
 
+use crate::subset::{
+    UNTYPED_BUILTINS, WITHHELD_BUILTINS, available_modules, oxford, withheld_builtins,
+};
 use crate::types::Outcome;
-
-/// The set an agent is most likely to reach for and not find. Kept short deliberately: an
-/// exhaustive list of absent modules would bury the available ones.
-const AVAILABLE_MODULES: &str = "asyncio, base64, binascii, collections, dataclasses, datetime, functools, itertools, json, math, os, pathlib, re, sys, typing, unicodedata";
-
-/// Builtins Monty does not implement. Type checking reports these as unresolved references, which
-/// reads as a typo unless the caller is told they are withheld on purpose.
-const WITHHELD_BUILTINS: [&str; 12] = [
-    "eval",
-    "exec",
-    "compile",
-    "__import__",
-    "globals",
-    "locals",
-    "vars",
-    "dir",
-    "input",
-    "super",
-    "breakpoint",
-    "help",
-];
 
 /// Classification of a raised exception plus the guidance that accompanies it.
 pub(crate) struct Diagnosis {
@@ -74,7 +56,7 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
         ExcType::MemoryError => Diagnosis {
             outcome: Outcome::Limited,
             diagnostic: Some(format!(
-                "The memory budget was exhausted. Process the data in smaller pieces, and remember that enumerate, zip, map, filter, and reversed are eager and materialise whole lists. ({message})"
+                "The memory budget was exhausted. Process the data in smaller pieces, and remember that enumerate, zip, reversed, and generator expressions are eager and materialise whole lists. ({message})"
             )),
         },
         ExcType::TimeoutError => Diagnosis {
@@ -104,21 +86,42 @@ pub(crate) fn timeout_guidance(detail: &str) -> String {
         format!(" ({detail})")
     };
     format!(
-        "Execution exceeded its time budget and was stopped. Reduce the work, or raise timeout up to its cap. Note that enumerate, zip, map, filter, and reversed are eager, so an infinite iterator such as map(f, itertools.count()) never terminates.{suffix}"
+        "Execution exceeded its time budget and was stopped. Reduce the work, or raise timeout up to its cap. Note that enumerate, zip, reversed, and generator expressions are eager, so an infinite source such as (f(x) for x in itertools.count()) never terminates.{suffix}"
     )
 }
 
 /// Guidance for an import the subset does not provide.
+///
+/// The list must stay exactly the set the worker resolves. Naming a module Monty does not implement
+/// turns this from a redirection into an instruction to retry a failure.
 fn module_guidance(detail: &str) -> String {
     format!(
-        "Only these standard library modules exist: {AVAILABLE_MODULES}. Third-party packages cannot be installed or imported. Do not retry this import; compute the result with the available modules, or use a different tool. ({detail})"
+        "Only these standard library modules exist: {}. Third-party packages cannot be installed or imported. Do not retry this import; compute the result with the available modules, or use a different tool. ({detail})",
+        available_modules!()
     )
 }
 
 /// Guidance for a name the subset does not provide.
 fn undefined_name_guidance(detail: &str) -> String {
     format!(
-        "Undefined name. Note that eval, exec, compile, globals, locals, vars, dir, input, super, callable, issubclass, bytearray, complex, memoryview, object, format, and ascii are not implemented, and nothing persists between code_execution calls. ({detail})"
+        "Undefined name. Note that {} are not implemented, and nothing persists between code_execution calls. ({detail})",
+        withheld_builtins!()
+    )
+}
+
+/// Guidance for a name the interpreter defines but the type stubs omit.
+///
+/// Neither of the other two answers fits. Calling it undefined is false, and it would send the
+/// caller looking for a different algorithm when the one it wrote is fine. Saying nothing leaves the
+/// rejection reading as a type error in the caller's own code.
+fn untyped_name_guidance(name: &str) -> String {
+    let others: Vec<&str> = UNTYPED_BUILTINS
+        .into_iter()
+        .filter(|candidate| *candidate != name)
+        .collect();
+    format!(
+        "`{name}` exists in the interpreter but is missing from its type stubs, so type checking rejects it before the snippet runs. The same is true of {}. Use a comprehension in place of map or filter, or ask the operator to disable type checking.",
+        oxford(&others)
     )
 }
 
@@ -144,8 +147,12 @@ pub(crate) fn diagnose_type_errors(diagnostics: &str) -> String {
         );
     }
     if let Some(name) = unresolved_reference(trimmed) {
+        // `open` is checked first: it is also unstubbed, but the isolation refusal it would hit at
+        // runtime is the more useful thing to tell the caller than anything about type stubs.
         let guidance = if name == "open" {
             isolation_guidance("`open` is not available")
+        } else if UNTYPED_BUILTINS.contains(&name) {
+            untyped_name_guidance(name)
         } else if WITHHELD_BUILTINS.contains(&name) {
             undefined_name_guidance(&format!("`{name}` is not implemented"))
         } else {
@@ -231,6 +238,33 @@ mod tests {
             "snippet.py:1:1: error[unresolved-reference] Name `total` used when not defined",
         );
         assert!(text.contains("nothing persists between"), "{text}");
+    }
+
+    /// `map` runs; only the checker refuses it. Reporting it as undefined would send the caller
+    /// looking for a different algorithm when the one it wrote was fine.
+    #[test]
+    fn an_unstubbed_builtin_is_not_reported_as_undefined() {
+        let text = diagnose_type_errors(
+            "snippet.py:1:6: error[unresolved-reference] Name `map` used when not defined",
+        );
+        assert!(text.contains("missing from its type stubs"), "{text}");
+        assert!(text.contains("comprehension"), "{text}");
+        assert!(
+            !text.contains("are not implemented"),
+            "the undefined-name wording must not be used here: {text}"
+        );
+        // The name under discussion must not also appear in the list of the others.
+        let (_, others) = text
+            .split_once("The same is true of ")
+            .expect("sibling list");
+        assert!(
+            !others.starts_with("map") && !others.contains(", map"),
+            "guidance repeats the name it is already explaining: {text}"
+        );
+        assert!(
+            others.starts_with("filter, getattr, setattr, and hasattr"),
+            "{text}"
+        );
     }
 
     fn exception(exc_type: ExcType, message: &str) -> MontyException {

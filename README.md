@@ -613,8 +613,8 @@ At most four shell calls execute concurrently within one process. Queued calls r
 `code_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
 value of its final expression along with anything it printed.
 
-- `code` is required and limited to 65,536 UTF-8 bytes. `timeout_ms` is optional, defaults to 5,000,
-  and is capped at 30,000. Unknown fields are rejected.
+- `code` is required and limited to 65,536 UTF-8 bytes. `timeout` is optional, measured in
+  milliseconds, defaults to 5,000, and is capped at 30,000. Unknown fields are rejected.
 - Each call is independent. No variables, definitions, imports, or printed output carry over, and
   there is no session to resume.
 - The worker has no filesystem access, no network access, no subprocesses, and an empty environment.
@@ -624,10 +624,15 @@ value of its final expression along with anything it printed.
   `pip install`. Importing anything else raises `ModuleNotFoundError` and the result lists what is
   available.
 - Snippets are type-checked before execution by default, so a type error is reported without running
-  any code. Use `--no-code-type-check` to execute unchecked.
+  any code. Use `--no-code-type-check` to execute unchecked. A few builtins — `map`, `filter`,
+  `getattr`, `setattr`, and `hasattr` — exist in the interpreter but are absent from its type stubs,
+  so they run only when type checking is off. The rejection says so rather than calling them
+  undefined.
 - The interpreter is Monty, not CPython. It implements a large but incomplete subset: notably no
-  `str.format()`, `match` statements, generators, or class inheritance. The tool description
-  enumerates the divergences that most often cost a caller a wasted turn.
+  `str.format()`, `match` statements, generators, or class inheritance, and operators do not dispatch
+  to user-defined dunders. The tool description enumerates the divergences that most often cost a
+  caller a wasted turn, and it is generated from the same lists the runtime diagnostics quote, so the
+  two cannot disagree.
 - The structured result reports the outcome, the final value as JSON with a `repr` fallback for values
   JSON cannot express, bounded stdout and stderr, and, when execution fails, the exception type,
   message, and traceback plus targeted guidance.

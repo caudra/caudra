@@ -6,6 +6,7 @@
 //!
 //! The JSON schema is an admission contract, not a security boundary; dispatch validates again.
 
+use crate::subset::{available_modules, untyped_builtins, withheld_builtins};
 use crate::types::{DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES, MAX_TIMEOUT_MS};
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
@@ -14,9 +15,12 @@ use std::sync::Arc;
 /// Stable extension key consumed by Workcell renderers. Preserve this namespace across versions.
 pub(crate) const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 
-const DESCRIPTION: &str = r#"Execute a short Python script in an isolated interpreter and return its value and printed output.
+/// Spliced from `subset` rather than written inline: the module and builtin lists have to be the
+/// same ones the diagnostics quote, or a failed call steers the caller back into the same failure.
+const DESCRIPTION: &str = concat!(
+    r#"Execute a short Python script in an isolated interpreter and return its value and printed output.
 
-Use this for computation: arithmetic and math, summary statistics computed directly since there is no statistics module, date arithmetic, string and text processing, JSON reshaping, regex extraction, sorting and aggregation, base64 and hex encoding. Prefer this over the shell tool for anything that is pure computation, because this tool cannot reach the host.
+Use this for computation: arithmetic and math, summary statistics computed directly since there is no statistics module, date arithmetic, string and text processing, JSON reshaping, regex extraction, sorting and aggregation. Prefer this over the shell tool for anything that is pure computation, because this tool cannot reach the host.
 
 Isolation:
 - No filesystem, no network, no environment variables, and no subprocesses. Use the file tools, webfetch, or shell when the task needs any of those.
@@ -25,15 +29,25 @@ Isolation:
 This is a Python subset, not CPython. It rejects or fails on:
 - Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.
 - yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.
-- str.format() and %-formatting. Use f-strings.
-- eval, exec, compile, globals, locals, vars, dir, input, super, callable, issubclass, bytearray, complex, memoryview, object, format, and ascii.
+- str.format(), %-formatting, str.translate(), and str.maketrans(). Use f-strings.
+- These builtins, which are undefined and raise NameError: "#,
+    withheld_builtins!(),
+    r#".
 - User-defined exception classes, and function attributes such as __name__.
 
-Only these standard library modules exist, each covering part of its CPython surface: asyncio, base64, binascii, collections, dataclasses, datetime, functools, itertools, json, math, os, pathlib, re, sys, typing, unicodedata. There are no third-party packages, and no random, time, io, copy, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.
+Only these standard library modules exist, each covering part of its CPython surface: "#,
+    available_modules!(),
+    r#". There are no third-party packages, and no base64, binascii, functools, random, time, io, copy, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.
 
 Behaviour that differs from CPython even where the API exists:
-- enumerate, zip, map, filter, and reversed are eager and return lists, so an infinite iterator never terminates.
-- re is backed by fancy-regex: no bytes patterns and no VERBOSE flag.
+- "#,
+    untyped_builtins!(),
+    r#" exist at runtime but are missing from the type stubs, so type checking rejects them before the snippet runs. Use a comprehension instead of map or filter. getattr and hasattr also cannot see methods, so hasattr returns False for attributes that do exist.
+- enumerate, zip, reversed, and generator expressions are eager and return lists, so an infinite iterator never terminates. iter() and the itertools functions stay lazy and single-use.
+- Operators do not dispatch to user-defined dunders, so +, -, <, len(), [], and () ignore __add__, __neg__, __lt__, __len__, __getitem__, and __call__ on your own classes. __init__, __repr__, __str__, __eq__, __hash__, __bool__, __iter__, and __contains__ do work; reach anything else by calling the method directly.
+- re is backed by fancy-regex: no bytes patterns, no VERBOSE flag, no re.subn, and re.sub takes a string replacement only, never a callable.
+- os exposes constants but no os.path, and sys exposes only version, platform, and the streams. Use pathlib for path manipulation.
+- dataclasses provides @dataclass with no arguments plus is_dataclass; field, asdict, astuple, fields, replace, and options such as frozen= are absent.
 - Only the utf-8, ascii, utf-16, and utf-32 codecs exist.
 
 Usage notes:
@@ -42,7 +56,8 @@ Usage notes:
 - timeout is optional, measured in milliseconds, defaults to 5000, and is capped at 30000.
 - Each call is independent. No variables, definitions, or imports persist between calls.
 - Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.
-- Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry."#;
+- Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry."#
+);
 
 #[must_use]
 pub fn catalog() -> Vec<Tool> {

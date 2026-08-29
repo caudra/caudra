@@ -9,7 +9,10 @@ use std::{path::PathBuf, sync::OnceLock};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use workcell_mcp_code::{CodeConfiguration, CodeToolGroup, WORKER_FILE_NAME, resolve_worker};
+use workcell_mcp_code::{
+    CodeConfiguration, CodeToolGroup, SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS,
+    WORKER_FILE_NAME, catalog, resolve_worker,
+};
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
 /// who ran `make code-worker` needs no extra configuration.
@@ -106,6 +109,198 @@ async fn supports_the_advertised_stdlib_modules() {
     .await;
     assert_eq!(output["outcome"], "completed");
     assert_eq!(output["result"], json!([3, true]));
+    group.shutdown().await;
+}
+
+/// The description and the import diagnostic both enumerate the modules, and for three of them —
+/// `base64`, `binascii`, and `functools` — the enumeration was wrong for as long as it existed.
+/// Spot-checking a handful of real modules could never catch that, so every advertised name is
+/// imported here against a running worker.
+#[tokio::test]
+async fn every_advertised_module_imports() {
+    let group = group_or_skip!();
+    for module in SUBSET_MODULES {
+        let output = run(&group, &format!("import {module}\nTrue")).await;
+        assert_eq!(
+            output["outcome"], "completed",
+            "{module} is advertised but the worker answered {output}"
+        );
+    }
+    group.shutdown().await;
+}
+
+/// The complement of the above: a name the worker does resolve must not be advertised as withheld,
+/// and a name it does not resolve must be. `map` and `filter` were described as eager rather than
+/// absent, which sent callers into a failure the description had told them to expect to work.
+///
+/// Bare references are used deliberately. Monty routes a *call* to an absent name through the OS
+/// handler, so `open('x')` raises `PermissionError` rather than `NameError`; a bare reference is a
+/// name lookup, which is the question being asked here.
+#[tokio::test]
+async fn every_withheld_builtin_is_actually_absent() {
+    let group = group_or_skip!();
+    let mut resolved = Vec::new();
+    for name in WITHHELD_BUILTINS {
+        let output = run(&group, name).await;
+        if output["exception"]["type"] != "NameError" {
+            resolved.push(format!("{name} -> {}", output["result"]));
+        }
+    }
+    group.shutdown().await;
+    // Reported together: fixing these one panic at a time is what let the lists drift in the first
+    // place, and a name that resolves at runtime is advertised wrongly even if others also are.
+    assert!(
+        resolved.is_empty(),
+        "advertised as withheld but the worker resolves them: {resolved:?}"
+    );
+}
+
+/// The absent-module sentence is the other half of the import diagnostic's promise: naming a module
+/// there that the worker can in fact import would send a caller to the shell tool for no reason.
+#[tokio::test]
+async fn modules_named_as_absent_really_are() {
+    let group = group_or_skip!();
+    for module in [
+        "base64",
+        "binascii",
+        "functools",
+        "random",
+        "statistics",
+        "hashlib",
+        "urllib",
+    ] {
+        let output = run(&group, &format!("import {module}")).await;
+        assert_eq!(
+            output["outcome"], "exception",
+            "{module} is described as absent but imported"
+        );
+        assert_eq!(output["exception"]["type"], "ModuleNotFoundError");
+    }
+    group.shutdown().await;
+}
+
+/// The description is the steering surface, so its claims about the subset have to be the ones the
+/// worker honours. These are the divergences an agent is most likely to write code against.
+#[tokio::test]
+async fn the_described_cpython_divergences_hold() {
+    let group = group_or_skip!();
+
+    // Eager iterators, including generator expressions, which CPython keeps lazy.
+    let eager = run(&group, "[type(zip([1], [2])) is list, type(enumerate('a')) is list, type(reversed([1])) is list, type(i for i in range(2)) is list]").await;
+    assert_eq!(eager["result"], json!([true, true, true, true]), "{eager}");
+
+    // Operators ignore user-defined dunders, but the method is still callable directly.
+    let dunder = run(
+        &group,
+        "class A:\n    def __init__(self, v):\n        self.v = v\n    def __add__(self, o):\n        return A(self.v + o.v)\na = A(1)\ntry:\n    a + a\n    r = 'dispatched'\nexcept TypeError:\n    r = 'ignored'\n[r, a.__add__(a).v]",
+    )
+    .await;
+    assert_eq!(dunder["result"], json!(["ignored", 2]), "{dunder}");
+
+    // re.sub takes a string replacement only; a callable is refused rather than applied.
+    let sub = run(
+        &group,
+        "import re\ntry:\n    re.sub(r'\\d', lambda m: m.group(), '1')\n    r = 'applied'\nexcept TypeError:\n    r = 'refused'\nr",
+    )
+    .await;
+    assert_eq!(sub["result"], json!("refused"), "{sub}");
+
+    // os carries constants but no path submodule; pathlib is the advertised replacement.
+    let paths = run(
+        &group,
+        "import os\nfrom pathlib import Path\n[os.sep, str(Path('/a') / 'b.txt'), Path('/a/b.txt').suffix]",
+    )
+    .await;
+    assert_eq!(paths["result"], json!(["/", "/a/b.txt", ".txt"]), "{paths}");
+
+    group.shutdown().await;
+}
+
+/// A failed import must not hand back guidance naming modules that do not exist, which is what made
+/// the drift expensive rather than merely untidy: the diagnostic invited the next failing attempt.
+#[tokio::test]
+async fn import_guidance_never_names_a_module_that_is_missing() {
+    let group = group_or_skip!();
+    let output = run(&group, "import functools").await;
+    let diagnostic = output["diagnostic"].as_str().expect("guidance");
+    // Only the enumeration is under test. The trailing parenthetical echoes Monty's own message,
+    // which necessarily repeats the module the caller asked for.
+    let offered = diagnostic
+        .split_once("modules exist: ")
+        .expect("the guidance enumerates the available modules")
+        .1
+        .split_once('.')
+        .expect("the enumeration is a sentence")
+        .0;
+    for absent in ["base64", "binascii", "functools"] {
+        assert!(
+            !offered.contains(absent),
+            "guidance offered {absent}, which the worker cannot import: {offered}"
+        );
+    }
+    // The enumeration is still present rather than having been emptied out.
+    assert!(offered.contains("unicodedata"), "{offered}");
+    group.shutdown().await;
+}
+
+/// `map` and `filter` are the sharp edge of the subset: they run fine but the default type checking
+/// rejects them, so both answers a caller could receive have to be right for the mode it is in.
+#[tokio::test]
+async fn unstubbed_builtins_run_but_are_rejected_by_type_checking() {
+    let permissive = group_or_skip!(false);
+    let mut absent = Vec::new();
+    for name in UNTYPED_BUILTINS {
+        let output = run(&permissive, name).await;
+        if output["outcome"] != "completed" {
+            absent.push(format!("{name} -> {}", output["exception"]));
+        }
+    }
+    permissive.shutdown().await;
+    assert!(
+        absent.is_empty(),
+        "described as existing at runtime but the worker does not define them: {absent:?}"
+    );
+
+    let checked = group_or_skip!(true);
+    let output = run(&checked, "list(map(str, [1, 2]))").await;
+    assert_eq!(output["outcome"], "rejected");
+    let diagnostic = output["diagnostic"].as_str().expect("guidance");
+    assert!(
+        diagnostic.contains("missing from its type stubs"),
+        "a name that exists must not be reported as undefined: {diagnostic}"
+    );
+    assert!(diagnostic.contains("comprehension"), "{diagnostic}");
+    checked.shutdown().await;
+}
+
+/// The catalog description and the runtime diagnostics are separate strings built from one source.
+/// This is what proves they were built from that source rather than kept in step by hand.
+#[tokio::test]
+async fn the_description_and_the_diagnostics_agree() {
+    let tools = catalog();
+    let description = tools[0].description.as_deref().expect("tool description");
+    for module in SUBSET_MODULES {
+        assert!(
+            description.contains(module),
+            "the description omits the advertised module {module}"
+        );
+    }
+    for name in WITHHELD_BUILTINS.iter().chain(UNTYPED_BUILTINS.iter()) {
+        assert!(
+            description.contains(name),
+            "the description omits the builtin {name}"
+        );
+    }
+
+    let group = group_or_skip!();
+    let output = run(&group, "import socket").await;
+    let diagnostic = output["diagnostic"].as_str().expect("guidance");
+    for module in SUBSET_MODULES {
+        assert!(
+            diagnostic.contains(module),
+            "the import guidance omits {module}: {diagnostic}"
+        );
+    }
     group.shutdown().await;
 }
 
