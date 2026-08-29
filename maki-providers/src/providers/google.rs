@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -20,19 +20,6 @@ use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
-const FLASH_MAX_THINKING: u32 = 24_576;
-const PRO_MAX_THINKING: u32 = 32_768;
-
-/// The generic per-model max, capped by Google's documented `thinkingBudget`
-/// hard limits per family.
-fn max_thinking(model: &Model) -> u32 {
-    let cap = if model.id.contains("flash") {
-        FLASH_MAX_THINKING
-    } else {
-        PRO_MAX_THINKING
-    };
-    model.max_thinking_budget().map_or(cap, |m| m.min(cap))
-}
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "google",
@@ -47,56 +34,73 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["gemini-2.5-pro"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.31,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["gemini-2.5-pro"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Gemini,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 1.25,
+                    output: 5.00,
+                    cache_write: 0.00,
+                    cache_read: 0.31,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 1_048_576,
+                reasoning_options: Some(&[StaticReasoningOption::BudgetTokens {
+                        min: Some(128),
+                        max: Some(32_768),
+                    }]),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-        ModelEntry {
-            prefixes: &["gemini-2.5-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.04,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-2.5-flash"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Gemini,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.15,
+                    output: 0.60,
+                    cache_write: 0.00,
+                    cache_read: 0.04,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 1_048_576,
+                reasoning_options: Some(&[
+                        StaticReasoningOption::Toggle,
+                        StaticReasoningOption::BudgetTokens {
+                            min: Some(0),
+                            max: Some(24_576),
+                        },
+                    ]),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-        ModelEntry {
-            prefixes: &["gemini-2.0-flash-lite"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.075,
-                output: 0.30,
-                cache_write: 0.00,
-                cache_read: 0.01,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-2.0-flash-lite"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Gemini,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.075,
+                    output: 0.30,
+                    cache_write: 0.00,
+                    cache_read: 0.01,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 1_048_576,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 fn resolve_google_base_url() -> Option<String> {
@@ -201,7 +205,7 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
+        thinking.apply_google_thinking(&mut body, model);
 
         if let Some(max_output) = model.max_output_tokens {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
@@ -671,6 +675,7 @@ async fn parse_sse(
 
 #[cfg(test)]
 mod tests {
+    use crate::ReasoningOptions;
     use super::*;
     use std::sync::Arc;
     use test_case::test_case;
@@ -705,6 +710,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
+            reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         }
     }

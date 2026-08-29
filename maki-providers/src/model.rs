@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use maki_config::ModelPolicy;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
+use maki_storage::sessions::StoredTokenUsage;
+use maki_storage::thinking::{ReasoningOption, ReasoningOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
@@ -39,6 +40,21 @@ pub enum ModelError {
     NotAllowed(String),
 }
 
+/// Rates that replace the base ones once a prompt crosses `above` tokens.
+/// Anthropic's 1M window and Gemini 2.5 both bill this way, and a single flat
+/// rate cannot express either.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PricingTier {
+    /// Prompt tokens above which these rates apply.
+    pub above: u32,
+    pub input: f64,
+    pub output: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
@@ -50,6 +66,9 @@ pub struct ModelPricing {
     /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
+    /// Context-size tiers, ascending by `above`. Empty for the flat majority.
+    #[serde(default)]
+    pub tiers: Vec<PricingTier>,
 }
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
@@ -62,6 +81,9 @@ pub struct ModelInfo {
     pub pricing: Option<ModelPricing>,
     pub supports_thinking: Option<bool>,
     pub supports_vision: Option<bool>,
+    /// Levels and bounds the provider just told us about, which outrank both
+    /// the static table and the catalog.
+    pub reasoning_options: Option<ReasoningOptions>,
     pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
@@ -76,6 +98,7 @@ impl ModelInfo {
             pricing: None,
             supports_thinking: None,
             supports_vision: None,
+            reasoning_options: None,
             tier: None,
             provider_info: None,
         }
@@ -98,10 +121,24 @@ impl ModelPricing {
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
+        tiers: Vec::new(),
     };
 
     pub fn is_zero(&self) -> bool {
         self.input == 0.0 && self.output == 0.0 && self.cache_write == 0.0 && self.cache_read == 0.0
+    }
+
+    /// Rates for a prompt of `prompt_tokens`: the highest tier it crosses, else
+    /// the base rates. Tiers are ascending, so the last match wins.
+    fn rates_at(&self, prompt_tokens: u32) -> (f64, f64, f64, f64) {
+        self.tiers
+            .iter()
+            .take_while(|tier| prompt_tokens > tier.above)
+            .last()
+            .map_or(
+                (self.input, self.output, self.cache_write, self.cache_read),
+                |tier| (tier.input, tier.output, tier.cache_write, tier.cache_read),
+            )
     }
 
     /// Cache multipliers Anthropic applies on top of the base input rate.
@@ -162,6 +199,37 @@ impl From<maki_config::providers::Tier> for ModelTier {
     }
 }
 
+/// Const-constructible mirror of [`ReasoningOption`], so the static tables can
+/// carry a correction for a model the catalog gets wrong or has not reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticReasoningOption {
+    Toggle,
+    Effort(&'static [&'static str]),
+    BudgetTokens { min: Option<u32>, max: Option<u32> },
+}
+
+pub(crate) fn reasoning_options_from_static(
+    options: &[StaticReasoningOption],
+) -> ReasoningOptions {
+    ReasoningOptions::new(
+        options
+            .iter()
+            .map(|option| match option {
+                StaticReasoningOption::Toggle => ReasoningOption::Toggle,
+                StaticReasoningOption::Effort(values) => ReasoningOption::Effort {
+                    values: values.iter().map(|v| (*v).to_string()).collect(),
+                },
+                StaticReasoningOption::BudgetTokens { min, max } => {
+                    ReasoningOption::BudgetTokens {
+                        min: *min,
+                        max: *max,
+                    }
+                }
+            })
+            .collect(),
+    )
+}
+
 #[derive(Debug)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
@@ -173,6 +241,9 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    /// Corrects the catalog where it describes the model rather than the
+    /// request maki sends. `None` defers to discovery and models.dev.
+    pub reasoning_options: Option<&'static [StaticReasoningOption]>,
 }
 
 pub(crate) fn lookup_entry<'a>(
@@ -247,6 +318,10 @@ pub struct Model {
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
     pub thinking_fields: Option<Box<ThinkingFields>>,
+    /// Levels and bounds this model accepts, resolved once at construction so a
+    /// request never needs a live catalog lookup. Empty when nothing declared
+    /// them, which callers read as "send nothing and take the API default".
+    pub reasoning_options: ReasoningOptions,
 }
 
 impl Model {
@@ -275,6 +350,19 @@ impl Model {
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| static_entry.map(|entry| entry.context_window))
             .unwrap_or(manifest.fallback_context_window);
+        // The static entry wins over the catalog on purpose: it is where maki
+        // records what a *request* accepts, which is not always what the model
+        // is capable of. Discovery still wins over both, since the provider
+        // just told us.
+        let reasoning_options = discovered
+            .and_then(|info| info.reasoning_options.clone())
+            .or_else(|| {
+                static_entry
+                    .and_then(|entry| entry.reasoning_options)
+                    .map(reasoning_options_from_static)
+            })
+            .or_else(|| manifest.catalog_reasoning_options(model_id))
+            .unwrap_or_default();
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
@@ -288,6 +376,7 @@ impl Model {
             max_output_tokens,
             context_window,
             thinking_fields: None,
+            reasoning_options,
         }
     }
 
@@ -315,11 +404,23 @@ impl Model {
                 cache_write: meta.cache_write,
                 cache_read: meta.cache_read,
                 fast: None,
+                tiers: Vec::new(),
             },
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
             thinking_fields: None,
+            reasoning_options: meta.reasoning_options,
+        }
+    }
+
+    /// What the model says it accepts. A local model spells its levels as
+    /// `thinking_fields` keys, so read them there rather than making the user
+    /// declare the same thing twice.
+    pub fn reasoning_options(&self) -> ReasoningOptions {
+        match &self.thinking_fields {
+            Some(fields) if self.reasoning_options.is_empty() => fields.reasoning_options(),
+            _ => self.reasoning_options.clone(),
         }
     }
 
@@ -337,8 +438,12 @@ impl Model {
             .unwrap_or(manifest.supports_thinking)
     }
 
+    /// A model that cannot be asked to stop reasoning. Read from what it
+    /// declared, so a new model needs no flag; the override stays for gateways
+    /// that know better than the catalog.
     pub fn requires_thinking(&self) -> bool {
         self.thinking_override == Some(ThinkingSupport::Required)
+            || !self.reasoning_options().can_disable()
     }
 
     pub fn supports_vision(&self) -> bool {
@@ -361,15 +466,6 @@ impl Model {
     pub fn supports_tool_examples(&self) -> bool {
         self.supports_tool_examples_override
             .unwrap_or_else(|| self.family.supports_tool_examples())
-    }
-
-    /// Half the output window, so the answer always has room after the
-    /// thinking. `None` when the window is unknown: callers must then let
-    /// budgets through unclamped. Providers cap further only where the API
-    /// documents a hard limit (currently just Google).
-    pub fn max_thinking_budget(&self) -> Option<u32> {
-        self.max_output_tokens
-            .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
     }
 
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
@@ -609,18 +705,16 @@ impl TokenUsage {
     /// schedule.
     pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
         let (input, output, cache_write, cache_read) = match &pricing.fast {
+            // Fast mode quotes one flat premium, so it never reads tiers.
             Some(f) if fast => (
                 f.input,
                 f.output,
                 f.input * ModelPricing::CACHE_WRITE_MULTIPLIER,
                 f.input * ModelPricing::CACHE_READ_MULTIPLIER,
             ),
-            _ => (
-                pricing.input,
-                pricing.output,
-                pricing.cache_write,
-                pricing.cache_read,
-            ),
+            // The tier boundary is on prompt size, which is everything the
+            // model read: fresh input plus whatever came from cache.
+            _ => pricing.rates_at(self.input + self.cache_read + self.cache_creation),
         };
         self.input as f64 * input / PER_MILLION
             + self.output as f64 * output / PER_MILLION
@@ -694,6 +788,7 @@ mod tests {
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
+        tiers: Vec::new(),
     };
 
     #[test_case(999, "999"         ; "under_thousand")]
@@ -803,6 +898,7 @@ mod tests {
             cache_write: 3.75,
             cache_read: 0.30,
             fast: None,
+            tiers: Vec::new(),
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -826,6 +922,7 @@ mod tests {
                 input: 30.00,
                 output: 150.00,
             }),
+            tiers: Vec::new(),
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -847,6 +944,7 @@ mod tests {
             cache_write: 3.75,
             cache_read: 0.30,
             fast: None,
+            tiers: Vec::new(),
         };
         let usage = TokenUsage {
             input: 1_000_000,

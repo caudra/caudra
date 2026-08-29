@@ -25,15 +25,16 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{
-    ContentBlock, Effort, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
+    ContentBlock, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
     expand_message, project_messages,
 };
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     Session, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
-    StoredSubagent, StoredThinking,
+    StoredSubagent,
 };
+use maki_storage::thinking::StoredThinking;
 use maki_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use ratatui::layout::Rect;
 use std::env;
@@ -2688,7 +2689,7 @@ fn clicking_status_thinking_cycles_from_visible_off_state() {
 
     assert!(click_status(&mut app, StatusBarHitTarget::Thinking).is_empty());
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
 }
 
 #[test]
@@ -2713,7 +2714,7 @@ fn required_thinking_click_advances_from_effective_minimal() {
 
     click_status(&mut app, StatusBarHitTarget::Thinking);
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Low));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("low".into()));
 }
 
 #[test]
@@ -7391,9 +7392,9 @@ fn shift_tab_cycles_explicit_reasoning_efforts() {
     let mut app = test_app();
     let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
 
-    for effort in Effort::ALL {
+    for effort in app.state.model.reasoning_options().effort_ladder() {
         assert!(app.update(Msg::Key(shift_tab)).is_empty());
-        assert_eq!(app.state.thinking, ThinkingConfig::Effort(effort));
+        assert_eq!(app.state.thinking, ThinkingConfig::Effort(effort.into()));
         let expected = format!("Reasoning effort: {effort}");
         assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
     }
@@ -7410,18 +7411,18 @@ fn backtab_representation_cycles_reasoning_effort() {
         KeyModifiers::SHIFT,
     )));
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
 }
 
 #[test]
 fn required_reasoning_wraps_from_max_to_minimal() {
     let mut app = test_app();
     app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
-    app.state.thinking = ThinkingConfig::Effort(Effort::Max);
+    app.state.thinking = ThinkingConfig::Effort("max".into());
 
     app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::Minimal));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
 }
 
 #[test]
@@ -7455,7 +7456,7 @@ fn thinking_explicit_args() {
         },
         0,
     );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("high".into()));
 }
 
 #[test]
@@ -7630,11 +7631,11 @@ fn model_state_reports_the_model_and_what_it_supports() {
 /// `maki.model.get` -> `maki.model.set` hop would silently change it.
 #[test_case(ThinkingConfig::Off, "off" ; "off")]
 #[test_case(ThinkingConfig::Adaptive, "adaptive" ; "adaptive")]
-#[test_case(ThinkingConfig::Effort(Effort::High), "high" ; "effort")]
+#[test_case(ThinkingConfig::Effort("high".into()), "high" ; "effort")]
 #[test_case(ThinkingConfig::Budget(8192), "8192" ; "budget")]
 fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, expected: &str) {
     let mut app = test_app();
-    app.state.thinking = thinking;
+    app.state.thinking = thinking.clone();
 
     let reported = app.model_state()["thinking"].as_str().unwrap().to_owned();
     assert_eq!(reported, expected);
@@ -7660,7 +7661,7 @@ fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expe
     }
 
     assert_eq!(app.set_thinking(input).unwrap_err(), expected);
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("high".into()));
 }
 
 /// Fast must never get stuck on: after switching to a model without fast mode,

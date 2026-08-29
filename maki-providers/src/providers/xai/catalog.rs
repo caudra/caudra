@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::AgentError;
 use crate::model::{ModelInfo, ModelPricing};
+use crate::{ReasoningOption, ReasoningOptions};
 
 use super::auth;
 
@@ -41,6 +42,8 @@ pub(crate) struct CachedModel {
     pub pricing: ModelPricingDto,
     pub context_window: u32,
     pub max_tokens: u32,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,9 +66,15 @@ impl From<CachedModel> for ModelInfo {
                 cache_write: model.pricing.cache_write,
                 cache_read: model.pricing.cache_read,
                 fast: None,
+                tiers: Vec::new(),
             }),
             supports_thinking: Some(model.reasoning),
             supports_vision: Some(model.vision),
+            reasoning_options: (!model.reasoning_efforts.is_empty()).then(|| {
+                ReasoningOptions::new(vec![ReasoningOption::Effort {
+                    values: model.reasoning_efforts,
+                }])
+            }),
             tier: None,
             provider_info: None,
         }
@@ -181,6 +190,11 @@ fn curated_fallback() -> Vec<CachedModel> {
                 max_tokens: entry
                     .max_output_tokens
                     .unwrap_or(DEFAULT_UNKNOWN_MAX_TOKENS),
+                reasoning_efforts: entry
+                    .reasoning_options
+                    .map(crate::model::reasoning_options_from_static)
+                    .map(|options| options.efforts().to_vec())
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -352,12 +366,19 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         meta,
         &["supportsReasoningEffort", "supports_reasoning_effort"],
     );
+    let reasoning_efforts: Vec<String> =
+        first_value(obj, meta, &["reasoningEfforts", "reasoning_efforts"])
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| Some(v.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
     let explicit_reasoning = first_bool(obj, meta, &["reasoning", "supportsReasoning"]);
     let reasoning = explicit_reasoning.unwrap_or_else(|| {
         supports_effort.unwrap_or_else(|| {
-            first_value(obj, meta, &["reasoningEfforts", "reasoning_efforts"])
-                .and_then(|v| v.as_array())
-                .is_some_and(|arr| !arr.is_empty())
+            !reasoning_efforts.is_empty()
                 || first_string(obj, meta, &["reasoningEffort", "reasoning_effort"]).is_some()
                 || known.is_some()
         })
@@ -384,6 +405,7 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         pricing,
         context_window,
         max_tokens: max_tokens.min(context_window),
+        reasoning_efforts,
     })
 }
 

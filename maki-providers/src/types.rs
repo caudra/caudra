@@ -10,8 +10,11 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+use maki_storage::sessions::TitleSource;
+pub use maki_storage::thinking::{
+    EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
+};
+use maki_storage::thinking::{EFFORT_NONE, StoredThinking, effort_rank};
 use maki_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -417,12 +420,7 @@ impl StopReason {
 }
 
 pub const THINKING_USAGE: &str =
-    "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]";
-
-/// Effort levels are percentages, so they need a ceiling even when the model
-/// never told us its output window. 32k matches common frontier thinking
-/// caps. Explicit user budgets never go through this.
-const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
+    "Usage: /thinking [off|adaptive|<effort level>|<token budget>]";
 
 /// First Claude version that speaks adaptive thinking. Opus got there a
 /// generation early, at 4.7; the other families joined at 5.
@@ -444,21 +442,6 @@ fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
     Some((family, (major, minor)))
 }
 
-/// How a provider's effort knob speaks: which levels its API accepts, what
-/// `adaptive` means there, and whether "off" needs an explicit string.
-/// New providers add a const in [`dialect`]; providers with dynamic model
-/// listings build one from the model's declared levels (see OpenRouter).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortDialect<'a> {
-    /// Accepted levels, non-empty and ascending (checked by test).
-    pub supported: &'a [Effort],
-    /// What `Adaptive` maps to. `None` means the API has its own adaptive or
-    /// default behavior: send nothing and let it decide.
-    pub adaptive: Option<Effort>,
-    /// Explicit opt-out string, e.g. GLM `"none"`.
-    pub off: Option<&'static str>,
-}
-
 /// How a local model spells thinking on the wire, in place of a token budget.
 /// Each mode carries the JSON fragment merged into the request body, so any
 /// shape a chat template needs works without a schema per provider.
@@ -468,37 +451,59 @@ pub struct ThinkingFields {
     off: Option<Map<String, Value>>,
     #[serde(default)]
     adaptive: Option<Map<String, Value>>,
-    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
-    #[serde(flatten)]
-    levels: BTreeMap<Effort, Map<String, Value>>,
+    /// Keyed by effort level. The declared keys are the levels the model
+    /// accepts, so they double as its [`ReasoningOptions`].
+    #[serde(flatten, deserialize_with = "deserialize_levels")]
+    levels: BTreeMap<String, Map<String, Value>>,
+}
+
+/// A key maki cannot rank is a key it cannot snap to, so it would be silently
+/// unreachable. Rejecting it turns a config typo into an error the user sees.
+fn deserialize_levels<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Map<String, Value>>, D::Error> {
+    let levels = BTreeMap::<String, Map<String, Value>>::deserialize(deserializer)?;
+    if let Some(unknown) = levels.keys().find(|key| effort_rank(key).is_none()) {
+        return Err(serde::de::Error::custom(format!(
+            "unknown thinking level {unknown}, expected one of: {}",
+            EFFORT_LEVELS.join(", ")
+        )));
+    }
+    Ok(levels)
 }
 
 impl ThinkingFields {
-    /// Levels snap to the declared ones, so a level the model never advertised
-    /// is never sent. A token budget picks the level it corresponds to; models
-    /// that declare no levels fall back to `adaptive` and keep the count
-    /// (the returned flag tells the caller to still send the budget field).
-    fn fragment(
-        &self,
-        thinking: ThinkingConfig,
-        max: Option<u32>,
-    ) -> Option<(&Map<String, Value>, bool)> {
-        let level = match thinking {
-            ThinkingConfig::Off => return self.off.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Effort(level) => level,
-            ThinkingConfig::Budget(n) => {
-                if self.levels.is_empty() {
-                    return self.adaptive.as_ref().map(|f| (f, true));
-                }
-                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
-            }
-        };
-        let declared: Vec<Effort> = self.levels.keys().copied().collect();
-        self.levels
-            .get(&level.snap(&declared))
-            .or(self.adaptive.as_ref())
-            .map(|f| (f, false))
+    /// The levels this model accepts, in ascending order. Reported as
+    /// [`ReasoningOptions`] so a local model resolves a setting through the
+    /// same path as every hosted one.
+    pub fn reasoning_options(&self) -> ReasoningOptions {
+        let mut values: Vec<&String> = self.levels.keys().collect();
+        values.sort_by_key(|level| effort_rank(level).unwrap_or(usize::MAX));
+        // A local model always has the budget field as an escape hatch, so it
+        // can be switched on and off whether or not it named a fragment for it.
+        let mut options = vec![ReasoningOption::Toggle];
+        if !values.is_empty() {
+            options.push(ReasoningOption::Effort {
+                values: values.into_iter().cloned().collect(),
+            });
+        }
+        ReasoningOptions::new(options)
+    }
+
+    /// The fragment for a resolved setting, falling back to `adaptive` when the
+    /// model has no spelling for the exact mode asked for. The flag tells the
+    /// caller to still send a token budget alongside it.
+    fn fragment(&self, resolved: &ResolvedThinking) -> Option<(&Map<String, Value>, bool)> {
+        match resolved {
+            ResolvedThinking::Off => self.off.as_ref().map(|fields| (fields, false)),
+            ResolvedThinking::On => self.adaptive.as_ref().map(|fields| (fields, false)),
+            ResolvedThinking::Effort(level) => self
+                .levels
+                .get(level.as_str())
+                .or(self.adaptive.as_ref())
+                .map(|fields| (fields, false)),
+            ResolvedThinking::Budget(_) => self.adaptive.as_ref().map(|fields| (fields, true)),
+        }
     }
 }
 
@@ -513,175 +518,131 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     }
 }
 
-pub mod dialect {
-    use super::EffortDialect;
-    use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
-
-    /// Wire string that disables reasoning, for APIs that need an explicit
-    /// opt-out.
-    pub const OFF: &str = "none";
-
-    /// OpenAI platform, synthetic.
-    pub const STANDARD: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Responses API models whose highest effort is `xhigh`.
-    pub const CODEX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI GPT-5.1 Codex Responses API models.
-    pub const CODEX_5_1: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
-    /// the Responses API opts out of reasoning with an explicit "none".
-    pub const CODING_PLAN: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
-    /// `max`.
-    pub const GPT_5_6: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// opencode chat-completions, openrouter (static fallback).
-    pub const PREFER_HIGH: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Mistral.
-    pub const HIGH_ONLY: EffortDialect = EffortDialect {
-        supported: &[High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-    /// Only use behind `Model::supports_thinking`.
-    pub const GLM: EffortDialect = EffortDialect {
-        supported: &[High, XHigh],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
-    /// reasoning depth by sending no effort at all.
-    pub const DEEPSEEK: EffortDialect = EffortDialect {
-        supported: &[Max],
-        adaptive: None,
-        off: None,
-    };
-    /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-    /// has native adaptive mode, so Adaptive sends no effort.
-    pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: None,
-        off: None,
-    };
-    /// TensorX routes models that may reason by default, so Off sends "none"
-    /// explicitly and Adaptive asks for full depth.
-    pub const TENSORX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
-    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
-    pub const GROK: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(High),
-        off: None,
-    };
+/// What a thinking setting means for one model, once resolved against the
+/// levels and bounds that model declares. Providers render one of these into
+/// their own wire shape; nothing else interprets a setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedThinking {
+    /// Reasoning off, and the model can say so.
+    Off,
+    /// Reasoning on with no depth named: the model picks.
+    On,
+    /// A level the model declared, or the level the user typed when the model
+    /// declared none.
+    Effort(String),
+    /// A token count inside the model's declared bounds.
+    Budget(u32),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+impl ResolvedThinking {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for ResolvedThinking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::On => f.write_str("adaptive"),
+            Self::Effort(level) => f.write_str(level),
+            Self::Budget(tokens) => write!(f, "{tokens}"),
+        }
+    }
+}
+
+/// The thinking setting exactly as the user asked for it. It stays unresolved
+/// so switching models never silently rewrites the request; see
+/// [`ThinkingConfig::resolve`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ThinkingConfig {
     #[default]
     Off,
     Adaptive,
-    Effort(Effort),
+    Effort(Box<str>),
     Budget(u32),
 }
 
-/// Resolved thinking value for token-budget APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Budgeted {
-    Off,
-    Adaptive,
-    Tokens(u32),
-}
-
 impl ThinkingConfig {
-    pub fn is_enabled(self) -> bool {
+    pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::Off)
     }
 
-    /// The effort string to send, snapped to the dialect's supported levels
-    /// here and nowhere else (never chain snaps). `None` means send nothing:
-    /// `Off` without an explicit off string, or `Adaptive` on APIs with their
-    /// own default behavior.
-    pub fn effort_str(self, dialect: &EffortDialect, model: &Model) -> Option<&'static str> {
-        let level = match self {
-            Self::Off => return dialect.off,
-            Self::Adaptive => dialect.adaptive?,
-            Self::Effort(e) => e,
-            Self::Budget(n) => Effort::from_budget(
-                n,
-                model
-                    .max_thinking_budget()
-                    .unwrap_or(FALLBACK_MAX_THINKING_BUDGET),
-            ),
-        };
-        Some(level.snap(dialect.supported).as_str())
-    }
-
-    /// The token budget to send, clamped to `[MIN_THINKING_BUDGET, max]` here
-    /// and nowhere else. An unknown `max` never caps: the user's number goes
-    /// through as asked, and effort levels scale the fallback ceiling.
-    fn budget(self, max: Option<u32>) -> Budgeted {
+    /// The one place a setting meets a model. Every level is snapped and every
+    /// budget clamped here and nowhere else, against what the model declares
+    /// rather than a table maki maintains per provider.
+    pub fn resolve(&self, model: &Model) -> ResolvedThinking {
+        let options = model.reasoning_options();
+        let max_output = model.max_output_tokens;
         match self {
-            Self::Off => Budgeted::Off,
-            Self::Adaptive => Budgeted::Adaptive,
-            Self::Effort(e) => {
-                Budgeted::Tokens(e.budget(max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET)))
+            // The model cannot be asked to stop, so the shallowest depth it
+            // offers is the closest thing to what was asked for.
+            Self::Off if model.requires_thinking() => match options.effort_ladder().first() {
+                Some(lowest) => Self::Effort((*lowest).into()).resolve(model),
+                None => ResolvedThinking::On,
+            },
+            // A declared `none` is how an effort model spells off.
+            Self::Off if options.efforts().iter().any(|level| level == EFFORT_NONE) => {
+                ResolvedThinking::Effort(EFFORT_NONE.to_string())
             }
-            Self::Budget(n) => Budgeted::Tokens(match max {
-                Some(max) => n.clamp(MIN_THINKING_BUDGET, max.max(MIN_THINKING_BUDGET)),
-                None => n.max(MIN_THINKING_BUDGET),
-            }),
+            Self::Off => ResolvedThinking::Off,
+            Self::Adaptive => ResolvedThinking::On,
+            Self::Effort(level) => match options.snap(level) {
+                Some(declared) => ResolvedThinking::Effort(declared.to_string()),
+                None if options.budget_bounds().is_some() => {
+                    ResolvedThinking::Budget(options.budget_for_effort(level, max_output))
+                }
+                // Nothing declared: the model never told us what it takes, so
+                // the level goes through as typed.
+                None => ResolvedThinking::Effort(level.to_string()),
+            },
+            Self::Budget(tokens) => {
+                if options.efforts().is_empty() || options.budget_bounds().is_some() {
+                    ResolvedThinking::Budget(options.clamp_budget(*tokens, max_output))
+                } else {
+                    // A level-only model has no honest token count to send, so
+                    // reasoning stays on at the model's own depth.
+                    warn!(
+                        model = %model.id,
+                        "model takes reasoning levels, not token budgets; using its default depth"
+                    );
+                    ResolvedThinking::On
+                }
+            }
         }
     }
 
     /// Anthropic messages API body. Adaptive-thinking models get the native
-    /// adaptive knob plus `output_config.effort`; legacy models get a plain
-    /// token budget.
-    pub fn apply_to_body(self, body: &mut Value, model: &Model) {
+    /// adaptive knob plus `output_config.effort`; older models get a token
+    /// budget, and the ones that take both get both.
+    pub fn apply_to_body(&self, body: &mut Value, model: &Model) {
+        let resolved = self.resolve(model);
         if Self::requires_adaptive(&model.id) {
-            if matches!(self, Self::Off) {
+            if !resolved.is_enabled() {
                 return;
             }
             // These models default `display` to "omitted", so thinking arrives
             // empty and tool calls pop up out of nowhere in the UI. Asking for
             // the summary back costs nothing: thinking tokens bill the same.
             body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-            if let Some(effort) = self.effort_str(&dialect::ANTHROPIC_ADAPTIVE, model) {
-                body["output_config"]["effort"] = json!(effort);
+            if let ResolvedThinking::Effort(level) = resolved {
+                body["output_config"]["effort"] = json!(level);
             }
             return;
         }
-        match self.budget(model.max_thinking_budget()) {
-            Budgeted::Off => {}
-            Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
-            Budgeted::Tokens(n) => {
-                body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
+        match resolved {
+            ResolvedThinking::Off => {}
+            ResolvedThinking::On => body["thinking"] = json!({"type": "adaptive"}),
+            ResolvedThinking::Budget(tokens) => {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
+            }
+            // Opus 4.5 names a level but still requires the budget field.
+            ResolvedThinking::Effort(level) => {
+                let tokens = model
+                    .reasoning_options()
+                    .budget_for_effort(&level, model.max_output_tokens);
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
+                body["output_config"]["effort"] = json!(level);
             }
         }
     }
@@ -700,47 +661,61 @@ impl ThinkingConfig {
         })
     }
 
-    pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
-        if let Some(effort) = self.effort_str(dialect, model) {
-            body["reasoning_effort"] = json!(effort);
+    /// The level to send, or `None` when this model has none to name and its
+    /// own default should stand.
+    pub fn effort_str(&self, model: &Model) -> Option<String> {
+        match self.resolve(model) {
+            ResolvedThinking::Effort(level) => Some(level),
+            _ => None,
         }
     }
 
-    pub fn apply_google_thinking(self, body: &mut Value, max: u32) {
-        match self.budget(Some(max)) {
-            Budgeted::Off => {}
-            Budgeted::Adaptive => {
-                body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
-            }
-            Budgeted::Tokens(n) => {
-                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
-            }
+    /// OpenAI-compatible `reasoning_effort`.
+    pub fn apply_reasoning_effort(&self, body: &mut Value, model: &Model) {
+        if let Some(level) = self.effort_str(model) {
+            body["reasoning_effort"] = json!(level);
         }
     }
 
-    pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
-        let max = model.max_thinking_budget();
+    /// Google `thinkingConfig`. Gemini 3 names a level, Gemini 2.5 takes a
+    /// budget, and both want the thought summaries back.
+    pub fn apply_google_thinking(&self, body: &mut Value, model: &Model) {
+        let config = match self.resolve(model) {
+            ResolvedThinking::Off => return,
+            ResolvedThinking::On => json!({"includeThoughts": true}),
+            ResolvedThinking::Effort(level) => {
+                json!({"includeThoughts": true, "thinkingLevel": level})
+            }
+            ResolvedThinking::Budget(tokens) => {
+                json!({"includeThoughts": true, "thinkingBudget": tokens})
+            }
+        };
+        body["generationConfig"]["thinkingConfig"] = config;
+    }
+
+    pub fn apply_local_thinking(&self, body: &mut Value, model: &Model) {
+        let resolved = self.resolve(model);
         if let Some(fields) = &model.thinking_fields
-            && let Some((fragment, keep_budget)) = fields.fragment(self, max)
+            && let Some((fragment, keep_budget)) = fields.fragment(&resolved)
             && let Some(object) = body.as_object_mut()
         {
             merge_body(object, fragment);
-            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
-                body[LOCAL_BUDGET_FIELD] = json!(budget);
+            if keep_budget && let ResolvedThinking::Budget(tokens) = resolved {
+                body[LOCAL_BUDGET_FIELD] = json!(tokens);
             }
             return;
         }
         // No fragment means the model has no way to spell this mode, so the
         // budget field takes over: a request must never end up saying nothing.
-        let budget = match self.budget(max) {
-            Budgeted::Off => 0,
-            Budgeted::Adaptive => -1,
-            Budgeted::Tokens(n) => i64::from(n),
+        let budget = match resolved {
+            ResolvedThinking::Off => 0,
+            ResolvedThinking::On | ResolvedThinking::Effort(_) => -1,
+            ResolvedThinking::Budget(tokens) => i64::from(tokens),
         };
         body[LOCAL_BUDGET_FIELD] = json!(budget);
     }
 
-    pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
+    pub fn parse(input: &str, current: &Self) -> Result<Self, &'static str> {
         if input.is_empty() {
             return Ok(if current.is_enabled() {
                 Self::Off
@@ -753,12 +728,12 @@ impl ThinkingConfig {
             .map_err(|_| THINKING_USAGE)
     }
 
-    pub fn status_label(self) -> Option<Cow<'static, str>> {
+    pub fn status_label(&self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off => None,
             Self::Adaptive => Some(Cow::Borrowed("thinking")),
-            Self::Effort(e) => Some(Cow::Owned(format!("thinking: {e}"))),
-            Self::Budget(n) => Some(Cow::Owned(format!("thinking: {n}"))),
+            Self::Effort(level) => Some(Cow::Owned(format!("thinking: {level}"))),
+            Self::Budget(tokens) => Some(Cow::Owned(format!("thinking: {tokens}"))),
         }
     }
 }
@@ -768,35 +743,37 @@ impl std::fmt::Display for ThinkingConfig {
         match self {
             Self::Off => f.write_str("off"),
             Self::Adaptive => f.write_str("adaptive"),
-            Self::Effort(e) => f.write_str(e.as_str()),
-            Self::Budget(n) => write!(f, "{n}"),
+            Self::Effort(level) => f.write_str(level),
+            Self::Budget(tokens) => write!(f, "{tokens}"),
         }
     }
 }
 
 impl From<StoredThinking> for ThinkingConfig {
-    fn from(s: StoredThinking) -> Self {
-        match s {
+    fn from(stored: StoredThinking) -> Self {
+        match stored {
             StoredThinking::Off => Self::Off,
             StoredThinking::Adaptive => Self::Adaptive,
-            StoredThinking::Effort { level } => Self::Effort(level),
+            StoredThinking::Effort { level } => Self::Effort(level.into_boxed_str()),
             StoredThinking::Budget { tokens } => Self::Budget(tokens),
         }
     }
 }
 
 impl From<ThinkingConfig> for StoredThinking {
-    fn from(c: ThinkingConfig) -> Self {
-        match c {
+    fn from(config: ThinkingConfig) -> Self {
+        match config {
             ThinkingConfig::Off => Self::Off,
             ThinkingConfig::Adaptive => Self::Adaptive,
-            ThinkingConfig::Effort(e) => Self::Effort { level: e },
-            ThinkingConfig::Budget(n) => Self::Budget { tokens: n },
+            ThinkingConfig::Effort(level) => Self::Effort {
+                level: level.into_string(),
+            },
+            ThinkingConfig::Budget(tokens) => Self::Budget { tokens },
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
@@ -806,16 +783,14 @@ pub struct RequestOptions {
 impl RequestOptions {
     /// Reconciles options with the model's capabilities. Called once before
     /// every request so UI state, restored sessions, and subagent flags all go
-    /// through the same gate. Despite the name, thinking clamps both ways:
-    /// down to `Off` when unsupported, up to minimal effort when required.
-    pub fn clamped(self, model: &crate::model::Model) -> Self {
+    /// through the same gate. A model that reasons unconditionally is handled
+    /// in [`ThinkingConfig::resolve`], which knows what it declared.
+    pub fn clamped(&self, model: &crate::model::Model) -> Self {
         Self {
-            thinking: if !model.supports_thinking() {
-                ThinkingConfig::Off
-            } else if model.requires_thinking() && !self.thinking.is_enabled() {
-                ThinkingConfig::Effort(Effort::Minimal)
+            thinking: if model.supports_thinking() {
+                self.thinking.clone()
             } else {
-                self.thinking
+                ThinkingConfig::Off
             },
             fast: self.fast && model.supports_fast(),
         }
@@ -1026,14 +1001,32 @@ mod tests {
         assert_eq!(&*deserialized.data, "abc123");
     }
 
-    use Effort::{High, Low, Max, Minimal, XHigh};
+    fn effort(level: &str) -> ThinkingConfig {
+        ThinkingConfig::Effort(level.into())
+    }
 
-    /// `max_output_tokens: 8192`, so `max_thinking_budget()` is 4096.
+    /// `max_output_tokens: 8192`, so a budget ceiling of 8191 unless the model
+    /// declares a tighter one.
     fn thinking_model(id: &str) -> crate::model::Model {
         crate::model::Model {
             id: id.into(),
             ..clamp_test_model(crate::provider::ProviderKind::Anthropic)
         }
+    }
+
+    fn effort_model(levels: &[&str]) -> crate::model::Model {
+        let mut model = thinking_model("test-model");
+        model.reasoning_options = ReasoningOptions::new(vec![ReasoningOption::Effort {
+            values: levels.iter().map(|level| (*level).to_string()).collect(),
+        }]);
+        model
+    }
+
+    fn budget_model(min: Option<u32>, max: Option<u32>) -> crate::model::Model {
+        let mut model = thinking_model("test-model");
+        model.reasoning_options =
+            ReasoningOptions::new(vec![ReasoningOption::BudgetTokens { min, max }]);
+        model
     }
 
     fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
@@ -1055,132 +1048,117 @@ mod tests {
         )
     }
 
-    #[test]
-    fn dialects_have_non_empty_ascending_supported() {
-        let all = [
-            &dialect::STANDARD,
-            &dialect::CODEX,
-            &dialect::CODEX_5_1,
-            &dialect::CODING_PLAN,
-            &dialect::GPT_5_6,
-            &dialect::PREFER_HIGH,
-            &dialect::HIGH_ONLY,
-            &dialect::GLM,
-            &dialect::DEEPSEEK,
-            &dialect::ANTHROPIC_ADAPTIVE,
-            &dialect::TENSORX,
-            &dialect::GROK,
-        ];
-        for d in all {
-            assert!(!d.supported.is_empty());
-            for pair in d.supported.windows(2) {
-                assert!(pair[0] < pair[1], "supported must be strictly ascending");
-            }
-            if let Some(adaptive) = d.adaptive {
-                assert!(d.supported.contains(&adaptive));
-            }
-        }
-    }
-
     #[test_case(ThinkingConfig::Off, "claude-opus-4-5", json!({}) ; "off")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-5", json!({"thinking": {"type": "adaptive"}}) ; "adaptive")]
     #[test_case(ThinkingConfig::Budget(2048), "claude-opus-4-5", json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}) ; "budget_legacy_in_range")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-5", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_clamped_to_max")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_sonnet")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_opus_4_6")]
     #[test_case(ThinkingConfig::Off, "claude-opus-4-7", json!({}) ; "off_adaptive_model")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
-    #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
-    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
+    #[test_case(effort("low"), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
+    #[test_case(effort("high"), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "effort_adaptive_opus_4_8_long_context")]
+    #[test_case(effort("high"), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "effort_adaptive_copilot_dotted_id")]
+    #[test_case(effort("high"), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "effort_adaptive_gateway_prefixed_id")]
+    #[test_case(ThinkingConfig::Budget(2048), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));
         assert_eq!(body, expected);
     }
 
-    #[test_case(&dialect::STANDARD, ThinkingConfig::Off,             None            ; "standard_off_noop")]
-    #[test_case(&dialect::STANDARD, ThinkingConfig::Adaptive,        Some("medium")  ; "standard_adaptive")]
-    #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
-    #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
-    #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
-    #[test_case(&dialect::CODEX, ThinkingConfig::Adaptive,        Some("medium") ; "codex_adaptive")]
-    #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Minimal), Some("low")    ; "codex_minimal_snaps_up")]
-    #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Max),     Some("xhigh")  ; "codex_max_snaps_down")]
-    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Effort(Minimal), Some("minimal") ; "coding_plan_minimal_passthrough")]
-    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Effort(Max),     Some("xhigh")   ; "coding_plan_max_snaps_down")]
-    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Off,             Some("none")    ; "coding_plan_off")]
-    #[test_case(&dialect::GPT_5_6, ThinkingConfig::Off,                 Some("none")    ; "gpt_5_6_off")]
-    #[test_case(&dialect::PREFER_HIGH, ThinkingConfig::Adaptive,        Some("high") ; "prefer_high_adaptive")]
-    #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Adaptive,        Some("high") ; "high_only_adaptive")]
-    #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Effort(Minimal), Some("high") ; "high_only_minimal")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Off,          Some("none")  ; "glm_off_explicit_none")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Adaptive,     Some("high")  ; "glm_adaptive")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Effort(Max),  Some("xhigh") ; "glm_max_snaps_to_xhigh")]
-    #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Adaptive,        None        ; "deepseek_adaptive_uses_api_default")]
-    #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Effort(Minimal), Some("max") ; "deepseek_minimal")]
-    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
-    #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
-    #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
+    const LEVELS_WITH_NONE: &[&str] = &["none", "low", "medium", "high"];
+    const LEVELS_WITHOUT_NONE: &[&str] = &["low", "medium", "high", "xhigh"];
+    const HIGH_ONLY: &[&str] = &["high"];
+
+    #[test_case(LEVELS_WITH_NONE, ThinkingConfig::Off,       Some("none")  ; "declared_none_is_how_off_is_spelled")]
+    #[test_case(LEVELS_WITH_NONE, ThinkingConfig::Adaptive,  None          ; "adaptive_leaves_the_choice_to_the_model")]
+    #[test_case(LEVELS_WITH_NONE, effort("low"),             Some("low")   ; "declared_level_passes_through")]
+    #[test_case(LEVELS_WITH_NONE, effort("minimal"),         Some("none")  ; "undeclared_below_floor_snaps_to_floor")]
+    #[test_case(LEVELS_WITH_NONE, effort("max"),             Some("high")  ; "undeclared_above_top_snaps_to_top")]
+    #[test_case(LEVELS_WITHOUT_NONE, ThinkingConfig::Off,    Some("low")   ; "no_declared_none_means_off_becomes_the_shallowest_level")]
+    #[test_case(LEVELS_WITHOUT_NONE, effort("max"),          Some("xhigh") ; "max_snaps_to_declared_xhigh")]
+    #[test_case(HIGH_ONLY, effort("minimal"),                Some("high")  ; "single_level_absorbs_everything")]
+    #[test_case(HIGH_ONLY, ThinkingConfig::Budget(1024),     None          ; "budget_on_a_level_model_keeps_its_own_depth")]
     fn thinking_apply_reasoning_effort(
-        dialect: &EffortDialect,
+        levels: &[&str],
         config: ThinkingConfig,
         expected: Option<&str>,
     ) {
         let mut body = json!({"model": "test"});
-        config.apply_reasoning_effort(&mut body, dialect, &thinking_model("test-model"));
+        config.apply_reasoning_effort(&mut body, &effort_model(levels));
         match expected {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
     }
 
-    #[test_case(ThinkingConfig::Off,             Some(4096), Budgeted::Off            ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,        Some(4096), Budgeted::Adaptive       ; "adaptive")]
-    #[test_case(ThinkingConfig::Effort(Max),     Some(4096), Budgeted::Tokens(4096)   ; "effort_delegates_to_level_budget")]
-    #[test_case(ThinkingConfig::Budget(2048),    Some(4096), Budgeted::Tokens(2048)   ; "budget_in_range")]
-    #[test_case(ThinkingConfig::Budget(512),     Some(4096), Budgeted::Tokens(1024)   ; "budget_floored")]
-    #[test_case(ThinkingConfig::Budget(10000),   Some(4096), Budgeted::Tokens(4096)   ; "budget_clamped_to_max")]
-    #[test_case(ThinkingConfig::Budget(2048),    Some(512),  Budgeted::Tokens(1024)   ; "tiny_max_raised_to_floor")]
-    #[test_case(ThinkingConfig::Budget(16384),   None,       Budgeted::Tokens(16384)  ; "unknown_max_passes_budget_through")]
-    #[test_case(ThinkingConfig::Budget(512),     None,       Budgeted::Tokens(1024)   ; "unknown_max_still_floors")]
-    #[test_case(ThinkingConfig::Effort(Max),     None,       Budgeted::Tokens(32_768) ; "unknown_max_effort_scales_fallback")]
-    #[test_case(ThinkingConfig::Effort(Minimal), None,       Budgeted::Tokens(3_276)  ; "unknown_max_minimal_effort")]
-    fn thinking_budget_resolver(config: ThinkingConfig, max: Option<u32>, expected: Budgeted) {
-        assert_eq!(config.budget(max), expected);
+    #[test_case(ThinkingConfig::Off,           ResolvedThinking::Budget(2048) ; "off_becomes_the_shallowest_budget_when_it_cannot_be_disabled")]
+    #[test_case(ThinkingConfig::Adaptive,      ResolvedThinking::On           ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(2048),  ResolvedThinking::Budget(2048) ; "budget_in_range")]
+    #[test_case(ThinkingConfig::Budget(512),   ResolvedThinking::Budget(1024) ; "budget_floored_to_the_declared_min")]
+    #[test_case(ThinkingConfig::Budget(10000), ResolvedThinking::Budget(4096) ; "budget_clamped_to_the_declared_max")]
+    #[test_case(effort("max"),                 ResolvedThinking::Budget(4096) ; "top_of_the_ladder_is_the_ceiling")]
+    #[test_case(effort("low"),                 ResolvedThinking::Budget(2048) ; "below_the_top_is_half_the_ceiling")]
+    fn budget_model_resolves_against_declared_bounds(
+        config: ThinkingConfig,
+        expected: ResolvedThinking,
+    ) {
+        let model = budget_model(Some(1024), Some(4096));
+        assert_eq!(config.resolve(&model), expected);
     }
 
-    #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped")]
+    /// llama.cpp models declare no window and no bounds, so the request must
+    /// still carry something honest rather than a number maki invented.
+    #[test_case(ThinkingConfig::Budget(16384), ResolvedThinking::Budget(16_384) ; "explicit_budget_passes_through")]
+    #[test_case(ThinkingConfig::Budget(512),   ResolvedThinking::Budget(1024)   ; "protocol_floor_still_applies")]
+    #[test_case(effort("max"),                 ResolvedThinking::Budget(32_768) ; "top_of_the_ladder_uses_the_fallback_ceiling")]
+    fn undeclared_budget_model_falls_back(config: ThinkingConfig, expected: ResolvedThinking) {
+        let mut model = budget_model(None, None);
+        model.max_output_tokens = None;
+        assert_eq!(config.resolve(&model), expected);
+    }
+
+    #[test_case(ThinkingConfig::Off,           json!({})                                                                    ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,      json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}})    ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096),  json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget_clamped_to_the_output_window")]
     fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
+        let mut model = budget_model(None, None);
+        model.reasoning_options =
+            ReasoningOptions::new(vec![ReasoningOption::Toggle, ReasoningOption::BudgetTokens {
+                min: None,
+                max: None,
+            }]);
         let mut body = json!({});
-        config.apply_google_thinking(&mut body, 8192);
+        config.apply_google_thinking(&mut body, &model);
         assert_eq!(body, expected);
+    }
+
+    /// Gemini 3 takes a level instead of a token count.
+    #[test]
+    fn google_effort_model_sends_thinking_level() {
+        let model = effort_model(&["low", "medium", "high"]);
+        let mut body = json!({});
+        effort("high").apply_google_thinking(&mut body, &model);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts": true, "thinkingLevel": "high"})
+        );
     }
 
     #[test_case(ThinkingConfig::Off,            0    ; "off")]
     #[test_case(ThinkingConfig::Adaptive,       -1   ; "adaptive")]
     #[test_case(ThinkingConfig::Budget(4096),   4096 ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000),  4096 ; "budget_clamped")]
+    #[test_case(ThinkingConfig::Budget(10000),  4096 ; "budget_clamped_to_the_output_window")]
     fn thinking_apply_local_thinking(config: ThinkingConfig, expected: i64) {
         let mut body = json!({});
         config.apply_local_thinking(&mut body, &thinking_model("local-model"));
         assert_eq!(body["thinking_budget_tokens"], expected);
     }
 
-    #[test_case(ThinkingConfig::Off,           json!({"reasoning_effort": "none"})   ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,      json!({"reasoning_effort": "medium"}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Effort(Low),   json!({"reasoning_effort": "low"})    ; "low")]
-    #[test_case(ThinkingConfig::Effort(High),  json!({"reasoning_effort": "medium"}) ; "undeclared_high_snaps_down")]
-    #[test_case(ThinkingConfig::Effort(XHigh), json!({"reasoning_effort": "xhigh"})  ; "xhigh")]
-    #[test_case(ThinkingConfig::Budget(4096),  json!({"reasoning_effort": "xhigh"})  ; "numeric_budget_maps_to_declared_level")]
+    #[test_case(ThinkingConfig::Off,      json!({"reasoning_effort": "none"})   ; "off")]
+    #[test_case(ThinkingConfig::Adaptive, json!({"reasoning_effort": "medium"}) ; "adaptive")]
+    #[test_case(effort("low"),            json!({"reasoning_effort": "low"})    ; "low")]
+    #[test_case(effort("high"),           json!({"reasoning_effort": "medium"}) ; "undeclared_high_snaps_down")]
+    #[test_case(effort("xhigh"),          json!({"reasoning_effort": "xhigh"})  ; "xhigh")]
     fn local_native_effort_uses_declared_levels(config: ThinkingConfig, expected: Value) {
         let mut body = json!({});
         config.apply_local_thinking(&mut body, &native_effort_model());
@@ -1204,7 +1182,7 @@ mod tests {
 
     #[test_case(ThinkingConfig::Off,          json!({"chat_template_kwargs": {"enable_thinking": false, "keep": 1}}) ; "off")]
     #[test_case(ThinkingConfig::Adaptive,     json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "adaptive")]
-    #[test_case(ThinkingConfig::Effort(High), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "effort_without_levels_uses_adaptive")]
+    #[test_case(effort("high"), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "effort_without_levels_uses_adaptive")]
     #[test_case(ThinkingConfig::Budget(2048), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}, "thinking_budget_tokens": 2048}) ; "numeric_budget")]
     fn local_native_toggle_merges_into_nested_object(config: ThinkingConfig, expected: Value) {
         let model = native_thinking_model(
@@ -1260,6 +1238,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 200_000,
+            reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         }
     }
@@ -1267,7 +1246,7 @@ mod tests {
     #[test_case(None,                    ThinkingConfig::Adaptive, ThinkingConfig::Adaptive        ; "provider_default_keeps")]
     #[test_case(Some(Support::No),       ThinkingConfig::Adaptive, ThinkingConfig::Off             ; "unsupported_clamps_off")]
     #[test_case(Some(Support::Yes),      ThinkingConfig::Off,      ThinkingConfig::Off             ; "supported_keeps_off")]
-    #[test_case(Some(Support::Required), ThinkingConfig::Off,      ThinkingConfig::Effort(Minimal) ; "required_raises_off_to_minimal")]
+    #[test_case(Some(Support::Required), ThinkingConfig::Off,      ThinkingConfig::Off             ; "required_off_is_resolved_at_request_time")]
     #[test_case(Some(Support::Required), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive        ; "required_keeps_enabled")]
     fn request_options_clamped_thinking(
         thinking_override: Option<Support>,
@@ -1297,23 +1276,23 @@ mod tests {
     #[test_case("",         ThinkingConfig::Adaptive, Ok(ThinkingConfig::Off)       ; "toggle_off")]
     #[test_case("off",      ThinkingConfig::Adaptive, Ok(ThinkingConfig::Off)       ; "explicit_off")]
     #[test_case("adaptive", ThinkingConfig::Off,      Ok(ThinkingConfig::Adaptive)  ; "explicit_adaptive")]
-    #[test_case("high",     ThinkingConfig::Off,      Ok(ThinkingConfig::Effort(High)) ; "explicit_effort")]
+    #[test_case("high",     ThinkingConfig::Off,      Ok(effort("high")) ; "explicit_effort")]
     #[test_case("8192",     ThinkingConfig::Off,      Ok(ThinkingConfig::Budget(8192)) ; "explicit_budget")]
     #[test_case("512",      ThinkingConfig::Off,      Ok(ThinkingConfig::Budget(512)) ; "small_budget")]
     #[test_case("0",        ThinkingConfig::Off,      Err(())                       ; "budget_zero")]
     #[test_case("garbage",  ThinkingConfig::Off,      Err(())                       ; "invalid_input")]
     fn thinking_parse(input: &str, current: ThinkingConfig, expected: Result<ThinkingConfig, ()>) {
-        let result = ThinkingConfig::parse(input, current).map_err(|_| ());
+        let result = ThinkingConfig::parse(input, &current).map_err(|_| ());
         assert_eq!(result, expected);
     }
 
     #[test_case(ThinkingConfig::Off      ; "off")]
     #[test_case(ThinkingConfig::Adaptive ; "adaptive")]
-    #[test_case(ThinkingConfig::Effort(Max) ; "effort")]
+    #[test_case(effort("max") ; "effort_level")]
     #[test_case(ThinkingConfig::Budget(8192) ; "budget")]
     fn thinking_display_round_trip(config: ThinkingConfig) {
         let s = config.to_string();
-        let parsed = ThinkingConfig::parse(&s, ThinkingConfig::Off).unwrap();
+        let parsed = ThinkingConfig::parse(&s, &ThinkingConfig::Off).unwrap();
         assert_eq!(parsed, config);
     }
 

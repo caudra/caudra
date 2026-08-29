@@ -9,7 +9,6 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::providers::ResolvedAuth;
-use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
     ThinkingConfig, TokenUsage,
@@ -39,13 +38,8 @@ pub(crate) fn build_body(
     body
 }
 
-pub(crate) fn apply_responses_reasoning(
-    body: &mut Value,
-    thinking: ThinkingConfig,
-    model: &Model,
-    dialect: &EffortDialect,
-) {
-    if let Some(effort) = thinking.effort_str(dialect, model) {
+pub(crate) fn apply_responses_reasoning(body: &mut Value, thinking: &ThinkingConfig, model: &Model) {
+    if let Some(effort) = thinking.effort_str(model) {
         body["reasoning"] = json!({ "effort": effort });
     }
 }

@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
-use crate::types::ThinkingFields;
+use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
@@ -82,6 +82,7 @@ struct ScriptModel {
     #[serde(default)]
     pricing: Option<ModelPricing>,
     #[serde(default)]
+    reasoning_options: Option<ReasoningOptions>,
     thinking_fields: Option<ThinkingFields>,
 }
 
@@ -102,6 +103,7 @@ impl ScriptModel {
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
+            reasoning_options: self.reasoning_options.clone().unwrap_or_default(),
             thinking_fields: self.thinking_fields.clone().map(Box::new),
         }
     }
@@ -738,7 +740,7 @@ impl Provider for DynamicProvider {
             let attempt = async {
                 let result = self
                     .inner
-                    .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                    .stream_message(model, messages, system, tools, &tx, opts.clone(), session_id)
                     .await;
                 drop(tx);
                 result
@@ -767,7 +769,13 @@ impl Provider for DynamicProvider {
                         Ok(()) => {
                             self.inner
                                 .stream_message(
-                                    model, messages, system, tools, event_tx, opts, session_id,
+                                    model,
+                                    messages,
+                                    system,
+                                    tools,
+                                    event_tx,
+                                    opts,
+                                    session_id,
                                 )
                                 .await
                         }
@@ -797,6 +805,7 @@ impl Provider for DynamicProvider {
                     pricing: m.pricing.clone(),
                     supports_thinking: None,
                     supports_vision: m.supports_vision,
+                    reasoning_options: None,
                     tier: None,
                     provider_info: None,
                 })

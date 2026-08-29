@@ -347,13 +347,16 @@ impl App {
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
         let main_chat = render_chat == 0;
+        // What the request will actually carry, not what was asked for: a
+        // model can refuse to stop reasoning, and the badge has to say so.
         let thinking_label = (main_chat && self.state.model.supports_thinking()).then(|| {
             let effective = RequestOptions {
-                thinking: self.state.thinking,
+                thinking: self.state.thinking.clone(),
                 fast: self.state.fast,
             }
             .clamped(&self.state.model)
-            .thinking;
+            .thinking
+            .resolve(&self.state.model);
             format!("thinking: {effective}").into()
         });
         let ctx = StatusBarContext {

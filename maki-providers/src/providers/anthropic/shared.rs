@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{
+    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption,
+};
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
@@ -576,6 +578,28 @@ impl EventParser {
     }
 }
 
+/// Levels these models declare, matching the models.dev catalog. Claude reasons
+/// unconditionally unless it declares a toggle, and no Claude model has ever
+/// accepted `minimal`, so the canonical fallback ladder would offer a level the
+/// API rejects.
+const EFFORT_TO_MAX: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"])];
+const TOGGLE_WITH_EFFORT_TO_MAX: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Toggle,
+    StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"]),
+];
+const EFFORT_TO_MAX_WITH_BUDGET: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Effort(&["low", "medium", "high", "max"]),
+    StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None },
+];
+const EFFORT_TO_HIGH_WITH_BUDGET: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Effort(&["low", "medium", "high"]),
+    StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None },
+];
+/// Pre-effort models: a token budget is the only knob they take.
+const BUDGET_ONLY: &[StaticReasoningOption] =
+    &[StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None }];
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
@@ -590,9 +614,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 1.25,
                 cache_read: 0.10,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            reasoning_options: Some(BUDGET_ONLY),
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-5"],
@@ -606,9 +632,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            reasoning_options: Some(BUDGET_ONLY),
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
@@ -622,9 +650,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
@@ -639,9 +669,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 2.50,
                 cache_read: 0.20,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4"],
@@ -655,9 +687,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 3.75,
                 cache_read: 0.30,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            reasoning_options: None,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-5"],
@@ -671,9 +705,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 6.25,
                 cache_read: 0.50,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_HIGH_WITH_BUDGET),
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
@@ -688,9 +724,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.50,
                 // Fast mode withdrawn on 2026-06-29.
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
             prefixes: &["claude-opus-4-7"],
@@ -705,9 +743,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.50,
                 // Fast mode withdrawn on 2026-07-24.
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
@@ -724,9 +764,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                     input: 10.00,
                     output: 50.00,
                 }),
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
             prefixes: &["claude-opus-5"],
@@ -743,9 +785,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                     input: 10.00,
                     output: 50.00,
                 }),
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
             prefixes: &["claude-fable-5"],
@@ -759,9 +803,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 12.50,
                 cache_read: 1.00,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
             context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
@@ -775,9 +821,11 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 18.75,
                 cache_read: 1.50,
                 fast: None,
+                tiers: Vec::new(),
             },
             max_output_tokens: Some(32000),
             context_window: 200_000,
+            reasoning_options: None,
         },
     ];
     MODELS
@@ -786,6 +834,28 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
+
+    use crate::Model;
+
+    #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]
+    #[test_case("anthropic/claude-opus-5",   &["low", "medium", "high", "xhigh", "max"] ; "opus_5_has_no_minimal")]
+    #[test_case("anthropic/claude-opus-4-5", &["low", "medium", "high"]                 ; "opus_4_5_stops_at_high")]
+    #[test_case("anthropic/claude-sonnet-4-5", &["high", "max"]                         ; "budget_only_model_gets_two_steps")]
+    #[test_case("openai/gpt-5.6-sol",        &["low", "medium", "high", "xhigh", "max"] ; "declared_none_is_not_a_depth")]
+    fn effort_ladder_offers_only_what_the_model_declares(spec: &str, expected: &[&str]) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.reasoning_options().effort_ladder(), expected);
+    }
+
+    const REJECTED_LEVEL: &str = "a level the model never declared must never reach the wire";
+
+    #[test_case("anthropic/claude-sonnet-5", "minimal", "low"  ; "minimal_snaps_up_to_the_declared_floor")]
+    #[test_case("anthropic/claude-opus-4-5", "max",     "high" ; "max_snaps_down_to_the_declared_top")]
+    fn undeclared_level_snaps_into_the_declared_ladder(spec: &str, asked: &str, expected: &str) {
+        let model = Model::from_spec(spec).unwrap();
+        let options = model.reasoning_options();
+        assert_eq!(options.snap(asked), Some(expected), "{REJECTED_LEVEL}");
+    }
 
     use super::{
         LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, canonical_tool_name, long_context_window,

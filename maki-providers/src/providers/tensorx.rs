@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -103,7 +103,7 @@ impl Provider for TensorX {
             }
             if has_reasoning_effort {
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
+                    .apply_reasoning_effort(&mut body, model);
             }
             // Fallback for deepseek models that use chat_template_kwargs
             else if !has_thinking
@@ -173,6 +173,7 @@ impl Provider for TensorX {
                                         .unwrap_or(0.0)
                                         * per_million,
                                     fast: None,
+                                    tiers: Vec::new(),
                                 })
                             } else {
                                 None
@@ -205,6 +206,7 @@ impl Provider for TensorX {
                                 pricing,
                                 supports_thinking,
                                 supports_vision: Some(supports_vision),
+                                reasoning_options: None,
                                 tier: None,
                                 provider_info: supported_params
                                     .map(|p| Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>),

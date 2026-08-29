@@ -74,7 +74,7 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use maki_providers::{ContentBlock, Effort, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -556,37 +556,37 @@ impl App {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
         self.state.thinking =
-            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
-        Ok(self.state.thinking)
+            ThinkingConfig::parse(input.trim(), &self.state.thinking).map_err(str::to_owned)?;
+        Ok(self.state.thinking.clone())
     }
 
+    /// Steps through the levels the current model declares, so the ladder is
+    /// the model's own rather than a fixed list maki offers everywhere. Wraps
+    /// through `off` unless the model cannot be asked to stop.
     fn cycle_reasoning_effort(&mut self) {
         if !self.state.model.supports_thinking() {
             self.flash(THINKING_UNSUPPORTED_MSG.into());
             return;
         }
-        let first = Effort::ALL[0];
-        let current = if self.state.model.requires_thinking() && !self.state.thinking.is_enabled() {
-            ThinkingConfig::Effort(first)
-        } else {
-            self.state.thinking
+        let options = self.state.model.reasoning_options();
+        let ladder = options.effort_ladder();
+        let Some(first) = ladder.first() else {
+            self.flash(THINKING_UNSUPPORTED_MSG.into());
+            return;
         };
-        self.state.thinking = match current {
-            ThinkingConfig::Effort(current) => Effort::ALL
+        let next = match &self.state.thinking {
+            ThinkingConfig::Effort(current) => ladder
                 .iter()
-                .position(|effort| *effort == current)
-                .and_then(|index| Effort::ALL.get(index + 1).copied())
-                .map(ThinkingConfig::Effort)
-                .unwrap_or_else(|| {
-                    if self.state.model.requires_thinking() {
-                        ThinkingConfig::Effort(first)
-                    } else {
-                        ThinkingConfig::Off
-                    }
-                }),
-            ThinkingConfig::Off | ThinkingConfig::Adaptive | ThinkingConfig::Budget(_) => {
-                ThinkingConfig::Effort(first)
+                .position(|level| *level == &**current)
+                .and_then(|index| ladder.get(index + 1)),
+            _ => None,
+        };
+        self.state.thinking = match next {
+            Some(level) => ThinkingConfig::Effort((*level).into()),
+            None if self.state.thinking.is_enabled() && !self.state.model.requires_thinking() => {
+                ThinkingConfig::Off
             }
+            None => ThinkingConfig::Effort((*first).into()),
         };
         self.flash(format!("Reasoning effort: {}", self.state.thinking));
     }
@@ -1467,7 +1467,7 @@ impl App {
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: self.state.thinking,
+            thinking: self.state.thinking.clone(),
             fast: self.state.fast,
             workflow: false,
             prompt: None,

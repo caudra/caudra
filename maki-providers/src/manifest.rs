@@ -1,3 +1,5 @@
+use maki_storage::thinking::ReasoningOptions;
+
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
@@ -18,6 +20,22 @@ pub struct ProviderManifest {
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
+    /// This provider's id in the models.dev catalog, where it differs from the
+    /// maki slug. `None` for providers the catalog has no entry for: local
+    /// runtimes and gateways that route somewhere else.
+    pub catalog_slug: Option<&'static str>,
+}
+
+impl ProviderManifest {
+    /// Reasoning options models.dev publishes for this model. Never triggers a
+    /// fetch, so a cold catalog simply leaves the decision to the static table
+    /// and discovery.
+    pub fn catalog_reasoning_options(&self, model_id: &str) -> Option<ReasoningOptions> {
+        let slug = self.catalog_slug?;
+        crate::providers::catalog::model_meta_if_available(slug, model_id)
+            .map(|meta| meta.reasoning_options)
+            .filter(|options| !options.is_empty())
+    }
 }
 
 const ANTHROPIC: ProviderManifest = ProviderManifest {
@@ -30,6 +48,7 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: anthropic::models(),
     pricing_schedule: None,
+    catalog_slug: Some("anthropic"),
 };
 
 const OPENAI: ProviderManifest = ProviderManifest {
@@ -42,6 +61,7 @@ const OPENAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: openai::models(),
     pricing_schedule: None,
+    catalog_slug: Some("openai"),
 };
 
 const GOOGLE: ProviderManifest = ProviderManifest {
@@ -54,6 +74,7 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_context_window: 1_000_000,
     models: google::models(),
     pricing_schedule: None,
+    catalog_slug: Some("google"),
 };
 
 const COPILOT: ProviderManifest = ProviderManifest {
@@ -66,6 +87,7 @@ const COPILOT: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: copilot::models(),
     pricing_schedule: None,
+    catalog_slug: Some("github-copilot"),
 };
 
 const OLLAMA: ProviderManifest = ProviderManifest {
@@ -78,6 +100,7 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: ollama::models(),
     pricing_schedule: None,
+    catalog_slug: None,
 };
 
 const LLAMA_CPP: ProviderManifest = ProviderManifest {
@@ -90,6 +113,7 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: llama_cpp::models(),
     pricing_schedule: None,
+    catalog_slug: None,
 };
 
 const MISTRAL: ProviderManifest = ProviderManifest {
@@ -102,6 +126,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: mistral::models(),
     pricing_schedule: None,
+    catalog_slug: Some("mistral"),
 };
 
 const ZAI: ProviderManifest = ProviderManifest {
@@ -114,6 +139,7 @@ const ZAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: zai::models(),
     pricing_schedule: None,
+    catalog_slug: Some("zai"),
 };
 
 const DEEPSEEK: ProviderManifest = ProviderManifest {
@@ -126,6 +152,7 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     fallback_context_window: 1_000_000,
     models: deepseek::models(),
     pricing_schedule: Some(&deepseek::PEAK_HOURS),
+    catalog_slug: Some("deepseek"),
 };
 
 const OPENROUTER: ProviderManifest = ProviderManifest {
@@ -138,6 +165,7 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: openrouter::models(),
     pricing_schedule: None,
+    catalog_slug: Some("openrouter"),
 };
 
 const SYNTHETIC: ProviderManifest = ProviderManifest {
@@ -150,6 +178,7 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: synthetic::models(),
     pricing_schedule: None,
+    catalog_slug: Some("synthetic"),
 };
 
 const TENSORX: ProviderManifest = ProviderManifest {
@@ -162,6 +191,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: tensorx::models(),
     pricing_schedule: None,
+    catalog_slug: Some("tensorx"),
 };
 
 const OPENCODE: ProviderManifest = ProviderManifest {
@@ -174,6 +204,7 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     fallback_context_window: 256_000,
     models: &[],
     pricing_schedule: None,
+    catalog_slug: Some("opencode"),
 };
 
 const XAI: ProviderManifest = ProviderManifest {
@@ -186,6 +217,7 @@ const XAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 500_000,
     models: xai::models(),
     pricing_schedule: None,
+    catalog_slug: Some("xai"),
 };
 
 const OPENCODE_GO: ProviderManifest = ProviderManifest {
@@ -198,6 +230,7 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: &[],
     pricing_schedule: None,
+    catalog_slug: Some("opencode-go"),
 };
 
 const APERTURE: ProviderManifest = ProviderManifest {
@@ -210,6 +243,7 @@ const APERTURE: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: aperture::models(),
     pricing_schedule: None,
+    catalog_slug: None,
 };
 
 const BUILTINS: &[ProviderManifest] = &[

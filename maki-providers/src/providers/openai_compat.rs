@@ -252,6 +252,7 @@ impl OpenAiCompatProvider {
                     .ok()
                     .unwrap_or(0.0),
                 fast: None,
+                tiers: Vec::new(),
             })
         });
         Some(crate::model::ModelInfo {
@@ -261,6 +262,7 @@ impl OpenAiCompatProvider {
             pricing,
             supports_thinking: None,
             supports_vision,
+            reasoning_options: None,
             tier: None,
             provider_info: None,
         })

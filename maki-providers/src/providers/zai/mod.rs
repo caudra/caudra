@@ -12,7 +12,6 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    dialect,
 };
 
 use super::{KeyPool, ResolvedAuth};
@@ -111,136 +110,154 @@ inventory::submit!(BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["glm-5-code"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.20,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["glm-5-code"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 1.20,
+                    output: 5.00,
+                    cache_write: 0.00,
+                    cache_read: 0.30,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.2"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-5.2"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: false,
+                pricing: ModelPricing {
+                    input: 1.00,
+                    output: 3.20,
+                    cache_write: 0.00,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 1_000_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.1", "glm-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-5.1", "glm-5"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: false,
+                pricing: ModelPricing {
+                    input: 1.00,
+                    output: 3.20,
+                    cache_write: 0.00,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-4.7-flash"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.00,
+                    output: 0.00,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7", "glm-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-4.7", "glm-4.6"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.60,
+                    output: 2.20,
+                    cache_write: 0.00,
+                    cache_read: 0.11,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-4.5-flash"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.00,
+                    output: 0.00,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(98304),
+                context_window: 131_072,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-air"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.10,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-4.5-air"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.20,
+                    output: 1.10,
+                    cache_write: 0.00,
+                    cache_read: 0.03,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(98304),
+                context_window: 131_072,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
+            ModelEntry {
+                prefixes: &["glm-4.5"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Glm,
+                vision: false,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.60,
+                    output: 2.20,
+                    cache_write: 0.00,
+                    cache_read: 0.11,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(98304),
+                context_window: 131_072,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 pub struct Zai {
@@ -301,7 +318,7 @@ impl Provider for Zai {
             let mut body = self.compat.build_body(model, messages, system, tools);
             if model.supports_thinking() {
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::GLM, model);
+                    .apply_reasoning_effort(&mut body, model);
             }
             match self
                 .compat

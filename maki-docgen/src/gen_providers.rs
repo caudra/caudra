@@ -1,4 +1,4 @@
-use maki_providers::Effort;
+use maki_providers::EFFORT_LEVELS;
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::provider::ProviderKind;
@@ -256,7 +256,7 @@ Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI
 
 fn dynamic_providers_section() -> String {
     let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
-    let efforts: Vec<String> = Effort::ALL.iter().map(|e| format!("`{e}`")).collect();
+    let efforts: Vec<String> = EFFORT_LEVELS.iter().map(|e| format!("`{e}`")).collect();
 
     format!(
         r#"## Dynamic Providers

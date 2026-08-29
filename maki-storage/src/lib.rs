@@ -13,6 +13,7 @@ pub mod permission_state;
 pub mod plans;
 pub mod sessions;
 pub mod theme;
+pub mod thinking;
 pub mod tool_outputs;
 pub mod version;
 

@@ -158,6 +158,7 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 
 #[cfg(test)]
 mod tests {
+    use crate::ReasoningOptions;
     use super::*;
     use crate::manifest::ManifestRegistry;
     use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
@@ -213,6 +214,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
+            reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         }
     }

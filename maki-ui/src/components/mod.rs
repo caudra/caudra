@@ -460,6 +460,7 @@ pub(crate) fn test_pricing() -> ModelPricing {
         cache_write: 3.75,
         cache_read: 0.30,
         fast: None,
+        tiers: Vec::new(),
     }
 }
 
@@ -477,6 +478,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         discovered_free: false,
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
+        reasoning_options: maki_providers::ReasoningOptions::default(),
         thinking_fields: None,
     }
 }

@@ -323,7 +323,7 @@ impl<'h> Agent<'h> {
         self.mode = latest.mode.clone();
         self.workflow = latest.workflow;
         self.opts = RequestOptions {
-            thinking: latest.thinking,
+            thinking: latest.thinking.clone(),
             fast: latest.fast,
         };
 
@@ -410,7 +410,7 @@ impl<'h> Agent<'h> {
             tools.as_ref(),
             &self.event_tx,
             &self.cancel,
-            self.opts,
+            self.opts.clone(),
             self.session_id.as_ref(),
         )
         .await
@@ -763,7 +763,7 @@ impl<'h> Agent<'h> {
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
             prompt_slots: Arc::clone(&self.prompt_slots),
-            opts: self.opts,
+            opts: self.opts.clone(),
             subagent_cancels: Arc::clone(&self.subagent_cancels),
             subagent_history: self.subagent_history.clone(),
             registry: Arc::clone(&self.registry),

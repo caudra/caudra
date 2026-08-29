@@ -11,9 +11,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
-};
+use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::{auth, catalog};
 
@@ -123,7 +121,7 @@ fn apply_grok_reasoning(body: &mut Value, opts: &RequestOptions, model: &Model) 
     if !model.supports_thinking() {
         return;
     }
-    if let Some(effort) = opts.thinking.effort_str(&dialect::GROK, model) {
+    if let Some(effort) = opts.thinking.effort_str(model) {
         body["reasoning"] = json!({ "effort": effort });
     }
     let include = body["include"].as_array_mut();
@@ -199,7 +197,7 @@ impl Provider for Xai {
 
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::GROK, model);
+                .apply_reasoning_effort(&mut body, model);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -292,6 +290,7 @@ fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ReasoningOptions;
     use super::*;
     use crate::types::ThinkingConfig;
     use crate::{ModelFamily, ModelPricing, ModelTier};
@@ -313,6 +312,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(131_072),
             context_window: 500_000,
+            reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         }
     }
@@ -324,7 +324,7 @@ mod tests {
         apply_grok_reasoning(
             &mut body,
             &RequestOptions {
-                thinking: ThinkingConfig::Effort(maki_storage::sessions::Effort::High),
+                thinking: ThinkingConfig::Effort("high".into()),
                 ..RequestOptions::default()
             },
             &model,

@@ -152,7 +152,7 @@ async fn stream_with_retry_inner(
             async move { forward_provider_events(prx, event_tx.as_ref()).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
+            provider.stream_message(model, messages, system, tools, &ptx, opts.clone(), session_id),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)

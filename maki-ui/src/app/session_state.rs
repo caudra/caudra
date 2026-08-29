@@ -113,6 +113,7 @@ impl SessionState {
             thinking: session
                 .meta
                 .thinking
+                .clone()
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
@@ -234,7 +235,7 @@ mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
     use maki_providers::{FastPricing, ModelPricing};
-    use maki_storage::sessions::StoredThinking;
+    use maki_storage::thinking::StoredThinking;
     use std::collections::HashMap;
     use test_case::test_case;
 

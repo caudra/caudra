@@ -364,11 +364,13 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                     cache_read: price_per_m(p.get("input_cache_read")),
                     cache_write: 0.0,
                     fast: None,
+                    tiers: Vec::new(),
                 }),
                 supports_thinking: ov
                     .supports_thinking
                     .or_else(|| routed_kind(provider_id, &ov).map(kind_supports_thinking)),
                 supports_vision: ov.supports_vision,
+                reasoning_options: None,
                 tier: None,
                 provider_info: None,
             })

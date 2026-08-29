@@ -277,7 +277,7 @@ impl App {
                     )
                 })
                 .collect(),
-            thinking: Some(state.thinking.into()),
+            thinking: Some(state.thinking.clone().into()),
             fast: state.fast,
             workflow: state.workflow,
             active_goal: state.goal.active_condition(),
@@ -1101,7 +1101,7 @@ impl App {
                 .path()
                 .map(|path| path.to_string_lossy().into_owned()),
             plan_written: self.state.plan.is_ready(),
-            thinking: Some(self.state.thinking.into()),
+            thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
             workflow: self.state.workflow,
             ..SessionMeta::default()

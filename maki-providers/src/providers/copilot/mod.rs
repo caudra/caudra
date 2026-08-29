@@ -14,12 +14,13 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry,
+    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, StaticReasoningOption,
+    lookup_entry,
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, Message, ProviderEvent, ReasoningOption, ReasoningOptions, RequestOptions,
+    StreamResponse, ThinkingConfig,
 };
 
 pub mod auth;
@@ -53,383 +54,468 @@ const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
 /// GitHub's published rates (usage-based billing since June 2026,
 /// docs.github.com/copilot/reference/copilot-billing/models-and-pricing), at
 /// the default context tier.
+/// Levels these models declare, matching the models.dev catalog. Copilot's
+/// `/models` response overrides these the moment it lands; the table only has
+/// to survive a cold start.
+const EFFORT_WITH_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+    "none", "low", "medium", "high", "xhigh", "max",
+])];
+const EFFORT_TO_XHIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+    "none", "low", "medium", "high", "xhigh",
+])];
+const EFFORT_TO_XHIGH_NO_NONE: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh"])];
+const EFFORT_TO_HIGH: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["none", "low", "medium", "high"])];
+const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
+const KIMI_EFFORT: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "high", "max"])];
+/// Claude on Copilot reasons unconditionally: no `none`, no toggle.
+const CLAUDE_EFFORT_MAX: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"])];
+const CLAUDE_BUDGET: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetTokens {
+    min: Some(1_024),
+    max: Some(32_000),
+}];
+const GEMINI_FLASH_24K: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Effort(&["minimal", "low", "medium", "high"]),
+    StaticReasoningOption::BudgetTokens { min: Some(256), max: Some(24_000) },
+];
+const GEMINI_FLASH_32K: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Effort(&["minimal", "low", "medium", "high"]),
+    StaticReasoningOption::BudgetTokens { min: Some(256), max: Some(32_000) },
+];
+const GEMINI_PRO_32K: &[StaticReasoningOption] = &[
+    StaticReasoningOption::Effort(&["low", "medium", "high"]),
+    StaticReasoningOption::BudgetTokens { min: Some(256), max: Some(32_000) },
+];
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["gpt-5-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.25,
-                output: 2.00,
-                cache_write: 0.00,
-                cache_read: 0.025,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["gpt-5-mini"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.25,
+                    output: 2.00,
+                    cache_write: 0.00,
+                    cache_read: 0.025,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_HIGH),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.4-mini"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.75,
+                    output: 4.50,
+                    cache_write: 0.00,
+                    cache_read: 0.075,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-nano"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.25,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.4-nano"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.20,
+                    output: 1.25,
+                    cache_write: 0.00,
+                    cache_read: 0.02,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-haiku-4.5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 5.00,
-                cache_write: 1.25,
-                cache_read: 0.10,
-                fast: None,
+            ModelEntry {
+                prefixes: &["claude-haiku-4.5"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 1.00,
+                    output: 5.00,
+                    cache_write: 1.25,
+                    cache_read: 0.10,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(64_000),
+                context_window: 200_000,
+                reasoning_options: Some(CLAUDE_BUDGET),
             },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.50,
-                output: 9.00,
-                cache_write: 0.00,
-                cache_read: 0.15,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-3.5-flash"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 1.50,
+                    output: 9.00,
+                    cache_write: 0.00,
+                    cache_read: 0.15,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 200_000,
+                reasoning_options: Some(GEMINI_FLASH_24K),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.6-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-3.6-flash"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.75,
+                    output: 3.75,
+                    cache_write: 0.00,
+                    cache_read: 0.075,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 200_000,
+                reasoning_options: Some(GEMINI_FLASH_32K),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.7-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-3.7-flash"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.75,
+                    output: 3.75,
+                    cache_write: 0.00,
+                    cache_read: 0.075,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["mai-code-1-flash-picker"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
+            ModelEntry {
+                prefixes: &["mai-code-1-flash-picker"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.75,
+                    output: 4.50,
+                    cache_write: 0.00,
+                    cache_read: 0.075,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
+            ModelEntry {
+                prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 3.00,
+                    output: 15.00,
+                    cache_write: 3.75,
+                    cache_read: 0.30,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(64_000),
+                context_window: 200_000,
+                reasoning_options: Some(CLAUDE_BUDGET),
             },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["claude-sonnet-5"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 10.00,
+                    cache_write: 2.50,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(CLAUDE_EFFORT_MAX),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.5"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 5.00,
+                    output: 30.00,
+                    cache_write: 0.00,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k2.7-code"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.95,
-                output: 4.00,
-                cache_write: 0.00,
-                cache_read: 0.19,
-                fast: None,
+            ModelEntry {
+                prefixes: &["kimi-k2.7-code"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 0.95,
+                    output: 4.00,
+                    cache_write: 0.00,
+                    cache_read: 0.19,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
+            ModelEntry {
+                prefixes: &["kimi-k3"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 3.00,
+                    output: 15.00,
+                    cache_write: 0.00,
+                    cache_read: 0.30,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(KIMI_EFFORT),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.1-pro-preview"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 12.00,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gemini-3.1-pro-preview"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 12.00,
+                    cache_write: 0.00,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(65_536),
+                context_window: 200_000,
+                reasoning_options: Some(GEMINI_PRO_32K),
             },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-luna"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.20,
-                cache_write: 0.25,
-                cache_read: 0.02,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.6-luna"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.20,
+                    output: 1.20,
+                    cache_write: 0.25,
+                    cache_read: 0.02,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_WITH_MAX),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.50,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.25,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.4"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.50,
+                    output: 15.00,
+                    cache_write: 0.00,
+                    cache_read: 0.25,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-sol"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.6-sol"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 5.00,
+                    output: 30.00,
+                    cache_write: 6.25,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_WITH_MAX),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-terra"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 12.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.6-terra"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 12.00,
+                    cache_write: 2.50,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_WITH_MAX),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.3-codex"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.75,
-                output: 14.00,
-                cache_write: 0.00,
-                cache_read: 0.175,
-                fast: None,
+            ModelEntry {
+                prefixes: &["gpt-5.3-codex"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 1.75,
+                    output: 14.00,
+                    cache_write: 0.00,
+                    cache_read: 0.175,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH_NO_NONE),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &[
-                "claude-opus-5",
-                "claude-opus-4.8",
-                "claude-opus-4.7",
-                "claude-opus-4.6",
-                "claude-opus-4.5",
-            ],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &[
+                    "claude-opus-5",
+                    "claude-opus-4.8",
+                    "claude-opus-4.7",
+                    "claude-opus-4.6",
+                    "claude-opus-4.5",
+                ],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 5.00,
+                    output: 25.00,
+                    cache_write: 6.25,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(64_000),
+                context_window: 200_000,
+                reasoning_options: Some(CLAUDE_EFFORT_MAX),
             },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 1.00,
-                fast: None,
+            ModelEntry {
+                prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 10.00,
+                    output: 50.00,
+                    cache_write: 12.50,
+                    cache_read: 1.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(CLAUDE_EFFORT_MAX),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &["grok-4.5"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 6.00,
+                    cache_write: 0.00,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &["grok-4.6"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 6.00,
+                    cache_write: 0.00,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(100_000),
+                context_window: 200_000,
+                reasoning_options: Some(EFFORT_TO_XHIGH_NO_NONE),
             },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 pub struct Copilot {
@@ -602,25 +688,7 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let mut body = responses::build_body(model, messages, system, tools);
-        let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
-            "copilot", &model.id,
-        )
-        .or_else(|| {
-            self.models
-                .lock()
-                .unwrap()
-                .get(&model.id)
-                .map(CopilotModel::reasoning_info)
-                .map(Arc::new)
-        });
-        if let Some(info) = reasoning_info {
-            responses::apply_responses_reasoning(
-                &mut body,
-                thinking,
-                model,
-                &effort_dialect(&info),
-            );
-        }
+        responses::apply_responses_reasoning(&mut body, &thinking, model);
         let resolved = super::ResolvedAuth {
             base_url: Some(auth.endpoint.clone()),
             headers: copilot_headers(&auth, Some("conversation-agent")),
@@ -757,7 +825,6 @@ impl CopilotModel {
     }
 
     fn model_info(&self) -> ModelInfo {
-        let reasoning = self.reasoning_info();
         ModelInfo {
             id: self.id.clone(),
             context_window: self.capabilities.limits.max_context_window_tokens,
@@ -765,10 +832,11 @@ impl CopilotModel {
             pricing: self.pricing(),
             supports_thinking: Some(self.supports_thinking()),
             supports_vision: Some(self.capabilities.supports.vision),
+            reasoning_options: Some(self.reasoning_options()),
             tier: self
                 .model_picker_category
                 .and_then(CopilotModelCategory::tier),
-            provider_info: Some(Arc::new(reasoning)),
+            provider_info: None,
         }
     }
 
@@ -783,26 +851,23 @@ impl CopilotModel {
                 || supports.min_thinking_budget.is_some())
     }
 
-    fn reasoning_info(&self) -> CopilotModelInfo {
-        let mut reasoning_efforts = self
-            .capabilities
-            .supports
-            .reasoning_effort
-            .iter()
-            .filter_map(|effort| effort.parse().ok())
-            .collect::<Vec<_>>();
-        reasoning_efforts.sort_unstable();
-        reasoning_efforts.dedup();
-        CopilotModelInfo {
-            reasoning_off: self
-                .capabilities
-                .supports
-                .reasoning_effort
-                .iter()
-                .any(|effort| effort == dialect::OFF),
-            reasoning_efforts,
-            adaptive_thinking: self.capabilities.supports.adaptive_thinking,
+    /// `/models` reports the levels and the budget window a model takes, which
+    /// is exactly what [`ReasoningOptions`] describes.
+    fn reasoning_options(&self) -> ReasoningOptions {
+        let supports = &self.capabilities.supports;
+        let mut options = Vec::new();
+        if !supports.reasoning_effort.is_empty() {
+            options.push(ReasoningOption::Effort {
+                values: supports.reasoning_effort.clone(),
+            });
         }
+        if supports.min_thinking_budget.is_some() || supports.max_thinking_budget.is_some() {
+            options.push(ReasoningOption::BudgetTokens {
+                min: supports.min_thinking_budget,
+                max: supports.max_thinking_budget,
+            });
+        }
+        ReasoningOptions::new(options)
     }
 
     /// `/models` reports prices in AI credits per billing batch (1 credit =
@@ -826,6 +891,7 @@ impl CopilotModel {
             cache_read: default.cache_price * usd_per_million,
             cache_write: manifest_cache_write,
             fast: None,
+            tiers: Vec::new(),
         })
     }
 
@@ -901,13 +967,6 @@ struct CopilotModelSupports {
     min_thinking_budget: Option<u32>,
     #[serde(default)]
     vision: bool,
-}
-
-#[derive(Debug)]
-struct CopilotModelInfo {
-    reasoning_efforts: Vec<Effort>,
-    reasoning_off: bool,
-    adaptive_thinking: bool,
 }
 
 #[derive(Deserialize)]
@@ -1048,18 +1107,6 @@ fn anthropic_messages(messages: &[Message]) -> Value {
     )
 }
 
-fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
-    EffortDialect {
-        supported: if info.reasoning_efforts.is_empty() {
-            dialect::PREFER_HIGH.supported
-        } else {
-            &info.reasoning_efforts
-        },
-        adaptive: (!info.adaptive_thinking).then_some(Effort::High),
-        off: info.reasoning_off.then_some(dialect::OFF),
-    }
-}
-
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
@@ -1189,17 +1236,9 @@ mod tests {
         assert_eq!(info.supports_thinking, Some(true));
         assert_eq!(info.supports_vision, Some(true));
         assert_eq!(info.tier, Some(ModelTier::Strong));
-        let provider_info = info
-            .provider_info
-            .unwrap()
-            .downcast::<CopilotModelInfo>()
-            .unwrap();
-        assert_eq!(
-            provider_info.reasoning_efforts,
-            vec![Effort::Low, Effort::Medium, Effort::High]
-        );
-        assert!(provider_info.reasoning_off);
-        assert!(provider_info.adaptive_thinking);
+        let options = info.reasoning_options.unwrap();
+        assert_eq!(options.efforts(), ["none", "low", "medium", "high"]);
+        assert_eq!(options.budget_bounds(), Some((Some(1_024), Some(64_000))));
     }
 
     #[test]
@@ -1321,28 +1360,14 @@ mod tests {
         assert!(model.model_info().pricing.is_none());
     }
 
-    #[test]
-    fn responses_reasoning_uses_effort_object_and_explicit_none() {
+    #[test_case(ThinkingConfig::Off, "none" ; "off is the declared none")]
+    #[test_case(ThinkingConfig::Effort("medium".into()), "medium" ; "declared level passes through")]
+    #[test_case(ThinkingConfig::Effort("max".into()), "xhigh" ; "undeclared level snaps down")]
+    fn responses_reasoning_uses_effort_object(thinking: ThinkingConfig, expected: &str) {
         let model = Model::from_spec("copilot/gpt-5.4").unwrap();
-        let info = CopilotModelInfo {
-            reasoning_efforts: vec![Effort::Low, Effort::Medium, Effort::High],
-            reasoning_off: true,
-            adaptive_thinking: false,
-        };
-        let dialect = effort_dialect(&info);
-
         let mut body = json!({});
-        responses::apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
-        assert_eq!(body, json!({"reasoning": {"effort": "none"}}));
-
-        let mut body = json!({});
-        responses::apply_responses_reasoning(
-            &mut body,
-            ThinkingConfig::Effort(Effort::Medium),
-            &model,
-            &dialect,
-        );
-        assert_eq!(body, json!({"reasoning": {"effort": "medium"}}));
+        responses::apply_responses_reasoning(&mut body, &thinking, &model);
+        assert_eq!(body, json!({"reasoning": {"effort": expected}}));
         assert!(body.get("reasoning_effort").is_none());
     }
 

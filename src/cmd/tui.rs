@@ -343,8 +343,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if setup::session_history_head(session).is_none() {
                 session.meta.fast |= stack.config.always_fast;
                 session.meta.workflow |= stack.config.always_workflow;
-                if let Some(thinking) = stack.config.always_thinking {
-                    session.meta.thinking = Some(thinking);
+                if let Some(thinking) = &stack.config.always_thinking {
+                    session.meta.thinking = Some(thinking.clone());
                 }
             }
         }

@@ -31,7 +31,7 @@ use maki_providers::{
     add_cost, expand_message,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredThinking;
+use maki_storage::thinking::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::info;
@@ -499,7 +499,7 @@ async fn session(
             return Ok(err_pair(format!("invalid thinking budget: {n}")));
         }
         Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
-        None => agent_ctx.opts.thinking,
+        None => agent_ctx.opts.thinking.clone(),
     };
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
@@ -846,7 +846,7 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: s.thinking,
+        thinking: s.thinking.clone(),
         fast: s.fast,
         workflow: false,
         prompt: None,

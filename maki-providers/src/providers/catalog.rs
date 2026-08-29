@@ -25,12 +25,14 @@ use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
-use crate::model::{Model, ModelInfo, ModelPricing};
+use maki_storage::thinking::ReasoningOptions;
+
+use crate::model::{Model, ModelInfo, ModelPricing, PricingTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, Timeouts, http_client};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 const MESSAGES_PATH: &str = "/messages";
 
@@ -39,7 +41,14 @@ const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
-const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
+/// Bumped whenever the cached shape gains a field, since the cache stores the
+/// parsed form: an older file would silently be missing reasoning options and
+/// price tiers.
+const CATALOG_CACHE_FILE: &str = "models-dev-catalog-v2.json";
+
+/// Used only when a catalog entry omits its limits entirely.
+const FALLBACK_CATALOG_CONTEXT: u32 = 128_000;
+const FALLBACK_CATALOG_OUTPUT: u32 = 64_000;
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
 
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
@@ -202,23 +211,72 @@ pub struct CatalogMeta {
     pub cache_write: f64,
     pub supports_thinking: bool,
     pub supports_vision: bool,
+    pub reasoning_options: ReasoningOptions,
+    pub pricing_tiers: Vec<PricingTier>,
 }
 
 impl CatalogMeta {
+    fn from_model(model: &schema::CatalogModel) -> Self {
+        let cost = model.cost.as_ref();
+        let limit = model.limit.as_ref();
+        Self {
+            context: limit
+                .and_then(|l| l.context)
+                .unwrap_or(FALLBACK_CATALOG_CONTEXT),
+            output: limit
+                .and_then(|l| l.output)
+                .unwrap_or(FALLBACK_CATALOG_OUTPUT),
+            input_price: cost.and_then(|c| c.input).unwrap_or(0.0),
+            output_price: cost.and_then(|c| c.output).unwrap_or(0.0),
+            cache_read: cost.and_then(|c| c.cache_read).unwrap_or(0.0),
+            cache_write: cost.and_then(|c| c.cache_write).unwrap_or(0.0),
+            supports_thinking: model.reasoning,
+            supports_vision: model.attachment
+                || model
+                    .modalities
+                    .as_ref()
+                    .is_some_and(|m| m.input.iter().any(|kind| kind == "image")),
+            reasoning_options: model.reasoning_options.clone().unwrap_or_default(),
+            pricing_tiers: cost
+                .map(|c| {
+                    let mut tiers: Vec<PricingTier> = c
+                        .tiers
+                        .iter()
+                        .map(|tier| PricingTier {
+                            above: tier.tier.size,
+                            input: tier.input.unwrap_or(0.0),
+                            output: tier.output.unwrap_or(0.0),
+                            cache_read: tier.cache_read.unwrap_or(0.0),
+                            cache_write: tier.cache_write.unwrap_or(0.0),
+                        })
+                        .collect();
+                    tiers.sort_by_key(|tier| tier.above);
+                    tiers
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn pricing(&self) -> ModelPricing {
+        ModelPricing {
+            input: self.input_price,
+            output: self.output_price,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+            fast: None,
+            tiers: self.pricing_tiers.clone(),
+        }
+    }
+
     fn model_info(&self, model_id: &str) -> ModelInfo {
         ModelInfo {
             id: model_id.to_string(),
             context_window: Some(self.context),
             max_output_tokens: Some(self.output),
-            pricing: Some(ModelPricing {
-                input: self.input_price,
-                output: self.output_price,
-                cache_read: self.cache_read,
-                cache_write: self.cache_write,
-                fast: None,
-            }),
+            pricing: Some(self.pricing()),
             supports_thinking: Some(self.supports_thinking),
             supports_vision: Some(self.supports_vision),
+            reasoning_options: Some(self.reasoning_options.clone()),
             tier: None,
             provider_info: None,
         }
@@ -237,7 +295,13 @@ pub enum Authentication {
 }
 
 pub(crate) struct CatalogData {
+    /// Providers maki will route requests through. Filtered hard: unsupported
+    /// SDK shapes, blocked ids, and anything a built-in already serves.
     providers: HashMap<String, ProviderData>,
+    /// What models.dev knows about every model, including the ones routed by a
+    /// built-in provider. Routing eligibility and model facts are different
+    /// questions, and only the first justifies a block list.
+    metadata: HashMap<String, HashMap<String, CatalogMeta>>,
     opencode_slugs: std::collections::HashSet<String>,
     enable_free_models: bool,
     pub(crate) state_dir: StateDir,
@@ -251,8 +315,21 @@ impl CatalogData {
         opencode_slugs: std::collections::HashSet<String>,
     ) -> Self {
         let mut providers = HashMap::new();
+        let mut metadata = HashMap::new();
 
         for (provider_id, provider) in index {
+            let models: HashMap<String, CatalogMeta> = provider
+                .models
+                .iter()
+                .map(|(model_id, model)| (model_id.clone(), CatalogMeta::from_model(model)))
+                .collect();
+            let model_count = models.len();
+
+            // Every provider contributes its model facts, whatever maki does
+            // about routing: the built-ins below need them most, and they are
+            // exactly the ones routing turns away.
+            metadata.insert(provider_id.clone(), models.clone());
+
             if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
                 debug!(npm = %provider.npm, "skipping provider: unsupported npm package");
                 continue;
@@ -281,65 +358,6 @@ impl CatalogData {
             }
 
             let api_format = determine_catalog_format(&provider.npm);
-
-            let mut models = HashMap::new();
-            for (model_id, model_data) in &provider.models {
-                let input_price = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.input)
-                    .unwrap_or(0.0);
-                let output_price = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.output)
-                    .unwrap_or(0.0);
-
-                let context = model_data
-                    .limit
-                    .as_ref()
-                    .and_then(|l| l.context)
-                    .unwrap_or(128_000);
-                let output = model_data
-                    .limit
-                    .as_ref()
-                    .and_then(|l| l.output)
-                    .unwrap_or(64_000);
-
-                let cache_read = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.cache_read)
-                    .unwrap_or(0.0);
-                let cache_write = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.cache_write)
-                    .unwrap_or(0.0);
-
-                let supports_vision = model_data.attachment
-                    || model_data
-                        .modalities
-                        .as_ref()
-                        .is_some_and(|m| m.input.iter().any(|s| s == "image"));
-                let supports_thinking = model_data.reasoning;
-
-                models.insert(
-                    model_id.clone(),
-                    CatalogMeta {
-                        context,
-                        output,
-                        input_price,
-                        output_price,
-                        cache_read,
-                        cache_write,
-                        supports_thinking,
-                        supports_vision,
-                    },
-                );
-            }
-
-            let model_count = models.len();
             let provider_data =
                 ProviderData::new(provider_id.clone(), &provider, api_format, models);
             providers.insert(provider_id.clone(), provider_data);
@@ -354,10 +372,27 @@ impl CatalogData {
 
         Self {
             providers,
+            metadata,
             opencode_slugs,
             enable_free_models,
             state_dir: state_dir.clone(),
         }
+    }
+
+    /// Nothing known: offline on a cold cache, or a state dir we could not
+    /// resolve. Every lookup then falls through to the static tables.
+    fn empty(state_dir: StateDir) -> Self {
+        Self {
+            providers: HashMap::new(),
+            metadata: HashMap::new(),
+            opencode_slugs: std::collections::HashSet::new(),
+            enable_free_models: false,
+            state_dir,
+        }
+    }
+
+    fn meta(&self, provider: &str, model_id: &str) -> Option<&CatalogMeta> {
+        self.metadata.get(provider)?.get(model_id)
     }
 
     pub(crate) fn lookup(
@@ -576,12 +611,7 @@ fn init_catalog_blocking(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "failed to resolve state dir");
-            return CatalogData {
-                providers: HashMap::new(),
-                opencode_slugs: std::collections::HashSet::new(),
-                enable_free_models: false,
-                state_dir: StateDir::from_path("".into()),
-            };
+            return CatalogData::empty(StateDir::from_path("".into()));
         }
     };
     let make_catalog = |index: schema::CatalogIndex| -> CatalogData {
@@ -607,12 +637,7 @@ fn init_catalog_blocking(
         }
         Err(e) => {
             warn!(error = %e, "catalog fetch failed, using empty catalog");
-            CatalogData {
-                providers: HashMap::new(),
-                opencode_slugs: std::collections::HashSet::new(),
-                enable_free_models: false,
-                state_dir,
-            }
+            CatalogData::empty(state_dir)
         }
     }
 }
@@ -716,11 +741,8 @@ impl Provider for CatalogProvider {
                     let mut body =
                         self.chat_compat
                             .build_body(&stream_model, messages, system, tools);
-                    opts.thinking.apply_reasoning_effort(
-                        &mut body,
-                        &dialect::PREFER_HIGH,
-                        &stream_model,
-                    );
+                    opts.thinking
+                        .apply_reasoning_effort(&mut body, &stream_model);
                     self.chat_compat
                         .do_stream(&stream_model, &[], &body, event_tx, auth)
                         .await
@@ -899,19 +921,13 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
 /// catalog has already been downloaded. Never triggers a fetch — callers
 /// (e.g. `Model::from_spec`) must tolerate `None` and fall through, since
 /// the catalog may still be warming in the background.
+///
+/// Reads the metadata index, not the routing map, so a built-in provider still
+/// gets the facts models.dev publishes about its models.
 pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMetaView> {
-    let data = catalog_provider_if_available(slug)?;
-    let meta = data.models.get(model_id)?;
-    Some(CatalogMetaView {
-        context: meta.context,
-        output: meta.output,
-        input_price: meta.input_price,
-        output_price: meta.output_price,
-        cache_read: meta.cache_read,
-        cache_write: meta.cache_write,
-        supports_thinking: meta.supports_thinking,
-        supports_vision: meta.supports_vision,
-    })
+    let catalog = SHARED_CATALOG.get()?;
+    let guard = catalog.lock().ok()?;
+    guard.meta(slug, model_id).map(CatalogMetaView::from)
 }
 
 /// True when the model is an OpenCode-family catalog entry that is free by
@@ -926,7 +942,7 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 /// Metadata shape `Model::from_spec` consumes when a spec resolves to a catalog
 /// sub-provider. Public so `maki-providers/src/model.rs` can name it without
 /// depending on the opencode-internal `CatalogMeta` struct.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CatalogMetaView {
     pub context: u32,
     pub output: u32,
@@ -936,10 +952,30 @@ pub struct CatalogMetaView {
     pub cache_write: f64,
     pub supports_thinking: bool,
     pub supports_vision: bool,
+    pub reasoning_options: ReasoningOptions,
+    pub pricing_tiers: Vec<PricingTier>,
+}
+
+impl From<&CatalogMeta> for CatalogMetaView {
+    fn from(meta: &CatalogMeta) -> Self {
+        Self {
+            context: meta.context,
+            output: meta.output,
+            input_price: meta.input_price,
+            output_price: meta.output_price,
+            cache_read: meta.cache_read,
+            cache_write: meta.cache_write,
+            supports_thinking: meta.supports_thinking,
+            supports_vision: meta.supports_vision,
+            reasoning_options: meta.reasoning_options.clone(),
+            pricing_tiers: meta.pricing_tiers.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::ReasoningOptions;
     use std::collections::HashMap;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
@@ -991,6 +1027,8 @@ mod tests {
                         cache_write: 0.0,
                         supports_thinking: false,
                         supports_vision: false,
+                        reasoning_options: ReasoningOptions::default(),
+                        pricing_tiers: Vec::new(),
                     },
                 ),
                 (
@@ -1004,6 +1042,8 @@ mod tests {
                         cache_write: 0.0,
                         supports_thinking: false,
                         supports_vision: false,
+                        reasoning_options: ReasoningOptions::default(),
+                        pricing_tiers: Vec::new(),
                     },
                 ),
             ]),
@@ -1030,6 +1070,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
+            reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         };
         let (tx, _rx) = flume::unbounded();
@@ -1115,6 +1156,7 @@ mod tests {
                         output: Some(1.5),
                         cache_read: Some(0.1),
                         cache_write: Some(0.2),
+                        ..Default::default()
                     }),
                     provider: None,
                     ..Default::default()
@@ -1367,6 +1409,7 @@ mod tests {
                     output: Some(2.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1381,6 +1424,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1423,6 +1467,7 @@ mod tests {
                     output: Some(25.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1437,6 +1482,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1485,6 +1531,7 @@ mod tests {
                         output: Some(0.0),
                         cache_read: None,
                         cache_write: None,
+                        ..Default::default()
                     }),
                     provider: None,
                     ..Default::default()
@@ -1499,6 +1546,7 @@ mod tests {
                         output: Some(25.0),
                         cache_read: None,
                         cache_write: None,
+                        ..Default::default()
                     }),
                     provider: None,
                     ..Default::default()
@@ -1534,6 +1582,7 @@ mod tests {
                     output: Some(25.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1548,6 +1597,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1596,6 +1646,7 @@ mod tests {
                     output: Some(25.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1610,6 +1661,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1682,6 +1734,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1696,6 +1749,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1782,6 +1836,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1861,6 +1916,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1901,6 +1957,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1948,6 +2005,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -1995,6 +2053,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -2070,6 +2129,7 @@ mod tests {
                             output: Some(10.0),
                             cache_read: None,
                             cache_write: None,
+                            ..Default::default()
                         }),
                         provider: None,
                         ..Default::default()
@@ -2115,6 +2175,7 @@ mod tests {
                     output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -2129,6 +2190,7 @@ mod tests {
                     output: Some(3.0),
                     cache_read: None,
                     cache_write: None,
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -2186,6 +2248,7 @@ mod tests {
                     output: Some(5.0),
                     cache_read: Some(0.1),
                     cache_write: Some(0.2),
+                    ..Default::default()
                 }),
                 provider: None,
                 ..Default::default()
@@ -2282,6 +2345,7 @@ pub(crate) mod schema {
 
     use std::collections::HashMap;
 
+    use maki_storage::thinking::ReasoningOptions;
     use serde::{Deserialize, Serialize};
 
     pub type CatalogIndex = HashMap<String, CatalogProvider>;
@@ -2318,19 +2382,25 @@ pub(crate) mod schema {
         pub reasoning: bool,
         #[serde(default)]
         pub modalities: Option<CatalogModalities>,
+        /// Per-model reasoning controls. Absent for models the catalog has not
+        /// classified, which is not the same as a model that cannot reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_options: Option<ReasoningOptions>,
     }
 
     #[derive(Deserialize, Serialize, Clone)]
     pub struct CatalogLimits {
         #[serde(default)]
         pub context: Option<u32>,
+        /// Real prompt budget where the catalog distinguishes it from the total
+        /// window. Only a sixth of the catalog sets it.
         #[serde(default)]
         pub input: Option<u32>,
         #[serde(default)]
         pub output: Option<u32>,
     }
 
-    #[derive(Deserialize, Serialize, Clone)]
+    #[derive(Deserialize, Serialize, Clone, Default)]
     pub struct CatalogCost {
         #[serde(default)]
         pub input: Option<f64>,
@@ -2340,6 +2410,28 @@ pub(crate) mod schema {
         pub cache_read: Option<f64>,
         #[serde(default)]
         pub cache_write: Option<f64>,
+        /// Context-size price tiers. `context_over_200k` is the legacy spelling
+        /// of the same thing and always accompanies `tiers`, so it is ignored.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tiers: Vec<CatalogCostTier>,
+    }
+
+    #[derive(Deserialize, Serialize, Clone)]
+    pub struct CatalogCostTier {
+        #[serde(default)]
+        pub input: Option<f64>,
+        #[serde(default)]
+        pub output: Option<f64>,
+        #[serde(default)]
+        pub cache_read: Option<f64>,
+        #[serde(default)]
+        pub cache_write: Option<f64>,
+        pub tier: CatalogTierBoundary,
+    }
+
+    #[derive(Deserialize, Serialize, Clone)]
+    pub struct CatalogTierBoundary {
+        pub size: u32,
     }
 
     #[derive(Deserialize, Serialize, Clone)]

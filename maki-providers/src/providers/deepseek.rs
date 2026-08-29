@@ -11,7 +11,7 @@ use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{ProviderUsage, UsageLimit};
 use crate::{
-    AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig, dialect,
+    AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -50,40 +50,46 @@ const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWind
 const PEAK_MULTIPLIER: f64 = 2.0;
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["deepseek-v4-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.22,
-                output: 0.66,
-                cache_write: 0.00,
-                cache_read: 0.007,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["deepseek-v4-flash"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.22,
+                    output: 0.66,
+                    cache_write: 0.00,
+                    cache_read: 0.007,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(384_000),
+                context_window: 1_000_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(384_000),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["deepseek-v4-pro"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.66,
-                output: 1.98,
-                cache_write: 0.00,
-                cache_read: 0.022,
-                fast: None,
+            ModelEntry {
+                prefixes: &["deepseek-v4-pro"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.66,
+                    output: 1.98,
+                    cache_write: 0.00,
+                    cache_read: 0.022,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(384_000),
+                context_window: 1_000_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(384_000),
-            context_window: 1_000_000,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 #[derive(Deserialize)]
@@ -184,7 +190,7 @@ impl Provider for DeepSeek {
             if opts.thinking.is_enabled() {
                 body["thinking"] = serde_json::json!({"type": "enabled"});
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::DEEPSEEK, model);
+                    .apply_reasoning_effort(&mut body, model);
                 if matches!(opts.thinking, ThinkingConfig::Budget(_)) {
                     warn!("DeepSeek reasoning does not support token budgets");
                 }

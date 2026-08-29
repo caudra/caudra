@@ -18,7 +18,7 @@ pub use history::{
 pub use maki_storage::sessions::add_cost;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    ThinkingSupport, TokenUsage, format_tokens,
+    PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
 pub use providers::Timeouts;
@@ -33,8 +33,8 @@ pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::xai::auth as xai_auth;
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType,
-    ImageSource, Message, MessageKind, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
-    dialect,
+    ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, ImageMediaType,
+    ImageSource, Message, MessageKind, MIN_THINKING_BUDGET, ProviderEvent, ProviderUsage,
+    ReasoningOption, ReasoningOptions, RequestOptions, ResolvedThinking, Role, StopReason,
+    StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
 };

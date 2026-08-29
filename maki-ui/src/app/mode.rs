@@ -126,7 +126,7 @@ impl App {
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
-            thinking: self.state.thinking,
+            thinking: self.state.thinking.clone(),
             fast: self.state.fast,
             workflow: self.state.workflow,
             prompt: None,

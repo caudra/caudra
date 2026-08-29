@@ -4,7 +4,7 @@ mod platform;
 
 pub use platform::Xai;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption};
 
 const GROK_CONTEXT_WINDOW: u32 = 500_000;
 const GROK_4_3_CONTEXT_WINDOW: u32 = 1_000_000;
@@ -22,57 +22,74 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
+/// Levels these models declare, matching the models.dev catalog. The live
+/// `/language-models` response overrides these once it lands.
+const EFFORT_TO_XHIGH: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh"])];
+const EFFORT_TO_HIGH: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
+const EFFORT_WITH_NONE: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["none", "low", "medium", "high"])];
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["grok-4.6"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["grok-4.6"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 6.00,
+                    cache_write: 0.00,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
+                context_window: GROK_CONTEXT_WINDOW,
+                reasoning_options: Some(EFFORT_TO_XHIGH),
             },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_CONTEXT_WINDOW,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
+            ModelEntry {
+                prefixes: &["grok-4.5"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: false,
+                pricing: ModelPricing {
+                    input: 2.00,
+                    output: 6.00,
+                    cache_write: 0.00,
+                    cache_read: 0.50,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
+                context_window: GROK_CONTEXT_WINDOW,
+                reasoning_options: Some(EFFORT_TO_HIGH),
             },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_CONTEXT_WINDOW,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.3"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 2.50,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
+            ModelEntry {
+                prefixes: &["grok-4.3"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Generic,
+                vision: true,
+                default: true,
+                pricing: ModelPricing {
+                    input: 1.25,
+                    output: 2.50,
+                    cache_write: 0.00,
+                    cache_read: 0.20,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
+                context_window: GROK_4_3_CONTEXT_WINDOW,
+                reasoning_options: Some(EFFORT_WITH_NONE),
             },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_4_3_CONTEXT_WINDOW,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 #[cfg(test)]

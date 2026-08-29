@@ -2,13 +2,14 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::id::SessionRef;
+use maki_storage::thinking::EFFORT_NONE;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    dialect,
+    AgentError, Message, ProviderEvent, ReasoningOption, ReasoningOptions, RequestOptions,
+    StreamResponse,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -41,13 +42,6 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
-}
-
-#[derive(Debug)]
-struct OpenRouterModelInfo {
-    reasoning_mandatory: bool,
-    reasoning_default_enabled: bool,
-    reasoning_efforts: Vec<Effort>,
 }
 
 pub struct OpenRouter {
@@ -83,23 +77,38 @@ impl OpenRouter {
     }
 }
 
-/// OpenRouter models come in three reasoning states, encoded here as a
-/// dialect so `effort_str` can resolve them like any other provider:
-/// 1. mandatory - always on; Off sends nothing (can't disable).
-/// 2. default_enabled - on by default; Off sends effort "none".
-/// 3. default off - Off sends nothing; any effort string turns it on.
-fn effort_dialect(info: Option<&OpenRouterModelInfo>) -> EffortDialect<'_> {
-    let Some(info) = info else {
-        return dialect::PREFER_HIGH;
-    };
-    EffortDialect {
-        supported: match info.reasoning_efforts.as_slice() {
-            [] => dialect::PREFER_HIGH.supported,
-            declared => declared,
-        },
-        off: (info.reasoning_default_enabled && !info.reasoning_mandatory).then_some(dialect::OFF),
-        ..dialect::PREFER_HIGH
+/// OpenRouter reports reasoning per model, in the three states its API
+/// documents. Translated into what the model accepts, so it resolves through
+/// the same path as every other provider:
+/// 1. mandatory - always on, so there is no way to spell off.
+/// 2. default_enabled - on unless told otherwise, and "none" is how you tell it.
+/// 3. default off - a plain toggle; omitting the field keeps it off.
+fn reasoning_options(reasoning: &serde_json::Map<String, Value>) -> ReasoningOptions {
+    let mandatory = reasoning.get("mandatory").and_then(Value::as_bool) == Some(true);
+    let default_enabled = reasoning.get("default_enabled").and_then(Value::as_bool) == Some(true);
+
+    let mut values: Vec<String> = reasoning
+        .get("supported_efforts")
+        .and_then(Value::as_array)
+        .map(|declared| {
+            declared
+                .iter()
+                .filter_map(|value| Some(value.as_str()?.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut options = Vec::new();
+    if !mandatory && !default_enabled {
+        options.push(ReasoningOption::Toggle);
     }
+    if !mandatory && default_enabled && !values.iter().any(|value| value == EFFORT_NONE) {
+        values.insert(0, EFFORT_NONE.to_string());
+    }
+    if !values.is_empty() {
+        options.push(ReasoningOption::Effort { values });
+    }
+    ReasoningOptions::new(options)
 }
 
 fn parse_model(m: &Value) -> Option<ModelInfo> {
@@ -135,29 +144,11 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
                 .unwrap_or(0.0),
             cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
             fast: None,
+            tiers: Vec::new(),
         })
     });
 
-    let reasoning = m
-        .get("reasoning")
-        .and_then(|v| v.as_object())
-        .map(|v| OpenRouterModelInfo {
-            reasoning_mandatory: v.get("mandatory").and_then(Value::as_bool) == Some(true),
-            reasoning_default_enabled: v.get("default_enabled").and_then(Value::as_bool)
-                == Some(true),
-            reasoning_efforts: v
-                .get("supported_efforts")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    let mut efforts: Vec<Effort> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str()?.parse().ok())
-                        .collect();
-                    efforts.sort_unstable();
-                    efforts
-                })
-                .unwrap_or_default(),
-        });
+    let reasoning = m.get("reasoning").and_then(Value::as_object);
 
     let supports_thinking = reasoning.is_some()
         || m.get("supported_parameters")
@@ -171,8 +162,9 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         pricing,
         supports_thinking: Some(supports_thinking),
         supports_vision: Some(supports_vision),
+        reasoning_options: reasoning.map(reasoning_options),
         tier: None,
-        provider_info: reasoning.map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
+        provider_info: None,
     })
 }
 
@@ -195,14 +187,8 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
-                "openrouter",
-                &model.id,
-            );
-
-            let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()
-                && let Some(effort) = opts.thinking.effort_str(&effort_dialect, model)
+                && let Some(effort) = opts.thinking.effort_str(model)
             {
                 body["reasoning"] = json!({"effort": effort});
             }
@@ -302,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_reasoning_efforts_skips_unknown_and_sorts() {
+    fn parse_model_keeps_declared_efforts_in_order() {
         let mut m = kimi_k3_json();
         m["reasoning"] = json!({
             "mandatory": false,
@@ -311,62 +297,40 @@ mod tests {
         });
 
         let info = parse_model(&m).expect("model should parse");
-        let provider_info = info.provider_info.expect("reasoning info should be set");
-        let reasoning = provider_info
-            .downcast_ref::<OpenRouterModelInfo>()
-            .expect("wrong provider info type");
-        assert!(reasoning.reasoning_default_enabled);
-        assert!(!reasoning.reasoning_mandatory);
-        assert_eq!(reasoning.reasoning_efforts, vec![Effort::Low, Effort::High]);
+        let options = info.reasoning_options.expect("reasoning should be declared");
+        // Declaration order is the ladder, and a spelling maki does not know is
+        // still the provider's to declare.
+        assert_eq!(options.efforts(), ["high", "bogus", "low", "none"]);
+        assert!(!options.has_toggle());
     }
 
-    fn openrouter_model(info: Option<&OpenRouterModelInfo>) -> (EffortDialect<'_>, Model) {
-        let model = Model {
-            id: "test-model".into(),
-            provider: "openrouter".into(),
-            tier: crate::model::ModelTier::Medium,
-            family: crate::model::ModelFamily::Generic,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            pricing: ModelPricing::default(),
-            discovered_free: false,
-            max_output_tokens: Some(8192),
-            context_window: 200_000,
-            thinking_fields: None,
-        };
-        (effort_dialect(info), model)
+    fn openrouter_model(reasoning: Value) -> Model {
+        let info = parse_model(&json!({
+            "id": "vendor/test-model",
+            "context_length": 200_000,
+            "architecture": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+            },
+            "reasoning": reasoning,
+        }))
+        .expect("model should parse");
+        let mut model = Model::from_spec("openrouter/vendor/test-model").unwrap();
+        model.reasoning_options = info.reasoning_options.unwrap_or_default();
+        model
     }
 
-    fn reasoning_info(efforts: &[Effort]) -> OpenRouterModelInfo {
-        OpenRouterModelInfo {
-            reasoning_mandatory: false,
-            reasoning_default_enabled: false,
-            reasoning_efforts: efforts.to_vec(),
-        }
-    }
-
-    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::XHigh), "xhigh" ; "declared_xhigh_passes_through")]
-    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::Max),   "xhigh" ; "max_snaps_to_declared_xhigh")]
-    #[test_case(&[Effort::Minimal, Effort::Low], ThinkingConfig::Adaptive,             "low"   ; "adaptive_snaps_into_declared")]
-    #[test_case(&[], ThinkingConfig::Effort(Effort::XHigh), "high" ; "no_declared_falls_back_to_static")]
-    fn effort_dialect_snaps_once_against_declared_levels(
-        efforts: &[Effort],
+    #[test_case(json!(["high", "xhigh"]), ThinkingConfig::Effort("xhigh".into()), Some("xhigh") ; "declared_level_passes_through")]
+    #[test_case(json!(["high", "xhigh"]), ThinkingConfig::Effort("max".into()),   Some("xhigh") ; "undeclared_level_snaps_down")]
+    #[test_case(json!(["minimal", "low"]), ThinkingConfig::Adaptive,              None          ; "adaptive_leaves_the_choice_to_the_model")]
+    #[test_case(json!([]), ThinkingConfig::Effort("xhigh".into()),                Some("xhigh") ; "undeclared_model_sends_what_was_asked")]
+    fn effort_resolves_against_declared_levels(
+        efforts: Value,
         config: ThinkingConfig,
-        expected: &str,
+        expected: Option<&str>,
     ) {
-        let info = reasoning_info(efforts);
-        let (dialect, model) = openrouter_model(Some(&info));
-        assert_eq!(config.effort_str(&dialect, &model), Some(expected));
-    }
-
-    #[test]
-    fn no_reasoning_info_still_requests_high_effort() {
-        let (dialect, model) = openrouter_model(None);
-        assert_eq!(
-            ThinkingConfig::Adaptive.effort_str(&dialect, &model),
-            Some("high")
-        );
+        let model = openrouter_model(json!({"supported_efforts": efforts}));
+        assert_eq!(config.effort_str(&model).as_deref(), expected);
     }
 
     #[test_case(false, false, None         ; "default_off_sends_nothing")]
@@ -377,13 +341,14 @@ mod tests {
         mandatory: bool,
         expected: Option<&str>,
     ) {
-        let info = OpenRouterModelInfo {
-            reasoning_mandatory: mandatory,
-            reasoning_default_enabled: default_enabled,
-            reasoning_efforts: vec![],
-        };
-        let (dialect, model) = openrouter_model(Some(&info));
-        assert_eq!(ThinkingConfig::Off.effort_str(&dialect, &model), expected);
+        let model = openrouter_model(json!({
+            "default_enabled": default_enabled,
+            "mandatory": mandatory,
+        }));
+        assert_eq!(
+            ThinkingConfig::Off.effort_str(&model).as_deref(),
+            expected
+        );
     }
 
     #[test_case(json!(["image"]), json!(["image"]); "image_only")]

@@ -1166,6 +1166,7 @@ mod tests {
     const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
     const PAID_PRICING: ModelPricing = ModelPricing {
+        tiers: Vec::new(),
         input: 3.0,
         output: 15.0,
         cache_write: 0.0,

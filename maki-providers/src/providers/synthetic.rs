@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -33,56 +33,64 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["hf:moonshotai/Kimi-K2.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.45,
-                output: 3.40,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
+    const MODELS: &[ModelEntry] = &[
+            ModelEntry {
+                prefixes: &["hf:moonshotai/Kimi-K2.5"],
+                tier: ModelTier::Strong,
+                family: ModelFamily::Synthetic,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.45,
+                    output: 3.40,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.56,
-                output: 1.68,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
+            ModelEntry {
+                prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
+                tier: ModelTier::Medium,
+                family: ModelFamily::Synthetic,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.56,
+                    output: 1.68,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
+            ModelEntry {
+                prefixes: &["hf:zai-org/GLM-4.7-Flash"],
+                tier: ModelTier::Weak,
+                family: ModelFamily::Synthetic,
+                vision: false,
+                default: true,
+                pricing: ModelPricing {
+                    input: 0.10,
+                    output: 0.50,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                    tiers: Vec::new(),
+                },
+                max_output_tokens: Some(131072),
+                context_window: 200_000,
+                reasoning_options: None,
             },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-    ]
+    
+    ];
+    MODELS
 }
 
 pub struct Synthetic {
@@ -135,7 +143,7 @@ impl Provider for Synthetic {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+                .apply_reasoning_effort(&mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

@@ -312,6 +312,7 @@ impl LocalEndpoint {
                     pricing: Some(crate::model::ModelPricing::ZERO),
                     supports_thinking: None,
                     supports_vision,
+                    reasoning_options: None,
                     tier: None,
                     provider_info: None,
                 })
@@ -431,6 +432,7 @@ impl LocalEndpoint {
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
                 supports_vision: None,
+                reasoning_options: None,
                 tier: None,
                 provider_info: None,
             })
