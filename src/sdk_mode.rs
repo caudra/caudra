@@ -19,7 +19,9 @@ use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
+use maki_agent::permissions::{
+    PermissionAnswer, PermissionLifetime, PermissionManager, PluginRuleStore,
+};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
@@ -1087,13 +1089,13 @@ fn decode_permission_response(
                 return PermissionAnswer::Deny;
             }
             let Some(updates) = data.get("updatedPermissions") else {
-                return PermissionAnswer::AllowOnce;
+                return exact_permission_allow(PermissionLifetime::Once);
             };
             let Some(updates) = updates.as_array() else {
                 return PermissionAnswer::Deny;
             };
             if updates.is_empty() {
-                return PermissionAnswer::AllowOnce;
+                return exact_permission_allow(PermissionLifetime::Once);
             }
             let mut destination = None;
             for update in updates {
@@ -1122,9 +1124,11 @@ fn decode_permission_response(
                 destination = current;
             }
             match destination {
-                Some("session") => PermissionAnswer::AllowSession,
-                Some("projectSettings" | "localSettings") => PermissionAnswer::AllowAlwaysLocal,
-                Some("userSettings") => PermissionAnswer::AllowAlwaysGlobal,
+                Some("session") => exact_permission_allow(PermissionLifetime::Conversation),
+                Some("projectSettings" | "localSettings") => {
+                    exact_permission_allow(PermissionLifetime::Project)
+                }
+                Some("userSettings") => exact_permission_allow(PermissionLifetime::Global),
                 _ => PermissionAnswer::Deny,
             }
         }
@@ -1133,6 +1137,13 @@ fn decode_permission_response(
             _ => PermissionAnswer::Deny,
         },
         _ => PermissionAnswer::Deny,
+    }
+}
+
+fn exact_permission_allow(lifetime: PermissionLifetime) -> PermissionAnswer {
+    PermissionAnswer::AllowOption {
+        option_id: "allow_exact".into(),
+        lifetime,
     }
 }
 
@@ -1584,12 +1595,11 @@ mod tests {
         );
         PermissionRuleRecord::conversation(
             request
-                .options
-                .iter()
-                .find(|option| option.id == "allow_conversation")
-                .unwrap()
-                .rule
-                .clone(),
+                .option_rule(
+                    "allow_exact",
+                    maki_agent::permissions::PermissionLifetime::Conversation,
+                )
+                .unwrap(),
         )
         .unwrap()
     }
@@ -2085,18 +2095,18 @@ mod tests {
 
     #[test]
     fn decode_permission_response_variants() {
-        assert!(matches!(
+        assert_eq!(
             decode_permission_response(&serde_json::json!({"behavior": "allow"}), None, None),
-            PermissionAnswer::AllowOnce
-        ));
-        assert!(matches!(
+            exact_permission_allow(PermissionLifetime::Once)
+        );
+        assert_eq!(
             decode_permission_response(
                 &serde_json::json!({"behavior": "allow", "updatedPermissions": []}),
                 None,
                 None,
             ),
-            PermissionAnswer::AllowOnce
-        ));
+            exact_permission_allow(PermissionLifetime::Once)
+        );
         assert!(matches!(
             decode_permission_response(&serde_json::json!({}), None, None),
             PermissionAnswer::Deny
@@ -2129,7 +2139,7 @@ mod tests {
             ),
             PermissionAnswer::Deny
         ));
-        assert!(matches!(
+        assert_eq!(
             decode_permission_response(
                 &serde_json::json!({
                     "behavior": "allow",
@@ -2144,8 +2154,8 @@ mod tests {
                 Some(&serde_json::json!({"command": "cargo test"})),
                 Some("Bash"),
             ),
-            PermissionAnswer::AllowSession
-        ));
+            exact_permission_allow(PermissionLifetime::Conversation)
+        );
         assert!(matches!(
             decode_permission_response(
                 &serde_json::json!({

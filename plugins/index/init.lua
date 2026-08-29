@@ -10,8 +10,6 @@ local opts = maki.api.register_options({
   max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
 })
 
-maki.api.register_permission_rule({ tool = "index", scope = "*" })
-
 local function split_trailing_range(line)
   local pos = line:find(" %[%d[%d%-,]*%]$")
   if not pos then

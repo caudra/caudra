@@ -308,10 +308,11 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
     }
 }
 
-fn authority_badge(record: &PermissionRuleRecord) -> &'static str {
-    match record.rule.arguments {
+fn authority_badge(record: &PermissionRuleRecord) -> String {
+    let argument = match record.rule.arguments {
         PermissionArgumentConstraint::Exact { .. } => "exact",
-        PermissionArgumentConstraint::Selected { .. } => "resource",
+        PermissionArgumentConstraint::Selected { .. }
+        | PermissionArgumentConstraint::SelectedDigest { .. } => "selected",
         PermissionArgumentConstraint::Unconstrained
             if record.rule.resources.is_empty()
                 || record.rule.resources.iter().any(|resource| {
@@ -321,7 +322,39 @@ fn authority_badge(record: &PermissionRuleRecord) -> &'static str {
             "any"
         }
         PermissionArgumentConstraint::Unconstrained => "resource",
-    }
+    };
+    let selector = if record.rule.resources.iter().any(|resource| {
+        matches!(
+            resource.selector,
+            PermissionResourceSelector::UrlOriginDigest { .. }
+        )
+    }) {
+        "origin/**"
+    } else if record.rule.resources.iter().any(|resource| {
+        matches!(
+            resource.selector,
+            PermissionResourceSelector::UrlSubtreeDigest { .. }
+        )
+    }) {
+        "url/**"
+    } else if record.rule.resources.iter().any(|resource| {
+        matches!(
+            resource.selector,
+            PermissionResourceSelector::FilesystemSubtreeDigest { .. }
+        )
+    }) {
+        "directory/**"
+    } else if record
+        .rule
+        .resources
+        .iter()
+        .any(|resource| matches!(resource.selector, PermissionResourceSelector::Any))
+    {
+        "*"
+    } else {
+        "exact-resource"
+    };
+    format!("{argument}:{selector}")
 }
 
 fn effect_name(effect: &StructuredPermissionEffect) -> &'static str {
@@ -396,7 +429,7 @@ mod tests {
         let id = record.id.clone();
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[]);
-        let backend = TestBackend::new(100, 16);
+        let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -405,10 +438,9 @@ mod tests {
             .unwrap();
         let screen = buffer_text(terminal.backend().buffer());
         assert!(screen.contains("bash"));
-        assert!(screen.contains("[exact] deny"));
+        assert!(screen.contains("[exact:exact-resource] deny"));
         assert!(screen.contains("conversation"));
         assert!(screen.contains("args"));
-        assert!(screen.contains("field:1"));
         assert!(screen.contains(&DIGEST[..10]));
 
         let enter = KeyEvent::from(KeyCode::Enter);

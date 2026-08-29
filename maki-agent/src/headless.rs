@@ -202,6 +202,7 @@ struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
     tools: Value,
+    tool_filter: ToolFilter,
 }
 
 fn setup(
@@ -225,6 +226,7 @@ fn setup(
         vars,
         instructions,
         tools,
+        tool_filter: ToolFilter::from_config(config, model, excluded_tools),
     }
 }
 
@@ -264,6 +266,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         vars,
         instructions,
         tools,
+        tool_filter,
     } = setup(
         &params.model,
         &params.config,
@@ -330,6 +333,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     subagent_history: SubagentHistoryStore::default(),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
+                    tool_filter,
                     model_policy: Arc::clone(&params.model_policy),
                 },
                 AgentRunParams {
@@ -423,6 +427,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         vars,
         instructions,
         mut tools,
+        mut tool_filter,
     } = setup(
         &params.model,
         &params.config,
@@ -543,6 +548,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 params.workflow,
                                 ToolRegistry::global(),
                             );
+                            tool_filter = ToolFilter::from_config(
+                                &params.config,
+                                &new_model,
+                                &params.excluded_tools,
+                            );
                             model = new_model;
                         }
                         Err(e) => {
@@ -588,6 +598,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         subagent_history: subagent_history.clone(),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
+                        tool_filter: tool_filter.clone(),
                         model_policy: Arc::clone(&params.model_policy),
                     },
                     AgentRunParams {
@@ -844,12 +855,11 @@ mod tests {
         );
         let structured = PermissionRuleRecord::conversation(
             request
-                .options
-                .iter()
-                .find(|option| option.id == "allow_conversation")
-                .unwrap()
-                .rule
-                .clone(),
+                .option_rule(
+                    "allow_exact",
+                    crate::permissions::PermissionLifetime::Conversation,
+                )
+                .unwrap(),
         )
         .unwrap();
         permissions.load_structured_conversation_rules(vec![structured.clone()]);

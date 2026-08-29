@@ -2,7 +2,8 @@ use std::collections::{HashSet, VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::permissions::{
-    DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionRequest, PermissionRisk,
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRisk,
+    StructuredPermissionEffect,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -16,9 +17,7 @@ use crate::components::{ModalScroll, Overlay, escape_terminal_controls, hint_lin
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
-const MAX_HEIGHT: u16 = 18;
 const NARROW_WIDTH: u16 = 60;
-const BROAD_UNAVAILABLE: &str = "Unavailable pending a richer scope chooser.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PromptState {
@@ -50,6 +49,7 @@ pub struct PermissionPrompt {
     buffer: TextBuffer,
     scroll: ModalScroll,
     full_details: bool,
+    selected_option: String,
 }
 
 impl Overlay for PermissionPrompt {
@@ -77,12 +77,18 @@ impl PermissionPrompt {
             buffer: TextBuffer::new(String::new()),
             scroll: ModalScroll::new_top(),
             full_details: false,
+            selected_option: "allow_exact".into(),
         }
     }
 
     pub fn enqueue(&mut self, request: Box<PermissionRequest>, requester: Option<String>) -> bool {
         if !self.request_ids.insert(request.id.clone()) {
             return false;
+        }
+        if self.requests.is_empty()
+            && let Some(option) = request.options.iter().find(|option| option.is_default)
+        {
+            self.selected_option = option.id.clone();
         }
         self.requests
             .push_back(QueuedPermission { request, requester });
@@ -157,6 +163,23 @@ impl PermissionPrompt {
         }
 
         if let Some(answer) = self.confirm_answer() {
+            if let Some(phrase) = self.confirmation_phrase() {
+                return match key.code {
+                    KeyCode::Enter if self.buffer.value().trim() == phrase => {
+                        Some(PermissionDecision { request_id, answer })
+                    }
+                    KeyCode::Esc => {
+                        self.state = PromptState::Normal;
+                        self.buffer = TextBuffer::new(String::new());
+                        self.scroll.reset();
+                        None
+                    }
+                    _ => {
+                        self.buffer.handle_key(key);
+                        None
+                    }
+                };
+            }
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     Some(PermissionDecision { request_id, answer })
@@ -195,11 +218,17 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Char('a') => {
-                self.open_confirmation(PromptState::ConfirmAllowAlwaysLocal);
+                self.open_allow_confirmation(
+                    PromptState::ConfirmAllowAlwaysLocal,
+                    PermissionLifetime::Project,
+                );
                 None
             }
             KeyCode::Char('A') => {
-                self.open_confirmation(PromptState::ConfirmAllowAlwaysGlobal);
+                self.open_allow_confirmation(
+                    PromptState::ConfirmAllowAlwaysGlobal,
+                    PermissionLifetime::Global,
+                );
                 None
             }
             KeyCode::Char('d') => {
@@ -211,7 +240,18 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Char('s') => {
-                self.open_confirmation(PromptState::ConfirmAllowSession);
+                self.open_allow_confirmation(
+                    PromptState::ConfirmAllowSession,
+                    PermissionLifetime::Conversation,
+                );
+                None
+            }
+            KeyCode::Tab => {
+                self.cycle_option(false);
+                None
+            }
+            KeyCode::BackTab => {
+                self.cycle_option(true);
                 None
             }
             KeyCode::Char('f') => {
@@ -237,7 +277,9 @@ impl PermissionPrompt {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if self.state != PromptState::DenyEditing || !self.is_open() {
+        if (self.state != PromptState::DenyEditing && self.confirmation_phrase().is_none())
+            || !self.is_open()
+        {
             return false;
         }
         self.buffer.insert_text(text);
@@ -296,9 +338,7 @@ impl PermissionPrompt {
             .wrap(Wrap { trim: false })
             .line_count(inner_width) as u16;
         let footer = self.footer_lines(inner_width, request).len() as u16;
-        body.saturating_add(footer)
-            .saturating_add(2)
-            .min(MAX_HEIGHT)
+        body.saturating_add(footer).saturating_add(2)
     }
 
     fn current(&self) -> Option<&PermissionRequest> {
@@ -310,22 +350,100 @@ impl PermissionPrompt {
         self.buffer = TextBuffer::new(String::new());
         self.scroll.reset();
         self.full_details = false;
+        self.selected_option = self
+            .current()
+            .and_then(|request| {
+                request.options.iter().find(|option| {
+                    option.is_default && option.rule.effect == StructuredPermissionEffect::Allow
+                })
+            })
+            .map(|option| option.id.clone())
+            .unwrap_or_else(|| "allow_exact".into());
     }
 
     fn open_confirmation(&mut self, state: PromptState) {
         self.state = state;
+        self.buffer = TextBuffer::new(String::new());
+        self.scroll.reset();
+    }
+
+    fn open_allow_confirmation(&mut self, state: PromptState, lifetime: PermissionLifetime) {
+        if self
+            .selected_authority()
+            .is_some_and(|option| option.allowed_lifetimes.contains(&lifetime))
+        {
+            self.open_confirmation(state);
+        }
+    }
+
+    fn selected_authority(&self) -> Option<&maki_agent::permissions::PermissionRuleOption> {
+        self.current()?.options.iter().find(|option| {
+            option.id == self.selected_option
+                && option.rule.effect == StructuredPermissionEffect::Allow
+        })
+    }
+
+    fn cycle_option(&mut self, reverse: bool) {
+        let Some(request) = self.current() else {
+            return;
+        };
+        let options: Vec<_> = request
+            .options
+            .iter()
+            .filter(|option| {
+                option.rule.effect == StructuredPermissionEffect::Allow
+                    && option
+                        .allowed_lifetimes
+                        .iter()
+                        .any(|lifetime| *lifetime != PermissionLifetime::Once)
+            })
+            .collect();
+        if options.is_empty() {
+            return;
+        }
+        let current = options
+            .iter()
+            .position(|option| option.id == self.selected_option)
+            .unwrap_or(0);
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(options.len() - 1)
+        } else {
+            (current + 1) % options.len()
+        };
+        self.selected_option = options[next].id.clone();
         self.scroll.reset();
     }
 
     fn confirm_answer(&self) -> Option<PermissionAnswer> {
         match self.state {
-            PromptState::ConfirmAllowAlwaysLocal => Some(PermissionAnswer::AllowAlwaysLocal),
-            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal),
-            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession),
+            PromptState::ConfirmAllowAlwaysLocal => Some(PermissionAnswer::AllowOption {
+                option_id: self.selected_option.clone(),
+                lifetime: PermissionLifetime::Project,
+            }),
+            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowOption {
+                option_id: self.selected_option.clone(),
+                lifetime: PermissionLifetime::Global,
+            }),
+            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowOption {
+                option_id: self.selected_option.clone(),
+                lifetime: PermissionLifetime::Conversation,
+            }),
             PromptState::ConfirmDenyAlwaysLocal => Some(PermissionAnswer::DenyAlwaysLocal),
             PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
             PromptState::Normal | PromptState::DenyEditing => None,
         }
+    }
+
+    fn confirmation_phrase(&self) -> Option<&str> {
+        if !matches!(
+            self.state,
+            PromptState::ConfirmAllowSession
+                | PromptState::ConfirmAllowAlwaysLocal
+                | PromptState::ConfirmAllowAlwaysGlobal
+        ) {
+            return None;
+        }
+        self.selected_authority()?.confirmation.as_deref()
     }
 
     fn body_lines(&self, request: &PermissionRequest) -> Vec<Line<'static>> {
@@ -383,6 +501,44 @@ impl PermissionPrompt {
                 ])
             }));
         }
+        let authorities: Vec<_> = request
+            .options
+            .iter()
+            .filter(|option| {
+                option.rule.effect == StructuredPermissionEffect::Allow
+                    && option
+                        .allowed_lifetimes
+                        .iter()
+                        .any(|lifetime| *lifetime != PermissionLifetime::Once)
+            })
+            .collect();
+        if !authorities.is_empty() {
+            lines.extend([
+                Line::default(),
+                Line::from(Span::styled("  Reusable authority", t.panel_title)),
+            ]);
+            for option in authorities {
+                let selected = option.id == self.selected_option;
+                lines.push(Line::from(vec![
+                    Span::styled(if selected { "  > " } else { "    " }, t.status_notice),
+                    Span::styled(safe(&option.label), if selected { value } else { label }),
+                    Span::styled(
+                        if option.is_default {
+                            " [recommended]"
+                        } else {
+                            ""
+                        },
+                        t.tool_success,
+                    ),
+                ]));
+                if selected {
+                    lines.push(Line::from(Span::styled(
+                        format!("      {}", safe(&option.description)),
+                        t.tool_dim,
+                    )));
+                }
+            }
+        }
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
@@ -420,17 +576,6 @@ impl PermissionPrompt {
                 ),
                 field_line("Input SHA-256", safe(&request.input_digest), label, value),
             ]);
-            for option in request.options.iter().filter(|option| option.broad) {
-                lines.extend([
-                    Line::default(),
-                    Line::from(Span::styled("  Broad MCP authority", t.panel_title)),
-                    Line::from(format!("    {}", safe(&option.label))),
-                    Line::from(Span::styled(
-                        format!("    {} {BROAD_UNAVAILABLE}", safe(&option.description)),
-                        t.tool_dim,
-                    )),
-                ]);
-            }
         }
 
         if let Some(authority) = self.confirmation_authority(request) {
@@ -439,39 +584,45 @@ impl PermissionPrompt {
                 Line::from(Span::styled("  Confirm future authority", t.panel_title)),
                 Line::from(format!("    {authority}")),
                 Line::from(Span::styled(
-                    format!("    Exact action: {}", safe(&request.presentation.action)),
-                    t.tool_dim,
-                )),
-                Line::from(Span::styled(
-                    format!("    Exact input SHA-256: {}", safe(&request.input_digest)),
+                    format!("    Action: {}", safe(&request.presentation.action)),
                     t.tool_dim,
                 )),
             ]);
+            if let Some(phrase) = self.confirmation_phrase() {
+                lines.extend([
+                    Line::from(Span::styled(
+                        format!("    Type {phrase} to confirm."),
+                        t.error,
+                    )),
+                    self.confirmation_input_line(),
+                ]);
+            }
         }
         lines
     }
 
-    fn footer_lines(&self, width: u16, request: &PermissionRequest) -> Vec<Line<'static>> {
+    fn footer_lines(&self, width: u16, _request: &PermissionRequest) -> Vec<Line<'static>> {
         match self.state {
             PromptState::Normal if width < NARROW_WIDTH => vec![
                 hint_line(&[("y", "once"), ("s", "convo")]),
                 hint_line(&[("a", "project"), ("A", "global")]),
                 hint_line(&[("n", "guide deny"), ("d", "deny project")]),
-                hint_line(&[("D", "deny global"), ("f", "details")]),
+                hint_line(&[("D", "deny global"), ("Tab", "authority"), ("f", "details")]),
             ],
             PromptState::Normal => vec![
                 hint_line(&[
-                    ("y", option_label(request, "allow_once", "Allow once")),
-                    ("s", "Exact conversation".to_string()),
+                    ("y", "Allow once".to_string()),
+                    ("s", "Selected conversation".to_string()),
                 ]),
                 hint_line(&[
-                    ("a", "Exact project".to_string()),
-                    ("A", "Exact global".to_string()),
+                    ("a", "Selected project".to_string()),
+                    ("A", "Selected global".to_string()),
                 ]),
                 hint_line(&[
                     ("n", "Guidance".to_string()),
                     ("d", "Deny project".to_string()),
                     ("D", "Deny global".to_string()),
+                    ("Tab", "Authority".to_string()),
                     ("f", "Details".to_string()),
                     ("↑/↓", "Inspect".to_string()),
                 ]),
@@ -485,10 +636,14 @@ impl PermissionPrompt {
             | PromptState::ConfirmAllowSession
             | PromptState::ConfirmDenyAlwaysLocal
             | PromptState::ConfirmDenyAlwaysGlobal => {
-                vec![hint_line(&[
-                    ("Enter/y", "Confirm exact authority"),
-                    ("Esc", "Back"),
-                ])]
+                if self.confirmation_phrase().is_some() {
+                    vec![hint_line(&[("Enter", "Confirm phrase"), ("Esc", "Back")])]
+                } else {
+                    vec![hint_line(&[
+                        ("Enter/y", "Confirm authority"),
+                        ("Esc", "Back"),
+                    ])]
+                }
             }
         }
     }
@@ -517,21 +672,28 @@ impl PermissionPrompt {
         ])
     }
 
+    fn confirmation_input_line(&self) -> Line<'static> {
+        let t = theme::current();
+        let text = escape_terminal_controls(&self.buffer.value());
+        Line::from(vec![
+            Span::styled("    > ", t.tool_dim),
+            Span::styled(text, Style::new().fg(t.foreground)),
+            Span::styled(" ", Style::new().reversed()),
+        ])
+    }
+
     fn confirmation_authority(&self, request: &PermissionRequest) -> Option<String> {
-        let option = |id: &str| {
+        let selected = || {
             request
                 .options
                 .iter()
-                .find(|option| option.id == id && !option.broad)
+                .find(|option| option.id == self.selected_option)
                 .map(|option| escape_terminal_controls(&option.description))
         };
         match self.state {
-            PromptState::ConfirmAllowSession => option("allow_conversation")
-                .or_else(|| Some("Allow only this exact call for this conversation.".into())),
-            PromptState::ConfirmAllowAlwaysLocal => option("allow_project")
-                .or_else(|| Some("Allow only this exact call for this project.".into())),
-            PromptState::ConfirmAllowAlwaysGlobal => option("allow_global")
-                .or_else(|| Some("Allow only this exact call globally.".into())),
+            PromptState::ConfirmAllowSession
+            | PromptState::ConfirmAllowAlwaysLocal
+            | PromptState::ConfirmAllowAlwaysGlobal => selected(),
             PromptState::ConfirmDenyAlwaysLocal => {
                 Some("Deny this exact action, resources, and input for this project.".into())
             }
@@ -560,15 +722,6 @@ fn risk_name(risk: &PermissionRisk) -> &'static str {
     }
 }
 
-fn option_label(request: &PermissionRequest, id: &str, fallback: &str) -> String {
-    request
-        .options
-        .iter()
-        .find(|option| option.id == id && !option.broad)
-        .map(|option| escape_terminal_controls(&option.label))
-        .unwrap_or_else(|| fallback.to_string())
-}
-
 fn masked_json(input: &Value) -> String {
     serde_json::to_string_pretty(&mask_secrets(input)).unwrap_or_else(|_| "null".into())
 }
@@ -589,8 +742,25 @@ fn mask_secrets(value: &Value) -> Value {
                 .collect::<Map<_, _>>(),
         ),
         Value::Array(values) => Value::Array(values.iter().map(mask_secrets).collect()),
+        Value::String(value) => Value::String(redact_url_query(value)),
         _ => value.clone(),
     }
+}
+
+fn redact_url_query(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value.to_owned();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.query().is_none() {
+        return value.to_owned();
+    }
+    let query = url
+        .query_pairs()
+        .map(|(key, _)| format!("{key}=<redacted>"))
+        .collect::<Vec<_>>()
+        .join("&");
+    url.set_query(Some(&query));
+    url.to_string()
 }
 
 fn likely_secret_key(key: &str) -> bool {
@@ -631,7 +801,7 @@ mod tests {
     use std::path::Path;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use maki_agent::permissions::{PermissionAnswer, PermissionRequest};
+    use maki_agent::permissions::{PermissionAnswer, PermissionLifetime, PermissionRequest};
     use maki_config::ToolKey;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -713,9 +883,9 @@ mod tests {
         );
     }
 
-    #[test_case('s', PermissionAnswer::AllowSession, PromptState::ConfirmAllowSession, "Remember only this exact call for the conversation." ; "conversation")]
-    #[test_case('a', PermissionAnswer::AllowAlwaysLocal, PromptState::ConfirmAllowAlwaysLocal, "Remember only this exact call for this project." ; "project_allow")]
-    #[test_case('A', PermissionAnswer::AllowAlwaysGlobal, PromptState::ConfirmAllowAlwaysGlobal, "Remember only this exact call globally." ; "global_allow")]
+    #[test_case('s', PermissionAnswer::AllowOption { option_id: "allow_exact".into(), lifetime: PermissionLifetime::Conversation }, PromptState::ConfirmAllowSession, "Allow only these exact arguments and resources." ; "conversation")]
+    #[test_case('a', PermissionAnswer::AllowOption { option_id: "allow_exact".into(), lifetime: PermissionLifetime::Project }, PromptState::ConfirmAllowAlwaysLocal, "Allow only these exact arguments and resources." ; "project_allow")]
+    #[test_case('A', PermissionAnswer::AllowOption { option_id: "allow_exact".into(), lifetime: PermissionLifetime::Global }, PromptState::ConfirmAllowAlwaysGlobal, "Allow only these exact arguments and resources." ; "global_allow")]
     #[test_case('d', PermissionAnswer::DenyAlwaysLocal, PromptState::ConfirmDenyAlwaysLocal, "Deny this exact action, resources, and input for this project." ; "project_deny")]
     #[test_case('D', PermissionAnswer::DenyAlwaysGlobal, PromptState::ConfirmDenyAlwaysGlobal, "Deny this exact action, resources, and input globally." ; "global_deny")]
     fn every_persistent_decision_requires_confirmation(
@@ -807,6 +977,19 @@ mod tests {
     }
 
     #[test]
+    fn prompt_uses_available_height_instead_of_fixed_eighteen_rows() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            request(
+                "tall",
+                json!({"values": (0..24).map(|value| format!("line-{value}")).collect::<Vec<_>>() }),
+            ),
+            None,
+        );
+        assert!(prompt.height(100) > 18);
+    }
+
+    #[test]
     fn controls_are_escaped_and_secrets_are_masked_with_types() {
         let mut structured = request(
             "safe",
@@ -828,7 +1011,48 @@ mod tests {
     }
 
     #[test]
-    fn broad_mcp_authority_is_details_only_and_unavailable() {
+    fn webfetch_shows_url_authorities_and_masks_query_values() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "webfetch".into(),
+                ToolKey::native("webfetch"),
+                vec!["https://untraind.com/metronome/?token=secret".into()],
+                json!({"url": "https://untraind.com/metronome/?token=secret"}),
+                Path::new("/project"),
+                false,
+            )),
+            None,
+        );
+        let screen = render(&mut prompt, 120, 40);
+        for authority in [
+            "This exact URL",
+            "This page and subpages",
+            "Any page on this origin",
+            "Any public HTTP(S) URL",
+        ] {
+            assert!(screen.contains(authority), "missing {authority}: {screen}");
+        }
+        assert!(!screen.contains("token=secret"));
+
+        for _ in 0..4 {
+            prompt.handle_key(key(KeyCode::Tab));
+        }
+        prompt.handle_key(key(KeyCode::Char('a')));
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(prompt.handle_paste("ALLOW ANY URL"));
+        let decision = prompt.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            decision.answer,
+            PermissionAnswer::AllowOption {
+                option_id: "allow_any_url".into(),
+                lifetime: PermissionLifetime::Project,
+            }
+        );
+    }
+
+    #[test]
+    fn broad_mcp_authority_requires_explicit_selection_and_phrase() {
         let mut prompt = PermissionPrompt::new();
         prompt.enqueue(
             Box::new(PermissionRequest::from_legacy(
@@ -842,15 +1066,43 @@ mod tests {
             None,
         );
         let primary = render(&mut prompt, 100, 24);
-        assert!(!primary.contains("Allow whole MCP tool"));
+        assert!(primary.contains("Allow whole MCP tool"));
+        prompt.handle_key(key(KeyCode::Tab));
+        let selected = render(&mut prompt, 100, 24);
+        assert!(selected.contains("Broad: allow this MCP tool"));
+        prompt.handle_key(key(KeyCode::Char('s')));
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(prompt.handle_paste("ALLOW MCP TOOL"));
+        let decision = prompt.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            decision.answer,
+            PermissionAnswer::AllowOption {
+                option_id: "allow_whole_mcp_tool_conversation".into(),
+                lifetime: PermissionLifetime::Conversation,
+            }
+        );
+    }
 
-        prompt.handle_key(key(KeyCode::Char('f')));
-        let details = render(&mut prompt, 100, 30);
-        assert!(details.contains("Broad MCP authority"));
-        for _ in 0..10 {
-            prompt.handle_key(key(KeyCode::Down));
+    #[test]
+    fn broad_allow_phrase_does_not_apply_to_exact_deny() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "webfetch".into(),
+                ToolKey::native("webfetch"),
+                vec!["https://example.com/path".into()],
+                json!({"url": "https://example.com/path"}),
+                Path::new("/project"),
+                false,
+            )),
+            None,
+        );
+        for _ in 0..4 {
+            prompt.handle_key(key(KeyCode::Tab));
         }
-        let scrolled = render(&mut prompt, 100, 30);
-        assert!(scrolled.contains("Unavailable pending"));
+
+        prompt.handle_key(key(KeyCode::Char('d')));
+        let decision = prompt.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(decision.answer, PermissionAnswer::DenyAlwaysLocal);
     }
 }

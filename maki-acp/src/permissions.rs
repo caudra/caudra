@@ -1,7 +1,7 @@
 use agent_client_protocol_schema::{
     PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
 };
-use maki_agent::permissions::{PermissionAnswer, PermissionRequest};
+use maki_agent::permissions::{PermissionAnswer, PermissionLifetime, PermissionRequest};
 
 const ALLOW_ONCE_ID: &str = "allow_once";
 const ALLOW_ALWAYS_ID: &str = "allow_always";
@@ -40,8 +40,8 @@ pub fn outcome_to_answer(
     match outcome {
         RequestPermissionOutcome::Cancelled => PermissionAnswer::Deny,
         RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
-            ALLOW_ONCE_ID => PermissionAnswer::AllowOnce,
-            ALLOW_ALWAYS_ID => PermissionAnswer::AllowSession,
+            ALLOW_ONCE_ID => exact_allow(PermissionLifetime::Once),
+            ALLOW_ALWAYS_ID => exact_allow(PermissionLifetime::Conversation),
             REJECT_ONCE_ID => PermissionAnswer::Deny,
             REJECT_ALWAYS_ID if exact_project_deny => PermissionAnswer::DenyAlwaysLocal,
             REJECT_ALWAYS_ID => PermissionAnswer::Deny,
@@ -51,11 +51,20 @@ pub fn outcome_to_answer(
     }
 }
 
+fn exact_allow(lifetime: PermissionLifetime) -> PermissionAnswer {
+    PermissionAnswer::AllowOption {
+        option_id: "allow_exact".into(),
+        lifetime,
+    }
+}
+
 pub fn exact_project_deny_is_representable(request: &PermissionRequest) -> bool {
-    request
-        .options
-        .iter()
-        .any(|option| option.id == "deny_project" && !option.broad)
+    request.options.iter().any(|option| {
+        option.id == "deny_exact"
+            && option
+                .allowed_lifetimes
+                .contains(&maki_agent::permissions::PermissionLifetime::Project)
+    })
 }
 
 #[cfg(test)]

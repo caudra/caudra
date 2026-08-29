@@ -105,6 +105,59 @@ impl ToolFilter {
         }
     }
 
+    pub fn intersect(self, inherited: &Self) -> Self {
+        match (self, inherited) {
+            (Self::All, inherited) => inherited.clone(),
+            (requested, Self::All) => requested,
+            (Self::Only(requested), Self::Only(inherited)) => Self::Only(
+                requested
+                    .into_iter()
+                    .filter(|name| inherited.contains(name))
+                    .collect(),
+            ),
+            (Self::Only(requested), Self::AllExcept(blocked)) => Self::Only(
+                requested
+                    .into_iter()
+                    .filter(|name| !blocked.contains(name))
+                    .collect(),
+            ),
+            (Self::AllExcept(blocked), Self::Only(inherited)) => Self::Only(
+                inherited
+                    .iter()
+                    .filter(|name| !blocked.contains(name))
+                    .cloned()
+                    .collect(),
+            ),
+            (Self::AllExcept(mut blocked), Self::AllExcept(inherited)) => {
+                for name in inherited {
+                    if !blocked.contains(name) {
+                        blocked.push(name.clone());
+                    }
+                }
+                Self::AllExcept(blocked)
+            }
+        }
+    }
+
+    pub fn including(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        match &mut self {
+            Self::All => {}
+            Self::Only(allowed) => {
+                for name in names {
+                    if !allowed.contains(&name) {
+                        allowed.push(name);
+                    }
+                }
+            }
+            Self::AllExcept(blocked) => {
+                for name in names {
+                    blocked.retain(|blocked| blocked != &name);
+                }
+            }
+        }
+        self
+    }
+
     pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
         let base = if config.allowed_tools.is_empty() {
             Self::All
@@ -250,6 +303,7 @@ pub struct ToolContext {
     pub registry: Arc<ToolRegistry>,
     pub workflow: bool,
     pub audience: ToolAudience,
+    pub tool_filter: ToolFilter,
     pub local_tools: LocalTools,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
@@ -478,6 +532,7 @@ pub fn interpreter_ctx(
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,
+        tool_filter: ToolFilter::All,
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
@@ -673,6 +728,31 @@ mod tests {
         assert!(!filter.matches(TOOL_OUTPUT_READ_TOOL_NAME));
         assert!(!filter.matches(TOOL_OUTPUT_GREP_TOOL_NAME));
         assert!(!filter.matches(READ_TOOL_NAME));
+    }
+
+    #[test]
+    fn filter_intersection_cannot_restore_parent_exclusions() {
+        let child = ToolFilter::Only(vec![READ_TOOL_NAME.into(), BASH_TOOL_NAME.into()]);
+        let parent = ToolFilter::Only(vec![READ_TOOL_NAME.into(), TASK_TOOL_NAME.into()]);
+        let filter = child.intersect(&parent);
+        assert!(filter.matches(READ_TOOL_NAME));
+        assert!(!filter.matches(BASH_TOOL_NAME));
+        assert!(!filter.matches(TASK_TOOL_NAME));
+
+        let filter = ToolFilter::AllExcept(vec![BASH_TOOL_NAME.into()])
+            .intersect(&ToolFilter::AllExcept(vec![WRITE_TOOL_NAME.into()]));
+        assert!(filter.matches(READ_TOOL_NAME));
+        assert!(!filter.matches(BASH_TOOL_NAME));
+        assert!(!filter.matches(WRITE_TOOL_NAME));
+    }
+
+    #[test]
+    fn session_local_tools_can_extend_an_inherited_filter() {
+        let filter =
+            ToolFilter::Only(vec![READ_TOOL_NAME.into()]).including(["structured_output".into()]);
+        assert!(filter.matches(READ_TOOL_NAME));
+        assert!(filter.matches("structured_output"));
+        assert!(!filter.matches(BASH_TOOL_NAME));
     }
 
     #[test_case(TOOL_OUTPUT_READ_TOOL_NAME)]

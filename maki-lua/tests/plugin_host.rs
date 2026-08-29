@@ -2711,6 +2711,7 @@ fn call_tool_streams_live_buf_and_annotations() {
         ToolSource::Lua {
             plugin: Arc::from("usage_fixture"),
             contract: Arc::from("test-contract"),
+            bundled: false,
         },
     )
     .unwrap();
@@ -4509,8 +4510,6 @@ fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior()
             json!({ "pattern": "needle", "path": "/tmp/parent/../scope" }),
         ),
     ];
-    let rules = host.plugin_rules().snapshot();
-
     for (tool, input) in cases {
         let scopes = builtin_permission_scopes(&reg, tool, input);
         let expected = if matches!(tool, "glob" | "grep") {
@@ -4520,14 +4519,6 @@ fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior()
         };
         assert_eq!(scopes.scopes, [expected], "wrong scope for {tool}");
         assert!(!scopes.force_prompt, "{tool} unexpectedly forces a prompt");
-        assert!(
-            rules.iter().any(|rule| {
-                rule.tool == ToolKey::native(tool)
-                    && rule.scope.as_deref() == Some("*")
-                    && rule.effect == Effect::Allow
-            }),
-            "{tool} is missing its trusted default allow"
-        );
     }
 
     let manager = maki_agent::permissions::PermissionManager::new_nonpersistent(

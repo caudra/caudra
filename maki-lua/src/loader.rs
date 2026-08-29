@@ -356,6 +356,7 @@ impl PluginHost {
                 name,
                 source,
                 None,
+                true,
                 PluginPermissions::trusted(),
                 PermissionRulePolicy::Trusted,
                 opts,
@@ -364,11 +365,13 @@ impl PluginHost {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_load(
         &self,
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
+        bundled: bool,
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -380,6 +383,7 @@ impl PluginHost {
                 name,
                 source,
                 plugin_dir,
+                bundled,
                 permissions,
                 rule_policy,
                 opts,
@@ -462,6 +466,7 @@ impl PluginHost {
             Arc::from(name),
             source.to_owned(),
             None,
+            false,
             PluginPermissions::trusted(),
             PermissionRulePolicy::Trusted,
             Arc::new(opts),
@@ -478,6 +483,7 @@ impl PluginHost {
             Arc::from(name),
             source.to_owned(),
             None,
+            false,
             permissions,
             PermissionRulePolicy::Trusted,
             PluginOpts::default(),
@@ -499,6 +505,7 @@ impl PluginHost {
             Arc::from("user"),
             source,
             plugin_dir,
+            false,
             permissions,
             if trusted {
                 PermissionRulePolicy::Trusted
@@ -674,9 +681,6 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
-    const BASH_SOURCE: &str = include_str!("../../plugins/bash/init.lua");
-    const RTK_PROMPT_HINT: &str = "- RTK is active and transparently compacts output from many Bash commands, so results may differ from regular shell output. To bypass RTK for one command, prefix it with `RTK_DISABLED=1`; only do this when uncompacted output would be valuable.";
-
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
@@ -686,7 +690,48 @@ mod tests {
         let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
-        assert!(reg.has("glob"));
+        assert!(matches!(
+            reg.get("glob").unwrap().source,
+            maki_agent::tools::ToolSource::Lua { bundled: true, .. }
+        ));
+    }
+
+    #[test]
+    fn dynamically_loaded_tools_are_not_marked_as_bundled() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "replacement",
+            r#"
+            maki.api.register_tool({
+                name = "task",
+                description = "replacement",
+                schema = { type = "object", properties = {} },
+                handler = function() return "ok" end,
+            })
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.get("task").unwrap().source,
+            maki_agent::tools::ToolSource::Lua { bundled: false, .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_init_policy_requires_a_valid_plugin_manifest() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let directory = tempfile::TempDir::new().unwrap();
+        let result = host.send_run_init_lua_with_policy(
+            r#"maki.api.register_permission_rule({ tool = "bash", scope = "*", effect = "allow" })"#
+                .into(),
+            "global/init.lua".into(),
+            Some(directory.path().to_path_buf()),
+            PermissionRulePolicy::Trusted,
+        );
+
+        assert!(result.is_err());
+        assert!(host.plugin_rules().snapshot().is_empty());
     }
 
     /// The second call sends `Shutdown` on a sender that is already
@@ -736,38 +781,6 @@ mod tests {
         let slots = host
             .event_handle()
             .collect_prompt_slots(&AgentConfig::default());
-        (host, slots)
-    }
-
-    fn bash_prompt_slots(
-        probe_exit_code: i32,
-        globally_disabled: bool,
-        config: &AgentConfig,
-    ) -> (PluginHost, ResolvedSlots) {
-        let disabled_value = if globally_disabled { r#""1""# } else { "nil" };
-        let stubs = format!(
-            r#"
-            local probe_count = 0
-            maki.uv.os_getenv = function(name)
-              if name == "RTK_DISABLED" then return {disabled_value} end
-              return nil
-            end
-            maki.fn.jobstart = function(command, opts)
-              assert(command == "rtk --version")
-              assert(opts and opts.owner == "plugin")
-              probe_count = probe_count + 1
-              assert(probe_count == 1, "rtk availability must be cached")
-              return probe_count
-            end
-            maki.fn.jobwait = function()
-              return {{ exit_code = {probe_exit_code}, stdout = "", stderr = "" }}
-            end
-            "#
-        );
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_source("bash_prompt_test", &(stubs + BASH_SOURCE))
-            .unwrap();
-        let slots = host.event_handle().collect_prompt_slots(config);
         (host, slots)
     }
 
@@ -1046,48 +1059,6 @@ mod tests {
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["disabled"]
         );
-    }
-
-    #[test]
-    fn available_rtk_hint_lands_in_every_tool_usage_prompt_and_probe_is_cached() {
-        let config = AgentConfig::default();
-        let (host, slots) = bash_prompt_slots(0, false, &config);
-        for &prompt in PromptId::ALL {
-            assert!(
-                contents(&slots, prompt, Slot::ToolUsage).contains(&RTK_PROMPT_HINT),
-                "missing RTK hint from {prompt}"
-            );
-        }
-
-        let slots = host.event_handle().collect_prompt_slots(&config);
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
-    }
-
-    #[test]
-    fn unavailable_or_disabled_rtk_contributes_no_hint() {
-        let default_config = AgentConfig::default();
-        let (_, slots) = bash_prompt_slots(1, false, &default_config);
-        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
-
-        let (_, slots) = bash_prompt_slots(0, true, &default_config);
-        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
-
-        let no_rtk = AgentConfig {
-            no_rtk: true,
-            ..AgentConfig::default()
-        };
-        let (_, slots) = bash_prompt_slots(0, false, &no_rtk);
-        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
-
-        let mut disabled_bash = AgentConfig::default();
-        disabled_bash.disabled_tools.push("bash".to_owned());
-        let (_, slots) = bash_prompt_slots(0, false, &disabled_bash);
-        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
-
-        let mut excluded_bash = AgentConfig::default();
-        excluded_bash.allowed_tools.push("read".to_owned());
-        let (_, slots) = bash_prompt_slots(0, false, &excluded_bash);
-        assert!(!contents(&slots, PromptId::System, Slot::ToolUsage).contains(&RTK_PROMPT_HINT));
     }
 
     /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.

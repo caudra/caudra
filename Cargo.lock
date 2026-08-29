@@ -2845,6 +2845,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "unicode-width",
+ "url",
 ]
 
 [[package]]
@@ -2980,6 +2981,7 @@ dependencies = [
  "toml",
  "tracing",
  "unicode-width",
+ "url",
  "wait-timeout",
  "windows-sys 0.61.2",
 ]

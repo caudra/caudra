@@ -10,7 +10,8 @@ use crate::{StateDir, atomic_write_permissions, exclusive_state_lock, now_epoch}
 
 pub const PERMISSION_STATE_FILE: &str = "permission-rules.json";
 
-const PERMISSION_STATE_VERSION: u32 = 1;
+const PERMISSION_STATE_VERSION: u32 = 2;
+const LEGACY_PERMISSION_STATE_VERSION: u32 = 1;
 const PERMISSION_STATE_MODE: u32 = 0o600;
 const PERMISSION_STATE_LOCK_FILE: &str = "permission-rules.lock";
 const SHA256_HEX_LEN: usize = 64;
@@ -74,6 +75,9 @@ pub enum PermissionResourceAccess {
 pub enum PermissionResourceSelector {
     Exact { value: String },
     Digest { digest: String },
+    FilesystemSubtreeDigest { digest: String },
+    UrlSubtreeDigest { digest: String },
+    UrlOriginDigest { digest: String },
     Subtree { root: String },
     Any,
 }
@@ -105,6 +109,10 @@ pub enum PermissionArgumentConstraint {
     },
     Selected {
         arguments: Vec<SelectedPermissionArgument>,
+    },
+    SelectedDigest {
+        pointers: Vec<String>,
+        digest: String,
     },
     Unconstrained,
 }
@@ -340,7 +348,10 @@ fn load_file(path: &Path) -> Result<Option<PermissionStateFile>, PermissionState
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let file: PermissionStateFile = serde_json::from_slice(&data)?;
+    let mut file: PermissionStateFile = serde_json::from_slice(&data)?;
+    if file.version == LEGACY_PERMISSION_STATE_VERSION {
+        file.version = PERMISSION_STATE_VERSION;
+    }
     validate_file(&file)?;
     Ok(Some(file))
 }
@@ -398,6 +409,20 @@ fn validate_record(
                 "selected raw arguments cannot be stored durably".into(),
             ));
         }
+        PermissionArgumentConstraint::SelectedDigest { pointers, digest } => {
+            if pointers.is_empty() || pointers.iter().any(|pointer| pointer.is_empty()) {
+                return Err(PermissionStateError::Invalid(
+                    "selected argument pointers must be non-empty".into(),
+                ));
+            }
+            let mut unique = HashSet::with_capacity(pointers.len());
+            if pointers.iter().any(|pointer| !unique.insert(pointer)) {
+                return Err(PermissionStateError::Invalid(
+                    "selected argument pointers must be unique".into(),
+                ));
+            }
+            validate_digest(digest)?;
+        }
         PermissionArgumentConstraint::Unconstrained => {}
     }
     for resource in &record.rule.resources {
@@ -431,7 +456,10 @@ fn validate_review(value: &Value) -> Result<(), PermissionStateError> {
 
 fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), PermissionStateError> {
     match selector {
-        PermissionResourceSelector::Digest { digest } => validate_digest(digest),
+        PermissionResourceSelector::Digest { digest }
+        | PermissionResourceSelector::FilesystemSubtreeDigest { digest }
+        | PermissionResourceSelector::UrlSubtreeDigest { digest }
+        | PermissionResourceSelector::UrlOriginDigest { digest } => validate_digest(digest),
         PermissionResourceSelector::Any => Ok(()),
         PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Subtree { .. } => {
             Err(PermissionStateError::Invalid(
@@ -523,6 +551,27 @@ mod tests {
 
         assert!(PermissionState::open(&state_dir).is_err());
         assert_eq!(fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn version_one_exact_rules_migrate_in_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let mut state = PermissionState::open(&state_dir).unwrap();
+        state
+            .insert(Some(project), rule(PermissionLifetime::Project))
+            .unwrap();
+        drop(state);
+        let path = state_dir.path().join(PERMISSION_STATE_FILE);
+        let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored["version"] = Value::from(LEGACY_PERMISSION_STATE_VERSION);
+        fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+
+        let restored = PermissionState::open(&state_dir).unwrap();
+        assert_eq!(restored.records().len(), 1);
     }
 
     #[cfg(unix)]

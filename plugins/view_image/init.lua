@@ -23,8 +23,6 @@ local MEDIA_TYPES = {
   webp = "image/webp",
 }
 
-maki.api.register_permission_rule({ tool = "view_image", scope = "*" })
-
 local function format_size(bytes)
   if bytes >= 1024 * 1024 then
     return string.format("%.1fMB", bytes / (1024 * 1024))

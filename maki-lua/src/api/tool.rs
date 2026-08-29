@@ -274,6 +274,10 @@ struct LuaToolInvocation {
 }
 
 impl ToolInvocation for LuaToolInvocation {
+    fn permission_input(&self) -> Option<&Value> {
+        Some(&self.input)
+    }
+
     fn start_header(&self) -> HeaderFuture {
         if !self.has_header_fn {
             return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));

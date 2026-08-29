@@ -52,7 +52,7 @@ use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
-use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions_with_trust};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -170,6 +170,7 @@ pub enum Request {
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
+        bundled: bool,
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -256,9 +257,8 @@ pub enum Request {
         dctx: Value,
         reply: flume::Sender<Option<String>>,
     },
-    /// Runs the tool's `start` fn so it can publish a live buf before the
-    /// permission prompt paints. Best-effort: Lua errors are logged, never
-    /// propagated.
+    /// Runs the tool's `start` fn after approval so it can publish a live buf.
+    /// Best-effort: Lua errors are logged, never propagated.
     StartTool {
         plugin: Arc<str>,
         tool: Arc<str>,
@@ -1820,6 +1820,7 @@ impl LuaRuntime {
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
+        bundled: bool,
         permissions: &PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -1934,6 +1935,7 @@ impl LuaRuntime {
                     ToolSource::Lua {
                         plugin: Arc::clone(&name),
                         contract: Arc::clone(contract),
+                        bundled,
                     },
                 )
             })
@@ -2072,11 +2074,17 @@ impl LuaRuntime {
         rule_policy: PermissionRulePolicy,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
-        let perms = load_plugin_permissions(plugin_dir.as_deref());
+        let (perms, trusted) = load_plugin_permissions_with_trust(plugin_dir.as_deref());
+        let rule_policy = if trusted {
+            rule_policy
+        } else {
+            PermissionRulePolicy::DenyOnly
+        };
         self.load_source(
             Arc::from(source_name),
             source,
             plugin_dir,
+            false,
             &perms,
             rule_policy,
             PluginOpts::default(),
@@ -2790,13 +2798,14 @@ pub fn spawn(
                             name,
                             source,
                             plugin_dir,
+                            bundled,
                             permissions,
                             rule_policy,
                             opts,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, rule_policy, opts, None).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, bundled, &permissions, rule_policy, opts, None).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {

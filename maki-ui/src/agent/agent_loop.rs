@@ -406,6 +406,7 @@ impl AgentLoop {
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                tool_filter: ToolFilter::from_config(&self.config, &slot.model, &[]),
                 model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {

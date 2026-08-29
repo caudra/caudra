@@ -67,6 +67,7 @@ pub enum ToolSource {
     Lua {
         plugin: Arc<str>,
         contract: Arc<str>,
+        bundled: bool,
     },
 }
 
@@ -218,8 +219,10 @@ pub trait ToolInvocation: Send + Sync {
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
     }
-    /// Runs after `ToolStart` but before permission enforcement, so a tool
-    /// can paint a preview while the prompt is still up. Some call paths skip
+    fn permission_input(&self) -> Option<&Value> {
+        None
+    }
+    /// Runs after permission enforcement and `ToolStart`. Some call paths skip
     /// it, so `execute` must never rely on it having run.
     fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
@@ -577,6 +580,7 @@ mod tests {
         ToolSource::Lua {
             plugin: plugin.into(),
             contract: "test-contract".into(),
+            bundled: false,
         }
     }
 
@@ -680,6 +684,7 @@ mod tests {
             ToolSource::Lua {
                 plugin: "pluginA".into(),
                 contract: "contract-a".into(),
+                bundled: false,
             },
         )
         .unwrap();
@@ -688,6 +693,7 @@ mod tests {
             ToolSource::Lua {
                 plugin: "pluginB".into(),
                 contract: "contract-b".into(),
+                bundled: false,
             },
         )
         .unwrap();
@@ -736,6 +742,7 @@ mod tests {
                     ToolSource::Lua {
                         plugin: "myplugin".into(),
                         contract: "test-contract".into(),
+                        bundled: false,
                     },
                 )],
             )

@@ -25,8 +25,6 @@ local function search_scope(input)
   return path:sub(-1) == "/" and (path .. "**") or (path .. "/**")
 end
 
-maki.api.register_permission_rule({ tool = "grep", scope = "*" })
-
 local function has_context(groups)
   for _, group in ipairs(groups) do
     if #group.lines > 1 then

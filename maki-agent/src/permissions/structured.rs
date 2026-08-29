@@ -21,6 +21,9 @@ const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
+const FILE_READ_TOOLS: &[&str] = &["index", "read", "view_image"];
+const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
+const FILE_SEARCH_TOOLS: &[&str] = &["glob", "grep"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +43,8 @@ pub struct PermissionResource {
     pub access: Option<PermissionResourceAccess>,
     #[serde(default)]
     pub protected: bool,
+    #[serde(default)]
+    pub requires_prompt: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attributes: BTreeMap<String, String>,
 }
@@ -50,10 +55,13 @@ pub struct PermissionRuleOption {
     pub label: String,
     pub description: String,
     pub rule: StructuredPermissionRule,
+    pub allowed_lifetimes: Vec<PermissionLifetime>,
     #[serde(default)]
     pub broad: bool,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +155,15 @@ impl PermissionRequest {
         let risk = risk_for(&tool, force_prompt);
         let resources = resources_for(&tool, &scopes, &input, cwd, force_prompt);
         let input_digest = canonical_json_sha256(&input);
-        let options = rule_options(&tool, &subject, &executor, &resources, &input_digest);
+        let options = rule_options(
+            &tool,
+            &subject,
+            &executor,
+            &resources,
+            &input,
+            &input_digest,
+            cwd,
+        );
         let presentation = presentation_for(&tool, &risk, &resources);
         Self {
             id,
@@ -163,6 +179,20 @@ impl PermissionRequest {
             options,
             presentation,
         }
+    }
+
+    pub fn option_rule(
+        &self,
+        option_id: &str,
+        lifetime: PermissionLifetime,
+    ) -> Option<StructuredPermissionRule> {
+        let option = self.options.iter().find(|option| option.id == option_id)?;
+        if !option.allowed_lifetimes.contains(&lifetime) {
+            return None;
+        }
+        let mut rule = option.rule.clone();
+        rule.lifetime = lifetime;
+        Some(rule)
     }
 }
 
@@ -329,6 +359,32 @@ pub fn selected_input<S: AsRef<str>>(
     Ok(selected)
 }
 
+pub fn selected_input_digest<S: AsRef<str>>(
+    input: &Value,
+    pointers: &[S],
+) -> Result<String, SelectedInputError> {
+    let mut seen = HashSet::with_capacity(pointers.len());
+    let mut projection = Vec::with_capacity(pointers.len());
+    for pointer in pointers {
+        let pointer = pointer.as_ref();
+        if pointer.is_empty() || !seen.insert(pointer) {
+            return Err(if pointer.is_empty() {
+                SelectedInputError::InvalidPointer(pointer.to_owned())
+            } else {
+                SelectedInputError::DuplicatePointer(pointer.to_owned())
+            });
+        }
+        decode_json_pointer(pointer)?;
+        let selected = selected_input_pointer(input, pointer);
+        projection.push(serde_json::json!({
+            "pointer": pointer,
+            "present": selected.is_ok(),
+            "value": selected.ok(),
+        }));
+    }
+    Ok(canonical_json_sha256(&Value::Array(projection)))
+}
+
 fn decode_json_pointer(pointer: &str) -> Result<Vec<String>, SelectedInputError> {
     if pointer.is_empty() {
         return Ok(Vec::new());
@@ -373,6 +429,9 @@ pub fn argument_constraint_matches(
                             && canonical_json(selected) == canonical_json(&argument.value)
                     })
             })
+        }
+        PermissionArgumentConstraint::SelectedDigest { pointers, digest } => {
+            selected_input_digest(input, pointers).is_ok_and(|actual| actual == *digest)
         }
         PermissionArgumentConstraint::Unconstrained => true,
     }
@@ -494,6 +553,20 @@ fn selector_matches(
         PermissionResourceSelector::Digest { digest } => {
             resource_value_digest(value, kind).is_some_and(|actual| actual == *digest)
         }
+        PermissionResourceSelector::FilesystemSubtreeDigest { digest } => {
+            matches!(
+                kind,
+                PermissionResourceKind::File | PermissionResourceKind::Directory
+            ) && filesystem_ancestor_digests(value).is_some_and(|digests| digests.contains(digest))
+        }
+        PermissionResourceSelector::UrlSubtreeDigest { digest } => {
+            matches!(kind, PermissionResourceKind::Url)
+                && url_subtree_digests(value).is_some_and(|digests| digests.contains(digest))
+        }
+        PermissionResourceSelector::UrlOriginDigest { digest } => {
+            matches!(kind, PermissionResourceKind::Url)
+                && url_origin_digest(value).is_some_and(|actual| actual == *digest)
+        }
         PermissionResourceSelector::Exact { value: expected } => match kind {
             PermissionResourceKind::File | PermissionResourceKind::Directory => {
                 normalized_filesystem_path(expected)
@@ -530,6 +603,79 @@ fn resource_value_digest(value: &str, kind: &PermissionResourceKind) -> Option<S
     Some(canonical_json_sha256(&Value::String(canonical)))
 }
 
+fn scoped_digest(domain: &str, value: &str) -> String {
+    canonical_json_sha256(&serde_json::json!([domain, value]))
+}
+
+fn filesystem_subtree_digest(value: &str) -> Option<String> {
+    let value = normalized_filesystem_path(value)?;
+    Some(scoped_digest(
+        "filesystem_subtree",
+        &value.to_string_lossy(),
+    ))
+}
+
+fn filesystem_ancestor_digests(value: &str) -> Option<HashSet<String>> {
+    let value = normalized_filesystem_path(value)?;
+    Some(
+        value
+            .ancestors()
+            .map(|ancestor| scoped_digest("filesystem_subtree", &ancestor.to_string_lossy()))
+            .collect(),
+    )
+}
+
+fn url_subtree_digest(value: &str) -> Option<String> {
+    let root = url_subtree_root(value)?;
+    Some(scoped_digest("url_subtree", &root))
+}
+
+fn url_subtree_digests(value: &str) -> Option<HashSet<String>> {
+    let strict = strict_http_url(value)?;
+    let segments: Vec<_> = strict
+        .url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let mut digests = HashSet::with_capacity(segments.len() + 1);
+    for count in 0..=segments.len() {
+        let mut root = strict.url.clone();
+        root.set_query(None);
+        root.set_fragment(None);
+        let path = if count == 0 {
+            "/".to_owned()
+        } else {
+            format!("/{}", segments[..count].join("/"))
+        };
+        root.set_path(&path);
+        digests.insert(scoped_digest(
+            "url_subtree",
+            &normalize_percent_hex(root.as_str()),
+        ));
+    }
+    Some(digests)
+}
+
+fn url_origin_digest(value: &str) -> Option<String> {
+    let strict = strict_http_url(value)?;
+    Some(scoped_digest(
+        "url_origin",
+        &strict.url.origin().ascii_serialization(),
+    ))
+}
+
+fn url_subtree_root(value: &str) -> Option<String> {
+    let strict = strict_http_url(value)?;
+    let mut root = strict.url;
+    root.set_query(None);
+    root.set_fragment(None);
+    if root.path().len() > 1 {
+        let path = root.path().trim_end_matches('/').to_owned();
+        root.set_path(&path);
+    }
+    Some(normalize_percent_hex(root.as_str()))
+}
+
 fn normalized_filesystem_path(path: &str) -> Option<PathBuf> {
     if path.is_empty() || path.contains('\0') {
         return None;
@@ -560,15 +706,18 @@ fn strict_http_url(value: &str) -> Option<StrictHttpUrl> {
         return None;
     }
     validate_url_percent_encoding(value)?;
-    let url = Url::parse(value).ok()?;
+    let mut url = Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
         || url.host_str().is_none()
-        || url.fragment().is_some()
     {
         return None;
     }
+    if url.scheme() == "http" {
+        url.set_scheme("https").ok()?;
+    }
+    url.set_fragment(None);
     let key = normalize_percent_hex(url.as_str());
     Some(StrictHttpUrl { url, key })
 }
@@ -699,6 +848,13 @@ fn risk_for(tool: &ToolKey, force_prompt: bool) -> PermissionRisk {
         ToolKey::Native(name) if name.as_ref() == "bash" => PermissionRisk::High,
         ToolKey::Native(name) if name.as_ref() == "webfetch" => PermissionRisk::Medium,
         ToolKey::Native(name) if name.as_ref() == "websearch" => PermissionRisk::Low,
+        ToolKey::Native(name)
+            if FILE_READ_TOOLS.contains(&name.as_ref())
+                || DIRECTORY_READ_TOOLS.contains(&name.as_ref())
+                || FILE_SEARCH_TOOLS.contains(&name.as_ref()) =>
+        {
+            PermissionRisk::Low
+        }
         ToolKey::Native(_) | ToolKey::Wildcard => PermissionRisk::Unknown,
     }
 }
@@ -713,30 +869,37 @@ fn resources_for(
     match tool {
         ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()) => scopes
             .iter()
-            .map(|scope| PermissionResource {
-                kind: PermissionResourceKind::File,
-                value: scope.clone(),
-                access: Some(PermissionResourceAccess::Write),
-                protected: protected_file(scope, cwd),
-                attributes: BTreeMap::new(),
+            .map(|scope| {
+                filesystem_resource(
+                    PermissionResourceKind::File,
+                    scope,
+                    PermissionResourceAccess::Write,
+                    cwd,
+                )
             })
             .collect(),
         ToolKey::Native(name) if name.as_ref() == "bash" => {
-            let workdir = input
+            let default_workdir = input
                 .get("workdir")
                 .and_then(Value::as_str)
-                .map(String::from);
+                .and_then(normalized_filesystem_path)
+                .unwrap_or_else(|| cwd.to_path_buf())
+                .to_string_lossy()
+                .into_owned();
             scopes
                 .iter()
-                .map(|scope| PermissionResource {
-                    kind: PermissionResourceKind::Command,
-                    value: scope.clone(),
-                    access: Some(PermissionResourceAccess::Execute),
-                    protected: force_prompt,
-                    attributes: workdir
-                        .iter()
-                        .map(|workdir| ("workdir".into(), workdir.clone()))
-                        .collect(),
+                .map(|scope| {
+                    let (command, workdir) = super::bash_scope_parts(scope)
+                        .map(|(command, workdir)| (command.to_owned(), workdir.to_owned()))
+                        .unwrap_or_else(|| (scope.clone(), default_workdir.clone()));
+                    PermissionResource {
+                        kind: PermissionResourceKind::Command,
+                        value: command,
+                        access: Some(PermissionResourceAccess::Execute),
+                        protected: force_prompt,
+                        requires_prompt: force_prompt,
+                        attributes: BTreeMap::from([("workdir".into(), workdir)]),
+                    }
                 })
                 .collect()
         }
@@ -744,9 +907,12 @@ fn resources_for(
             .iter()
             .map(|scope| PermissionResource {
                 kind: PermissionResourceKind::Url,
-                value: scope.clone(),
+                value: strict_http_url(scope)
+                    .map(|strict| strict.key)
+                    .unwrap_or_else(|| scope.clone()),
                 access: Some(PermissionResourceAccess::Read),
                 protected: false,
+                requires_prompt: false,
                 attributes: BTreeMap::new(),
             })
             .collect(),
@@ -757,7 +923,93 @@ fn resources_for(
                 value: scope.clone(),
                 access: Some(PermissionResourceAccess::Search),
                 protected: false,
+                requires_prompt: false,
                 attributes: BTreeMap::new(),
+            })
+            .collect(),
+        ToolKey::Native(name) if FILE_READ_TOOLS.contains(&name.as_ref()) => scopes
+            .iter()
+            .map(|scope| {
+                let directory = name.as_ref() == "index" && Path::new(scope).is_dir();
+                filesystem_resource(
+                    if directory {
+                        PermissionResourceKind::Directory
+                    } else {
+                        PermissionResourceKind::File
+                    },
+                    scope,
+                    PermissionResourceAccess::Read,
+                    cwd,
+                )
+            })
+            .collect(),
+        ToolKey::Native(name) if DIRECTORY_READ_TOOLS.contains(&name.as_ref()) => scopes
+            .iter()
+            .map(|scope| {
+                filesystem_resource(
+                    PermissionResourceKind::Directory,
+                    scope,
+                    PermissionResourceAccess::Read,
+                    cwd,
+                )
+            })
+            .collect(),
+        ToolKey::Native(name) if FILE_SEARCH_TOOLS.contains(&name.as_ref()) => scopes
+            .iter()
+            .map(|scope| {
+                let root = scope.strip_suffix("/**").unwrap_or(scope);
+                filesystem_resource(
+                    PermissionResourceKind::Directory,
+                    root,
+                    PermissionResourceAccess::Search,
+                    cwd,
+                )
+            })
+            .collect(),
+        ToolKey::Native(name) if name.as_ref() == "memory" => {
+            let write = matches!(
+                input.get("command").and_then(Value::as_str),
+                Some("write" | "delete")
+            );
+            scopes
+                .iter()
+                .map(|scope| {
+                    let subtree = scope.strip_suffix("/**");
+                    PermissionResource {
+                        kind: if subtree.is_some() {
+                            PermissionResourceKind::Directory
+                        } else {
+                            PermissionResourceKind::File
+                        },
+                        value: subtree.unwrap_or(scope).to_owned(),
+                        access: Some(if write {
+                            PermissionResourceAccess::Write
+                        } else {
+                            PermissionResourceAccess::Read
+                        }),
+                        protected: false,
+                        requires_prompt: false,
+                        attributes: BTreeMap::new(),
+                    }
+                })
+                .collect()
+        }
+        ToolKey::Native(name) if name.as_ref() == "skill" => scopes
+            .iter()
+            .map(|scope| {
+                let subtree = scope.strip_suffix("/**");
+                PermissionResource {
+                    kind: if subtree.is_some() {
+                        PermissionResourceKind::Directory
+                    } else {
+                        PermissionResourceKind::File
+                    },
+                    value: subtree.unwrap_or(scope).to_owned(),
+                    access: Some(PermissionResourceAccess::Read),
+                    protected: false,
+                    requires_prompt: false,
+                    attributes: BTreeMap::new(),
+                }
             })
             .collect(),
         ToolKey::McpTool { .. } | ToolKey::McpServer { .. } => vec![PermissionResource {
@@ -767,6 +1019,7 @@ fn resources_for(
             value: tool.to_string(),
             access: Some(PermissionResourceAccess::Execute),
             protected: false,
+            requires_prompt: false,
             attributes: BTreeMap::new(),
         }],
         _ => scopes
@@ -778,25 +1031,43 @@ fn resources_for(
                 value: scope.clone(),
                 access: Some(PermissionResourceAccess::Execute),
                 protected: force_prompt,
+                requires_prompt: force_prompt,
                 attributes: BTreeMap::new(),
             })
             .collect(),
     }
 }
 
-fn protected_file(value: &str, cwd: &Path) -> bool {
+fn filesystem_resource(
+    kind: PermissionResourceKind,
+    value: &str,
+    access: PermissionResourceAccess,
+    cwd: &Path,
+) -> PermissionResource {
+    let (protected, requires_prompt) = filesystem_resource_flags(value, cwd);
+    PermissionResource {
+        kind,
+        value: value.to_owned(),
+        access: Some(access),
+        protected,
+        requires_prompt,
+        attributes: BTreeMap::new(),
+    }
+}
+
+fn filesystem_resource_flags(value: &str, cwd: &Path) -> (bool, bool) {
     let Some(value) = normalized_filesystem_path(value) else {
-        return true;
+        return (true, true);
     };
     let outside_project = normalized_filesystem_path(&cwd.to_string_lossy())
         .is_none_or(|cwd| value != cwd && !value.starts_with(cwd));
-    outside_project
-        || value.components().any(|component| {
-            let component = component.as_os_str().to_string_lossy();
-            matches!(component.as_ref(), ".git" | ".ssh" | ".aws")
-                || component == ".env"
-                || component.starts_with(".env.")
-        })
+    let protected = value.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        matches!(component.as_ref(), ".git" | ".ssh" | ".aws")
+            || component == ".env"
+            || component.starts_with(".env.")
+    });
+    (protected, protected || outside_project)
 }
 
 fn exact_resource_constraints(
@@ -841,7 +1112,9 @@ fn rule_options(
     subject: &PermissionSubject,
     executor: &PermissionExecutorKind,
     resources: &[PermissionResource],
+    input: &Value,
     input_digest: &str,
+    cwd: &Path,
 ) -> Vec<PermissionRuleOption> {
     let exact_arguments = PermissionArgumentConstraint::Exact {
         digest: input_digest.into(),
@@ -851,113 +1124,459 @@ fn rule_options(
                   label: &str,
                   description: &str,
                   effect: StructuredPermissionEffect,
-                  lifetime: PermissionLifetime,
+                  resources: Vec<PermissionResourceConstraint>,
                   arguments: PermissionArgumentConstraint,
+                  allowed_lifetimes: Vec<PermissionLifetime>,
                   broad: bool,
-                  is_default: bool| PermissionRuleOption {
+                  is_default: bool,
+                  confirmation: Option<&str>| PermissionRuleOption {
         id: id.into(),
         label: label.into(),
         description: description.into(),
         rule: StructuredPermissionRule {
             subject: subject.clone(),
             executor: executor.clone(),
-            resources: resource_constraints.clone(),
+            resources,
             arguments,
-            lifetime,
+            lifetime: PermissionLifetime::Once,
             effect,
         },
+        allowed_lifetimes,
         broad,
         is_default,
+        confirmation: confirmation.map(String::from),
     };
+    let reusable = vec![
+        PermissionLifetime::Conversation,
+        PermissionLifetime::Project,
+        PermissionLifetime::Global,
+    ];
+    let mut exact_lifetimes = vec![PermissionLifetime::Once];
+    exact_lifetimes.extend(reusable.iter().cloned());
     let mut options = vec![
         option(
-            "allow_once",
-            "Allow once",
-            "Allow only this exact call once.",
+            "allow_exact",
+            "This exact call",
+            "Allow only these exact arguments and resources.",
             StructuredPermissionEffect::Allow,
-            PermissionLifetime::Once,
+            resource_constraints.clone(),
             exact_arguments.clone(),
+            exact_lifetimes,
             false,
             true,
+            None,
         ),
         option(
-            "allow_conversation",
-            "Allow for conversation",
-            "Remember only this exact call for the conversation.",
-            StructuredPermissionEffect::Allow,
-            PermissionLifetime::Conversation,
-            exact_arguments.clone(),
-            false,
-            false,
-        ),
-        option(
-            "allow_project",
-            "Allow for project",
-            "Remember only this exact call for this project.",
-            StructuredPermissionEffect::Allow,
-            PermissionLifetime::Project,
-            exact_arguments.clone(),
-            false,
-            false,
-        ),
-        option(
-            "allow_global",
-            "Allow globally",
-            "Remember only this exact call globally.",
-            StructuredPermissionEffect::Allow,
-            PermissionLifetime::Global,
-            exact_arguments.clone(),
-            false,
-            false,
-        ),
-        option(
-            "deny_once",
-            "Deny",
-            "Deny this exact call.",
+            "deny_exact",
+            "Deny this exact call",
+            "Deny only these exact arguments and resources.",
             StructuredPermissionEffect::Deny,
-            PermissionLifetime::Once,
+            resource_constraints.clone(),
             exact_arguments,
+            vec![PermissionLifetime::Project, PermissionLifetime::Global],
             false,
             false,
-        ),
-        option(
-            "deny_project",
-            "Deny for project",
-            "Deny only this exact call for this project.",
-            StructuredPermissionEffect::Deny,
-            PermissionLifetime::Project,
-            PermissionArgumentConstraint::Exact {
-                digest: input_digest.into(),
-            },
-            false,
-            false,
-        ),
-        option(
-            "deny_global",
-            "Deny globally",
-            "Deny only this exact call globally.",
-            StructuredPermissionEffect::Deny,
-            PermissionLifetime::Global,
-            PermissionArgumentConstraint::Exact {
-                digest: input_digest.into(),
-            },
-            false,
-            false,
+            None,
         ),
     ];
+
+    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "webfetch")
+        && let [resource] = resources
+        && resource.kind == PermissionResourceKind::Url
+        && let Some(strict) = strict_http_url(&resource.value)
+    {
+        let exact_url = PermissionResourceConstraint {
+            kind: PermissionResourceKind::Url,
+            selector: PermissionResourceSelector::Digest {
+                digest: resource_value_digest(&resource.value, &PermissionResourceKind::Url)
+                    .expect("strict URL has a digest"),
+            },
+            access: resource.access.clone(),
+            protected: Some(false),
+            attributes: BTreeMap::new(),
+        };
+        options.push(option(
+            "allow_exact_url",
+            "This exact URL",
+            "Allow this normalized URL with different fetch format or timeout controls.",
+            StructuredPermissionEffect::Allow,
+            vec![exact_url],
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            None,
+        ));
+
+        if let Some(root) = url_subtree_root(&resource.value)
+            && strict.url.path() != "/"
+        {
+            options.push(option(
+                "allow_url_subtree",
+                "This page and subpages",
+                &format!("Allow requested URLs at or below {root}/**."),
+                StructuredPermissionEffect::Allow,
+                vec![PermissionResourceConstraint {
+                    kind: PermissionResourceKind::Url,
+                    selector: PermissionResourceSelector::UrlSubtreeDigest {
+                        digest: url_subtree_digest(&root).expect("strict URL subtree has a digest"),
+                    },
+                    access: resource.access.clone(),
+                    protected: Some(false),
+                    attributes: BTreeMap::new(),
+                }],
+                PermissionArgumentConstraint::Unconstrained,
+                reusable.clone(),
+                true,
+                false,
+                None,
+            ));
+        }
+
+        let origin = strict.url.origin().ascii_serialization();
+        options.push(option(
+            "allow_url_origin",
+            "Any page on this origin",
+            &format!("Allow any requested URL on {origin}/**."),
+            StructuredPermissionEffect::Allow,
+            vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::Url,
+                selector: PermissionResourceSelector::UrlOriginDigest {
+                    digest: url_origin_digest(&resource.value).expect("strict URL has an origin"),
+                },
+                access: resource.access.clone(),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            None,
+        ));
+        options.push(option(
+            "allow_any_url",
+            "Any public HTTP(S) URL",
+            "Allow any public HTTP(S) URL accepted by this exact webfetch contract.",
+            StructuredPermissionEffect::Allow,
+            vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::Url,
+                selector: PermissionResourceSelector::Any,
+                access: resource.access.clone(),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            Some("ALLOW ANY URL"),
+        ));
+    }
+
+    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "websearch")
+        && let [resource] = resources
+        && resource.kind == PermissionResourceKind::Query
+    {
+        options.push(option(
+            "allow_exact_query",
+            "This exact search query",
+            "Allow this query with different result limits or paging controls.",
+            StructuredPermissionEffect::Allow,
+            exact_resource_constraints(resources),
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            None,
+        ));
+        options.push(option(
+            "allow_any_query",
+            "Any search query",
+            "Allow any future query through this exact websearch contract.",
+            StructuredPermissionEffect::Allow,
+            vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::Query,
+                selector: PermissionResourceSelector::Any,
+                access: resource.access.clone(),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            Some("ALLOW ANY SEARCH"),
+        ));
+    }
+
+    if matches!(tool, ToolKey::Native(name) if name.as_ref() == "bash")
+        && !resources.is_empty()
+        && resources
+            .iter()
+            .all(|resource| resource.kind == PermissionResourceKind::Command && !resource.protected)
+    {
+        options.push(option(
+            "allow_exact_commands",
+            "These commands in this workdir",
+            "Allow the reviewed commands and workdir with different timeout or display controls.",
+            StructuredPermissionEffect::Allow,
+            exact_resource_constraints(resources),
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            None,
+        ));
+        if let Some(workdir) = resources
+            .first()
+            .and_then(|resource| resource.attributes.get("workdir"))
+        {
+            options.push(option(
+                "allow_commands_in_workdir",
+                "Any command in this workdir",
+                &format!(
+                    "Allow arbitrary commands starting in {}.",
+                    safe_summary(workdir)
+                ),
+                StructuredPermissionEffect::Allow,
+                vec![PermissionResourceConstraint {
+                    kind: PermissionResourceKind::Command,
+                    selector: PermissionResourceSelector::Any,
+                    access: Some(PermissionResourceAccess::Execute),
+                    protected: Some(false),
+                    attributes: BTreeMap::from([(
+                        "workdir".into(),
+                        PermissionResourceSelector::Digest {
+                            digest: resource_value_digest(
+                                workdir,
+                                &PermissionResourceKind::Directory,
+                            )
+                            .expect("workdir has a digest"),
+                        },
+                    )]),
+                }],
+                PermissionArgumentConstraint::Unconstrained,
+                reusable.clone(),
+                true,
+                false,
+                Some("ALLOW BROAD SHELL ACCESS"),
+            ));
+        }
+        options.push(option(
+            "allow_any_command",
+            "Any shell command",
+            "Allow arbitrary shell commands from any working directory.",
+            StructuredPermissionEffect::Allow,
+            vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::Command,
+                selector: PermissionResourceSelector::Any,
+                access: Some(PermissionResourceAccess::Execute),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            Some("ALLOW BROAD SHELL ACCESS"),
+        ));
+    }
+
+    add_filesystem_options(
+        &mut options,
+        tool,
+        resources,
+        input,
+        cwd,
+        subject,
+        executor,
+        &reusable,
+    );
     if tool.is_mcp() {
         options.push(option(
             "allow_whole_mcp_tool_conversation",
             "Allow whole MCP tool for conversation (broad)",
             "Broad: allow this MCP tool with any arguments for the conversation.",
             StructuredPermissionEffect::Allow,
-            PermissionLifetime::Conversation,
+            resource_constraints,
             PermissionArgumentConstraint::Unconstrained,
+            vec![PermissionLifetime::Conversation],
             true,
             false,
+            Some("ALLOW MCP TOOL"),
         ));
     }
     options
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_filesystem_options(
+    options: &mut Vec<PermissionRuleOption>,
+    tool: &ToolKey,
+    resources: &[PermissionResource],
+    input: &Value,
+    cwd: &Path,
+    subject: &PermissionSubject,
+    executor: &PermissionExecutorKind,
+    reusable: &[PermissionLifetime],
+) {
+    if resources.is_empty()
+        || resources.iter().any(|resource| {
+            resource.protected
+                || !matches!(
+                    resource.kind,
+                    PermissionResourceKind::File | PermissionResourceKind::Directory
+                )
+        })
+    {
+        return;
+    }
+    let ToolKey::Native(name) = tool else {
+        return;
+    };
+    let write = FILE_WRITE_TOOLS.contains(&name.as_ref());
+    let search = FILE_SEARCH_TOOLS.contains(&name.as_ref());
+    if !write
+        && !search
+        && !FILE_READ_TOOLS.contains(&name.as_ref())
+        && !DIRECTORY_READ_TOOLS.contains(&name.as_ref())
+    {
+        return;
+    }
+
+    let arguments = if search {
+        let pointers = vec!["/pattern".to_owned()];
+        let Ok(digest) = selected_input_digest(input, &pointers) else {
+            return;
+        };
+        PermissionArgumentConstraint::SelectedDigest { pointers, digest }
+    } else {
+        PermissionArgumentConstraint::Unconstrained
+    };
+    options.push(PermissionRuleOption {
+        id: "allow_exact_resources".into(),
+        label: if resources.len() == 1 {
+            "This exact path".into()
+        } else {
+            "These exact paths".into()
+        },
+        description: if write {
+            "Allow future changes to only the exact reviewed path set.".into()
+        } else if search {
+            "Allow the same search expression at this exact root.".into()
+        } else {
+            "Allow future reads of only the exact reviewed path set.".into()
+        },
+        rule: StructuredPermissionRule {
+            subject: subject.clone(),
+            executor: executor.clone(),
+            resources: exact_resource_constraints(resources),
+            arguments,
+            lifetime: PermissionLifetime::Once,
+            effect: StructuredPermissionEffect::Allow,
+        },
+        allowed_lifetimes: reusable.to_vec(),
+        broad: true,
+        is_default: false,
+        confirmation: write.then(|| "ALLOW FILE CHANGES".into()),
+    });
+
+    let mut roots = Vec::with_capacity(resources.len());
+    let mut constraints = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let Some(path) = normalized_filesystem_path(&resource.value) else {
+            return;
+        };
+        let root = if resource.kind == PermissionResourceKind::File {
+            path.parent().unwrap_or(&path)
+        } else {
+            path.as_path()
+        };
+        roots.push(root.to_string_lossy().into_owned());
+        constraints.push(PermissionResourceConstraint {
+            kind: resource.kind.clone(),
+            selector: PermissionResourceSelector::FilesystemSubtreeDigest {
+                digest: filesystem_subtree_digest(&root.to_string_lossy())
+                    .expect("normalized filesystem root has a digest"),
+            },
+            access: resource.access.clone(),
+            protected: Some(false),
+            attributes: BTreeMap::new(),
+        });
+    }
+    roots.sort();
+    roots.dedup();
+    let patterns = roots
+        .iter()
+        .map(|root| format!("{}/**", root.trim_end_matches('/')))
+        .collect::<Vec<_>>()
+        .join(", ");
+    options.push(PermissionRuleOption {
+        id: "allow_filesystem_subtree".into(),
+        label: "These directories and descendants".into(),
+        description: format!("Allow matching paths below {patterns}."),
+        rule: StructuredPermissionRule {
+            subject: subject.clone(),
+            executor: executor.clone(),
+            resources: constraints,
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Once,
+            effect: StructuredPermissionEffect::Allow,
+        },
+        allowed_lifetimes: reusable.to_vec(),
+        broad: true,
+        is_default: false,
+        confirmation: write.then(|| "ALLOW DIRECTORY CHANGES".into()),
+    });
+
+    let Some(project) = normalized_filesystem_path(&cwd.to_string_lossy()) else {
+        return;
+    };
+    if !resources.iter().all(|resource| {
+        normalized_filesystem_path(&resource.value)
+            .is_some_and(|path| path == project || path.starts_with(&project))
+    }) {
+        return;
+    }
+    let mut project_constraints = Vec::new();
+    for resource in resources {
+        if project_constraints
+            .iter()
+            .any(|constraint: &PermissionResourceConstraint| {
+                constraint.kind == resource.kind && constraint.access == resource.access
+            })
+        {
+            continue;
+        }
+        project_constraints.push(PermissionResourceConstraint {
+            kind: resource.kind.clone(),
+            selector: PermissionResourceSelector::FilesystemSubtreeDigest {
+                digest: filesystem_subtree_digest(&project.to_string_lossy())
+                    .expect("normalized project has a digest"),
+            },
+            access: resource.access.clone(),
+            protected: Some(false),
+            attributes: BTreeMap::new(),
+        });
+    }
+    options.push(PermissionRuleOption {
+        id: "allow_project_files".into(),
+        label: "Any unprotected project path".into(),
+        description: format!("Allow matching paths below {}/**.", project.display()),
+        rule: StructuredPermissionRule {
+            subject: subject.clone(),
+            executor: executor.clone(),
+            resources: project_constraints,
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Once,
+            effect: StructuredPermissionEffect::Allow,
+        },
+        allowed_lifetimes: reusable.to_vec(),
+        broad: true,
+        is_default: false,
+        confirmation: write.then(|| "ALLOW PROJECT FILE CHANGES".into()),
+    });
 }
 
 fn presentation_for(
@@ -994,7 +1613,11 @@ fn presentation_for(
         resources: resources
             .iter()
             .map(|resource| {
-                let mut summary = safe_summary(&resource.value);
+                let mut summary = if resource.kind == PermissionResourceKind::Url {
+                    redacted_url_summary(&resource.value)
+                } else {
+                    safe_summary(&resource.value)
+                };
                 if let Some(workdir) = resource.attributes.get("workdir") {
                     summary.push_str(" in ");
                     summary.push_str(&safe_summary(workdir));
@@ -1008,6 +1631,22 @@ fn presentation_for(
             })
             .collect(),
     }
+}
+
+fn redacted_url_summary(value: &str) -> String {
+    let Some(strict) = strict_http_url(value) else {
+        return safe_summary(value);
+    };
+    let mut url = strict.url;
+    if url.query().is_some() {
+        let query = url
+            .query_pairs()
+            .map(|(key, _)| format!("{key}=<redacted>"))
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query(Some(&query));
+    }
+    safe_summary(url.as_str())
 }
 
 fn safe_summary(value: &str) -> String {
@@ -1081,6 +1720,7 @@ mod tests {
             value: value.into(),
             access: Some(PermissionResourceAccess::Execute),
             protected: false,
+            requires_prompt: false,
             attributes: BTreeMap::new(),
         }
     }
@@ -1123,6 +1763,33 @@ mod tests {
         assert_eq!(
             canonical_json(&left),
             r#"{"a":{"b":2,"d":4},"items":[3,2,1],"z":1}"#
+        );
+    }
+
+    #[test]
+    fn bash_resource_uses_the_framed_execution_workdir() {
+        let workdir = "/tmp/actual";
+        let scope = format!(
+            "cargo test # maki-workdir[{}]={workdir} # maki-frame[{}]",
+            workdir.len(),
+            workdir.len()
+        );
+        let request = PermissionRequest::from_legacy(
+            "request".into(),
+            ToolKey::native("bash"),
+            vec![scope],
+            json!({"command": "cd /tmp/actual && cargo test"}),
+            Path::new("/tmp/project"),
+            false,
+        );
+
+        assert_eq!(request.resources[0].value, "cargo test");
+        assert_eq!(
+            request.resources[0]
+                .attributes
+                .get("workdir")
+                .map(String::as_str),
+            Some(workdir)
         );
     }
 
@@ -1214,6 +1881,7 @@ mod tests {
             value: path.to_string_lossy().into(),
             access: Some(PermissionResourceAccess::Write),
             protected: false,
+            requires_prompt: false,
             attributes: BTreeMap::new(),
         };
         assert!(resource_constraint_matches(
@@ -1248,6 +1916,7 @@ mod tests {
             value: link.join("new.txt").to_string_lossy().into(),
             access: None,
             protected: false,
+            requires_prompt: false,
             attributes: BTreeMap::new(),
         };
         assert!(resource_constraint_matches(&constraint, &resource));
@@ -1269,6 +1938,7 @@ mod tests {
             value: value.into(),
             access: Some(PermissionResourceAccess::Read),
             protected: false,
+            requires_prompt: false,
             attributes: BTreeMap::new(),
         };
         assert!(resource_constraint_matches(
@@ -1287,7 +1957,7 @@ mod tests {
             &constraint,
             &resource("https://example.com/api/%2e%2e/admin")
         ));
-        assert!(!resource_constraint_matches(
+        assert!(resource_constraint_matches(
             &constraint,
             &resource("http://example.com/api/v1")
         ));
@@ -1401,6 +2071,7 @@ mod tests {
         );
         let broad = request.options.iter().find(|option| option.broad).unwrap();
         assert!(!broad.is_default);
+        assert_eq!(broad.allowed_lifetimes, [PermissionLifetime::Conversation]);
         assert!(matches!(
             broad.rule.arguments,
             PermissionArgumentConstraint::Unconstrained
@@ -1425,13 +2096,119 @@ mod tests {
             assert!(request.options.iter().any(|option| {
                 option.rule.effect == StructuredPermissionEffect::Allow
                     && !option.broad
-                    && option.rule.lifetime == lifetime
+                    && option.allowed_lifetimes.contains(&lifetime)
             }));
         }
         let serialized = serde_json::to_string(&request).unwrap();
         assert_eq!(
             serde_json::from_str::<PermissionRequest>(&serialized).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn webfetch_options_cover_exact_url_subtree_origin_and_any_url() {
+        let request = PermissionRequest::from_legacy(
+            "webfetch".into(),
+            ToolKey::native("webfetch"),
+            vec!["http://example.com/docs/page?token=secret#fragment".into()],
+            json!({
+                "url": "http://example.com/docs/page?token=secret#fragment",
+                "format": "markdown"
+            }),
+            Path::new("/project"),
+            false,
+        );
+        for option in [
+            "allow_exact",
+            "allow_exact_url",
+            "allow_url_subtree",
+            "allow_url_origin",
+            "allow_any_url",
+        ] {
+            assert!(
+                request
+                    .options
+                    .iter()
+                    .any(|candidate| candidate.id == option),
+                "missing {option}"
+            );
+        }
+        assert_eq!(
+            request.resources[0].value,
+            "https://example.com/docs/page?token=secret"
+        );
+        assert!(!request.presentation.resources[0].summary.contains("secret"));
+
+        let descendant = PermissionRequest::from_legacy(
+            "descendant".into(),
+            ToolKey::native("webfetch"),
+            vec!["https://example.com/docs/page/child?other=value".into()],
+            json!({"url": "https://example.com/docs/page/child?other=value", "timeout": 10}),
+            Path::new("/project"),
+            false,
+        );
+        let sibling = PermissionRequest::from_legacy(
+            "sibling".into(),
+            ToolKey::native("webfetch"),
+            vec!["https://example.com/docs/other".into()],
+            json!({"url": "https://example.com/docs/other"}),
+            Path::new("/project"),
+            false,
+        );
+        let other_origin = PermissionRequest::from_legacy(
+            "other".into(),
+            ToolKey::native("webfetch"),
+            vec!["https://other.example/path".into()],
+            json!({"url": "https://other.example/path"}),
+            Path::new("/project"),
+            false,
+        );
+
+        let subtree = request
+            .option_rule("allow_url_subtree", PermissionLifetime::Conversation)
+            .unwrap();
+        assert!(permission_rule_covers_request(&subtree, &descendant));
+        assert!(!permission_rule_covers_request(&subtree, &sibling));
+        let origin = request
+            .option_rule("allow_url_origin", PermissionLifetime::Project)
+            .unwrap();
+        assert!(permission_rule_covers_request(&origin, &sibling));
+        assert!(!permission_rule_covers_request(&origin, &other_origin));
+        let any = request
+            .option_rule("allow_any_url", PermissionLifetime::Global)
+            .unwrap();
+        assert!(permission_rule_covers_request(&any, &other_origin));
+
+        let persisted = serde_json::to_string(&any).unwrap();
+        assert!(!persisted.contains("example.com"));
+        assert!(!persisted.contains("secret"));
+    }
+
+    #[test]
+    fn selected_digest_tracks_presence_without_storing_values() {
+        let pointers = vec!["/query".to_owned(), "/country".to_owned()];
+        let input = json!({"query": "secret", "limit": 10});
+        let constraint = PermissionArgumentConstraint::SelectedDigest {
+            digest: selected_input_digest(&input, &pointers).unwrap(),
+            pointers,
+        };
+        assert!(argument_constraint_matches(
+            &constraint,
+            &json!({"query": "secret", "limit": 20})
+        ));
+        assert!(!argument_constraint_matches(
+            &constraint,
+            &json!({"query": "changed", "limit": 10})
+        ));
+        assert!(!argument_constraint_matches(
+            &constraint,
+            &json!({"query": "secret", "country": null})
+        ));
+        assert!(
+            !serde_json::to_string(&constraint)
+                .unwrap()
+                .contains("secret")
         );
     }
 }

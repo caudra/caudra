@@ -7,8 +7,6 @@ local DESCRIPTION =
 
 - Filters out instruction files (AGENTS.md, CLAUDE.md, COPILOT.md).]]
 
-maki.api.register_permission_rule({ tool = "list", scope = "*" })
-
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[

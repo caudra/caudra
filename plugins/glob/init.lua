@@ -17,8 +17,6 @@ local function search_scope(input)
   return path:sub(-1) == "/" and (path .. "**") or (path .. "/**")
 end
 
-maki.api.register_permission_rule({ tool = "glob", scope = "*" })
-
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.other) or 3, keep = "head" }

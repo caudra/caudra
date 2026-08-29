@@ -65,8 +65,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Disable rtk command rewriting
-    #[arg(long)]
+    /// Legacy compatibility flag. Maki no longer rewrites commands through RTK.
+    #[arg(long, hide = true)]
     pub no_rtk: bool,
 
     /// Skip user `init.lua` files (global and project) but keep the Lua

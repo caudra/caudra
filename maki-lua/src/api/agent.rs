@@ -257,7 +257,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let filter = base
         .excluding(&disabled)
         .excluding(maki_agent::tools::capability_exclusions(model))
-        .with_internal_companions();
+        .with_internal_companions()
+        .intersect(&agent.tool_filter);
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -471,6 +472,16 @@ async fn session(
             );
         }
     }
+    let tool_filter = ToolFilter::Only(
+        tools_json
+            .as_array()
+            .expect("tools were validated as an array")
+            .iter()
+            .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
+            .collect(),
+    )
+    .intersect(&agent_ctx.tool_filter)
+    .including(local_map.keys().cloned());
 
     let thinking = match thinking_val {
         Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
@@ -563,6 +574,7 @@ async fn session(
             subagent_history: agent_ctx.subagent_history.clone(),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
+            tool_filter,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
         system: system.unwrap_or_default(),

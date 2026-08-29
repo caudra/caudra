@@ -1,9 +1,6 @@
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
-local RTK_REWRITE_TIMEOUT_MS = 2000
-local RTK_PROMPT_HINT =
-  "- RTK is active and transparently compacts output from many Bash commands, so results may differ from regular shell output. To bypass RTK for one command, prefix it with `RTK_DISABLED=1`; only do this when uncompacted output would be valuable."
 local SMALL_OUTPUT_MAX_BYTES = 8 * 1024
 local FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 local CONTROL_RESERVE_BYTES = 256
@@ -15,27 +12,7 @@ local OUTPUT_LIMIT_MARKER = "[stopped: output limit exceeded]"
 local STREAM_FAILURE_MARKER = "[stopped: stream failure]"
 local PERSISTENCE_FAILURE_MARKER = "[stopped: output persistence failure]"
 local WORKDIR_SCOPE_FMT = "%s # maki-workdir[%d]=%s # maki-frame[%d]"
-local RTK_UNSUPPORTED_FLAGS = {
-  " -o ",
-  " -not ",
-  " ! ",
-  " -exec ",
-  " -execdir ",
-  " -print0",
-  " -delete",
-  " -ok ",
-  " -okdir ",
-  " -fprint",
-  " -fls ",
-  " -fprintf ",
-}
 local SEPARATOR = "──────"
-
-local rtk_available
-
-local function shell_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
 
 local function unquote(s)
   local q = s:sub(1, 1)
@@ -104,86 +81,6 @@ local function build_header_lines(command)
   end
   header[#header + 1] = { { SEPARATOR, "dim" } }
   return header
-end
-
-local function rtk_find_unsupported(cmd)
-  if not cmd:match("^rtk find ") then
-    return false
-  end
-  for _, flag in ipairs(RTK_UNSUPPORTED_FLAGS) do
-    if cmd:find(flag, 1, true) then
-      return true
-    end
-  end
-  return false
-end
-
-local function includes(values, expected)
-  for _, value in ipairs(values or {}) do
-    if value == expected then
-      return true
-    end
-  end
-  return false
-end
-
-local function rtk_enabled(config)
-  if maki.uv.os_getenv("RTK_DISABLED") == "1" then
-    return false
-  end
-  if not config then
-    return true
-  end
-  if config.no_rtk or includes(config.disabled_tools, "bash") then
-    return false
-  end
-  local allowed_tools = config.allowed_tools or {}
-  return #allowed_tools == 0 or includes(allowed_tools, "bash")
-end
-
-local function rtk_is_available()
-  if rtk_available == nil then
-    local id = maki.fn.jobstart("rtk --version", { owner = "plugin" })
-    local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
-    if result then
-      rtk_available = (result.exit_code == 0)
-    else
-      maki.fn.jobstop(id)
-      rtk_available = false
-    end
-  end
-  return rtk_available
-end
-
-local function rtk_rewrite(command, ctx)
-  if not rtk_enabled(ctx:config()) or not rtk_is_available() then
-    return nil
-  end
-
-  local cmd = command:match("^%s*(.-)%s*$")
-  if cmd:match("^cargo ") and cmd:find(" -- ", 1, true) then
-    return nil
-  end
-
-  local id = maki.fn.jobstart("rtk rewrite " .. shell_quote(command))
-  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
-  if not result then
-    maki.fn.jobstop(id)
-    return nil
-  end
-
-  if result.exit_code ~= 0 and result.exit_code ~= 3 then
-    return nil
-  end
-
-  local rewritten = (result.stdout or ""):match("^%s*(.-)%s*$")
-  if rewritten == "" or rewritten == command:match("^%s*(.-)%s*$") then
-    return nil
-  end
-  if rtk_find_unsupported(rewritten) then
-    return nil
-  end
-  return rewritten
 end
 
 local function create_bash_view(command, ctx)
@@ -319,16 +216,6 @@ maki.api.register_prompt_hint({
   content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
 })
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = function(config)
-    if rtk_enabled(config) and rtk_is_available() then
-      return RTK_PROMPT_HINT
-    end
-    return nil
-  end,
-})
-
 local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 120,
@@ -406,11 +293,6 @@ maki.api.register_tool({
     local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     ctx:set_deadline(timeout_secs)
-
-    local rewritten = rtk_rewrite(command, ctx)
-    if rewritten then
-      command = rewritten
-    end
 
     local buf, view = create_bash_view(command, ctx)
 

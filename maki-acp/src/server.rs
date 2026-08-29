@@ -952,7 +952,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::{PermissionManager, PermissionRequest};
+    use maki_agent::permissions::{PermissionLifetime, PermissionManager, PermissionRequest};
     use maki_agent::tools::PermissionScopes;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
@@ -989,6 +989,13 @@ mod tests {
         selected_permission(id, "allow_once")
     }
 
+    fn allow_exact(lifetime: PermissionLifetime) -> PermissionAnswer {
+        PermissionAnswer::AllowOption {
+            option_id: "allow_exact".into(),
+            lifetime,
+        }
+    }
+
     fn selected_permission(id: i64, option_id: &str) -> Value {
         serde_json::json!({
             "id": id,
@@ -996,8 +1003,8 @@ mod tests {
         })
     }
 
-    #[test_case(allow_once(ANSWERED_ID), true, PermissionAnswer::AllowOnce ; "selected_option")]
-    #[test_case(selected_permission(ANSWERED_ID, "allow_always"), true, PermissionAnswer::AllowSession ; "allow_always_is_exact_conversation")]
+    #[test_case(allow_once(ANSWERED_ID), true, allow_exact(PermissionLifetime::Once) ; "selected_option")]
+    #[test_case(selected_permission(ANSWERED_ID, "allow_always"), true, allow_exact(PermissionLifetime::Conversation) ; "allow_always_is_exact_conversation")]
     #[test_case(selected_permission(ANSWERED_ID, "reject_always"), true, PermissionAnswer::DenyAlwaysLocal ; "representable_reject_always")]
     #[test_case(selected_permission(ANSWERED_ID, "reject_always"), false, PermissionAnswer::Deny ; "unrepresentable_reject_always_fails_closed_once")]
     #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), true, PermissionAnswer::Deny ; "cancelled_outcome")]
@@ -1342,12 +1349,11 @@ mod tests {
         session.meta.structured_permission_rules = vec![
             PermissionRuleRecord::conversation(
                 request
-                    .options
-                    .iter()
-                    .find(|option| option.id == "allow_conversation")
-                    .unwrap()
-                    .rule
-                    .clone(),
+                    .option_rule(
+                        "allow_exact",
+                        maki_agent::permissions::PermissionLifetime::Conversation,
+                    )
+                    .unwrap(),
             )
             .unwrap(),
         ];

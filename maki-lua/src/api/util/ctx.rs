@@ -296,7 +296,7 @@ enum Caps {
         /// start with a clean instruction set.
         loaded_instructions: LoadedInstructions,
     },
-    /// `start` runs before permission checks: it reads config and publishes
+    /// `start` runs after permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
         config: AgentConfig,

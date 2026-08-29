@@ -123,10 +123,6 @@ fn denied_error(perm: Permission) -> LuaError {
     LuaError::runtime(msg)
 }
 
-pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
-    load_plugin_permissions_with_trust(plugin_dir).0
-}
-
 pub(crate) fn load_plugin_permissions_with_trust(
     plugin_dir: Option<&Path>,
 ) -> (PluginPermissions, bool) {

@@ -34,6 +34,16 @@ pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const BASH_WORKDIR_SCOPE_MARKER: &str = " # maki-workdir[";
 const BASH_WORKDIR_FRAME_MARKER: &str = " # maki-frame[";
+const PROJECT_READ_TOOLS: &[&str] = &["glob", "grep", "index", "list", "read", "view_image"];
+const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
+    "batch",
+    "code_execution",
+    "question",
+    "task",
+    "todo_write",
+    "tool_output_grep",
+    "tool_output_read",
+];
 
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
@@ -49,7 +59,8 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         .iter()
         .map(|tool| allow(tool, &cwd_glob))
         .collect();
-    rules.push(allow("task", "*"));
+    rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, &cwd_glob)));
+    rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
     rules
 }
 
@@ -112,6 +123,10 @@ pub enum PermissionAnswer {
     AllowSession,
     AllowAlwaysLocal,
     AllowAlwaysGlobal,
+    AllowOption {
+        option_id: String,
+        lifetime: PermissionLifetime,
+    },
     Deny,
     DenyWithGuidance(String),
     DenyAlwaysLocal,
@@ -121,19 +136,34 @@ pub enum PermissionAnswer {
 impl PermissionAnswer {
     pub fn decision_source(&self) -> &'static str {
         match self {
-            Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
-            Self::AllowSession => DECISION_SOURCE_USER_SESSION,
+            Self::AllowOnce
+            | Self::Deny
+            | Self::DenyWithGuidance(_)
+            | Self::AllowOption {
+                lifetime: PermissionLifetime::Once,
+                ..
+            } => DECISION_SOURCE_USER_ONCE,
+            Self::AllowSession
+            | Self::AllowOption {
+                lifetime: PermissionLifetime::Conversation,
+                ..
+            } => DECISION_SOURCE_USER_SESSION,
             Self::AllowAlwaysLocal
             | Self::AllowAlwaysGlobal
             | Self::DenyAlwaysLocal
-            | Self::DenyAlwaysGlobal => DECISION_SOURCE_USER_ALWAYS,
+            | Self::DenyAlwaysGlobal
+            | Self::AllowOption { .. } => DECISION_SOURCE_USER_ALWAYS,
         }
     }
 
     pub fn is_allow(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AllowSession | Self::AllowAlwaysLocal | Self::AllowAlwaysGlobal
+            Self::AllowOnce
+                | Self::AllowSession
+                | Self::AllowAlwaysLocal
+                | Self::AllowAlwaysGlobal
+                | Self::AllowOption { .. }
         )
     }
 
@@ -143,6 +173,10 @@ impl PermissionAnswer {
             Self::AllowSession => "allow_session".to_string(),
             Self::AllowAlwaysLocal => "allow_always_local".to_string(),
             Self::AllowAlwaysGlobal => "allow_always_global".to_string(),
+            Self::AllowOption {
+                option_id,
+                lifetime,
+            } => format!("allow_option:{}:{option_id}", lifetime_name(lifetime)),
             Self::Deny => "deny".to_string(),
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
             Self::DenyAlwaysLocal => "deny_always_local".to_string(),
@@ -159,6 +193,14 @@ impl PermissionAnswer {
             "deny" => Some(Self::Deny),
             "deny_always_local" => Some(Self::DenyAlwaysLocal),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
+            _ if s.starts_with("allow_option:") => {
+                let rest = s.strip_prefix("allow_option:")?;
+                let (lifetime, option_id) = rest.split_once(':')?;
+                Some(Self::AllowOption {
+                    option_id: option_id.to_owned(),
+                    lifetime: parse_lifetime(lifetime)?,
+                })
+            }
             _ if s.starts_with("deny:") => {
                 let guidance = s.strip_prefix("deny:").unwrap();
                 if guidance.is_empty() {
@@ -176,6 +218,25 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
+    }
+}
+
+fn lifetime_name(lifetime: &PermissionLifetime) -> &'static str {
+    match lifetime {
+        PermissionLifetime::Once => "once",
+        PermissionLifetime::Conversation => "conversation",
+        PermissionLifetime::Project => "project",
+        PermissionLifetime::Global => "global",
+    }
+}
+
+fn parse_lifetime(value: &str) -> Option<PermissionLifetime> {
+    match value {
+        "once" => Some(PermissionLifetime::Once),
+        "conversation" => Some(PermissionLifetime::Conversation),
+        "project" => Some(PermissionLifetime::Project),
+        "global" => Some(PermissionLifetime::Global),
+        _ => None,
     }
 }
 
@@ -557,6 +618,7 @@ impl PermissionManager {
         scopes: &[&str],
         force_prompt: bool,
         plan_path: Option<&Path>,
+        include_builtin_allows: bool,
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
@@ -575,7 +637,12 @@ impl PermissionManager {
             for r in session
                 .iter()
                 .chain(&self.config_rules)
-                .chain(&project.builtin_rules)
+                .chain(
+                    project
+                        .builtin_rules
+                        .iter()
+                        .filter(|_| include_builtin_allows),
+                )
                 .chain(&plugin)
             {
                 if !matches_rule(&r.tool, tool) || !rule_matches_scope(r, tool, scope) {
@@ -664,7 +731,7 @@ impl PermissionManager {
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path)
+        self.check_inner(tool, &[scope], false, plan_path, true)
     }
 
     pub fn check_multi(
@@ -674,7 +741,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path)
+        self.check_inner(tool, scopes, force_prompt, plan_path, true)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -1000,28 +1067,47 @@ impl PermissionManager {
         request: &PermissionRequest,
         answer: &PermissionAnswer,
     ) -> Result<(), PermissionPolicyError> {
-        let (option_id, persistent) = match answer {
-            PermissionAnswer::AllowOnce
-            | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => return Ok(()),
-            PermissionAnswer::AllowSession => ("allow_conversation", false),
-            PermissionAnswer::AllowAlwaysLocal => ("allow_project", true),
-            PermissionAnswer::AllowAlwaysGlobal => ("allow_global", true),
-            PermissionAnswer::DenyAlwaysLocal => ("deny_project", true),
-            PermissionAnswer::DenyAlwaysGlobal => ("deny_global", true),
+        let (option_id, lifetime) = match answer {
+            PermissionAnswer::AllowOnce => ("allow_exact", PermissionLifetime::Once),
+            PermissionAnswer::AllowSession => ("allow_exact", PermissionLifetime::Conversation),
+            PermissionAnswer::AllowAlwaysLocal => ("allow_exact", PermissionLifetime::Project),
+            PermissionAnswer::AllowAlwaysGlobal => ("allow_exact", PermissionLifetime::Global),
+            PermissionAnswer::AllowOption {
+                option_id,
+                lifetime,
+            } => (option_id.as_str(), lifetime.clone()),
+            PermissionAnswer::DenyAlwaysLocal => ("deny_exact", PermissionLifetime::Project),
+            PermissionAnswer::DenyAlwaysGlobal => ("deny_exact", PermissionLifetime::Global),
+            PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => return Ok(()),
         };
-        let rule = request
+        let option = request
             .options
             .iter()
-            .find(|option| option.id == option_id && !option.broad)
-            .map(|option| option.rule.clone())
+            .find(|option| option.id == option_id)
             .ok_or_else(|| {
-                PermissionPolicyError(format!(
-                    "request did not offer the exact {option_id:?} authority"
-                ))
+                PermissionPolicyError(format!("request did not offer {option_id:?} authority"))
             })?;
+        if !option.allowed_lifetimes.contains(&lifetime) {
+            return Err(PermissionPolicyError(format!(
+                "authority {option_id:?} does not allow {lifetime:?} lifetime"
+            )));
+        }
+        let mut rule = option.rule.clone();
+        rule.lifetime = lifetime;
+        let covers = match rule.effect {
+            StructuredPermissionEffect::Allow => permission_rule_covers_request(&rule, request),
+            StructuredPermissionEffect::Deny => permission_rule_intersects_request(&rule, request),
+        };
+        if !covers {
+            return Err(PermissionPolicyError(format!(
+                "authority {option_id:?} does not cover the pending request"
+            )));
+        }
+        if rule.lifetime == PermissionLifetime::Once {
+            return Ok(());
+        }
         let review = Some(redacted_review_shape(&request.input));
-        if !persistent {
+        if rule.lifetime == PermissionLifetime::Conversation {
             let record = PermissionRuleRecord::conversation_with_review(rule, review)
                 .map_err(|error| PermissionPolicyError(error.to_string()))?;
             self.structured_conversation_rules().push(record);
@@ -1076,6 +1162,27 @@ impl PermissionManager {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
             | PermissionAnswer::DenyWithGuidance(_) => {}
+            PermissionAnswer::AllowOption { lifetime, .. } => match lifetime {
+                PermissionLifetime::Once => {}
+                PermissionLifetime::Conversation => {
+                    for s in &resolved {
+                        self.add_session_rule(PermissionRule {
+                            tool: tool.clone(),
+                            scope: Some(s.clone()),
+                            effect: Effect::Allow,
+                        });
+                    }
+                }
+                PermissionLifetime::Project | PermissionLifetime::Global => {
+                    for s in &resolved {
+                        self.add_session_rule(PermissionRule {
+                            tool: tool.clone(),
+                            scope: Some(s.clone()),
+                            effect: Effect::Allow,
+                        });
+                    }
+                }
+            },
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
@@ -1127,6 +1234,7 @@ impl PermissionManager {
             cancel,
             plan_path,
             None,
+            true,
         )
         .await
     }
@@ -1143,6 +1251,7 @@ impl PermissionManager {
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
         identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+        include_builtin_allows: bool,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let cwd = self.project().cwd.clone();
@@ -1169,27 +1278,39 @@ impl PermissionManager {
             }
         };
 
-        let make_request = |tool: ToolKey, request_scopes: Vec<String>| match &identity {
-            Some((subject, executor)) => PermissionRequest::from_legacy_with_identity(
-                request_id.to_owned(),
-                tool,
-                request_scopes,
-                input.clone(),
-                &cwd,
-                scopes.force_prompt,
-                subject.clone(),
-                executor.clone(),
-            ),
-            None => PermissionRequest::from_legacy(
-                request_id.to_owned(),
-                tool,
-                request_scopes,
-                input.clone(),
-                &cwd,
-                scopes.force_prompt,
-            ),
+        let make_request =
+            |tool: ToolKey, request_scopes: Vec<String>, force_prompt: bool| match &identity {
+                Some((subject, executor)) => PermissionRequest::from_legacy_with_identity(
+                    request_id.to_owned(),
+                    tool,
+                    request_scopes,
+                    input.clone(),
+                    &cwd,
+                    force_prompt,
+                    subject.clone(),
+                    executor.clone(),
+                ),
+                None => PermissionRequest::from_legacy(
+                    request_id.to_owned(),
+                    tool,
+                    request_scopes,
+                    input.clone(),
+                    &cwd,
+                    force_prompt,
+                ),
+            };
+        let initial_request =
+            make_request(tool.clone(), scopes.scopes.clone(), scopes.force_prompt);
+        let force_prompt = scopes.force_prompt
+            || initial_request
+                .resources
+                .iter()
+                .any(|resource| resource.requires_prompt);
+        let full_request = if force_prompt == scopes.force_prompt {
+            initial_request
+        } else {
+            make_request(tool.clone(), scopes.scopes.clone(), force_prompt)
         };
-        let full_request = make_request(tool.clone(), scopes.scopes.clone());
         let structured_rules = self.applicable_structured_rules().map_err(|error| {
             warn!(%error, "structured permission policy failed closed");
             deny(DECISION_SOURCE_RULE, Some(error.to_string()))
@@ -1201,25 +1322,31 @@ impl PermissionManager {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
 
-        let (pt, ps, force_prompt) =
-            match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
-                PermissionCheck::Allowed => return allowed(by_rule()),
-                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes,
-                    force_prompt,
-                } => (tool, scopes, force_prompt),
-            };
-
-        let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
+        let (pt, ps, force_prompt) = match self.check_inner(
+            tool,
+            &scope_refs,
+            force_prompt,
+            plan_path,
+            include_builtin_allows,
+        ) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-            PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                force_prompt,
+            } => (tool, scopes, force_prompt),
         };
 
-        let request = make_request(t2.clone(), s2.clone());
+        let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
+        let (t2, s2) =
+            match self.check_inner(&pt, &refs, force_prompt, plan_path, include_builtin_allows) {
+                PermissionCheck::Allowed => return allowed(by_rule()),
+                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+                PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
+            };
+
+        let request = make_request(t2.clone(), s2.clone(), force_prompt);
         let structured_rules = self.applicable_structured_rules().map_err(|error| {
             warn!(%error, "structured permission policy failed closed");
             deny(DECISION_SOURCE_RULE, Some(error.to_string()))
@@ -1329,12 +1456,17 @@ fn rule_matches_scope(rule: &PermissionRule, tool: &ToolKey, scope: &str) -> boo
 }
 
 fn bash_command_scope(scope: &str) -> Option<&str> {
+    bash_scope_parts(scope).map(|(command, _)| command)
+}
+
+fn bash_scope_parts(scope: &str) -> Option<(&str, &str)> {
     let (payload, frame) = scope.rsplit_once(BASH_WORKDIR_FRAME_MARKER)?;
     let workdir_length = frame.strip_suffix(']')?.parse::<usize>().ok()?;
     let workdir_start = payload.len().checked_sub(workdir_length)?;
     let command_with_metadata = payload.get(..workdir_start)?;
+    let workdir = payload.get(workdir_start..)?;
     let metadata = format!("{BASH_WORKDIR_SCOPE_MARKER}{workdir_length}]=");
-    command_with_metadata.strip_suffix(&metadata)
+    Some((command_with_metadata.strip_suffix(&metadata)?, workdir))
 }
 
 fn canonical_mcp_scope(scope: &str) -> String {
@@ -1540,6 +1672,20 @@ mod tests {
             default_mgr().check(&ToolKey::native(tool), scope, None),
             PermissionCheck::Allowed
         )
+    }
+
+    #[test]
+    fn builtin_allows_apply_only_to_bundled_implementations() {
+        let manager = default_mgr();
+        let tool = ToolKey::native("task");
+        assert!(matches!(
+            manager.check_inner(&tool, &["{}"], false, None, true),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            manager.check_inner(&tool, &["{}"], false, None, false),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
     }
 
     #[test]
@@ -1769,6 +1915,10 @@ mod tests {
             PermissionAnswer::AllowOnce,
             PermissionAnswer::AllowSession,
             PermissionAnswer::AllowAlwaysLocal,
+            PermissionAnswer::AllowOption {
+                option_id: "allow_url_origin".into(),
+                lifetime: PermissionLifetime::Project,
+            },
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
         ] {
@@ -2403,18 +2553,29 @@ mod tests {
         input: serde_json::Value,
         answer: PermissionAnswer,
     ) -> Result<(), PermissionError> {
+        answer_tool_enforcement(manager, "bash", scope, input, answer).await
+    }
+
+    async fn answer_tool_enforcement(
+        manager: Arc<PermissionManager>,
+        tool: &str,
+        scope: &str,
+        input: serde_json::Value,
+        answer: PermissionAnswer,
+    ) -> Result<(), PermissionError> {
         let scopes = crate::tools::PermissionScopes::single(scope.to_owned());
         let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
         let event_tx = crate::EventSender::new(event_tx, 0);
         let (_legacy_tx, legacy_rx) = flume::unbounded();
         let legacy_rx = Arc::new(async_lock::Mutex::new(legacy_rx));
+        let tool = ToolKey::native(tool);
         let task = smol::spawn({
             let manager = Arc::clone(&manager);
             let legacy_rx = Arc::clone(&legacy_rx);
             async move {
                 manager
                     .enforce(
-                        &ToolKey::native("bash"),
+                        &tool,
                         &scopes,
                         &input,
                         &event_tx,
@@ -2437,10 +2598,19 @@ mod tests {
         scope: &str,
         input: serde_json::Value,
     ) -> Result<(), PermissionError> {
+        enforce_tool_without_prompt(manager, "bash", scope, input).await
+    }
+
+    async fn enforce_tool_without_prompt(
+        manager: &PermissionManager,
+        tool: &str,
+        scope: &str,
+        input: serde_json::Value,
+    ) -> Result<(), PermissionError> {
         let (event_tx, _) = flume::unbounded::<crate::Envelope>();
         manager
             .enforce(
-                &ToolKey::native("bash"),
+                &ToolKey::native(tool),
                 &crate::tools::PermissionScopes::single(scope.to_owned()),
                 &input,
                 &crate::EventSender::new(event_tx, 0),
@@ -2495,6 +2665,57 @@ mod tests {
     }
 
     #[test]
+    fn url_subtree_project_rule_survives_restart_without_storing_url() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let state_dir = StateDir::from_path(temp.path().join("state"));
+            let manager = persistent_manager(state_dir.clone(), &project);
+            let approved = "https://example.com/docs/page?token=secret";
+
+            answer_tool_enforcement(
+                Arc::clone(&manager),
+                "webfetch",
+                approved,
+                serde_json::json!({"url": approved}),
+                PermissionAnswer::AllowOption {
+                    option_id: "allow_url_subtree".into(),
+                    lifetime: PermissionLifetime::Project,
+                },
+            )
+            .await
+            .unwrap();
+            let stored =
+                std::fs::read_to_string(state_dir.path().join(PERMISSION_STATE_FILE)).unwrap();
+            assert!(!stored.contains("example.com"));
+            assert!(!stored.contains("secret"));
+            drop(manager);
+
+            let restarted = persistent_manager(state_dir, &project);
+            let descendant = "https://example.com/docs/page/child?other=value";
+            enforce_tool_without_prompt(
+                &restarted,
+                "webfetch",
+                descendant,
+                serde_json::json!({"url": descendant, "timeout": 10}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                enforce_tool_without_prompt(
+                    &restarted,
+                    "webfetch",
+                    "https://example.com/docs/sibling",
+                    serde_json::json!({"url": "https://example.com/docs/sibling"}),
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
     fn persistent_deny_is_exact_and_wins_over_conversation_allow() {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
@@ -2523,12 +2744,8 @@ mod tests {
             );
             let allow = PermissionRuleRecord::conversation(
                 request
-                    .options
-                    .iter()
-                    .find(|option| option.id == "allow_conversation")
-                    .unwrap()
-                    .rule
-                    .clone(),
+                    .option_rule("allow_exact", PermissionLifetime::Conversation)
+                    .unwrap(),
             )
             .unwrap();
             manager.load_structured_conversation_rules(vec![allow]);
@@ -2786,12 +3003,8 @@ mod tests {
         );
         let record = PermissionRuleRecord::conversation(
             request
-                .options
-                .iter()
-                .find(|option| option.id == "allow_conversation")
-                .unwrap()
-                .rule
-                .clone(),
+                .option_rule("allow_exact", PermissionLifetime::Conversation)
+                .unwrap(),
         )
         .unwrap();
         manager.load_structured_conversation_rules(vec![record]);

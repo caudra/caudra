@@ -87,6 +87,7 @@ pub struct AgentParams {
     pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
+    pub tool_filter: crate::tools::ToolFilter,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -130,6 +131,7 @@ pub struct Agent<'h> {
     subagent_history: SubagentHistoryStore,
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
+    tool_filter: crate::tools::ToolFilter,
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
@@ -174,6 +176,7 @@ impl<'h> Agent<'h> {
             subagent_history: params.subagent_history,
             registry: params.registry,
             audience: params.audience,
+            tool_filter: params.tool_filter,
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
@@ -766,6 +769,7 @@ impl<'h> Agent<'h> {
             registry: Arc::clone(&self.registry),
             workflow: self.workflow,
             audience: self.audience,
+            tool_filter: self.tool_filter.clone(),
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
@@ -1130,6 +1134,7 @@ mod tests {
                 subagent_history: SubagentHistoryStore::default(),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
+                tool_filter: crate::tools::ToolFilter::All,
                 model_policy: Arc::new(ModelPolicy::default()),
             },
             AgentRunParams {

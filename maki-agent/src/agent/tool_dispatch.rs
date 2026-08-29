@@ -116,9 +116,7 @@ async fn run_inner(
     // Covers names re-entering from model JSON (batch children, `call_tool`,
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
     let name = super::streaming::canonical_tool_name(name);
-    if let Some(local) = ctx.local_tools.get(name) {
-        return run_local_tool(local, id, name, input, ctx, emit).await;
-    }
+    let local = ctx.local_tools.get(name);
     let entry = registry.get(name);
     // LLM providers send tool names in wire format (server__tool) but our
     // internal index uses server.tool. Only convert if the name isn't a
@@ -133,6 +131,7 @@ async fn run_inner(
     let tool_id: Arc<str> = entry
         .as_ref()
         .map(|e| Arc::from(e.tool.name()))
+        .or_else(|| local.map(|_| Arc::from(name)))
         .or_else(|| mcp.map(|m| m.interned_name(mcp_lookup)))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
@@ -151,7 +150,19 @@ async fn run_inner(
         model_output_from_ref: false,
     };
 
+    if (local.is_some() || entry.is_some()) && !ctx.tool_filter.matches(name) {
+        return done_error(format!("tool {name} is disabled for the current agent"));
+    }
+    if let Some(local) = local {
+        return run_local_tool(local, id, name, input, ctx, emit).await;
+    }
+
     if let Some(entry) = entry {
+        if !entry.tool.audience().contains(ctx.audience) {
+            return done_error(format!(
+                "tool {name} is unavailable to the current agent audience"
+            ));
+        }
         let invocation = match entry.tool.parse(input) {
             Ok(inv) => inv,
             Err(e) => {
@@ -183,6 +194,12 @@ async fn run_inner(
             }
         }
 
+        if let Err(e) =
+            enforce_permission(invocation.as_ref(), &entry.source, name, input, ctx, &id).await
+        {
+            return done_error(e);
+        }
+
         let header_result = invocation.start_header().await;
         let start = ToolStartEvent {
             id: id.clone(),
@@ -199,12 +216,6 @@ async fn run_inner(
         }
 
         invocation.start(ctx).await;
-
-        if let Err(e) =
-            enforce_permission(invocation.as_ref(), &entry.source, name, input, ctx, &id).await
-        {
-            return done_error(e);
-        }
 
         let result = invocation.execute(ctx).await;
 
@@ -375,34 +386,41 @@ async fn enforce_permission(
             "enforce_permission called with dotted name: {name}"
         ));
     }
-    if let Some(scopes) = inv.permission_scopes().await {
-        let tool_key = ToolKey::native(name);
-        let identity = match source {
-            crate::tools::ToolSource::Lua { plugin, contract } => Some((
-                crate::permissions::PermissionSubject::Lua {
-                    plugin: plugin.to_string(),
-                    tool: name.to_owned(),
-                    contract: contract.to_string(),
-                },
-                crate::permissions::PermissionExecutorKind::Lua,
-            )),
-            crate::tools::ToolSource::Mcp { .. } => None,
-        };
-        ctx.permissions
-            .enforce_with_identity(
-                &tool_key,
-                &scopes,
-                input,
-                &ctx.event_tx,
-                ctx.user_response_rx.as_deref(),
-                id,
-                &ctx.cancel,
-                ctx.mode.plan_path(),
-                identity,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    let input = inv.permission_input().unwrap_or(input);
+    let scopes = inv.permission_scopes().await.unwrap_or_else(|| {
+        crate::tools::PermissionScopes::single(crate::permissions::canonical_json(input))
+    });
+    let tool_key = ToolKey::native(name);
+    let identity = match source {
+        crate::tools::ToolSource::Lua {
+            plugin,
+            contract,
+            bundled: _,
+        } => Some((
+            crate::permissions::PermissionSubject::Lua {
+                plugin: plugin.to_string(),
+                tool: name.to_owned(),
+                contract: contract.to_string(),
+            },
+            crate::permissions::PermissionExecutorKind::Lua,
+        )),
+        crate::tools::ToolSource::Mcp { .. } => None,
+    };
+    ctx.permissions
+        .enforce_with_identity(
+            &tool_key,
+            &scopes,
+            input,
+            &ctx.event_tx,
+            ctx.user_response_rx.as_deref(),
+            id,
+            &ctx.cancel,
+            ctx.mode.plan_path(),
+            identity,
+            matches!(source, crate::tools::ToolSource::Lua { bundled: true, .. }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -462,6 +480,7 @@ async fn execute_mcp_tool(
                 binding.subject().clone(),
                 crate::permissions::PermissionExecutorKind::Mcp,
             )),
+            false,
         )
         .await
     {
@@ -1120,6 +1139,7 @@ mod tests {
                     ToolSource::Lua {
                         plugin: "test".into(),
                         contract: "test-contract".into(),
+                        bundled: false,
                     },
                 )
                 .unwrap();
@@ -1203,9 +1223,144 @@ mod tests {
         }
     }
 
-    /// A denied tool should still get its preview, but never its `execute`.
+    struct ReplacementTaskProbe {
+        executed: Arc<AtomicBool>,
+    }
+
+    struct ReplacementTaskInvocation {
+        executed: Arc<AtomicBool>,
+    }
+
+    impl ToolInvocation for ReplacementTaskInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("replacement task".into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            self.executed.store(true, Ordering::SeqCst);
+            Box::pin(async {
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl Tool for ReplacementTaskProbe {
+        fn name(&self) -> &str {
+            "task"
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "replacement task".into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(ReplacementTaskInvocation {
+                executed: Arc::clone(&self.executed),
+            }))
+        }
+    }
+
     #[test]
-    fn start_runs_before_permission_denial_blocks_execute() {
+    fn unscoped_replacement_does_not_inherit_builtin_trust() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(ReplacementTaskProbe {
+                        executed: Arc::clone(&executed),
+                    }),
+                    ToolSource::Lua {
+                        plugin: "replacement".into(),
+                        contract: "replacement-contract".into(),
+                        bundled: false,
+                    },
+                )
+                .unwrap();
+
+            let done = run(
+                &registry,
+                None,
+                "t1".into(),
+                "task",
+                &serde_json::json!({"prompt": "do something"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn filtered_tool_cannot_be_dispatched_by_name() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    default: maki_config::DefaultEffect::Allow,
+                    ..PermissionsConfig::default()
+                },
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            ctx.tool_filter = crate::tools::ToolFilter::AllExcept(vec![START_PROBE_NAME.into()]);
+            let probe = StartProbe::default();
+            let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                        contract: "test-contract".into(),
+                        bundled: true,
+                    },
+                )
+                .unwrap();
+
+            let done = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().contains("disabled"));
+            assert!(!started.load(Ordering::SeqCst));
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    /// A denied tool cannot run either lifecycle callback.
+    #[test]
+    fn permission_denial_blocks_start_and_execute() {
         smol::block_on(async {
             let deny_cfg = PermissionsConfig {
                 rules: vec![PermissionRule {
@@ -1235,6 +1390,7 @@ mod tests {
                     ToolSource::Lua {
                         plugin: "test".into(),
                         contract: "test-contract".into(),
+                        bundled: false,
                     },
                 )
                 .unwrap();
@@ -1252,8 +1408,8 @@ mod tests {
 
             assert!(done.is_error, "denial must error");
             assert!(
-                started.load(Ordering::SeqCst),
-                "start must run before permission enforcement"
+                !started.load(Ordering::SeqCst),
+                "start must not run after denial"
             );
             assert!(
                 !executed.load(Ordering::SeqCst),

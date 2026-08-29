@@ -22,8 +22,6 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
-maki.api.register_permission_rule({ tool = "read", scope = "*" })
-
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
