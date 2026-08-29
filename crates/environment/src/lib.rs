@@ -1,3 +1,7 @@
+#![forbid(unsafe_code)]
+
+//! Typed, sanitized execution-environment inspection with an optional MCP adapter.
+
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -7,18 +11,21 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "mcp")]
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
 
-pub(crate) const EXTENSION_ID: &str = "ai.workcell/execution-environment";
-pub(crate) const TOOL_NAME: &str = "execution_environment";
+pub const EXTENSION_ID: &str = "ai.workcell/execution-environment";
+pub const TOOL_NAME: &str = "execution_environment";
 
+#[cfg(feature = "mcp")]
 const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
-const TOOL_DESCRIPTION: &str = r#"Inspect the MCP server's current sanitized execution environment.
+const TOOL_DESCRIPTION: &str = r#"Inspect the execution host's current sanitized environment.
 
 Use this tool when command availability, installed versions, privilege access, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.
 
@@ -44,7 +51,7 @@ pub(crate) struct ExecutionEnvironmentSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExecutionEnvironmentDisclosure {
+pub struct ExecutionEnvironmentDisclosure {
     root: Option<PathBuf>,
     startup: ExecutionEnvironmentSnapshot,
     refresh_gate: Arc<Semaphore>,
@@ -52,12 +59,54 @@ pub(crate) struct ExecutionEnvironmentDisclosure {
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ToolGroupDisclosure {
-    pub(crate) files: bool,
-    pub(crate) web: bool,
-    pub(crate) shell: bool,
-    pub(crate) code: bool,
+pub struct ToolGroupDisclosure {
+    pub files: bool,
+    pub web: bool,
+    pub shell: bool,
+    pub code: bool,
 }
+
+pub type ExecutionEnvironment = ExecutionEnvironmentDisclosure;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionEnvironmentOutput {
+    pub version: &'static str,
+    pub snapshot_revision: String,
+    pub scope: &'static str,
+    pub os: OsDescriptor,
+    pub runtime: RuntimeDescriptor,
+    pub execution: ExecutionEnvironmentExecution,
+    pub container: ContainerDescriptor,
+    pub workspace: WorkspaceDescriptor,
+    pub tool_groups: ToolGroupDisclosure,
+    pub commands: Vec<CommandDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionEnvironmentResult {
+    pub output: ExecutionEnvironmentOutput,
+    pub model_text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionEnvironmentError {
+    Unavailable,
+    Cancelled,
+    TimedOut,
+}
+
+impl std::fmt::Display for ExecutionEnvironmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "Execution-environment refresh gate is unavailable",
+            Self::Cancelled => "Execution-environment inspection cancelled",
+            Self::TimedOut => "Execution-environment inspection timed out",
+        })
+    }
+}
+
+impl std::error::Error for ExecutionEnvironmentError {}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,37 +122,32 @@ struct SemanticDescriptor<'a> {
     commands: &'a [CommandDescriptor],
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Descriptor<'a> {
-    version: &'static str,
-    snapshot_revision: String,
-    scope: &'static str,
-    os: &'a OsDescriptor,
-    runtime: RuntimeDescriptor,
-    execution: ExecutionDescriptor<'a>,
-    container: &'a ContainerDescriptor,
-    workspace: &'a WorkspaceDescriptor,
-    tool_groups: ToolGroupDisclosure,
-    commands: &'a [CommandDescriptor],
+pub struct ExecutionEnvironmentExecution {
+    pub shell: &'static str,
+    pub sandbox: &'static str,
+    pub network_access: &'static str,
+    pub environment_inheritance: &'static str,
+    pub privilege: PrivilegeDescriptor,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OsDescriptor {
-    family: &'static str,
-    architecture: &'static str,
-    path_style: &'static str,
-    kernel_release: Option<String>,
-    distribution: Option<String>,
-    wsl: bool,
-    system_package_manager: SystemPackageManagerDescriptor,
+pub struct OsDescriptor {
+    pub family: &'static str,
+    pub architecture: &'static str,
+    pub path_style: &'static str,
+    pub kernel_release: Option<String>,
+    pub distribution: Option<String>,
+    pub wsl: bool,
+    pub system_package_manager: SystemPackageManagerDescriptor,
 }
 
-#[derive(Clone, Copy, Serialize)]
-struct RuntimeDescriptor {
-    name: &'static str,
-    version: &'static str,
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RuntimeDescriptor {
+    pub name: &'static str,
+    pub version: &'static str,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -118,19 +162,19 @@ struct ExecutionDescriptor<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PrivilegeDescriptor {
-    effective_root: Option<bool>,
-    non_interactive_sudo: &'static str,
+pub struct PrivilegeDescriptor {
+    pub effective_root: Option<bool>,
+    pub non_interactive_sudo: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct SystemPackageManagerDescriptor {
-    name: &'static str,
-    available: bool,
+pub struct SystemPackageManagerDescriptor {
+    pub name: &'static str,
+    pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    executable: Option<&'static str>,
+    pub executable: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,46 +185,46 @@ struct LinuxDistribution {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ContainerDescriptor {
-    kind: &'static str,
-    evidence: Vec<&'static str>,
+pub struct ContainerDescriptor {
+    pub kind: &'static str,
+    pub evidence: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct WorkspaceDescriptor {
-    git: GitDescriptor,
+pub struct WorkspaceDescriptor {
+    pub git: GitDescriptor,
     #[serde(rename = "packageManager")]
-    package_manager: PackageManagerDescriptor,
+    pub package_manager: PackageManagerDescriptor,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct GitDescriptor {
-    available: bool,
-    repository: &'static str,
+pub struct GitDescriptor {
+    pub available: bool,
+    pub repository: &'static str,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-struct PackageManagerDescriptor {
+pub struct PackageManagerDescriptor {
     #[serde(skip_serializing_if = "Option::is_none")]
-    declared: Option<DeclaredPackageManager>,
+    pub declared: Option<DeclaredPackageManager>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inferred: Option<String>,
-    lockfiles: Vec<&'static str>,
+    pub inferred: Option<String>,
+    pub lockfiles: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct DeclaredPackageManager {
-    name: String,
+pub struct DeclaredPackageManager {
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct CommandDescriptor {
-    id: &'static str,
-    available: bool,
+pub struct CommandDescriptor {
+    pub id: &'static str,
+    pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -296,7 +340,7 @@ const fn system_package_manager(
 }
 
 impl ExecutionEnvironmentDisclosure {
-    pub(crate) async fn collect(root: Option<&Path>) -> Self {
+    pub async fn collect(root: Option<&Path>) -> Self {
         let root = canonical_root(root).await;
         Self {
             startup: ExecutionEnvironmentSnapshot::collect(root.as_deref()).await,
@@ -305,14 +349,51 @@ impl ExecutionEnvironmentDisclosure {
         }
     }
 
-    pub(crate) fn discovery_descriptor(
+    pub fn discovery_descriptor(
         &self,
         groups: ToolGroupDisclosure,
     ) -> serde_json::Map<String, Value> {
         self.startup.descriptor(groups)
     }
 
-    pub(crate) async fn call_tool(
+    #[must_use]
+    pub fn startup(&self, groups: ToolGroupDisclosure) -> ExecutionEnvironmentOutput {
+        self.startup.output(groups)
+    }
+
+    pub async fn inspect(
+        &self,
+        groups: ToolGroupDisclosure,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionEnvironmentResult, ExecutionEnvironmentError> {
+        let gate = self.refresh_gate.clone();
+        let permit = tokio::select! {
+            permit = gate.acquire_owned() => permit.map_err(|_| ExecutionEnvironmentError::Unavailable)?,
+            () = cancellation.cancelled() => return Err(ExecutionEnvironmentError::Cancelled),
+        };
+        let collection = tokio::time::timeout(
+            INSPECTION_TIMEOUT,
+            ExecutionEnvironmentSnapshot::collect(self.root.as_deref()),
+        );
+        tokio::pin!(collection);
+        let snapshot = tokio::select! {
+            snapshot = &mut collection => snapshot.map_err(|_| ExecutionEnvironmentError::TimedOut)?,
+            () = cancellation.cancelled() => {
+                // Finish the bounded collection before releasing the gate so cancellation cannot
+                // create overlapping process batches.
+                let _ = collection.await;
+                return Err(ExecutionEnvironmentError::Cancelled);
+            }
+        };
+        drop(permit);
+        let output = snapshot.output(groups);
+        let model_text = serde_json::to_string_pretty(&output)
+            .expect("execution-environment descriptor is serializable");
+        Ok(ExecutionEnvironmentResult { output, model_text })
+    }
+
+    #[cfg(feature = "mcp")]
+    pub async fn call_tool(
         &self,
         arguments: Value,
         groups: ToolGroupDisclosure,
@@ -324,73 +405,74 @@ impl ExecutionEnvironmentDisclosure {
             );
         }
 
-        let gate = self.refresh_gate.clone();
-        let permit = tokio::select! {
-            permit = gate.acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => return tool_error("Execution-environment refresh gate is unavailable"),
-            },
-            () = cancellation.cancelled() => {
-                return tool_error("Execution-environment inspection cancelled");
-            }
-        };
-        let collection = tokio::time::timeout(
-            INSPECTION_TIMEOUT,
-            ExecutionEnvironmentSnapshot::collect(self.root.as_deref()),
-        );
-        tokio::pin!(collection);
-        let snapshot = tokio::select! {
-            snapshot = &mut collection => match snapshot {
-                Ok(snapshot) => snapshot,
-                Err(_) => return tool_error("Execution-environment inspection timed out"),
-            },
-            () = cancellation.cancelled() => {
-                // The total collection deadline bounds cleanup. Let it finish before releasing the
-                // gate so cancellation cannot create overlapping process batches.
-                let _ = collection.await;
-                return tool_error("Execution-environment inspection cancelled");
-            }
-        };
-        drop(permit);
-        success(snapshot.descriptor(groups))
+        match self.inspect(groups, cancellation).await {
+            Ok(result) => success(result),
+            Err(error) => tool_error(error.to_string()),
+        }
     }
 }
 
-pub(crate) fn tool() -> Tool {
+#[must_use]
+pub fn spec() -> ToolSpec {
     let input_schema = json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {},
         "additionalProperties": false
     });
+    ToolSpec::new(
+        TOOL_NAME,
+        Some("Inspect execution environment"),
+        TOOL_DESCRIPTION,
+        input_schema
+            .as_object()
+            .expect("execution-environment input schema is an object")
+            .clone(),
+        NeutralAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
+        "execution-environment.snapshot.v1",
+        "execution-environment.snapshot.v1",
+    )
+    .with_output_schema(output_schema())
+}
+
+#[cfg(feature = "mcp")]
+pub fn tool() -> Tool {
+    let spec = spec();
     let mut meta = JsonObject::new();
     meta.insert(
         PRESENTATION_KEY.to_owned(),
-        Value::String("execution-environment.snapshot.v1".to_owned()),
+        Value::String(spec.presentation.to_owned()),
     );
-    Tool::new(
-        TOOL_NAME,
-        TOOL_DESCRIPTION,
-        Arc::new(
-            input_schema
-                .as_object()
-                .expect("execution-environment input schema is an object")
-                .clone(),
-        ),
-    )
-    .with_title("Inspect execution environment")
-    .with_raw_output_schema(output_schema())
+    let tool = Tool::new(
+        spec.name,
+        spec.description.clone(),
+        Arc::new(spec.input_schema.clone()),
+    );
+    let tool = match spec.title {
+        Some(title) => tool.with_title(title),
+        None => tool,
+    };
+    tool.with_raw_output_schema(Arc::new(
+        spec.output_schema
+            .clone()
+            .expect("execution-environment output schema"),
+    ))
     .with_annotations(ToolAnnotations::from_raw(
         None,
-        Some(false),
-        Some(false),
-        Some(false),
-        Some(true),
+        spec.annotations.read_only_hint,
+        spec.annotations.destructive_hint,
+        spec.annotations.idempotent_hint,
+        spec.annotations.open_world_hint,
     ))
     .with_meta(MetaObject(meta))
 }
 
-fn output_schema() -> Arc<JsonObject> {
+fn output_schema() -> serde_json::Map<String, Value> {
     let nullable_string = json!({"type": ["string", "null"], "maxLength": 128});
     let lockfiles = LOCKFILES
         .iter()
@@ -565,23 +647,22 @@ fn output_schema() -> Arc<JsonObject> {
             }
         }
     });
-    Arc::new(
-        schema
-            .as_object()
-            .expect("execution-environment output schema is an object")
-            .clone(),
-    )
+    schema
+        .as_object()
+        .expect("execution-environment output schema is an object")
+        .clone()
 }
 
-fn success(descriptor: serde_json::Map<String, Value>) -> CallToolResult {
-    let structured = Value::Object(descriptor);
-    let text = serde_json::to_string_pretty(&structured)
-        .expect("execution-environment descriptor is serializable");
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+#[cfg(feature = "mcp")]
+fn success(result: ExecutionEnvironmentResult) -> CallToolResult {
+    let structured =
+        serde_json::to_value(result.output).expect("execution-environment output serializes");
+    let mut result = CallToolResult::success(vec![ContentBlock::text(result.model_text)]);
     result.structured_content = Some(structured);
     result
 }
 
+#[cfg(feature = "mcp")]
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
 }
@@ -626,6 +707,14 @@ impl ExecutionEnvironmentSnapshot {
         &self,
         groups: ToolGroupDisclosure,
     ) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::to_value(self.output(groups))
+            .expect("static descriptor is serializable")
+            .as_object()
+            .expect("descriptor serializes as an object")
+            .clone()
+    }
+
+    fn output(&self, groups: ToolGroupDisclosure) -> ExecutionEnvironmentOutput {
         let execution = ExecutionDescriptor {
             shell: if groups.shell {
                 process_shell()
@@ -657,22 +746,24 @@ impl ExecutionEnvironmentSnapshot {
             commands: &self.commands,
         };
         let revision = format!("sha256:{}", canonical_hash(&semantic));
-        serde_json::to_value(Descriptor {
+        ExecutionEnvironmentOutput {
             version: "v1",
             snapshot_revision: revision,
             scope: "server-process",
-            os: &self.os,
+            os: self.os.clone(),
             runtime,
-            execution,
-            container: &self.container,
-            workspace: &self.workspace,
+            execution: ExecutionEnvironmentExecution {
+                shell: execution.shell,
+                sandbox: execution.sandbox,
+                network_access: execution.network_access,
+                environment_inheritance: execution.environment_inheritance,
+                privilege: self.privilege.clone(),
+            },
+            container: self.container.clone(),
+            workspace: self.workspace.clone(),
             tool_groups: groups,
-            commands: &self.commands,
-        })
-        .expect("static descriptor is serializable")
-        .as_object()
-        .expect("descriptor serializes as an object")
-        .clone()
+            commands: self.commands.clone(),
+        }
     }
 }
 
@@ -1536,7 +1627,7 @@ const fn architecture() -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod tests {
     use tempfile::tempdir;
 
@@ -1545,13 +1636,18 @@ mod tests {
     #[test]
     fn tool_catalog_matches_conformance_fixture() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../fixtures/mcp-conformance/catalog/v1/execution-environment-tool.json"
+            "../../../fixtures/mcp-conformance/catalog/v1/execution-environment-tool.json"
         ))
         .expect("execution-environment catalog fixture");
         assert_eq!(
             serde_json::to_value(tool()).unwrap(),
             fixture["expected"]["tools"][0]
         );
+        let neutral = spec();
+        let mcp = tool();
+        assert_eq!(neutral.name, mcp.name);
+        assert_eq!(neutral.input_schema, *mcp.input_schema);
+        assert_eq!(neutral.contract_id, "execution-environment.snapshot.v1");
     }
 
     #[test]
@@ -1782,9 +1878,25 @@ mod tests {
                 "lockfiles": ["pnpm-lock.yaml"]
             })
         );
-        assert_eq!(text.text, serde_json::to_string_pretty(&second).unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&text.text).unwrap(), second);
         assert!(!text.text.contains("must-not-leak"));
         assert!(!text.text.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn native_inspection_returns_typed_output_and_exact_model_text() {
+        let disclosure = ExecutionEnvironmentDisclosure::collect(None).await;
+        let result = disclosure
+            .inspect(ToolGroupDisclosure::default(), CancellationToken::new())
+            .await
+            .expect("native inspection");
+
+        assert_eq!(result.output.version, "v1");
+        assert_eq!(result.output.scope, "server-process");
+        assert_eq!(
+            result.model_text,
+            serde_json::to_string_pretty(&result.output).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1825,19 +1937,21 @@ mod tests {
         let second = snapshot.descriptor(groups);
         assert_eq!(first, second);
         assert_eq!(first.len(), 10);
+        let mut keys = first.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
         assert_eq!(
-            first.keys().map(String::as_str).collect::<Vec<_>>(),
+            keys,
             [
-                "version",
-                "snapshotRevision",
-                "scope",
+                "commands",
+                "container",
+                "execution",
                 "os",
                 "runtime",
-                "execution",
-                "container",
-                "workspace",
+                "scope",
+                "snapshotRevision",
                 "toolGroups",
-                "commands",
+                "version",
+                "workspace",
             ]
         );
         assert_eq!(first["version"], "v1");

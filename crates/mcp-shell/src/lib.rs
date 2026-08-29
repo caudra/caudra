@@ -1,13 +1,12 @@
-//! MCP facade for Workcell's local shell executor.
+//! Protocol-neutral shell execution with an MCP adapter.
 //!
-//! This crate owns the wire contract and process lifecycle, while exposing only the tool catalog
-//! and dispatch group to the application. The executor is intentionally marked unsafe: validating
-//! an initial working directory is not a sandbox, and commands inherit the server's authority.
+//! The crate exposes typed prepare/execute APIs and, with the `mcp` feature, MCP catalog and
+//! dispatch integration. Initial working-directory validation is not a sandbox: commands inherit
+//! the server process's authority.
 
 #![forbid(unsafe_code)]
 
-// Keep implementation details private so callers cannot bypass dispatch validation or lifecycle
-// cleanup by composing lower-level process and output helpers themselves.
+// Process and output internals stay private so all callers retain lifecycle cleanup and bounds.
 mod catalog;
 mod group;
 mod output;
@@ -17,10 +16,17 @@ mod progress;
 mod types;
 mod workdir;
 
+#[cfg(feature = "mcp")]
 pub use catalog::catalog;
+pub use catalog::specs;
 pub use group::{ShellBuildError, ShellToolGroup};
 pub use permission::{
     ShellPermissionPolicy, ShellPermissionPolicyError, ShellPermissionPolicySummary,
 };
 // These limits are public because hosts may need to describe the same contract outside MCP.
-pub use types::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
+pub use progress::ShellProgressSink;
+pub use types::{
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellCommandScope,
+    ShellExecution, ShellInput, ShellOutput, ShellProgressChunk, ShellStream,
+};
+pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

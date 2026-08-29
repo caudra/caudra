@@ -1,3 +1,5 @@
+#![cfg(feature = "mcp")]
+
 mod support;
 
 use std::fs;
@@ -12,8 +14,9 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
     NativePdfExtractor, PdfExtraction, PdfExtractionError, PdfExtractor, SerpApiEngine,
-    WebHttpError, WebHttpRequestKind, WebToolGroup, WebsearchBackend, WebsearchConfigurationIssue,
-    WebsearchExecutionConfiguration, catalog,
+    WebHttpError, WebHttpRequestKind, WebToolGroup, WebfetchFormat, WebfetchInput, WebfetchPdfMode,
+    WebsearchBackend, WebsearchConfigurationIssue, WebsearchExecutionConfiguration, WebsearchInput,
+    catalog, specs,
 };
 
 use support::*;
@@ -129,6 +132,21 @@ fn catalog_is_backend_specific_and_ordered() {
 }
 
 #[test]
+fn neutral_specs_match_the_mcp_catalog_contract() {
+    let configuration = WebsearchExecutionConfiguration::exa_mcp();
+    let tools = catalog(2026, &configuration);
+    let specs = specs(2026, &configuration);
+
+    for (spec, tool) in specs.iter().zip(&tools) {
+        assert_eq!(spec.name, tool.name);
+        assert_eq!(spec.description, tool.description.as_deref().unwrap());
+        assert_eq!(spec.input_schema, *tool.input_schema);
+    }
+    assert_eq!(specs[0].contract_id, "web.search.v1");
+    assert_eq!(specs[1].contract_id, "web.fetch.v1");
+}
+
+#[test]
 fn kagi_and_serpapi_catalogs_are_provider_accurate_and_unique() {
     let kagi =
         serde_json::to_value(catalog(2026, &WebsearchExecutionConfiguration::kagi("key"))).unwrap();
@@ -165,6 +183,70 @@ fn http_response_debug_redacts_payload_headers_and_url_secrets() {
     assert!(
         !debug.contains("canary") && !debug.contains("secret") && !debug.contains("body-canary")
     );
+}
+
+#[tokio::test]
+async fn native_preparation_normalizes_permissions_without_network_io() {
+    let http = Arc::new(FakeHttp::default());
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::searxng("https://search.example.test/search"),
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    let search = group
+        .prepare_websearch(WebsearchInput {
+            query: "  native query  ".into(),
+            country: None,
+            categories: None,
+            language: None,
+            pageno: None,
+            time_range: None,
+            safesearch: None,
+            limit: None,
+            timeout_sec: None,
+        })
+        .expect("prepared search");
+    let fetch = group
+        .prepare_webfetch(WebfetchInput {
+            url: "http://example.test/page".into(),
+            format: WebfetchFormat::Markdown,
+            pdf_mode: WebfetchPdfMode::Extract,
+            timeout: Some(120),
+        })
+        .expect("prepared fetch");
+
+    assert_eq!(search.permission_query, "native query");
+    assert_eq!(fetch.permission_url, "https://example.test/page");
+    assert_eq!(fetch.timeout_seconds, 60);
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn native_webfetch_returns_exact_model_text_with_typed_output() {
+    let http = Arc::new(FakeHttp::with_responses(vec![Ok(response(
+        "https://example.test/native.txt",
+        StatusCode::OK,
+        Some("text/plain"),
+        Bytes::from_static(b"native body"),
+    ))]));
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http, Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    let execution = group
+        .webfetch(
+            WebfetchInput {
+                url: "https://example.test/native.txt".into(),
+                format: WebfetchFormat::Text,
+                pdf_mode: WebfetchPdfMode::Extract,
+                timeout: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("native fetch");
+
+    assert_eq!(execution.model_text, "native body");
+    assert_eq!(execution.output.output, execution.model_text);
 }
 
 #[tokio::test]

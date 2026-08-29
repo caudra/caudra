@@ -12,6 +12,13 @@ enum Token {
 #[derive(Debug)]
 pub(crate) struct GlobMatcher {
     alternatives: Vec<Vec<Token>>,
+    fast_path: Option<FastPath>,
+}
+
+#[derive(Debug)]
+enum FastPath {
+    Literal(String),
+    RecursiveLiteralSuffix(String),
 }
 
 impl GlobMatcher {
@@ -26,11 +33,15 @@ impl GlobMatcher {
         let mut expanded = Vec::new();
         let mut generated_bytes = 0usize;
         expand_bounded(&normalized, 0, &mut expanded, &mut generated_bytes, limits)?;
+        let fast_path = (expanded.len() == 1)
+            .then(|| FastPath::new(&expanded[0]))
+            .flatten();
         Ok(Self {
             alternatives: expanded
                 .iter()
                 .map(|alternative| tokenize(alternative))
                 .collect(),
+            fast_path,
         })
     }
 
@@ -40,6 +51,16 @@ impl GlobMatcher {
         remaining_steps: &mut usize,
     ) -> Result<bool, FilesystemError> {
         let normalized = normalize_separators(value);
+        if let Some(fast_path) = &self.fast_path {
+            let steps = fast_path.steps();
+            if steps > *remaining_steps {
+                return Err(FilesystemError::message(
+                    "glob matching exceeded its operation work budget",
+                ));
+            }
+            *remaining_steps -= steps;
+            return Ok(fast_path.is_match(&normalized));
+        }
         let value = normalized.encode_utf16().collect::<Vec<_>>();
         let token_count = self.alternatives.iter().map(Vec::len).sum::<usize>();
         let steps = token_count
@@ -55,6 +76,36 @@ impl GlobMatcher {
             .alternatives
             .iter()
             .any(|tokens| matches_tokens(tokens, &value)))
+    }
+}
+
+impl FastPath {
+    fn new(pattern: &str) -> Option<Self> {
+        if let Some(suffix) = pattern.strip_prefix("**/")
+            && !suffix.is_empty()
+            && !suffix.contains(['*', '?'])
+        {
+            return Some(Self::RecursiveLiteralSuffix(suffix.to_owned()));
+        }
+        (!pattern.contains(['*', '?'])).then(|| Self::Literal(pattern.to_owned()))
+    }
+
+    fn steps(&self) -> usize {
+        match self {
+            Self::Literal(literal) | Self::RecursiveLiteralSuffix(literal) => literal.len() + 1,
+        }
+    }
+
+    fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::Literal(literal) => value == literal,
+            Self::RecursiveLiteralSuffix(suffix) => {
+                value == suffix
+                    || value
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('/'))
+            }
+        }
     }
 }
 

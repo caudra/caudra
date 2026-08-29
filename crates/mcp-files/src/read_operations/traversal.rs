@@ -27,6 +27,9 @@ pub(super) async fn list_files(
         let directory = if candidate == root {
             candidate
         } else {
+            if !core.policy.traversal_allowed(root, &candidate) {
+                continue;
+            }
             let name = candidate.file_name().unwrap_or_default();
             if name == ".git" || name == "node_modules" {
                 continue;

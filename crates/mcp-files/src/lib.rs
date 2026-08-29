@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Root-confined filesystem tools with MCP catalog and dispatch integration.
+//! Typed confined or host-managed filesystem tools with an optional MCP adapter.
 
 mod catalog;
 mod diff;
@@ -17,7 +17,10 @@ mod read_operations;
 mod text;
 mod types;
 
+#[cfg(feature = "mcp")]
 pub use catalog::catalog;
+pub use catalog::specs;
 pub use error::FilesystemError;
-pub use group::FileToolGroup;
+pub use group::{FileToolGroup, PreparedFilePatch};
 pub use types::*;
+pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

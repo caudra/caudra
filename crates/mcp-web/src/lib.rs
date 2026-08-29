@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Web search and content-fetching tools for the standalone MCP server.
+//! Typed web search and content fetching with an optional MCP adapter.
 //!
 //! The production path composes `workcell-net` public/redirect policy with
 //! `workcell-source-icons`. Search transport, icon resolution, time, and PDF
@@ -24,7 +24,9 @@ mod pdf;
 mod search;
 mod types;
 
+#[cfg(feature = "mcp")]
 pub use catalog::catalog;
+pub use catalog::specs;
 pub use config::{
     SerpApiEngine, WebsearchBackend, WebsearchConfigurationIssue, WebsearchExecutionConfiguration,
 };
@@ -33,12 +35,15 @@ pub use dependencies::{
     SystemClock, WebHttpError, WebHttpRequest, WebHttpRequestKind, WebHttpResponse,
     WebHttpTransport, WebToolDependencies,
 };
+pub use fetch::WebfetchError;
+pub use group::{PreparedWebfetch, PreparedWebsearch};
 pub use group::{WebToolGroup, WebsearchConfigurationSnapshot, WebsearchConfigurationSource};
 pub use pdf::{NativePdfExtractor, PdfExtraction, PdfExtractionError, PdfExtractor};
 pub use types::{
-    TimeRange, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfAttachment,
+    TimeRange, WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfAttachment,
     WebfetchPdfMode, WebsearchInput, WebsearchOutput, WebsearchResult,
 };
+pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 
 /// Stable crate marker retained for consumers that used the scaffold.
 pub const CRATE_NAME: &str = "workcell-mcp-web";

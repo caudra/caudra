@@ -1,6 +1,6 @@
 [package]
-name = "workcell-mcp-shell"
-description = "Typed bounded shell execution for Workcell"
+name = "workcell-environment"
+description = "Protocol-neutral Workcell execution environment inspection"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,17 +12,13 @@ default = ["mcp"]
 mcp = ["dep:rmcp"]
 
 [dependencies]
-async-trait.workspace = true
-dunce.workspace = true
 rmcp = { workspace = true, optional = true }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-toml.workspace = true
-tree-sitter.workspace = true
-tree-sitter-bash.workspace = true
 workcell-tool-contract.workspace = true
 
 [dev-dependencies]

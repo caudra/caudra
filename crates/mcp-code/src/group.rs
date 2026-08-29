@@ -13,22 +13,26 @@ use std::{
 
 use monty_pool::{Checkout, Pool, PoolError, ReplConfig, TurnEvent, on_print_sync};
 use monty_types::{PrintStream, ResourceLimits, TypeCheckingConfig, TypeCheckingFormat};
+#[cfg(feature = "mcp")]
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
+#[cfg(feature = "mcp")]
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "mcp")]
+use crate::catalog;
 use crate::{
-    catalog,
     diagnose::{diagnose, diagnose_type_errors, timeout_guidance},
     render::{Capture, render},
     suspend::{Answer, answer},
     types::{
-        CodeException, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES, MAX_MEMORY_BYTES,
-        MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, STREAM_CAPTURE_BYTES,
+        CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,
+        MAX_MEMORY_BYTES, MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, STREAM_CAPTURE_BYTES,
     },
     worker::{CodeBuildError, build_pool},
 };
 
+#[cfg(feature = "mcp")]
 const TOOL_NAME: &str = "code_execution";
 /// Name shown in tracebacks the caller sees. It is not a real path and never touches a filesystem.
 const SCRIPT_NAME: &str = "snippet.py";
@@ -68,6 +72,7 @@ impl CodeToolGroup {
     }
 
     #[must_use]
+    #[cfg(feature = "mcp")]
     pub fn catalog(&self) -> Vec<Tool> {
         catalog::catalog()
     }
@@ -78,6 +83,7 @@ impl CodeToolGroup {
         self.pool.close().await;
     }
 
+    #[cfg(feature = "mcp")]
     pub async fn dispatch(
         &self,
         name: &str,
@@ -97,17 +103,18 @@ impl CodeToolGroup {
             }
         };
         Some(Ok(match self.execute(input, cancellation).await {
-            Ok(Some(output)) => result_content(output),
+            Ok(Some(execution)) => result_content(execution),
             Ok(None) => tool_error("Code execution cancelled"),
             Err(e) => tool_error(e),
         }))
     }
 
-    async fn execute(
+    /// Execute one validated, isolated snippet without involving MCP.
+    pub async fn execute(
         &self,
         input: CodeInput,
         cancellation: CancellationToken,
-    ) -> Result<Option<CodeOutput>, String> {
+    ) -> Result<Option<CodeExecution>, String> {
         if input.code.trim().is_empty() {
             return Err("Invalid arguments: code must not be empty".into());
         }
@@ -136,12 +143,12 @@ impl CodeToolGroup {
         let mut session = match session {
             Ok(session) => session,
             Err(e) => {
-                return Ok(Some(Self::failure(
+                return Ok(Some(execution(Self::failure(
                     self.type_check,
                     &e,
                     timeout_ms,
                     started.elapsed(),
-                )));
+                ))));
             }
         };
 
@@ -161,16 +168,18 @@ impl CodeToolGroup {
             Ok(completion) => {
                 // Only a clean completion returns the worker; anything else discards it.
                 let _ = session.finish().await;
-                Ok(Some(self.complete(completion, timeout_ms, duration)))
+                Ok(Some(execution(
+                    self.complete(completion, timeout_ms, duration),
+                )))
             }
             Err(DriveError::Pool(e)) => {
                 drop(session);
-                Ok(Some(Self::failure(
+                Ok(Some(execution(Self::failure(
                     self.type_check,
                     &e,
                     timeout_ms,
                     duration,
-                )))
+                ))))
             }
             Err(DriveError::SuspensionLimit(captured)) => {
                 drop(session);
@@ -185,7 +194,7 @@ impl CodeToolGroup {
                 output.diagnostic = Some(
                     "The snippet made too many unresolved external lookups and was stopped. This usually means a typo or an undefined name inside a loop.".into(),
                 );
-                Ok(Some(output))
+                Ok(Some(execution(output)))
             }
         }
     }
@@ -409,14 +418,14 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn result_content(output: CodeOutput) -> CallToolResult {
-    let text = summary(&output);
-    let structured = serde_json::to_value(&output).expect("code output serializes");
-    let is_error = output.outcome != Outcome::Completed;
+#[cfg(feature = "mcp")]
+fn result_content(execution: CodeExecution) -> CallToolResult {
+    let structured = serde_json::to_value(&execution.output).expect("code output serializes");
+    let is_error = execution.output.outcome != Outcome::Completed;
     let mut result = if is_error {
-        CallToolResult::error(vec![ContentBlock::text(text)])
+        CallToolResult::error(vec![ContentBlock::text(execution.model_text)])
     } else {
-        CallToolResult::success(vec![ContentBlock::text(text)])
+        CallToolResult::success(vec![ContentBlock::text(execution.model_text)])
     };
     result.structured_content = Some(structured);
     result
@@ -459,6 +468,12 @@ fn summary(output: &CodeOutput) -> String {
     lines.join("\n")
 }
 
+fn execution(output: CodeOutput) -> CodeExecution {
+    let model_text = summary(&output);
+    CodeExecution { output, model_text }
+}
+
+#[cfg(feature = "mcp")]
 fn tool_error(error: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.into())])
 }

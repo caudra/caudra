@@ -4345,6 +4345,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "workcell"
+version = "0.1.0"
+dependencies = [
+ "workcell-environment",
+ "workcell-mcp-code",
+ "workcell-mcp-files",
+ "workcell-mcp-shell",
+ "workcell-mcp-web",
+ "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-environment"
+version = "0.1.0"
+dependencies = [
+ "rmcp",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "workcell-tool-contract",
+]
+
+[[package]]
 name = "workcell-mcp"
 version = "0.1.0"
 dependencies = [
@@ -4364,6 +4391,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workcell-environment",
  "workcell-mcp-code",
  "workcell-mcp-files",
  "workcell-mcp-shell",
@@ -4382,6 +4410,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "workcell-tool-contract",
 ]
 
 [[package]]
@@ -4402,6 +4431,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "workcell-tool-contract",
 ]
 
 [[package]]
@@ -4420,6 +4450,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-bash",
+ "workcell-tool-contract",
 ]
 
 [[package]]
@@ -4447,6 +4478,7 @@ dependencies = [
  "url",
  "workcell-net",
  "workcell-source-icons",
+ "workcell-tool-contract",
 ]
 
 [[package]]
@@ -4487,6 +4519,14 @@ dependencies = [
  "url",
  "wiremock",
  "workcell-net",
+]
+
+[[package]]
+name = "workcell-tool-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

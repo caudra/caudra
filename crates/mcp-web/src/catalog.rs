@@ -1,10 +1,14 @@
+#[cfg(feature = "mcp")]
 use std::sync::Arc;
 
+#[cfg(feature = "mcp")]
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::WebsearchExecutionConfiguration;
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
 
+#[cfg(feature = "mcp")]
 const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 
 const WEBFETCH_DESCRIPTION: &str = r#"Fetch content from a URL and return model-facing text.
@@ -20,11 +24,21 @@ const WEBFETCH_DESCRIPTION: &str = r#"Fetch content from a URL and return model-
 
 /// Return fresh tools in compatibility order: `websearch`, then `webfetch`.
 #[must_use]
+#[cfg(feature = "mcp")]
 pub fn catalog(current_year: i32, configuration: &WebsearchExecutionConfiguration) -> Vec<Tool> {
+    specs(current_year, configuration)
+        .iter()
+        .map(to_mcp_tool)
+        .collect()
+}
+
+#[must_use]
+pub fn specs(current_year: i32, configuration: &WebsearchExecutionConfiguration) -> Vec<ToolSpec> {
     vec![
-        websearch_tool(current_year, configuration),
-        tool(
+        websearch_spec(current_year, configuration),
+        spec(
             "webfetch",
+            None,
             WEBFETCH_DESCRIPTION.to_owned(),
             schema(json!({
                 "type": "object",
@@ -38,11 +52,12 @@ pub fn catalog(current_year: i32, configuration: &WebsearchExecutionConfiguratio
                 }
             })),
             "web.source.v1",
+            "web.fetch.v1",
         ),
     ]
 }
 
-fn websearch_tool(current_year: i32, configuration: &WebsearchExecutionConfiguration) -> Tool {
+fn websearch_spec(current_year: i32, configuration: &WebsearchExecutionConfiguration) -> ToolSpec {
     let (description, properties) = configuration.provider().map_or_else(
         || {
             let properties = json!({
@@ -62,8 +77,9 @@ fn websearch_tool(current_year: i32, configuration: &WebsearchExecutionConfigura
             (contract.description, contract.properties)
         },
     );
-    tool(
+    spec(
         "websearch",
+        None,
         description,
         schema(json!({
             "type": "object",
@@ -72,31 +88,56 @@ fn websearch_tool(current_year: i32, configuration: &WebsearchExecutionConfigura
             "properties": properties
         })),
         "web.search.v1",
+        "web.search.v1",
     )
 }
 
-fn tool(
+fn spec(
     name: &'static str,
+    title: Option<&'static str>,
     description: String,
-    input_schema: Arc<JsonObject>,
-    profile: &str,
-) -> Tool {
+    input_schema: Map<String, Value>,
+    profile: &'static str,
+    contract_id: &'static str,
+) -> ToolSpec {
+    ToolSpec::new(
+        name,
+        title,
+        description,
+        input_schema,
+        NeutralAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: None,
+            idempotent_hint: None,
+            open_world_hint: Some(true),
+        },
+        profile,
+        contract_id,
+    )
+}
+
+#[cfg(feature = "mcp")]
+fn to_mcp_tool(spec: &ToolSpec) -> Tool {
     let mut meta = JsonObject::new();
     meta.insert(
         PRESENTATION_KEY.to_owned(),
-        Value::String(profile.to_owned()),
+        Value::String(spec.presentation.to_owned()),
     );
-    Tool::new(name, description, input_schema)
-        .with_annotations(ToolAnnotations::from_raw(
-            None,
-            Some(true),
-            None,
-            None,
-            Some(true),
-        ))
-        .with_meta(MetaObject(meta))
+    Tool::new(
+        spec.name,
+        spec.description.clone(),
+        Arc::new(spec.input_schema.clone()),
+    )
+    .with_annotations(ToolAnnotations::from_raw(
+        None,
+        spec.annotations.read_only_hint,
+        spec.annotations.destructive_hint,
+        spec.annotations.idempotent_hint,
+        spec.annotations.open_world_hint,
+    ))
+    .with_meta(MetaObject(meta))
 }
 
-fn schema(value: Value) -> Arc<JsonObject> {
-    Arc::new(value.as_object().expect("schema is an object").clone())
+fn schema(value: Value) -> Map<String, Value> {
+    value.as_object().expect("schema is an object").clone()
 }

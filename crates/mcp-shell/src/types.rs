@@ -1,69 +1,151 @@
-//! Private MCP request, result, and progress payloads.
+//! Protocol-neutral request, result, inspection, and progress payloads.
 //!
 //! These structs are wire contracts even though they are crate-private. Field names and version
 //! numbers therefore change deliberately: consumers can branch on `version` rather than infer a
 //! schema from optional fields or presentation text.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 // Strict decoding mirrors the advertised schema and prevents typoed controls from being ignored.
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct ShellInput {
-    pub(crate) command: String,
-    pub(crate) timeout: Option<u64>,
-    pub(crate) workdir: Option<String>,
+pub struct ShellInput {
+    pub command: String,
+    pub timeout: Option<u64>,
+    pub workdir: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ShellOutput {
+pub struct ShellOutput {
     /// Version of the structured result shape, independent of the MCP protocol version.
-    pub(crate) version: u8,
-    pub(crate) kind: &'static str,
-    pub(crate) relative_workdir: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) duration_ms: u64,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) signal: Option<i32>,
-    pub(crate) timed_out: bool,
-    pub(crate) output_limit_exceeded: bool,
+    pub version: u8,
+    pub kind: &'static str,
+    pub relative_workdir: String,
+    pub timeout_ms: u64,
+    pub duration_ms: u64,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub output_limit_exceeded: bool,
     /// Last emitted progress sequence, or zero when the command produced no decoded output.
-    pub(crate) final_sequence: u64,
+    pub final_sequence: u64,
     /// UTF-8 bytes emitted in stdout progress chunks, independent of raw process byte counts.
-    pub(crate) stdout_utf8_bytes: u64,
+    pub stdout_utf8_bytes: u64,
     /// UTF-8 bytes emitted in stderr progress chunks, independent of raw process byte counts.
-    pub(crate) stderr_utf8_bytes: u64,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    pub(crate) stdout_capture_truncated: bool,
-    pub(crate) stderr_capture_truncated: bool,
-    pub(crate) stdout_preview_truncated: bool,
-    pub(crate) stderr_preview_truncated: bool,
+    pub stderr_utf8_bytes: u64,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_capture_truncated: bool,
+    pub stderr_capture_truncated: bool,
+    pub stdout_preview_truncated: bool,
+    pub stderr_preview_truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Stream {
+pub enum ShellStream {
     Stdout,
     Stderr,
 }
 
 pub(crate) struct OutputEvent {
-    pub(crate) stream: Stream,
+    pub(crate) stream: ShellStream,
     pub(crate) text: String,
     /// Number of source bytes represented by this event, which may differ from UTF-8 text length.
     pub(crate) raw_bytes: usize,
 }
 
-#[derive(Serialize)]
-pub(crate) struct OutputChunk<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ShellProgressChunk {
     /// Version of the progress extension payload; it evolves separately from the final result.
-    pub(crate) version: u8,
-    pub(crate) sequence: u64,
-    pub(crate) stream: Stream,
-    pub(crate) text: &'a str,
+    pub version: u8,
+    pub sequence: u64,
+    pub stream: ShellStream,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellCommandScope {
+    pub start_byte: usize,
+    pub source: String,
+    pub normalized: String,
+    pub permission: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellCommandAnalysis {
+    pub scopes: Vec<ShellCommandScope>,
+    pub opaque: bool,
+}
+
+#[derive(Debug)]
+pub struct PreparedShell {
+    command: String,
+    timeout_ms: u64,
+    relative_workdir: String,
+    analysis: ShellCommandAnalysis,
+    workdir: PathBuf,
+}
+
+impl PreparedShell {
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    #[must_use]
+    pub fn relative_workdir(&self) -> &str {
+        &self.relative_workdir
+    }
+
+    #[must_use]
+    pub const fn analysis(&self) -> &ShellCommandAnalysis {
+        &self.analysis
+    }
+
+    #[must_use]
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    pub(crate) fn new(
+        command: String,
+        timeout_ms: u64,
+        workdir: PathBuf,
+        relative_workdir: String,
+        analysis: ShellCommandAnalysis,
+    ) -> Self {
+        Self {
+            command,
+            timeout_ms,
+            relative_workdir,
+            analysis,
+            workdir,
+        }
+    }
+
+    pub(crate) fn into_execution_parts(self) -> (String, u64, PathBuf, String) {
+        (
+            self.command,
+            self.timeout_ms,
+            self.workdir,
+            self.relative_workdir,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ShellExecution {
+    pub output: ShellOutput,
+    pub model_text: String,
 }

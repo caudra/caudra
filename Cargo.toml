@@ -11,12 +11,15 @@ version.workspace = true
 [workspace]
 members = [
   ".",
+  "crates/environment",
   "crates/mcp-code",
   "crates/mcp-files",
   "crates/mcp-shell",
   "crates/mcp-web",
   "crates/net",
   "crates/source-icons",
+  "crates/tool-contract",
+  "crates/workcell",
 ]
 resolver = "3"
 
@@ -73,6 +76,12 @@ tree-sitter-bash = "0.25.1"
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 wiremock = "0.6.5"
+workcell-tool-contract = { path = "crates/tool-contract" }
+workcell-environment = { path = "crates/environment", default-features = false }
+workcell-mcp-code = { path = "crates/mcp-code", default-features = false }
+workcell-mcp-files = { path = "crates/mcp-files", default-features = false }
+workcell-mcp-shell = { path = "crates/mcp-shell", default-features = false }
+workcell-mcp-web = { path = "crates/mcp-web", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -97,15 +106,16 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-workcell-mcp-code = { path = "crates/mcp-code" }
-workcell-mcp-files = { path = "crates/mcp-files" }
-workcell-mcp-shell = { path = "crates/mcp-shell" }
-workcell-mcp-web = { path = "crates/mcp-web" }
+workcell-environment = { workspace = true, features = ["mcp"] }
+workcell-mcp-code = { workspace = true, features = ["mcp"] }
+workcell-mcp-files = { workspace = true, features = ["mcp"] }
+workcell-mcp-shell = { workspace = true, features = ["mcp"] }
+workcell-mcp-web = { workspace = true, features = ["mcp"] }
 
 [dev-dependencies]
 reqwest.workspace = true
 tempfile.workspace = true
-workcell-mcp-code = { path = "crates/mcp-code" }
+workcell-mcp-code = { workspace = true, features = ["mcp"] }
 
 [lints]
 workspace = true

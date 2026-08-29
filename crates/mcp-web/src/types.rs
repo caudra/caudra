@@ -19,7 +19,7 @@ pub enum WebfetchPdfMode {
     Attachment,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebsearchInput {
     pub query: String,
@@ -34,7 +34,7 @@ pub struct WebsearchInput {
     pub timeout_sec: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeRange {
     Day,
@@ -42,7 +42,7 @@ pub enum TimeRange {
     Year,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WebfetchInput {
     pub url: String,
@@ -125,4 +125,10 @@ pub struct WebfetchOutput {
     pub icon_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_data_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WebExecution<T> {
+    pub output: T,
+    pub model_text: String,
 }

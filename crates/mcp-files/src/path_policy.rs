@@ -14,6 +14,7 @@ pub(crate) struct RootPathPolicy {
     // is not a descriptor-relative sandbox. Concurrent component replacement
     // between resolve and tokio::fs use remains a documented TOCTOU risk.
     root: PathBuf,
+    confined: bool,
 }
 
 impl RootPathPolicy {
@@ -36,7 +37,16 @@ impl RootPathPolicy {
                 requested_root.to_string_lossy()
             )));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            confined: true,
+        })
+    }
+
+    pub(crate) async fn create_unconfined(base_cwd: &Path) -> Result<Self, FilesystemError> {
+        let mut policy = Self::create(base_cwd).await?;
+        policy.confined = false;
+        Ok(policy)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -53,11 +63,15 @@ impl RootPathPolicy {
         } else {
             normalize(&self.root.join(requested_path))
         };
-        self.assert_inside(&lexical, requested)?;
+        if self.confined {
+            self.assert_inside(&lexical, requested)?;
+        }
 
         // Both the caller's spelling and the canonical target matter. Without
         // the lexical check, a symlink named `.git` could point at public data.
-        self.assert_not_protected(&lexical, requested)?;
+        if self.confined {
+            self.assert_not_protected(&lexical, requested)?;
+        }
 
         let mut current = lexical.clone();
         let mut suffix: Vec<OsString> = Vec::new();
@@ -68,8 +82,10 @@ impl RootPathPolicy {
                     for part in suffix.iter().rev() {
                         canonical.push(part);
                     }
-                    self.assert_inside(&canonical, requested)?;
-                    self.assert_not_protected(&canonical, requested)?;
+                    if self.confined {
+                        self.assert_inside(&canonical, requested)?;
+                        self.assert_not_protected(&canonical, requested)?;
+                    }
                     return Ok(canonical);
                 }
                 Err(_) => {
@@ -91,13 +107,12 @@ impl RootPathPolicy {
     }
 
     pub(crate) fn relative(&self, path: &Path) -> Result<String, FilesystemError> {
-        self.assert_inside(path, &path.to_string_lossy())?;
-        let relative = path.strip_prefix(&self.root).map_err(|_| {
-            FilesystemError::RootEscape(format!(
-                "Path escapes filesystem root: {}",
-                path.to_string_lossy()
-            ))
-        })?;
+        if self.confined {
+            self.assert_inside(path, &path.to_string_lossy())?;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return Ok(path.to_string_lossy().into_owned());
+        };
         if relative.as_os_str().is_empty() {
             return Ok(".".to_owned());
         }
@@ -106,6 +121,10 @@ impl RootPathPolicy {
             .map(|part| part.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/"))
+    }
+
+    pub(crate) fn traversal_allowed(&self, traversal_root: &Path, candidate: &Path) -> bool {
+        self.is_protected_path(traversal_root) || !self.is_protected_path(candidate)
     }
 
     fn assert_inside(&self, candidate: &Path, requested: &str) -> Result<(), FilesystemError> {
@@ -128,26 +147,33 @@ impl RootPathPolicy {
         if relative.as_os_str().is_empty() {
             return Ok(());
         }
-        let parts = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>();
-        let basename = parts.last().map(String::as_str).unwrap_or_default();
-        let protected_component = parts
-            .iter()
-            .any(|part| matches!(part.as_str(), ".git" | ".ssh" | ".workcell"));
-        let protected_name = basename == ".env"
-            || basename.starts_with(".env.")
-            || matches!(basename, ".npmrc" | ".pypirc" | ".netrc")
-            || basename.ends_with(".key")
-            || matches!(basename, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519");
-        if protected_component || protected_name {
+        if protected_relative(relative) {
             return Err(FilesystemError::ProtectedPath(format!(
                 "Path is protected by filesystem policy: {requested}"
             )));
         }
         Ok(())
     }
+
+    fn is_protected_path(&self, path: &Path) -> bool {
+        protected_relative(path.strip_prefix(&self.root).unwrap_or(path))
+    }
+}
+
+fn protected_relative(path: &Path) -> bool {
+    let parts = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    let basename = parts.last().map(String::as_str).unwrap_or_default();
+    parts
+        .iter()
+        .any(|part| matches!(part.as_str(), ".git" | ".ssh" | ".workcell"))
+        || basename == ".env"
+        || basename.starts_with(".env.")
+        || matches!(basename, ".npmrc" | ".pypirc" | ".netrc")
+        || basename.ends_with(".key")
+        || matches!(basename, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
 }
 
 async fn canonicalize(path: &Path) -> io::Result<PathBuf> {
@@ -207,6 +233,19 @@ mod tests {
         proptest::string::string_regex("[A-Za-z0-9_-]{1,8}").expect("safe component regex is valid")
     }
 
+    #[test]
+    fn broad_traversal_excludes_protected_descendants_but_explicit_root_allows_them() {
+        let root = PathBuf::from("/workspace");
+        let policy = RootPathPolicy {
+            root: root.clone(),
+            confined: false,
+        };
+        let protected = root.join(".ssh/id_ed25519");
+
+        assert!(!policy.traversal_allowed(&root, &protected));
+        assert!(policy.traversal_allowed(&root.join(".ssh"), &protected));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 256,
@@ -220,7 +259,10 @@ mod tests {
             outside in safe_component(),
         ) {
             let root = PathBuf::from("workspace").join("root");
-            let policy = RootPathPolicy { root };
+            let policy = RootPathPolicy {
+                root,
+                confined: true,
+            };
             let requested = interior
                 .iter()
                 .map(String::as_str)

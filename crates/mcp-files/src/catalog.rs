@@ -1,8 +1,12 @@
+#[cfg(feature = "mcp")]
 use std::sync::Arc;
 
+#[cfg(feature = "mcp")]
 use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
 
+#[cfg(feature = "mcp")]
 const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -99,87 +103,136 @@ Rules:
 /// Returns fresh values so a composing server may safely augment its own copy.
 /// Order is part of the public compatibility contract and mirrors registration
 /// order in the TypeScript MCP server.
+#[cfg(feature = "mcp")]
 pub fn catalog() -> Vec<Tool> {
+    specs().iter().map(to_mcp_tool).collect()
+}
+
+#[must_use]
+pub fn specs() -> Vec<ToolSpec> {
     vec![
-        tool(
+        spec(
             "file_read",
             "Read file or directory",
             READ_DESCRIPTION,
             read_schema(),
             read_annotations(),
             "file.read.v1",
+            "file.read.v1",
         ),
-        tool(
+        spec(
             "file_glob",
             "Glob files",
             GLOB_DESCRIPTION,
             glob_schema(),
             read_annotations(),
             "file.list.v1",
+            "file.glob.v1",
         ),
-        tool(
+        spec(
             "file_grep",
             "Search file contents",
             GREP_DESCRIPTION,
             grep_schema(),
             read_annotations(),
             "file.search.v1",
+            "file.grep.v1",
         ),
-        tool(
+        spec(
             "file_write",
             "Write file",
             WRITE_DESCRIPTION,
             write_schema(),
             mutation_annotations(true),
             "file.diff.v1",
+            "file.write.v1",
         ),
-        tool(
+        spec(
             "file_edit",
             "Edit file",
             EDIT_DESCRIPTION,
             edit_schema(),
             mutation_annotations(false),
             "file.diff.v1",
+            "file.edit.v1",
         ),
-        tool(
+        spec(
             "file_apply_patch",
             "Apply file patch",
             PATCH_DESCRIPTION,
             patch_schema(),
             mutation_annotations(false),
             "file.diff.v1",
+            "file.patch.v1",
         ),
     ]
 }
 
-fn tool(
+fn spec(
     name: &'static str,
-    title: &str,
+    title: &'static str,
     description: &'static str,
-    input_schema: Arc<JsonObject>,
-    annotations: ToolAnnotations,
-    presentation: &str,
-) -> Tool {
+    input_schema: Map<String, Value>,
+    annotations: NeutralAnnotations,
+    presentation: &'static str,
+    contract_id: &'static str,
+) -> ToolSpec {
+    ToolSpec::new(
+        name,
+        Some(title),
+        description,
+        input_schema,
+        annotations,
+        presentation,
+        contract_id,
+    )
+}
+
+#[cfg(feature = "mcp")]
+fn to_mcp_tool(spec: &ToolSpec) -> Tool {
     let mut meta = JsonObject::new();
     meta.insert(
         PRESENTATION_KEY.to_owned(),
-        Value::String(presentation.to_owned()),
+        Value::String(spec.presentation.to_owned()),
     );
-    Tool::new(name, description, input_schema)
-        .with_title(title)
-        .with_annotations(annotations)
-        .with_meta(MetaObject(meta))
+    let tool = Tool::new(
+        spec.name,
+        spec.description.clone(),
+        Arc::new(spec.input_schema.clone()),
+    );
+    let tool = match spec.title {
+        Some(title) => tool.with_title(title),
+        None => tool,
+    };
+    tool.with_annotations(ToolAnnotations::from_raw(
+        None,
+        spec.annotations.read_only_hint,
+        spec.annotations.destructive_hint,
+        spec.annotations.idempotent_hint,
+        spec.annotations.open_world_hint,
+    ))
+    .with_meta(MetaObject(meta))
 }
 
-fn read_annotations() -> ToolAnnotations {
-    ToolAnnotations::from_raw(None, Some(true), Some(false), Some(true), Some(false))
+fn read_annotations() -> NeutralAnnotations {
+    NeutralAnnotations {
+        read_only_hint: Some(true),
+        destructive_hint: Some(false),
+        idempotent_hint: Some(true),
+        open_world_hint: Some(false),
+    }
 }
 
-fn mutation_annotations(idempotent: bool) -> ToolAnnotations {
-    ToolAnnotations::from_raw(None, Some(false), Some(true), Some(idempotent), Some(false))
+fn mutation_annotations(idempotent: bool) -> NeutralAnnotations {
+    NeutralAnnotations {
+        read_only_hint: Some(false),
+        destructive_hint: Some(true),
+        idempotent_hint: Some(idempotent),
+        open_world_hint: Some(false),
+    }
 }
 
-fn read_schema() -> Arc<JsonObject> {
+fn read_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -206,7 +259,7 @@ fn read_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn glob_schema() -> Arc<JsonObject> {
+fn glob_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -226,7 +279,7 @@ fn glob_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn grep_schema() -> Arc<JsonObject> {
+fn grep_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -251,7 +304,7 @@ fn grep_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn write_schema() -> Arc<JsonObject> {
+fn write_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -274,7 +327,7 @@ fn write_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn edit_schema() -> Arc<JsonObject> {
+fn edit_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -306,7 +359,7 @@ fn edit_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn patch_schema() -> Arc<JsonObject> {
+fn patch_schema() -> Map<String, Value> {
     schema(json!({
         "type": "object",
         "properties": {
@@ -325,15 +378,15 @@ fn patch_schema() -> Arc<JsonObject> {
     }))
 }
 
-fn schema(value: Value) -> Arc<JsonObject> {
-    Arc::new(value.as_object().expect("schema is an object").clone())
+fn schema(value: Value) -> Map<String, Value> {
+    value.as_object().expect("schema is an object").clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod tests {
     use serde_json::json;
 
-    use super::{PRESENTATION_KEY, catalog};
+    use super::{PRESENTATION_KEY, catalog, specs};
 
     #[test]
     fn catalog_has_compatible_order_annotations_and_metadata() {
@@ -365,5 +418,15 @@ mod tests {
             json!("file.read.v1")
         );
         assert_eq!(tools[0].input_schema["$schema"], json!(super::DRAFT_07));
+
+        for (spec, tool) in specs().iter().zip(&tools) {
+            assert_eq!(spec.name, tool.name);
+            assert_eq!(spec.description, tool.description.as_deref().unwrap());
+            assert_eq!(&spec.input_schema, tool.input_schema.as_ref());
+            assert_eq!(
+                spec.presentation,
+                tool.meta.as_ref().unwrap().0[PRESENTATION_KEY]
+            );
+        }
     }
 }

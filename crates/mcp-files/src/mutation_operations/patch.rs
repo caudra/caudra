@@ -25,6 +25,44 @@ impl FilesystemCore {
         enforce_bytes("patchText", &input.patch_text, self.limits.max_patch_bytes)?;
         let changes = self.plan_patch(&input.patch_text, token).await?;
         let applied = self.should_apply(input.dry_run)?;
+        let output = self.patch_output(&changes, applied)?;
+        self.validate_patch_output(&output)?;
+        // The exact text + structured MCP response shape, including a
+        // conservative envelope, fits the MCP raw result ceiling
+        // before the first file is published.
+        if applied {
+            publish_patch(self, &changes, token).await?;
+        }
+        Ok(output)
+    }
+
+    pub(crate) async fn prepare_patch(
+        &self,
+        patch_text: &str,
+        token: &CancellationToken,
+    ) -> Result<(Vec<PlannedChange>, FileApplyPatchOutput), FilesystemError> {
+        check_cancelled(token)?;
+        enforce_bytes("patchText", patch_text, self.limits.max_patch_bytes)?;
+        let changes = self.plan_patch(patch_text, token).await?;
+        let output = self.patch_output(&changes, false)?;
+        self.validate_patch_output(&output)?;
+        Ok((changes, output))
+    }
+
+    pub(crate) async fn publish_prepared_patch(
+        &self,
+        changes: &[PlannedChange],
+        token: &CancellationToken,
+    ) -> Result<(), FilesystemError> {
+        self.should_apply(None)?;
+        publish_patch(self, changes, token).await
+    }
+
+    fn patch_output(
+        &self,
+        changes: &[PlannedChange],
+        applied: bool,
+    ) -> Result<FileApplyPatchOutput, FilesystemError> {
         let files = changes
             .iter()
             .map(|change| {
@@ -41,7 +79,7 @@ impl FilesystemCore {
                 })
             })
             .collect::<Result<Vec<_>, FilesystemError>>()?;
-        let output = FileApplyPatchOutput {
+        Ok(FileApplyPatchOutput {
             kind: FilePatchKind::Patch,
             applied,
             diff: files
@@ -51,7 +89,10 @@ impl FilesystemCore {
                 .join("\n"),
             truncated: files.iter().any(|file| file.truncated),
             files,
-        };
+        })
+    }
+
+    fn validate_patch_output(&self, output: &FileApplyPatchOutput) -> Result<(), FilesystemError> {
         let output_size = mcp_response_size(&output)
             .map_err(|_| FilesystemError::message("Cannot serialize patch result"))?;
         let output_limit = self
@@ -64,13 +105,7 @@ impl FilesystemCore {
                 output_limit
             )));
         }
-        // The exact text + structured MCP response shape, including a
-        // conservative envelope, fits the MCP raw result ceiling
-        // before the first file is published.
-        if applied {
-            publish_patch(self, &changes, token).await?;
-        }
-        Ok(output)
+        Ok(())
     }
 
     async fn plan_patch(

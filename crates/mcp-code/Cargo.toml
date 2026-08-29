@@ -1,20 +1,25 @@
 [package]
 name = "workcell-mcp-code"
-description = "Isolated Python code execution MCP tool for Workcell"
+description = "Typed isolated Python code execution for Workcell"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
+
 [dependencies]
 monty-pool.workspace = true
 monty-types.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+workcell-tool-contract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

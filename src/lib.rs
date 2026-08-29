@@ -3,7 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod environment;
-mod execution_environment;
+pub use workcell_environment as execution_environment;
 pub mod http_policy;
 pub mod logging;
 pub mod root;

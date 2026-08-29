@@ -1,3 +1,5 @@
+#![cfg(feature = "mcp")]
+
 //! Public catalog contract.
 //!
 //! The committed fixture is the compatibility contract for the tool name, title, description,

@@ -15,14 +15,14 @@ use crate::WebToolDependencies;
 use crate::dependencies::{WebHttpError, WebHttpRequest, WebHttpRequestKind};
 use crate::types::WebfetchOutput;
 
-pub(crate) use input::normalize_input;
+pub(crate) use input::{NormalizedWebfetchInput, normalize_input};
 pub(crate) use output::utf8_prefix;
 
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_PDF_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WebfetchError {
+pub enum WebfetchError {
     #[error("{0}")]
     InvalidInput(String),
     #[error("Tool invocation was aborted.")]

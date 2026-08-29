@@ -1,11 +1,12 @@
-//! Ordered, bounded delivery of live shell output through MCP progress notifications.
+//! Ordered, bounded delivery of live shell output to host-neutral progress sinks.
 //!
 //! The queue bounds memory and decouples pipe reads from network latency. Saturation is a hard
 //! execution failure rather than permission to drop chunks: sequence continuity means consumers can
 //! trust that a successful call's progress stream is complete and ordered.
 
-use crate::types::{OutputChunk, Stream};
+use crate::types::{ShellProgressChunk, ShellStream};
 use async_trait::async_trait;
+#[cfg(feature = "mcp")]
 use rmcp::{
     RoleServer,
     model::{
@@ -16,52 +17,50 @@ use rmcp::{
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
+#[cfg(feature = "mcp")]
 const OUTPUT_CHUNK_KEY: &str = "ai.workcell/tool-output-chunk";
 const PROGRESS_QUEUE_CAPACITY: usize = 32;
 const PROGRESS_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const PROGRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(feature = "mcp")]
 const STANDARD_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[async_trait]
-pub(crate) trait ProgressTransport: Send + Sync {
-    async fn publish(&self, notification: ProgressNotificationParam) -> Result<(), String>;
+pub trait ShellProgressSink: Send + Sync {
+    async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String>;
 }
-pub(crate) struct PeerProgressTransport {
+#[cfg(feature = "mcp")]
+pub(crate) struct McpProgressSink {
     pub(crate) peer: Peer<RoleServer>,
+    pub(crate) token: ProgressToken,
 }
 #[async_trait]
-impl ProgressTransport for PeerProgressTransport {
-    async fn publish(&self, notification: ProgressNotificationParam) -> Result<(), String> {
+#[cfg(feature = "mcp")]
+impl ShellProgressSink for McpProgressSink {
+    async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
         self.peer
-            .notify_progress(notification)
+            .notify_progress(notification(&self.token, &chunk))
             .await
             .map_err(|_| "progress delivery failed".to_owned())
     }
 }
-struct ProgressMessage {
-    sequence: u64,
-    stream: Stream,
-    text: String,
-}
 pub(crate) struct ProgressPump {
-    sender: mpsc::Sender<ProgressMessage>,
+    sender: mpsc::Sender<ShellProgressChunk>,
     pub(crate) failure: mpsc::Receiver<String>,
     pub(crate) task: tokio::task::JoinHandle<Result<(), String>>,
 }
 impl ProgressPump {
-    pub(crate) fn start(token: ProgressToken, transport: Arc<dyn ProgressTransport>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<ProgressMessage>(PROGRESS_QUEUE_CAPACITY);
+    pub(crate) fn start(sink: Arc<dyn ShellProgressSink>) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<ShellProgressChunk>(PROGRESS_QUEUE_CAPACITY);
         let (failure_sender, failure) = mpsc::channel(1);
         let task = tokio::spawn(async move {
             // A single worker preserves stdout/stderr event order assigned by the orchestrator.
             while let Some(message) = receiver.recv().await {
-                let delivery = tokio::time::timeout(
-                    PROGRESS_DELIVERY_TIMEOUT,
-                    transport.publish(notification(&token, &message)),
-                )
-                .await
-                .map_err(|_| "progress delivery timed out".to_owned())
-                .and_then(|r| r);
+                let delivery =
+                    tokio::time::timeout(PROGRESS_DELIVERY_TIMEOUT, sink.publish(message))
+                        .await
+                        .map_err(|_| "progress delivery timed out".to_owned())
+                        .and_then(|r| r);
                 if let Err(error) = delivery {
                     let _ = failure_sender.try_send(error.clone());
                     return Err(error);
@@ -75,11 +74,17 @@ impl ProgressPump {
             task,
         }
     }
-    pub(crate) fn enqueue(&self, sequence: u64, stream: Stream, text: &str) -> Result<(), String> {
+    pub(crate) fn enqueue(
+        &self,
+        sequence: u64,
+        stream: ShellStream,
+        text: &str,
+    ) -> Result<(), String> {
         // Never await here: blocking the orchestrator could stop pipe draining and deadlock a child.
         // Instead, a full bounded queue aborts execution with an explicit delivery failure.
         self.sender
-            .try_send(ProgressMessage {
+            .try_send(ShellProgressChunk {
+                version: 1,
                 sequence,
                 stream,
                 text: text.to_owned(),
@@ -103,31 +108,27 @@ impl ProgressPump {
         }
     }
 }
-fn notification(token: &ProgressToken, message: &ProgressMessage) -> ProgressNotificationParam {
+#[cfg(feature = "mcp")]
+fn notification(token: &ProgressToken, chunk: &ShellProgressChunk) -> ProgressNotificationParam {
     let mut fields = JsonObject::new();
     fields.insert(
         OUTPUT_CHUNK_KEY.to_owned(),
-        serde_json::to_value(OutputChunk {
-            version: 1,
-            sequence: message.sequence,
-            stream: message.stream,
-            text: &message.text,
-        })
-        .expect("output chunk serializes"),
+        serde_json::to_value(chunk).expect("output chunk serializes"),
     );
-    let mut n = ProgressNotificationParam::new(token.clone(), message.sequence as f64)
-        .with_message(standard_message(message));
+    let mut n = ProgressNotificationParam::new(token.clone(), chunk.sequence as f64)
+        .with_message(standard_message(chunk));
     n.meta = Some(NotificationMetaObject(MetaObject(fields)));
     n
 }
 
-fn standard_message(message: &ProgressMessage) -> String {
-    let label = match message.stream {
-        Stream::Stdout => "stdout",
-        Stream::Stderr => "stderr",
+#[cfg(feature = "mcp")]
+fn standard_message(chunk: &ShellProgressChunk) -> String {
+    let label = match chunk.stream {
+        ShellStream::Stdout => "stdout",
+        ShellStream::Stderr => "stderr",
     };
     let mut rendered = format!("[{label}] ");
-    for character in message.text.chars() {
+    for character in chunk.text.chars() {
         let escaped = match character {
             '\0' => Some("\\0".to_owned()),
             '\n' => Some("\\n".to_owned()),
@@ -172,24 +173,26 @@ mod tests {
     use std::sync::Mutex;
 
     struct Recording {
-        notifications: Arc<Mutex<Vec<ProgressNotificationParam>>>,
+        chunks: Arc<Mutex<Vec<ShellProgressChunk>>>,
     }
 
     #[async_trait]
-    impl ProgressTransport for Recording {
-        async fn publish(&self, notification: ProgressNotificationParam) -> Result<(), String> {
-            self.notifications.lock().unwrap().push(notification);
+    impl ShellProgressSink for Recording {
+        async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
+            self.chunks.lock().unwrap().push(chunk);
             Ok(())
         }
     }
 
     #[test]
+    #[cfg(feature = "mcp")]
     fn notification_has_standard_message_and_structured_chunk() {
         let notification = notification(
             &ProgressToken(rmcp::model::NumberOrString::String("request-1".into())),
-            &ProgressMessage {
+            &ShellProgressChunk {
+                version: 1,
                 sequence: 4,
-                stream: Stream::Stderr,
+                stream: ShellStream::Stderr,
                 text: "compiling\n".into(),
             },
         );
@@ -210,13 +213,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mcp")]
     fn standard_message_escapes_terminal_controls_but_metadata_remains_exact() {
         let text = "safe\x1b[31m\r\0\u{009b}\u{200f}\u{2028}\u{202e}\n\t";
         let notification = notification(
             &ProgressToken(rmcp::model::NumberOrString::Number(1)),
-            &ProgressMessage {
+            &ShellProgressChunk {
+                version: 1,
                 sequence: 1,
-                stream: Stream::Stdout,
+                stream: ShellStream::Stdout,
                 text: text.into(),
             },
         );
@@ -230,10 +235,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mcp")]
     fn standard_message_is_bounded_after_control_escaping() {
-        let message = ProgressMessage {
+        let message = ShellProgressChunk {
+            version: 1,
             sequence: 1,
-            stream: Stream::Stdout,
+            stream: ShellStream::Stdout,
             text: "\x1b".repeat(STANDARD_MESSAGE_BYTES),
         };
 
@@ -245,42 +252,43 @@ mod tests {
 
     #[tokio::test]
     async fn pump_delivers_monotonic_messages_in_order_before_finishing() {
-        let notifications = Arc::new(Mutex::new(Vec::new()));
-        let pump = ProgressPump::start(
-            ProgressToken(rmcp::model::NumberOrString::String("ordered".into())),
-            Arc::new(Recording {
-                notifications: notifications.clone(),
-            }),
-        );
-        pump.enqueue(1, Stream::Stdout, "first").unwrap();
-        pump.enqueue(2, Stream::Stderr, "second").unwrap();
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let pump = ProgressPump::start(Arc::new(Recording {
+            chunks: chunks.clone(),
+        }));
+        pump.enqueue(1, ShellStream::Stdout, "first").unwrap();
+        pump.enqueue(2, ShellStream::Stderr, "second").unwrap();
 
         pump.finish().await.unwrap();
 
-        let notifications = notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 2);
-        assert_eq!(notifications[0].progress, 1.0);
-        assert_eq!(notifications[0].message.as_deref(), Some("[stdout] first"));
-        assert_eq!(notifications[1].progress, 2.0);
-        assert_eq!(notifications[1].message.as_deref(), Some("[stderr] second"));
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sequence, 1);
+        assert_eq!(chunks[0].stream, ShellStream::Stdout);
+        assert_eq!(chunks[0].text, "first");
+        assert_eq!(chunks[1].sequence, 2);
+        assert_eq!(chunks[1].stream, ShellStream::Stderr);
+        assert_eq!(chunks[1].text, "second");
     }
 
     struct Stalled;
     #[async_trait]
-    impl ProgressTransport for Stalled {
-        async fn publish(&self, _: ProgressNotificationParam) -> Result<(), String> {
+    impl ShellProgressSink for Stalled {
+        async fn publish(&self, _: ShellProgressChunk) -> Result<(), String> {
             std::future::pending().await
         }
     }
     #[tokio::test]
     async fn saturated_queue_fails() {
-        let token = ProgressToken(rmcp::model::NumberOrString::Number(7));
-        let pump = ProgressPump::start(token, Arc::new(Stalled));
-        pump.enqueue(1, Stream::Stdout, "first").unwrap();
+        let pump = ProgressPump::start(Arc::new(Stalled));
+        pump.enqueue(1, ShellStream::Stdout, "first").unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut saturated = false;
         for sequence in 2..=(PROGRESS_QUEUE_CAPACITY as u64 + 2) {
-            if pump.enqueue(sequence, Stream::Stdout, "queued").is_err() {
+            if pump
+                .enqueue(sequence, ShellStream::Stdout, "queued")
+                .is_err()
+            {
                 saturated = true;
                 break;
             }

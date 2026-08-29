@@ -146,6 +146,37 @@ fn rejects_expansion_before_exponential_allocation() {
     );
 }
 
+#[test]
+fn literal_paths_stay_within_the_default_budget_in_large_trees() {
+    const CANDIDATE_COUNT: usize = 10_000;
+    const MATCHING_PATH: &str = "src/cmd/tui.rs";
+    const CANDIDATE_BASENAME: &str = "dependency.rlib";
+
+    for pattern in [MATCHING_PATH, "**/cmd/tui.rs"] {
+        let matcher = matcher(pattern);
+        let mut budget = FilesystemLimits::default().max_glob_match_steps;
+        assert!(
+            matcher
+                .is_match(MATCHING_PATH, &mut budget)
+                .expect("matching path")
+        );
+
+        for index in 0..CANDIDATE_COUNT {
+            let candidate = format!("target/debug/deps/dependency-{index}.rlib");
+            assert!(
+                !matcher
+                    .is_match(&candidate, &mut budget)
+                    .expect("non-matching path")
+            );
+            assert!(
+                !matcher
+                    .is_match(CANDIDATE_BASENAME, &mut budget)
+                    .expect("non-matching basename")
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 512,

@@ -1,16 +1,37 @@
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "mcp")]
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+#[cfg(feature = "mcp")]
+use serde::{Serialize, de::DeserializeOwned};
+#[cfg(feature = "mcp")]
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "mcp")]
 use crate::catalog;
 use crate::fetch::{self, WebfetchError};
 use crate::search;
-use crate::types::{WebfetchInput, WebsearchInput};
-use crate::{WebToolDependencies, WebsearchExecutionConfiguration};
+use crate::types::{
+    WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode, WebsearchInput,
+    WebsearchOutput,
+};
+use crate::{WebToolDependencies, WebsearchBackend, WebsearchExecutionConfiguration};
+
+pub struct PreparedWebsearch {
+    pub permission_query: String,
+    pub backend: Option<WebsearchBackend>,
+    input: WebsearchInput,
+    configuration: WebsearchExecutionConfiguration,
+}
+
+pub struct PreparedWebfetch {
+    pub permission_url: String,
+    pub format: WebfetchFormat,
+    pub pdf_mode: WebfetchPdfMode,
+    pub timeout_seconds: u64,
+    input: fetch::NormalizedWebfetchInput,
+}
 
 /// Cloneable composition unit for the MCP server. Clones share immutable
 /// configuration and dependency handles but no mutable invocation state.
@@ -90,6 +111,7 @@ impl WebToolGroup {
     }
 
     #[must_use]
+    #[cfg(feature = "mcp")]
     pub fn catalog(&self, current_year: i32) -> Vec<Tool> {
         catalog(current_year, &self.snapshot().configuration)
     }
@@ -129,40 +151,103 @@ impl WebToolGroup {
         state.revision
     }
 
+    /// Validate and normalize a search request without performing network I/O.
+    pub fn prepare_websearch(&self, input: WebsearchInput) -> Result<PreparedWebsearch, String> {
+        let configuration = self.snapshot().configuration;
+        let mut input = validate_websearch(input, &configuration)?;
+        input.query = input.query.trim().to_owned();
+        Ok(PreparedWebsearch {
+            permission_query: input.query.clone(),
+            backend: configuration.backend(),
+            input,
+            configuration,
+        })
+    }
+
+    pub async fn execute_websearch(
+        &self,
+        prepared: PreparedWebsearch,
+        cancellation: CancellationToken,
+    ) -> Result<WebExecution<WebsearchOutput>, String> {
+        let output = search::execute(
+            prepared.input,
+            &prepared.configuration,
+            &self.dependencies,
+            cancellation,
+        )
+        .await?;
+        Ok(WebExecution {
+            model_text: output.formatted_results.clone(),
+            output,
+        })
+    }
+
+    pub async fn websearch(
+        &self,
+        input: WebsearchInput,
+        cancellation: CancellationToken,
+    ) -> Result<WebExecution<WebsearchOutput>, String> {
+        self.execute_websearch(self.prepare_websearch(input)?, cancellation)
+            .await
+    }
+
+    /// Validate and normalize a fetch request without performing network I/O.
+    pub fn prepare_webfetch(
+        &self,
+        input: WebfetchInput,
+    ) -> Result<PreparedWebfetch, WebfetchError> {
+        let input = validate_webfetch(input).map_err(WebfetchError::InvalidInput)?;
+        let input = fetch::normalize_input(input, self.dependencies.webfetch_policy)?;
+        Ok(PreparedWebfetch {
+            permission_url: input.url.to_string(),
+            format: input.format,
+            pdf_mode: input.pdf_mode,
+            timeout_seconds: input.timeout_seconds,
+            input,
+        })
+    }
+
+    pub async fn execute_webfetch(
+        &self,
+        prepared: PreparedWebfetch,
+        cancellation: CancellationToken,
+    ) -> Result<WebExecution<WebfetchOutput>, WebfetchError> {
+        let execution = fetch::execute(prepared.input, &self.dependencies, cancellation).await?;
+        Ok(WebExecution {
+            output: execution.output,
+            model_text: execution.model_text,
+        })
+    }
+
+    pub async fn webfetch(
+        &self,
+        input: WebfetchInput,
+        cancellation: CancellationToken,
+    ) -> Result<WebExecution<WebfetchOutput>, WebfetchError> {
+        self.execute_webfetch(self.prepare_webfetch(input)?, cancellation)
+            .await
+    }
+
     /// Returns `None` only for names outside this group. Invalid arguments and
     /// operational webfetch failures are MCP tool errors; websearch provider
     /// failures intentionally remain successful error-shaped results.
+    #[cfg(feature = "mcp")]
     pub async fn dispatch(
         &self,
         name: &str,
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Option<Result<CallToolResult, rmcp::ErrorData>> {
-        let configuration = self.snapshot().configuration;
         let result = match name {
-            "websearch" => match parse_arguments::<WebsearchInput>(name, arguments)
-                .and_then(|input| validate_websearch(input, &configuration))
-            {
-                Ok(input) => {
-                    match search::execute(input, &configuration, &self.dependencies, cancellation)
-                        .await
-                    {
-                        Ok(output) => {
-                            let model_text = output.formatted_results.clone();
-                            success(&model_text, output)
-                        }
-                        Err(error) => tool_error(error),
-                    }
-                }
+            "websearch" => match parse_arguments::<WebsearchInput>(name, arguments) {
+                Ok(input) => match self.websearch(input, cancellation).await {
+                    Ok(execution) => success(&execution.model_text, execution.output),
+                    Err(error) => tool_error(error),
+                },
                 Err(error) => tool_error(error),
             },
-            "webfetch" => match parse_arguments::<WebfetchInput>(name, arguments)
-                .and_then(validate_webfetch)
-                .and_then(|input| {
-                    fetch::normalize_input(input, self.dependencies.webfetch_policy)
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(input) => match fetch::execute(input, &self.dependencies, cancellation).await {
+            "webfetch" => match parse_arguments::<WebfetchInput>(name, arguments) {
+                Ok(input) => match self.webfetch(input, cancellation).await {
                     Ok(execution) => success(&execution.model_text, execution.output),
                     Err(error) => tool_error(error),
                 },
@@ -174,6 +259,7 @@ impl WebToolGroup {
     }
 }
 
+#[cfg(feature = "mcp")]
 fn parse_arguments<T: DeserializeOwned>(name: &str, value: Value) -> Result<T, String> {
     serde_json::from_value(value)
         .map_err(|error| format!("Invalid arguments for tool {name}: {error}"))
@@ -250,6 +336,7 @@ fn validate_webfetch(input: WebfetchInput) -> Result<WebfetchInput, String> {
     Ok(input)
 }
 
+#[cfg(feature = "mcp")]
 fn success(model_text: &str, output: impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
     let structured = serde_json::to_value(output).map_err(|error| {
         rmcp::ErrorData::internal_error(
@@ -263,22 +350,26 @@ fn success(model_text: &str, output: impl Serialize) -> Result<CallToolResult, r
     Ok(result)
 }
 
+#[cfg(feature = "mcp")]
 fn tool_error(error: impl IntoToolError) -> Result<CallToolResult, rmcp::ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(
         error.tool_error(),
     )]))
 }
 
+#[cfg(feature = "mcp")]
 trait IntoToolError {
     fn tool_error(self) -> String;
 }
 
+#[cfg(feature = "mcp")]
 impl IntoToolError for String {
     fn tool_error(self) -> String {
         self
     }
 }
 
+#[cfg(feature = "mcp")]
 impl IntoToolError for WebfetchError {
     fn tool_error(self) -> String {
         self.to_string()

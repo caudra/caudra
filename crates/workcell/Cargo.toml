@@ -1,0 +1,27 @@
+[package]
+name = "workcell"
+description = "Protocol-neutral typed Workcell tool facade"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+files = ["dep:workcell-mcp-files"]
+web = ["dep:workcell-mcp-web"]
+shell = ["dep:workcell-mcp-shell"]
+code = ["dep:workcell-mcp-code"]
+environment = ["dep:workcell-environment"]
+
+[dependencies]
+workcell-environment = { workspace = true, optional = true }
+workcell-mcp-code = { workspace = true, optional = true }
+workcell-mcp-files = { workspace = true, optional = true }
+workcell-mcp-shell = { workspace = true, optional = true }
+workcell-mcp-web = { workspace = true, optional = true }
+workcell-tool-contract.workspace = true
+
+[lints]
+workspace = true

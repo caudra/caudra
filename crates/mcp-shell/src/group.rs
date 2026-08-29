@@ -4,22 +4,28 @@
 //! must have an exit status and both output pipes must close. Descendants can inherit pipes after the
 //! child exits, so conflating these conditions can hang forever or discard trailing output.
 
+#[cfg(feature = "mcp")]
+use crate::{catalog, progress::McpProgressSink};
 use crate::{
-    catalog,
     output::{
         COMBINED_OUTPUT_BYTES, FALLBACK_PREVIEW_BYTES, OUTPUT_CHANNEL_CAPACITY, Tail, read_stream,
     },
     permission::{MAX_COMMAND_BYTES, ShellPermissionPolicy},
     process::{exit_signal, platform_command, terminate_and_reap, terminate_residual_group},
-    progress::{PeerProgressTransport, ProgressPump, receive_failure},
-    types::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellInput, ShellOutput, Stream},
+    progress::{ProgressPump, ShellProgressSink, receive_failure},
+    types::{
+        DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellExecution, ShellInput, ShellOutput,
+        ShellStream,
+    },
     workdir,
 };
+#[cfg(feature = "mcp")]
 use rmcp::{
     RoleServer,
     model::{CallToolResult, ContentBlock, ProgressToken, Tool},
     service::Peer,
 };
+#[cfg(feature = "mcp")]
 use serde_json::Value;
 use std::{
     fmt,
@@ -45,12 +51,13 @@ fn concurrency() -> &'static Arc<Semaphore> {
 pub struct ShellToolGroup {
     root: PathBuf,
     policy: ShellPermissionPolicy,
+    confined: bool,
 }
 #[derive(Debug)]
 pub struct ShellBuildError;
 impl fmt::Display for ShellBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("shell root must be an existing directory")
+        f.write_str("shell base cwd must be an existing directory")
     }
 }
 impl std::error::Error for ShellBuildError {}
@@ -64,7 +71,26 @@ impl ShellToolGroup {
         root: impl AsRef<Path>,
         policy: ShellPermissionPolicy,
     ) -> Result<Self, ShellBuildError> {
-        let root = workdir::canonicalize(root.as_ref())
+        Self::build(root.as_ref(), policy, true).await
+    }
+
+    /// Construct a trusted native group whose base cwd only resolves relative workdirs.
+    /// Absolute paths and relative traversal outside the base are accepted.
+    pub async fn new_unconfined(base_cwd: impl AsRef<Path>) -> Result<Self, ShellBuildError> {
+        Self::build(
+            base_cwd.as_ref(),
+            ShellPermissionPolicy::restricted(),
+            false,
+        )
+        .await
+    }
+
+    async fn build(
+        root: &Path,
+        policy: ShellPermissionPolicy,
+        confined: bool,
+    ) -> Result<Self, ShellBuildError> {
+        let root = workdir::canonicalize(root)
             .await
             .map_err(|_| ShellBuildError)?;
         if !tokio::fs::metadata(&root)
@@ -74,12 +100,24 @@ impl ShellToolGroup {
         {
             return Err(ShellBuildError);
         }
-        Ok(Self { root, policy })
+        Ok(Self {
+            root,
+            policy,
+            confined,
+        })
     }
+
     #[must_use]
+    pub fn policy_summary(&self) -> crate::ShellPermissionPolicySummary {
+        self.policy.summary()
+    }
+
+    #[must_use]
+    #[cfg(feature = "mcp")]
     pub fn catalog(&self) -> Vec<Tool> {
         catalog::catalog()
     }
+    #[cfg(feature = "mcp")]
     pub async fn dispatch(
         &self,
         name: &str,
@@ -99,23 +137,30 @@ impl ShellToolGroup {
                 ))));
             }
         };
+        let prepared = match self.prepare(input).await {
+            Ok(prepared) => prepared,
+            Err(error) => return Some(Ok(tool_error(error))),
+        };
+        if let Err(error) = self.policy.authorize(prepared.command()) {
+            return Some(Ok(tool_error(error)));
+        }
         let progress = progress.map(|(peer, token)| {
-            ProgressPump::start(token, Arc::new(PeerProgressTransport { peer }))
+            Arc::new(McpProgressSink { peer, token }) as Arc<dyn ShellProgressSink>
         });
         Some(Ok(
-            match self.execute(input, cancellation, progress).await {
-                Ok(Some(output)) => result_content(output),
+            match self
+                .execute_prepared(prepared, cancellation, progress)
+                .await
+            {
+                Ok(Some(execution)) => result_content(execution),
                 Ok(None) => tool_error("Shell execution cancelled"),
                 Err(e) => tool_error(e),
             },
         ))
     }
-    async fn execute(
-        &self,
-        input: ShellInput,
-        cancellation: CancellationToken,
-        mut progress: Option<ProgressPump>,
-    ) -> Result<Option<ShellOutput>, String> {
+
+    /// Validate and inspect a command without applying policy or starting a process.
+    pub async fn prepare(&self, input: ShellInput) -> Result<PreparedShell, String> {
         if input.command.trim().is_empty() {
             return Err("Invalid arguments: command must not be empty".into());
         }
@@ -131,14 +176,36 @@ impl ShellToolGroup {
                 "Invalid arguments: timeout must be between 1 and {MAX_TIMEOUT_MS}"
             ));
         }
-        let (workdir, relative_workdir) =
-            workdir::resolve(&self.root, input.workdir.as_deref().unwrap_or(".")).await?;
-        self.policy.authorize(&input.command)?;
+        let requested_workdir = input.workdir.as_deref().unwrap_or(".");
+        let (workdir, relative_workdir) = if self.confined {
+            workdir::resolve(&self.root, requested_workdir).await?
+        } else {
+            workdir::resolve_unconfined(&self.root, requested_workdir).await?
+        };
+        let analysis = crate::permission::inspect(&input.command);
+        Ok(PreparedShell::new(
+            input.command,
+            timeout_ms,
+            workdir,
+            relative_workdir,
+            analysis,
+        ))
+    }
+
+    /// Execute after a native host has authorized the prepared scopes.
+    pub async fn execute_prepared(
+        &self,
+        prepared: PreparedShell,
+        cancellation: CancellationToken,
+        progress: Option<Arc<dyn ShellProgressSink>>,
+    ) -> Result<Option<ShellExecution>, String> {
+        let (command_text, timeout_ms, workdir, relative_workdir) = prepared.into_execution_parts();
+        let mut progress = progress.map(ProgressPump::start);
         // Queue admission remains cancellable; holding the permit through final progress drain keeps
         // all per-execution resources inside the global concurrency budget.
         let _permit = tokio::select! {permit=concurrency().clone().acquire_owned()=>permit.map_err(|_|"Shell concurrency gate is unavailable".to_owned())?,()=cancellation.cancelled()=>return Ok(None)};
         let started = Instant::now();
-        let mut command = platform_command(&input.command);
+        let mut command = platform_command(&command_text);
         command
             .current_dir(workdir)
             .stdin(Stdio::null())
@@ -158,8 +225,8 @@ impl ShellToolGroup {
             .take()
             .ok_or_else(|| "Failed to capture stderr".to_owned())?;
         let (sender, mut receiver) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
-        let stdout_task = tokio::spawn(read_stream(stdout, Stream::Stdout, sender.clone()));
-        let stderr_task = tokio::spawn(read_stream(stderr, Stream::Stderr, sender));
+        let stdout_task = tokio::spawn(read_stream(stdout, ShellStream::Stdout, sender.clone()));
+        let stderr_task = tokio::spawn(read_stream(stderr, ShellStream::Stderr, sender));
         let mut stdout_tail = Tail::default();
         let mut stderr_tail = Tail::default();
         let mut total_bytes = 0_u64;
@@ -200,16 +267,16 @@ impl ShellToolGroup {
                       sequence=sequence.saturating_add(1);
                       let utf8_bytes=u64::try_from(event.text.len()).unwrap_or(u64::MAX);
                       match event.stream {
-                          Stream::Stdout=>stdout_utf8_bytes=stdout_utf8_bytes.saturating_add(utf8_bytes),
-                          Stream::Stderr=>stderr_utf8_bytes=stderr_utf8_bytes.saturating_add(utf8_bytes)
+                          ShellStream::Stdout=>stdout_utf8_bytes=stdout_utf8_bytes.saturating_add(utf8_bytes),
+                          ShellStream::Stderr=>stderr_utf8_bytes=stderr_utf8_bytes.saturating_add(utf8_bytes)
                       }
                       if let Some(p)=&progress&&let Err(e)=p.enqueue(sequence,event.stream,&event.text) {
                          terminate_and_reap(&mut child,pid).await?;
                          stdout_task.abort(); stderr_task.abort(); p.task.abort(); return Err(e);
                      }
                      match event.stream {
-                         Stream::Stdout=>stdout_tail.push(event.text.as_bytes()),
-                         Stream::Stderr=>stderr_tail.push(event.text.as_bytes())
+                         ShellStream::Stdout=>stdout_tail.push(event.text.as_bytes()),
+                         ShellStream::Stderr=>stderr_tail.push(event.text.as_bytes())
                      }
                  },
                  None=>pipes_closed=true
@@ -228,7 +295,7 @@ impl ShellToolGroup {
         }
         let (stdout, stdout_preview_truncated) = stdout_tail.preview(FALLBACK_PREVIEW_BYTES / 2);
         let (stderr, stderr_preview_truncated) = stderr_tail.preview(FALLBACK_PREVIEW_BYTES / 2);
-        Ok(Some(ShellOutput {
+        let output = ShellOutput {
             version: 1,
             kind: "shell",
             relative_workdir,
@@ -247,7 +314,21 @@ impl ShellToolGroup {
             stderr_capture_truncated: stderr_tail.truncated,
             stdout_preview_truncated,
             stderr_preview_truncated,
+        };
+        Ok(Some(ShellExecution {
+            model_text: model_text(&output),
+            output,
         }))
+    }
+
+    pub async fn execute(
+        &self,
+        input: ShellInput,
+        cancellation: CancellationToken,
+        progress: Option<Arc<dyn ShellProgressSink>>,
+    ) -> Result<Option<ShellExecution>, String> {
+        self.execute_prepared(self.prepare(input).await?, cancellation, progress)
+            .await
     }
 }
 async fn wait_for_pipe_deadline(deadline: Option<tokio::time::Instant>) {
@@ -257,8 +338,8 @@ async fn wait_for_pipe_deadline(deadline: Option<tokio::time::Instant>) {
         std::future::pending().await
     }
 }
-fn result_content(output: ShellOutput) -> CallToolResult {
-    let text = if output.stdout.is_empty() && output.stderr.is_empty() {
+fn model_text(output: &ShellOutput) -> String {
+    if output.stdout.is_empty() && output.stderr.is_empty() {
         format!(
             "Command exited with code {} and produced no output.",
             output
@@ -270,17 +351,22 @@ fn result_content(output: ShellOutput) -> CallToolResult {
             "stdout tail:\n{}\nstderr tail:\n{}",
             output.stdout, output.stderr
         )
-    };
-    let structured = serde_json::to_value(&output).expect("shell output serializes");
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn result_content(execution: ShellExecution) -> CallToolResult {
+    let structured = serde_json::to_value(&execution.output).expect("shell output serializes");
+    let mut result = CallToolResult::success(vec![ContentBlock::text(execution.model_text)]);
     result.structured_content = Some(structured);
     result
 }
+#[cfg(feature = "mcp")]
 fn tool_error(error: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.into())])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -365,6 +451,81 @@ mod tests {
         assert!(too_long.contains("65537 UTF-8 bytes"));
         assert!(too_long.contains("maximum is 65536"));
         assert!(too_long.contains("Split the operation"));
+    }
+    #[tokio::test]
+    async fn native_prepare_exposes_scopes_and_does_not_execute() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::new(root.path()).await.unwrap();
+        let marker = root.path().join("not-created");
+        let prepared = group
+            .prepare(ShellInput {
+                command: format!("printf prepared > '{}'", marker.display()),
+                timeout: None,
+                workdir: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.workdir(), root.path().canonicalize().unwrap());
+        assert_eq!(prepared.relative_workdir(), ".");
+        assert_eq!(prepared.analysis().scopes.len(), 1);
+        assert_eq!(prepared.analysis().scopes[0].permission, "printf *");
+        assert!(!marker.exists());
+    }
+    #[tokio::test]
+    async fn unconfined_native_prepare_accepts_absolute_and_outside_workdirs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().join("base");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let group = ShellToolGroup::new_unconfined(&base).await.unwrap();
+
+        let absolute = group
+            .prepare(ShellInput {
+                command: "pwd".into(),
+                timeout: None,
+                workdir: Some(outside.to_string_lossy().into_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(absolute.workdir(), outside.canonicalize().unwrap());
+        assert_eq!(
+            absolute.relative_workdir(),
+            outside.canonicalize().unwrap().to_string_lossy()
+        );
+
+        let relative = group
+            .prepare(ShellInput {
+                command: "pwd".into(),
+                timeout: None,
+                workdir: Some("../outside".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(relative.workdir(), outside.canonicalize().unwrap());
+    }
+    #[tokio::test]
+    async fn trusted_native_execution_uses_host_authorization_instead_of_workcell_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::new(root.path()).await.unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: "printf native".into(),
+                timeout: None,
+                workdir: None,
+            })
+            .await
+            .unwrap();
+
+        let execution = group
+            .execute_prepared(prepared, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .expect("not cancelled");
+
+        assert_eq!(execution.output.stdout, "native");
+        assert_eq!(execution.model_text, "stdout tail:\nnative\nstderr tail:\n");
     }
     #[tokio::test]
     async fn bounded_tails() {

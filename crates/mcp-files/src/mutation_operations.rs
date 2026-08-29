@@ -10,7 +10,7 @@ use crate::text::FileVersion;
 use crate::types::{FileDiff, FileMutationType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlannedChangeType {
+pub(crate) enum PlannedChangeType {
     Add,
     Update,
     Delete,
@@ -28,13 +28,13 @@ impl From<PlannedChangeType> for FileMutationType {
     }
 }
 
-struct PlannedChange {
-    file_path: PathBuf,
-    new_content: String,
-    change_type: PlannedChangeType,
-    move_path: Option<PathBuf>,
-    diff: FileDiff,
-    expected_source: Option<FileVersion>,
+pub(crate) struct PlannedChange {
+    pub(crate) file_path: PathBuf,
+    pub(crate) new_content: String,
+    pub(crate) change_type: PlannedChangeType,
+    pub(crate) move_path: Option<PathBuf>,
+    pub(crate) diff: FileDiff,
+    pub(crate) expected_source: Option<FileVersion>,
 }
 
 fn path_string(path: &Path) -> String {

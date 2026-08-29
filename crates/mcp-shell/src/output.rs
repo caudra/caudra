@@ -4,7 +4,7 @@
 //! coalesce tiny reads to avoid flooding progress delivery. Resource limits use raw source bytes;
 //! decoded replacement characters must not let malformed output evade the combined byte budget.
 
-use crate::types::{OutputEvent, Stream};
+use crate::types::{OutputEvent, ShellStream};
 use std::collections::VecDeque;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -59,7 +59,7 @@ impl Tail {
 
 pub(crate) async fn read_stream(
     mut reader: impl AsyncRead + Unpin,
-    stream: Stream,
+    stream: ShellStream,
     sender: mpsc::Sender<OutputEvent>,
 ) {
     let mut buffer = [0_u8; CHUNK_BYTES];
@@ -130,7 +130,7 @@ fn decode_available(bytes: &[u8], text: &mut String) -> usize {
 async fn emit_full_chunks(
     text: &mut String,
     raw_bytes: &mut usize,
-    stream: Stream,
+    stream: ShellStream,
     sender: &mpsc::Sender<OutputEvent>,
 ) -> bool {
     while text.len() >= CHUNK_BYTES {
@@ -160,7 +160,7 @@ async fn emit_full_chunks(
 async fn emit_remainder(
     text: &mut String,
     raw_bytes: &mut usize,
-    stream: Stream,
+    stream: ShellStream,
     sender: &mpsc::Sender<OutputEvent>,
 ) -> bool {
     if text.is_empty() {
@@ -215,7 +215,7 @@ mod tests {
                 bytes: raw,
                 offset: 0,
             },
-            Stream::Stdout,
+            ShellStream::Stdout,
             sender,
         ));
 

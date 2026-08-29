@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Resource bounds are deliberately independent so deployments can tighten one
 /// attack surface without unexpectedly changing another operation.
@@ -315,6 +316,22 @@ pub struct FileApplyPatchOutput {
 #[serde(rename_all = "lowercase")]
 pub enum FilePatchKind {
     Patch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileResourceAccess {
+    Read,
+    Traverse,
+    Write,
+    ReadWrite,
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileResource {
+    pub requested_path: String,
+    pub path: PathBuf,
+    pub access: FileResourceAccess,
 }
 
 fn is_false(value: &bool) -> bool {

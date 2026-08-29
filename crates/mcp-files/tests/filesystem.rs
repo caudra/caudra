@@ -991,6 +991,89 @@ async fn rejects_zero_limits_at_initialization() {
     assert_eq!(error.to_string(), "maxReadBytes must be a positive integer");
 }
 
+#[tokio::test]
+async fn unconfined_native_mode_inspects_and_operates_on_absolute_outside_paths() {
+    let fixture = fixture();
+    let files = FileToolGroup::new_unconfined(&fixture.root, None)
+        .await
+        .expect("unconfined group");
+    let outside_file = fixture.outside.join("secret.txt");
+    let input = FileReadInput {
+        file_path: outside_file.to_string_lossy().into_owned(),
+        offset: None,
+        limit: None,
+    };
+
+    let resource = files.inspect_read(&input).await.expect("resource");
+    assert_eq!(resource.path, outside_file.canonicalize().unwrap());
+    let output = files
+        .file_read(input, &token())
+        .await
+        .expect("outside read");
+    let FileReadOutput::File { text, .. } = output else {
+        panic!("expected file");
+    };
+    assert_eq!(text, "secret\n");
+
+    let invalid = files
+        .file_read(
+            FileReadInput {
+                file_path: String::new(),
+                offset: None,
+                limit: None,
+            },
+            &token(),
+        )
+        .await
+        .expect_err("typed validation");
+    assert_eq!(
+        invalid.to_string(),
+        "Invalid arguments: filePath must not be empty"
+    );
+}
+
+#[tokio::test]
+async fn prepared_native_patch_exposes_every_resource_and_mutates_only_on_execute() {
+    let fixture = fixture();
+    let source = fixture.outside.join("source.txt");
+    let destination = fixture.outside.join("destination.txt");
+    fs::write(&source, "old\n").expect("source");
+    let files = FileToolGroup::new_unconfined(&fixture.root, None)
+        .await
+        .expect("unconfined group");
+    let patch_text = format!(
+        "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n-old\n+new\n*** End Patch",
+        source.display(),
+        destination.display()
+    );
+
+    let prepared = files
+        .prepare_apply_patch(
+            FileApplyPatchInput {
+                patch_text,
+                dry_run: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared patch");
+
+    assert!(!prepared.preview().applied);
+    assert_eq!(prepared.resources().len(), 2);
+    assert_eq!(prepared.resources()[0].path, source.canonicalize().unwrap());
+    assert_eq!(prepared.resources()[1].path, destination);
+    assert_eq!(fs::read_to_string(&source).unwrap(), "old\n");
+    assert!(!destination.exists());
+
+    let output = files
+        .execute_prepared_patch(prepared, &token())
+        .await
+        .expect("execute prepared patch");
+    assert!(output.applied);
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "new\n");
+}
+
 fn temporary_files(root: &std::path::Path, basename: &str) -> Vec<String> {
     fs::read_dir(root)
         .expect("directory")

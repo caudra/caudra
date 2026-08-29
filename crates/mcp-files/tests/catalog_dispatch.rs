@@ -1,3 +1,5 @@
+#![cfg(feature = "mcp")]
+
 use rmcp::model::ContentBlock;
 use serde_json::{Value, json};
 use tempfile::tempdir;

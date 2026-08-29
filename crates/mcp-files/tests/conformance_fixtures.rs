@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "mcp"))]
 
 use std::fs;
 use std::path::{Path, PathBuf};

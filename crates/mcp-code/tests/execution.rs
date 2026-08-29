@@ -1,3 +1,5 @@
+#![cfg(feature = "mcp")]
+
 //! End-to-end execution against a real `monty` worker.
 //!
 //! These tests assert the behaviour the tool description promises: the value contract, the isolation
@@ -10,8 +12,8 @@ use std::{path::PathBuf, sync::OnceLock};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_code::{
-    CodeConfiguration, CodeToolGroup, SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS,
-    WORKER_FILE_NAME, catalog, resolve_worker,
+    CodeConfiguration, CodeInput, CodeToolGroup, SUBSET_MODULES, UNTYPED_BUILTINS,
+    WITHHELD_BUILTINS, WORKER_FILE_NAME, catalog, resolve_worker,
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
@@ -72,6 +74,37 @@ async fn returns_the_value_of_the_final_expression() {
     assert_eq!(output["result"], json!(42));
     assert_eq!(output["version"], json!(1));
     assert_eq!(output["kind"], "code");
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_execute_returns_typed_output_and_exact_model_summary() {
+    let group = group_or_skip!();
+    let execution = group
+        .execute(
+            CodeInput {
+                code: "21 * 2".into(),
+                timeout: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("valid input")
+        .expect("not cancelled");
+    assert_eq!(execution.output.result, json!(42));
+    assert_eq!(execution.model_text, "result: 42");
+
+    let error = group
+        .execute(
+            CodeInput {
+                code: "   ".into(),
+                timeout: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("typed validation");
+    assert_eq!(error, "Invalid arguments: code must not be empty");
     group.shutdown().await;
 }
 

@@ -1,8 +1,8 @@
 //! Initial working-directory validation.
 //!
-//! Resolution blocks lexical traversal and symlink escapes at launch time. It does not confine the
-//! command after launch: the shell can use absolute paths, change directory, access the network, or
-//! mutate anything permitted to the server process. This is validation, not a command sandbox.
+//! Confined resolution blocks lexical traversal and symlink escapes at launch time; host-managed
+//! resolution accepts paths outside its base cwd. Neither mode confines the command after launch:
+//! this is validation, not a command sandbox.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -48,6 +48,40 @@ pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<(PathBuf, St
     } else {
         relative.to_string_lossy().replace('\\', "/")
     };
+    Ok((canonical, relative))
+}
+
+pub(crate) async fn resolve_unconfined(
+    base_cwd: &Path,
+    requested: &str,
+) -> Result<(PathBuf, String), String> {
+    let requested = if requested.is_empty() { "." } else { requested };
+    let path = Path::new(requested);
+    let lexical = normalize(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_cwd.join(path)
+    });
+    let canonical = canonicalize(&lexical)
+        .await
+        .map_err(|_| "Invalid arguments: workdir must be an existing directory".to_owned())?;
+    if !tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| "Invalid arguments: workdir cannot be inspected".to_owned())?
+        .is_dir()
+    {
+        return Err("Invalid arguments: workdir must be a directory".into());
+    }
+    let relative = canonical.strip_prefix(base_cwd).map_or_else(
+        |_| canonical.to_string_lossy().replace('\\', "/"),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            }
+        },
+    );
     Ok((canonical, relative))
 }
 

@@ -6,6 +6,8 @@ use std::{fs::File, io::Read};
 use serde::Deserialize;
 use tree_sitter::{Node, Parser};
 
+use crate::types::{ShellCommandAnalysis, ShellCommandScope};
+
 const POLICY_VERSION: u8 = 1;
 pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -95,7 +97,9 @@ impl std::error::Error for ShellPermissionPolicyError {}
 
 #[derive(Debug)]
 enum AuthorizationError {
+    #[cfg(feature = "mcp")]
     Denied(String),
+    #[cfg(feature = "mcp")]
     Required(String),
     Opaque,
 }
@@ -103,10 +107,12 @@ enum AuthorizationError {
 impl fmt::Display for AuthorizationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "mcp")]
             Self::Denied(scope) => write!(
                 formatter,
                 "Shell execution denied by an immutable Workcell policy rule for scope `{scope}`. Ask the Workcell operator to remove or narrow the matching deny rule if this command is required; tool arguments cannot override it"
             ),
+            #[cfg(feature = "mcp")]
             Self::Required(scope) => write!(
                 formatter,
                 "Shell execution requires an allow rule for scope `{scope}`. Ask the Workcell operator to update the immutable shell policy; tool arguments cannot approve execution"
@@ -116,18 +122,6 @@ impl fmt::Display for AuthorizationError {
             ),
         }
     }
-}
-
-struct Analysis {
-    scopes: Vec<CommandScope>,
-    opaque: bool,
-}
-
-struct CommandScope {
-    start_byte: usize,
-    source: String,
-    normalized: String,
-    permission: String,
 }
 
 impl ShellPermissionPolicy {
@@ -219,11 +213,13 @@ impl ShellPermissionPolicy {
         }
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn authorize(&self, command: &str) -> Result<(), String> {
         self.authorize_inner(command)
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(feature = "mcp")]
     fn authorize_inner(&self, command: &str) -> Result<(), AuthorizationError> {
         let analysis = match analyze(command) {
             Ok(analysis) => analysis,
@@ -264,7 +260,14 @@ impl ShellPermissionPolicy {
     }
 }
 
-fn analyze(command: &str) -> Result<Analysis, AuthorizationError> {
+pub(crate) fn inspect(command: &str) -> ShellCommandAnalysis {
+    analyze(command).unwrap_or_else(|_| ShellCommandAnalysis {
+        scopes: Vec::new(),
+        opaque: true,
+    })
+}
+
+fn analyze(command: &str) -> Result<ShellCommandAnalysis, AuthorizationError> {
     if command.len() > MAX_COMMAND_BYTES {
         return Err(AuthorizationError::Opaque);
     }
@@ -283,7 +286,7 @@ fn analyze(command: &str) -> Result<Analysis, AuthorizationError> {
             .parse(command.as_bytes(), None)
             .ok_or(AuthorizationError::Opaque)?;
         let root = tree.root_node();
-        let mut analysis = Analysis {
+        let mut analysis = ShellCommandAnalysis {
             scopes: Vec::new(),
             opaque: root.has_error(),
         };
@@ -354,7 +357,7 @@ fn is_scope_node(kind: &str) -> bool {
     )
 }
 
-fn command_scope(node: Node<'_>, command: &[u8]) -> Option<(CommandScope, bool)> {
+fn command_scope(node: Node<'_>, command: &[u8]) -> Option<(ShellCommandScope, bool)> {
     let (start_byte, raw_name) = if node.kind() == "command" {
         let name = node.child_by_field_name("name")?;
         (name.start_byte(), name.utf8_text(command).ok()?)
@@ -385,7 +388,7 @@ fn command_scope(node: Node<'_>, command: &[u8]) -> Option<(CommandScope, bool)>
         format!("{basename}{tail}")
     };
     Some((
-        CommandScope {
+        ShellCommandScope {
             start_byte,
             source,
             normalized,
@@ -505,10 +508,12 @@ fn valid_pattern(pattern: &str) -> bool {
         && (!pattern.contains('*') || pattern.ends_with('*'))
 }
 
-fn scope_matches(pattern: &str, scope: &CommandScope) -> bool {
+#[cfg(feature = "mcp")]
+fn scope_matches(pattern: &str, scope: &ShellCommandScope) -> bool {
     matches_text(pattern, &scope.source) || matches_text(pattern, &scope.normalized)
 }
 
+#[cfg(feature = "mcp")]
 fn matches_text(pattern: &str, scope: &str) -> bool {
     if matches!(pattern, "*" | "**") {
         return true;
@@ -535,7 +540,7 @@ fn open_policy_file(path: &Path) -> Result<File, ShellPermissionPolicyError> {
     Ok(File::from(descriptor))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::*;
 

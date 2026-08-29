@@ -1,6 +1,6 @@
 [package]
 name = "workcell-mcp-files"
-description = "Confined file tools for the Workcell MCP server"
+description = "Typed confined and host-managed filesystem tools for Workcell"
 readme = "README.md"
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
+
 [dependencies]
 dunce.workspace = true
 file-format.workspace = true
 regex.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, optional = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
@@ -21,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+workcell-tool-contract.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -1,12 +1,16 @@
 [package]
 name = "workcell-mcp-web"
-description = "Web search and fetch tools for the Workcell MCP server"
+description = "Typed web search and fetch tools for Workcell"
 readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
 
 [dependencies]
 async-trait.workspace = true
@@ -23,13 +27,14 @@ workcell-source-icons = { path = "../source-icons" }
 pdf_oxide = { version = "0.3.74", default-features = false }
 regex = "1.13.1"
 reqwest.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
+workcell-tool-contract.workspace = true
 
 [lints]
 workspace = true
