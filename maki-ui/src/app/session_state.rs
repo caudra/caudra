@@ -228,6 +228,7 @@ mod tests {
     use crate::components::{test_model, test_pricing};
     use maki_providers::{FastPricing, ModelPricing};
     use maki_storage::sessions::StoredThinking;
+    use std::collections::HashMap;
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -279,15 +280,10 @@ mod tests {
         assert_eq!(state.cost, Some(RECORDED_COST));
     }
 
-    /// Older sessions kept counters only, and those are priced with the
-    /// session's own clamped `fast` flag. A hardcoded `false` would open a
-    /// resumed fast session on half its bill.
-    #[test_case(false => Some(LIST_PRICE)     ; "standard_rates")]
-    #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
-    fn resume_without_a_breakdown_prices_the_counters(fast: bool) -> Option<f64> {
-        let mut session = session_with_counters();
-        session.meta.fast = fast;
-        let model = Model {
+    /// Fast pricing only counts on Anthropic, so this is the one provider a
+    /// fast-rate test can use.
+    fn fast_priced_model() -> Model {
+        Model {
             pricing: ModelPricing {
                 fast: Some(FastPricing {
                     input: FAST_INPUT_RATE,
@@ -296,12 +292,39 @@ mod tests {
                 ..test_pricing()
             },
             ..test_model()
-        };
+        }
+    }
 
-        let state = resumed(session, &model);
+    /// Older sessions kept counters only, and those are priced with the
+    /// session's own `fast` flag. A hardcoded `false` would open a resumed
+    /// fast session on half its bill.
+    ///
+    /// Priced through [`settle_session`] rather than a resumed session,
+    /// because resuming adjusts the model against its provider and Anthropic
+    /// zeroes pricing under a subscription. That would make the rates here
+    /// depend on how the machine running the test happens to be logged in.
+    #[test_case(false => Some(LIST_PRICE)      ; "standard_rates")]
+    #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
+    fn counters_without_a_breakdown_price_at_the_session_rate(fast: bool) -> Option<f64> {
+        settle_session(
+            &MILLION_INPUT,
+            &mut HashMap::new(),
+            &fast_priced_model(),
+            fast,
+        )
+    }
+
+    /// The flag those rates are chosen with is the session's own, clamped to
+    /// what the model supports.
+    #[test_case(false ; "standard")]
+    #[test_case(true  ; "fast")]
+    fn resume_keeps_the_stored_fast_flag(fast: bool) {
+        let mut session = session_with_counters();
+        session.meta.fast = fast;
+
+        let state = resumed(session, &fast_priced_model());
 
         assert_eq!(state.fast, fast, "{FAST_FLAG_LOST}");
-        state.cost
     }
 
     #[test]
