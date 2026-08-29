@@ -10,6 +10,8 @@ local opts = maki.api.register_options({
   max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
 })
 
+maki.api.register_permission_rule({ tool = "index", scope = "*" })
+
 local function split_trailing_range(line)
   local pos = line:find(" %[%d[%d%-,]*%]$")
   if not pos then
@@ -160,6 +162,9 @@ Return a compact overview of a source file: imports, type definitions, function 
 - Use this FIRST to understand file structure before using read with offset/limit.
 - Supports source files in different programming languages and markdown.
 - Falls back with an error on unsupported languages. Use read instead.]],
+  permission_scopes = function(input)
+    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+  end,
 
   schema = {
     type = "object",
@@ -171,7 +176,8 @@ Return a compact overview of a source file: imports, type definitions, function 
     return render_header(input.path)
   end,
   restore = function(input, output, _is_error, ctx)
-    local meta = input.path and maki.fs.metadata(input.path)
+    local path = input.path and maki.fs.normalize(input.path)
+    local meta = path and maki.fs.metadata(path)
     if meta and meta.is_dir then
       return { body = dir_listing.view(output, ctx) }
     end
@@ -180,10 +186,10 @@ Return a compact overview of a source file: imports, type definitions, function 
     return { body = buf, header = header }
   end,
   handler = function(input, ctx)
-    local path = input.path
-    if not path then
+    if not input.path then
       return { llm_output = "error: path is required", is_error = true }
     end
+    local path = maki.fs.normalize(input.path)
 
     local meta = maki.fs.metadata(path)
     if not meta then

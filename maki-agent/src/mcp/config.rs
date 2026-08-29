@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
+use url::{Host, Url};
 
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
@@ -101,6 +105,7 @@ fn default_timeout() -> u64 {
 pub enum McpServerStatus {
     Connecting,
     Running,
+    AwaitingTrust,
     Disabled,
     Failed(String),
     NeedsAuth { url: Option<String> },
@@ -108,8 +113,25 @@ pub enum McpServerStatus {
 
 impl McpServerStatus {
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Running | Self::Connecting)
+        matches!(self, Self::Running | Self::Connecting | Self::AwaitingTrust)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpConfigSource {
+    Global,
+    #[default]
+    Project,
+    Runtime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpReviewSummary {
+    pub command: Option<Vec<String>>,
+    pub url: Option<String>,
+    pub config_source: McpConfigSource,
+    pub environment_names: Vec<String>,
+    pub header_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +144,8 @@ pub struct McpServerInfo {
     pub config_path: PathBuf,
     pub url: Option<String>,
     pub oauth: Option<OauthClientConfig>,
+    pub resolved_addresses: Vec<IpAddr>,
+    pub review: McpReviewSummary,
 }
 
 #[derive(Deserialize, Default)]
@@ -135,6 +159,10 @@ pub struct McpConfig {
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
     pub origins: HashMap<String, PathBuf>,
+    #[serde(skip)]
+    pub sources: HashMap<String, McpConfigSource>,
+    #[serde(skip)]
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -222,6 +250,7 @@ pub enum Transport {
         url: String,
         headers: HashMap<String, String>,
         oauth: Option<OauthClientConfig>,
+        resolved: Vec<IpAddr>,
     },
 }
 
@@ -236,8 +265,13 @@ impl McpConfig {
         self.mcp
             .iter()
             .map(|(name, raw)| {
+                let source = self.sources.get(name).copied().unwrap_or_default();
                 let status = if !raw.enabled || disabled.contains(name) {
                     McpServerStatus::Disabled
+                } else if source == McpConfigSource::Project
+                    && requires_project_trust(&raw.transport)
+                {
+                    McpServerStatus::AwaitingTrust
                 } else {
                     McpServerStatus::Connecting
                 };
@@ -256,6 +290,8 @@ impl McpConfig {
                         RawTransport::Http(h) => h.oauth.clone(),
                         _ => None,
                     },
+                    resolved_addresses: Vec::new(),
+                    review: review_summary(&raw.transport, source),
                 }
             })
             .collect()
@@ -307,6 +343,7 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
                 url: cfg.url,
                 headers: cfg.headers,
                 oauth: cfg.oauth,
+                resolved: Vec::new(),
             }
         }
     };
@@ -325,9 +362,226 @@ pub fn transport_kind(raw: &RawTransport) -> &'static str {
     }
 }
 
+pub fn security_digest(server: &RawServerConfig) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"mcp-security-v1");
+    match &server.transport {
+        RawTransport::Stdio(config) => {
+            hash_field(&mut hasher, b"stdio");
+            hash_field(&mut hasher, b"command");
+            hash_count(&mut hasher, config.command.len());
+            for part in &config.command {
+                hash_field(&mut hasher, part.as_bytes());
+            }
+            hash_map(&mut hasher, b"environment", &config.environment);
+        }
+        RawTransport::Http(config) => {
+            hash_field(&mut hasher, b"http");
+            hash_field(&mut hasher, b"url");
+            hash_field(&mut hasher, config.url.as_bytes());
+            hash_map(&mut hasher, b"headers", &config.headers);
+            if let Some(oauth) = &config.oauth {
+                hash_field(&mut hasher, b"oauth");
+                hash_field(&mut hasher, oauth.client_id.as_bytes());
+                hash_option(&mut hasher, oauth.client_secret.as_deref());
+                hash_option(
+                    &mut hasher,
+                    oauth.callback_port.map(|port| port.to_string()).as_deref(),
+                );
+                hash_option(&mut hasher, oauth.callback_path.as_deref());
+                hash_option(&mut hasher, oauth.callback_hostname.as_deref());
+            } else {
+                hash_field(&mut hasher, b"no-oauth");
+            }
+        }
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    digest
+}
+
+pub fn requires_project_trust(transport: &RawTransport) -> bool {
+    match transport {
+        RawTransport::Stdio(_) => true,
+        RawTransport::Http(config) => risky_http_url(&config.url),
+    }
+}
+
+pub fn resolve_http_addresses(transport: &RawTransport) -> Result<Vec<IpAddr>, String> {
+    let RawTransport::Http(config) = transport else {
+        return Ok(Vec::new());
+    };
+    resolve_url_addresses(&config.url)
+}
+
+pub fn resolve_url_addresses(value: &str) -> Result<Vec<IpAddr>, String> {
+    let url = Url::parse(value).map_err(|error| error.to_string())?;
+    let host = url.host().ok_or_else(|| "URL has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no known port".to_string())?;
+    let mut addresses = match host {
+        Host::Ipv4(address) => vec![IpAddr::V4(address)],
+        Host::Ipv6(address) => vec![IpAddr::V6(address)],
+        Host::Domain(host) => (host, port)
+            .to_socket_addrs()
+            .map_err(|error| error.to_string())?
+            .map(|address| address.ip())
+            .collect(),
+    };
+    if addresses.is_empty() {
+        return Err("URL host resolved to no addresses".into());
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
+}
+
+pub fn review_summary(
+    transport: &RawTransport,
+    config_source: McpConfigSource,
+) -> McpReviewSummary {
+    match transport {
+        RawTransport::Stdio(config) => McpReviewSummary {
+            command: Some(config.command.clone()),
+            url: None,
+            config_source,
+            environment_names: sorted_names(&config.environment),
+            header_names: Vec::new(),
+        },
+        RawTransport::Http(config) => McpReviewSummary {
+            command: None,
+            url: Some(safe_review_url(&config.url)),
+            config_source,
+            environment_names: Vec::new(),
+            header_names: sorted_names(&config.headers),
+        },
+    }
+}
+
+fn risky_http_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return true;
+    };
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return true;
+    }
+    match url.host() {
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.');
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(Host::Ipv4(address)) => risky_ip(IpAddr::V4(address)),
+        Some(Host::Ipv6(address)) => risky_ip(IpAddr::V6(address)),
+        None => true,
+    }
+}
+
+pub fn risky_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, ..] = address.octets();
+            first == 0
+                || address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || first >= 240
+                || first == 100 && (64..=127).contains(&second)
+                || first == 192 && second == 0
+                || first == 192 && second == 88
+                || first == 198 && (18..=19).contains(&second)
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return risky_ip(IpAddr::V4(mapped));
+            }
+            let segments = address.segments();
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+                || segments[0] & 0xe000 != 0x2000
+                || segments[0] == 0x2001
+                    && matches!(segments[1], 0x0000 | 0x0002 | 0x0010..=0x001f | 0x0db8)
+                || segments[0] == 0x2002
+        }
+    }
+}
+
+fn safe_review_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "<invalid URL>".into();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("REDACTED");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("REDACTED"));
+    }
+    let query_names: Vec<String> = url
+        .query_pairs()
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    if !query_names.is_empty() {
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(query_names.iter().map(|name| (name.as_str(), "REDACTED")));
+    }
+    url.set_fragment(None);
+    url.into()
+}
+
+fn sorted_names(values: &HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<String> = values.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+fn hash_map(hasher: &mut Sha256, label: &[u8], values: &HashMap<String, String>) {
+    hash_field(hasher, label);
+    hash_count(hasher, values.len());
+    let mut entries: Vec<(&String, &String)> = values.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    for (name, value) in entries {
+        hash_field(hasher, name.as_bytes());
+        hash_field(hasher, value.as_bytes());
+    }
+}
+
+fn hash_count(hasher: &mut Sha256, count: usize) {
+    hasher.update((count as u64).to_be_bytes());
+}
+
+fn hash_option(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_field(hasher, b"some");
+            hash_field(hasher, value.as_bytes());
+        }
+        None => hash_field(hasher, b"none"),
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
 /// Call order is precedence: the caller merges global first, project last,
 /// so a project's servers and `defer_tools` beat the global ones.
-fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Path) {
+fn merge_config(
+    merged: &mut McpConfig,
+    errors: &mut McpConfigErrors,
+    path: &Path,
+    source: McpConfigSource,
+) {
     match read_config(path) {
         Ok(None) => {}
         Ok(Some(cfg)) => {
@@ -338,6 +592,7 @@ fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Pat
             );
             for name in cfg.mcp.keys() {
                 merged.origins.insert(name.clone(), path.to_path_buf());
+                merged.sources.insert(name.clone(), source);
             }
             merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
             merged.mcp.extend(cfg.mcp);
@@ -347,15 +602,28 @@ fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Pat
 }
 
 pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
-    let mut merged = McpConfig::default();
+    let mut merged = McpConfig {
+        project_root: cwd.canonicalize().ok(),
+        ..Default::default()
+    };
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
     if let Some(global_dir) = global_config_dir() {
         let global_path = global_dir.join(MCP_CONFIG_FILE);
-        merge_config(&mut merged, &mut errors, &global_path);
+        merge_config(
+            &mut merged,
+            &mut errors,
+            &global_path,
+            McpConfigSource::Global,
+        );
     }
     let project_path = cwd.join(".maki").join(MCP_CONFIG_FILE);
-    merge_config(&mut merged, &mut errors, &project_path);
+    merge_config(
+        &mut merged,
+        &mut errors,
+        &project_path,
+        McpConfigSource::Project,
+    );
     (merged, errors)
 }
 
@@ -689,6 +957,7 @@ enabled = true
             ]
             .into(),
             origins: [("enabled".into(), PathBuf::from("/test.toml"))].into(),
+            sources: [("enabled".into(), McpConfigSource::Global)].into(),
             ..Default::default()
         };
         let mut infos = config.preliminary_infos(&["disabled-runtime".into()]);
@@ -715,12 +984,116 @@ enabled = true
 
         let mut merged = McpConfig::default();
         let mut errors = McpConfigErrors::new(dir.path().to_path_buf());
-        merge_config(&mut merged, &mut errors, &global);
-        merge_config(&mut merged, &mut errors, &project);
+        merge_config(&mut merged, &mut errors, &global, McpConfigSource::Global);
+        merge_config(&mut merged, &mut errors, &project, McpConfigSource::Project);
 
         assert!(errors.is_empty());
         assert_eq!(merged.defer_tools, expected);
         assert_eq!(merged.origins["srv"], project, "later config must win");
+        assert_eq!(merged.sources["srv"], McpConfigSource::Project);
+    }
+
+    #[test_case("http://example.com/mcp", true ; "plain_http")]
+    #[test_case("https://user:pass@example.com/mcp", true ; "url_credentials")]
+    #[test_case("https://localhost/mcp", true ; "localhost")]
+    #[test_case("https://localhost./mcp", true ; "localhost_trailing_dot")]
+    #[test_case("https://127.0.0.1/mcp", true ; "ipv4_loopback")]
+    #[test_case("https://10.0.0.1/mcp", true ; "ipv4_private")]
+    #[test_case("https://169.254.1.1/mcp", true ; "ipv4_link_local")]
+    #[test_case("https://0.0.0.0/mcp", true ; "ipv4_unspecified")]
+    #[test_case("https://[::1]/mcp", true ; "ipv6_loopback")]
+    #[test_case("https://[fd00::1]/mcp", true ; "ipv6_private")]
+    #[test_case("https://[fe80::1]/mcp", true ; "ipv6_link_local")]
+    #[test_case("https://[::]/mcp", true ; "ipv6_unspecified")]
+    #[test_case("https://example.com/mcp", false ; "public_https")]
+    #[test_case("https://internal.example/mcp", false ; "domain_is_classified_after_resolution")]
+    fn risky_http_classification(url: &str, expected: bool) {
+        assert_eq!(requires_project_trust(&http_raw(url).transport), expected);
+    }
+
+    #[test_case("https://8.8.8.8/mcp", false ; "public_ipv4")]
+    #[test_case("https://10.0.0.1/mcp", true ; "private_ipv4")]
+    #[test_case("https://192.0.2.1/mcp", true ; "documentation_ipv4")]
+    #[test_case("https://[2606:4700:4700::1111]/mcp", false ; "public_ipv6")]
+    #[test_case("https://[2001:db8::1]/mcp", true ; "documentation_ipv6")]
+    fn resolved_http_address_classification(url: &str, expected_risky: bool) {
+        let addresses = resolve_http_addresses(&http_raw(url).transport).unwrap();
+        assert_eq!(addresses.iter().copied().any(risky_ip), expected_risky);
+    }
+
+    #[test]
+    fn security_digest_is_stable_and_tracks_security_config_only() {
+        let mut config = stdio_raw(&["runner", "--safe"]);
+        let RawTransport::Stdio(stdio) = &mut config.transport else {
+            unreachable!();
+        };
+        stdio.environment.insert("TOKEN".into(), "secret".into());
+        stdio.environment.insert("MODE".into(), "readonly".into());
+        let digest = security_digest(&config);
+
+        config.enabled = false;
+        config.timeout = 1;
+        config.always_load = true;
+        assert_eq!(security_digest(&config), digest);
+
+        let RawTransport::Stdio(stdio) = &mut config.transport else {
+            unreachable!();
+        };
+        stdio.environment.insert("TOKEN".into(), "changed".into());
+        assert_ne!(security_digest(&config), digest);
+
+        let command_only = stdio_raw(&["runner", "--safe", "MODE", "readonly", "TOKEN", "secret"]);
+        assert_ne!(security_digest(&command_only), digest);
+    }
+
+    #[test]
+    fn review_summaries_expose_names_without_secret_values() {
+        let stdio = RawTransport::Stdio(RawStdioFields {
+            command: vec!["runner".into(), "serve".into()],
+            environment: HashMap::from([
+                ("TOKEN".into(), "environment-secret".into()),
+                ("MODE".into(), "readonly".into()),
+            ]),
+        });
+        let summary = review_summary(&stdio, McpConfigSource::Project);
+        assert_eq!(summary.command, Some(vec!["runner".into(), "serve".into()]));
+        assert_eq!(summary.environment_names, vec!["MODE", "TOKEN"]);
+        assert_eq!(summary.config_source, McpConfigSource::Project);
+        assert!(!format!("{summary:?}").contains("environment-secret"));
+
+        let http = RawTransport::Http(RawHttpFields {
+            url: "https://user:url-secret@example.com/mcp?token=query-secret#fragment-secret"
+                .into(),
+            headers: HashMap::from([("Authorization".into(), "header-secret".into())]),
+            oauth: None,
+        });
+        let summary = review_summary(&http, McpConfigSource::Runtime);
+        let rendered = format!("{summary:?}");
+        assert_eq!(summary.header_names, vec!["Authorization"]);
+        assert_eq!(summary.config_source, McpConfigSource::Runtime);
+        assert!(summary.url.as_deref().unwrap().contains("REDACTED"));
+        assert!(!rendered.contains("url-secret"));
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("fragment-secret"));
+        assert!(!rendered.contains("header-secret"));
+    }
+
+    #[test]
+    fn merge_records_global_and_project_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let project = dir.path().join("project.toml");
+        fs::write(&global, "[mcp.global]\ncommand = [\"global\"]").unwrap();
+        fs::write(&project, "[mcp.project]\ncommand = [\"project\"]").unwrap();
+        let mut config = McpConfig::default();
+        let mut errors = McpConfigErrors::new(dir.path().to_path_buf());
+
+        merge_config(&mut config, &mut errors, &global, McpConfigSource::Global);
+        merge_config(&mut config, &mut errors, &project, McpConfigSource::Project);
+
+        assert!(errors.is_empty());
+        assert_eq!(config.sources["global"], McpConfigSource::Global);
+        assert_eq!(config.sources["project"], McpConfigSource::Project);
     }
 
     #[test]

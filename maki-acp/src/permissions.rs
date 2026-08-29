@@ -1,7 +1,7 @@
 use agent_client_protocol_schema::{
     PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
 };
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, PermissionRequest};
 
 const ALLOW_ONCE_ID: &str = "allow_once";
 const ALLOW_ALWAYS_ID: &str = "allow_always";
@@ -17,7 +17,7 @@ pub fn permission_options() -> Vec<PermissionOption> {
         ),
         PermissionOption::new(
             PermissionOptionId::from(ALLOW_ALWAYS_ID),
-            "Allow always",
+            "Allow exact call for conversation",
             PermissionOptionKind::AllowAlways,
         ),
         PermissionOption::new(
@@ -27,22 +27,61 @@ pub fn permission_options() -> Vec<PermissionOption> {
         ),
         PermissionOption::new(
             PermissionOptionId::from(REJECT_ALWAYS_ID),
-            "Reject always",
+            "Reject exact call for project",
             PermissionOptionKind::RejectAlways,
         ),
     ]
 }
 
-pub fn outcome_to_answer(outcome: &RequestPermissionOutcome) -> PermissionAnswer {
+pub fn outcome_to_answer(
+    outcome: &RequestPermissionOutcome,
+    exact_project_deny: bool,
+) -> PermissionAnswer {
     match outcome {
         RequestPermissionOutcome::Cancelled => PermissionAnswer::Deny,
         RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
             ALLOW_ONCE_ID => PermissionAnswer::AllowOnce,
             ALLOW_ALWAYS_ID => PermissionAnswer::AllowSession,
             REJECT_ONCE_ID => PermissionAnswer::Deny,
-            REJECT_ALWAYS_ID => PermissionAnswer::DenyAlwaysLocal,
+            REJECT_ALWAYS_ID if exact_project_deny => PermissionAnswer::DenyAlwaysLocal,
+            REJECT_ALWAYS_ID => PermissionAnswer::Deny,
             _ => PermissionAnswer::Deny,
         },
         _ => PermissionAnswer::Deny,
+    }
+}
+
+pub fn exact_project_deny_is_representable(request: &PermissionRequest) -> bool {
+    request
+        .options
+        .iter()
+        .any(|option| option.id == "deny_project" && !option.broad)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use maki_config::ToolKey;
+    use serde_json::json;
+    use test_case::test_case;
+
+    use super::*;
+
+    #[test_case(vec!["cargo test".into()] ; "exact_scope")]
+    #[test_case(vec!["cargo *".into()] ; "broad_command_scope")]
+    #[test_case(vec!["/project/src/**".into()] ; "broad_path_scope")]
+    #[test_case(Vec::new() ; "missing_scope")]
+    fn reject_always_uses_the_host_generated_exact_option(scopes: Vec<String>) {
+        let request = PermissionRequest::from_legacy(
+            "request-id".into(),
+            ToolKey::native("bash"),
+            scopes,
+            json!({"command": "cargo test"}),
+            Path::new("/project"),
+            false,
+        );
+
+        assert!(exact_project_deny_is_representable(&request));
     }
 }

@@ -622,6 +622,8 @@ pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
             mcp_config::Transport::Http { url, oauth, .. } => (url, oauth),
             _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
         };
+        let resolved_addresses = mcp_config::resolve_url_addresses(&url)
+            .map_err(|error| color_eyre::eyre::eyre!("cannot resolve MCP URL: {error}"))?;
         mcp_oauth::authenticate(
             server,
             &url,
@@ -629,6 +631,7 @@ pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
             storage,
             mcp_oauth::Interaction::Cli,
             oauth,
+            Some(&resolved_addresses),
         )
         .await?;
         eprintln!("Successfully authenticated with MCP server '{server}'");

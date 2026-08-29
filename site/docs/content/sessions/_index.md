@@ -33,7 +33,9 @@ Revert and unrevert require every live session in the workspace to be idle. Acti
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, model and execution settings, and snapshots for that path. Usage totals, goals, queues, and pending revert state start clean.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, model and execution settings, and snapshots for that path. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
+
+Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 
 Forking does not restore files. The child uses the same working directory and sees its current contents. Use a revert action first when the workspace must match an older conversation point.
 

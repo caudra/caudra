@@ -42,6 +42,7 @@ use crate::components::message_actions::{MessageActionKind, MessageActions, Mess
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -60,7 +61,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, RevokedRuleScope};
 use maki_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
@@ -226,6 +227,7 @@ pub struct App {
     pub(super) file_picker: FilePickerModal,
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
+    pub(super) permissions_picker: PermissionsPicker,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub(super) status_hits: Vec<StatusBarHit>,
@@ -361,6 +363,7 @@ impl App {
             file_picker: FilePickerModal::new(),
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
+            permissions_picker: PermissionsPicker::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             status_hits: Vec::new(),
@@ -706,6 +709,10 @@ impl App {
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
+        if self.permission_prompt.is_open() {
+            self.permission_prompt.scroll(delta);
+            return None;
+        }
         if self.btw_modal.is_open() {
             self.btw_modal.scroll(delta);
             return None;
@@ -741,6 +748,7 @@ impl App {
         try_picker!(self.message_actions);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
+        try_picker!(self.permissions_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -835,11 +843,23 @@ impl App {
         }
 
         if self.permission_prompt.is_open() {
-            if let Some(answer) = self.permission_prompt.handle_key(key) {
-                let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let encoded = answer.encode();
-                self.permission_prompt.close();
-                self.send_to_agent(subagent_id.as_deref(), encoded);
+            if let Some(decision) = self.permission_prompt.handle_key(key) {
+                let transient = matches!(
+                    decision.answer,
+                    PermissionAnswer::AllowOnce
+                        | PermissionAnswer::Deny
+                        | PermissionAnswer::DenyWithGuidance(_)
+                );
+                if self
+                    .permissions
+                    .answer(&decision.request_id, decision.answer)
+                    || transient
+                {
+                    self.permission_prompt.resolve(&decision.request_id);
+                } else {
+                    self.status_bar
+                        .flash("Could not save permission decision".into());
+                }
             }
             return Some(vec![]);
         }
@@ -968,6 +988,11 @@ impl App {
             return Some(self.handle_mcp_picker_action(action));
         }
 
+        if self.permissions_picker.is_open() {
+            let action = self.permissions_picker.handle_key(key);
+            return Some(self.handle_permissions_picker_action(action));
+        }
+
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
             return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
@@ -1094,8 +1119,8 @@ impl App {
         Vec::new()
     }
 
-    fn handle_login_picker_action(&self, action: LoginPickerAction) -> Vec<Action> {
-        match action {
+    fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
+        let actions = match action {
             LoginPickerAction::Consumed | LoginPickerAction::Close => Vec::new(),
             LoginPickerAction::Authenticated { model_spec } => {
                 vec![Action::ChangeModel(model_spec), Action::RefreshModels]
@@ -1103,7 +1128,14 @@ impl App {
             LoginPickerAction::Configured { slug } => {
                 vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
+        };
+        if !actions.is_empty() {
+            self.login_picker.close();
+            if self.mcp_picker.has_awaiting_trust() {
+                self.mcp_picker.open();
+            }
         }
+        actions
     }
 
     fn handle_mcp_picker_action(&self, action: McpPickerAction) -> Vec<Action> {
@@ -1113,7 +1145,66 @@ impl App {
                 server_name,
                 enabled,
             } => vec![Action::ToggleMcp(server_name, enabled)],
+            McpPickerAction::TrustOnce { server_name } => {
+                vec![Action::TrustMcpOnce(server_name)]
+            }
+            McpPickerAction::TrustProject { server_name } => {
+                vec![Action::TrustMcpProject(server_name)]
+            }
+            McpPickerAction::Reject { server_name } => vec![Action::RejectMcp(server_name)],
         }
+    }
+
+    pub(crate) fn open_awaiting_mcp_trust(&mut self, needs_login: bool) {
+        if !needs_login && self.mcp_picker.has_awaiting_trust() {
+            self.mcp_picker.open();
+        }
+    }
+
+    fn handle_permissions_picker_action(&mut self, action: PermissionsPickerAction) -> Vec<Action> {
+        match action {
+            PermissionsPickerAction::Consumed => {}
+            PermissionsPickerAction::Close => self.permissions_picker.close(),
+            PermissionsPickerAction::RemoveLegacy(rule) => {
+                if self.permissions.remove_conversation_legacy_rule(
+                    &rule.tool,
+                    rule.scope.as_deref(),
+                    rule.effect,
+                ) {
+                    self.checkpoint_now();
+                    if let Ok(rules) = self.permissions.structured_rule_inventory() {
+                        let candidates = self.permissions.review_candidates();
+                        let policy = self.permissions.effective_legacy_policy();
+                        self.permissions_picker.open(rules, &candidates, &policy);
+                    }
+                    self.flash("Legacy conversation rule removed".into());
+                }
+            }
+            PermissionsPickerAction::Revoke(id) => {
+                match self.permissions.revoke_structured_rule(&id) {
+                    Ok(Some(scope)) => {
+                        if scope == RevokedRuleScope::Conversation {
+                            self.checkpoint_now();
+                        }
+                        match self.permissions.structured_rule_inventory() {
+                            Ok(rules) => {
+                                let candidates = self.permissions.review_candidates();
+                                let policy = self.permissions.effective_legacy_policy();
+                                self.permissions_picker.open(rules, &candidates, &policy);
+                            }
+                            Err(error) => {
+                                self.permissions_picker.close();
+                                self.flash(error.to_string());
+                            }
+                        }
+                        self.flash("Permission revoked".into());
+                    }
+                    Ok(None) => self.flash("Permission is no longer active".into()),
+                    Err(error) => self.flash(format!("Failed to revoke permission: {error}")),
+                }
+            }
+        }
+        Vec::new()
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1942,9 +2033,8 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
-            self.permission_prompt
-                .open(id, tool, scopes, subagent_id.clone());
+        if let ChatEventResult::PermissionRequest(request) = result {
+            self.permission_prompt.enqueue(request, subagent_id);
             return vec![];
         }
 
@@ -2002,7 +2092,7 @@ impl App {
                     }
                 }
                 ChatEventResult::AuthRequired
-                | ChatEventResult::PermissionRequest { .. }
+                | ChatEventResult::PermissionRequest(_)
                 | ChatEventResult::QueueItemConsumed { .. }
                 | ChatEventResult::QueueBatchConsumed { .. } => unreachable!(),
                 ChatEventResult::Continue => {}
@@ -2155,6 +2245,17 @@ impl App {
             }
             "/mcp" => {
                 self.mcp_picker.open();
+                vec![]
+            }
+            "/permissions" => {
+                match self.permissions.structured_rule_inventory() {
+                    Ok(rules) => {
+                        let candidates = self.permissions.review_candidates();
+                        let policy = self.permissions.effective_legacy_policy();
+                        self.permissions_picker.open(rules, &candidates, &policy);
+                    }
+                    Err(error) => self.flash(error.to_string()),
+                }
                 vec![]
             }
             "/login" => {
@@ -2388,6 +2489,7 @@ impl App {
         cwd: &std::path::Path,
         snapshot_store: Arc<SnapshotStore>,
     ) {
+        self.permissions.set_project(cwd);
         self.state
             .session_mut()
             .set_cwd(cwd.to_string_lossy().into_owned());
@@ -2395,7 +2497,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 15] {
+    fn overlays(&self) -> [&dyn Overlay; 16] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2411,11 +2513,12 @@ impl App {
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
+            &self.permissions_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 16] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2431,6 +2534,7 @@ impl App {
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
+            &mut self.permissions_picker,
             &mut self.permission_prompt,
         ]
     }
@@ -2611,6 +2715,7 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
+        try_picker!(self.permissions_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
             if self.active_subagent_can_steer() || self.queue_editor_active() {

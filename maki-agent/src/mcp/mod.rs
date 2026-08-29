@@ -32,17 +32,22 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use maki_providers::{ContentBlock, Message};
+use maki_storage::StateDir;
+use maki_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig,
-    RawTransport, ServerConfig, Transport, load_config, parse_server, transport_kind,
+    McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary, McpServerInfo, McpServerStatus,
+    OauthClientConfig, RawServerConfig, RawTransport, ServerConfig, Transport, load_config,
+    parse_server, requires_project_trust, resolve_http_addresses, review_summary, risky_ip,
+    security_digest, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
+use crate::permissions::{PermissionSubject, canonical_json_sha256};
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
@@ -127,10 +132,22 @@ struct ServerEntry {
     config: Option<ServerConfig>,
     transport_kind: &'static str,
     origin: PathBuf,
+    source: McpConfigSource,
+    review: McpReviewSummary,
+    authority_digest: String,
+    trust: Option<ProjectTrust>,
+    trusted_once: bool,
+    trust_rejected: bool,
     status: McpServerStatus,
     transport: Option<Arc<dyn McpTransport>>,
     tools: Vec<McpToolDef>,
     prompts: Vec<McpPromptDef>,
+}
+
+#[derive(Clone)]
+struct ProjectTrust {
+    project: Option<PathBuf>,
+    config_digest: String,
 }
 
 impl ServerEntry {
@@ -189,6 +206,7 @@ impl ServerEntry {
 
 struct McpManagerInner {
     entries: Vec<ServerEntry>,
+    state_dir: Option<StateDir>,
     generation: u64,
 }
 
@@ -214,9 +232,36 @@ impl ToolDescriptor {
     }
 }
 
+#[derive(Clone)]
 struct ToolRef {
+    qualified_name: Arc<str>,
     raw_name: String,
+    subject: PermissionSubject,
+    generation: u64,
     transport: Arc<dyn McpTransport>,
+}
+
+#[derive(Clone)]
+pub struct McpToolBinding {
+    tool: ToolRef,
+}
+
+impl McpToolBinding {
+    pub fn qualified_name(&self) -> &str {
+        &self.tool.qualified_name
+    }
+
+    pub fn subject(&self) -> &PermissionSubject {
+        &self.tool.subject
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.tool.generation
+    }
+
+    pub async fn call(&self, args: &Value) -> Result<String, McpError> {
+        transport::call_tool(self.tool.transport.as_ref(), &self.tool.raw_name, args).await
+    }
 }
 
 struct PromptRef {
@@ -276,6 +321,15 @@ pub enum McpCommand {
         enabled: bool,
     },
     Reconnect {
+        server: String,
+    },
+    TrustOnce {
+        server: String,
+    },
+    TrustProject {
+        server: String,
+    },
+    Reject {
         server: String,
     },
     /// Drain every running transport and stop the loop. The loop sends `()` on `ack` once
@@ -513,17 +567,21 @@ impl McpHandle {
             .unwrap_or_else(|| Arc::from(UNKNOWN_MCP))
     }
 
-    pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
-        let (raw_name, transport) = {
-            let idx = self.index.load();
-            let Some(t) = idx.tools.get(qualified_name) else {
-                return Err(McpError::UnknownTool {
+    pub fn bind_tool(&self, qualified_name: &str) -> Result<McpToolBinding, McpError> {
+        let index = self.index.load();
+        let tool =
+            index
+                .tools
+                .get(qualified_name)
+                .cloned()
+                .ok_or_else(|| McpError::UnknownTool {
                     name: qualified_name.into(),
-                });
-            };
-            (t.raw_name.clone(), Arc::clone(&t.transport))
-        };
-        transport::call_tool(transport.as_ref(), &raw_name, args).await
+                })?;
+        Ok(McpToolBinding { tool })
+    }
+
+    pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
+        self.bind_tool(qualified_name)?.call(args).await
     }
 
     pub async fn get_prompt(
@@ -590,27 +648,59 @@ pub async fn start_with_extra(
 ) -> (Option<McpHandle>, McpConfigErrors) {
     let owned_cwd = cwd.to_owned();
     let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
+    merge_runtime_servers(&mut config, extra);
+    (start_with_config(config), config_errors)
+}
+
+pub async fn pending_startup_trust(
+    cwd: &Path,
+    extra: Vec<(String, RawTransport)>,
+) -> (Vec<String>, McpConfigErrors) {
+    let owned_cwd = cwd.to_owned();
+    let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
+    merge_runtime_servers(&mut config, extra);
+    let inner = parse_entries(config, StateDir::resolve().ok());
+    let pending = inner
+        .entries
+        .into_iter()
+        .filter(|entry| entry.status == McpServerStatus::AwaitingTrust)
+        .map(|entry| entry.name)
+        .collect();
+    (pending, config_errors)
+}
+
+fn merge_runtime_servers(config: &mut McpConfig, extra: Vec<(String, RawTransport)>) {
     for (name, transport) in extra {
+        let runtime_name = name.clone();
         match config.mcp.entry(name) {
             Entry::Vacant(slot) => {
                 slot.insert(RawServerConfig::runtime(transport));
+                config
+                    .sources
+                    .insert(runtime_name, McpConfigSource::Runtime);
             }
             Entry::Occupied(slot) => {
                 warn!(server = slot.key(), "runtime MCP server already configured");
             }
         }
     }
-    (start_with_config(config), config_errors)
 }
 
 pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
+    start_with_config_and_state(config, StateDir::resolve().ok())
+}
+
+fn start_with_config_and_state(
+    config: McpConfig,
+    state_dir: Option<StateDir>,
+) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
         return None;
     }
 
     let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
-    let inner = parse_entries(config);
+    let inner = parse_entries(config, state_dir);
 
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
@@ -689,6 +779,15 @@ async fn run(
             Step::Command(McpCommand::Reconnect { server }) => {
                 handle_reconnect(&mut inner, &server).await;
             }
+            Step::Command(McpCommand::TrustOnce { server }) => {
+                handle_trust(&mut inner, &server, false).await;
+            }
+            Step::Command(McpCommand::TrustProject { server }) => {
+                handle_trust(&mut inner, &server, true).await;
+            }
+            Step::Command(McpCommand::Reject { server }) => {
+                handle_reject(&mut inner, &server).await;
+            }
             Step::Command(McpCommand::Shutdown { ack: tx }) => {
                 ack = Some(tx);
                 break;
@@ -731,16 +830,57 @@ fn release_ready(inner: &McpManagerInner, ready: &mut Option<flume::Sender<Infal
 }
 
 async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: bool) {
-    if let Some(path) = inner
+    if let Some((path, source)) = inner
         .entries
         .iter()
         .find(|e| e.name == server_name)
-        .map(|e| e.origin.clone())
+        .map(|e| (e.origin.clone(), e.source))
+        && source != McpConfigSource::Runtime
+        && !path.as_os_str().is_empty()
     {
         spawn_persist_enabled(path, server_name.to_owned(), enabled);
     }
 
     if enabled {
+        let unpinned_url = inner
+            .entries
+            .iter()
+            .find(|entry| entry.name == server_name)
+            .and_then(|entry| entry.config.as_ref())
+            .and_then(|config| match &config.transport {
+                Transport::Http { url, resolved, .. } if resolved.is_empty() => Some(url.clone()),
+                _ => None,
+            });
+        if let Some(url) = unpinned_url {
+            let resolution = smol::unblock(move || config::resolve_url_addresses(&url)).await;
+            let Some(entry) = inner
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == server_name)
+            else {
+                return;
+            };
+            match resolution {
+                Ok(addresses) => {
+                    if let Some(ServerConfig {
+                        transport: Transport::Http { resolved, .. },
+                        ..
+                    }) = entry.config.as_mut()
+                    {
+                        *resolved = addresses;
+                    }
+                }
+                Err(error) => {
+                    entry.status = if entry.trust.is_some() {
+                        McpServerStatus::AwaitingTrust
+                    } else {
+                        McpServerStatus::Failed(format!("cannot resolve MCP URL: {error}"))
+                    };
+                    warn!(server = server_name, %error, "MCP server has no pinned address");
+                    return;
+                }
+            }
+        }
         if let Err(e) = refresh_server(inner, server_name).await {
             warn!(server = %server_name, error = %e, "MCP server refresh failed");
         }
@@ -772,10 +912,118 @@ async fn handle_reconnect(inner: &mut McpManagerInner, server_name: &str) {
     info!(server = server_name, "MCP reconnect complete");
 }
 
+async fn handle_trust(inner: &mut McpManagerInner, server_name: &str, persist: bool) {
+    let Some(index) = inner
+        .entries
+        .iter()
+        .position(|entry| entry.name == server_name)
+    else {
+        warn!(server = server_name, "trust for unknown MCP server");
+        return;
+    };
+    if inner.entries[index].status == McpServerStatus::Disabled {
+        info!(
+            server = server_name,
+            "ignoring trust for disabled MCP server"
+        );
+        return;
+    }
+    let Some(trust) = inner.entries[index].trust.clone() else {
+        info!(
+            server = server_name,
+            "MCP server does not require project trust"
+        );
+        return;
+    };
+
+    let url = inner.entries[index]
+        .config
+        .as_ref()
+        .and_then(|config| transport_url(&config.transport));
+    if let Some(url) = url {
+        let resolve_url = url.clone();
+        let resolving_server = server_name.to_owned();
+        let addresses = match smol::unblock(move || {
+            config::resolve_url_addresses(&resolve_url).map_err(|error| McpError::StartFailed {
+                server: resolving_server,
+                reason: format!("cannot resolve reviewed URL: {error}"),
+            })
+        })
+        .await
+        {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                warn!(server = server_name, %error, "MCP trust requires a resolved address");
+                return;
+            }
+        };
+        if let Some(ServerConfig {
+            transport: Transport::Http { resolved, .. },
+            ..
+        }) = inner.entries[index].config.as_mut()
+        {
+            *resolved = addresses;
+        }
+    }
+
+    if persist {
+        let (Some(state_dir), Some(project)) = (inner.state_dir.clone(), trust.project) else {
+            warn!(
+                server = server_name,
+                "cannot persist MCP trust without state and canonical project directories"
+            );
+            return;
+        };
+        let server = server_name.to_string();
+        let digest = trust.config_digest;
+        let result =
+            smol::unblock(move || trust_project(&state_dir, &project, &server, &digest)).await;
+        if let Err(error) = result {
+            warn!(server = server_name, error = %error, "failed to persist MCP project trust");
+            return;
+        }
+    } else {
+        inner.entries[index].trusted_once = true;
+    }
+    inner.entries[index].trust_rejected = false;
+
+    if let Err(error) = refresh_server(inner, server_name).await {
+        warn!(server = server_name, error = %error, "trusted MCP server start failed");
+    }
+}
+
+async fn handle_reject(inner: &mut McpManagerInner, server_name: &str) {
+    let Some(index) = inner
+        .entries
+        .iter()
+        .position(|entry| entry.name == server_name)
+    else {
+        warn!(server = server_name, "reject for unknown MCP server");
+        return;
+    };
+    inner.entries[index].trusted_once = false;
+    inner.entries[index].trust_rejected = true;
+
+    if let Some(trust) = inner.entries[index].trust.clone()
+        && let (Some(state_dir), Some(project)) = (inner.state_dir.clone(), trust.project)
+    {
+        let server = server_name.to_string();
+        if let Err(error) =
+            smol::unblock(move || revoke_project_trust(&state_dir, &project, &server)).await
+        {
+            warn!(server = server_name, error = %error, "failed to revoke MCP project trust");
+        }
+    }
+    handle_toggle(inner, server_name, false).await;
+}
+
 async fn shutdown_all(inner: &mut McpManagerInner) {
     for entry in &mut inner.entries {
         entry.clear_connection().await;
-        if entry.status != McpServerStatus::Disabled {
+        if !matches!(
+            entry.status,
+            McpServerStatus::Disabled | McpServerStatus::AwaitingTrust
+        ) {
             entry.status = McpServerStatus::Failed("shutdown".into());
         }
     }
@@ -789,6 +1037,13 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
     let Some(idx) = inner.entries.iter().position(|e| e.name == server_name) else {
         return Err(McpError::Config(format!("unknown server '{server_name}'")));
     };
+
+    if !entry_has_startup_trust(&inner.entries[idx], inner.state_dir.as_ref()) {
+        let entry = &mut inner.entries[idx];
+        entry.clear_connection().await;
+        entry.status = McpServerStatus::AwaitingTrust;
+        return Ok(());
+    }
 
     let config = inner.entries[idx]
         .config
@@ -809,6 +1064,33 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
         "MCP server refreshed"
     );
     Ok(())
+}
+
+fn entry_has_startup_trust(entry: &ServerEntry, state_dir: Option<&StateDir>) -> bool {
+    let Some(trust) = &entry.trust else {
+        return true;
+    };
+    if entry.trust_rejected {
+        return false;
+    }
+    entry.trusted_once || stored_project_trust(state_dir, trust, &entry.name)
+}
+
+fn stored_project_trust(
+    state_dir: Option<&StateDir>,
+    trust: &ProjectTrust,
+    server_name: &str,
+) -> bool {
+    let (Some(state_dir), Some(project)) = (state_dir, trust.project.as_deref()) else {
+        return false;
+    };
+    match is_project_trusted(state_dir, project, server_name, &trust.config_digest) {
+        Ok(trusted) => trusted,
+        Err(error) => {
+            warn!(server = server_name, error = %error, "failed to read MCP project trust");
+            false
+        }
+    }
 }
 
 fn status_from_err(e: &McpError) -> McpServerStatus {
@@ -845,10 +1127,16 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             environment,
             config.timeout,
         )?),
-        Transport::Http { url, headers, .. } => Arc::new(HttpTransport::new(
+        Transport::Http {
+            url,
+            headers,
+            resolved,
+            ..
+        } => Arc::new(HttpTransport::new(
             &config.name,
             url,
             headers,
+            resolved,
             config.timeout,
             maki_storage::StateDir::resolve().ok(),
         )?),
@@ -884,17 +1172,73 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
     })
 }
 
-fn parse_entries(config: McpConfig) -> McpManagerInner {
+fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerInner {
     let origins = config.origins;
+    let sources = config.sources;
+    let project_root = config.project_root;
     let mut entries = Vec::with_capacity(config.mcp.len());
 
     for (name, raw) in config.mcp {
         let transport_kind = transport_kind(&raw.transport);
         let origin = origins.get(&name).cloned().unwrap_or_default();
+        let source = sources.get(&name).copied().unwrap_or_default();
+        let review = review_summary(&raw.transport, source);
+        let config_digest = security_digest(&raw);
+        let authority_digest = canonical_json_sha256(&json!({
+            "source": match source {
+                McpConfigSource::Global => "global",
+                McpConfigSource::Project => "project",
+                McpConfigSource::Runtime => "runtime",
+            },
+            "config": config_digest,
+        }));
+        let resolved = resolve_http_addresses(&raw.transport);
+        let resolution_failed = resolved.is_err();
+        let resolved_risk = resolved
+            .as_ref()
+            .map_or(true, |addresses| addresses.iter().copied().any(risky_ip));
+        let trust = (source == McpConfigSource::Project
+            && (requires_project_trust(&raw.transport) || resolved_risk))
+            .then(|| ProjectTrust {
+                project: project_root.clone(),
+                config_digest,
+            });
         let disabled = !raw.enabled;
         let (config, status) = match parse_server(name.clone(), raw) {
-            Ok(sc) if disabled => (Some(sc), McpServerStatus::Disabled),
-            Ok(sc) => (Some(sc), McpServerStatus::Connecting),
+            Ok(mut sc) if disabled => {
+                if let Transport::Http {
+                    resolved: pinned, ..
+                } = &mut sc.transport
+                {
+                    *pinned = resolved.unwrap_or_default();
+                }
+                (Some(sc), McpServerStatus::Disabled)
+            }
+            Ok(sc) if trust.is_some() && resolution_failed => {
+                (Some(sc), McpServerStatus::AwaitingTrust)
+            }
+            Ok(mut sc)
+                if trust.as_ref().is_some_and(|trust| {
+                    !stored_project_trust(state_dir.as_ref(), trust, &name)
+                }) =>
+            {
+                if let Transport::Http {
+                    resolved: pinned, ..
+                } = &mut sc.transport
+                {
+                    *pinned = resolved.unwrap_or_default();
+                }
+                (Some(sc), McpServerStatus::AwaitingTrust)
+            }
+            Ok(mut sc) => {
+                if let Transport::Http {
+                    resolved: pinned, ..
+                } = &mut sc.transport
+                {
+                    *pinned = resolved.unwrap_or_default();
+                }
+                (Some(sc), McpServerStatus::Connecting)
+            }
             Err(e) => {
                 warn!(server = %name, error = %e, "invalid MCP server config");
                 (None, McpServerStatus::Failed(e.to_string()))
@@ -905,6 +1249,12 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
             config,
             transport_kind,
             origin,
+            source,
+            review,
+            authority_digest,
+            trust,
+            trusted_once: false,
+            trust_rejected: false,
             status,
             transport: None,
             tools: Vec::new(),
@@ -918,6 +1268,7 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
 
     McpManagerInner {
         entries,
+        state_dir,
         generation: 0,
     }
 }
@@ -981,16 +1332,37 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             .config
             .as_ref()
             .and_then(|c| transport_oauth(&c.transport));
+        let resolved_addresses =
+            entry
+                .config
+                .as_ref()
+                .map_or_else(Vec::new, |config| match &config.transport {
+                    Transport::Http { resolved, .. } => resolved.clone(),
+                    Transport::Stdio { .. } => Vec::new(),
+                });
 
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
         {
             let always_load = entry.config.as_ref().is_some_and(|c| c.always_load);
             for t in &entry.tools {
+                let contract = canonical_json_sha256(&json!({
+                    "name": t.raw_name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                }));
                 tools.insert(
                     Arc::clone(&t.qualified_name),
                     ToolRef {
+                        qualified_name: Arc::clone(&t.qualified_name),
                         raw_name: t.raw_name.clone(),
+                        subject: PermissionSubject::Mcp {
+                            server: entry.name.clone(),
+                            authority: entry.authority_digest.clone(),
+                            tool: t.raw_name.clone(),
+                            contract,
+                        },
+                        generation: inner.generation,
                         transport: Arc::clone(transport),
                     },
                 );
@@ -1027,6 +1399,8 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             config_path: entry.origin.clone(),
             url,
             oauth,
+            resolved_addresses,
+            review: entry.review.clone(),
         });
     }
 
@@ -1052,6 +1426,18 @@ pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
         config: None,
         transport_kind: "stub",
         origin: PathBuf::new(),
+        source: McpConfigSource::Runtime,
+        review: McpReviewSummary {
+            command: None,
+            url: None,
+            config_source: McpConfigSource::Runtime,
+            environment_names: Vec::new(),
+            header_names: Vec::new(),
+        },
+        authority_digest: "stub-authority".into(),
+        trust: None,
+        trusted_once: false,
+        trust_rejected: false,
         status: McpServerStatus::Running,
         transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
         tools: tools
@@ -1070,6 +1456,7 @@ pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
     };
     let inner = McpManagerInner {
         entries: vec![entry],
+        state_dir: None,
         generation: 0,
     };
     let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
@@ -1244,7 +1631,7 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
-    use config::{RawServerConfig, RawStdioFields, RawTransport};
+    use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1266,18 +1653,44 @@ mod tests {
         }
     }
 
+    fn http_raw(url: &str) -> RawServerConfig {
+        RawServerConfig {
+            enabled: true,
+            timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
+            transport: RawTransport::Http(RawHttpFields {
+                url: url.into(),
+                headers: HashMap::new(),
+                oauth: None,
+            }),
+        }
+    }
+
     fn make_config(entries: Vec<(&str, RawServerConfig)>) -> McpConfig {
         let mut mcp = HashMap::new();
         let mut origins = HashMap::new();
+        let mut sources = HashMap::new();
         for (name, cfg) in entries {
             origins.insert(name.to_string(), PathBuf::from("/test/config.toml"));
+            sources.insert(name.to_string(), McpConfigSource::Global);
             mcp.insert(name.to_string(), cfg);
         }
         McpConfig {
             mcp,
             origins,
+            sources,
             ..Default::default()
         }
+    }
+
+    fn make_project_config(project: &Path, entries: Vec<(&str, RawServerConfig)>) -> McpConfig {
+        let mut config = make_config(entries);
+        config.origins.clear();
+        config.project_root = Some(project.canonicalize().unwrap());
+        for source in config.sources.values_mut() {
+            *source = McpConfigSource::Project;
+        }
+        config
     }
 
     const TOOL_NAME: &str = "srv.tool";
@@ -1353,6 +1766,18 @@ mod tests {
             config: None,
             transport_kind: "fake",
             origin: PathBuf::new(),
+            source: McpConfigSource::Runtime,
+            review: McpReviewSummary {
+                command: None,
+                url: None,
+                config_source: McpConfigSource::Runtime,
+                environment_names: Vec::new(),
+                header_names: Vec::new(),
+            },
+            authority_digest: format!("fake-authority:{name}"),
+            trust: None,
+            trusted_once: false,
+            trust_rejected: false,
             status: McpServerStatus::Running,
             transport: Some(transport),
             tools: vec![McpToolDef {
@@ -1390,6 +1815,7 @@ mod tests {
     ) -> (McpManagerInner, McpSession) {
         let inner = McpManagerInner {
             entries,
+            state_dir: None,
             generation: 0,
         };
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
@@ -1406,15 +1832,298 @@ mod tests {
     }
 
     #[test]
+    fn bound_tool_keeps_reviewed_transport_and_contract_snapshot() {
+        let original = FakeTransport::new();
+        let original_transport: Arc<dyn McpTransport> = original.clone();
+        let (mut inner, session) = setup(vec![fake_entry("srv", original_transport.clone())]);
+        let binding = session.bind_tool(TOOL_NAME).unwrap();
+        let reviewed_subject = binding.subject().clone();
+        assert!(Arc::ptr_eq(&binding.tool.transport, &original_transport));
+
+        let replacement = FakeTransport::new();
+        let replacement_transport: Arc<dyn McpTransport> = replacement.clone();
+        inner.entries[0] = fake_entry("srv", replacement_transport.clone());
+        inner.entries[0].tools[0].description = "changed contract".into();
+        inner.generation += 1;
+        publish(
+            &inner,
+            session.handle.index.as_ref(),
+            session.handle.snapshot.as_ref(),
+        );
+
+        let current = session.bind_tool(TOOL_NAME).unwrap();
+        assert!(Arc::ptr_eq(&binding.tool.transport, &original_transport));
+        assert!(Arc::ptr_eq(&current.tool.transport, &replacement_transport));
+        assert_ne!(reviewed_subject, *current.subject());
+        assert_ne!(binding.generation(), current.generation());
+    }
+
+    #[test]
     fn parse_entries_sorts_servers_by_name() {
         let config = make_config(vec![
             ("zeta", stdio_raw(&["z"])),
             ("alpha", stdio_raw(&["a"])),
             ("mid", stdio_raw(&["m"])),
         ]);
-        let inner = parse_entries(config);
+        let inner = parse_entries(config, None);
         let names: Vec<&str> = inner.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn startup_trust_follows_project_global_and_runtime_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut config = make_config(vec![
+            ("global", stdio_raw(&[MISSING_PROGRAM])),
+            ("project", stdio_raw(&[MISSING_PROGRAM])),
+            ("project-risky-http", http_raw("http://example.com/mcp")),
+            ("project-safe-http", http_raw("https://8.8.8.8/mcp")),
+        ]);
+        config.project_root = Some(project.canonicalize().unwrap());
+        config
+            .sources
+            .insert("project".into(), McpConfigSource::Project);
+        config
+            .sources
+            .insert("project-risky-http".into(), McpConfigSource::Project);
+        config
+            .sources
+            .insert("project-safe-http".into(), McpConfigSource::Project);
+        merge_runtime_servers(
+            &mut config,
+            vec![(
+                "runtime".into(),
+                RawTransport::Stdio(RawStdioFields {
+                    command: vec![MISSING_PROGRAM.into()],
+                    environment: HashMap::new(),
+                }),
+            )],
+        );
+
+        let inner = parse_entries(config, None);
+        let status = |name: &str| {
+            &inner
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .status
+        };
+        assert_eq!(*status("global"), McpServerStatus::Connecting);
+        assert_eq!(*status("project"), McpServerStatus::AwaitingTrust);
+        assert_eq!(
+            *status("project-risky-http"),
+            McpServerStatus::AwaitingTrust
+        );
+        assert_eq!(*status("project-safe-http"), McpServerStatus::Connecting);
+        assert_eq!(*status("runtime"), McpServerStatus::Connecting);
+        assert_eq!(
+            inner
+                .entries
+                .iter()
+                .find(|entry| entry.name == "runtime")
+                .unwrap()
+                .review
+                .config_source,
+            McpConfigSource::Runtime
+        );
+    }
+
+    #[test]
+    fn project_stdio_is_not_spawn_eligible_before_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let inner = parse_entries(
+            make_project_config(&project, vec![("project", stdio_raw(&[MISSING_PROGRAM]))]),
+            None,
+        );
+        let (tx, _rx) = flume::unbounded();
+
+        assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
+        assert!(spawn_connects(&inner, tx).is_empty());
+    }
+
+    #[test]
+    fn persisted_trust_requires_the_exact_config_digest_without_storing_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().join("state"));
+        let mut raw = stdio_raw(&["runner"]);
+        let RawTransport::Stdio(stdio) = &mut raw.transport else {
+            unreachable!();
+        };
+        stdio
+            .environment
+            .insert("TOKEN".into(), "raw-secret-value".into());
+        let digest = security_digest(&raw);
+        trust_project(&state_dir, &project, "project", &digest).unwrap();
+
+        let trusted = parse_entries(
+            make_project_config(&project, vec![("project", raw.clone())]),
+            Some(state_dir.clone()),
+        );
+        assert_eq!(trusted.entries[0].status, McpServerStatus::Connecting);
+
+        let RawTransport::Stdio(stdio) = &mut raw.transport else {
+            unreachable!();
+        };
+        stdio.command.push("changed".into());
+        let drifted = parse_entries(
+            make_project_config(&project, vec![("project", raw)]),
+            Some(state_dir.clone()),
+        );
+        assert_eq!(drifted.entries[0].status, McpServerStatus::AwaitingTrust);
+        let persisted = std::fs::read_to_string(state_dir.path().join("mcp-trust.json")).unwrap();
+        assert!(!persisted.contains("raw-secret-value"));
+    }
+
+    #[test]
+    fn persisted_http_trust_cannot_bypass_failed_dns_pinning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let state_dir = StateDir::from_path(tmp.path().join("state"));
+        let raw = http_raw("https://[invalid");
+        let digest = security_digest(&raw);
+        trust_project(&state_dir, &project, "project", &digest).unwrap();
+
+        let inner = parse_entries(
+            make_project_config(&project, vec![("project", raw)]),
+            Some(state_dir),
+        );
+
+        assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
+        let (tx, _rx) = flume::unbounded();
+        assert!(spawn_connects(&inner, tx).is_empty());
+    }
+
+    #[test]
+    fn enabling_trusted_http_server_still_requires_a_pinned_address() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let state_dir = StateDir::from_path(tmp.path().join("state"));
+            let mut raw = http_raw("https://[invalid");
+            raw.enabled = false;
+            let digest = security_digest(&raw);
+            trust_project(&state_dir, &project, "project", &digest).unwrap();
+            let mut inner = parse_entries(
+                make_project_config(&project, vec![("project", raw)]),
+                Some(state_dir),
+            );
+
+            handle_toggle(&mut inner, "project", true).await;
+
+            assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
+            assert!(inner.entries[0].transport.is_none());
+        });
+    }
+
+    #[test]
+    fn awaiting_trust_is_ready_and_parked() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let config =
+                make_project_config(&project, vec![("project", stdio_raw(&[MISSING_PROGRAM]))]);
+            let state_dir = StateDir::from_path(tmp.path().join("state"));
+            let handle = start_with_config_and_state(config, Some(state_dir)).unwrap();
+
+            handle.ready().await;
+
+            let snapshot = handle.reader().load_full();
+            assert_eq!(snapshot.infos[0].status, McpServerStatus::AwaitingTrust);
+            assert!(snapshot.pids.is_empty());
+            handle.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn trust_once_allows_start_and_refresh_actions_recheck_trust() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let mut inner = parse_entries(
+                make_project_config(&project, vec![("project", stdio_raw(&[MISSING_PROGRAM]))]),
+                None,
+            );
+
+            handle_reconnect(&mut inner, "project").await;
+            assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
+
+            let mut disabled = stdio_raw(&[MISSING_PROGRAM]);
+            disabled.enabled = false;
+            let mut toggled = parse_entries(
+                make_project_config(&project, vec![("project", disabled)]),
+                None,
+            );
+            handle_toggle(&mut toggled, "project", true).await;
+            assert_eq!(toggled.entries[0].status, McpServerStatus::AwaitingTrust);
+
+            handle_trust(&mut inner, "project", false).await;
+            assert!(matches!(
+                inner.entries[0].status,
+                McpServerStatus::Failed(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn reject_revokes_project_trust_and_disables_server() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let state_dir = StateDir::from_path(tmp.path().join("state"));
+            let raw = stdio_raw(&[MISSING_PROGRAM]);
+            let digest = security_digest(&raw);
+            trust_project(&state_dir, &project, "project", &digest).unwrap();
+            let mut inner = parse_entries(
+                make_project_config(&project, vec![("project", raw)]),
+                Some(state_dir.clone()),
+            );
+
+            handle_reject(&mut inner, "project").await;
+
+            assert_eq!(inner.entries[0].status, McpServerStatus::Disabled);
+            assert!(!is_project_trusted(&state_dir, &project, "project", &digest).unwrap());
+        });
+    }
+
+    #[test]
+    fn trust_project_action_persists_exact_config() {
+        smol::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let state_dir = StateDir::from_path(tmp.path().join("state"));
+            let raw = stdio_raw(&[MISSING_PROGRAM]);
+            let digest = security_digest(&raw);
+            let mut inner = parse_entries(
+                make_project_config(&project, vec![("project", raw)]),
+                Some(state_dir.clone()),
+            );
+
+            handle_trust(&mut inner, "project", true).await;
+
+            assert!(is_project_trusted(&state_dir, &project, "project", &digest).unwrap());
+            assert!(matches!(
+                inner.entries[0].status,
+                McpServerStatus::Failed(_)
+            ));
+        });
     }
 
     fn always_load_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
@@ -1868,6 +2577,7 @@ mod tests {
                     fake_entry("a", Arc::clone(&t1) as _),
                     fake_entry("b", Arc::clone(&t2) as _),
                 ],
+                state_dir: None,
                 generation: 0,
             };
             let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));

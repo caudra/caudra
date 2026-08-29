@@ -669,7 +669,7 @@ async fn dispatch_racing_live(
     let run = tool_dispatch::run(
         &tctx.registry,
         tctx.mcp.as_ref(),
-        String::new(),
+        MakiId::generate().to_string(),
         name,
         input,
         tctx,

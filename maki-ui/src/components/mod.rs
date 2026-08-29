@@ -17,6 +17,7 @@ pub(crate) mod modal;
 pub(crate) mod model_picker;
 pub(crate) mod paste_editor;
 pub(crate) mod permission_prompt;
+pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
@@ -90,6 +91,18 @@ pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
     } else {
         offset.saturating_add(delta.unsigned_abs() as u16)
     }
+}
+
+pub(crate) fn escape_terminal_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 pub fn is_ctrl(key: &KeyEvent) -> bool {
@@ -223,6 +236,9 @@ pub enum Action {
     RefreshUsage,
     Compact,
     ToggleMcp(String, bool),
+    TrustMcpOnce(String),
+    TrustMcpProject(String),
+    RejectMcp(String),
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),

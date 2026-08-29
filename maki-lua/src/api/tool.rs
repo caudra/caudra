@@ -144,6 +144,12 @@ pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
 
 pub(crate) type PendingRules = Arc<Mutex<Vec<PermissionRule>>>;
 
+#[derive(Clone, Copy)]
+pub(crate) enum PermissionRulePolicy {
+    Trusted,
+    DenyOnly,
+}
+
 pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
@@ -152,6 +158,7 @@ pub(crate) struct LuaTool {
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
+    pub(crate) contract: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
@@ -234,6 +241,7 @@ impl Tool for LuaTool {
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
+            contract: Arc::clone(&self.contract),
             has_header_fn: self.has_header_fn,
             has_start_fn: self.has_start_fn,
             input: validated,
@@ -254,6 +262,7 @@ enum PermissionState {
 struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
+    contract: Arc<str>,
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
@@ -272,6 +281,7 @@ impl ToolInvocation for LuaToolInvocation {
         let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
         let tool = Arc::clone(&self.tool);
         let plugin = Arc::clone(&self.plugin);
+        let contract = Arc::clone(&self.contract);
         let input = self.input.clone();
         let tx = self.tx.clone();
         let fallback = tool.to_string();
@@ -282,6 +292,7 @@ impl ToolInvocation for LuaToolInvocation {
                     .send_async(Request::ComputeHeader {
                         plugin: Arc::clone(&plugin),
                         tool: Arc::clone(&tool),
+                        contract,
                         input,
                         reply: reply_tx,
                     })
@@ -326,6 +337,7 @@ impl ToolInvocation for LuaToolInvocation {
         let req = Request::StartTool {
             plugin: Arc::clone(&self.plugin),
             tool: Arc::clone(&self.tool),
+            contract: Arc::clone(&self.contract),
             input: self.input.clone(),
             live: LiveCtx {
                 event_tx: ctx.event_tx.clone(),
@@ -350,6 +362,7 @@ impl ToolInvocation for LuaToolInvocation {
                 let tx = self.tx.clone();
                 let plugin = Arc::clone(&self.plugin);
                 let tool = Arc::clone(&self.tool);
+                let contract = Arc::clone(&self.contract);
                 let input = self.input.clone();
                 let fallback = input.to_string();
                 Box::pin(async move {
@@ -357,6 +370,7 @@ impl ToolInvocation for LuaToolInvocation {
                         .send_async(Request::ComputePermissionScopes {
                             plugin,
                             tool,
+                            contract,
                             input,
                             reply: reply_tx,
                         })
@@ -384,6 +398,7 @@ impl ToolInvocation for LuaToolInvocation {
         let deadline = ctx.deadline;
         let plugin = self.plugin;
         let tool = self.tool;
+        let contract = self.contract;
         let input = self.input;
         let tx = self.tx;
         let tool_timeout = self.timeout;
@@ -414,6 +429,7 @@ impl ToolInvocation for LuaToolInvocation {
                 .send_async(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
+                    contract,
                     input,
                     ctx: Box::new(lua_ctx),
                     deadline: match deadline {
@@ -690,6 +706,7 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 fn register_permission_rule(
     _lua: &Lua,
     #[ctx] pending_rules: PendingRules,
+    #[ctx] rule_policy: PermissionRulePolicy,
     spec: Table,
 ) -> LuaResult<()> {
     for entry in spec.pairs::<String, LuaValue>() {
@@ -741,6 +758,11 @@ fn register_permission_rule(
             )));
         }
     };
+    if effect == Effect::Allow && matches!(rule_policy, PermissionRulePolicy::DenyOnly) {
+        return Err(mlua::Error::runtime(
+            "register_permission_rule: this plugin source may register deny rules only",
+        ));
+    }
 
     pending_rules
         .lock()
@@ -1012,8 +1034,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending), register_permission_rule(pending_rules), register_command(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, rule_policy: PermissionRulePolicy, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending), register_permission_rule(pending_rules, rule_policy), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1024,12 +1046,13 @@ pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
+    rule_policy: PermissionRulePolicy,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, plugin, opts)?;
+    add_tool_fns(&t, lua, pending, pending_rules, rule_policy, plugin, opts)?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
@@ -1806,6 +1829,7 @@ mod tests {
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
             has_header_fn: false,
             input,
             tx,
@@ -1861,6 +1885,7 @@ mod tests {
             kind: None,
             tx,
             plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
             has_header_fn: false,
             permission_scope_kind,
             mutable_path_field: None,
@@ -1963,6 +1988,7 @@ mod tests {
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
             has_header_fn: false,
             input: serde_json::json!({"command": "ls"}),
             tx,
@@ -1981,6 +2007,7 @@ mod tests {
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
             has_header_fn: false,
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
@@ -2005,6 +2032,7 @@ mod tests {
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
             has_header_fn: false,
             input: serde_json::json!({"command": "cargo test"}),
             tx,

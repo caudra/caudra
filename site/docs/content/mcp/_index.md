@@ -9,6 +9,8 @@ group = "Reference"
 
 Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** transports are supported.
 
+An external stdio server is an unsandboxed local process. Per-tool permissions control MCP calls after startup. They cannot confine the server process itself.
+
 ## Configuration
 
 Add servers under `[mcp.*]` in your MCP config:
@@ -120,7 +122,31 @@ Good for small servers you rely on every turn. On a big server it defeats the po
 
 Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
 
-Permission rules for MCP tools use the same nested form under `[mcp.<server>]` in `permissions.toml`. See [Permissions](/docs/permissions/#mcp-tool-permissions).
+See [Permissions](/docs/permissions/#mcp-tool-calls) for MCP call review and remembered decisions.
+
+Tool-call approval binds to the configured server authority, the discovered tool contract, and one transport snapshot. Reconnects and contract changes cannot inherit an approval by reusing the same display name.
+
+Generic MCP approvals are exact-input by default. The permission review shows the complete validated JSON rather than a truncated preview.
+
+## Project server trust
+
+Maki separates server startup trust from tool-call permissions.
+
+Project stdio servers do not start until you review them. Project HTTP servers also wait for plaintext HTTP, URL credentials, failed DNS resolution, or any resolved private or reserved address. A trust decision cannot start or persist until DNS succeeds. Public HTTPS addresses connect normally. Maki pins the reviewed DNS result for the process, so a later DNS answer cannot redirect that connection into a private network. Global user configuration and ACP-provided runtime servers are trusted for startup.
+
+Open `/mcp` to review a parked server. The picker shows the command or URL, config source, and environment or header names. Values remain hidden.
+
+| Key | Action |
+|---|---|
+| `o` | Connect once for this process |
+| `p` | Confirm trust for this exact configuration and project |
+| `r` | Confirm rejection and disable the server |
+
+Persistent trust is stored in the user state directory using the canonical project, server name, and SHA-256 configuration digest. Changing the command, arguments, environment, URL, headers, or OAuth client configuration requires review again.
+
+MCP and OAuth HTTP requests do not follow redirects. OAuth discovery and token endpoints are resolved and pinned too. A private OAuth endpoint is accepted only on the reviewed MCP origin.
+
+Print, SDK, and ACP sessions fail with an actionable error when project startup trust is still pending. Review the exact configuration in the TUI with `/mcp`, then retry the non-interactive client.
 
 ## Runtime toggling
 
@@ -132,6 +158,7 @@ Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back
 |--------|---------|
 | Connecting | Waiting for the server to come up |
 | Running | Tools available |
+| AwaitingTrust | No connection attempted; review with `/mcp` |
 | Disabled | Off in config or toggled off in UI |
 | Failed | Error shown in UI |
 | NeedsAuth | Waiting for OAuth (see below) |

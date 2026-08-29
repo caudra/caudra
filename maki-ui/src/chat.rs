@@ -12,9 +12,10 @@ use crate::components::{DisplayMessage, DisplayRole, DisplaySource, ToolRole, To
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
+use maki_agent::permissions::PermissionRequest;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::{ToolKey, ToolOutputLines, UiConfig};
+use maki_config::{ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{HistoryItem, HistoryItemKind, MakiId, UserOrigin};
 use ratatui::Frame;
@@ -42,11 +43,7 @@ pub enum ChatEventResult {
         items: Vec<maki_agent::QueueConsumedItem>,
     },
     Error(String),
-    PermissionRequest {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-    },
+    PermissionRequest(Box<PermissionRequest>),
     AuthRequired,
 }
 
@@ -191,8 +188,8 @@ impl Chat {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest(request) => {
+                return ChatEventResult::PermissionRequest(request);
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;

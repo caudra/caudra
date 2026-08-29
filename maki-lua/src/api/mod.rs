@@ -30,14 +30,16 @@ use std::sync::Arc;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::options::PluginOpts;
-use crate::api::tool::{PendingRules, PendingTools};
+use crate::api::tool::{PendingRules, PendingTools, PermissionRulePolicy};
 use crate::api::util::command::UiAction;
 use crate::plugin_permissions::PluginPermissions;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
+    rule_policy: PermissionRulePolicy,
     plugin: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
@@ -49,6 +51,7 @@ pub(crate) fn create_maki_global(
         lua,
         pending,
         pending_rules,
+        rule_policy,
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),

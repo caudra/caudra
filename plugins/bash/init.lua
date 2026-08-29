@@ -12,6 +12,7 @@ local NO_PARTIAL_OUTPUT = "no output before the cut"
 local OUTPUT_LIMIT_MARKER = "[stopped: output limit exceeded]"
 local STREAM_FAILURE_MARKER = "[stopped: stream failure]"
 local PERSISTENCE_FAILURE_MARKER = "[stopped: output persistence failure]"
+local WORKDIR_SCOPE_FMT = "%s # maki-workdir[%d]=%s # maki-frame[%d]"
 local RTK_UNSUPPORTED_FLAGS = {
   " -o ",
   " -not ",
@@ -54,6 +55,11 @@ local function parse_cd_hint(input)
     end
   end
   return input.command, nil
+end
+
+local function execution(input)
+  local command, workdir = parse_cd_hint(input)
+  return command, maki.fs.normalize(workdir or maki.uv.cwd() or ".")
 end
 
 local function normalize_sep(s)
@@ -172,71 +178,110 @@ local function create_bash_view(command, ctx)
   return buf, view
 end
 
-local cwd = maki.uv.cwd() or "."
-
-local COMPLEX_TYPES = {
+local COMMAND_TYPES = {
+  command = true,
+  declaration_command = true,
+  test_command = true,
+  unset_command = true,
+}
+local FORCE_PROMPT_TYPES = {
   command_substitution = true,
   process_substitution = true,
   subshell = true,
   arithmetic_expansion = true,
 }
 
-local function is_complex(node)
-  if COMPLEX_TYPES[node:type()] then
-    return true
-  end
-  for child in node:iter_children() do
-    if is_complex(child) then
-      return true
-    end
-  end
-  return false
+local function with_workdir(effect, workdir)
+  return string.format(WORKDIR_SCOPE_FMT, effect, #workdir, workdir, #workdir)
 end
 
-local LEAF_COMMAND_TYPES = {
-  command = true,
-  redirected_statement = true,
-  negated_command = true,
-  subshell = true,
-  compound_statement = true,
-  if_statement = true,
-  while_statement = true,
-  for_statement = true,
-  case_statement = true,
-  function_definition = true,
-  c_style_for_statement = true,
-}
+local function redirect_path(raw, workdir)
+  local quote = raw:sub(1, 1)
+  local quoted = (quote == "'" or quote == '"') and raw:sub(-1) == quote
+  local path = quoted and raw:sub(2, -2) or raw
+  if path == "" or path:find("[%$`%*%?%[]") then
+    return nil
+  end
+  if not quoted then
+    path = path:gsub("\\(.)", "%1")
+  end
+  if not quoted and (path == "~" or path:sub(1, 2) == "~/") then
+    return maki.fs.normalize(path)
+  end
+  if path:sub(1, 1) == "/" then
+    return maki.fs.normalize(path)
+  end
+  return maki.fs.normalize(maki.fs.joinpath(workdir, path))
+end
 
-local function collect_commands(node, source)
-  local out = {}
+local function collect_effects(node, source, workdir, out, seen)
   local kind = node:type()
-  if kind == "program" or kind == "list" then
-    for child in node:iter_children() do
-      local nested = collect_commands(child, source)
-      for _, cmd in ipairs(nested) do
-        out[#out + 1] = cmd
+  if FORCE_PROMPT_TYPES[kind] then
+    out.force_prompt = true
+  end
+  if COMMAND_TYPES[kind] then
+    local command = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+    if command ~= "" then
+      local scope = with_workdir(command, workdir)
+      if not seen[scope] then
+        seen[scope] = true
+        out[#out + 1] = scope
       end
     end
-  elseif kind == "pipeline" then
-    for child in node:iter_children() do
-      if child:named() then
-        local text = maki.treesitter.get_node_text(child, source):match("^%s*(.-)%s*$")
-        if text ~= "" then
-          out[#out + 1] = text
+  elseif kind == "file_redirect" then
+    local destinations = node:field("destination")
+    local raw = destinations[1] and maki.treesitter.get_node_text(destinations[1], source) or nil
+    if raw then
+      local redirect = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+      local descriptor_only = redirect:find("[<>]&") and (raw == "-" or raw:match("^%d+$"))
+      if not descriptor_only then
+        local target = redirect_path(raw, workdir)
+        local scope = with_workdir("redirect " .. redirect .. " => " .. (target or raw), workdir)
+        if not seen[scope] then
+          seen[scope] = true
+          out[#out + 1] = scope
+        end
+        if not target then
+          out.force_prompt = true
         end
       end
     end
-  elseif LEAF_COMMAND_TYPES[kind] then
-    local text = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
-    if text ~= "" then
-      out[#out + 1] = text
+  end
+
+  for child in node:iter_children() do
+    if child:named() then
+      collect_effects(child, source, workdir, out, seen)
     end
   end
-  return out
+end
+
+local function permission_scopes(input)
+  local command, workdir = execution(input)
+  if not command or command:match("^%s*$") then
+    return nil
+  end
+
+  local fallback = with_workdir(command, workdir)
+  local parser = maki.treesitter.get_parser(command, "bash")
+  if not parser then
+    return { scopes = { fallback }, force_prompt = true }
+  end
+
+  local root = parser:parse()[1]:root()
+  if root:has_error() then
+    return { scopes = { fallback }, force_prompt = true }
+  end
+
+  local scopes = {}
+  collect_effects(root, command, workdir, scopes, {})
+  if #scopes == 0 then
+    scopes[1] = fallback
+  end
+  return { scopes = scopes, force_prompt = scopes.force_prompt or false }
 end
 
 local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+Commands run in the current working directory by default.
 
 - **DO NOT** use for file ops! Only git, builds, tests, and system commands.
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
@@ -272,31 +317,13 @@ maki.api.register_tool({
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
-  permission_scopes = function(input)
-    local command = input.command
-    if not command or command:match("^%s*$") then
-      return nil
-    end
-
-    local parser = maki.treesitter.get_parser(command, "bash")
-    if not parser then
-      return { scopes = { command }, force_prompt = true }
-    end
-
-    local root = parser:parse()[1]:root()
-    if root:has_error() or is_complex(root) then
-      return { scopes = { command }, force_prompt = true }
-    end
-
-    local segments = collect_commands(root, command)
-    if #segments == 0 then
-      segments = { command }
-    end
-    return { scopes = segments, force_prompt = false }
-  end,
+  permission_scopes = permission_scopes,
 
   header = function(input)
     local command, workdir = parse_cd_hint(input)
+    if workdir then
+      workdir = maki.fs.normalize(workdir)
+    end
     local s = input.description or command
     if workdir then
       s = s .. " in " .. relative_path(workdir)
@@ -340,7 +367,7 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
-    local command, workdir = parse_cd_hint(input)
+    local command, workdir = execution(input)
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
     local limits = { max_lines = max_lines, max_bytes = max_bytes }

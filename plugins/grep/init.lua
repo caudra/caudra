@@ -16,6 +16,17 @@ local opts = maki.api.register_options(output_limits.extend({
   max_line_bytes = { default = 500, min = 80, desc = "Skip lines longer than this many bytes." },
 }))
 
+local function search_path(input)
+  return maki.fs.normalize(input.path or ".")
+end
+
+local function search_scope(input)
+  local path = search_path(input)
+  return path:sub(-1) == "/" and (path .. "**") or (path .. "/**")
+end
+
+maki.api.register_permission_rule({ tool = "grep", scope = "*" })
+
 local function has_context(groups)
   for _, group in ipairs(groups) do
     if #group.lines > 1 then
@@ -202,6 +213,9 @@ maki.api.register_tool({
 - Prefer speculative parallel searches over sequential rounds of glob+grep.
 - Do NOT wrap the pattern in quotes. Do NOT double-escape (e.g. `\[` not `\\[`).
 - Multi-line matching is auto-enabled when the pattern contains `\n`, `(?s)`, or `(?m)`.]],
+  permission_scopes = function(input)
+    return { scopes = { search_scope(input) }, force_prompt = false }
+  end,
 
   schema = {
     type = "object",
@@ -256,7 +270,7 @@ maki.api.register_tool({
     local max_line_bytes = opts.max_line_bytes
 
     local entries, err = maki.fs.grep(pattern, {
-      path = input.path,
+      path = search_path(input),
       include = input.include,
       context_before = input.context_before or 0,
       context_after = input.context_after or 0,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,15 +6,16 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
-use maki_agent::permissions::PluginRuleStore;
+use maki_agent::permissions::{PluginRuleStore, canonical_json_sha256};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::tool::PermissionRulePolicy;
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
-use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions_with_trust};
 use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
@@ -24,6 +25,34 @@ const ALWAYS_LOADED_BUILTINS: &[&str] = &["tool_output"];
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
+}
+
+fn bundled_implementation_digest() -> String {
+    fn collect(plugin: &str, directory: &Dir<'_>, files: &mut BTreeMap<String, String>) {
+        for file in directory.files() {
+            if file
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "lua")
+            {
+                files.insert(
+                    format!("{plugin}/{}", file.path().display()),
+                    canonical_json_sha256(&serde_json::Value::String(
+                        file.contents_utf8().unwrap_or_default().into(),
+                    )),
+                );
+            }
+        }
+        for child in directory.dirs() {
+            collect(plugin, child, files);
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    for plugin in BUNDLED_PLUGINS {
+        collect(plugin.name, &plugin.dir, &mut files);
+    }
+    canonical_json_sha256(&serde_json::json!(files))
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
@@ -204,12 +233,22 @@ impl PluginHost {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
-            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                "global/init.lua",
+                PermissionRulePolicy::Trusted,
+                &mut merged,
+            )?;
             if merged.is_some() {
                 break;
             }
         }
-        self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
+        self.run_init_file(
+            &cwd.join(".maki/init.lua"),
+            "project/init.lua",
+            PermissionRulePolicy::DenyOnly,
+            &mut merged,
+        )?;
 
         Ok(merged)
     }
@@ -232,6 +271,7 @@ impl PluginHost {
         &self,
         path: &Path,
         label: &str,
+        rule_policy: PermissionRulePolicy,
         merged: &mut Option<RawConfig>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
@@ -242,7 +282,9 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
+        if let Some(raw) =
+            self.send_run_init_lua_with_policy(source, label.to_owned(), plugin_dir, rule_policy)?
+        {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -306,11 +348,16 @@ impl PluginHost {
                 .cloned()
                 .map(Arc::new)
                 .unwrap_or_default();
+            let source = format!(
+                "{init}\n-- maki bundled implementation {}",
+                bundled_implementation_digest()
+            );
             self.send_load(
                 name,
-                init.to_owned(),
+                source,
                 None,
                 PluginPermissions::trusted(),
+                PermissionRulePolicy::Trusted,
                 opts,
             )?;
         }
@@ -323,6 +370,7 @@ impl PluginHost {
         source: String,
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
+        rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -333,6 +381,7 @@ impl PluginHost {
                 source,
                 plugin_dir,
                 permissions,
+                rule_policy,
                 opts,
                 reply: reply_tx,
             })
@@ -357,6 +406,21 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_run_init_lua_with_policy(
+            source,
+            source_name,
+            plugin_dir,
+            PermissionRulePolicy::DenyOnly,
+        )
+    }
+
+    fn send_run_init_lua_with_policy(
+        &self,
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+        rule_policy: PermissionRulePolicy,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
@@ -364,6 +428,7 @@ impl PluginHost {
                 source,
                 source_name,
                 plugin_dir,
+                rule_policy,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -398,6 +463,7 @@ impl PluginHost {
             source.to_owned(),
             None,
             PluginPermissions::trusted(),
+            PermissionRulePolicy::Trusted,
             Arc::new(opts),
         )
     }
@@ -413,6 +479,7 @@ impl PluginHost {
             source.to_owned(),
             None,
             permissions,
+            PermissionRulePolicy::Trusted,
             PluginOpts::default(),
         )
     }
@@ -423,7 +490,7 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        let permissions = load_plugin_permissions(plugin_dir.as_deref());
+        let (permissions, trusted) = load_plugin_permissions_with_trust(plugin_dir.as_deref());
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
@@ -433,6 +500,11 @@ impl PluginHost {
             source,
             plugin_dir,
             permissions,
+            if trusted {
+                PermissionRulePolicy::Trusted
+            } else {
+                PermissionRulePolicy::DenyOnly
+            },
             PluginOpts::default(),
         )
     }

@@ -6,18 +6,20 @@ pub mod auth;
 pub mod id;
 pub mod input_history;
 pub mod log;
+pub mod mcp_trust;
 pub mod model;
 pub mod paths;
+pub mod permission_state;
 pub mod plans;
 pub mod sessions;
 pub mod theme;
 pub mod tool_outputs;
 pub mod version;
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::thread;
@@ -114,6 +116,22 @@ pub(crate) fn atomic_write_permissions(
     let _ = mode;
     tmp.as_file().sync_all()?;
     persist(tmp, path)
+}
+
+pub(crate) fn exclusive_state_lock(path: &Path, mode: u32) -> Result<File, StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the

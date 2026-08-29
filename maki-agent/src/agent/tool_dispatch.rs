@@ -9,9 +9,10 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext, truncate_bytes};
+use crate::tools::{LocalToolFn, ToolContext};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
 
@@ -25,8 +26,6 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
-const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
-
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
@@ -201,7 +200,9 @@ async fn run_inner(
 
         invocation.start(ctx).await;
 
-        if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+        if let Err(e) =
+            enforce_permission(invocation.as_ref(), &entry.source, name, input, ctx, &id).await
+        {
             return done_error(e);
         }
 
@@ -363,7 +364,9 @@ async fn run_local_tool(
 /// Returns an error if `name` contains dots (not a valid native tool name).
 async fn enforce_permission(
     inv: &dyn ToolInvocation,
+    source: &crate::tools::ToolSource,
     name: &str,
+    input: &Value,
     ctx: &ToolContext,
     id: &str,
 ) -> Result<(), String> {
@@ -374,15 +377,28 @@ async fn enforce_permission(
     }
     if let Some(scopes) = inv.permission_scopes().await {
         let tool_key = ToolKey::native(name);
+        let identity = match source {
+            crate::tools::ToolSource::Lua { plugin, contract } => Some((
+                crate::permissions::PermissionSubject::Lua {
+                    plugin: plugin.to_string(),
+                    tool: name.to_owned(),
+                    contract: contract.to_string(),
+                },
+                crate::permissions::PermissionExecutorKind::Lua,
+            )),
+            crate::tools::ToolSource::Mcp { .. } => None,
+        };
         ctx.permissions
-            .enforce(
+            .enforce_with_identity(
                 &tool_key,
                 &scopes,
+                input,
                 &ctx.event_tx,
                 ctx.user_response_rx.as_deref(),
                 id,
                 &ctx.cancel,
                 ctx.mode.plan_path(),
+                identity,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -421,33 +437,41 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
         }
     };
-    let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
+    let perm_scope = canonical_json(input);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
+    let Some(mcp) = &ctx.mcp else {
+        return done(format!("MCP manager not available for {tool_name}"), true);
+    };
+    let binding = match mcp.bind_tool(tool_name) {
+        Ok(binding) => binding,
+        Err(error) => return done(error.to_string(), true),
+    };
 
     if let Err(e) = ctx
         .permissions
-        .enforce(
+        .enforce_with_identity(
             &perm_tool,
             &perm_scopes,
+            input,
             &ctx.event_tx,
             ctx.user_response_rx.as_deref(),
             id,
             &ctx.cancel,
             ctx.mode.plan_path(),
+            Some((
+                binding.subject().clone(),
+                crate::permissions::PermissionExecutorKind::Mcp,
+            )),
         )
         .await
     {
         return done(e.to_string(), true);
     }
 
-    let Some(mcp) = &ctx.mcp else {
-        return done(format!("MCP manager not available for {tool_name}"), true);
-    };
-
     // A permitted call to a deferred tool counts as loading it, so its full
     // definition joins the next request; a denied call must not load anything.
     mcp.mark_loaded(tool_name);
-    match mcp.call_tool(tool_name, input).await {
+    match binding.call(input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
     }
@@ -957,7 +981,7 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 deny_cfg,
                 dir.path().to_path_buf(),
                 Arc::default(),
@@ -1079,7 +1103,7 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 deny_cfg,
                 dir.path().to_path_buf(),
                 Arc::default(),
@@ -1095,6 +1119,7 @@ mod tests {
                     Arc::new(GuardedMock),
                     ToolSource::Lua {
                         plugin: "test".into(),
+                        contract: "test-contract".into(),
                     },
                 )
                 .unwrap();
@@ -1191,7 +1216,7 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 deny_cfg,
                 dir.path().to_path_buf(),
                 Arc::default(),
@@ -1209,6 +1234,7 @@ mod tests {
                     Arc::new(probe),
                     ToolSource::Lua {
                         plugin: "test".into(),
+                        contract: "test-contract".into(),
                     },
                 )
                 .unwrap();

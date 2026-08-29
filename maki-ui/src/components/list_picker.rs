@@ -65,6 +65,7 @@ pub struct ListPicker<T> {
     max_visible: Option<u16>,
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<String>,
+    info_text: Option<String>,
     empty_text: &'static str,
     width_percent: u16,
 }
@@ -80,6 +81,7 @@ struct State<T> {
     row_hits: Vec<PickerRowHit>,
     mouse_down: Option<usize>,
     enabled: Option<Vec<bool>>,
+    toggleable: Option<Vec<bool>>,
     matcher: Matcher,
 }
 
@@ -97,6 +99,13 @@ struct RenderOptions<'a> {
     empty_text: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct RenderContent<'a> {
+    footer: Option<fn() -> Line<'static>>,
+    error_text: Option<&'a str>,
+    info_text: Option<&'a str>,
+}
+
 impl<T: PickerItem> State<T> {
     fn new(items: Vec<T>) -> Self {
         let filtered = (0..items.len()).collect();
@@ -111,6 +120,7 @@ impl<T: PickerItem> State<T> {
             row_hits: Vec::new(),
             mouse_down: None,
             enabled: None,
+            toggleable: None,
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -260,6 +270,7 @@ impl<T: PickerItem> ListPicker<T> {
             max_visible: None,
             footer: None,
             error_text: None,
+            info_text: None,
             empty_text: NO_MATCHES,
             width_percent: MIN_WIDTH_PERCENT,
         }
@@ -288,15 +299,27 @@ impl<T: PickerItem> ListPicker<T> {
         self.title = title.into();
     }
 
-    pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
+    pub fn open_selectively_toggleable(
+        &mut self,
+        items: Vec<T>,
+        enabled: Vec<bool>,
+        toggleable: Vec<bool>,
+        title: impl Into<String>,
+    ) {
         assert_eq!(
             items.len(),
             enabled.len(),
             "items and enabled must have same length"
         );
+        assert_eq!(
+            items.len(),
+            toggleable.len(),
+            "items and toggleable must have same length"
+        );
         self.title = title.into();
         let mut state = State::new(items);
         state.enabled = Some(enabled);
+        state.toggleable = Some(toggleable);
         self.state = Some(state);
     }
 
@@ -334,6 +357,10 @@ impl<T: PickerItem> ListPicker<T> {
         self.error_text = text;
     }
 
+    pub fn set_info_text(&mut self, text: Option<String>) {
+        self.info_text = text;
+    }
+
     pub fn set_empty_text(&mut self, text: &'static str) {
         self.empty_text = text;
     }
@@ -351,9 +378,17 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
-    pub fn replace_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>) {
+    pub fn replace_selectively_toggleable(
+        &mut self,
+        items: Vec<T>,
+        enabled: Vec<bool>,
+        toggleable: Vec<bool>,
+    ) {
+        assert_eq!(items.len(), enabled.len());
+        assert_eq!(items.len(), toggleable.len());
         if let Some(s) = self.state.as_mut() {
             s.enabled = Some(enabled);
+            s.toggleable = Some(toggleable);
             s.replace_items(items);
         }
     }
@@ -434,6 +469,13 @@ impl<T: PickerItem> ListPicker<T> {
                     return PickerAction::Consumed;
                 }
                 if let Some(enabled) = &mut state.enabled {
+                    if state
+                        .toggleable
+                        .as_ref()
+                        .is_some_and(|toggleable| !toggleable[pressed])
+                    {
+                        return PickerAction::Consumed;
+                    }
                     enabled[pressed] = !enabled[pressed];
                     return PickerAction::Toggle(pressed, enabled[pressed]);
                 }
@@ -491,6 +533,12 @@ impl<T: PickerItem> ListPicker<T> {
             KeyCode::Enter => {
                 let idx = s.selected_item_index();
                 if let (Some(enabled), Some(idx)) = (&mut s.enabled, idx) {
+                    if s.toggleable
+                        .as_ref()
+                        .is_some_and(|toggleable| !toggleable[idx])
+                    {
+                        return PickerAction::Consumed;
+                    }
                     enabled[idx] = !enabled[idx];
                     return PickerAction::Toggle(idx, enabled[idx]);
                 }
@@ -593,8 +641,11 @@ impl<T: PickerItem> ListPicker<T> {
                     width_percent: self.width_percent,
                     empty_text: self.empty_text,
                 },
-                footer,
-                self.error_text.as_deref(),
+                RenderContent {
+                    footer,
+                    error_text: self.error_text.as_deref(),
+                    info_text: self.info_text.as_deref(),
+                },
             ),
         }
     }
@@ -620,9 +671,13 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     options: RenderOptions<'_>,
-    footer: Option<fn() -> Line<'static>>,
-    error_text: Option<&str>,
+    content: RenderContent<'_>,
 ) -> Rect {
+    let RenderContent {
+        footer,
+        error_text,
+        info_text,
+    } = content;
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
@@ -634,6 +689,13 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
+    let modal_inner_width =
+        (area.width as u32 * options.width_percent as u32 / 100).saturating_sub(2) as u16;
+    let requested_info_rows = info_text.map_or(0, |text| {
+        Paragraph::new(text)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .line_count(modal_inner_width.max(1)) as u16
+    });
     let modal = Modal {
         title,
         width_percent: options.width_percent,
@@ -642,18 +704,29 @@ fn render_ready<T: PickerItem>(
     let (popup, inner) = modal.render(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows + SEARCH_ROW + footer_rows + error_rows + requested_info_rows,
+    );
+    let info_rows = requested_info_rows.min(
+        inner
+            .height
+            .saturating_sub(error_rows + SEARCH_ROW + footer_rows + 1),
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + info_rows + SEARCH_ROW + footer_rows);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(
+        3 + footer.is_some() as usize
+            + error_text.is_some() as usize
+            + info_text.is_some() as usize,
+    );
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
+    }
+    if info_rows > 0 {
+        constraints.push(Constraint::Length(info_rows));
     }
     constraints.push(Constraint::Min(1)); // list
     constraints.push(Constraint::Length(1)); // search
@@ -670,6 +743,18 @@ fn render_ready<T: PickerItem>(
             theme::current().error,
         ));
         frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
+        area_idx += 1;
+    }
+
+    if let Some(info) = info_text
+        && info_rows > 0
+    {
+        frame.render_widget(
+            Paragraph::new(info)
+                .style(theme::current().item_desc)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            areas[area_idx],
+        );
         area_idx += 1;
     }
 
@@ -1348,7 +1433,12 @@ mod tests {
     #[test]
     fn toggle_mode_enter_flips_enabled() {
         let mut p = ListPicker::new();
-        p.open_toggleable(entries(&["A", "B"]), vec![true, true], " Test ");
+        p.open_selectively_toggleable(
+            entries(&["A", "B"]),
+            vec![true, true],
+            vec![true, true],
+            " Test ",
+        );
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, PickerAction::Toggle(0, false)));
         assert!(p.is_open());
@@ -1357,7 +1447,12 @@ mod tests {
     #[test]
     fn toggle_mode_search_targets_correct_item() {
         let mut p = ListPicker::new();
-        p.open_toggleable(entries(&["Alpha", "Beta"]), vec![true, true], " Test ");
+        p.open_selectively_toggleable(
+            entries(&["Alpha", "Beta"]),
+            vec![true, true],
+            vec![true, true],
+            " Test ",
+        );
         p.handle_key(key(KeyCode::Char('b')));
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, PickerAction::Toggle(1, false)));

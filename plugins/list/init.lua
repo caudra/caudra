@@ -7,6 +7,8 @@ local DESCRIPTION =
 
 - Filters out instruction files (AGENTS.md, CLAUDE.md, COPILOT.md).]]
 
+maki.api.register_permission_rule({ tool = "list", scope = "*" })
+
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
@@ -17,6 +19,9 @@ maki.api.register_tool({
   name = "list",
   kind = "read",
   description = DESCRIPTION,
+  permission_scopes = function(input)
+    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+  end,
 
   schema = {
     type = "object",

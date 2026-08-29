@@ -13,7 +13,8 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::mcp::config::{McpConfigSource, McpReviewSummary};
+use maki_agent::permissions::{PermissionManager, PermissionRequest};
 use maki_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use maki_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
@@ -54,6 +55,7 @@ const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
+const SESSION_PERMISSION_SCOPE: &str = "cargo *";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
@@ -106,7 +108,7 @@ fn build_app_with_lua(
         writer,
         UiConfig::default(),
         100,
-        Arc::new(PermissionManager::new(
+        Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
                 ..Default::default()
@@ -191,6 +193,17 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
         subagent: None,
         run_id,
     }))
+}
+
+fn permission_event(id: &str, command: &str) -> AgentEvent {
+    AgentEvent::PermissionRequest(Box::new(PermissionRequest::from_legacy(
+        id.into(),
+        ToolKey::native("bash"),
+        vec![command.into()],
+        serde_json::json!({"command": command}),
+        Path::new("/tmp"),
+        true,
+    )))
 }
 
 fn done() -> AgentEvent {
@@ -4145,10 +4158,46 @@ fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
     assert_eq!(app.state.session.meta.yolo, Some(false));
 }
 
+fn session_allow_rule() -> PermissionRule {
+    PermissionRule {
+        tool: ToolKey::native("bash"),
+        scope: Some(SESSION_PERMISSION_SCOPE.into()),
+        effect: Effect::Allow,
+    }
+}
+
+#[test]
+fn checkpoint_and_resume_restore_session_rules() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(RESUMED_PROMPT.into()),
+    );
+    let rule = session_allow_rule();
+    app.permissions.load_session_rules(vec![rule.clone()]);
+    app.checkpoint();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let stored = AppSession::load(id, &dir).unwrap();
+    assert_eq!(stored.meta.session_rules.len(), 1);
+    let resumed_writer = Arc::new(test_writer(dir.clone()));
+    let mut resumed = build_app(dir, Arc::clone(&resumed_writer));
+    resumed.state.session = Arc::new(stored);
+    resumed.restore_resumed_session();
+
+    let restored_rules = resumed.permissions.session_rules_snapshot();
+    assert_eq!(restored_rules.len(), 1);
+    assert_eq!(restored_rules[0].tool, rule.tool);
+    assert_eq!(restored_rules[0].scope, rule.scope);
+    assert_eq!(restored_rules[0].effect, rule.effect);
+    drain_writer(resumed, resumed_writer);
+}
+
 fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSession) {
     let mut app = test_app();
     if seed {
-        app.permissions = Arc::new(PermissionManager::new(
+        app.permissions = Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 yolo: true,
                 ..Default::default()
@@ -4212,6 +4261,19 @@ fn resetting_the_session_falls_back_to_the_yolo_seed(seed: bool) -> (bool, Optio
     app.reset_session();
     app.checkpoint();
     (app.permissions.is_yolo(), app.state.session.meta.yolo)
+}
+
+#[test]
+fn resetting_the_session_clears_conversation_rules() {
+    let mut app = test_app();
+    app.permissions
+        .load_session_rules(vec![session_allow_rule()]);
+
+    app.reset_session();
+    app.checkpoint();
+
+    assert!(app.permissions.session_rules_snapshot().is_empty());
+    assert!(app.state.session.meta.session_rules.is_empty());
 }
 
 #[test]
@@ -5840,7 +5902,7 @@ fn fork_title_uses_next_number_for_base_title() {
 }
 
 #[test]
-fn fork_copies_execution_settings_but_resets_ephemeral_state() {
+fn fork_copies_execution_settings_but_resets_conversation_state() {
     let (_temp, _, _, mut app) = tempdir_app();
     let plan = PathBuf::from(&app.state.session.cwd).join("plan.md");
     std::fs::write(&plan, "plan").unwrap();
@@ -5874,8 +5936,8 @@ fn fork_copies_execution_settings_but_resets_ephemeral_state() {
     assert_eq!(child.meta.thinking, Some(StoredThinking::Adaptive));
     assert!(child.meta.fast);
     assert!(child.meta.workflow);
-    assert_eq!(child.meta.session_rules.len(), 1);
-    assert_eq!(child.meta.yolo, Some(true));
+    assert!(child.meta.session_rules.is_empty());
+    assert_eq!(child.meta.yolo, None);
     assert_eq!(child.token_usage, TokenUsage::default());
     assert!(child.usage_by_model().is_empty());
     assert!(child.meta.input_draft.is_none());
@@ -6187,6 +6249,14 @@ fn mcp_toggle_dispatches_action() {
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
                 oauth: None,
+                resolved_addresses: Vec::new(),
+                review: McpReviewSummary {
+                    command: Some(vec!["test-server".into()]),
+                    url: None,
+                    config_source: McpConfigSource::Runtime,
+                    environment_names: vec![],
+                    header_names: vec![],
+                },
             }],
             prompts: vec![],
             pids: vec![],
@@ -6201,6 +6271,74 @@ fn mcp_toggle_dispatches_action() {
         &actions[0],
         Action::ToggleMcp(name, false) if name == "test-srv"
     ));
+}
+
+#[test]
+fn permissions_command_lists_current_conversation_rules() {
+    let mut app = test_app();
+    app.permissions.load_session_rules(vec![PermissionRule {
+        tool: ToolKey::native("bash"),
+        scope: Some("cargo check -p maki-ui".into()),
+        effect: Effect::Allow,
+    }]);
+
+    app.execute_command(cmd("/permissions"), 0);
+
+    assert!(app.permissions_picker.is_open());
+}
+
+fn awaiting_mcp_picker() -> McpPicker {
+    McpPicker::new(
+        McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: vec![McpServerInfo {
+                name: "project-srv".into(),
+                transport_kind: "stdio",
+                tool_count: 0,
+                prompt_count: 0,
+                status: McpServerStatus::AwaitingTrust,
+                config_path: PathBuf::from("/project/.maki/config.toml"),
+                url: None,
+                oauth: None,
+                resolved_addresses: Vec::new(),
+                review: McpReviewSummary {
+                    command: Some(vec!["project-server".into()]),
+                    url: None,
+                    config_source: McpConfigSource::Project,
+                    environment_names: vec!["PROJECT_TOKEN".into()],
+                    header_names: vec![],
+                },
+            }],
+            prompts: vec![],
+            pids: vec![],
+            generation: 0,
+        }),
+        McpConfigErrors::new(PathBuf::new()),
+    )
+}
+
+#[test]
+fn mcp_trust_once_dispatches_action_without_toggle() {
+    let mut app = test_app();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.execute_command(cmd("/mcp"), 0);
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    let actions = app.update(Msg::Key(key(KeyCode::Char('o'))));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::TrustMcpOnce(server)] if server == "project-srv"
+    ));
+}
+
+#[test_case(false, true ; "opens_without_login")]
+#[test_case(true, false ; "does_not_disrupt_login")]
+fn awaiting_mcp_trust_startup_behavior(needs_login: bool, opens: bool) {
+    let mut app = test_app();
+    app.mcp_picker = awaiting_mcp_picker();
+
+    app.open_awaiting_mcp_trust(needs_login);
+
+    assert_eq!(app.mcp_picker.is_open(), opens);
 }
 
 #[test_case(
@@ -7550,6 +7688,59 @@ fn ctrl_c_denies_permission_prompt() {
     assert!(actions.is_empty());
 }
 
+#[test]
+fn subagent_permission_requests_remain_in_fifo_order() {
+    let mut app = app_with_subagent_id("sub1");
+    app.update(subagent_msg(
+        permission_event("subagent-request", "cargo test"),
+        "sub1",
+        Some("research"),
+    ));
+    app.update(agent_msg(permission_event("main-request", "cargo check")));
+
+    assert_eq!(app.permission_prompt.pending_count(), 2);
+    assert_eq!(app.permission_prompt.request_id(), Some("subagent-request"));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.permission_prompt.request_id(), Some("main-request"));
+}
+
+#[test]
+fn permission_decision_answers_manager_request_id_directly() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let manager = Arc::clone(&app.permissions);
+    let (event_tx, event_rx) = flume::unbounded();
+    let event_sender = maki_agent::EventSender::new(event_tx, 1);
+    let (legacy_tx, legacy_rx) = flume::unbounded();
+    let (_cancel_trigger, cancel) = maki_agent::CancelToken::new();
+    let task = smol::spawn(async move {
+        let legacy_rx = async_lock::Mutex::new(legacy_rx);
+        manager
+            .enforce(
+                &ToolKey::native("bash"),
+                &maki_agent::tools::PermissionScopes::single("cargo test".into()),
+                &serde_json::json!({"command": "cargo test"}),
+                &event_sender,
+                Some(&legacy_rx),
+                "request-by-id",
+                &cancel,
+                None,
+            )
+            .await
+    });
+    let envelope = smol::block_on(event_rx.recv_async()).unwrap();
+    assert_eq!(app.permissions.pending_count(), 1);
+    app.update(Msg::Agent(Box::new(envelope)));
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+
+    assert!(smol::block_on(task).is_ok());
+    assert_eq!(app.permissions.pending_count(), 0);
+    assert!(app.permission_prompt.request_id().is_none());
+    drop(legacy_tx);
+}
+
 const TEST_AREA: Rect = Rect {
     x: 0,
     y: 0,
@@ -7905,6 +8096,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         })
     );
 
+    app.permission_prompt.close();
     app.permission_prompt
         .open("id".into(), maki_config::ToolKey::Wildcard, vec![], None);
     assert_eq!(

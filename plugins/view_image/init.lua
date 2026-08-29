@@ -23,6 +23,8 @@ local MEDIA_TYPES = {
   webp = "image/webp",
 }
 
+maki.api.register_permission_rule({ tool = "view_image", scope = "*" })
+
 local function format_size(bytes)
   if bytes >= 1024 * 1024 then
     return string.format("%.1fMB", bytes / (1024 * 1024))
@@ -118,6 +120,9 @@ maki.api.register_tool({
   name = "view_image",
   kind = "read",
   description = DESCRIPTION,
+  permission_scopes = function(input)
+    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+  end,
   -- No interpreter audience: the code_execution bridge flattens tool output
   -- to text, so the pixels could never reach the model from there.
   audiences = { "main", "research_sub", "general_sub" },
@@ -145,7 +150,7 @@ maki.api.register_tool({
     if not raw then
       return fail("error: path is required")
     end
-    local path = maki.fs.abspath(raw)
+    local path = maki.fs.normalize(raw)
     local meta = maki.fs.metadata(path)
     if not meta then
       return fail("error: path not found: " .. path)

@@ -1,9 +1,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_int;
+use std::fs;
 use std::future::Future;
+use std::io;
 use std::panic::catch_unwind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
@@ -16,14 +18,14 @@ use event_listener::Event;
 
 use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
-use maki_agent::permissions::PluginRuleStore;
+use maki_agent::permissions::{PluginRuleStore, canonical_json_sha256};
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use maki_config::RawConfig;
 
@@ -35,7 +37,8 @@ use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::slot::SlotStore;
 use crate::api::tool::{
-    LuaTool, PendingRules, PendingTool, PendingTools, PermissionScopeSpec, ToolCallReply,
+    LuaTool, PendingRules, PendingTool, PendingTools, PermissionRulePolicy, PermissionScopeSpec,
+    ToolCallReply,
 };
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
@@ -98,6 +101,44 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+
+fn plugin_implementation_digest(source: &str, plugin_dir: Option<&Path>) -> io::Result<String> {
+    fn collect(
+        root: &Path,
+        directory: &Path,
+        files: &mut BTreeMap<String, String>,
+    ) -> io::Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                collect(root, &path, files)?;
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && path.extension().is_some_and(|extension| extension == "lua")
+                && path.metadata()?.is_file()
+            {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                let content = fs::read_to_string(&path)?;
+                files.insert(
+                    relative.into_owned(),
+                    canonical_json_sha256(&Value::String(content)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = BTreeMap::from([(
+        "<entry>".into(),
+        canonical_json_sha256(&Value::String(source.into())),
+    )]);
+    if let Some(plugin_dir) = plugin_dir {
+        collect(plugin_dir, plugin_dir, &mut files)?;
+    }
+    Ok(canonical_json_sha256(&json!(files)))
+}
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -127,12 +168,14 @@ pub enum Request {
         source: String,
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
+        rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
         plugin: Arc<str>,
         tool: Arc<str>,
+        contract: Arc<str>,
         input: Value,
         ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
@@ -142,12 +185,14 @@ pub enum Request {
     ComputeHeader {
         plugin: Arc<str>,
         tool: Arc<str>,
+        contract: Arc<str>,
         input: Value,
         reply: flume::Sender<HeaderResult>,
     },
     ComputePermissionScopes {
         plugin: Arc<str>,
         tool: Arc<str>,
+        contract: Arc<str>,
         input: Value,
         reply: flume::Sender<Option<PermissionScopes>>,
     },
@@ -159,6 +204,7 @@ pub enum Request {
         source: String,
         source_name: String,
         plugin_dir: Option<PathBuf>,
+        rule_policy: PermissionRulePolicy,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
     RunCommand {
@@ -212,6 +258,7 @@ pub enum Request {
     StartTool {
         plugin: Arc<str>,
         tool: Arc<str>,
+        contract: Arc<str>,
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
@@ -1353,6 +1400,7 @@ async fn drain_barrier(
 }
 
 struct ToolKeys {
+    contract: Arc<str>,
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
@@ -1748,12 +1796,14 @@ impl LuaRuntime {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn load_source(
         &mut self,
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
         permissions: &PluginPermissions,
+        rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
@@ -1761,6 +1811,8 @@ impl LuaRuntime {
             plugin: name.to_string(),
             source: e,
         };
+        let implementation = plugin_implementation_digest(source, plugin_dir.as_deref())
+            .map_err(|error| map_err(mlua::Error::external(error)))?;
 
         let stale = self.drain_pending();
         debug_assert!(
@@ -1778,6 +1830,7 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
+            rule_policy,
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             permissions,
@@ -1818,10 +1871,25 @@ impl LuaRuntime {
         }
 
         let pending = self.drain_pending();
+        let contracts: HashMap<Arc<str>, Arc<str>> = pending
+            .iter()
+            .map(|tool| {
+                let contract = canonical_json_sha256(&json!({
+                    "implementation": &implementation,
+                    "tool": tool.name.as_ref(),
+                    "description": &tool.description,
+                    "schema": maki_agent::tools::schema::to_json_schema(tool.schema),
+                }));
+                (Arc::clone(&tool.name), contract.into())
+            })
+            .collect();
 
         let registry_entries: Vec<(Arc<dyn Tool>, ToolSource)> = pending
             .iter()
             .map(|t| {
+                let contract = contracts
+                    .get(&t.name)
+                    .expect("contract exists for every pending tool");
                 let tool: Arc<dyn Tool> = Arc::new(LuaTool {
                     name: Arc::clone(&t.name),
                     description: t.description.clone(),
@@ -1830,6 +1898,7 @@ impl LuaRuntime {
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
+                    contract: Arc::clone(contract),
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t
@@ -1846,6 +1915,7 @@ impl LuaRuntime {
                     tool,
                     ToolSource::Lua {
                         plugin: Arc::clone(&name),
+                        contract: Arc::clone(contract),
                     },
                 )
             })
@@ -1864,9 +1934,14 @@ impl LuaRuntime {
         let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
             .map(|t| {
+                let contract = contracts
+                    .get(&t.name)
+                    .expect("contract exists for every pending tool")
+                    .clone();
                 (
                     t.name,
                     ToolKeys {
+                        contract,
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
@@ -1920,6 +1995,7 @@ impl LuaRuntime {
         &self,
         plugin: &str,
         tool: &str,
+        contract: &str,
         input: Value,
     ) -> Option<PermissionScopes> {
         let (func, lua_input) = plugin_fn(
@@ -1927,7 +2003,7 @@ impl LuaRuntime {
             &self.plugins,
             plugin,
             tool,
-            "permission_scopes",
+            Some(contract),
             |tk| tk.permission_scopes.as_ref(),
             &input,
         )?;
@@ -1943,14 +2019,27 @@ impl LuaRuntime {
             _ => return None,
         };
         let scopes_table: mlua::Table = table.get("scopes").ok()?;
-        let mut scopes = Vec::new();
-        for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
-            scopes.push(s);
+        let mut indexed = BTreeMap::new();
+        for pair in scopes_table.pairs::<LuaValue, LuaValue>() {
+            let (key, value) = pair.ok()?;
+            let LuaValue::Integer(index) = key else {
+                return None;
+            };
+            let index = usize::try_from(index).ok().filter(|index| *index > 0)?;
+            let LuaValue::String(value) = value else {
+                return None;
+            };
+            indexed.insert(index, value.to_str().ok()?.to_string());
         }
-        if scopes.is_empty() {
+        if indexed.is_empty() || indexed.keys().copied().ne(1..=indexed.len()) {
             return None;
         }
-        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        let scopes = indexed.into_values().collect();
+        let force_prompt = match table.get::<LuaValue>("force_prompt").ok()? {
+            LuaValue::Nil => false,
+            LuaValue::Boolean(value) => value,
+            _ => return None,
+        };
         Some(PermissionScopes {
             scopes,
             force_prompt,
@@ -1962,6 +2051,7 @@ impl LuaRuntime {
         source: &str,
         source_name: &str,
         plugin_dir: Option<PathBuf>,
+        rule_policy: PermissionRulePolicy,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
         let perms = load_plugin_permissions(plugin_dir.as_deref());
@@ -1970,6 +2060,7 @@ impl LuaRuntime {
             source,
             plugin_dir,
             &perms,
+            rule_policy,
             PluginOpts::default(),
             Some(&config_store),
         )
@@ -1985,17 +2076,26 @@ fn plugin_fn(
     plugins: &PluginMap,
     plugin: &str,
     tool: &str,
-    callback: &'static str,
+    contract: Option<&str>,
     key: impl FnOnce(&ToolKeys) -> Option<&RegistryKey>,
     input: &Value,
 ) -> Option<(Function, LuaValue)> {
     let func = {
         let plugins = plugins.borrow();
-        let key = key(plugins.get(plugin)?.get(tool)?)?;
+        let tool_keys = plugins.get(plugin)?.get(tool)?;
+        if contract.is_some_and(|contract| tool_keys.contract.as_ref() != contract) {
+            tracing::warn!(
+                plugin,
+                tool,
+                "plugin implementation changed during tool review"
+            );
+            return None;
+        }
+        let key = key(tool_keys)?;
         match lua.registry_value::<Function>(key) {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!(plugin, tool, callback, error = %e, "callback registry lookup failed");
+                tracing::warn!(plugin, tool, error = %e, "callback registry lookup failed");
                 return None;
             }
         }
@@ -2003,7 +2103,7 @@ fn plugin_fn(
     match json_to_lua(lua, input) {
         Ok(v) => Some((func, v)),
         Err(e) => {
-            tracing::warn!(plugin, tool, callback, error = %e, "callback input conversion failed");
+            tracing::warn!(plugin, tool, error = %e, "callback input conversion failed");
             None
         }
     }
@@ -2016,6 +2116,7 @@ async fn compute_header(
     plugins: &PluginMap,
     plugin: &str,
     tool: &str,
+    contract: Option<&str>,
     input: Value,
 ) -> HeaderResult {
     let Some((func, input_lua)) = plugin_fn(
@@ -2023,7 +2124,7 @@ async fn compute_header(
         plugins,
         plugin,
         tool,
-        "header",
+        contract,
         |tk| tk.header.as_ref(),
         &input,
     ) else {
@@ -2112,7 +2213,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let mut reply = extract_restore_reply(&ret)?;
     if reply.header.is_none() {
         reply.header = Some(
-            compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+            compute_header(lua, plugins, &plugin_name, &item.tool, None, item.input)
                 .await
                 .into_snapshot(),
         );
@@ -2395,6 +2496,7 @@ async fn run_tool_call(
     lua: Lua,
     plugin: Arc<str>,
     tool: Arc<str>,
+    contract: Arc<str>,
     input: Value,
     mut ctx: Box<LuaCtx>,
     deadline: Option<Instant>,
@@ -2412,6 +2514,9 @@ async fn run_tool_call(
         let Some(tool_keys) = keys.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        if tool_keys.contract != contract {
+            return ToolCallReply::err("plugin implementation changed during permission review");
+        }
         match lua.registry_value(&tool_keys.handler) {
             Ok(f) => f,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -2668,16 +2773,18 @@ pub fn spawn(
                             source,
                             plugin_dir,
                             permissions,
+                            rule_policy,
                             opts,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, opts, None).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, rule_policy, opts, None).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
                             plugin,
                             tool,
+                            contract,
                             input,
                             ctx,
                             deadline,
@@ -2696,6 +2803,7 @@ pub fn spawn(
                                     lua.clone(),
                                     plugin,
                                     tool,
+                                    contract,
                                     input,
                                     ctx,
                                     deadline,
@@ -2749,30 +2857,42 @@ pub fn spawn(
                         Request::ComputeHeader {
                             plugin,
                             tool,
+                            contract,
                             input,
                             reply,
                         } => {
-                            let res =
-                                compute_header(&rt.lua, &rt.plugins, &plugin, &tool, input).await;
+                            let res = compute_header(
+                                &rt.lua,
+                                &rt.plugins,
+                                &plugin,
+                                &tool,
+                                Some(&contract),
+                                input,
+                            )
+                            .await;
                             let _ = reply.send(res);
                         }
                         Request::ComputePermissionScopes {
                             plugin,
                             tool,
+                            contract,
                             input,
                             reply,
                         } => {
-                            let res = rt.compute_permission_scopes(&plugin, &tool, input).await;
+                            let res = rt
+                                .compute_permission_scopes(&plugin, &tool, &contract, input)
+                                .await;
                             let _ = reply.send(res);
                         }
                         Request::RunInitLua {
                             source,
                             source_name,
                             plugin_dir,
+                            rule_policy,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.run_init_lua(&source, &source_name, plugin_dir).await;
+                            let res = rt.run_init_lua(&source, &source_name, plugin_dir, rule_policy).await;
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
@@ -2860,6 +2980,7 @@ pub fn spawn(
                         Request::StartTool {
                             plugin,
                             tool,
+                            contract,
                             input,
                             live,
                             ctx,
@@ -2870,6 +2991,7 @@ pub fn spawn(
                                 plugins
                                     .get(&*plugin)
                                     .and_then(|p| p.get(&*tool))
+                                    .filter(|tk| tk.contract == contract)
                                     .and_then(|tk| tk.start.as_ref())
                                     .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
                             };

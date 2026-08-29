@@ -61,15 +61,20 @@ impl ToolAudience {
 
 #[derive(Clone, Debug)]
 pub enum ToolSource {
-    Mcp { server: Arc<str> },
-    Lua { plugin: Arc<str> },
+    Mcp {
+        server: Arc<str>,
+    },
+    Lua {
+        plugin: Arc<str>,
+        contract: Arc<str>,
+    },
 }
 
 impl ToolSource {
     pub fn as_log_field(&self) -> Cow<'static, str> {
         match self {
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
-            Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
+            Self::Lua { plugin, .. } => Cow::Owned(format!("lua:{plugin}")),
         }
     }
 }
@@ -378,7 +383,7 @@ impl ToolRegistry {
             let mut next: Vec<RegisteredTool> = current
                 .iter()
                 .filter(
-                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p, .. } if p.as_ref() == plugin),
                 )
                 .cloned()
                 .collect();
@@ -419,7 +424,7 @@ impl ToolRegistry {
             current
                 .iter()
                 .filter(
-                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p, .. } if p.as_ref() == plugin),
                 )
                 .cloned()
                 .collect::<Vec<_>>()
@@ -571,6 +576,7 @@ mod tests {
     fn lua_source(plugin: &str) -> ToolSource {
         ToolSource::Lua {
             plugin: plugin.into(),
+            contract: "test-contract".into(),
         }
     }
 
@@ -673,6 +679,7 @@ mod tests {
             mock("pluginA.foo"),
             ToolSource::Lua {
                 plugin: "pluginA".into(),
+                contract: "contract-a".into(),
             },
         )
         .unwrap();
@@ -680,6 +687,7 @@ mod tests {
             mock("pluginB.bar"),
             ToolSource::Lua {
                 plugin: "pluginB".into(),
+                contract: "contract-b".into(),
             },
         )
         .unwrap();
@@ -727,6 +735,7 @@ mod tests {
                     mock("shared"),
                     ToolSource::Lua {
                         plugin: "myplugin".into(),
+                        contract: "test-contract".into(),
                     },
                 )],
             )

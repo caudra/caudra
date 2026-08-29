@@ -7,198 +7,144 @@ group = "Reference"
 
 # Permissions
 
-Maki uses a permission system to decide what each tool is allowed to do and when to ask you first.
+Maki reviews a tool's exact action before it sends the call to the tool. Reusable decisions bind to the tool implementation, validated input, resources, and execution type.
 
-Rules come from four layers, combined for resolution:
+Permissions control consent. They do not sandbox shell commands or external MCP processes.
 
-1. **Session rules**, set during the current session (in-memory only)
-2. **Config rules**, loaded from TOML permission files
-3. **Builtin rules**, the hardcoded defaults
-4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/lua-api/#maki-api-register_permission_rule)
+## Resolution order
 
-Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
+Maki resolves a tool call in this order:
 
-## Check Flow
+1. Plan-mode and executor restrictions reject prohibited operations.
+2. A matching deny blocks the call.
+3. A single structured allow must cover every unresolved resource in the call.
+4. Builtin and trusted-plugin policy can allow known operations.
+5. YOLO mode can skip a prompt, but cannot override a deny.
+6. The effective default allows, denies, or prompts.
 
-For every tool call, each scope resolves like this:
+Partial structured grants are not combined. A call that affects two resources needs one rule that covers the complete reviewed call.
 
-```
-tool call
-    │
-deny rule matches?  ── yes ──►  blocked. no exceptions
-    │ no
-allow rule matches? ── yes ──►  runs
-    │ no
-YOLO active?        ── yes ──►  runs
-    │ no
-plan file write?    ── yes ──►  runs
-    │ no
-    ▼
-default: prompt / allow / deny
-```
+## Permission scopes
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Prompt decisions use four lifetimes:
 
-## Builtin Defaults
+| Lifetime | Behavior |
+|---|---|
+| Once | Allows only the current bound invocation |
+| Conversation | Survives resume and applies to subtasks in the same root conversation |
+| Project | Applies in the same canonical project directory |
+| Global | Applies in every project |
 
-File-write tools are pre-allowed inside the project working directory (cwd at session start, canonicalized). Paths outside that tree still need a prompt or an explicit allow rule:
+Project and global rules still bind to the exact native tool contract or MCP server authority and tool contract. Replacing a tool, changing an MCP endpoint, or changing an MCP schema invalidates the old authority.
 
-| Tool | Scope | Notes |
-|------|-------|-------|
-| `write` | `<cwd>/**` | Outside cwd requires permission |
-| `edit` | `<cwd>/**` | Outside cwd requires permission |
-| `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
-| `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
-| `task` | `*` | Subagent spawning always allowed |
+A user-created fork starts with no conversation grants and no inherited explicit YOLO state. Subtasks share the root conversation's grants. `/new` also starts clean.
 
-The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
+## Permission prompts
 
-These tools have no builtin allow rule, so they prompt (or follow your `default`) every time unless you add rules:
-
-- `bash` - Shell commands (scopes come from tree-sitter parsing)
-- `websearch` - Web search queries
-- `webfetch` - URL fetching
-
-Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
-
-Container tools like `batch` and `code_execution` prompt for each inner tool individually.
-
-## TOML Configuration
-
-There are two permission files:
-
-- **Global**: `~/.config/maki/permissions.toml`
-- **Project**: `.maki/permissions.toml` (takes precedence over global)
-
-```toml
-default = "deny"
-
-[bash]
-allow = [
-    "cargo *",
-    "git *",
-]
-deny = [
-    "rm -rf *",
-    "sudo *",
-]
-
-[read]
-default = "allow"
-
-[mcp.deepwiki]
-allow = ["search", "fetch"]
-
-[mcp.github]
-deny = ["admin_delete"]
-```
-
-Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
-
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
-
-### The `default` key
-
-Controls what happens when no allow or deny rule matches. Can be `"prompt"` (built-in default), `"deny"`, or `"allow"`. Set it globally or per-tool:
-
-```toml
-default = "deny"
-
-[bash]
-default = "prompt"
-allow = ["cargo *"]
-```
-
-Here everything is denied by default, except `bash` which still prompts, and `cargo *` commands which are allowed.
-
-Project files **cannot** set `default = "allow"` (top-level, per-tool, or MCP). That value is ignored so a project cannot grant itself full access. Project **allow lists** still work. Put `default = "allow"` only in the global file.
-
-## Scope Patterns
-
-| Pattern | Matches |
-|---------|--------|
-| `*` or `**` | Any value (full wildcard) |
-| `prefix*` | Values starting with prefix |
-| `cmd *` | Bare `cmd` or `cmd` plus args (`pwd *` matches `pwd` and `pwd -L`, not `pwdx`) |
-| `dir/**` | `dir` itself or anything under it (path-aware on Windows and Unix) |
-| `exact` | Exact match only |
-
-## MCP Tool Permissions
-
-MCP tools use natural TOML nesting. Server names are table keys under `[mcp]`, tool names are array values:
-
-```toml
-# Global permissions.toml (default = "allow" is ignored in project files)
-[mcp.deepwiki]
-allow = ["search", "fetch"]
-
-[mcp.github]
-deny = ["admin_delete"]
-
-[mcp.lean-lsp]
-default = "allow"               # allow all tools on this server (global only)
-```
-
-Tool names must match `^[a-zA-Z0-9_-]{1,64}$` (no dots, max 64 chars). Server names cannot contain dots.
-
-## Permission Prompts
-
-When a gated tool needs permission, Maki asks you.
+The prompt shows the action, risk, typed resources, and complete validated JSON before its controls. The body scrolls while the decision controls remain visible. Likely secret values are masked.
 
 | Key | Action |
-|-----|--------|
-| `y` | Allow once (immediate) |
-| `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels) |
-| `a` | Always allow for this project (confirm; saved to `.maki/permissions.toml`) |
-| `A` | Always allow globally (confirm; saved to `~/.config/maki/permissions.toml`) |
-| `n` | Open deny guidance editor (type optional guidance, then `Enter` to deny once; `Esc` cancels) |
-| `d` | Deny always for this project (confirm) |
-| `D` | Deny always globally (confirm) |
+|---|---|
+| `y` | Allow this exact call once |
+| `s` | Allow this exact call for the conversation, after confirmation |
+| `a` | Allow this exact call for the project, after confirmation |
+| `A` | Allow this exact call globally, after confirmation |
+| `n` | Add guidance and deny once |
+| `d` | Deny this exact call for the project, after confirmation |
+| `D` | Deny this exact call globally, after confirmation |
+| `f` | Show technical identity and digest details |
+| `Esc` or `Ctrl-C` | Deny once |
 
-Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
+Reusable approvals are exact by default. A shell approval no longer turns `cargo test` into `cargo *`, and an MCP approval no longer grants every argument to that tool.
 
-### Scope Generalization
+Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask.
 
-When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
+## Stored rules
 
-- **bash**: `cargo test --all` becomes `cargo *`
-- **write / edit / multiedit / edit_lines / insert_lines**: `/path/to/file.rs` becomes `/path/to/**`
-- **MCP tools**: always `*` (per-tool, so allowing `deepwiki.search` will not cover `deepwiki.fetch`)
-- **webfetch / websearch** (and anything else gated): the exact URL or query string is stored as-is
+Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker labels structured rules as exact, resource-scoped, or unrestricted. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
 
-For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). MCP inputs are opaque JSON with no meaningful scope pattern. Denying a single MCP invocation denies that tool until you revoke the rule.
+Project and global prompt decisions are stored in `permission-rules.json` under Maki's user state directory. The file and its update lock are owner-only. Exact input and resource values are stored as SHA-256 digests. The picker metadata keeps only anonymous field positions and value types, so raw tool input, field names, and secrets are not written there.
 
-## YOLO Mode
+Conversation rules are stored with the session. A persistent write must finish before Maki executes the approved call. If storage fails, the durable approval fails and the prompt remains open in the TUI.
 
-To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
+## TOML policy
 
-To start in YOLO mode every time:
+Maki reads policy from:
 
-```lua
--- ~/.config/maki/init.lua
-maki.setup({
-    always_yolo = true,
-})
+- Global: `~/.config/maki/permissions.toml`
+- Project: `.maki/permissions.toml`
+
+TOML deny rules and `default = "deny"` remain active. Existing allow rules, allow defaults, and legacy conversation allows are inactive review candidates. This prevents a repository from granting itself authority and prevents an old name-only rule from authorizing a replaced tool.
+
+A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
+
+`/permissions` lists these entries as `needs review`. Remove an old config entry or approve a new exact request when it appears. Legacy conversation allows can be removed directly from the picker.
+
+```toml
+default = "prompt"
+
+[bash]
+deny = [
+    "sudo *",
+    "rm -rf *",
+]
+
+[mcp.github]
+deny = ["admin_delete"]
 ```
 
-## Bash Command Parsing
+Legacy deny matching remains glob-like for compatibility:
 
-Bash commands get parsed with tree-sitter to extract individual commands. Something like `cd /tmp && cargo test` is checked as two separate commands.
+| Pattern | Matches |
+|---|---|
+| `*` or `**` | Any scope |
+| `prefix*` | Values starting with the prefix |
+| `cmd *` | Bare `cmd` or `cmd` followed by arguments |
+| `dir/**` | The directory and descendants, using path components |
+| Other | Exact text |
 
-Some constructs are too complex to analyze statically, so they always trigger a prompt:
+New remembered decisions use structured matching rather than these strings.
 
-- Command substitution: `$(...)`, backticks
-- Process substitution: `<(...)`, `>(...)`
-- Subshells: `(...)`
-- Arithmetic expansion: `$((...))`
+## Typed resources
 
-Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when possible; they do not by themselves force a prompt the way substitutions do.
+Structured requests distinguish files, directories, URLs, commands, queries, and custom resources.
 
-## Plugin Permissions
+- File matching uses normalized path components and resolves existing symlinks.
+- Protected paths such as `.git`, `.ssh`, `.aws`, and dotenv files require exact authority.
+- URL matching rejects credentials and ambiguous encoded path separators or dot segments.
+- Shell authority includes the initial working directory.
+- A deny that intersects any resource blocks the complete call.
 
-Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted bundled policy allows them by default. Explicit deny rules can therefore block read, glob, grep, index, list, skill, or image access without adding normal prompt noise.
 
-## Session Persistence
+Container tools such as `batch` and `code_execution` route inner calls through the same permission manager.
 
-When you save a session, its permission rules are saved too. Loading the session restores them.
+## MCP tool calls
+
+Generic MCP tools use the complete canonical JSON input as their exact authority. The prompt never truncates the reviewed input.
+
+Maki binds approval to one immutable MCP transport, server configuration digest, remote tool name, and discovered tool contract. A reconnect cannot switch the transport after approval. A changed description or schema creates a different contract.
+
+Generic field names such as `path` or `command` do not create reusable resource authority. External servers control their schemas, so Maki treats these values as display information unless the host has a trusted typed profile.
+
+Broad whole-tool MCP authority is shown only in technical details and is not offered by the current TUI chooser.
+
+## Bash parsing
+
+Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, functions, and redirects so nested commands and redirect targets remain visible to deny rules.
+
+Command substitution, process substitution, subshells, arithmetic expansion, unresolved redirect targets, and parse failures force exact review.
+
+The initial working directory is context, not confinement. An approved shell command can still access files, the network, and inherited environment variables.
+
+## Plugin rules
+
+Bundled plugins can declare trusted host policy for resources they own. Global user plugins need a valid `plugin.toml` before they can register allow policy. Project plugins can register deny rules only. Remembered Lua decisions bind to the plugin name, tool name, entry source, required Lua modules, description, and schema. A reload during review cannot switch the approved handler generation.
+
+Lua plugin API capabilities remain separate. `plugin.toml` controls whether plugin code may call filesystem, network, process, and environment APIs. Tool-call permissions control whether the agent may invoke a registered tool.
+
+## YOLO mode
+
+`/yolo` and `--yolo` skip prompts after deny rules and hard restrictions have run. The status bar shows `[yolo]` while enabled.
+
+An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` supplies the initial default for a fresh root.

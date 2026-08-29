@@ -8,6 +8,10 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 - NEVER create files unless absolutely necessary - prefer editing existing files.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
 
+local function path_permission_scopes(input)
+  return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+end
+
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.write) or 10, keep = "head" }
@@ -28,7 +32,7 @@ maki.api.register_tool({
   name = "write",
   kind = "edit",
   mutable_path = "path",
-  permission_scopes = "path",
+  permission_scopes = path_permission_scopes,
   audiences = { "main", "general_sub", "interpreter" },
   description = DESCRIPTION,
 
@@ -73,7 +77,7 @@ maki.api.register_tool({
       return { llm_output = "error: content is required", is_error = true }
     end
 
-    local path = maki.fs.abspath(raw)
+    local path = maki.fs.normalize(raw)
 
     local ok, err = ctx:check_before_edit(path)
     if not ok then

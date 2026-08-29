@@ -405,7 +405,7 @@ mod tests {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
         }));
-        let permissions = Arc::new(PermissionManager::new(
+        let permissions = Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
             Arc::default(),

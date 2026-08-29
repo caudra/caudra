@@ -64,6 +64,7 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
         || session.meta.active_goal.is_some()
         || session.meta.goal_result.is_some()
         || session.meta.pending_revert.is_some()
+        || !session.meta.structured_permission_rules.is_empty()
         || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
@@ -205,6 +206,7 @@ impl App {
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
+            structured_permission_rules: self.permissions.structured_conversation_rules_snapshot(),
             context_size: state.context_size,
             input_draft: (!draft.is_empty()).then_some(draft.text),
             input_draft_images: self
@@ -516,6 +518,9 @@ impl App {
     pub(crate) fn restore_resumed_session(&mut self) {
         self.permissions
             .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
+        self.permissions.load_structured_conversation_rules(
+            self.state.session.meta.structured_permission_rules.clone(),
+        );
         self.apply_stored_yolo(&self.state.session.meta);
         self.restore_display();
         if !self.state.session.meta.queued_messages.is_empty()
@@ -577,6 +582,9 @@ impl App {
         self.state.goal.reset();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
+        self.permissions.load_session_rules(Vec::new());
+        self.permissions
+            .load_structured_conversation_rules(Vec::new());
         self.permissions.set_session_yolo(None);
         if self.state.mode == Mode::Plan {
             self.enter_plan();
@@ -1077,11 +1085,9 @@ impl App {
                 .path()
                 .map(|path| path.to_string_lossy().into_owned()),
             plan_written: self.state.plan.is_ready(),
-            session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             thinking: Some(self.state.thinking.into()),
             fast: self.state.fast,
             workflow: self.state.workflow,
-            yolo: self.permissions.persisted_yolo(),
             ..SessionMeta::default()
         };
         child.replace_messages(ancestor.clone());
@@ -1207,6 +1213,8 @@ impl App {
         self.checkpoint_now();
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
+        self.permissions
+            .load_structured_conversation_rules(session.meta.structured_permission_rules.clone());
         self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);

@@ -124,20 +124,26 @@ fn denied_error(perm: Permission) -> LuaError {
 }
 
 pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
+    load_plugin_permissions_with_trust(plugin_dir).0
+}
+
+pub(crate) fn load_plugin_permissions_with_trust(
+    plugin_dir: Option<&Path>,
+) -> (PluginPermissions, bool) {
     let Some(dir) = plugin_dir else {
-        return PluginPermissions::denied();
+        return (PluginPermissions::denied(), false);
     };
     let manifest_path = dir.join(MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
         Ok(content) => match toml::from_str::<toml::Value>(&content) {
-            Ok(val) => PluginPermissions::from_manifest(&val),
+            Ok(val) => (PluginPermissions::from_manifest(&val), true),
             Err(e) => {
                 warn!(
                     path = %manifest_path.display(),
                     error = %e,
                     "invalid {MANIFEST_FILE}, denying all permissions"
                 );
-                PluginPermissions::denied()
+                (PluginPermissions::denied(), false)
             }
         },
         Err(e) => {
@@ -154,7 +160,7 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
                     "cannot read {MANIFEST_FILE}, denying all permissions"
                 );
             }
-            PluginPermissions::denied()
+            (PluginPermissions::denied(), false)
         }
     }
 }

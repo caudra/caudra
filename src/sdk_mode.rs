@@ -19,7 +19,7 @@ use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
@@ -32,7 +32,8 @@ use maki_providers::{
     HistoryItem, HistoryItemKind, ImageSource, StopReason, Timeouts, TokenUsage, add_cost,
 };
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::SessionError;
+use maki_storage::permission_state::PermissionRuleRecord;
+use maki_storage::sessions::{SessionError, StoredRule};
 use maki_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use maki_storage::{StateDir, StorageError};
 use serde::Serialize;
@@ -255,6 +256,14 @@ struct InboundControlRequestInner {
 
 #[derive(serde::Deserialize)]
 struct InboundControlResponse {
+    response: InboundControlResponseInner,
+}
+
+#[derive(serde::Deserialize)]
+struct InboundControlResponseInner {
+    subtype: String,
+    request_id: String,
+    #[serde(default)]
     response: Value,
 }
 
@@ -460,7 +469,7 @@ struct Shared {
     model: Model,
     permission_mode: PermissionMode,
     turn_start: Instant,
-    pending: HashSet<String>,
+    pending: HashMap<String, String>,
 }
 
 pub fn run(params: SdkParams) -> Result<()> {
@@ -480,11 +489,18 @@ pub fn run(params: SdkParams) -> Result<()> {
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
-    let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let requested_permission_mode =
+        PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
-    let (session_id, initial_history) = resolve_session(&cli, &working_dir)?;
+    let ResolvedSession {
+        session_id,
+        initial_history,
+        session_rules,
+        structured_permission_rules,
+        session_yolo,
+    } = resolve_session(&cli, &working_dir)?;
     crate::setup::report_session_start(
         if initial_history.is_empty() {
             maki_otel::emit::START_FRESH
@@ -498,6 +514,44 @@ pub fn run(params: SdkParams) -> Result<()> {
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
+    if let Some(handle) = &mcp_handle {
+        let awaiting: Vec<_> = handle
+            .reader()
+            .load()
+            .infos
+            .iter()
+            .filter(|info| info.status == maki_agent::McpServerStatus::AwaitingTrust)
+            .map(|info| info.name.clone())
+            .collect();
+        if !awaiting.is_empty() {
+            return Err(eyre!(
+                "project MCP servers require startup trust: {}. Run `maki`, review them with `/mcp`, then retry",
+                awaiting.join(", ")
+            ));
+        }
+    }
+    let sdk_mcp_servers: Vec<_> = mcp_handle
+        .as_ref()
+        .map(|handle| {
+            handle
+                .reader()
+                .load()
+                .infos
+                .iter()
+                .map(|info| {
+                    let status = match &info.status {
+                        maki_agent::McpServerStatus::Running => "connected",
+                        maki_agent::McpServerStatus::Connecting => "connecting",
+                        maki_agent::McpServerStatus::AwaitingTrust => "pending",
+                        maki_agent::McpServerStatus::Disabled => "disabled",
+                        maki_agent::McpServerStatus::Failed(_) => "failed",
+                        maki_agent::McpServerStatus::NeedsAuth { .. } => "needs-auth",
+                    };
+                    serde_json::json!({"name": info.name, "status": status})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let startup_model = model.clone();
     let handle = headless::spawn_interactive(InteractiveParams {
@@ -511,7 +565,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         initial_wd: cwd.clone(),
         session_id,
         initial_history,
-        yolo: permission_mode == PermissionMode::BypassPermissions,
+        yolo: requested_permission_mode == PermissionMode::BypassPermissions,
+        session_rules,
+        structured_permission_rules,
+        session_yolo,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
@@ -519,6 +576,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         local_tools: Default::default(),
     });
+    let permission_mode =
+        effective_permission_mode(requested_permission_mode, handle.permissions.is_yolo());
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -547,7 +606,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             "model": startup_model.id,
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
-            "mcp_servers": [],
+            "mcp_servers": sdk_mcp_servers,
             "slash_commands": [],
             "output_style": "default",
         }),
@@ -557,16 +616,15 @@ pub fn run(params: SdkParams) -> Result<()> {
         model: startup_model.clone(),
         permission_mode,
         turn_start: Instant::now(),
-        pending: HashSet::new(),
+        pending: HashMap::new(),
     }));
 
     let pump = EventPump {
         writer: writer.clone(),
         shared: Arc::clone(&shared),
-        answer_tx: handle.answer_tx.clone(),
+        permissions: Arc::clone(&handle.permissions),
         include_partial_messages: cli.include_partial_messages,
         synth: StreamSynth::new(),
-        tool_inputs: HashMap::new(),
         result_text: String::new(),
         cost: None,
         request_counter: 0,
@@ -635,14 +693,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                 else {
                     continue;
                 };
-                let data = cr.response;
-                if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                    && shared.lock().unwrap().pending.remove(req_id)
-                {
-                    let _ = handle
-                        .answer_tx
-                        .send(decode_permission_response(&data).encode());
-                }
+                answer_permission_response(&shared, &handle.permissions, cr.response);
             }
             "control_cancel_request" => {
                 let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
@@ -651,9 +702,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                 ) else {
                     continue;
                 };
-                if shared.lock().unwrap().pending.remove(&ccr.request_id) {
-                    let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
-                }
+                answer_pending_permission(
+                    &shared,
+                    &handle.permissions,
+                    &ccr.request_id,
+                    PermissionAnswer::Deny,
+                );
             }
             other => warn!("unknown inbound message type: {other}"),
         }
@@ -670,7 +724,30 @@ pub fn run(params: SdkParams) -> Result<()> {
     Ok(())
 }
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<HistoryItem>)> {
+struct ResolvedSession {
+    session_id: Option<SessionRef>,
+    initial_history: Vec<HistoryItem>,
+    session_rules: Vec<StoredRule>,
+    structured_permission_rules: Vec<PermissionRuleRecord>,
+    session_yolo: Option<bool>,
+}
+
+fn session_permissions(
+    session: &StoredSession,
+    fork: bool,
+) -> (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>) {
+    if fork {
+        (Vec::new(), Vec::new(), None)
+    } else {
+        (
+            session.meta.session_rules.clone(),
+            session.meta.structured_permission_rules.clone(),
+            session.meta.yolo,
+        )
+    }
+}
+
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<ResolvedSession> {
     let cli_session_id = cli
         .session_id
         .as_deref()
@@ -681,70 +758,110 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Hist
         })
         .transpose()?;
 
-    let (resumed_id, history) = if let Some(id) = &cli.session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
-        let session_ref: SessionRef = id
-            .parse()
-            .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
-        let session = crate::setup::load_session(session_ref.id(), &storage)
-            .map_err(|e| eyre!("load session {id}: {e}"))?;
-        let history = crate::setup::active_session_history(&session)
-            .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
-        if cli.fork_session {
-            let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
-            if target.id() == session_ref.id() {
-                return Err(eyre!(
-                    "fork session ID must differ from source session {id}"
-                ));
+    let (resumed_id, initial_history, session_rules, structured_permission_rules, session_yolo) =
+        if let Some(id) = &cli.session {
+            let storage = StateDir::resolve().context("resolve state dir")?;
+            let session_ref: SessionRef = id
+                .parse()
+                .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
+            let session = crate::setup::load_session(session_ref.id(), &storage)
+                .map_err(|e| eyre!("load session {id}: {e}"))?;
+            let history = crate::setup::active_session_history(&session)
+                .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
+            if cli.fork_session {
+                let (session_rules, structured_permission_rules, session_yolo) =
+                    session_permissions(&session, true);
+                let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
+                if target.id() == session_ref.id() {
+                    return Err(eyre!(
+                        "fork session ID must differ from source session {id}"
+                    ));
+                }
+                ensure_fork_target_available(&storage, &target)?;
+                let history = rebase_history(history)?;
+                let subagent_histories = session
+                    .subagent_messages()
+                    .iter()
+                    .map(|(task_id, items)| {
+                        rebase_history(items.as_ref().clone())
+                            .map(|history| (task_id.clone(), history))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                copy_history_outputs(
+                    &storage,
+                    &session_ref,
+                    &target,
+                    std::iter::once(history.as_slice())
+                        .chain(subagent_histories.values().map(Vec::as_slice)),
+                )?;
+                if let Err(error) =
+                    save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
+                {
+                    let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
+                    return Err(error);
+                }
+                (
+                    Some(target),
+                    history,
+                    session_rules,
+                    structured_permission_rules,
+                    session_yolo,
+                )
+            } else {
+                if cli_session_id
+                    .as_ref()
+                    .is_some_and(|target| target.id() != session_ref.id())
+                {
+                    return Err(eyre!(
+                        "--session-id cannot replace the resumed session ID without --fork-session"
+                    ));
+                }
+                let (session_rules, structured_permission_rules, session_yolo) =
+                    session_permissions(&session, false);
+                (
+                    Some(session_ref),
+                    history,
+                    session_rules,
+                    structured_permission_rules,
+                    session_yolo,
+                )
             }
-            ensure_fork_target_available(&storage, &target)?;
-            let history = rebase_history(history)?;
-            let subagent_histories = session
-                .subagent_messages()
-                .iter()
-                .map(|(task_id, items)| {
-                    rebase_history(items.as_ref().clone()).map(|history| (task_id.clone(), history))
-                })
-                .collect::<Result<HashMap<_, _>>>()?;
-            copy_history_outputs(
-                &storage,
-                &session_ref,
-                &target,
-                std::iter::once(history.as_slice())
-                    .chain(subagent_histories.values().map(Vec::as_slice)),
-            )?;
-            if let Err(error) =
-                save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
-            {
-                let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
-                return Err(error);
+        } else if cli.continue_session {
+            let storage = StateDir::resolve().context("resolve state dir")?;
+            match crate::setup::latest_session(cwd, &storage) {
+                Ok(Some(session)) => {
+                    let history = crate::setup::active_session_history(&session)?;
+                    let (session_rules, structured_permission_rules, session_yolo) =
+                        session_permissions(&session, false);
+                    (
+                        Some(SessionRef::from(session.id)),
+                        history,
+                        session_rules,
+                        structured_permission_rules,
+                        session_yolo,
+                    )
+                }
+                _ => (None, Vec::new(), Vec::new(), Vec::new(), None),
             }
-            (Some(target), history)
         } else {
-            if cli_session_id
-                .as_ref()
-                .is_some_and(|target| target.id() != session_ref.id())
-            {
-                return Err(eyre!(
-                    "--session-id cannot replace the resumed session ID without --fork-session"
-                ));
-            }
-            (Some(session_ref), history)
-        }
-    } else if cli.continue_session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
-        match crate::setup::latest_session(cwd, &storage) {
-            Ok(Some(session)) => {
-                let history = crate::setup::active_session_history(&session)?;
-                (Some(SessionRef::from(session.id)), history)
-            }
-            _ => (None, Vec::new()),
-        }
-    } else {
-        (None, Vec::new())
-    };
+            (None, Vec::new(), Vec::new(), Vec::new(), None)
+        };
 
-    Ok((cli_session_id.or(resumed_id), history))
+    Ok(ResolvedSession {
+        session_id: cli_session_id.or(resumed_id),
+        initial_history,
+        session_rules,
+        structured_permission_rules,
+        session_yolo,
+    })
+}
+
+fn effective_permission_mode(requested: PermissionMode, yolo: bool) -> PermissionMode {
+    match (requested, yolo) {
+        (PermissionMode::Default, true) => PermissionMode::BypassPermissions,
+        (PermissionMode::BypassPermissions, false) => PermissionMode::Default,
+        _ => requested,
+    }
 }
 
 fn rebase_history(items: Vec<HistoryItem>) -> Result<Vec<HistoryItem>> {
@@ -885,6 +1002,9 @@ fn handle_control_request(
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
                     shared.lock().unwrap().permission_mode = mode;
+                    handle
+                        .permissions
+                        .set_session_yolo(Some(mode == PermissionMode::BypassPermissions));
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -954,10 +1074,60 @@ fn resolve_model_spec(model_id: &str) -> String {
     model_id.to_string()
 }
 
-fn decode_permission_response(data: &Value) -> PermissionAnswer {
+fn decode_permission_response(
+    data: &Value,
+    expected_input: Option<&Value>,
+    expected_tool: Option<&str>,
+) -> PermissionAnswer {
     match data.get("behavior").and_then(Value::as_str) {
-        Some("allow") if data.get("updatedPermissions").is_some() => PermissionAnswer::AllowSession,
-        Some("allow") => PermissionAnswer::AllowOnce,
+        Some("allow") => {
+            if let Some(updated) = data.get("updatedInput")
+                && expected_input != Some(updated)
+            {
+                return PermissionAnswer::Deny;
+            }
+            let Some(updates) = data.get("updatedPermissions") else {
+                return PermissionAnswer::AllowOnce;
+            };
+            let Some(updates) = updates.as_array() else {
+                return PermissionAnswer::Deny;
+            };
+            if updates.is_empty() {
+                return PermissionAnswer::AllowOnce;
+            }
+            let mut destination = None;
+            for update in updates {
+                if update.get("type").and_then(Value::as_str) != Some("addRules")
+                    || update.get("behavior").and_then(Value::as_str) != Some("allow")
+                {
+                    return PermissionAnswer::Deny;
+                }
+                let Some(expected_tool) = expected_tool else {
+                    return PermissionAnswer::Deny;
+                };
+                let Some(rules) = update.get("rules").and_then(Value::as_array) else {
+                    return PermissionAnswer::Deny;
+                };
+                if rules.is_empty()
+                    || rules.iter().any(|rule| {
+                        rule.get("toolName").and_then(Value::as_str) != Some(expected_tool)
+                    })
+                {
+                    return PermissionAnswer::Deny;
+                }
+                let current = update.get("destination").and_then(Value::as_str);
+                if current.is_none() || destination.is_some_and(|value| Some(value) != current) {
+                    return PermissionAnswer::Deny;
+                }
+                destination = current;
+            }
+            match destination {
+                Some("session") => PermissionAnswer::AllowSession,
+                Some("projectSettings" | "localSettings") => PermissionAnswer::AllowAlwaysLocal,
+                Some("userSettings") => PermissionAnswer::AllowAlwaysGlobal,
+                _ => PermissionAnswer::Deny,
+            }
+        }
         Some("deny") => match data.get("message").and_then(Value::as_str) {
             Some(msg) if !msg.is_empty() => PermissionAnswer::DenyWithGuidance(msg.to_string()),
             _ => PermissionAnswer::Deny,
@@ -966,13 +1136,64 @@ fn decode_permission_response(data: &Value) -> PermissionAnswer {
     }
 }
 
+fn answer_permission_response(
+    shared: &Mutex<Shared>,
+    permissions: &PermissionManager,
+    response: InboundControlResponseInner,
+) {
+    let request_id = shared
+        .lock()
+        .unwrap()
+        .pending
+        .get(&response.request_id)
+        .cloned();
+    let pending_request = request_id
+        .as_deref()
+        .and_then(|request_id| permissions.pending_request(request_id));
+    let pending_tool = pending_request.as_ref().map(|request| {
+        let tool = request.tool.to_string();
+        maki_to_claude_tool_name(&tool).to_owned()
+    });
+    let answer = if response.subtype == "success" {
+        decode_permission_response(
+            &response.response,
+            pending_request.as_ref().map(|request| &request.input),
+            pending_tool.as_deref(),
+        )
+    } else {
+        PermissionAnswer::Deny
+    };
+    answer_pending_permission(shared, permissions, &response.request_id, answer);
+}
+
+fn answer_pending_permission(
+    shared: &Mutex<Shared>,
+    permissions: &PermissionManager,
+    sdk_request_id: &str,
+    answer: PermissionAnswer,
+) -> bool {
+    let Some(request_id) = shared.lock().unwrap().pending.remove(sdk_request_id) else {
+        warn!(
+            sdk_request_id,
+            "response for unknown SDK permission request"
+        );
+        return false;
+    };
+    if permissions.answer(&request_id, answer) {
+        true
+    } else {
+        warn!(%request_id, "SDK permission response failed; denying request");
+        permissions.answer(&request_id, PermissionAnswer::Deny);
+        false
+    }
+}
+
 struct EventPump {
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
-    answer_tx: Sender<String>,
+    permissions: Arc<PermissionManager>,
     include_partial_messages: bool,
     synth: StreamSynth,
-    tool_inputs: HashMap<String, (String, Value)>,
     result_text: String,
     /// Summed as the turns land: rates move mid-prompt, and only a turn knows
     /// the rate it paid.
@@ -1005,10 +1226,12 @@ impl EventPump {
 
     fn reset_turn(&mut self) {
         self.synth.reset();
-        self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock().unwrap().pending.clear();
+        let pending = mem::take(&mut self.shared.lock().unwrap().pending);
+        for request_id in pending.into_values() {
+            self.permissions.answer(&request_id, PermissionAnswer::Deny);
+        }
     }
 
     fn emit_turn_result(
@@ -1075,7 +1298,6 @@ impl EventPump {
                     );
                     self.emit_stream(events)?;
                 }
-                self.tool_inputs.insert(ts.id.clone(), (name, input));
             }
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
@@ -1146,33 +1368,39 @@ impl EventPump {
                     parent_tool_use_id,
                 }))?;
             }
-            AgentEvent::PermissionRequest { id, tool, .. } => {
+            AgentEvent::PermissionRequest(request) => {
                 if self.shared.lock().unwrap().permission_mode == PermissionMode::BypassPermissions
                 {
-                    let _ = self.answer_tx.send(PermissionAnswer::AllowSession.encode());
+                    self.permissions
+                        .answer(&request.id, PermissionAnswer::AllowOnce);
                     return Ok(());
                 }
 
-                let (tool_name, input) = self
-                    .tool_inputs
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| (tool.to_string(), Value::Null));
-
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                self.shared.lock().unwrap().pending.insert(req_id.clone());
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .insert(req_id.clone(), request.id.clone());
+                let tool_name = request.tool.to_string();
 
-                self.writer
+                let emitted = self
+                    .writer
                     .emit(WireInner::ControlRequest(ControlRequestPayload {
-                        request_id: req_id,
+                        request_id: req_id.clone(),
                         request: ControlRequestInner {
                             subtype: "can_use_tool",
                             tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
-                            input: Some(input),
-                            tool_use_id: Some(id.clone()),
+                            input: Some(request.input.clone()),
+                            tool_use_id: Some(request.id.clone()),
                         },
-                    }))?;
+                    }));
+                if let Err(error) = emitted {
+                    self.shared.lock().unwrap().pending.remove(&req_id);
+                    self.permissions.answer(&request.id, PermissionAnswer::Deny);
+                    return Err(error);
+                }
             }
             AgentEvent::Done {
                 usage,
@@ -1217,9 +1445,103 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::permissions::PermissionRequest;
+    use maki_agent::tools::PermissionScopes;
     use maki_providers::{ContentBlock, Message, Role};
+    use maki_storage::sessions::{StoredEffect, StoredRule};
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const SESSION_PERMISSION_SCOPE: &str = "cargo *";
+    const MAKI_REQUEST_ID: &str = "maki-permission-1";
+    const SECOND_MAKI_REQUEST_ID: &str = "maki-permission-2";
+
+    fn permission_manager() -> Arc<PermissionManager> {
+        Arc::new(PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            Path::new("/project").to_path_buf(),
+            Arc::default(),
+        ))
+    }
+
+    fn shared_with_pending(pending: HashMap<String, String>) -> Arc<Mutex<Shared>> {
+        Arc::new(Mutex::new(Shared {
+            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending,
+        }))
+    }
+
+    fn pending_permission(
+        manager: Arc<PermissionManager>,
+        request_id: &str,
+        scope: &str,
+        input: Value,
+    ) -> (smol::Task<bool>, Receiver<Envelope>) {
+        let (event_tx, event_rx) = flume::unbounded();
+        let event_tx = maki_agent::EventSender::new(event_tx, 0);
+        let request_id = request_id.to_owned();
+        let scopes = PermissionScopes::single(scope.to_owned());
+        let task = smol::spawn(async move {
+            let (_legacy_tx, legacy_rx) = flume::unbounded();
+            let legacy_rx = smol::lock::Mutex::new(legacy_rx);
+            manager
+                .enforce(
+                    &maki_config::ToolKey::native("bash"),
+                    &scopes,
+                    &input,
+                    &event_tx,
+                    Some(&legacy_rx),
+                    &request_id,
+                    &maki_agent::CancelToken::none(),
+                    None,
+                )
+                .await
+                .is_ok()
+        });
+        (task, event_rx)
+    }
+
+    async fn enforcement_without_answer(manager: &PermissionManager, scope: &str) -> bool {
+        let (event_tx, _) = flume::unbounded();
+        manager
+            .enforce(
+                &maki_config::ToolKey::native("bash"),
+                &PermissionScopes::single(scope.to_owned()),
+                &serde_json::json!({"command": scope}),
+                &maki_agent::EventSender::new(event_tx, 0),
+                None,
+                "follow-up",
+                &maki_agent::CancelToken::none(),
+                None,
+            )
+            .await
+            .is_ok()
+    }
+
+    fn permission_event_pump(
+        permissions: Arc<PermissionManager>,
+        permission_mode: PermissionMode,
+    ) -> (EventPump, Receiver<String>, Arc<Mutex<Shared>>) {
+        let (out_tx, out_rx) = flume::unbounded();
+        let shared = shared_with_pending(HashMap::new());
+        shared.lock().unwrap().permission_mode = permission_mode;
+        let pump = EventPump {
+            writer: SdkWriter {
+                session_id: SessionRef::generate(),
+                out_tx,
+            },
+            shared: Arc::clone(&shared),
+            permissions,
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+        };
+        (pump, out_rx, shared)
+    }
 
     fn history_messages(items: Vec<HistoryItem>) -> Vec<Message> {
         History::restored(items).unwrap().into_vec()
@@ -1241,6 +1563,35 @@ mod tests {
                 ..Default::default()
             },
         ]
+    }
+
+    fn stored_session_rule() -> StoredRule {
+        StoredRule {
+            tool: "bash".into(),
+            scope: Some(SESSION_PERMISSION_SCOPE.into()),
+            effect: StoredEffect::Allow,
+        }
+    }
+
+    fn stored_structured_rule() -> PermissionRuleRecord {
+        let request = PermissionRequest::from_legacy(
+            "stored-structured".into(),
+            maki_config::ToolKey::native("bash"),
+            vec!["cargo test".into()],
+            serde_json::json!({"command": "cargo test"}),
+            Path::new("/repo"),
+            false,
+        );
+        PermissionRuleRecord::conversation(
+            request
+                .options
+                .iter()
+                .find(|option| option.id == "allow_conversation")
+                .unwrap()
+                .rule
+                .clone(),
+        )
+        .unwrap()
     }
 
     fn claude_to_maki_tool_name(name: &str) -> &str {
@@ -1399,7 +1750,10 @@ mod tests {
     fn saved_sdk_fork_restores_rebased_subagent_history_and_rejects_collision() {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
-        let source = StoredSession::new("provider/model", "/repo");
+        let mut source = StoredSession::new("provider/model", "/repo");
+        source.meta.session_rules = vec![stored_session_rule()];
+        source.meta.structured_permission_rules = vec![stored_structured_rule()];
+        source.meta.yolo = Some(true);
         let target = SessionRef::generate();
         let history = History::new(vec![Message::user("main".into())]).into_items();
         let subagent = History::new(vec![Message::user("nested".into())]).into_items();
@@ -1416,8 +1770,32 @@ mod tests {
         let loaded = maki_agent::load_stored_session(target.id(), &storage).unwrap();
         assert_eq!(loaded.messages(), history);
         assert_eq!(loaded.subagent_messages()["task-1"].as_ref(), &subagent);
+        assert!(loaded.meta.session_rules.is_empty());
+        assert!(loaded.meta.structured_permission_rules.is_empty());
+        assert_eq!(loaded.meta.yolo, None);
         assert!(ensure_fork_target_available(&storage, &target).is_err());
         assert!(ensure_fork_target_available(&storage, &SessionRef::generate()).is_ok());
+    }
+
+    #[test]
+    fn sdk_resume_restores_permissions_while_fork_starts_clean() {
+        let mut session = StoredSession::new("provider/model", "/repo");
+        session.meta.session_rules = vec![stored_session_rule()];
+        session.meta.structured_permission_rules = vec![stored_structured_rule()];
+        session.meta.yolo = Some(true);
+
+        let resumed = session_permissions(&session, false);
+        let forked = session_permissions(&session, true);
+
+        assert_eq!(
+            resumed,
+            (
+                session.meta.session_rules.clone(),
+                session.meta.structured_permission_rules.clone(),
+                Some(true)
+            )
+        );
+        assert_eq!(forked, (Vec::new(), Vec::new(), None));
     }
 
     const MODEL: &str = "test-model";
@@ -1573,6 +1951,16 @@ mod tests {
         );
     }
 
+    #[test_case(PermissionMode::Default, true => PermissionMode::BypassPermissions ; "stored_yolo_is_reported")]
+    #[test_case(PermissionMode::BypassPermissions, false => PermissionMode::Default ; "stored_off_overrides_flag")]
+    #[test_case(PermissionMode::Plan, true => PermissionMode::Plan ; "plan_mode_is_preserved")]
+    fn effective_mode_tracks_restored_yolo(
+        requested: PermissionMode,
+        yolo: bool,
+    ) -> PermissionMode {
+        effective_permission_mode(requested, yolo)
+    }
+
     #[test]
     fn content_text_extracts_from_all_shapes() {
         assert_eq!(content_text(&serde_json::json!("hi")), Some("hi".into()));
@@ -1698,29 +2086,263 @@ mod tests {
     #[test]
     fn decode_permission_response_variants() {
         assert!(matches!(
-            decode_permission_response(&serde_json::json!({"behavior": "allow"})),
+            decode_permission_response(&serde_json::json!({"behavior": "allow"}), None, None),
             PermissionAnswer::AllowOnce
         ));
         assert!(matches!(
             decode_permission_response(
-                &serde_json::json!({"behavior": "allow", "updatedPermissions": []})
+                &serde_json::json!({"behavior": "allow", "updatedPermissions": []}),
+                None,
+                None,
             ),
-            PermissionAnswer::AllowSession
+            PermissionAnswer::AllowOnce
         ));
         assert!(matches!(
-            decode_permission_response(&serde_json::json!({})),
+            decode_permission_response(&serde_json::json!({}), None, None),
             PermissionAnswer::Deny
         ));
         assert!(matches!(
-            decode_permission_response(&serde_json::json!({"behavior": "something_else"})),
+            decode_permission_response(
+                &serde_json::json!({"behavior": "something_else"}),
+                None,
+                None,
+            ),
             PermissionAnswer::Deny
         ));
         match decode_permission_response(
             &serde_json::json!({"behavior": "deny", "message": "not now"}),
+            None,
+            None,
         ) {
             PermissionAnswer::DenyWithGuidance(msg) => assert_eq!(msg, "not now"),
             other => panic!("expected guidance, got {other:?}"),
         }
+        let expected = serde_json::json!({"command": "cargo test"});
+        assert!(matches!(
+            decode_permission_response(
+                &serde_json::json!({
+                    "behavior": "allow",
+                    "updatedInput": {"command": "cargo publish"}
+                }),
+                Some(&expected),
+                Some("Bash"),
+            ),
+            PermissionAnswer::Deny
+        ));
+        assert!(matches!(
+            decode_permission_response(
+                &serde_json::json!({
+                    "behavior": "allow",
+                    "updatedInput": expected,
+                    "updatedPermissions": [{
+                        "type": "addRules",
+                        "behavior": "allow",
+                        "destination": "session",
+                        "rules": [{"toolName": "Bash"}]
+                    }]
+                }),
+                Some(&serde_json::json!({"command": "cargo test"})),
+                Some("Bash"),
+            ),
+            PermissionAnswer::AllowSession
+        ));
+        assert!(matches!(
+            decode_permission_response(
+                &serde_json::json!({
+                    "behavior": "allow",
+                    "updatedPermissions": [{
+                        "type": "addRules",
+                        "behavior": "allow",
+                        "destination": "session",
+                        "rules": [{"toolName": "Read"}]
+                    }]
+                }),
+                Some(&serde_json::json!({"command": "cargo test"})),
+                Some("Bash"),
+            ),
+            PermissionAnswer::Deny
+        ));
+    }
+
+    #[test]
+    fn sdk_permission_request_uses_full_structured_input() {
+        let manager = permission_manager();
+        let (mut pump, out_rx, shared) =
+            permission_event_pump(Arc::clone(&manager), PermissionMode::Default);
+        let input = serde_json::json!({
+            "command": "x".repeat(512),
+            "nested": {"complete": true, "values": [1, 2, 3]}
+        });
+        let request = PermissionRequest::from_legacy(
+            MAKI_REQUEST_ID.into(),
+            maki_config::ToolKey::native("bash"),
+            vec!["cargo test".into()],
+            input.clone(),
+            Path::new("/project"),
+            false,
+        );
+
+        pump.handle(Envelope {
+            event: AgentEvent::PermissionRequest(Box::new(request)),
+            subagent: None,
+            run_id: 0,
+        })
+        .unwrap();
+
+        let message: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(message["type"], "control_request");
+        assert_eq!(message["request"]["subtype"], "can_use_tool");
+        assert_eq!(message["request"]["input"], input);
+        assert_eq!(message["request"]["tool_use_id"], MAKI_REQUEST_ID);
+        assert_eq!(shared.lock().unwrap().pending["req_1"], MAKI_REQUEST_ID);
+    }
+
+    #[test]
+    fn sdk_permission_responses_correlate_concurrent_requests_out_of_order() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (first, first_events) = pending_permission(
+                Arc::clone(&manager),
+                MAKI_REQUEST_ID,
+                "cargo test",
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let (second, second_events) = pending_permission(
+                Arc::clone(&manager),
+                SECOND_MAKI_REQUEST_ID,
+                "cargo check",
+                serde_json::json!({"command": "cargo check"}),
+            );
+            let _ = first_events.recv_async().await.unwrap();
+            let _ = second_events.recv_async().await.unwrap();
+            let shared = shared_with_pending(HashMap::from([
+                ("req_1".into(), MAKI_REQUEST_ID.into()),
+                ("req_2".into(), SECOND_MAKI_REQUEST_ID.into()),
+            ]));
+
+            answer_permission_response(
+                &shared,
+                &manager,
+                InboundControlResponseInner {
+                    subtype: "success".into(),
+                    request_id: "req_2".into(),
+                    response: serde_json::json!({"behavior": "allow"}),
+                },
+            );
+            answer_permission_response(
+                &shared,
+                &manager,
+                InboundControlResponseInner {
+                    subtype: "success".into(),
+                    request_id: "req_1".into(),
+                    response: serde_json::json!({"behavior": "unknown"}),
+                },
+            );
+
+            assert!(!first.await, "unknown response denies its request");
+            assert!(second.await, "out-of-order allow reaches its request");
+            assert!(shared.lock().unwrap().pending.is_empty());
+        });
+    }
+
+    #[test]
+    fn sdk_updated_permissions_grant_only_exact_conversation_scope() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (task, events) = pending_permission(
+                Arc::clone(&manager),
+                MAKI_REQUEST_ID,
+                "cargo test",
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let _ = events.recv_async().await.unwrap();
+            let shared =
+                shared_with_pending(HashMap::from([("req_1".into(), MAKI_REQUEST_ID.into())]));
+
+            answer_permission_response(
+                &shared,
+                &manager,
+                InboundControlResponseInner {
+                    subtype: "success".into(),
+                    request_id: "req_1".into(),
+                    response: serde_json::json!({
+                        "behavior": "allow",
+                        "updatedPermissions": [{
+                            "type": "addRules",
+                            "rules": [{"toolName": "Bash"}],
+                            "behavior": "allow",
+                            "destination": "session"
+                        }]
+                    }),
+                },
+            );
+
+            assert!(task.await);
+            assert!(enforcement_without_answer(&manager, "cargo test").await);
+            assert!(!enforcement_without_answer(&manager, "cargo publish").await);
+        });
+    }
+
+    #[test]
+    fn sdk_permission_cancellation_denies_the_correlated_request() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (task, events) = pending_permission(
+                Arc::clone(&manager),
+                MAKI_REQUEST_ID,
+                "cargo test",
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let _ = events.recv_async().await.unwrap();
+            let shared =
+                shared_with_pending(HashMap::from([("req_1".into(), MAKI_REQUEST_ID.into())]));
+
+            assert!(answer_pending_permission(
+                &shared,
+                &manager,
+                "req_1",
+                PermissionAnswer::Deny
+            ));
+            assert!(!task.await);
+            assert!(shared.lock().unwrap().pending.is_empty());
+        });
+    }
+
+    #[test]
+    fn sdk_bypass_answers_the_structured_request_id() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (task, events) = pending_permission(
+                Arc::clone(&manager),
+                MAKI_REQUEST_ID,
+                "cargo test",
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let envelope = events.recv_async().await.unwrap();
+            let (mut pump, out_rx, _) =
+                permission_event_pump(Arc::clone(&manager), PermissionMode::BypassPermissions);
+
+            pump.handle(envelope).unwrap();
+
+            assert!(task.await);
+            assert!(out_rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn sdk_control_response_deserializes_claude_wire_envelope() {
+        let response: InboundControlResponse = serde_json::from_value(serde_json::json!({
+            "response": {
+                "subtype": "success",
+                "request_id": "req_1",
+                "response": {"behavior": "allow", "updatedInput": {}}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(response.response.request_id, "req_1");
+        assert_eq!(response.response.subtype, "success");
+        assert_eq!(response.response.response["behavior"], "allow");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
-use maki_config::ModelPolicy;
+use maki_config::{Effect, ModelPolicy, PermissionRule, ToolKey};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -12,6 +12,8 @@ use maki_providers::{ContentBlock, HistoryItemKind, Message, Role};
 use maki_providers::{HistoryItem, merge_history_items};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::permission_state::PermissionRuleRecord;
+use maki_storage::sessions::{StoredEffect, StoredRule};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -88,7 +90,19 @@ impl SessionStore {
         }
     }
 
-    fn record_turn(&mut self, history: &History, model_spec: String) {
+    fn sync_permissions(&mut self, permissions: &PermissionManager) {
+        self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
+        self.session.meta.structured_permission_rules =
+            permissions.structured_conversation_rules_snapshot();
+        self.session.meta.yolo = permissions.persisted_yolo();
+    }
+
+    fn record_turn(
+        &mut self,
+        history: &History,
+        model_spec: String,
+        permissions: &PermissionManager,
+    ) {
         let mut merged = self.session.messages().to_vec();
         if let Err(error) = merge_history_items(&mut merged, history.active_items()) {
             warn!(%error, "refusing to persist invalid history graph");
@@ -116,9 +130,45 @@ impl SessionStore {
             }
             self.persisted_subagent_history = snapshot;
         }
+        self.sync_permissions(permissions);
         self.session.update_title_if_default();
         self.save();
     }
+}
+
+fn rules_to_stored(rules: &[PermissionRule]) -> Vec<StoredRule> {
+    rules
+        .iter()
+        .map(|rule| StoredRule {
+            tool: rule.tool.to_string(),
+            scope: rule.scope.clone(),
+            effect: match rule.effect {
+                Effect::Allow => StoredEffect::Allow,
+                Effect::Deny => StoredEffect::Deny,
+            },
+        })
+        .collect()
+}
+
+fn stored_to_rules(rules: &[StoredRule]) -> Vec<PermissionRule> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let tool = ToolKey::parse(&rule.tool)
+                .map_err(|error| {
+                    warn!(tool = %rule.tool, %error, "skipping malformed stored permission rule")
+                })
+                .ok()?;
+            Some(PermissionRule {
+                tool,
+                scope: rule.scope.clone(),
+                effect: match rule.effect {
+                    StoredEffect::Allow => Effect::Allow,
+                    StoredEffect::Deny => Effect::Deny,
+                },
+            })
+        })
+        .collect()
 }
 
 pub struct HeadlessParams {
@@ -266,7 +316,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     model,
                     config: params.config,
                     tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::new(PermissionManager::new(
+                    permissions: Arc::new(PermissionManager::new_persistent(
                         params.permissions_config,
                         working_dir_path,
                         params.plugin_rules,
@@ -343,6 +393,9 @@ pub struct InteractiveParams {
     pub session_id: Option<SessionRef>,
     pub initial_history: Vec<HistoryItem>,
     pub yolo: bool,
+    pub session_rules: Vec<StoredRule>,
+    pub structured_permission_rules: Vec<PermissionRuleRecord>,
+    pub session_yolo: Option<bool>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub workflow: bool,
@@ -406,11 +459,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
-    let permissions = Arc::new(PermissionManager::new(
+    let permissions = Arc::new(PermissionManager::new_persistent(
         permissions_config,
         params.initial_wd,
         Arc::clone(&params.plugin_rules),
     ));
+    permissions.load_session_rules(stored_to_rules(&params.session_rules));
+    permissions.load_structured_conversation_rules(params.structured_permission_rules);
+    permissions.set_session_yolo(params.session_yolo);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
@@ -559,9 +615,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 }
 
                 if let Some(store) = &mut store {
-                    store.record_turn(&history, model.spec());
+                    store.record_turn(&history, model.spec(), &permissions);
                 }
                 run_id += 1;
+            }
+
+            if let Some(store) = &mut store {
+                store.sync_permissions(&permissions);
+                store.save();
             }
 
             if let Some(handle) = params.mcp_handle {
@@ -596,6 +657,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::permission_state::PermissionRuleRecord;
     use maki_storage::sessions::generate_title;
     use maki_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
@@ -605,6 +667,7 @@ mod tests {
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+    const SESSION_SCOPE: &str = "cargo *";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -621,6 +684,14 @@ mod tests {
 
     fn load(tmp: &TempDir) -> StoredSession {
         StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
+    }
+
+    fn permission_manager() -> PermissionManager {
+        PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            PathBuf::from(CWD),
+            Arc::default(),
+        )
     }
 
     #[test]
@@ -640,7 +711,7 @@ mod tests {
         let mut store = store_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
         let history = History::new(messages.clone());
-        store.record_turn(&history, MODEL_SPEC.into());
+        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 1);
@@ -655,7 +726,7 @@ mod tests {
             Message::user("fix the login bug".into()),
             Message::observation("build failed".into()),
         ]);
-        store.record_turn(&history, MODEL_SPEC.into());
+        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
@@ -694,7 +765,7 @@ mod tests {
             },
         ]);
 
-        store.record_turn(&history, MODEL_SPEC.into());
+        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
 
         let loaded = load(&tmp);
         let restored = loaded.messages().iter().find_map(|item| match &item.kind {
@@ -711,6 +782,7 @@ mod tests {
         store.record_turn(
             &History::new(vec![Message::user("first prompt".into())]),
             MODEL_SPEC.into(),
+            &permission_manager(),
         );
         drop(store);
 
@@ -719,7 +791,7 @@ mod tests {
 
         let mut history = History::restored(store.session.messages().to_vec()).unwrap();
         history.push(Message::user("second prompt".into()));
-        store.record_turn(&history, "other/model".into());
+        store.record_turn(&history, "other/model".into(), &permission_manager());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
@@ -735,7 +807,11 @@ mod tests {
             .reserve("task-1")
             .unwrap()
             .complete(vec![Message::user("investigate".into())]);
-        store.record_turn(&History::default(), MODEL_SPEC.into());
+        store.record_turn(
+            &History::default(),
+            MODEL_SPEC.into(),
+            &permission_manager(),
+        );
 
         let loaded = load(&tmp);
         let task_history =
@@ -745,6 +821,65 @@ mod tests {
         let reopened = store_in(&tmp);
         let lease = reopened.subagent_history.continue_task("task-1").unwrap();
         assert_eq!(lease.history().unwrap()[0].user_text(), Some("investigate"));
+    }
+
+    #[test]
+    fn record_turn_checkpoints_restorable_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let permissions = permission_manager();
+        let rule = PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: Some(SESSION_SCOPE.into()),
+            effect: Effect::Allow,
+        };
+        permissions.load_session_rules(vec![rule.clone()]);
+        let request = crate::permissions::PermissionRequest::from_legacy(
+            "request".into(),
+            ToolKey::native("bash"),
+            vec!["cargo test".into()],
+            serde_json::json!({"command": "cargo test"}),
+            PathBuf::from(CWD).as_path(),
+            false,
+        );
+        let structured = PermissionRuleRecord::conversation(
+            request
+                .options
+                .iter()
+                .find(|option| option.id == "allow_conversation")
+                .unwrap()
+                .rule
+                .clone(),
+        )
+        .unwrap();
+        permissions.load_structured_conversation_rules(vec![structured.clone()]);
+        permissions.set_session_yolo(Some(true));
+
+        store.record_turn(&History::default(), MODEL_SPEC.into(), &permissions);
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.meta.session_rules.len(), 1);
+        assert_eq!(
+            loaded.meta.structured_permission_rules,
+            vec![structured.clone()]
+        );
+        assert_eq!(loaded.meta.yolo, Some(true));
+        let restored = permission_manager();
+        restored.load_session_rules(stored_to_rules(&loaded.meta.session_rules));
+        restored
+            .load_structured_conversation_rules(loaded.meta.structured_permission_rules.clone());
+        restored.set_session_yolo(loaded.meta.yolo);
+        let restored_rules = restored.session_rules_snapshot();
+        assert_eq!(restored_rules.len(), 1);
+        assert_eq!(restored_rules[0].tool, rule.tool);
+        assert_eq!(restored_rules[0].scope, rule.scope);
+        assert_eq!(restored_rules[0].effect, rule.effect);
+        assert_eq!(
+            restored.structured_conversation_rules_snapshot(),
+            vec![structured]
+        );
+        assert!(restored.is_yolo());
+        assert_eq!(restored.persisted_yolo(), Some(true));
     }
 
     #[test]

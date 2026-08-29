@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
 use maki_storage::StateDir;
 use maki_storage::auth::load_mcp_auth;
 use serde_json::Value;
+use url::{Host, Url};
 
 use super::error::McpError;
 use super::oauth;
@@ -19,7 +21,6 @@ use super::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest};
 use super::transport::{BoxFuture, McpTransport};
 use tracing::{info, warn};
 
-pub(super) const MAX_REDIRECTS: u32 = 10;
 const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 const INITIALIZE_METHOD: &str = "initialize";
@@ -33,6 +34,7 @@ pub struct HttpTransport {
     url: String,
     client: HttpClient,
     headers: HashMap<String, String>,
+    resolved: Vec<IpAddr>,
     auth: Mutex<Option<String>>,
     storage: Option<StateDir>,
     negotiated: Mutex<Negotiated>,
@@ -52,16 +54,32 @@ impl HttpTransport {
         name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        resolved: &[IpAddr],
         timeout: Duration,
         storage: Option<StateDir>,
     ) -> Result<Self, McpError> {
-        let client = HttpClient::builder()
-            .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
+        let builder = HttpClient::builder()
+            // A trusted public endpoint must not redirect MCP traffic or
+            // credentials into a private network target that was never reviewed.
+            .redirect_policy(RedirectPolicy::None)
             // The workspace enables curl's http2 feature for OTLP over gRPC,
             // which would otherwise flip this transport to h2 over TLS. Its
             // streaming responses are tuned for HTTP/1.1, so pin it.
             .version_negotiation(VersionNegotiation::http11())
-            .timeout(timeout)
+            .timeout(timeout);
+        let builder = match (Url::parse(url), resolved.is_empty()) {
+            (Ok(url), false) => match (url.host(), url.port_or_known_default()) {
+                (Some(Host::Domain(host)), Some(port)) => {
+                    let mappings = resolved.iter().fold(ResolveMap::new(), |map, address| {
+                        map.add(host, port, *address)
+                    });
+                    builder.dns_resolve(mappings)
+                }
+                _ => builder,
+            },
+            _ => builder,
+        };
+        let client = builder
             .build()
             .map_err(|e: isahc::Error| McpError::StartFailed {
                 server: name.into(),
@@ -84,6 +102,7 @@ impl HttpTransport {
             url: url.to_string(),
             client,
             headers,
+            resolved: resolved.to_vec(),
             auth: Mutex::new(auth),
             storage,
             negotiated: Mutex::new(Negotiated::default()),
@@ -193,7 +212,7 @@ impl HttpTransport {
             return guard.clone();
         }
 
-        match oauth::silent_refresh(storage, &self.name, &self.url).await {
+        match oauth::silent_refresh(storage, &self.name, &self.url, Some(&self.resolved)).await {
             Ok(Some(data)) => {
                 let header = format!("Bearer {}", data.tokens?.access);
                 *guard = Some(header.clone());
@@ -560,7 +579,7 @@ mod tests {
         headers: HashMap<String, String>,
         storage: Option<StateDir>,
     ) -> HttpTransport {
-        HttpTransport::new("srv", url, &headers, Duration::from_secs(5), storage).unwrap()
+        HttpTransport::new("srv", url, &headers, &[], Duration::from_secs(5), storage).unwrap()
     }
 
     fn oauth_routes(base: &str, req: &Req) -> Option<(u16, String)> {

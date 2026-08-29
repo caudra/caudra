@@ -493,7 +493,7 @@ pub fn cli_tool_ctx() -> ToolContext {
         &AgentMode::Build,
         &event_tx,
         CancelToken::none(),
-        Arc::new(PermissionManager::new(
+        Arc::new(PermissionManager::new_nonpersistent(
             maki_config::PermissionsConfig {
                 default: maki_config::DefaultEffect::Allow,
                 rules: vec![],
@@ -556,7 +556,7 @@ pub mod test_support {
     }
 
     static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
-        Arc::new(PermissionManager::new(
+        Arc::new(PermissionManager::new_nonpersistent(
             maki_config::PermissionsConfig {
                 default: maki_config::DefaultEffect::Allow,
                 rules: vec![],

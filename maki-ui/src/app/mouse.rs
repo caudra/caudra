@@ -34,6 +34,14 @@ impl App {
             || self.float_mgr.is_open();
         if passive_modal_open || self.permission_prompt.is_open() {
             self.clear_control_hovers();
+        } else if self.permissions_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.permissions_picker.handle_mouse(event),
+                |app, action| app.handle_permissions_picker_action(action),
+            ) {
+                return actions;
+            }
         } else if self.mcp_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,

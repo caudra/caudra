@@ -1112,7 +1112,7 @@ mod tests {
                 model: default_model(),
                 config: AgentConfig::default(),
                 tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
+                permissions: Arc::new(PermissionManager::new_nonpersistent(
                     maki_config::PermissionsConfig {
                         default: maki_config::DefaultEffect::Allow,
                         rules: vec![],

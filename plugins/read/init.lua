@@ -22,6 +22,8 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
+maki.api.register_permission_rule({ tool = "read", scope = "*" })
+
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
@@ -163,6 +165,9 @@ maki.api.register_tool({
   name = "read",
   kind = "read",
   description = DESCRIPTION,
+  permission_scopes = function(input)
+    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+  end,
 
   schema = {
     type = "object",
@@ -226,7 +231,7 @@ maki.api.register_tool({
     if not raw then
       return { llm_output = "error: path is required", is_error = true }
     end
-    local path = maki.fs.abspath(raw)
+    local path = maki.fs.normalize(raw)
     local meta = maki.fs.metadata(path)
     if not meta then
       return { llm_output = "error: path not found: " .. path, is_error = true }

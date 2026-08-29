@@ -10,7 +10,10 @@ use maki_agent::tools::{
     timeout_annotation,
 };
 use maki_agent::{ToolOutput, ToolOutputLimits};
-use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
+use maki_config::{
+    AlwaysThinking, Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey,
+    ToolOutputLines,
+};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
@@ -307,7 +310,7 @@ fn register_echo_tool() {
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
     assert!(
-        matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "echo_plugin"),
+        matches!(entry.source, ToolSource::Lua { ref plugin, .. } if plugin.as_ref() == "echo_plugin"),
     );
     assert_eq!(entry.tool.tool_kind(), None);
 
@@ -855,7 +858,7 @@ fn managed_tool_output_is_default_documentable_and_prompt_free() {
             .unwrap_or_else(|| panic!("default builtin {name} was not registered"));
         assert_eq!(entry.tool.audience(), ToolAudience::all());
         assert!(
-            matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "tool_output")
+            matches!(entry.source, ToolSource::Lua { ref plugin, .. } if plugin.as_ref() == "tool_output")
         );
 
         let schema = entry.tool.schema();
@@ -907,6 +910,110 @@ fn unload_round_trip() {
 
     host.unload("unload_test").unwrap();
     assert!(!reg.has("echo_"));
+}
+
+#[test]
+fn malformed_permission_scope_callback_forces_exact_review() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "malformed_scopes",
+    description = "test",
+    schema = {STRING_FIELD_SCHEMA},
+    permission_scopes = function()
+        return {{ scopes = {{ [1] = "safe", [3] = "hidden" }}, force_prompt = false }}
+    end,
+    handler = function() return "ok" end,
+}})
+"#
+    );
+    host.load_source("malformed_scopes", &source).unwrap();
+    let input = json!({"url": "secret"});
+    let invocation = reg
+        .get("malformed_scopes")
+        .unwrap()
+        .tool
+        .parse(&input)
+        .unwrap();
+
+    let scopes = smol::block_on(invocation.permission_scopes()).unwrap();
+    assert!(scopes.force_prompt);
+    assert_eq!(scopes.scopes, [input.to_string()]);
+}
+
+#[test]
+fn lua_tool_contract_changes_with_plugin_implementation() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = |result: &str| {
+        format!(
+            r#"
+maki.api.register_tool({{
+    name = "contract_probe",
+    description = "test",
+    schema = {MINIMAL_SCHEMA},
+    handler = function() return "{result}" end,
+}})
+"#
+        )
+    };
+    host.load_source("contract_plugin", &source("one")).unwrap();
+    let first_entry = reg.get("contract_probe").unwrap();
+    let old_invocation = first_entry.tool.parse(&json!({})).unwrap();
+    let first = match first_entry.source {
+        ToolSource::Lua { contract, .. } => contract,
+        ToolSource::Mcp { .. } => unreachable!(),
+    };
+
+    host.load_source("contract_plugin", &source("two")).unwrap();
+    let second = match reg.get("contract_probe").unwrap().source {
+        ToolSource::Lua { contract, .. } => contract,
+        ToolSource::Mcp { .. } => unreachable!(),
+    };
+
+    assert_ne!(first, second);
+    let context = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    let error = smol::block_on(old_invocation.execute(&context))
+        .output
+        .unwrap_err();
+    assert!(error.contains("implementation changed"));
+}
+
+#[test]
+fn lua_tool_contract_changes_with_required_module() {
+    let directory = tempfile::tempdir().unwrap();
+    let init = directory.path().join("init.lua");
+    let module = directory.path().join("helper.lua");
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "module_contract_probe",
+    description = "test",
+    schema = {MINIMAL_SCHEMA},
+    handler = function() return "ok" end,
+}})
+"#
+    );
+    std::fs::write(&init, &source).unwrap();
+    std::fs::write(&module, "return 'one'").unwrap();
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init).unwrap();
+    let first = match reg.get("module_contract_probe").unwrap().source {
+        ToolSource::Lua { contract, .. } => contract,
+        ToolSource::Mcp { .. } => unreachable!(),
+    };
+
+    std::fs::write(&module, "return 'two'").unwrap();
+    host.load_plugin_file(&init).unwrap();
+    let second = match reg.get("module_contract_probe").unwrap().source {
+        ToolSource::Lua { contract, .. } => contract,
+        ToolSource::Mcp { .. } => unreachable!(),
+    };
+
+    assert_ne!(first, second);
 }
 
 const PERMISSION_RULE_SRC: &str =
@@ -962,6 +1069,111 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     assert_eq!(rules[0].tool, ToolKey::native("write"));
     assert_eq!(rules[0].scope.as_deref(), Some("/tmp/y/**"));
     assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test]
+fn project_init_rejects_allow_permission_rule() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let err = host
+        .send_run_init_lua(
+            PERMISSION_RULE_SRC.to_owned(),
+            "project/init.lua".to_owned(),
+            None,
+        )
+        .expect_err("project allow must be rejected");
+
+    assert!(
+        err.to_string().contains("may register deny rules only"),
+        "got: {err}"
+    );
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn project_init_accepts_deny_permission_rule() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.send_run_init_lua(
+        r#"maki.api.register_permission_rule({ tool = "write", scope = "/tmp/project/**", effect = "deny" })"#
+            .to_owned(),
+        "project/init.lua".to_owned(),
+        None,
+    )
+    .unwrap();
+
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].tool, ToolKey::native("write"));
+    assert_eq!(rules[0].scope.as_deref(), Some("/tmp/project/**"));
+    assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test]
+fn user_plugin_without_manifest_rejects_allow_permission_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.lua");
+    std::fs::write(&init, PERMISSION_RULE_SRC).unwrap();
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let err = host
+        .load_plugin_file(&init)
+        .expect_err("untrusted user plugin allow must be rejected");
+    assert!(
+        err.to_string().contains("may register deny rules only"),
+        "got: {err}"
+    );
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn user_plugin_with_valid_manifest_accepts_allow_permission_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.lua");
+    std::fs::write(&init, PERMISSION_RULE_SRC).unwrap();
+    std::fs::write(dir.path().join("plugin.toml"), "").unwrap();
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    host.load_plugin_file(&init).unwrap();
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].effect, Effect::Allow);
+}
+
+#[test]
+fn bundled_memory_policy_still_allows_owned_paths() {
+    const MEMORY_POLICY_TOOLS: &[&str] = &[
+        "memory",
+        "write",
+        "edit",
+        "multiedit",
+        "edit_lines",
+        "insert_lines",
+    ];
+
+    let (_reg, host) = builtins_host();
+    let rules = host.plugin_rules().snapshot();
+    let memory_scope = rules
+        .iter()
+        .find(|rule| {
+            rule.tool == ToolKey::native("memory")
+                && rule.effect == Effect::Allow
+                && rule
+                    .scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.ends_with("/memories/**"))
+        })
+        .and_then(|rule| rule.scope.as_deref())
+        .expect("bundled memory allow rule missing");
+
+    for tool in MEMORY_POLICY_TOOLS {
+        assert!(
+            rules.iter().any(|rule| {
+                rule.tool == ToolKey::native(tool)
+                    && rule.scope.as_deref() == Some(memory_scope)
+                    && rule.effect == Effect::Allow
+            }),
+            "missing bundled memory policy for {tool}"
+        );
+    }
 }
 
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
@@ -1824,7 +2036,9 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert!(matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "keeper"),);
+    assert!(
+        matches!(entry.source, ToolSource::Lua { ref plugin, .. } if plugin.as_ref() == "keeper"),
+    );
 }
 
 #[test]
@@ -2496,6 +2710,7 @@ fn call_tool_streams_live_buf_and_annotations() {
         Arc::new(UsageTool),
         ToolSource::Lua {
             plugin: Arc::from("usage_fixture"),
+            contract: Arc::from("test-contract"),
         },
     )
     .unwrap();
@@ -4240,6 +4455,189 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
     assert!(
         !scopes.scopes.iter().any(|s| s.contains("\"command\"")),
         "fell back to raw JSON scope: {:?}",
+        scopes.scopes
+    );
+}
+
+fn builtin_permission_scopes(
+    reg: &ToolRegistry,
+    tool: &str,
+    input: serde_json::Value,
+) -> maki_agent::tools::PermissionScopes {
+    let entry = reg.get(tool).unwrap_or_else(|| panic!("{tool} registered"));
+    let invocation = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(invocation.permission_scopes()).expect("permission scopes missing")
+}
+
+#[test]
+fn path_permission_scope_expands_and_normalizes_tilde() {
+    let (reg, _host) = builtins_host();
+    let home = maki_storage::paths::home().expect("home directory");
+    let scopes = builtin_permission_scopes(
+        &reg,
+        "write",
+        json!({
+            "path": "~/maki-permission-scope/../scope.txt",
+            "content": "unused",
+        }),
+    );
+
+    assert_eq!(
+        scopes.scopes,
+        [home.join("scope.txt").display().to_string()]
+    );
+    assert!(!scopes.force_prompt);
+}
+
+#[test]
+fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior() {
+    let (reg, host) = builtins_host();
+    let cases = [
+        (
+            "read",
+            json!({ "path": "/tmp/parent/../scope", "offset": 1, "limit": 1 }),
+        ),
+        ("list", json!({ "path": "/tmp/parent/../scope" })),
+        ("index", json!({ "path": "/tmp/parent/../scope" })),
+        ("view_image", json!({ "path": "/tmp/parent/../scope" })),
+        (
+            "glob",
+            json!({ "pattern": "**/*", "path": "/tmp/parent/../scope" }),
+        ),
+        (
+            "grep",
+            json!({ "pattern": "needle", "path": "/tmp/parent/../scope" }),
+        ),
+    ];
+    let rules = host.plugin_rules().snapshot();
+
+    for (tool, input) in cases {
+        let scopes = builtin_permission_scopes(&reg, tool, input);
+        let expected = if matches!(tool, "glob" | "grep") {
+            "/tmp/scope/**"
+        } else {
+            "/tmp/scope"
+        };
+        assert_eq!(scopes.scopes, [expected], "wrong scope for {tool}");
+        assert!(!scopes.force_prompt, "{tool} unexpectedly forces a prompt");
+        assert!(
+            rules.iter().any(|rule| {
+                rule.tool == ToolKey::native(tool)
+                    && rule.scope.as_deref() == Some("*")
+                    && rule.effect == Effect::Allow
+            }),
+            "{tool} is missing its trusted default allow"
+        );
+    }
+
+    let manager = maki_agent::permissions::PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("read"),
+                scope: Some("/tmp/blocked".into()),
+                effect: Effect::Deny,
+            }],
+            ..PermissionsConfig::default()
+        },
+        "/tmp".into(),
+        host.plugin_rules(),
+    );
+    assert!(matches!(
+        manager.check(&ToolKey::native("read"), "/tmp/blocked", None),
+        maki_agent::permissions::PermissionCheck::Denied
+    ));
+    assert!(matches!(
+        manager.check(&ToolKey::native("read"), "/tmp/allowed", None),
+        maki_agent::permissions::PermissionCheck::Allowed
+    ));
+}
+
+#[test]
+fn bash_permission_scope_distinguishes_normalized_workdirs() {
+    let (reg, _host) = builtins_host();
+    let first = builtin_permission_scopes(
+        &reg,
+        "bash",
+        json!({ "command": "git status", "workdir": "/tmp/one/../first" }),
+    );
+    let second = builtin_permission_scopes(
+        &reg,
+        "bash",
+        json!({ "command": "git status", "workdir": "/tmp/second" }),
+    );
+    let home = maki_storage::paths::home().expect("home directory");
+    let expected_home = home.join("second").display().to_string();
+    let tilde = builtin_permission_scopes(
+        &reg,
+        "bash",
+        json!({ "command": "git status", "workdir": "~/one/../second" }),
+    );
+
+    assert_eq!(first.scopes.len(), 1);
+    assert_eq!(second.scopes.len(), 1);
+    assert_ne!(first.scopes, second.scopes);
+    assert!(first.scopes[0].ends_with("maki-workdir[10]=/tmp/first # maki-frame[10]"));
+    assert!(second.scopes[0].ends_with("maki-workdir[11]=/tmp/second # maki-frame[11]"));
+    assert!(
+        tilde.scopes[0].ends_with(&format!(
+            "maki-workdir[{}]={} # maki-frame[{}]",
+            expected_home.len(),
+            expected_home,
+            expected_home.len(),
+        )),
+        "tilde workdir was not normalized: {:?}",
+        tilde.scopes
+    );
+}
+
+#[test_case::test_case("if true; then rm -rf /tmp/hidden; fi" ; "if_statement")]
+#[test_case::test_case("for item in one two; do rm -f \"$item\"; done" ; "loop_statement")]
+#[test_case::test_case("cleanup() { rm -rf /tmp/hidden; }; cleanup" ; "function_definition")]
+fn bash_permission_scopes_include_nested_rm(command: &str) {
+    let (reg, _host) = builtins_host();
+    let scopes = builtin_permission_scopes(&reg, "bash", json!({ "command": command }));
+
+    assert!(
+        scopes.scopes.iter().any(|scope| scope.starts_with("rm ")),
+        "nested rm was hidden: {:?}",
+        scopes.scopes
+    );
+}
+
+#[test]
+fn bash_permission_scopes_include_normalized_redirect_target() {
+    let (reg, _host) = builtins_host();
+    let scopes = builtin_permission_scopes(
+        &reg,
+        "bash",
+        json!({
+            "command": "printf ok > artifacts/../result.txt",
+            "workdir": "/tmp/project",
+        }),
+    );
+
+    assert!(
+        scopes
+            .scopes
+            .iter()
+            .any(|scope| scope.starts_with("redirect ")
+                && scope.contains("=> /tmp/project/result.txt")),
+        "redirect target was hidden: {:?}",
+        scopes.scopes
+    );
+}
+
+#[test_case::test_case("echo $(whoami)" ; "command_substitution")]
+#[test_case::test_case("diff <(printf a) <(printf b)" ; "process_substitution")]
+#[test_case::test_case("(cd /tmp && pwd)" ; "subshell")]
+#[test_case::test_case("echo $((1 + 2))" ; "arithmetic_expansion")]
+fn bash_complex_constructs_force_exact_review(command: &str) {
+    let (reg, _host) = builtins_host();
+    let scopes = builtin_permission_scopes(&reg, "bash", json!({ "command": command }));
+
+    assert!(
+        scopes.force_prompt,
+        "complex command did not force exact review: {:?}",
         scopes.scopes
     );
 }

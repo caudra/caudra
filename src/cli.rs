@@ -125,7 +125,7 @@ pub struct Cli {
     #[arg(long)]
     pub include_partial_messages: bool,
 
-    /// Permission prompt tool (accepted for compat, used in SDK mode)
+    /// Permission prompt tool (accepted for compatibility but ignored)
     #[arg(long, hide = true)]
     pub permission_prompt_tool: Option<String>,
 
@@ -169,6 +169,10 @@ pub struct Cli {
 impl Cli {
     pub fn warn_ignored_flags(&self) {
         let ignored = [
+            (
+                "permission-prompt-tool",
+                self.permission_prompt_tool.is_some(),
+            ),
             ("fallback-model", self.fallback_model.is_some()),
             ("settings", self.settings.is_some()),
             ("setting-sources", self.setting_sources.is_some()),

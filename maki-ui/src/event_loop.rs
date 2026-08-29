@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
+use crate::app::session_state::stored_to_rules;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{
@@ -460,6 +461,8 @@ impl SpawnCtx {
         };
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let permissions = Arc::new(self.permissions.fork());
+        permissions.load_session_rules(stored_to_rules(&session.meta.session_rules));
+        permissions.set_session_yolo(session.meta.yolo);
         let goal = maki_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         let subagent_history = crate::agent::stored_subagent_history(&session);
         let handles = AgentHandles::spawn(
@@ -723,6 +726,7 @@ impl<'t> EventLoop<'t> {
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
+        app.open_awaiting_mcp_trust(needs_login);
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
@@ -1573,6 +1577,7 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].app.flash(format!("cd: {error}"));
             return;
         }
+        self.ctx.permissions.set_project(&cwd);
         for (runtime, store) in self.sessions.iter_mut().zip(stores) {
             runtime.app.install_working_directory(&cwd, store);
             runtime.app.checkpoint_now();
@@ -1764,6 +1769,23 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
                     server: server_name,
                     enabled,
+                });
+            }
+            Action::TrustMcpOnce(server_name) => {
+                self.sessions[idx].handles.send_mcp(McpCommand::TrustOnce {
+                    server: server_name,
+                });
+            }
+            Action::TrustMcpProject(server_name) => {
+                self.sessions[idx]
+                    .handles
+                    .send_mcp(McpCommand::TrustProject {
+                        server: server_name,
+                    });
+            }
+            Action::RejectMcp(server_name) => {
+                self.sessions[idx].handles.send_mcp(McpCommand::Reject {
+                    server: server_name,
                 });
             }
             Action::ShellCommand {

@@ -2,7 +2,7 @@ local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
 
-local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
+local MEMORY_POLICY_TOOLS = { "memory", "write", "edit", "multiedit", "edit_lines", "insert_lines" }
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -22,10 +22,9 @@ local function legacy_dir_if_exists(suffix)
   end
 end
 
--- Notes live outside cwd, where file-write tools normally prompt; pre-allow
--- them here so the agent can edit notes directly. Reads may come from the
--- legacy dir while writes go to the state dir, so cover both.
-local function register_write_rules()
+-- Notes live outside cwd, where effectful tools normally prompt. Reads may
+-- come from the legacy dir while writes go to the state dir, so cover both.
+local function register_memory_rules()
   local suffix = memories_path_suffix()
   local dirs = { legacy_dir_if_exists(suffix) }
   local state = maki.env.state_dir()
@@ -33,12 +32,13 @@ local function register_write_rules()
     dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
   end
   for _, dir in ipairs(dirs) do
-    for _, tool in ipairs(WRITE_TOOLS) do
+    dir = maki.fs.normalize(dir)
+    for _, tool in ipairs(MEMORY_POLICY_TOOLS) do
       maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
     end
   end
 end
-register_write_rules()
+register_memory_rules()
 
 local function resolve_dir(check_legacy)
   local suffix = memories_path_suffix()
@@ -167,8 +167,24 @@ local function with_dir(res, dir)
   return res
 end
 
+local function memory_permission_scopes(input)
+  local command = input.command
+  local dir = resolve_dir(command == "list" or command == "read")
+  if not dir then
+    return nil
+  end
+  local scope = maki.fs.normalize(dir)
+  if input.path then
+    scope = helpers.safe_resolve(scope, input.path) or scope
+  else
+    scope = scope:sub(-1) == "/" and (scope .. "**") or (scope .. "/**")
+  end
+  return { scopes = { scope }, force_prompt = false }
+end
+
 maki.api.register_tool({
   name = "memory",
+  permission_scopes = memory_permission_scopes,
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
     .. "- Save important context before compaction or to build up project knowledge.\n"

@@ -33,6 +33,10 @@ Prefer this over edit when making multiple changes to the same file.
 - Ensure earlier edits don't affect text that later edits need to find.
 ]]
 
+local function path_permission_scopes(input)
+  return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+end
+
 local function edit_header(input)
   local buf = maki.ui.buf()
   buf:line({ { shorten_path(input.path or ""), "path" } })
@@ -72,7 +76,7 @@ local function resolve_block_nrs(blocks, path)
   local content
   for _, b in ipairs(blocks) do
     if not b.nr and (b.new or "") ~= "" then
-      content = content or maki.fs.read(maki.fs.abspath(path))
+      content = content or maki.fs.read(maki.fs.normalize(path))
       if not content then
         return
       end
@@ -192,7 +196,7 @@ local function diff_restore(blocks_from)
 end
 
 local function apply_edit(path, ctx, transform)
-  path = maki.fs.abspath(path)
+  path = maki.fs.normalize(path)
 
   local ok, err = ctx:check_before_edit(path)
   if not ok then
@@ -249,7 +253,7 @@ maki.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",
-  permission_scopes = "path",
+  permission_scopes = path_permission_scopes,
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_DESCRIPTION,
 
@@ -300,7 +304,7 @@ register_tool_if(opts.multiedit, {
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
-  permission_scopes = "path",
+  permission_scopes = path_permission_scopes,
   start_annotation = "edits",
   audiences = { "main", "general_sub", "interpreter" },
   description = MULTIEDIT_DESCRIPTION,
@@ -386,7 +390,7 @@ register_tool_if(opts.edit_lines, {
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
-  permission_scopes = "path",
+  permission_scopes = path_permission_scopes,
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_LINES_DESCRIPTION,
 
@@ -440,7 +444,7 @@ register_tool_if(opts.insert_lines, {
   name = "insert_lines",
   kind = "edit",
   mutable_path = "path",
-  permission_scopes = "path",
+  permission_scopes = path_permission_scopes,
   audiences = { "main", "general_sub", "interpreter" },
   description = INSERT_LINES_DESCRIPTION,
 

@@ -1,6 +1,5 @@
 use std::io::Read;
 
-use isahc::HttpClient;
 use isahc::http::Request;
 use serde::Deserialize;
 
@@ -157,14 +156,14 @@ fn validate_resource_metadata(
 }
 
 pub async fn discover_resource_metadata(
-    client: &HttpClient,
     server_url: &str,
     www_auth: Option<&WwwAuthenticateInfo>,
+    server_addresses: Option<&[std::net::IpAddr]>,
 ) -> Result<ResourceMetadata, OAuthError> {
     if let Some(info) = www_auth
         && let Some(ref url) = info.resource_metadata
         && origin(url) == origin(server_url)
-        && let Ok(meta) = fetch_json::<ResourceMetadata>(client, url).await
+        && let Ok(meta) = fetch_json::<ResourceMetadata>(url, server_url, server_addresses).await
         && let Ok(meta) = validate_resource_metadata(meta, server_url)
     {
         return Ok(meta);
@@ -172,7 +171,7 @@ pub async fn discover_resource_metadata(
 
     let mut last_err = OAuthError::Other("no candidates".into());
     for url in resource_metadata_urls(server_url) {
-        match fetch_json::<ResourceMetadata>(client, &url).await {
+        match fetch_json::<ResourceMetadata>(&url, server_url, server_addresses).await {
             Ok(meta) => match validate_resource_metadata(meta, server_url) {
                 Ok(meta) => return Ok(meta),
                 Err(e) => last_err = e,
@@ -186,8 +185,9 @@ pub async fn discover_resource_metadata(
 }
 
 pub async fn discover_auth_server(
-    client: &HttpClient,
     issuer_url: &str,
+    server_url: &str,
+    server_addresses: Option<&[std::net::IpAddr]>,
 ) -> Result<AuthServerMetadata, OAuthError> {
     let parts = parse_url(issuer_url);
     let has_path = !parts.path.is_empty() && parts.path != "/";
@@ -209,7 +209,7 @@ pub async fn discover_auth_server(
 
     let mut last_err = OAuthError::Other("no candidates".into());
     for url in &candidates {
-        match fetch_json::<AuthServerMetadata>(client, url).await {
+        match fetch_json::<AuthServerMetadata>(url, server_url, server_addresses).await {
             Ok(meta) => {
                 validate_auth_server(&meta)?;
                 return Ok(meta);
@@ -223,9 +223,11 @@ pub async fn discover_auth_server(
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(
-    client: &HttpClient,
     url: &str,
+    server_url: &str,
+    server_addresses: Option<&[std::net::IpAddr]>,
 ) -> Result<T, OAuthError> {
+    let client = super::build_http_client(url, server_url, server_addresses, super::HTTP_TIMEOUT)?;
     let req = Request::get(url)
         .header("Accept", "application/json")
         .body(())

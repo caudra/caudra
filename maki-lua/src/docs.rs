@@ -101,6 +101,7 @@ mod tests {
 
     use super::{DocKind, api_docs};
     use crate::api::create_maki_global;
+    use crate::api::tool::PermissionRulePolicy;
     use crate::plugin_permissions::PluginPermissions;
 
     fn resolve_table(maki: &Table, path: &str) -> Table {
@@ -130,6 +131,7 @@ mod tests {
             &lua,
             Arc::default(),
             Arc::default(),
+            PermissionRulePolicy::Trusted,
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),

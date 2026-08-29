@@ -65,6 +65,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/permissions",
+        description: "Inspect active conversation permission rules",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,

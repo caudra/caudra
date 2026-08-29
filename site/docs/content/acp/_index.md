@@ -38,12 +38,14 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 - **Sessions persist.** Loading a session replays the full conversation in the editor, so you can resume where you left off.
 - **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.
-- **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
+- **Permissions.** Tool permission prompts appear in the editor. "Allow exact call for conversation" stores only the reviewed input and resources. Broad tool authority is not exposed through ACP.
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
 - **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
 - **Images and context.** Prompts can include images and editor-attached files.
 
 Authentication, providers, and permissions come from your normal Maki config. Set up [providers](/docs/providers/) first and ACP sessions just work.
+
+Project MCP startup trust must already be approved through `/mcp` in the TUI. ACP returns an actionable session error instead of silently omitting a parked server.
 
 ```bash
 maki acp

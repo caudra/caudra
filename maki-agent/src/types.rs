@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_config::ToolKey;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use maki_storage::tool_outputs::ToolOutputRef;
 use serde::de::Deserializer;
@@ -13,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
+use crate::permissions::PermissionRequest;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 
@@ -695,11 +695,7 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
-    PermissionRequest {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-    },
+    PermissionRequest(Box<PermissionRequest>),
     AuthRequired,
     Nudge,
     SubagentHistory {

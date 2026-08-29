@@ -5,21 +5,22 @@ pub mod pkce;
 pub mod registration;
 pub mod token;
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_lite::future;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
-use url::Url;
+use url::{Host, Url};
 
 use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::parse_www_authenticate;
-use super::config::OauthClientConfig;
+use super::config::{OauthClientConfig, resolve_url_addresses, risky_ip};
 use super::error::McpError;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -53,14 +54,12 @@ pub async fn authenticate(
     storage: &StateDir,
     interaction: Interaction,
     static_client: Option<OauthClientConfig>,
+    server_addresses: Option<&[IpAddr]>,
 ) -> Result<McpAuthData, McpError> {
     let wrap = |e: OAuthError| McpError::OAuthFailed {
         server: server_name.into(),
         reason: e.to_string(),
     };
-    let client =
-        build_http_client(HTTP_TIMEOUT).map_err(|e| wrap(OAuthError::Other(e.to_string())))?;
-
     if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
         && let Some(ref tokens) = existing.tokens
         && !tokens.is_expired()
@@ -68,7 +67,7 @@ pub async fn authenticate(
         return Ok(existing);
     }
 
-    match silent_refresh(storage, server_name, server_url).await {
+    match silent_refresh(storage, server_name, server_url, server_addresses).await {
         Ok(Some(data)) => return Ok(data),
         Ok(None) => {}
         Err(e) => {
@@ -79,7 +78,7 @@ pub async fn authenticate(
     let www_auth = www_authenticate.and_then(parse_www_authenticate);
 
     let resource_meta =
-        discovery::discover_resource_metadata(&client, server_url, www_auth.as_ref())
+        discovery::discover_resource_metadata(server_url, www_auth.as_ref(), server_addresses)
             .await
             .map_err(&wrap)?;
 
@@ -89,9 +88,10 @@ pub async fn authenticate(
         .cloned()
         .unwrap_or_else(|| discovery::server_origin(server_url));
 
-    let auth_server = discovery::discover_auth_server(&client, &auth_server_url)
-        .await
-        .map_err(&wrap)?;
+    let auth_server =
+        discovery::discover_auth_server(&auth_server_url, server_url, server_addresses)
+            .await
+            .map_err(&wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -103,6 +103,13 @@ pub async fn authenticate(
             "server does not support S256 PKCE".into(),
         )));
     }
+    build_http_client(
+        &auth_server.authorization_endpoint,
+        server_url,
+        server_addresses,
+        HTTP_TIMEOUT,
+    )
+    .map_err(&wrap)?;
 
     let callback = CallbackServer::bind(
         static_client.as_ref().and_then(|c| c.callback_port),
@@ -132,6 +139,8 @@ pub async fn authenticate(
             client_secret_expires_at: existing.client_secret_expires_at,
         }
     } else if let Some(endpoint) = &auth_server.registration_endpoint {
+        let client = build_http_client(endpoint, server_url, server_addresses, HTTP_TIMEOUT)
+            .map_err(&wrap)?;
         registration::register_client(&client, endpoint, &redirect_uri)
             .await
             .map_err(&wrap)?
@@ -205,8 +214,15 @@ pub async fn authenticate(
     }
     .map_err(|e| wrap(OAuthError::Other(e)))?;
 
+    let token_client = build_http_client(
+        &auth_server.token_endpoint,
+        server_url,
+        server_addresses,
+        HTTP_TIMEOUT,
+    )
+    .map_err(&wrap)?;
     let tokens = token::exchange_code(
-        &client,
+        &token_client,
         &auth_server.token_endpoint,
         &result.code,
         &redirect_uri,
@@ -240,6 +256,7 @@ pub async fn silent_refresh(
     storage: &StateDir,
     server_name: &str,
     server_url: &str,
+    server_addresses: Option<&[IpAddr]>,
 ) -> Result<Option<McpAuthData>, OAuthError> {
     let Some(existing) = load_mcp_auth(storage, server_name, server_url) else {
         return Ok(None);
@@ -253,20 +270,23 @@ pub async fn silent_refresh(
         return Ok(None);
     }
 
-    let client = build_http_client(SILENT_REFRESH_HTTP_TIMEOUT)
-        .map_err(|e| OAuthError::Other(e.to_string()))?;
-
     // Trust the endpoint pinned at interactive auth over fresh discovery: a
     // later-compromised server must not redirect the refresh token (and any
     // static client secret) elsewhere. Pre-pin records fall back to discovery.
     let token_endpoint = match existing.token_endpoint.clone() {
         Some(pinned) => pinned,
         None => {
-            discover_auth_server_for(&client, server_url, None)
+            discover_auth_server_for(server_url, None, server_addresses)
                 .await?
                 .token_endpoint
         }
     };
+    let client = build_http_client(
+        &token_endpoint,
+        server_url,
+        server_addresses,
+        SILENT_REFRESH_HTTP_TIMEOUT,
+    )?;
 
     let new_tokens = token::refresh_token(
         &client,
@@ -290,17 +310,18 @@ pub async fn silent_refresh(
 }
 
 async fn discover_auth_server_for(
-    client: &HttpClient,
     server_url: &str,
     www_auth: Option<&discovery::WwwAuthenticateInfo>,
+    server_addresses: Option<&[IpAddr]>,
 ) -> Result<discovery::AuthServerMetadata, OAuthError> {
-    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth).await?;
+    let resource_meta =
+        discovery::discover_resource_metadata(server_url, www_auth, server_addresses).await?;
     let auth_server_url = resource_meta
         .authorization_servers
         .first()
         .cloned()
         .unwrap_or_else(|| discovery::server_origin(server_url));
-    discovery::discover_auth_server(client, &auth_server_url).await
+    discovery::discover_auth_server(&auth_server_url, server_url, server_addresses).await
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
@@ -317,13 +338,68 @@ fn is_headless() -> bool {
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
 }
 
-fn build_http_client(timeout: Duration) -> Result<HttpClient, isahc::Error> {
-    HttpClient::builder()
-        .redirect_policy(RedirectPolicy::Limit(super::http::MAX_REDIRECTS))
+fn build_http_client(
+    endpoint: &str,
+    server_url: &str,
+    server_addresses: Option<&[IpAddr]>,
+    timeout: Duration,
+) -> Result<HttpClient, OAuthError> {
+    let endpoint_url =
+        Url::parse(endpoint).map_err(|error| OAuthError::Other(error.to_string()))?;
+    if !endpoint_url.username().is_empty() || endpoint_url.password().is_some() {
+        return Err(OAuthError::Other(
+            "OAuth endpoint must not contain URL credentials".into(),
+        ));
+    }
+    let same_server_origin = same_origin(&endpoint_url, server_url);
+    if endpoint_url.scheme() != "https" && !same_server_origin {
+        return Err(OAuthError::Other(
+            "OAuth endpoint must use HTTPS or the reviewed MCP origin".into(),
+        ));
+    }
+    let addresses = if same_server_origin {
+        server_addresses
+            .filter(|addresses| !addresses.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| resolve_url_addresses(endpoint).unwrap_or_default())
+    } else {
+        resolve_url_addresses(endpoint).map_err(OAuthError::Other)?
+    };
+    if addresses.is_empty() {
+        return Err(OAuthError::Other(
+            "OAuth endpoint resolved to no addresses".into(),
+        ));
+    }
+    if !same_server_origin && addresses.iter().copied().any(risky_ip) {
+        return Err(OAuthError::Other(
+            "OAuth endpoint resolves to a private or reserved address".into(),
+        ));
+    }
+    let mut builder = HttpClient::builder()
+        .redirect_policy(RedirectPolicy::None)
         // Same pin as mcp::http, so oauth and data traffic match.
         .version_negotiation(VersionNegotiation::http11())
-        .timeout(timeout)
+        .timeout(timeout);
+    if let (Some(Host::Domain(host)), Some(port)) =
+        (endpoint_url.host(), endpoint_url.port_or_known_default())
+    {
+        let mappings = addresses.iter().fold(ResolveMap::new(), |map, address| {
+            map.add(host, port, *address)
+        });
+        builder = builder.dns_resolve(mappings);
+    }
+    builder
         .build()
+        .map_err(|error| OAuthError::Other(error.to_string()))
+}
+
+fn same_origin(endpoint: &Url, server_url: &str) -> bool {
+    let Ok(server) = Url::parse(server_url) else {
+        return false;
+    };
+    endpoint.scheme() == server.scheme()
+        && endpoint.host() == server.host()
+        && endpoint.port_or_known_default() == server.port_or_known_default()
 }
 
 fn build_authorization_url(
@@ -356,7 +432,10 @@ fn build_authorization_url(
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthError, build_authorization_url};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    use super::{OAuthError, build_authorization_url, build_http_client};
     use test_case::test_case;
     use url::Url;
 
@@ -421,5 +500,32 @@ mod tests {
             ),
             Err(OAuthError::InvalidResponse(_))
         ));
+    }
+
+    #[test]
+    fn oauth_http_client_rejects_unreviewed_private_origin() {
+        assert!(
+            build_http_client(
+                "https://10.0.0.2/token",
+                "https://8.8.8.8/mcp",
+                Some(&[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_http_client_allows_and_pins_reviewed_origin() {
+        let reviewed = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))];
+        assert!(
+            build_http_client(
+                "https://private.example/token",
+                "https://private.example/mcp",
+                Some(&reviewed),
+                Duration::from_secs(1),
+            )
+            .is_ok()
+        );
     }
 }

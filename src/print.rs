@@ -174,6 +174,22 @@ pub fn run(
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
+    if let Some(handle) = &mcp_handle {
+        let awaiting: Vec<_> = handle
+            .reader()
+            .load()
+            .infos
+            .iter()
+            .filter(|info| info.status == maki_agent::McpServerStatus::AwaitingTrust)
+            .map(|info| info.name.clone())
+            .collect();
+        if !awaiting.is_empty() {
+            return Err(eyre!(
+                "project MCP servers require startup trust: {}. Run `maki`, review them with `/mcp`, then retry",
+                awaiting.join(", ")
+            ));
+        }
+    }
 
     let handle = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
@@ -255,7 +271,7 @@ pub fn run(
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
-            | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::PermissionRequest(_)
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

@@ -63,6 +63,39 @@ local function find_project_ancestors()
   return dirs
 end
 
+local function configured_skill_dirs()
+  local dirs = {}
+  local seen = {}
+  local function add(dir)
+    dir = maki.fs.normalize(dir)
+    if not seen[dir] then
+      seen[dir] = true
+      dirs[#dirs + 1] = dir
+    end
+  end
+
+  local config = maki.env.config_dir()
+  if config then
+    add(maki.fs.joinpath(config, "skills"))
+  end
+
+  local home = maki.uv.os_homedir()
+  if home then
+    for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
+      add(maki.fs.joinpath(home, rel))
+    end
+  end
+
+  for _, ancestor in ipairs(find_project_ancestors()) do
+    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
+      add(maki.fs.joinpath(ancestor, rel))
+    end
+  end
+  return dirs
+end
+
+local skill_dirs = configured_skill_dirs()
+
 local opts = maki.api.register_options({
   plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
 })
@@ -108,22 +141,8 @@ local function discover_skills()
     }
   end
 
-  local config = maki.env.config_dir()
-  if config then
-    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
-  end
-
-  local home = maki.uv.os_homedir()
-  if home then
-    for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills)
-    end
-  end
-
-  for _, ancestor in ipairs(find_project_ancestors()) do
-    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
-    end
+  for _, dir in ipairs(skill_dirs) do
+    scan_skill_dir(dir, skills)
   end
 
   return skills
@@ -133,10 +152,30 @@ local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
+maki.api.register_permission_rule({ tool = "skill", scope = "*" })
+
+local function skill_permission_scopes(input)
+  local scopes = {}
+  for _, dir in ipairs(skill_dirs) do
+    scopes[#scopes + 1] = dir:sub(-1) == "/" and (dir .. "**") or (dir .. "/**")
+  end
+  if builtin and input.name == builtin.name then
+    local state = maki.env.state_dir()
+    if state then
+      scopes[#scopes + 1] = maki.fs.normalize(maki.fs.joinpath(state, "docs", REFERENCE_FILE))
+    end
+  end
+  if #scopes == 0 then
+    return nil
+  end
+  return { scopes = scopes, force_prompt = false }
+end
+
 maki.api.register_tool({
   name = "skill",
   kind = "read",
   description = description,
+  permission_scopes = skill_permission_scopes,
 
   schema = {
     type = "object",

@@ -21,6 +21,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 use crate::id::{MakiId, MakiIdParseError};
+use crate::permission_state::PermissionRuleRecord;
 use crate::tool_outputs::delete_session_outputs;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,8 @@ pub struct SessionMeta {
     pub plan_written: bool,
     #[serde(default)]
     pub session_rules: Vec<StoredRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structured_permission_rules: Vec<PermissionRuleRecord>,
     #[serde(default)]
     pub context_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2056,6 +2059,7 @@ mod tests {
         assert!(meta.input_draft_images.is_empty());
         assert_eq!(meta.history_head, None);
         assert_eq!(meta.pending_revert, None);
+        assert!(meta.structured_permission_rules.is_empty());
     }
 
     #[test]

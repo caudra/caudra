@@ -8,6 +8,17 @@ local opts = maki.api.register_options(output_limits.extend({
   search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
 }))
 
+local function search_path(input)
+  return maki.fs.normalize(input.path or ".")
+end
+
+local function search_scope(input)
+  local path = search_path(input)
+  return path:sub(-1) == "/" and (path .. "**") or (path .. "/**")
+end
+
+maki.api.register_permission_rule({ tool = "glob", scope = "*" })
+
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.other) or 3, keep = "head" }
@@ -21,6 +32,9 @@ maki.api.register_tool({
 - Respects .gitignore.
 - Returns absolute paths sorted by modification time (newest first).
 - Prefer speculative parallel searches over sequential rounds of glob+grep.]],
+  permission_scopes = function(input)
+    return { scopes = { search_scope(input) }, force_prompt = false }
+  end,
 
   schema = {
     type = "object",
@@ -56,7 +70,7 @@ maki.api.register_tool({
     local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
     local files, err = maki.fs.glob(pattern, {
-      path = input.path,
+      path = search_path(input),
       gitignore = true,
       sort = "mtime",
       limit = limit,

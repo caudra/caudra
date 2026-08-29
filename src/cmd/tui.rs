@@ -338,7 +338,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                permissions: Arc::new(maki_agent::permissions::PermissionManager::new_persistent(
                     stack.config.permissions.clone(),
                     cwd.clone(),
                     stack.plugin_host.plugin_rules(),
