@@ -42,7 +42,7 @@ COPY --from=builder /build/target/release/workcell-mcp /usr/local/bin/workcell-m
 # The server discovers the worker beside its own executable, so no configuration is needed in the
 # image. Keep the file name `monty`: it is what the discovery path looks for.
 COPY --from=worker /out/bin/monty /usr/local/bin/monty
-COPY LICENSE.md /usr/share/doc/workcell-mcp/
+COPY LICENSE.md THIRD_PARTY_LICENSES/Monty.txt /usr/share/doc/workcell-mcp/
 
 USER 10001:10001
 EXPOSE 3001

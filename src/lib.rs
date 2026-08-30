@@ -13,7 +13,7 @@ pub mod transports;
 use cli::{CliOptions, Transport};
 use server::{ServerBehavior, ToolConfiguration, WorkcellServer};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
-use workcell_mcp_code::CodeConfiguration;
+use workcell_mcp_code::{CodeConfiguration, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
 
@@ -38,7 +38,12 @@ pub async fn run(
             web_icons: options.web_icons,
             shell_policy,
             code: CodeConfiguration {
-                worker: options.code_worker.as_deref(),
+                worker: options.code_worker.as_deref().map_or(
+                    WorkerSource::Discover {
+                        bundled_cache_root: options.code_worker_cache.as_deref(),
+                    },
+                    WorkerSource::Path,
+                ),
                 type_check: options.code_type_check,
             },
         },

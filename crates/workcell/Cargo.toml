@@ -13,6 +13,7 @@ files = ["dep:workcell-mcp-files"]
 web = ["dep:workcell-mcp-web"]
 shell = ["dep:workcell-mcp-shell"]
 code = ["dep:workcell-mcp-code"]
+code-bundled = ["code", "workcell-mcp-code/bundled-worker"]
 environment = ["dep:workcell-environment"]
 
 [dependencies]

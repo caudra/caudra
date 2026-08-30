@@ -26,7 +26,4 @@ jobs:
         with:
           path: target/code-worker
           key: monty-worker-${{ runner.os }}-${{ steps.worker.outputs.version }}
-      # Built before `make ci` so the code-group tests exercise a real worker instead of taking
-      # their skip path. `make test` passes this binary through WORKCELL_MCP_CODE_WORKER.
-      - run: make code-worker
       - run: make ci

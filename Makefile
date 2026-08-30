@@ -13,6 +13,7 @@ MONTY_VERSION ?= 0.0.21
 CODE_WORKER_ROOT ?= target/code-worker
 CODE_WORKER_BUILD ?= target/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty
+BUNDLED_CODE_WORKER_ENV := WORKCELL_BUNDLED_MONTY_WORKER
 
 .PHONY: help code-worker fmt fmt-check check check-native clippy test build release ci install run run-web clean docker-build docker-smoke docker-run
 
@@ -63,8 +64,13 @@ code-worker:
 			'the worker protocol is version-coupled, so update both together'; \
 		exit 2; \
 	fi
-	$(CARGO) install monty-runtime --version "=$(MONTY_VERSION)" --locked --no-default-features \
-		--root "$(CODE_WORKER_ROOT)" --target-dir "$(CODE_WORKER_BUILD)"
+	@if [[ ! -x "$(CODE_WORKER)" ]] \
+		|| ! "$(CODE_WORKER)" --version 2>&1 | grep -qx 'monty-runtime $(MONTY_VERSION)'; then \
+		$(CARGO) install monty-runtime --version "=$(MONTY_VERSION)" --locked --no-default-features \
+			--force --root "$(CODE_WORKER_ROOT)" --target-dir "$(CODE_WORKER_BUILD)"; \
+	else \
+		printf '%s\n' 'reusing pinned worker at $(CODE_WORKER)'; \
+	fi
 	@# The server finds the worker beside its own executable, which is the same rule the container
 	@# relies on. Placing a copy in each Cargo profile directory makes `cargo run` and a direct
 	@# `./target/<profile>/workcell-mcp` work with no configuration, exactly like the image.
@@ -93,6 +99,7 @@ check-native:
 		printf '%s\n' "checking facade group: $$group"; \
 		$(CARGO) check --locked --package workcell --no-default-features --features "$$group" || exit 1; \
 	done
+	$(CARGO) check --locked --package workcell --no-default-features --features code-bundled
 	$(CARGO) check --locked --package workcell --no-default-features \
 		--features "$(NATIVE_FEATURES)"
 	@for crate in $(NATIVE_CRATES); do \
@@ -101,6 +108,8 @@ check-native:
 	done
 	$(CARGO) clippy --locked --package workcell --no-default-features \
 		--features "$(NATIVE_FEATURES)" -- -D warnings
+	$(CARGO) clippy --locked --package workcell --no-default-features \
+		--features code-bundled -- -D warnings
 	@# A non-optional rmcp dependency anywhere in the tool crates would silently pull a transport
 	@# into every native host. Assert its absence rather than trusting the feature declarations.
 	@if $(CARGO) tree --locked --package workcell --no-default-features \
@@ -109,31 +118,35 @@ check-native:
 		printf '%s\n' 'rmcp is reachable from the protocol-neutral facade; an MCP dependency is no longer optional'; \
 		exit 2; \
 	fi
+	@if $(CARGO) tree --locked --package workcell --no-default-features \
+		--features code-bundled --prefix none 2>/dev/null \
+		| grep -q '^rmcp '; then \
+		printf '%s\n' 'rmcp is reachable from the bundled native code facade'; \
+		exit 2; \
+	fi
 	@printf '%s\n' 'native facade builds for every tool group with no MCP dependency'
 
 clippy:
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 
-# Code-group tests locate $(CODE_WORKER) themselves and skip when it is absent, so `make
-# code-worker` is what makes them run. Deliberately not exported here: WORKCELL_MCP_CODE_WORKER is
-# operator configuration, and setting it process-wide would leak into tests that assert how the CLI
-# reacts to it being present.
-test:
-	$(CARGO) test --workspace --locked
+# Build-time bundling is separate from the runtime override, so tests exercise both embedded and
+# explicit-path worker sources without leaking operator configuration into CLI tests.
+test: code-worker
+	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) test --workspace --locked
 
 build:
 	$(CARGO) build --workspace --locked
 
-release:
-	$(CARGO) build --release --locked --package workcell-mcp
+release: code-worker
+	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" \
+		$(CARGO) build --release --locked --package workcell-mcp
 
-ci: fmt-check check check-native clippy test release
+ci: code-worker fmt-check check check-native clippy test release
 
 # Installs the worker into the same Cargo bin directory, so the installed server finds it beside
 # itself. Without this the code tool group would be enabled but unusable after a plain install.
-install:
-	$(CARGO) install --path . --locked
-	$(CARGO) install monty-runtime --version "=$(MONTY_VERSION)" --locked --no-default-features
+install: code-worker
+	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) install --path . --locked
 
 run:
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make run ROOT=/absolute/workspace'; exit 2; }
@@ -150,10 +163,14 @@ docker-build:
 
 docker-smoke: docker-build
 	$(DOCKER) run --rm "$(IMAGE):$(TAG)" --version
-	@printf '%s\n' 'checking the image ships a usable code execution worker'
-	$(DOCKER) run --rm --entrypoint /usr/local/bin/monty "$(IMAGE):$(TAG)" -c 'print(1)' 2>&1 \
-		| grep -q 'subprocess' \
-		|| { printf '%s\n' 'monty worker is missing or was built with the standalone CLI'; exit 2; }
+	@printf '%s\n' 'executing code through the packaged MCP server and adjacent worker'
+	@output=$$(printf '%s\n' \
+		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
+		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+		'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_execution","arguments":{"code":"sum([1, 2, 3, 4])"}}}' \
+		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code); \
+	printf '%s\n' "$$output" | grep -q '"outcome":"completed".*"result":10' \
+		|| { printf '%s\n' 'packaged code execution failed'; exit 2; }
 
 docker-run:
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make docker-run ROOT=/absolute/workspace'; exit 2; }

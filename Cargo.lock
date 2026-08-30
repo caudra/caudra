@@ -4410,6 +4410,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "workcell-monty-worker",
  "workcell-tool-contract",
 ]
 
@@ -4479,6 +4480,16 @@ dependencies = [
  "workcell-net",
  "workcell-source-icons",
  "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-monty-worker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

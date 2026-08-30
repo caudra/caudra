@@ -16,6 +16,7 @@ members = [
   "crates/mcp-files",
   "crates/mcp-shell",
   "crates/mcp-web",
+  "crates/monty-worker",
   "crates/net",
   "crates/source-icons",
   "crates/tool-contract",
@@ -42,6 +43,7 @@ file-format = { version = "0.29.0", default-features = false }
 futures-util = "0.3.32"
 http = "1.4.2"
 image = { version = "0.25.10", default-features = false }
+libc = "0.2"
 lru = "0.18.1"
 # Monty's wire protocol is version-coupled: this host-side pool and the `monty` worker binary must
 # come from one release. Keep these pins and MONTY_VERSION in the Makefile in lockstep; `make
@@ -82,6 +84,7 @@ workcell-mcp-code = { path = "crates/mcp-code", default-features = false }
 workcell-mcp-files = { path = "crates/mcp-files", default-features = false }
 workcell-mcp-shell = { path = "crates/mcp-shell", default-features = false }
 workcell-mcp-web = { path = "crates/mcp-web", default-features = false }
+workcell-monty-worker = { path = "crates/monty-worker" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -107,7 +110,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 workcell-environment = { workspace = true, features = ["mcp"] }
-workcell-mcp-code = { workspace = true, features = ["mcp"] }
+workcell-mcp-code = { workspace = true, features = ["bundled-worker", "mcp"] }
 workcell-mcp-files = { workspace = true, features = ["mcp"] }
 workcell-mcp-shell = { workspace = true, features = ["mcp"] }
 workcell-mcp-web = { workspace = true, features = ["mcp"] }

@@ -11,9 +11,11 @@ use std::{path::PathBuf, sync::OnceLock};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "bundled-worker")]
+use workcell_mcp_code::bundled_worker_available;
 use workcell_mcp_code::{
     CodeConfiguration, CodeInput, CodeToolGroup, SUBSET_MODULES, UNTYPED_BUILTINS,
-    WITHHELD_BUILTINS, WORKER_FILE_NAME, catalog, resolve_worker,
+    WITHHELD_BUILTINS, WORKER_FILE_NAME, WorkerSource, catalog,
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
@@ -23,14 +25,47 @@ fn worker() -> Option<PathBuf> {
     WORKER
         .get_or_init(|| {
             if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
-                return resolve_worker(Some(&PathBuf::from(configured)));
+                let configured = PathBuf::from(configured);
+                return usable_worker(&configured).then_some(configured);
             }
             let installed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/code-worker/bin")
                 .join(WORKER_FILE_NAME);
-            resolve_worker(Some(&installed)).or_else(|| resolve_worker(None))
+            if usable_worker(&installed) {
+                return Some(installed);
+            }
+            if let Some(adjacent) = std::env::current_exe().ok().and_then(|executable| {
+                executable
+                    .parent()
+                    .map(|directory| directory.join(WORKER_FILE_NAME))
+            }) && usable_worker(&adjacent)
+            {
+                return Some(adjacent);
+            }
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(WORKER_FILE_NAME))
+                .find(|candidate| usable_worker(candidate))
         })
         .clone()
+}
+
+fn usable_worker(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 macro_rules! group_or_skip {
@@ -44,7 +79,10 @@ macro_rules! group_or_skip {
             );
             return;
         };
-        CodeToolGroup::new(CodeConfiguration { worker: Some(&worker), type_check: $type_check })
+        CodeToolGroup::new(CodeConfiguration {
+            worker: WorkerSource::Path(&worker),
+            type_check: $type_check,
+        })
             .await
             .expect("worker pool starts")
     }};
@@ -74,6 +112,33 @@ async fn returns_the_value_of_the_final_expression() {
     assert_eq!(output["result"], json!(42));
     assert_eq!(output["version"], json!(1));
     assert_eq!(output["kind"], "code");
+    group.shutdown().await;
+}
+
+#[cfg(feature = "bundled-worker")]
+#[tokio::test]
+async fn bundled_worker_executes_without_an_external_path() {
+    if !bundled_worker_available() {
+        assert!(
+            option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none(),
+            "the configured worker was not embedded"
+        );
+        return;
+    }
+    let cache = tempfile::tempdir().expect("temporary cache");
+    let group = CodeToolGroup::new(CodeConfiguration {
+        worker: WorkerSource::Bundled {
+            cache_root: cache.path(),
+        },
+        type_check: true,
+    })
+    .await
+    .expect("bundled worker pool starts");
+
+    let output = run(&group, "21 * 2").await;
+
+    assert_eq!(output["outcome"], "completed");
+    assert_eq!(output["result"], json!(42));
     group.shutdown().await;
 }
 
@@ -516,7 +581,7 @@ async fn type_checking_rejects_before_execution_when_enabled() {
         return;
     };
     let group = CodeToolGroup::new(CodeConfiguration {
-        worker: Some(&worker),
+        worker: WorkerSource::Path(&worker),
         type_check: true,
     })
     .await

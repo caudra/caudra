@@ -6,7 +6,6 @@
 //! caller's definitions into the next.
 
 use std::{
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -18,6 +17,8 @@ use rmcp::model::{CallToolResult, ContentBlock, Tool};
 #[cfg(feature = "mcp")]
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "bundled-worker")]
+use workcell_monty_worker::WorkerLease;
 
 #[cfg(feature = "mcp")]
 use crate::catalog;
@@ -29,7 +30,7 @@ use crate::{
         CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,
         MAX_MEMORY_BYTES, MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, STREAM_CAPTURE_BYTES,
     },
-    worker::{CodeBuildError, build_pool},
+    worker::{CodeBuildError, WorkerSource, build_pool},
 };
 
 #[cfg(feature = "mcp")]
@@ -40,14 +41,16 @@ const SCRIPT_NAME: &str = "snippet.py";
 /// Startup configuration. Everything here is operator-chosen and unreachable from tool input.
 #[derive(Clone, Copy, Debug)]
 pub struct CodeConfiguration<'a> {
-    /// Explicit worker path, or `None` to discover one.
-    pub worker: Option<&'a Path>,
+    /// Worker resolution policy.
+    pub worker: WorkerSource<'a>,
     /// Type check each snippet before running it.
     pub type_check: bool,
 }
 
 pub struct CodeToolGroup {
     pool: Pool,
+    #[cfg(feature = "bundled-worker")]
+    _worker_lease: Option<WorkerLease>,
     type_check: bool,
 }
 
@@ -64,9 +67,11 @@ impl std::fmt::Debug for CodeToolGroup {
 impl CodeToolGroup {
     /// Builds the group and eagerly starts a worker, so a broken deployment fails at startup.
     pub async fn new(configuration: CodeConfiguration<'_>) -> Result<Self, CodeBuildError> {
-        let pool = build_pool(configuration.worker, Duration::from_millis(MAX_TIMEOUT_MS)).await?;
+        let built = build_pool(configuration.worker, Duration::from_millis(MAX_TIMEOUT_MS)).await?;
         Ok(Self {
-            pool,
+            pool: built.pool,
+            #[cfg(feature = "bundled-worker")]
+            _worker_lease: built.worker_lease,
             type_check: configuration.type_check,
         })
     }
@@ -534,5 +539,29 @@ mod tests {
                 .expect("guidance")
                 .contains("busy")
         );
+    }
+
+    #[cfg(feature = "bundled-worker")]
+    #[tokio::test]
+    async fn bundled_group_retains_the_extracted_worker() {
+        if !crate::bundled_worker_available() {
+            return;
+        }
+        let cache = tempfile::tempdir().expect("tempdir");
+        let group = CodeToolGroup::new(CodeConfiguration {
+            worker: WorkerSource::Bundled {
+                cache_root: cache.path(),
+            },
+            type_check: false,
+        })
+        .await
+        .expect("bundled worker pool");
+        assert!(
+            group
+                ._worker_lease
+                .as_ref()
+                .is_some_and(|lease| lease.path().is_file())
+        );
+        group.shutdown().await;
     }
 }

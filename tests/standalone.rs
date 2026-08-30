@@ -10,7 +10,7 @@ use workcell_mcp::{
     server::{ServerBehavior, ToolConfiguration, WorkcellServer},
     transports::http::{HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome},
 };
-use workcell_mcp_code::CodeConfiguration;
+use workcell_mcp_code::{CodeConfiguration, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
 use workcell_mcp_web::WebsearchExecutionConfiguration;
 
@@ -50,7 +50,9 @@ async fn fixture_server_with_options(
             web_icons: false,
             shell_policy,
             code: CodeConfiguration {
-                worker: None,
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
                 type_check: true,
             },
         },
@@ -962,13 +964,12 @@ where
 /// developer who ran `make code-worker` needs no extra configuration.
 fn code_worker() -> Option<std::path::PathBuf> {
     if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
-        return workcell_mcp_code::resolve_worker(Some(&std::path::PathBuf::from(configured)));
+        return Some(configured.into());
     }
     let installed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/code-worker/bin")
         .join(workcell_mcp_code::WORKER_FILE_NAME);
-    workcell_mcp_code::resolve_worker(Some(&installed))
-        .or_else(|| workcell_mcp_code::resolve_worker(None))
+    installed.is_file().then_some(installed)
 }
 
 /// Exercises the full catalog, including the code group, over a real stdio session.
@@ -1004,7 +1005,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             web_icons: false,
             shell_policy: ShellPermissionPolicy::restricted(),
             code: CodeConfiguration {
-                worker: Some(&worker),
+                worker: WorkerSource::Path(&worker),
                 type_check: true,
             },
         },

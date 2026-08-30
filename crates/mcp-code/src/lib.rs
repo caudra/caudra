@@ -25,7 +25,7 @@ mod worker;
 pub use catalog::catalog;
 pub use catalog::specs;
 pub use group::{CodeConfiguration, CodeToolGroup};
-pub use worker::{CodeBuildError, WORKER_FILE_NAME, resolve_worker};
+pub use worker::{CodeBuildError, WORKER_FILE_NAME, WorkerSource, bundled_worker_available};
 // These limits are public because hosts may need to describe the same contract outside MCP.
 pub use types::{
     CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,

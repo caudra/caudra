@@ -135,10 +135,13 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
   together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal
   error on the first checkout. Treat interpreter escape as possible and do not rely on the code tool
   as the only barrier protecting anything sensitive to the deployment.
-- The worker binary is resolved at startup from `--code-worker`, then beside the server executable,
-  then `PATH`. The `PATH` fallback trusts the deployment's `PATH`: an operator who leaves it writable
-  by a lower-privileged account lets that account supply the process that receives every snippet.
-  Configure `--code-worker` explicitly where `PATH` is not fully controlled.
+- An explicit `--code-worker` path is authoritative. Without one, discovery checks beside the server,
+  then the verified embedded worker, then `PATH`. Embedded bytes are digest-checked and extracted into
+  a private content-addressed cache under an interprocess lease. The `PATH` fallback still trusts the
+  deployment's `PATH`; configure an explicit worker where it is not fully controlled. Set
+  `--code-worker-cache` when the platform cache is unavailable, not writable, or not executable. The
+  configured cache must be controlled by the Workcell process identity and not shared with less-trusted
+  users.
 - The `monty-pool` client links a TLS stack and a WebSocket implementation into the server binary to
   support a remote worker transport that Workcell never configures. Workcell only ever constructs the
   local subprocess transport, so that code is unreachable at runtime, but it is present in the binary

@@ -9,6 +9,7 @@ version.workspace = true
 
 [features]
 default = ["mcp"]
+bundled-worker = ["dep:workcell-monty-worker"]
 mcp = ["dep:rmcp"]
 
 [dependencies]
@@ -20,6 +21,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 workcell-tool-contract.workspace = true
+workcell-monty-worker = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

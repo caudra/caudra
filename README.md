@@ -80,10 +80,11 @@ still win under `--yolo`.
 The code tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
 that has no filesystem, no network, no subprocesses, and an empty environment, so it needs no root
 and no policy. It is for computation, not for reaching the host. It requires the `monty` worker
-binary, which is installed from a pinned release rather than built with the workspace; the container
-ships one, and a source build produces it with `make code-worker`. Workcell resolves it from
-`--code-worker`, then beside the server executable, then `PATH`. When no worker is found, startup
-fails rather than exposing a tool that cannot run.
+binary, which is installed from a pinned release rather than built with the workspace. Workcell
+release/install builds embed it, the container ships it beside the server, and source builds produce
+it with `make code-worker`. An explicit `--code-worker` is authoritative; otherwise discovery checks
+beside the server, then the embedded worker, then `PATH`. When no worker is available, startup fails
+rather than exposing a tool that cannot run.
 
 ## Requirements
 
@@ -380,8 +381,9 @@ than security or authorization guarantees. Disable both surfaces with
 
 ## Embedding
 
-Workcell's tool groups are usable directly from another Rust program, with no transport, no
-subprocess, and no MCP dependency. MCP is one projection of the tool contracts, not their definition.
+Workcell's tool groups are usable directly from another Rust program with no MCP transport or MCP
+dependency. MCP is one projection of the tool contracts, not their definition. The code group still
+launches its isolated Monty worker subprocess.
 
 The `workcell` facade is the single entry point. Each tool group is a feature, so a host compiles
 only what it uses:
@@ -397,6 +399,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
 | `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis and progress streaming |
 | `code` | `CodeToolGroup`, isolated interpreter execution |
+| `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
 | `environment` | `ExecutionEnvironment` inspection |
 
 `ToolSpec` carries the protocol-neutral contract: name, description, input and output schemas,
@@ -431,6 +434,15 @@ resolution while leaving permission policy fail-closed.
 
 Run `make check-native` to verify every facade feature builds with no MCP adapter linked.
 
+`CodeConfiguration` selects an explicit external worker, a bundled-only worker with a host-provided
+cache root, or discovery. Discovery checks beside the host executable, then the configured bundle,
+then `PATH`. Explicit paths are authoritative and never fall back. Set
+`WORKCELL_BUNDLED_MONTY_WORKER` while compiling `code-bundled` to embed a target-matching worker;
+`make release` and `make install` do this automatically. The standalone cache defaults to the platform
+cache directory and can be overridden with `--code-worker-cache` or
+`WORKCELL_MCP_CODE_WORKER_CACHE`. Configure one explicitly when the platform cache directory cannot be
+determined, and keep it owned by the Workcell process identity rather than sharing it across users.
+
 ## Development
 
 ```bash
@@ -451,6 +463,7 @@ tool schemas and bounded behavior. Update fixtures deliberately when a public to
 src/                   Workcell host, transports, CLI, and process policy
 crates/workcell/       Protocol-neutral embedding facade for native hosts
 crates/tool-contract/  Protocol-neutral tool contracts shared by every group
+crates/monty-worker/   Target validation, embedded worker bytes, extraction, and leases
 crates/mcp-files/      Filesystem tools
 crates/mcp-shell/      Shell tool and progress streaming
 crates/mcp-code/       Code execution tool and worker-process supervision
@@ -749,5 +762,6 @@ the discovery descriptor and this tool.
 Apache-2.0. See [`LICENSE.md`](LICENSE.md).
 
 The code execution tool runs [Monty](https://github.com/pydantic/monty), a separate MIT-licensed
-project by Pydantic. Workcell installs it as its own executable rather than linking it, so the two
-are distributed as separate programs under their own licenses.
+project by Pydantic. Workcell either ships Monty beside the server or embeds its bytes and extracts
+the same separate executable at runtime; it is never linked into the Workcell process. See
+[`THIRD_PARTY_LICENSES/Monty.txt`](THIRD_PARTY_LICENSES/Monty.txt).

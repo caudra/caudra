@@ -31,9 +31,12 @@ catalog test keeps that list from silently drifting.
 
 ## Worker binary
 
-The crate does not build the worker. It resolves one at startup from explicit configuration, then
-beside the current executable, then `PATH`. Install one with `make code-worker` from the workspace
-root; the container image ships it at `/usr/local/bin/monty`.
+The crate does not build the worker as a Rust dependency. `WorkerSource` selects an authoritative
+external path, a bundled-only worker extracted under a caller-provided cache root, or discovery.
+Discovery checks beside the current executable, then the configured bundle, then `PATH`. Install an
+external worker with `make code-worker`; release builds embed it, while the container image ships it
+at `/usr/local/bin/monty` to remain compatible with its read-only filesystem and `noexec` temporary
+directory.
 
 The worker is installed from a pinned release rather than built as a workspace member. Monty's
 interpreter and type checker pull a large ruff/ty tree that only resolves under Monty's own lockfile,
@@ -54,5 +57,6 @@ Integration tests need a worker binary and skip with an explicit message when no
 
 ## License
 
-Apache-2.0, consistent with the workspace. Monty is a separate MIT-licensed project by Pydantic,
-installed and distributed as its own executable rather than linked into Workcell.
+Apache-2.0, consistent with the workspace. Monty is a separate MIT-licensed project by Pydantic. It
+may be embedded as data, but is extracted and executed as a separate program rather than linked into
+Workcell. See the repository's `THIRD_PARTY_LICENSES/Monty.txt`.

@@ -5,6 +5,7 @@ use clap::{Parser, ValueEnum};
 use crate::environment::StartupEnvironment;
 
 pub const DEFAULT_PORT: u16 = 3001;
+const CODE_WORKER_CACHE_ENV: &str = "WORKCELL_MCP_CODE_WORKER_CACHE";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
 pub enum ToolGroup {
@@ -95,6 +96,10 @@ pub struct RawOptions {
     #[arg(long)]
     pub code_worker: Option<PathBuf>,
 
+    /// Cache directory for an embedded `monty` worker.
+    #[arg(long)]
+    pub code_worker_cache: Option<PathBuf>,
+
     /// Skip type checking code snippets before executing them.
     #[arg(long)]
     pub no_code_type_check: bool,
@@ -145,6 +150,7 @@ pub struct CliOptions {
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
     pub code_worker: Option<PathBuf>,
+    pub code_worker_cache: Option<PathBuf>,
     pub code_type_check: bool,
     pub env_file: Option<PathBuf>,
     pub transport: Transport,
@@ -172,6 +178,10 @@ impl fmt::Debug for CliOptions {
             .field(
                 "code_worker",
                 &self.code_worker.as_ref().map(|_| "[CONFIGURED]"),
+            )
+            .field(
+                "code_worker_cache",
+                &self.code_worker_cache.as_ref().map(|_| "[CONFIGURED]"),
             )
             .field("code_type_check", &self.code_type_check)
             .field("env_file", &self.env_file.as_ref().map(|_| "[CONFIGURED]"))
@@ -223,7 +233,7 @@ impl fmt::Display for CliError {
                 "--shell-policy and --yolo require the shell tool group"
             }
             Self::CodeOptionRequiresCode => {
-                "--code-worker and --no-code-type-check require the code tool group"
+                "--code-worker, --code-worker-cache, and --no-code-type-check require the code tool group"
             }
             Self::HttpOptionRequiresHttp => "HTTP options require --transport http",
             Self::InvalidAllowedHost => {
@@ -242,7 +252,9 @@ impl RawOptions {
             || self.http_token_file.is_some()
             || !self.allowed_hosts.is_empty();
         let explicit_shell_options = self.shell_policy.is_some() || self.yolo;
-        let explicit_code_options = self.code_worker.is_some() || self.no_code_type_check;
+        let explicit_code_options = self.code_worker.is_some()
+            || self.code_worker_cache.is_some()
+            || self.no_code_type_check;
         let groups = if self.groups.is_empty() {
             match environment_value(environment, "WORKCELL_MCP_TOOL_GROUPS")? {
                 Some(value) => parse_groups(&value)?,
@@ -344,6 +356,9 @@ impl RawOptions {
         let code_worker =
             self.code_worker
                 .or(environment_value(environment, "WORKCELL_MCP_CODE_WORKER")?.map(PathBuf::from));
+        let code_worker_cache =
+            self.code_worker_cache
+                .or(environment_value(environment, CODE_WORKER_CACHE_ENV)?.map(PathBuf::from));
         // Type checking is on by default: it turns an unsupported API into a diagnostic issued
         // before the snippet runs, which is the difference between one wasted turn and several.
         let code_type_check = if self.no_code_type_check {
@@ -375,7 +390,10 @@ impl RawOptions {
             return Err(CliError::ShellOptionRequiresShell);
         }
         if !groups.contains(&ToolGroup::Code)
-            && (explicit_code_options || code_worker.is_some() || !code_type_check)
+            && (explicit_code_options
+                || code_worker.is_some()
+                || code_worker_cache.is_some()
+                || !code_type_check)
         {
             return Err(CliError::CodeOptionRequiresCode);
         }
@@ -392,6 +410,7 @@ impl RawOptions {
             shell_policy_file,
             yolo,
             code_worker,
+            code_worker_cache: code_worker_cache.or_else(default_code_worker_cache),
             code_type_check,
             env_file: self.env_file,
             transport,
@@ -403,6 +422,22 @@ impl RawOptions {
             modern_only,
         })
     }
+}
+
+fn default_code_worker_cache() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(path) = environment_path("LOCALAPPDATA") {
+        return Some(PathBuf::from(path).join("workcell-mcp"));
+    }
+    #[cfg(not(windows))]
+    if let Some(path) = environment_path("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(path).join("workcell-mcp"));
+    }
+    environment_path("HOME").map(|path| PathBuf::from(path).join(".cache/workcell-mcp"))
+}
+
+fn environment_path(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
 fn environment_value(
@@ -513,5 +548,53 @@ mod tests {
             RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web", "--modern-only"])
                 .unwrap();
         assert!(raw.modern_only);
+    }
+
+    #[test]
+    fn code_worker_cache_requires_code_and_is_redacted() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let without_code = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "web",
+            "--code-worker-cache",
+            "/private/cache",
+        ])
+        .unwrap();
+        assert_eq!(
+            without_code.resolve(&environment).unwrap_err(),
+            CliError::CodeOptionRequiresCode
+        );
+
+        let with_code = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "code",
+            "--code-worker-cache",
+            "/private/cache",
+        ])
+        .unwrap()
+        .resolve(&environment)
+        .unwrap();
+        assert_eq!(
+            with_code.code_worker_cache,
+            Some(PathBuf::from("/private/cache"))
+        );
+        assert!(!format!("{with_code:?}").contains("/private/cache"));
+    }
+
+    #[test]
+    fn code_worker_cache_environment_requires_code() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("server.env");
+        std::fs::write(&path, "WORKCELL_MCP_CODE_WORKER_CACHE=/private/cache\n")
+            .expect("write environment");
+        let environment = StartupEnvironment::load(Some(&path)).expect("load environment");
+        let raw = RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web"]).unwrap();
+
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::CodeOptionRequiresCode
+        );
     }
 }

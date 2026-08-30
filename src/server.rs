@@ -134,8 +134,7 @@ impl WorkcellServer {
         } else {
             None
         };
-        // Building the group starts a worker, so a missing or mismatched binary fails here rather
-        // than on the first tool call.
+        // Building the group starts a worker, so a missing or unrunnable binary fails here.
         let code = if groups.contains(&ToolGroup::Code) {
             Some(Arc::new(
                 CodeToolGroup::new(tools.code)
@@ -521,6 +520,7 @@ fn year_from_unix_days(days: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use workcell_mcp_code::WorkerSource;
     use workcell_mcp_files::catalog as file_catalog;
     use workcell_mcp_web::{WebsearchExecutionConfiguration, catalog as web_catalog};
 
@@ -534,7 +534,9 @@ mod tests {
             web_icons: false,
             shell_policy: ShellPermissionPolicy::restricted(),
             code: CodeConfiguration {
-                worker: None,
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
                 type_check: true,
             },
         }

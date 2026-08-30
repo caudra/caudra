@@ -2,8 +2,9 @@
 
 ## Purpose
 
-Workcell MCP is a standalone, harness-independent MCP execution server for filesystem, web, and shell
-tools. It is designed to run directly or inside an operator-provided container, VM, sandbox, or host.
+Workcell MCP is a standalone, harness-independent MCP execution server for filesystem, web, shell,
+isolated code, and execution-environment tools. It is designed to run directly or inside an
+operator-provided container, VM, sandbox, or host.
 
 The server is intentionally single-environment. Do not add users, teams, workspaces, tenant routing,
 deployment controllers, lease brokers, ontology tools, or harness-specific state.
@@ -22,12 +23,18 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 - `crates/mcp-web` owns web tool schemas, provider lowering, fetch extraction, and parser bounds.
 - `crates/mcp-code` owns code tool schemas, worker-process supervision, interpreter isolation, value
   rendering, and the failure taxonomy.
+- `crates/monty-worker` owns build-time worker validation, embedded bytes, secure extraction, and
+  executable leases. It must remain optional for native code consumers.
 - `crates/net` owns outbound URL, DNS, redirect, retry, and response-body policy.
 - `crates/source-icons` owns bounded source-icon discovery and normalization.
 - `fixtures/mcp-conformance` contains committed public-contract fixtures.
 
 Keep the tool crates independent from the host. Do not make them depend on client SDKs, harnesses,
 container APIs, tenant identity, or host authentication.
+
+`WorkerSource` is the worker-resolution contract. Explicit paths are authoritative. Discovery checks
+beside the host executable, then a configured bundle, then `PATH`. `CodeToolGroup` owns any bundled
+worker lease for the full pool lifetime; hosts supply cache and source policy, not extraction logic.
 
 ## Security Model
 
@@ -60,11 +67,17 @@ container APIs, tenant identity, or host authentication.
 - Source-icon output and resolution must remain process-level opt-in for every web tool. Disabled mode
   must issue no icon requests and must omit provider-supplied inline icon fields.
 - Authentication credentials must be bounded, redacted, and compared in constant time.
+- Bundled Monty bytes must remain target-validated, digest-addressed, atomically extracted, and
+  protected by private directories and interprocess leases. Cache roots are operator-controlled and
+  must never default to a predictable shared temporary directory.
+- `WORKCELL_BUNDLED_MONTY_WORKER` is a build input. Runtime worker selection must use
+  `WORKCELL_MCP_CODE_WORKER`, `--code-worker`, or the cache setting without treating build paths as
+  operator configuration.
 
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, web, shell.
+- Preserve stable catalog order: files, web, shell, code, execution environment.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.
@@ -92,6 +105,10 @@ make
 `make` includes `check-native`, which builds every `workcell` facade feature with no MCP adapter and
 fails if `rmcp` becomes reachable from the neutral tree. A workspace-wide `cargo check` cannot catch
 that regression, because feature unification always resolves `mcp` in.
+
+For code worker or packaging changes, verify both explicit-path and bundled sources, then execute a
+real snippet through an optimized binary copied away from any adjacent worker. This proves the
+embedded fallback works rather than accidentally resolving the development worker.
 
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
 test against the resulting process. Use `make docker-smoke` as the minimum image check.

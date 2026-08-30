@@ -1,0 +1,22 @@
+[package]
+name = "workcell-monty-worker"
+description = "Bundled Monty worker artifact and secure extraction"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true
