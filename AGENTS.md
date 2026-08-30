@@ -58,9 +58,22 @@ Rust workspace, key crates in root dir:
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
+- maki-workcell: Native Workcell adapter, Maki authorization integration, and tool-result presentation
 
 First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, websearch, webfetch, shell, code_execution, and execution_environment.
-Workcell owns the bundled Monty worker artifact, extraction, and lease; maki-workcell supplies Maki's cache root and process-only override policy.
+Maki owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
+validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
+lifecycle. Keep Workcell logic in Workcell rather than duplicating it in `maki-workcell`.
+
+`maki-workcell` supplies Maki's cache root and uses Workcell's bundled-only worker source for normal
+production startup. `WORKCELL_BUNDLED_MONTY_WORKER` is a build input populated by `just code-worker`,
+Nix, and release jobs. `WORKCELL_MCP_CODE_WORKER` is an authoritative process-only runtime override;
+never persist it or silently fall back when it is invalid. Workcell's `CodeToolGroup` retains the
+extracted worker lease for the complete pool lifetime.
+
+For worker or release changes, run the production bundled-worker execution test with a real pinned
+worker, not only a catalog check. Release smoke tests must fail when `code_execution` is reserved but
+unavailable. Keep Monty's worker and `monty-pool` versions in lockstep.
 
 Active built-in Lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources remain in-tree for tests and reference but are not loaded in production.
 
