@@ -994,9 +994,11 @@ async fn rejects_zero_limits_at_initialization() {
 #[tokio::test]
 async fn unconfined_native_mode_inspects_and_operates_on_absolute_outside_paths() {
     let fixture = fixture();
-    let files = FileToolGroup::new_unconfined(&fixture.root, None)
+    // Read-only hosting: reaching outside the base must not imply write access.
+    let files = FileToolGroup::new_unconfined(&fixture.root, false, None)
         .await
         .expect("unconfined group");
+    assert!(!files.allow_write());
     let outside_file = fixture.outside.join("secret.txt");
     let input = FileReadInput {
         file_path: outside_file.to_string_lossy().into_owned(),
@@ -1038,7 +1040,7 @@ async fn prepared_native_patch_exposes_every_resource_and_mutates_only_on_execut
     let source = fixture.outside.join("source.txt");
     let destination = fixture.outside.join("destination.txt");
     fs::write(&source, "old\n").expect("source");
-    let files = FileToolGroup::new_unconfined(&fixture.root, None)
+    let files = FileToolGroup::new_unconfined(&fixture.root, true, None)
         .await
         .expect("unconfined group");
     let patch_text = format!(
@@ -1072,6 +1074,113 @@ async fn prepared_native_patch_exposes_every_resource_and_mutates_only_on_execut
     assert!(output.applied);
     assert!(!source.exists());
     assert_eq!(fs::read_to_string(destination).unwrap(), "new\n");
+}
+
+#[tokio::test]
+async fn unconfined_read_only_hosting_rejects_mutation() {
+    let fixture = fixture();
+    let files = FileToolGroup::new_unconfined(&fixture.root, false, None)
+        .await
+        .expect("unconfined group");
+    let outside_file = fixture.outside.join("secret.txt");
+
+    // Reaching outside the base is a confinement decision; writing is a separate one.
+    let error = files
+        .file_write(
+            FileWriteInput {
+                file_path: outside_file.to_string_lossy().into_owned(),
+                content: "overwritten\n".into(),
+                dry_run: None,
+            },
+            &token(),
+        )
+        .await
+        .expect_err("read-only hosting must reject writes");
+    assert_eq!(
+        error.to_string(),
+        "Filesystem is read-only; restart with write access or use dryRun"
+    );
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "secret\n");
+}
+
+#[tokio::test]
+async fn traversal_and_read_agree_on_protected_entries_in_both_modes() {
+    let fixture = fixture();
+    fs::create_dir(fixture.root.join(".ssh")).expect("ssh dir");
+    fs::write(fixture.root.join(".ssh/config"), "ssh-secret\n").expect("ssh file");
+    fs::write(fixture.root.join(".env.local"), "env-secret\n").expect("env");
+
+    let listed = |files: &FileToolGroup| {
+        let files = files.clone();
+        async move {
+            files
+                .file_glob(
+                    FileGlobInput {
+                        pattern: "**/*".into(),
+                        path: None,
+                    },
+                    &token(),
+                )
+                .await
+                .expect("glob")
+                .files
+                .into_iter()
+                .map(|entry| entry.relative_path)
+                .collect::<Vec<_>>()
+        }
+    };
+    let read = |files: &FileToolGroup, path: &str| {
+        let files = files.clone();
+        let path = path.to_owned();
+        async move {
+            files
+                .file_read(
+                    FileReadInput {
+                        file_path: path,
+                        offset: None,
+                        limit: None,
+                    },
+                    &token(),
+                )
+                .await
+        }
+    };
+
+    // Confined: denied by `resolve` and absent from enumeration.
+    let confined = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .expect("confined group");
+    let confined_entries = listed(&confined).await;
+    for protected in [".ssh/config", ".env.local"] {
+        assert!(
+            matches!(
+                read(&confined, protected).await,
+                Err(FilesystemError::ProtectedPath(_))
+            ),
+            "{protected} must be denied while confined"
+        );
+        assert!(
+            !confined_entries.iter().any(|entry| entry == protected),
+            "{protected} must not be enumerated while confined"
+        );
+    }
+
+    // Unconfined: readable, and therefore also discoverable. A host cannot authorize what a
+    // prepared call would touch if enumeration hides paths that `file_read` will happily return.
+    let unconfined = FileToolGroup::new_unconfined(&fixture.root, false, None)
+        .await
+        .expect("unconfined group");
+    let unconfined_entries = listed(&unconfined).await;
+    for protected in [".ssh/config", ".env.local"] {
+        assert!(
+            read(&unconfined, protected).await.is_ok(),
+            "{protected} must be readable while unconfined"
+        );
+        assert!(
+            unconfined_entries.iter().any(|entry| entry == protected),
+            "{protected} must be enumerated while unconfined; got {unconfined_entries:?}"
+        );
+    }
 }
 
 fn temporary_files(root: &std::path::Path, basename: &str) -> Vec<String> {

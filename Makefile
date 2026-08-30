@@ -14,7 +14,17 @@ CODE_WORKER_ROOT ?= target/code-worker
 CODE_WORKER_BUILD ?= target/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty
 
-.PHONY: help code-worker fmt fmt-check check clippy test build release ci install run run-web clean docker-build docker-smoke docker-run
+.PHONY: help code-worker fmt fmt-check check check-native clippy test build release ci install run run-web clean docker-build docker-smoke docker-run
+
+# Cargo wants one comma-separated `--features` value; Make can only build that from a word list.
+comma := ,
+empty :=
+space := $(empty) $(empty)
+# Tool groups exposed by the `workcell` embedding facade, each gating one optional dependency.
+NATIVE_GROUPS := files web shell code environment
+NATIVE_FEATURES := $(subst $(space),$(comma),$(NATIVE_GROUPS))
+# Tool crates that must compile with no MCP adapter, so native hosts never link a transport.
+NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-environment
 
 help:
 	@printf '%s\n' \
@@ -23,6 +33,7 @@ help:
 		'  make fmt           Format the Rust workspace' \
 		'  make fmt-check     Verify formatting without changing files' \
 		'  make check         Type-check all workspace targets' \
+		'  make check-native  Type-check the protocol-neutral facade without any MCP adapter' \
 		'  make clippy        Run Clippy with warnings denied' \
 		'  make test          Run all workspace tests with the lockfile' \
 		'  make build         Build the debug workspace with the lockfile' \
@@ -72,6 +83,34 @@ fmt-check:
 check:
 	$(CARGO) check --workspace --all-targets --locked
 
+# `check` cannot cover the native path. Cargo unifies features across a workspace build, and the
+# standalone server depends on every tool crate with `features = ["mcp"]`, so `--workspace` always
+# resolves the MCP adapter in. The facade's own `default = []` then leaves it compiling empty. Both
+# effects together mean no workspace-wide command ever builds a tool crate without `rmcp`, which is
+# precisely the configuration native hosts consume. These per-package checks are that coverage.
+check-native:
+	@for group in $(NATIVE_GROUPS); do \
+		printf '%s\n' "checking facade group: $$group"; \
+		$(CARGO) check --locked --package workcell --no-default-features --features "$$group" || exit 1; \
+	done
+	$(CARGO) check --locked --package workcell --no-default-features \
+		--features "$(NATIVE_FEATURES)"
+	@for crate in $(NATIVE_CRATES); do \
+		printf '%s\n' "checking crate without MCP adapter: $$crate"; \
+		$(CARGO) check --locked --package "$$crate" --no-default-features || exit 1; \
+	done
+	$(CARGO) clippy --locked --package workcell --no-default-features \
+		--features "$(NATIVE_FEATURES)" -- -D warnings
+	@# A non-optional rmcp dependency anywhere in the tool crates would silently pull a transport
+	@# into every native host. Assert its absence rather than trusting the feature declarations.
+	@if $(CARGO) tree --locked --package workcell --no-default-features \
+		--features "$(NATIVE_FEATURES)" --prefix none 2>/dev/null \
+		| grep -q '^rmcp '; then \
+		printf '%s\n' 'rmcp is reachable from the protocol-neutral facade; an MCP dependency is no longer optional'; \
+		exit 2; \
+	fi
+	@printf '%s\n' 'native facade builds for every tool group with no MCP dependency'
+
 clippy:
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 
@@ -88,7 +127,7 @@ build:
 release:
 	$(CARGO) build --release --locked --package workcell-mcp
 
-ci: fmt-check check clippy test release
+ci: fmt-check check check-native clippy test release
 
 # Installs the worker into the same Cargo bin directory, so the installed server finds it beside
 # itself. Without this the code tool group would be enabled but unusable after a plain install.

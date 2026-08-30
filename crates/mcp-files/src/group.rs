@@ -86,14 +86,26 @@ impl FileToolGroup {
         })
     }
 
-    /// Construct a host-managed filesystem rooted only for relative-path resolution.
-    /// Absolute paths and relative traversal may resolve outside `base_cwd`.
+    /// Construct a host-managed filesystem where `base_cwd` only anchors relative-path resolution.
+    ///
+    /// This is the native-hosting constructor and it is deliberately fail-open: the calling host is
+    /// the policy layer. Both root confinement and protected-path denial are disabled, so absolute
+    /// paths and `..` traversal resolve anywhere the process can reach, and credential-bearing
+    /// entries such as `.env`, `.ssh`, `.netrc`, `*.key`, and `id_rsa` are reachable for read and,
+    /// when `allow_write` is set, for mutation. Broad traversal reports those entries too, so an
+    /// authorizing host can enumerate exactly what a call would touch.
+    ///
+    /// Hosts must authorize the [`FileResource`] values a prepared operation exposes before
+    /// committing it. Pass `allow_write = false` for inspection-only hosting.
     pub async fn new_unconfined(
         base_cwd: impl AsRef<Path>,
+        allow_write: bool,
         limits: Option<FilesystemLimits>,
     ) -> Result<Self, FilesystemError> {
         Ok(Self {
-            core: Arc::new(FilesystemCore::create_unconfined(base_cwd.as_ref(), limits).await?),
+            core: Arc::new(
+                FilesystemCore::create_unconfined(base_cwd.as_ref(), allow_write, limits).await?,
+            ),
         })
     }
 

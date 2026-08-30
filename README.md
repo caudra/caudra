@@ -378,6 +378,59 @@ package-manager, container, sandbox, and network classifications are best-effort
 than security or authorization guarantees. Disable both surfaces with
 `--no-expose-execution-environment`.
 
+## Embedding
+
+Workcell's tool groups are usable directly from another Rust program, with no transport, no
+subprocess, and no MCP dependency. MCP is one projection of the tool contracts, not their definition.
+
+The `workcell` facade is the single entry point. Each tool group is a feature, so a host compiles
+only what it uses:
+
+```toml
+[dependencies]
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-features = false, features = ["files"] }
+```
+
+| Feature | Provides |
+| --- | --- |
+| `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
+| `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
+| `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis and progress streaming |
+| `code` | `CodeToolGroup`, isolated interpreter execution |
+| `environment` | `ExecutionEnvironment` inspection |
+
+`ToolSpec` carries the protocol-neutral contract: name, description, input and output schemas,
+annotations, presentation profile, and a stable contract identity. A host registers those directly.
+Enabling a group's `mcp` feature additionally projects the same spec into an MCP `Tool`, which is how
+the standalone server builds its catalog; without it, `rmcp` is not in the dependency graph at all.
+
+Operations separate preparation from execution. `prepare_apply_patch`, `ShellToolGroup::prepare`, and
+the web `prepare_*` methods return a prepared value that exposes every resource the call would touch,
+before anything is read, written, or executed. Hosts authorize the prepared resources under their own
+policy, then commit with the matching `execute_*` method.
+
+### Confinement is a host decision
+
+`FileToolGroup::new` and `ShellToolGroup::with_policy` confine to a root, exactly as the standalone
+server does. The `_unconfined` constructors are for hosts that own authorization themselves, and they
+relax **confinement only** — every other axis stays an explicit argument:
+
+```rust
+// Inspection-only hosting: reaches anywhere the process can, but cannot mutate.
+let files = FileToolGroup::new_unconfined(&base_cwd, false, None).await?;
+
+// Host-owned shell policy with host-managed workdirs.
+let shell = ShellToolGroup::with_policy_unconfined(&base_cwd, policy).await?;
+```
+
+`FileToolGroup::new_unconfined` disables root-escape rejection *and* protected-path denial together,
+so `.env`, `.ssh`, `.netrc`, `*.key`, and `id_rsa` become reachable. Enumeration matches: broad
+traversal reports those entries too, so a host can always discover what a call would touch. Passing
+`allow_write = false` keeps that reach read-only. `ShellToolGroup::new_unconfined` relaxes workdir
+resolution while leaving permission policy fail-closed.
+
+Run `make check-native` to verify every facade feature builds with no MCP adapter linked.
+
 ## Development
 
 ```bash
@@ -396,10 +449,13 @@ tool schemas and bounded behavior. Update fixtures deliberately when a public to
 
 ```text
 src/                   Workcell host, transports, CLI, and process policy
+crates/workcell/       Protocol-neutral embedding facade for native hosts
+crates/tool-contract/  Protocol-neutral tool contracts shared by every group
 crates/mcp-files/      Filesystem tools
 crates/mcp-shell/      Shell tool and progress streaming
 crates/mcp-code/       Code execution tool and worker-process supervision
 crates/mcp-web/        Search, fetch, extraction, and PDF handling
+crates/environment/    Execution environment inspection
 crates/net/            Outbound URL, DNS, redirect, retry, and body policy
 crates/source-icons/   Bounded favicon discovery and normalization
 fixtures/              Cross-crate MCP conformance fixtures
@@ -422,10 +478,15 @@ annotations do not replace client consent, Workcell admission checks, or deploym
 
 ### Filesystem tools
 
-All filesystem paths are resolved against one canonical root. Inputs may use root-relative paths or
-absolute paths inside that root. Lexical escapes, stable symlink escapes, protected paths, and paths
-outside the root are rejected. Broad traversal skips symlinks, `.git`, `node_modules`, and protected
-entries. Binary classification uses bounded content inspection rather than filename extensions.
+In the standalone server, all filesystem paths are resolved against one canonical root. Inputs may
+use root-relative paths or absolute paths inside that root. Lexical escapes, stable symlink escapes,
+protected paths, and paths outside the root are rejected. Broad traversal skips symlinks, `.git`,
+`node_modules`, and protected entries. Binary classification uses bounded content inspection rather
+than filename extensions.
+
+Confinement is a property of the server's constructor, not of the crate. Native hosts may opt into
+unconfined resolution, which disables both root confinement and protected-path denial; see
+[Embedding](#embedding).
 
 The standalone defaults limit individual files and writes to 5 MiB, model-facing reads to 50 KiB,
 lines to 2,000 characters, read windows to 2,000 lines, search results to 100, and broad traversal to

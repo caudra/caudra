@@ -65,6 +65,29 @@ must not treat reported availability or privilege, package-manager, container, s
 classifications as an authorization or isolation boundary. Disable discovery and the tool together
 with `--no-expose-execution-environment`.
 
+The statements above describe the standalone server. Workcell's tool crates are also embeddable
+directly by a native Rust host through the `workcell` facade, and that host becomes the authorization
+layer. Confined constructors (`FileToolGroup::new`, `ShellToolGroup::with_policy`) enforce exactly
+what the server enforces. The `_unconfined` constructors do not, and they are the intended mechanism
+for hosts that authorize paths and commands themselves:
+
+- `FileToolGroup::new_unconfined` disables root confinement and protected-path denial together.
+  Absolute paths and `..` traversal resolve anywhere the process can reach, and credential-bearing
+  entries such as `.env`, `.ssh`, `.netrc`, `*.key`, and `id_rsa` are readable. Its `allow_write`
+  argument independently controls mutation; pass `false` for inspection-only hosting. Broad traversal
+  reports the same entries `file_read` will return, so a host can enumerate the full reachable set
+  rather than authorizing against a filtered view.
+- `ShellToolGroup::new_unconfined` and `with_policy_unconfined` relax only workdir resolution.
+  Permission policy stays fail-closed unless the host supplies its own, and deny rules still reject a
+  request before any command runs.
+
+Prepared operations exist so that authorization can happen before any effect. `prepare_apply_patch`,
+`ShellToolGroup::prepare`, and the web `prepare_*` methods disclose every path, command scope, query,
+or URL a call would touch without reading, writing, or executing anything. A host that commits a
+prepared value without inspecting its resources has performed no authorization, and unconfined mode
+grants that call the full reach of the process. Embedding does not add an isolation boundary;
+deployment isolation remains mandatory exactly as it is for the standalone server.
+
 Recommended controls for untrusted workloads include:
 
 - A dedicated container, VM, microVM, or restricted operating-system account.
@@ -97,6 +120,10 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
   another allowed executable.
 - Filesystem authorization is path based and retains a potential time-of-check/time-of-use window under
   malicious concurrent filesystem mutation.
+- A native host embedding the tool crates with an `_unconfined` constructor supplies the entire
+  authorization layer. Workcell enforces bounded reads, writes, output, deadlines, and cancellation in
+  that configuration, but no path or workdir boundary. A host defect there has the same reach as the
+  process itself.
 - Native document and image parsing occurs in-process. Internal bounds reduce risk but do not replace
   hard process memory and CPU isolation.
 - Credential-free Exa MCP search is not private or an availability guarantee. Queries leave the

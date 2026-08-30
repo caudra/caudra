@@ -43,6 +43,10 @@ impl RootPathPolicy {
         })
     }
 
+    /// Host-authorized policy: `root` degrades from a boundary to a base for relative paths.
+    /// Clearing `confined` disables root-escape rejection and protected-path denial together,
+    /// because a host that is trusted to authorize paths outside the root is also the only party
+    /// that can decide whether a credential file inside it is in scope.
     pub(crate) async fn create_unconfined(base_cwd: &Path) -> Result<Self, FilesystemError> {
         let mut policy = Self::create(base_cwd).await?;
         policy.confined = false;
@@ -124,6 +128,12 @@ impl RootPathPolicy {
     }
 
     pub(crate) fn traversal_allowed(&self, traversal_root: &Path, candidate: &Path) -> bool {
+        // Enumeration must agree with `resolve`. When protected-path denial is off, hiding these
+        // entries from traversal would leave a host able to read a path it could never discover,
+        // and unable to enumerate what a call is about to touch.
+        if !self.confined {
+            return true;
+        }
         self.is_protected_path(traversal_root) || !self.is_protected_path(candidate)
     }
 
@@ -238,12 +248,26 @@ mod tests {
         let root = PathBuf::from("/workspace");
         let policy = RootPathPolicy {
             root: root.clone(),
-            confined: false,
+            confined: true,
         };
         let protected = root.join(".ssh/id_ed25519");
 
         assert!(!policy.traversal_allowed(&root, &protected));
         assert!(policy.traversal_allowed(&root.join(".ssh"), &protected));
+    }
+
+    #[test]
+    fn unconfined_traversal_reports_paths_that_unconfined_resolution_would_return() {
+        let root = PathBuf::from("/workspace");
+        let policy = RootPathPolicy {
+            root: root.clone(),
+            confined: false,
+        };
+
+        // `resolve` skips protected-path denial when unconfined, so hiding the same entry from
+        // enumeration would leave a host unable to discover what it is permitted to read.
+        assert!(policy.traversal_allowed(&root, &root.join(".ssh/id_ed25519")));
+        assert!(policy.traversal_allowed(&root, &root.join(".env.local")));
     }
 
     proptest! {

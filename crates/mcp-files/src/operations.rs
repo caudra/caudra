@@ -33,13 +33,14 @@ impl FilesystemCore {
 
     pub(crate) async fn create_unconfined(
         base_cwd: &Path,
+        allow_write: bool,
         limits: Option<FilesystemLimits>,
     ) -> Result<Self, FilesystemError> {
         let policy = RootPathPolicy::create_unconfined(base_cwd).await?;
         let limits = limits.unwrap_or_default().validate()?;
         Ok(Self {
             policy,
-            allow_write: true,
+            allow_write,
             limits,
             mutation: Arc::new(Mutex::new(())),
         })

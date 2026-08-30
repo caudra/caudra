@@ -74,15 +74,26 @@ impl ShellToolGroup {
         Self::build(root.as_ref(), policy, true).await
     }
 
-    /// Construct a trusted native group whose base cwd only resolves relative workdirs.
-    /// Absolute paths and relative traversal outside the base are accepted.
+    /// Construct a host-managed group where `base_cwd` only anchors relative workdirs.
+    ///
+    /// Absolute and outside-the-base workdirs are accepted, so the host is responsible for
+    /// authorizing the prepared workdir and scopes. Permission policy stays fail-closed at
+    /// [`ShellPermissionPolicy::restricted`]; use [`Self::with_policy_unconfined`] to supply the
+    /// host's own policy.
     pub async fn new_unconfined(base_cwd: impl AsRef<Path>) -> Result<Self, ShellBuildError> {
-        Self::build(
-            base_cwd.as_ref(),
-            ShellPermissionPolicy::restricted(),
-            false,
-        )
-        .await
+        Self::with_policy_unconfined(base_cwd, ShellPermissionPolicy::restricted()).await
+    }
+
+    /// Host-managed workdir resolution combined with a host-supplied permission policy.
+    ///
+    /// Relaxing workdir confinement and choosing a policy are separate decisions; this is the
+    /// constructor for hosts that own both. Deny rules still reject a request before any command
+    /// runs, exactly as in the confined server.
+    pub async fn with_policy_unconfined(
+        base_cwd: impl AsRef<Path>,
+        policy: ShellPermissionPolicy,
+    ) -> Result<Self, ShellBuildError> {
+        Self::build(base_cwd.as_ref(), policy, false).await
     }
 
     async fn build(
@@ -504,6 +515,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(relative.workdir(), outside.canonicalize().unwrap());
+    }
+    #[tokio::test]
+    async fn unconfined_workdir_and_permission_policy_are_independent_choices() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().join("base");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        // Relaxing workdir confinement must not silently relax policy.
+        let default = ShellToolGroup::new_unconfined(&base).await.unwrap();
+        assert_eq!(default.policy_summary().default_decision, "deny");
+        assert!(!default.policy_summary().yolo);
+
+        // ...and a host that owns policy must be able to supply it alongside an outside workdir.
+        let hosted = ShellToolGroup::with_policy_unconfined(&base, ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        assert!(hosted.policy_summary().yolo);
+
+        let result = call(
+            &hosted,
+            json!({"command":"printf hosted","workdir":outside.to_string_lossy()}),
+        )
+        .await;
+        let output = result.structured_content.unwrap();
+        assert_eq!(output["stdout"], "hosted");
+
+        let denied = call(
+            &default,
+            json!({"command":"printf denied","workdir":outside.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(denied.is_error, Some(true));
     }
     #[tokio::test]
     async fn trusted_native_execution_uses_host_authorization_instead_of_workcell_policy() {

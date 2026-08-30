@@ -12,6 +12,10 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 
 - `src/` owns process startup, CLI policy, MCP composition, transport lifecycle, authentication, and
   sanitized execution-environment disclosure.
+- `crates/tool-contract` owns the protocol-neutral `ToolSpec` contract shared by every tool group. It
+  must not depend on any protocol SDK.
+- `crates/workcell` is the embedding facade. It only re-exports; keep logic in the owning crate.
+- `crates/environment` owns execution-environment inspection and its disclosure shape.
 - `crates/mcp-files` owns filesystem schemas, confinement, bounded reads, and mutations.
 - `crates/mcp-shell` owns immutable shell permission policy, command execution, process cleanup,
   output bounds, and progress streaming.
@@ -29,14 +33,22 @@ container APIs, tenant identity, or host authentication.
 
 - Workcell does not provide an OS sandbox. Never describe shell execution as safe or sandboxed.
 - One process represents one execution environment and one configured root.
-- Filesystem tools are root-confined; shell commands are not. Shell may access anything visible to the
-  process after starting in a root-confined workdir.
+- In the standalone server, filesystem tools are root-confined; shell commands are not. Shell may
+  access anything visible to the process after starting in a root-confined workdir.
+- Confinement is a constructor choice, not a crate property. The `_unconfined` constructors exist for
+  native hosts that own authorization. They must relax confinement only: never fold write permission,
+  permission policy, or any other axis into that single decision.
+- Keep enumeration consistent with resolution. If a path is readable in a given mode, traversal must
+  report it. A host cannot authorize what it cannot discover.
 - Shell is fail-closed without an operator policy or `--yolo`. Preserve tree-sitter scope extraction,
   deny-first atomic decisions, and authorization before semaphore admission or process creation.
 - Shell policy is startup configuration. Never add policy, approval, or bypass fields to tool input.
 - Describe shell policy as best effort. Allowed interpreters and programs can execute scripts or
   equivalent behavior that is not represented by the visible command scope.
-- File mutation remains preview-only unless `--allow-write` is explicit.
+- File mutation remains preview-only unless write access is explicit: `--allow-write` in the server,
+  the `allow_write` argument in native constructors.
+- Prepared operations must disclose every resource they would touch before any effect occurs, so a
+  native host can authorize them.
 - Container HTTP bind must remain authenticated. Do not add an unauthenticated wildcard bind.
 - HTTP exposes only `POST /mcp`. New control or administrative endpoints require a documented threat
   model and explicit maintainer approval.
@@ -56,6 +68,8 @@ container APIs, tenant identity, or host authentication.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.
+- MCP is a projection of `ToolSpec`, not a second source of truth. Derive catalogs from the neutral
+  spec and keep the `mcp` feature optional so native hosts never link a transport.
 
 ## Coding Rules
 
@@ -75,11 +89,15 @@ Run before considering a change complete:
 make
 ```
 
+`make` includes `check-native`, which builds every `workcell` facade feature with no MCP adapter and
+fails if `rmcp` becomes reachable from the neutral tree. A workspace-wide `cargo check` cannot catch
+that regression, because feature unification always resolves `mcp` in.
+
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
 test against the resulting process. Use `make docker-smoke` as the minimum image check.
 
 ## Documentation
 
 Update `README.md`, `SECURITY.md`, and `example.env` when startup, transport, authentication,
-deployment, or security behavior changes. Mermaid diagrams are preferred for architecture and flow
+deployment, embedding, or security behavior changes. Mermaid diagrams are preferred for architecture and flow
 documentation.
