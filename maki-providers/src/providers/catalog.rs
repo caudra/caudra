@@ -18,6 +18,7 @@ use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_config::providers::builtin_provider;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -41,10 +42,12 @@ const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
-/// Bumped whenever the cached shape gains a field, since the cache stores the
-/// parsed form: an older file would silently be missing reasoning options and
-/// price tiers.
-const CATALOG_CACHE_FILE: &str = "models-dev-catalog-v2.json";
+const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
+/// Bumped whenever the parsed shape gains a field, since the cache stores the
+/// parsed form and an older file would silently be missing it. Carried inside
+/// the cache rather than in its name, so a bump refetches in place instead of
+/// orphaning the previous file forever.
+const CATALOG_CACHE_VERSION: u32 = 2;
 
 /// Used only when a catalog entry omits its limits entirely.
 const FALLBACK_CATALOG_CONTEXT: u32 = 128_000;
@@ -304,6 +307,10 @@ pub(crate) struct CatalogData {
     metadata: HashMap<String, HashMap<String, CatalogMeta>>,
     opencode_slugs: std::collections::HashSet<String>,
     enable_free_models: bool,
+    /// False when models.dev could not be read at all. Without it an offline
+    /// run is indistinguishable from a catalog that simply has no such
+    /// provider, and the error blames the provider for the network.
+    reachable: bool,
     pub(crate) state_dir: StateDir,
 }
 
@@ -375,6 +382,7 @@ impl CatalogData {
             metadata,
             opencode_slugs,
             enable_free_models,
+            reachable: true,
             state_dir: state_dir.clone(),
         }
     }
@@ -387,6 +395,7 @@ impl CatalogData {
             metadata: HashMap::new(),
             opencode_slugs: std::collections::HashSet::new(),
             enable_free_models: false,
+            reachable: false,
             state_dir,
         }
     }
@@ -507,6 +516,15 @@ pub fn available_if_warm(slug: &str) -> bool {
     data.resolve_auth(&state_dir).is_some()
 }
 
+/// The cached catalog, tagged with the shape it was written against. A file
+/// from before this wrapper existed has no `version` and is rejected the same
+/// way a stale one is: refetched, then overwritten in place.
+#[derive(Serialize, Deserialize)]
+struct CachedCatalog<I> {
+    version: u32,
+    index: I,
+}
+
 fn catalog_cache_path() -> Option<PathBuf> {
     let dir = maki_storage::paths::cache_dir().ok()?;
     Some(dir.join(CATALOG_CACHE_FILE))
@@ -531,9 +549,24 @@ async fn load_cached_catalog_async() -> Option<schema::CatalogIndex> {
     let text = smol::unblock(move || fs::read_to_string(&path))
         .await
         .ok()?;
-    let index: schema::CatalogIndex = serde_json::from_str(&text).ok()?;
+    decode_cached_catalog(&text)
+}
+
+/// Rejects a cache written against a different shape. A file from before the
+/// version wrapper existed has no `version` at all and fails to parse, which is
+/// the same answer: refetch, then overwrite in place.
+fn decode_cached_catalog(text: &str) -> Option<schema::CatalogIndex> {
+    let cached: CachedCatalog<schema::CatalogIndex> = serde_json::from_str(text).ok()?;
+    if cached.version != CATALOG_CACHE_VERSION {
+        debug!(
+            found = cached.version,
+            want = CATALOG_CACHE_VERSION,
+            "catalog cache predates the current shape"
+        );
+        return None;
+    }
     debug!("loaded catalog from cache");
-    Some(index)
+    Some(cached.index)
 }
 
 async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
@@ -545,7 +578,10 @@ async fn save_cached_catalog_async(index: &schema::CatalogIndex) {
         let dir = dir.to_path_buf();
         let _ = smol::unblock(move || fs::create_dir_all(&dir)).await;
     }
-    let text = match serde_json::to_string_pretty(index) {
+    let text = match serde_json::to_string_pretty(&CachedCatalog {
+        version: CATALOG_CACHE_VERSION,
+        index,
+    }) {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "failed to serialize catalog for cache");
@@ -880,12 +916,31 @@ impl Provider for LazyCatalogProvider {
 
 fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, AgentError> {
     let data = catalog_provider(slug).ok_or_else(|| AgentError::Config {
-        message: format!("unknown provider '{slug}'"),
+        message: unresolved_slug_reason(slug),
     })?;
     let state_dir = StateDir::resolve().map_err(|e| AgentError::Config {
         message: format!("failed to resolve state dir: {e}"),
     })?;
     CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
+}
+
+/// Why a catalog-backed slug did not resolve. An empty catalog means models.dev
+/// was unreadable, which is a network problem and not the provider's fault;
+/// saying "unknown provider" there sends the user looking in the wrong place.
+pub(crate) fn unresolved_slug_reason(slug: &str) -> String {
+    let reachable = SHARED_CATALOG
+        .get()
+        .and_then(|catalog| catalog.lock().ok())
+        .is_some_and(|guard| guard.reachable);
+    slug_failure_message(slug, reachable)
+}
+
+fn slug_failure_message(slug: &str, catalog_reachable: bool) -> String {
+    if catalog_reachable {
+        format!("unknown provider '{slug}'")
+    } else {
+        format!("could not read the models.dev catalog, so provider '{slug}' cannot be resolved")
+    }
 }
 
 /// Zen hides free models behind `providers.opencode.enable_free_models`;
@@ -1112,6 +1167,75 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["free-model", "paid-model"]);
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_KEY_41827") };
+    }
+
+    const ONE_BAD_MODEL: &str =
+        "one unreadable model must cost that model, not the provider it sits in";
+
+    #[test]
+    fn unreadable_model_is_dropped_without_losing_its_provider() {
+        let provider: super::schema::CatalogProvider = serde_json::from_str(
+            r#"{
+                "name": "Vendor",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://vendor.example/v1",
+                "models": {
+                    "good": {"limit": {"context": 200000, "output": 64000}},
+                    "bad": {"limit": {"context": "not a number"}}
+                }
+            }"#,
+        )
+        .expect(ONE_BAD_MODEL);
+
+        assert!(provider.models.contains_key("good"), "{ONE_BAD_MODEL}");
+        assert!(!provider.models.contains_key("bad"), "{ONE_BAD_MODEL}");
+    }
+
+    const STALE_CACHE_REFETCHES: &str =
+        "a cache written against another shape must be refetched, not trusted";
+
+    #[test]
+    fn cache_round_trips_at_the_current_version() {
+        let index: super::schema::CatalogIndex = HashMap::from([(
+            "vendor".into(),
+            super::schema::CatalogProvider {
+                name: "Vendor".into(),
+                env: vec!["VENDOR_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://vendor.example/v1".into()),
+                models: HashMap::new(),
+            },
+        )]);
+        let text = serde_json::to_string(&super::CachedCatalog {
+            version: super::CATALOG_CACHE_VERSION,
+            index: &index,
+        })
+        .unwrap();
+
+        let decoded = super::decode_cached_catalog(&text).expect("current version must load");
+        assert!(decoded.contains_key("vendor"));
+    }
+
+    /// The bare index is what every cache written before the version wrapper
+    /// looks like, and it lives at the same path.
+    #[test_case(r#"{"vendor":{"name":"V","env":[],"npm":"@ai-sdk/openai-compatible","models":{}}}"# ; "unversioned_file_from_an_older_maki")]
+    #[test_case(r#"{"version":1,"index":{}}"# ; "older_version")]
+    #[test_case(r#"{"version":99,"index":{}}"# ; "newer_version")]
+    #[test_case("not json at all" ; "corrupt")]
+    fn cache_from_another_shape_is_rejected(text: &str) {
+        assert!(
+            super::decode_cached_catalog(text).is_none(),
+            "{STALE_CACHE_REFETCHES}"
+        );
+    }
+
+    #[test_case(true,  "unknown provider 'opencode-go'" ; "a_warm_catalog_blames_the_provider")]
+    #[test_case(false, "could not read the models.dev catalog, so provider 'opencode-go' cannot be resolved" ; "an_unreadable_catalog_blames_the_network")]
+    fn slug_failure_message_names_the_real_cause(reachable: bool, expected: &str) {
+        assert_eq!(
+            super::slug_failure_message("opencode-go", reachable),
+            expected
+        );
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {
@@ -2357,7 +2481,30 @@ pub(crate) mod schema {
         pub env: Vec<String>,
         pub npm: String,
         pub api: Option<String>,
+        #[serde(deserialize_with = "deserialize_models")]
         pub models: HashMap<String, CatalogModel>,
+    }
+
+    /// Drops the models maki cannot read instead of failing the whole catalog
+    /// with them. models.dev describes ~7500 models from every vendor alive; one
+    /// of them carrying a shape this schema has not met yet must cost that one
+    /// model, not every provider maki can route to.
+    fn deserialize_models<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<String, CatalogModel>, D::Error> {
+        let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(id, value)| {
+                match serde_json::from_value::<CatalogModel>(value) {
+                    Ok(model) => Some((id, model)),
+                    Err(error) => {
+                        tracing::debug!(model = %id, %error, "skipping unreadable catalog model");
+                        None
+                    }
+                }
+            })
+            .collect())
     }
 
     /// Data types a model supports on input and output (e.g. text, image).
@@ -2440,3 +2587,4 @@ pub(crate) mod schema {
         pub shape: Option<String>,
     }
 }
+

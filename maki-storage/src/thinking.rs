@@ -56,11 +56,29 @@ pub enum ReasoningOption {
     Effort { values: Vec<String> },
     /// A token budget, bounded by whatever the API documents.
     BudgetTokens {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_bound",
+            skip_serializing_if = "Option::is_none"
+        )]
         min: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_bound",
+            skip_serializing_if = "Option::is_none"
+        )]
         max: Option<u32>,
     },
+}
+
+/// A catalog bound, where a negative number is the sentinel for "the model
+/// decides" rather than a real token count. Treated as no bound at all, since
+/// that is what it means and a signed budget is not something to clamp against.
+fn deserialize_bound<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let raw = Option::<i64>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| u32::try_from(value).ok()))
 }
 
 /// The reasoning controls a model advertises. Empty means the model either
@@ -272,6 +290,29 @@ mod tests {
         BUDGET_LADDER, EFFORT_LEVELS, ReasoningOption, ReasoningOptions, StoredThinking,
         ThinkingParseError, effort_rank,
     };
+
+    const SENTINEL_IS_NOT_A_BOUND: &str =
+        "a negative bound means the model decides, not a token count to clamp against";
+
+    /// models.dev publishes `min: -1` on a handful of models. Rejecting it once
+    /// cost the entire catalog, because one unreadable model failed the whole
+    /// parse.
+    #[test_case(r#"{"type":"budget_tokens","min":-1,"max":32768}"#, None, Some(32_768) ; "negative_min_is_no_min")]
+    #[test_case(r#"{"type":"budget_tokens","min":1024,"max":-1}"#, Some(1_024), None ; "negative_max_is_no_max")]
+    #[test_case(r#"{"type":"budget_tokens","min":1024,"max":32768}"#, Some(1_024), Some(32_768) ; "real_bounds_survive")]
+    #[test_case(r#"{"type":"budget_tokens"}"#, None, None ; "absent_bounds")]
+    fn budget_bounds_read_negative_sentinels_as_unbounded(
+        json: &str,
+        min: Option<u32>,
+        max: Option<u32>,
+    ) {
+        let option: ReasoningOption = serde_json::from_str(json).expect(SENTINEL_IS_NOT_A_BOUND);
+        assert_eq!(
+            option,
+            ReasoningOption::BudgetTokens { min, max },
+            "{SENTINEL_IS_NOT_A_BOUND}"
+        );
+    }
 
     fn efforts(values: &[&str]) -> ReasoningOptions {
         ReasoningOptions::new(vec![ReasoningOption::Effort {

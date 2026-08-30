@@ -34,6 +34,9 @@ use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
+const STATIC_FALLBACK_NOTE: &str = "using static fallback";
+const NO_FALLBACK_NOTE: &str = "no models listed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
 pub enum ProviderKind {
@@ -301,7 +304,7 @@ pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provi
         return catalog;
     }
     Err(AgentError::Config {
-        message: format!("unknown provider '{slug}'"),
+        message: crate::providers::catalog::unresolved_slug_reason(slug),
     })
 }
 
@@ -484,18 +487,24 @@ pub async fn fetch_all_models(
                     }
                 }
                 Err(e) => {
-                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
                     let fallback: Vec<String> = manifest
                         .models
                         .iter()
                         .flat_map(|entry| entry.prefixes.iter())
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
+                    // A catalog-backed provider ships no static models, so
+                    // promising a fallback it does not have would send the user
+                    // looking for models that were never there.
+                    let outcome = if fallback.is_empty() {
+                        NO_FALLBACK_NOTE
+                    } else {
+                        STATIC_FALLBACK_NOTE
+                    };
+                    warn!(provider = slug, error = %e, outcome, "failed to list models");
                     ModelBatch {
                         models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
+                        warnings: vec![format!("{display_name}: {e} ({outcome})")],
                     }
                 }
             };
