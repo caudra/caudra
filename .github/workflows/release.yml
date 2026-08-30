@@ -64,9 +64,13 @@ jobs:
                worker="$PWD/target/code-worker/bin/monty"
                strip "$worker"
                "$worker" --version | grep -q '0.0.21'
-               MAKI_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
-               XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-                 target/${{ matrix.target }}/release/maki prompt --tools --names | grep -qx code_execution
+               WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
+               WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
+                 --package maki-workcell production_host_executes_code_with_the_embedded_worker
+               smoke_output="$(XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+                 target/${{ matrix.target }}/release/maki prompt --tools --names 2>&1)"
+               printf '%s\n' "$smoke_output" | grep -qx code_execution
+               ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
              '
           sudo chown -R $(id -u):$(id -g) target/
 
@@ -118,14 +122,18 @@ jobs:
             strip -x "$worker"
           fi
           "$worker" --version | grep -q '0.0.21'
-          MAKI_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
+          WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
+          WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
+            --package maki-workcell production_host_executes_code_with_the_embedded_worker
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             binary="target/${{ matrix.target }}/release/maki.exe"
           else
             binary="target/${{ matrix.target }}/release/maki"
           fi
-          XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-            "$binary" prompt --tools --names | grep -qx code_execution
+          smoke_output="$(XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+            "$binary" prompt --tools --names 2>&1)"
+          printf '%s\n' "$smoke_output" | grep -qx code_execution
+          ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

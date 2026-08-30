@@ -169,7 +169,7 @@
               stdenv.cc.cc.lib
             ];
             inherit cargoVendorDir;
-            MAKI_MONTY_WORKER = "${montyWorker}/bin/monty";
+            WORKCELL_BUNDLED_MONTY_WORKER = "${montyWorker}/bin/monty";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly (

@@ -90,7 +90,7 @@ maki-otel = { path = "maki-otel" }
 maki-workcell = { path = "maki-workcell" }
 # Temporary cross-repository development dependency. Replace `path` with a
 # pinned git `rev` once the Workcell API changes are published.
-workcell = { path = "../workcell-mcp/crates/workcell", default-features = false, features = ["files", "web", "shell", "code", "environment"] }
+workcell = { path = "../workcell-mcp/crates/workcell", default-features = false, features = ["files", "web", "shell", "code-bundled", "environment"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bs58 = "0.5"

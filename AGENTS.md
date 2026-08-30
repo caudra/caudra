@@ -53,13 +53,14 @@ Rust workspace, key crates in root dir:
 - maki-ui: Uses ratatui for an interactive UI (elm like architecture)
 - maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI, xAI)
 - maki-agent: An async agent loop that runs on smol
-- maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
+- maki-interpreter: legacy Lua interpreter API using pydantic/monty
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
 
 First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, websearch, webfetch, shell, code_execution, and execution_environment.
+Workcell owns the bundled Monty worker artifact, extraction, and lease; maki-workcell supplies Maki's cache root and process-only override policy.
 
 Active built-in Lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources remain in-tree for tests and reference but are not loaded in production.
 

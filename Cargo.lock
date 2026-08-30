@@ -3687,13 +3687,11 @@ dependencies = [
  "flume 0.11.1",
  "futures-lite",
  "jiff",
- "libc",
  "maki-agent",
  "maki-config",
  "maki-storage",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "smol",
  "tempfile",
  "thiserror 2.0.18",
@@ -8482,6 +8480,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "workcell-monty-worker",
  "workcell-tool-contract",
 ]
 
@@ -8545,6 +8544,16 @@ dependencies = [
  "workcell-net",
  "workcell-source-icons",
  "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-monty-worker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

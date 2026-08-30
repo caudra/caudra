@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod worker;
-
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -26,7 +24,9 @@ use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 use workcell::ToolSpec;
-use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome};
+#[cfg(test)]
+use workcell::code::bundled_worker_available;
+use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
@@ -86,7 +86,6 @@ struct HostInner {
     projects: tokio::sync::Mutex<HashMap<PathBuf, ProjectGroups>>,
     web: WebToolGroup,
     code: Option<Arc<CodeToolGroup>>,
-    _worker_lease: Mutex<Option<worker::WorkerLease>>,
 }
 
 impl HostInner {
@@ -176,6 +175,13 @@ impl WorkcellHost {
         project_cwd: impl AsRef<Path>,
         worker_path: Option<&Path>,
     ) -> Result<Self, HostError> {
+        Self::with_worker_source(project_cwd, worker_path.map(WorkerSource::Path))
+    }
+
+    fn with_worker_source(
+        project_cwd: impl AsRef<Path>,
+        worker_source: Option<WorkerSource<'_>>,
+    ) -> Result<Self, HostError> {
         let runtime = Builder::new_multi_thread()
             .enable_all()
             .thread_name("maki-workcell")
@@ -183,15 +189,14 @@ impl WorkcellHost {
             .map_err(HostError::Runtime)?;
         let project_cwd = std::fs::canonicalize(project_cwd.as_ref())
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
-        let worker_exists = worker_path.is_some_and(Path::is_file);
         let (files, shell, environment, code_result) = runtime.block_on(async {
             let files = FileToolGroup::new_unconfined(&project_cwd, true, None).await;
             let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
             let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
-            let code = if worker_exists {
+            let code = if let Some(worker) = worker_source {
                 Some(
                     CodeToolGroup::new(CodeConfiguration {
-                        worker: worker_path,
+                        worker,
                         type_check: true,
                     })
                     .await,
@@ -213,13 +218,7 @@ impl WorkcellHost {
                 None
             }
             None => {
-                warnings.push(match worker_path {
-                    Some(path) => format!(
-                        "Workcell code_execution is unavailable: code worker does not exist at {}",
-                        path.display()
-                    ),
-                    None => CODE_WORKER_UNAVAILABLE.to_owned(),
-                });
+                warnings.push(CODE_WORKER_UNAVAILABLE.to_owned());
                 None
             }
         };
@@ -237,7 +236,6 @@ impl WorkcellHost {
                 projects: tokio::sync::Mutex::new(projects),
                 web: WebToolGroup::new(WebsearchExecutionConfiguration::default()),
                 code,
-                _worker_lease: Mutex::new(None),
             }),
             warnings,
             reserve_code: false,
@@ -253,23 +251,24 @@ impl WorkcellHost {
             host.reserve_code = true;
             return Ok(host);
         }
-        match worker::extract() {
-            Ok(lease) => {
-                let mut host = Self::new(project_cwd, Some(lease.path()))?;
+        match maki_storage::paths::cache_dir() {
+            Ok(cache_root) => {
+                let mut host = Self::with_worker_source(
+                    project_cwd,
+                    Some(WorkerSource::Bundled {
+                        cache_root: &cache_root,
+                    }),
+                )?;
                 host.reserve_code = true;
-                *host
-                    .inner
-                    ._worker_lease
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(lease);
                 Ok(host)
             }
             Err(error) => {
                 let mut host = Self::new(project_cwd, None)?;
                 host.reserve_code = true;
                 host.warnings.clear();
-                host.warnings
-                    .push(format!("Workcell code_execution is unavailable: {error}"));
+                host.warnings.push(format!(
+                    "Workcell code_execution cache is unavailable: {error}"
+                ));
                 Ok(host)
             }
         }
@@ -1677,9 +1676,15 @@ mod tests {
         );
     }
 
-    #[cfg(embedded_monty_worker)]
     #[test]
     fn production_host_executes_code_with_the_embedded_worker() {
+        if !bundled_worker_available() {
+            assert!(
+                option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none(),
+                "the configured worker was not embedded"
+            );
+            return;
+        }
         let root = TempDir::new().expect("tempdir");
         let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
         assert!(host.warnings().is_empty());

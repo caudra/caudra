@@ -1,14 +1,15 @@
 monty_worker_name := if os_family() == "windows" { "monty.exe" } else { "monty" }
 monty_worker := justfile_directory() + "/target/code-worker/bin/" + monty_worker_name
-export MAKI_MONTY_WORKER := monty_worker
+monty_version := "0.0.21"
+export WORKCELL_BUNDLED_MONTY_WORKER := monty_worker
 
 default:
     @just --list
 
-# Build the pinned worker that maki-workcell embeds at compile time.
+# Build the pinned worker that Workcell embeds at compile time.
 code-worker:
-    cargo install monty-runtime --version "=0.0.21" --locked --no-default-features --root target/code-worker --target-dir target/code-worker-build
-    "{{monty_worker}}" --version
+    if [ ! -x "{{ monty_worker }}" ] || ! "{{ monty_worker }}" --version 2>&1 | grep -qx "monty-runtime {{ monty_version }}"; then cargo install monty-runtime --version "={{ monty_version }}" --locked --no-default-features --force --root target/code-worker --target-dir target/code-worker-build; fi
+    "{{ monty_worker }}" --version
 
 build *ARGS:
     cargo build {{ARGS}}
