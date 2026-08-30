@@ -1155,7 +1155,8 @@ fn reset_session_clears_plan() {
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
-    app.btw_modal.open("q", rx);
+    let (trigger, _cancel) = maki_agent::CancelToken::new();
+    app.btw_modal.open("q", rx, trigger);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::NewSession));
     assert_eq!(app.status, Status::Idle);
@@ -6578,10 +6579,57 @@ fn btw_with_question_returns_action() {
 }
 
 #[test]
+fn btw_usage_settles_into_the_session_ledger() {
+    const BTW_MODEL: &str = "btw-model";
+    const BTW_COST: f64 = 0.25;
+    let mut app = test_app();
+    app.state.goal.set("ship it").unwrap();
+    app.chats[0].context_size = 1000;
+
+    let (tx, rx) = flume::bounded(1);
+    let (trigger, _cancel) = maki_agent::CancelToken::new();
+    app.btw_modal.open("why sqlite?", rx, trigger);
+    tx.send(BtwEvent::Done(crate::components::btw_modal::BtwUsage {
+        usage: TokenUsage {
+            input: 100,
+            output: 40,
+            cache_read: 900,
+            ..Default::default()
+        },
+        cost: Some(BTW_COST),
+        model: BTW_MODEL.into(),
+    }))
+    .unwrap();
+    let _ = app.tick();
+
+    assert_eq!(app.state.token_usage.input, 100);
+    assert_eq!(app.state.token_usage.cache_read, 900);
+    assert_eq!(app.state.cost, Some(BTW_COST));
+    assert_eq!(
+        app.chats[0].cost,
+        Some(BTW_COST),
+        "the status bar renders the focused chat's cost, not the session total"
+    );
+    let billed = &app.state.session.usage_by_model()[BTW_MODEL];
+    assert_eq!(billed.input, 100);
+    assert_eq!(billed.cost, Some(BTW_COST));
+    assert_eq!(
+        app.state.goal.snapshot().unwrap().usage.input,
+        100,
+        "btw spends inside the goal window, so the goal is charged"
+    );
+    assert_eq!(
+        app.chats[0].context_size, 1000,
+        "btw never enters history, so it must not move the context gauge"
+    );
+}
+
+#[test]
 fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
     let (tx, rx) = flume::bounded(1);
-    app.btw_modal.open("test", rx);
+    let (trigger, _cancel) = maki_agent::CancelToken::new();
+    app.btw_modal.open("test", rx, trigger);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.

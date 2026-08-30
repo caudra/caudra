@@ -23,7 +23,8 @@ use maki_storage::id::SessionRef;
 
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
-use maki_providers::{HistoryItem, Message, Model, project_messages};
+use maki_providers::{HistoryItem, Message, Model, RequestOptions, project_messages};
+use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -36,6 +37,18 @@ pub(crate) struct ModelSlot {
     pub(crate) model: Model,
     pub(crate) provider: Arc<dyn Provider>,
 }
+
+/// Every input the provider hashes into its cache prefix, published as one
+/// unit. Swapping system and tools separately could pair a stale system with
+/// fresh tools, which is exactly the mismatch that costs `/btw` a cache hit.
+#[derive(Default)]
+pub(crate) struct BtwPrompt {
+    pub(crate) system: String,
+    pub(crate) tools: Value,
+    pub(crate) opts: RequestOptions,
+}
+
+pub(crate) type SharedBtwPrompt = Arc<ArcSwap<BtwPrompt>>;
 
 pub(crate) enum AgentCommand {
     Cancel { run_id: u64 },
@@ -54,7 +67,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedHistory,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
+    pub(crate) btw_prompt: SharedBtwPrompt,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -119,7 +132,7 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
+        app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
             match app.state.goal.status() {
@@ -285,7 +298,7 @@ fn spawn_agent_internal(
     let shared_history: SharedHistory = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         initial_history.clone(),
     )));
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
+    let btw_prompt: SharedBtwPrompt = Arc::new(ArcSwap::from_pointee(BtwPrompt::default()));
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
@@ -305,7 +318,7 @@ fn spawn_agent_internal(
         tool_output_lines,
         initial_history,
         Arc::clone(&shared_history),
-        Arc::clone(&btw_system),
+        Arc::clone(&btw_prompt),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -333,7 +346,7 @@ fn spawn_agent_internal(
         agent_tx,
         answer_tx,
         history: shared_history,
-        btw_system,
+        btw_prompt,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,

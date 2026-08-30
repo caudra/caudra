@@ -61,7 +61,7 @@ use crate::image;
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, RevokedRuleScope};
 use maki_agent::prompt::profile::PromptProfileCatalog;
@@ -277,7 +277,7 @@ pub struct App {
     pub(crate) snapshot_store: Arc<SnapshotStore>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
+    pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
@@ -415,7 +415,7 @@ impl App {
             snapshot_store,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            btw_system: None,
+            btw_prompt: None,
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
@@ -2792,7 +2792,7 @@ impl App {
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
-            | self.btw_modal.poll()
+            | self.tick_btw()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
@@ -2807,6 +2807,23 @@ impl App {
         let (dirty, flash) = self.file_picker.tick();
         if let Some(flash) = flash {
             self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    /// btw spends real tokens outside any turn, so it settles into the same
+    /// ledger as compaction and the goal evaluator. It deliberately leaves
+    /// `context_size` alone: the question never enters history.
+    fn tick_btw(&mut self) -> Dirty {
+        let dirty = self.btw_modal.poll();
+        if let Some(btw) = self.btw_modal.take_usage() {
+            self.state.token_usage += btw.usage;
+            add_cost(&mut self.state.cost, btw.cost);
+            add_cost(&mut self.main_chat().cost, btw.cost);
+            self.state
+                .session_mut()
+                .add_model_usage(&btw.model, btw.usage.billed(btw.cost));
+            self.state.goal.record_external_usage(btw.usage, btw.cost);
         }
         dirty
     }

@@ -21,14 +21,14 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, HistoryItem, Message, Model};
+use maki_providers::{AgentError, HistoryItem, Message, Model, RequestOptions};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
 
-use super::ModelSlot;
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
+use super::{BtwPrompt, ModelSlot, SharedBtwPrompt};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -40,7 +40,7 @@ pub(super) struct AgentLoop {
     mcp: Option<McpSession>,
     history: History,
     history_restore_error: Option<String>,
-    btw_system: Arc<ArcSwap<String>>,
+    btw_prompt: SharedBtwPrompt,
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
@@ -69,7 +69,7 @@ impl AgentLoop {
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<HistoryItem>,
         shared_history: SharedHistory,
-        btw_system: Arc<ArcSwap<String>>,
+        btw_prompt: SharedBtwPrompt,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
@@ -108,7 +108,7 @@ impl AgentLoop {
             mcp,
             history,
             history_restore_error,
-            btw_system,
+            btw_prompt,
             cancel_map,
             init_cancel,
             permissions,
@@ -279,14 +279,6 @@ impl AgentLoop {
         if self.init_cancel.is_cancelled() {
             return false;
         }
-        self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
-
-        let slot = self.model_slot.load();
-        self.tools = self.build_tools(
-            &slot.model,
-            &maki_providers::ThinkingConfig::default(),
-            false,
-        );
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
             // startup must still carry the MCP tools.
@@ -295,6 +287,18 @@ impl AgentLoop {
             }
             spawn_oauth_for_needs_auth(mcp);
         }
+        // Built once MCP has settled, so a `/btw` fired before the first prompt
+        // carries the same tools the live request will.
+        let slot = self.model_slot.load();
+        self.tools = self.build_tools(
+            &slot.model,
+            &maki_providers::ThinkingConfig::default(),
+            false,
+        );
+        self.publish_btw_prompt(
+            &maki_agent::prompt::ResolvedSlots::default(),
+            RequestOptions::default(),
+        );
         !self.init_cancel.is_cancelled()
     }
 
@@ -387,6 +391,10 @@ impl AgentLoop {
             }
         }
 
+        let opts = RequestOptions {
+            thinking: input.thinking.clone(),
+            fast: input.fast,
+        };
         let prompt_slots = self
             .lua_handle
             .collect_prompt_slots_async(&self.config)
@@ -399,7 +407,7 @@ impl AgentLoop {
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );
-        self.publish_btw_system(&prompt_slots);
+        self.publish_btw_prompt(&prompt_slots, opts);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
@@ -507,9 +515,15 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model. Everything else matches the live prompt.
-    fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
+    /// Always pins `Build` mode: btw never acts on tools, so Plan-mode constraints would only
+    /// confuse the model. Everything else must match the live request byte for byte, because a
+    /// divergent tools array or system prompt costs btw the provider cache prefix and makes it
+    /// re-read the whole history as fresh input tokens.
+    fn publish_btw_prompt(
+        &self,
+        prompt_slots: &maki_agent::prompt::ResolvedSlots,
+        opts: RequestOptions,
+    ) {
         let slot = self.model_slot.load();
         let system = agent::build_system_prompt(
             &self.vars,
@@ -519,7 +533,11 @@ impl AgentLoop {
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );
-        self.btw_system.store(Arc::new(system));
+        self.btw_prompt.store(Arc::new(BtwPrompt {
+            system,
+            tools: self.tools.clone(),
+            opts,
+        }));
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {

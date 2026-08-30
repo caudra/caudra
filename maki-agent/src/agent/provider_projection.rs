@@ -18,7 +18,7 @@ struct Candidate {
     estimated_tokens: usize,
 }
 
-pub(super) fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
+pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
     if !has_tool(tools, TOOL_OUTPUT_READ_TOOL_NAME) {
         return Cow::Borrowed(messages);
     }
