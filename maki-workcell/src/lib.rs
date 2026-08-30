@@ -96,7 +96,7 @@ impl HostInner {
         if let Some(groups) = projects.get(&cwd) {
             return Ok(groups.clone());
         }
-        let files = FileToolGroup::new_unconfined(&cwd, None)
+        let files = FileToolGroup::new_unconfined(&cwd, true, None)
             .await
             .map_err(|error| error.to_string())?;
         let shell = ShellToolGroup::new_unconfined(&cwd)
@@ -185,7 +185,7 @@ impl WorkcellHost {
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
         let worker_exists = worker_path.is_some_and(Path::is_file);
         let (files, shell, environment, code_result) = runtime.block_on(async {
-            let files = FileToolGroup::new_unconfined(&project_cwd, None).await;
+            let files = FileToolGroup::new_unconfined(&project_cwd, true, None).await;
             let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
             let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
             let code = if worker_exists {
@@ -565,7 +565,7 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let inspection_input = input.clone();
-                let (group, resource) = self
+                let (group, resource, search_path) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
@@ -574,11 +574,13 @@ impl WorkcellInvocation {
                             .inspect_glob(&inspection_input)
                             .await
                             .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                        let (group, search_path) =
+                            confined_traversal_group(groups.files, &resource).await?;
+                        Ok::<_, String>((group, resource, search_path))
                     })
                     .await??;
                 let mut authorized = input.clone();
-                authorized.path = Some(resource.path.to_string_lossy().into_owned());
+                authorized.path = Some(search_path);
                 file_prepared(
                     vec![resource],
                     &project,
@@ -591,7 +593,7 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let inspection_input = input.clone();
-                let (group, resource) = self
+                let (group, resource, search_path) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
@@ -600,11 +602,13 @@ impl WorkcellInvocation {
                             .inspect_grep(&inspection_input)
                             .await
                             .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                        let (group, search_path) =
+                            confined_traversal_group(groups.files, &resource).await?;
+                        Ok::<_, String>((group, resource, search_path))
                     })
                     .await??;
                 let mut authorized = input.clone();
-                authorized.path = Some(resource.path.to_string_lossy().into_owned());
+                authorized.path = Some(search_path);
                 file_prepared(
                     vec![resource],
                     &project,
@@ -1108,6 +1112,23 @@ fn check_stale(ctx: &ToolContext, paths: &[PathBuf]) -> Result<(), String> {
         ctx.file_tracker.check_before_edit(path)?;
     }
     Ok(())
+}
+
+async fn confined_traversal_group(
+    unconfined: FileToolGroup,
+    resource: &FileResource,
+) -> Result<(FileToolGroup, String), String> {
+    let is_directory = tokio::fs::metadata(&resource.path)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
+    if !is_directory {
+        return Ok((unconfined, resource.path.to_string_lossy().into_owned()));
+    }
+    let limits = *unconfined.limits();
+    let confined = FileToolGroup::new(&resource.path, false, Some(limits))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((confined, ".".into()))
 }
 
 fn file_prepared(
