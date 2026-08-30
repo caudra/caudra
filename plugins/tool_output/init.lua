@@ -126,6 +126,7 @@ end
 
 maki.api.register_tool({
   name = "tool_output_read",
+  effect = "read_only",
   kind = "read",
   description = "Read a page of managed tool output owned by the current session.",
   audiences = { "all" },
@@ -155,6 +156,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "tool_output_grep",
+  effect = "read_only",
   kind = "search",
   description = "Search managed tool output owned by the current session using a regex.",
   audiences = { "all" },

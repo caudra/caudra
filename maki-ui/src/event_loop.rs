@@ -521,6 +521,7 @@ impl SpawnCtx {
             goal,
             subagent_history,
             system_prompt_profile.clone(),
+            Arc::clone(&self.prompt_profiles),
         );
         let mut app = App::new(
             &self.model_slot.load().model,

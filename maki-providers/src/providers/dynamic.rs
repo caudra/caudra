@@ -740,7 +740,15 @@ impl Provider for DynamicProvider {
             let attempt = async {
                 let result = self
                     .inner
-                    .stream_message(model, messages, system, tools, &tx, opts.clone(), session_id)
+                    .stream_message(
+                        model,
+                        messages,
+                        system,
+                        tools,
+                        &tx,
+                        opts.clone(),
+                        session_id,
+                    )
                     .await;
                 drop(tx);
                 result
@@ -769,13 +777,7 @@ impl Provider for DynamicProvider {
                         Ok(()) => {
                             self.inner
                                 .stream_message(
-                                    model,
-                                    messages,
-                                    system,
-                                    tools,
-                                    event_tx,
-                                    opts,
-                                    session_id,
+                                    model, messages, system, tools, event_tx, opts, session_id,
                                 )
                                 .await
                         }

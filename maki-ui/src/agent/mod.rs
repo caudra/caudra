@@ -3,12 +3,14 @@ mod cancel_map;
 mod command_router;
 pub(crate) mod shared_queue;
 
+use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::profile::PromptProfileCatalog;
 use maki_agent::prompt::profile::SystemPromptProfile;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
@@ -60,6 +62,7 @@ pub(crate) struct AgentHandles {
     subagent_cancels: Arc<CancelMap<String>>,
     pub(crate) timeouts: maki_providers::Timeouts,
     model_policy: Arc<ModelPolicy>,
+    prompt_profiles: Arc<PromptProfileCatalog>,
     mailbox: Option<SessionMailbox>,
     task: smol::Task<()>,
 }
@@ -83,6 +86,7 @@ impl AgentHandles {
         goal: maki_agent::GoalHandle,
         subagent_history: SubagentHistoryStore,
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
+        prompt_profiles: Arc<PromptProfileCatalog>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -100,6 +104,7 @@ impl AgentHandles {
             goal,
             subagent_history,
             system_prompt_profile,
+            Arc::clone(&prompt_profiles),
         )
     }
 
@@ -201,6 +206,7 @@ impl AgentHandles {
             app.state.goal.clone(),
             subagent_history,
             app.state.system_prompt_profile.clone(),
+            Arc::clone(&self.prompt_profiles),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -268,6 +274,7 @@ fn spawn_agent_internal(
     goal: maki_agent::GoalHandle,
     subagent_history: SubagentHistoryStore,
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    prompt_profiles: Arc<PromptProfileCatalog>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -315,6 +322,7 @@ fn spawn_agent_internal(
         Arc::clone(&model_policy),
         goal.clone(),
         system_prompt_profile,
+        Arc::clone(&prompt_profiles),
     );
 
     let task = smol::spawn(agent_loop.run());
@@ -333,24 +341,129 @@ fn spawn_agent_internal(
         subagent_cancels,
         timeouts,
         model_policy,
+        prompt_profiles,
         mailbox,
         task,
     }
 }
 
 pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHistoryStore {
-    let histories = session
-        .subagent_messages()
+    let active_history = crate::active_session_history(session).unwrap_or_else(|error| {
+        warn!(%error, "failed to resolve active history for subagent restoration");
+        Vec::new()
+    });
+    let mut versions =
+        maki_agent::active_task_history_versions_with_batch_state(&active_history, |call_id| {
+            session
+                .tool_outputs()
+                .get(call_id)
+                .and_then(|output| output.state())
+        });
+    let mut reachable = crate::app::reachable_subagent_ids(
+        &active_history,
+        session.subagent_messages(),
+        session.tool_outputs(),
+        session.subagents(),
+    );
+    reachable.extend(
+        versions
+            .iter()
+            .filter(|(_, version_id)| session.subagent_messages().contains_key(*version_id))
+            .map(|(task_id, _)| task_id.clone()),
+    );
+    let legacy_fallback = reachable.is_empty()
+        || active_history.iter().any(|item| {
+            matches!(
+                &item.kind,
+                maki_providers::HistoryItemKind::AssistantText {
+                    retained_subagent_ids,
+                    is_compaction_summary: true,
+                    ..
+                } if retained_subagent_ids.is_empty()
+            )
+        });
+    let mut active_calls = maki_agent::history_tool_call_ids(&active_history);
+    for task_id in &reachable {
+        if let Some(history) = session.subagent_messages().get(task_id) {
+            active_calls.extend(maki_agent::history_tool_call_ids(history));
+        }
+    }
+    reachable.extend(
+        session
+            .subagent_task_specs()
+            .iter()
+            .filter(|(task_id, spec)| {
+                if !spec.is_generic() {
+                    return false;
+                }
+                let descriptor = session
+                    .subagents()
+                    .iter()
+                    .find(|subagent| subagent.tool_use_id == **task_id);
+                descriptor.is_none()
+                    || active_calls.contains(*task_id)
+                    || descriptor
+                        .and_then(|subagent| subagent.root_tool_use_id.as_ref())
+                        .is_some_and(|root| active_calls.contains(root))
+            })
+            .map(|(task_id, _)| task_id.clone()),
+    );
+    if legacy_fallback {
+        reachable.extend(
+            session
+                .subagent_messages()
+                .keys()
+                .filter(|task_id| !session.subagent_task_specs().contains_key(*task_id))
+                .filter(|task_id| {
+                    !session.subagents().iter().any(|subagent| {
+                        subagent.tool_use_id.as_str() != task_id.as_str()
+                            && subagent.parent_tool_use_id.as_ref() == Some(*task_id)
+                    })
+                })
+                .cloned(),
+        );
+    }
+    for subagent in session.subagents() {
+        if reachable.contains(&subagent.tool_use_id)
+            && !versions.contains_key(&subagent.tool_use_id)
+            && let Some(version_id) = &subagent.parent_tool_use_id
+            && session.subagent_messages().contains_key(version_id)
+        {
+            versions.insert(subagent.tool_use_id.clone(), version_id.clone());
+        }
+    }
+    let version_ids: HashSet<&str> = versions
         .iter()
-        .filter_map(|(task_id, items)| match project_messages(items) {
-            Ok(messages) => Some((task_id.clone(), Arc::new(messages))),
-            Err(error) => {
-                warn!(%error, %task_id, "failed to restore subagent history");
-                None
+        .filter_map(|(task_id, version_id)| {
+            (task_id != version_id && session.subagent_messages().contains_key(version_id))
+                .then_some(version_id.as_str())
+        })
+        .collect();
+    let histories = reachable
+        .iter()
+        .filter(|task_id| !version_ids.contains(task_id.as_str()))
+        .filter_map(|task_id| {
+            let version_id = versions.get(task_id).unwrap_or(task_id);
+            let items = session
+                .subagent_messages()
+                .get(version_id)
+                .or_else(|| session.subagent_messages().get(task_id))?;
+            match project_messages(items) {
+                Ok(messages) => Some((task_id.clone(), Arc::new(messages))),
+                Err(error) => {
+                    warn!(%error, %task_id, "failed to restore subagent history");
+                    None
+                }
             }
         })
         .collect();
-    SubagentHistoryStore::seeded(histories)
+    let specs = session
+        .subagent_task_specs()
+        .iter()
+        .filter(|(task_id, spec)| reachable.contains(*task_id) && !spec.is_version())
+        .map(|(task_id, spec)| (task_id.clone(), spec.clone()))
+        .collect();
+    SubagentHistoryStore::seeded_with_specs(histories, specs)
 }
 
 #[cfg(test)]
@@ -431,6 +544,7 @@ mod tests {
             maki_agent::GoalHandle::default(),
             SubagentHistoryStore::default(),
             None,
+            Arc::new(PromptProfileCatalog::default()),
         );
         (handles, model_slot, permissions)
     }

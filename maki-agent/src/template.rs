@@ -12,9 +12,13 @@ pub fn env_vars() -> Vars {
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
+        .set(
+            "{task_system_prompt_profiles}",
+            "- `builtin`: Maki's built-in task prompt",
+        )
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Vars(Vec<(&'static str, String)>);
 
 impl Vars {
@@ -23,7 +27,12 @@ impl Vars {
     }
 
     pub fn set(mut self, key: &'static str, val: impl Into<String>) -> Self {
-        self.0.push((key, val.into()));
+        let val = val.into();
+        if let Some((_, current)) = self.0.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *current = val;
+        } else {
+            self.0.push((key, val));
+        }
         self
     }
 

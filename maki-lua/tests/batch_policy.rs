@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
 };
@@ -58,7 +58,7 @@ const SUCCESS_STYLE: &str = "tool_success";
 /// `maki.agent.call_tool` is stubbed; `maki.async.gather` and the semaphore
 /// stay real, so the park/release pair proves children genuinely overlap.
 const STUB_PRELUDE: &str = r#"
-recorder = { calls = {} }
+recorder = { calls = {}, header_calls = 0 }
 local sem = maki.async.semaphore(1)
 local held = sem:acquire()
 
@@ -123,6 +123,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {} },
   audiences = { "main" },
   header = function(input)
+    recorder.header_calls = recorder.header_calls + 1
     return "H:" .. tostring(input.x)
   end,
   handler = function() return "unused" end,
@@ -244,6 +245,12 @@ fn recorded_calls(reg: &ToolRegistry) -> Vec<Value> {
     snap["calls"].as_array().cloned().unwrap_or_default()
 }
 
+fn recorded_header_calls(reg: &ToolRegistry) -> u64 {
+    let out = exec_tool(reg, PROBE_TOOL, json!({})).expect("probe failed");
+    let snap: Value = serde_json::from_str(&out).expect("probe returned invalid json");
+    snap["header_calls"].as_u64().unwrap_or_default()
+}
+
 fn section(tool: &str, body: &str) -> String {
     format!("## {tool}\n{body}\n\n")
 }
@@ -277,6 +284,67 @@ fn all_success_exact_llm_output() {
         summary_all_ok(2)
     );
     assert_eq!(out, expected);
+}
+
+#[test]
+fn read_only_batch_does_not_run_unsafe_child_presentation_callbacks() {
+    let mut research_ctx = stub_ctx(&AgentMode::Build);
+    research_ctx.audience = ToolAudience::RESEARCH_SUB;
+    for ctx in [
+        stub_ctx(&AgentMode::ReadOnly),
+        stub_ctx(&AgentMode::Plan("/tmp/plan.md".into())),
+        research_ctx,
+    ] {
+        let (reg, _host) = load_batch_host();
+        let input = batch_input(json!([{ "tool": "hdrtool", "parameters": { "x": "A" } }]));
+
+        exec_with_ctx(&reg, BATCH_TOOL, input, &ctx).expect("batch failed");
+
+        assert_eq!(recorded_header_calls(&reg), 0);
+    }
+}
+
+#[test]
+fn restore_does_not_run_header_for_an_errored_child() {
+    let (reg, host) = load_batch_host();
+    let input = batch_input(json!([{ "tool": "hdrtool", "parameters": { "x": "A" } }]));
+    let output = format!(
+        "{}{}",
+        section("hdrtool", &format!("{ERROR_PREFIX}denied")),
+        summary_mixed(0, 1, 1)
+    );
+
+    restore_snapshot_lines(
+        &host,
+        input,
+        &output,
+        Some(json!([{ "tool": "hdrtool", "status": "error", "output": "denied" }])),
+    );
+
+    assert_eq!(recorded_header_calls(&reg), 0);
+}
+
+#[test]
+fn restore_does_not_run_replaced_child_presentation_contract() {
+    let (reg, host) = load_batch_host();
+    let calls = json!([{ "tool": "hdrtool", "parameters": { "x": "A" } }]);
+    let input = batch_input(calls.clone());
+    let state = run_batch_state(&reg, calls);
+    let output = format!("{}{}", section("hdrtool", "unused"), summary_all_ok(1));
+    let prelude = STUB_PRELUDE
+        .replace("@BOOM_ERR@", BOOM_ERR)
+        .replace("@CHILD_USAGE@", CHILD_USAGE)
+        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
+        .replace("@PARK_SECS@", &PARK_SECS.to_string());
+    host.load_source(
+        "batch_policy",
+        &format!("{prelude}\n{BATCH_PLUGIN_SRC}\n-- changed implementation"),
+    )
+    .unwrap();
+
+    restore_snapshot_lines(&host, input, &output, Some(state));
+
+    assert_eq!(recorded_header_calls(&reg), 0);
 }
 
 /// The grace is a budget, not a licence to hang: a child that never yields
@@ -646,6 +714,7 @@ fn restore_snapshot_lines_opts(
             theme_gen: None,
             clicks,
             state,
+            lua_provenance: None,
         },
         EventSender::new(tx, 0),
     );

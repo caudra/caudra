@@ -146,6 +146,16 @@ pub struct TextOutput {
     /// has to re-parse its own llm output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lua_provenance: Option<LuaToolProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LuaToolProvenance {
+    pub plugin: String,
+    pub contract: String,
+    #[serde(default)]
+    pub error_restore_allowed: bool,
 }
 
 impl From<String> for TextOutput {
@@ -154,6 +164,7 @@ impl From<String> for TextOutput {
             text,
             instructions: None,
             state: None,
+            lua_provenance: None,
         }
     }
 }
@@ -164,6 +175,7 @@ impl From<&str> for TextOutput {
             text: text.to_owned(),
             instructions: None,
             state: None,
+            lua_provenance: None,
         }
     }
 }
@@ -180,6 +192,8 @@ impl<'de> Deserialize<'de> for TextOutput {
                 instructions: Option<Vec<InstructionBlock>>,
                 #[serde(default)]
                 state: Option<serde_json::Value>,
+                #[serde(default)]
+                lua_provenance: Option<LuaToolProvenance>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -188,10 +202,12 @@ impl<'de> Deserialize<'de> for TextOutput {
                 text,
                 instructions,
                 state,
+                lua_provenance,
             } => Ok(Self {
                 text,
                 instructions,
                 state,
+                lua_provenance,
             }),
         }
     }
@@ -322,6 +338,19 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
             _ => None,
+        }
+    }
+
+    pub fn lua_provenance(&self) -> Option<&LuaToolProvenance> {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.lua_provenance.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_lua_provenance(&mut self, provenance: LuaToolProvenance) {
+        if let Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) = self {
+            t.lua_provenance = Some(provenance);
         }
     }
 
@@ -721,7 +750,12 @@ pub enum AgentEvent {
     Nudge,
     SubagentHistory {
         task_id: String,
+        parent_tool_use_id: String,
+        root_tool_use_id: String,
+        name: String,
+        model: String,
         messages: Vec<Message>,
+        spec: Option<maki_storage::sessions::StoredSubagentTaskSpec>,
     },
     ToolSnapshot {
         id: String,
@@ -1695,6 +1729,11 @@ mod tests {
             text: "file contents".into(),
             instructions: Some(blocks),
             state: None,
+            lua_provenance: Some(LuaToolProvenance {
+                plugin: "test".into(),
+                contract: "contract".into(),
+                error_restore_allowed: true,
+            }),
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1705,6 +1744,15 @@ mod tests {
                 assert_eq!(inst.len(), 1, "{MSG}");
                 assert_eq!(inst[0].path, "AGENTS.md", "{MSG}");
                 assert_eq!(inst[0].content, "be nice", "{MSG}");
+                assert_eq!(
+                    t.lua_provenance,
+                    Some(LuaToolProvenance {
+                        plugin: "test".into(),
+                        contract: "contract".into(),
+                        error_restore_allowed: true,
+                    }),
+                    "{MSG}"
+                );
             }
             _ => panic!("wrong variant"),
         }
@@ -1758,6 +1806,7 @@ mod tests {
                 content: "do stuff".into(),
             }]),
             state: None,
+            lua_provenance: None,
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");

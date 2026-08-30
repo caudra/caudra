@@ -5,7 +5,7 @@ weight = 45
 
 # System Prompt Profiles
 
-System prompt profiles change the main agent prompt without copying Maki's built-in prompt. Overlay profiles preserve current tool guidance, environment details, instruction files, plugin hints, and plan mode text.
+System prompt profiles change main and task prompts without copying Maki's built-in prompts. Overlay profiles preserve current tool guidance, environment details, instruction files, plugin hints, and mode text.
 
 Profiles are Markdown files in the user config directory:
 
@@ -73,6 +73,33 @@ Each component directive may appear once. `{{maki.default}}` cannot be combined 
 
 Profile files must be valid UTF-8 and no larger than 64 KiB. Unknown frontmatter fields and unknown directives make the profile invalid.
 
+## Configure subagents
+
+A profile can select a model and thinking setting for subagents:
+
+```markdown
+---
+description: Deep security analysis
+layout: overlay
+subagent_model: anthropic/claude-opus-4-6
+subagent_thinking: high
+---
+
+Prioritize exploitable findings and concrete fixes.
+```
+
+`subagent_model` uses a qualified `provider/model` name. `subagent_thinking` accepts `off`, `adaptive`, an effort level, or a positive token budget. Omitted fields inherit the parent model and thinking setting. These fields do not change the main agent.
+
+Maki validates each profile against the effective subagent model. An explicit thinking setting must be supported exactly. Maki does not snap effort levels, clamp budgets, or translate between effort and budget modes for a profile. An incompatible profile remains available to the main agent, but Maki warns and removes it from the task profile list.
+
+The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Maki's built-in task prompt. `mode` defaults to `plan`, which has a host-enforced read-only tool set. `build` enables implementation tools.
+
+Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{maki.default}}` expands to the complete built-in task prompt. Maki appends the plan or build contract after the rendered profile, so custom layouts cannot remove it.
+
+The effective profile and mode are stored with task history. A continuation uses the stored values when they are omitted and rejects conflicting values. Legacy task histories bind both values on their first successful continuation.
+
+The task API no longer accepts `subagent_type`, `model`, or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Move model selection into profile frontmatter and remove `plugins.task.allow_model` from `init.lua`.
+
 ## Select a profile
 
 Set the default in `init.lua`:
@@ -101,4 +128,4 @@ An explicit CLI profile takes precedence over the stored session profile and the
 
 `--system-prompt-profile` and the raw SDK `--system-prompt` override cannot be used together. A raw SDK override continues to replace normal prompt assembly.
 
-Profiles affect the main TUI, print, SDK, ACP, prompt inspection, and `/btw` prompts. Research and general subagent prompts, compaction prompts, and goal evaluation prompts remain host-controlled.
+Profiles affect the main TUI, print, SDK, ACP, prompt inspection, `/btw`, and task prompts. Compaction and goal evaluation prompts remain host-controlled.

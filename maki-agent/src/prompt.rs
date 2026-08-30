@@ -27,6 +27,16 @@ pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
 pub const GOAL_EVALUATOR: &str = include_str!("prompts/goal_evaluator.md");
+pub const TASK_PLAN_CONTRACT: &str = "\n\n# Host mode contract\nYou are in plan mode. Inspect, reason, and report, but do not modify files, persistent state, or external systems. If implementation is needed, describe the exact changes without applying them.";
+pub const TASK_BUILD_CONTRACT: &str = "\n\n# Host mode contract\nYou are in build mode. You may modify the workspace using the available tools. Complete the requested work, verify it, and report the result concisely.";
+
+const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
+const TASK_ENVIRONMENT_HEADING: &str = "Environment:\n";
+const TASK_STYLE_HEADING: &str = "# Output discipline\n";
+const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
+const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
+const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
+const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
 
@@ -207,6 +217,7 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
     let names = NATIVE_EFFICIENT_TOOLS
         .iter()
         .copied()
+        .filter(|name| prompt == PromptId::System || *name != "task")
         .chain(extras.iter().map(|e| e.content.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
@@ -336,7 +347,11 @@ fn render_system_layout(template: &str, parts: &SystemParts) -> String {
     })
 }
 
-fn render_custom_layout(template: &str, parts: &SystemParts, default: &str) -> String {
+fn render_custom_layout<'a>(
+    template: &str,
+    default: &str,
+    mut resolve: impl FnMut(&str) -> Option<&'a str>,
+) -> String {
     let mut output = String::with_capacity(template.len() + default.len());
     for line in template.split_inclusive('\n') {
         let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
@@ -359,7 +374,7 @@ fn render_custom_layout(template: &str, parts: &SystemParts, default: &str) -> S
             .and_then(|body| body.strip_suffix("}}"));
         let content = match component {
             Some("default") => Some(default),
-            Some(name) => parts.get(name),
+            Some(name) => resolve(name),
             None => None,
         };
         if let Some(content) = content {
@@ -397,9 +412,88 @@ pub fn assemble_system(
         }
         PromptProfileLayout::Custom => {
             default.push_str(&parts.plan);
-            render_custom_layout(profile.body(), &parts, &default)
+            render_custom_layout(profile.body(), &default, |name| parts.get(name))
         }
     }
+}
+
+fn task_parts(slots: &ResolvedSlots, mode: PromptId, instructions: &str) -> Option<SystemParts> {
+    let template = mode.template();
+    let environment_start = template.find(TASK_ENVIRONMENT_HEADING)?;
+    let style_start = template.find(TASK_STYLE_HEADING)?;
+    let tools_start = template.find(TASK_TOOLS_HEADING)?;
+    let conventions_heading = match mode {
+        PromptId::Research => RESEARCH_CONVENTIONS_HEADING,
+        PromptId::General => GENERAL_CONVENTIONS_HEADING,
+        PromptId::System => return None,
+    };
+    let conventions_start = template.find(conventions_heading)?;
+    let instructions_start = template.rfind(INSTRUCTIONS_MARKER)?;
+    let completion_start = match mode {
+        PromptId::Research => instructions_start,
+        PromptId::General => template.find(GENERAL_COMPLETION_HEADING)?,
+        PromptId::System => return None,
+    };
+    if ![
+        environment_start,
+        style_start,
+        tools_start,
+        conventions_start,
+        completion_start,
+        instructions_start,
+    ]
+    .is_sorted()
+    {
+        return None;
+    }
+
+    let render = |fragment: &str| {
+        render_prompt_template(fragment.trim_matches(['\r', '\n']), slots, mode, "")
+    };
+    let mut context = render(&template[environment_start..style_start]);
+    if !instructions.is_empty() {
+        context.push('\n');
+        context.push_str(instructions);
+    }
+    Some(SystemParts {
+        identity: render(&template[..environment_start]),
+        style: render(&template[style_start..tools_start]),
+        tools: render(&template[tools_start..conventions_start]),
+        conventions: render(&template[conventions_start..completion_start]),
+        completion: render(&template[completion_start..instructions_start]),
+        context,
+        plan: String::new(),
+    })
+}
+
+/// Assemble a research or general task prompt under a system prompt profile.
+/// The mode contract is opaque to templates and is appended exactly once, last.
+pub fn assemble_task(
+    mode: PromptId,
+    slots: &ResolvedSlots,
+    instructions: &str,
+    profile: Option<&SystemPromptProfile>,
+    mode_contract: &str,
+) -> String {
+    let mut default = render_prompt_template(mode.template(), slots, mode, instructions);
+    let mut output = match profile {
+        None => default,
+        Some(profile) if profile.layout() == PromptProfileLayout::Overlay => {
+            if default.ends_with('\n') {
+                default.push('\n');
+            } else {
+                default.push_str("\n\n");
+            }
+            default.push_str(profile.body());
+            default
+        }
+        Some(profile) => match task_parts(slots, mode, instructions) {
+            Some(parts) => render_custom_layout(profile.body(), &default, |name| parts.get(name)),
+            None => default,
+        },
+    };
+    output.push_str(mode_contract);
+    output
 }
 
 /// Fill each host template marker once. Inserted content is opaque and is not
@@ -502,6 +596,14 @@ mod tests {
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
     }
 
+    #[test_case(PromptId::Research ; "research")]
+    #[test_case(PromptId::General ; "general")]
+    fn task_prompts_do_not_recommend_the_main_only_task_tool(prompt: PromptId) {
+        let out = assemble(prompt, &ResolvedSlots::default(), "");
+        assert!(out.contains("Most efficient tools: batch, code_execution."));
+        assert!(!out.contains(NATIVE_EFFICIENT_LINE));
+    }
+
     #[test]
     fn same_slot_preserves_insertion_order() {
         let s = slots(
@@ -543,7 +645,7 @@ mod tests {
         );
         let out = assemble(PromptId::Research, &s, "");
         assert!(!out.contains("DROPPED"));
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, EXTRA.")));
+        assert!(out.contains("Most efficient tools: batch, code_execution, EXTRA."));
     }
 
     #[test_case(PromptId::System, Slot::ToolUsage, true ; "system_tool_usage")]
@@ -697,5 +799,22 @@ mod tests {
 
         let output = assemble_system(&slots, "", "", None);
         assert!(output.contains("EXTRA\n\n\n# When done"));
+    }
+
+    #[test_case(PromptId::Research, "You are a research agent" ; "research")]
+    #[test_case(PromptId::General, "You are a general-purpose coding agent" ; "general")]
+    fn builtin_task_uses_existing_default_and_appends_contract_last(
+        mode: PromptId,
+        identity: &str,
+    ) {
+        const CONTRACT: &str = "\n<mode-contract>{{maki.default}}</mode-contract>";
+        let slots = ResolvedSlots::default();
+        let default = assemble(mode, &slots, "TASK_CONTEXT");
+
+        let output = assemble_task(mode, &slots, "TASK_CONTEXT", None, CONTRACT);
+        assert_eq!(output, format!("{default}{CONTRACT}"));
+        assert!(output.starts_with(identity));
+        assert!(output.ends_with(CONTRACT));
+        assert_eq!(output.matches(CONTRACT).count(), 1);
     }
 }

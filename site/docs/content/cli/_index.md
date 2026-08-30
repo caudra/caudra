@@ -149,7 +149,7 @@ maki prompt --tools          # tool definitions as JSON
 maki prompt --tools --names  # tool names only, one per line
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` is rejected on non-system variants.
+Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants.
 
 ### `maki migrate`
 

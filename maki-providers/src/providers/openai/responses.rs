@@ -38,7 +38,11 @@ pub(crate) fn build_body(
     body
 }
 
-pub(crate) fn apply_responses_reasoning(body: &mut Value, thinking: &ThinkingConfig, model: &Model) {
+pub(crate) fn apply_responses_reasoning(
+    body: &mut Value,
+    thinking: &ThinkingConfig,
+    model: &Model,
+) {
     if let Some(effort) = thinking.effort_str(model) {
         body["reasoning"] = json!({ "effort": effort });
     }

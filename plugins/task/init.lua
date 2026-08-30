@@ -37,9 +37,12 @@ local DEFAULT_OUTPUT_LINES = 5
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
-Subagent types (set via `subagent_type`):
-- `research` (default): Read-only tools. For codebase exploration or gathering context.
-- `general`: Full tool access. For delegating implementation work.
+Modes:
+- `plan` (default): Strictly read-only. For exploration, review, and implementation planning.
+- `build`: Can modify files and run commands. For implementation work.
+
+Available system prompt profiles:
+{task_system_prompt_profiles}
 
 Notes:
 1. Launch multiple tasks concurrently when possible.
@@ -50,16 +53,13 @@ Notes:
 
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
-  allow_model = {
-    default = false,
-    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
-  },
 })
 
 local schema = {
   type = "object",
   required = { "description", "prompt" },
   additionalProperties = false,
+  ["x-maki-reject-unknown"] = true,
   properties = {
     description = {
       type = "string",
@@ -73,13 +73,14 @@ local schema = {
       type = "string",
       description = "A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh.",
     },
-    subagent_type = {
+    mode = {
       type = "string",
-      description = 'Subagent type: "research" (read-only, default) or "general" (can modify files)',
+      enum = { "plan", "build" },
+      description = 'Subagent mode. Defaults to "plan" for a new task; omitted continuations retain their stored mode.',
     },
-    model_tier = {
+    profile = {
       type = "string",
-      description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
+      description = 'System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Maki\'s built-in prompt. Omitted continuations retain their stored profile.',
     },
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
@@ -87,20 +88,10 @@ local schema = {
   },
 }
 
--- Only advertise `model` when the plugin opts in: it costs tokens in every
--- task schema, and an off-by-default flag keeps the common path lean.
-if opts.allow_model then
-  schema.properties.model = {
-    type = "string",
-    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
-  }
-end
-
 local examples = {
   {
     description = "Find auth middleware",
     prompt = "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.",
-    model_tier = "weak",
   },
 }
 
@@ -121,11 +112,6 @@ local function with_task_id(task_id, reply)
 end
 
 local function handler(input, ctx)
-  local subagent_type = input.subagent_type or "research"
-  if subagent_type ~= "research" and subagent_type ~= "general" then
-    return { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
-  end
-
   -- Compile early: a bad schema costs zero tokens.
   local validator
   if input.output_schema then
@@ -139,32 +125,6 @@ local function handler(input, ctx)
     end
   end
 
-  local model, model_err = maki.agent.resolve_model(ctx, {
-    tier = input.model_tier,
-    spec = opts.allow_model and input.model or nil,
-  })
-  if model_err then
-    return { llm_output = model_err, is_error = true }
-  end
-
-  local audience = subagent_type == "research" and "research_sub" or "general_sub"
-  local prompt_id = subagent_type == "research" and "research" or "general"
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-  })
-  if system_err then
-    return { llm_output = system_err, is_error = true }
-  end
-
-  local tool_defs, tools_err = maki.agent.tools(ctx, {
-    audience = audience,
-    spec = model.spec,
-  })
-  if tools_err then
-    return { llm_output = tools_err, is_error = true }
-  end
-
   local captured, last_errors
   local local_tools
   if validator then
@@ -172,6 +132,7 @@ local function handler(input, ctx)
       [STRUCTURED_OUTPUT_NAME] = {
         description = STRUCTURED_OUTPUT_DESCRIPTION,
         input_schema = input.output_schema,
+        effect = "read_only",
         handler = function(value)
           local errs = validator:validate(value)
           if errs then
@@ -186,16 +147,17 @@ local function handler(input, ctx)
   end
 
   local permit = semaphore:acquire()
+  local sess
 
   -- pcall so a raised error cannot leak the permit.
   local ok, out = pcall(function()
-    local sess, sess_err = maki.agent.session(ctx, {
+    local sess_err
+    sess, sess_err = maki.agent.session(ctx, {
+      task = true,
       task_id = input.task_id,
-      model_spec = model.spec,
-      system = system,
-      tools = tool_defs,
+      profile = input.profile,
+      mode = input.mode,
       local_tools = local_tools,
-      audience = audience,
       name = input.description,
     })
     if sess_err then
@@ -250,6 +212,13 @@ local function handler(input, ctx)
 
   permit:release()
   if not ok then
+    if sess then
+      local task_id = sess:id()
+      pcall(function()
+        sess:close()
+      end)
+      return with_task_id(task_id, { llm_output = "sub-agent error: " .. tostring(out), is_error = true })
+    end
     error(out, 0)
   end
   return out
@@ -273,6 +242,7 @@ end
 
 maki.api.register_tool({
   name = "task",
+  effect = "orchestrator",
   description = description,
   kind = "execute",
   audiences = { "main", "workflow" },

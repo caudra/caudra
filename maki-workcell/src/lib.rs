@@ -15,7 +15,7 @@ use maki_agent::permissions::{
 };
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionIntent, PermissionScopes, RegistryError, Tool, ToolAudience, ToolContext,
+    PermissionIntent, PermissionScopes, RegistryError, Tool, ToolAudience, ToolContext, ToolEffect,
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{
@@ -280,14 +280,17 @@ impl WorkcellHost {
     }
 
     pub fn register(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
-        registry.register_many(self.entries(false))
+        registry.register_many_audited(self.entries(false))
     }
 
     pub fn register_documented_tools(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
-        registry.register_many(self.entries(true))
+        registry.register_many_audited(self.entries(true))
     }
 
-    fn entries(&self, include_unavailable_code: bool) -> Vec<(Arc<dyn Tool>, ToolSource)> {
+    fn entries(
+        &self,
+        include_unavailable_code: bool,
+    ) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
         let mut specs = workcell::files::specs();
         let year = jiff::Timestamp::now()
             .strftime("%Y")
@@ -306,6 +309,7 @@ impl WorkcellHost {
         specs
             .into_iter()
             .map(|spec| {
+                let kind = ToolKind::from_name(spec.name);
                 let source = ToolSource::Native {
                     owner: OWNER.into(),
                     contract: spec.contract_id.into(),
@@ -313,11 +317,12 @@ impl WorkcellHost {
                 };
                 (
                     Arc::new(WorkcellTool {
-                        kind: ToolKind::from_name(spec.name),
+                        kind,
                         spec,
                         host: Arc::clone(&self.inner),
                     }) as Arc<dyn Tool>,
                     source,
+                    kind.effect(),
                 )
             })
             .collect()
@@ -374,6 +379,20 @@ impl ToolKind {
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
             Self::Shell | Self::Code | Self::Environment => "execute",
+        }
+    }
+
+    fn effect(self) -> ToolEffect {
+        match self {
+            Self::FileRead | Self::FileGlob | Self::FileGrep | Self::Websearch | Self::Webfetch => {
+                ToolEffect::ReadOnly
+            }
+            Self::Code => ToolEffect::Isolated,
+            Self::FileWrite
+            | Self::FileEdit
+            | Self::FileApplyPatch
+            | Self::Shell
+            | Self::Environment => ToolEffect::Mutating,
         }
     }
 }
@@ -1295,6 +1314,7 @@ fn text_output(text: String, state: Value) -> TextOutput {
         text,
         instructions: None,
         state: Some(state),
+        lua_provenance: None,
     }
 }
 
@@ -1684,6 +1704,58 @@ mod tests {
                 .parse(&json!({"filePath": "a.txt", "unknown": true}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn registered_effects_match_workcell_boundaries() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+
+        for (name, expected) in [
+            ("file_read", ToolEffect::ReadOnly),
+            ("file_glob", ToolEffect::ReadOnly),
+            ("file_grep", ToolEffect::ReadOnly),
+            ("websearch", ToolEffect::ReadOnly),
+            ("webfetch", ToolEffect::ReadOnly),
+            ("execution_environment", ToolEffect::Mutating),
+            ("file_write", ToolEffect::Mutating),
+            ("file_edit", ToolEffect::Mutating),
+            ("file_apply_patch", ToolEffect::Mutating),
+            ("shell", ToolEffect::Mutating),
+        ] {
+            assert_eq!(registry.get(name).unwrap().effect, expected, "{name}");
+        }
+        if let Some(code) = registry.get("code_execution") {
+            assert_eq!(code.effect, ToolEffect::Isolated);
+        }
+    }
+
+    #[test]
+    fn read_only_dispatch_blocks_workcell_mutation_before_preflight() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::ReadOnly,
+            DefaultEffect::Allow,
+        );
+        let target = root.path().join("forged.txt");
+
+        let done = smol::block_on(maki_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "write-read-only".into(),
+            "file_write",
+            &json!({"filePath": target, "content": "forged"}),
+            &ctx,
+            maki_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(done.is_error);
+        assert!(done.output.as_text().contains("strict read-only mode"));
+        assert!(!target.exists());
     }
 
     #[test]

@@ -102,8 +102,7 @@ impl Provider for TensorX {
                 body["thinking"] = json!(opts.thinking.is_enabled());
             }
             if has_reasoning_effort {
-                opts.thinking
-                    .apply_reasoning_effort(&mut body, model);
+                opts.thinking.apply_reasoning_effort(&mut body, model);
             }
             // Fallback for deepseek models that use chat_template_kwargs
             else if !has_thinking

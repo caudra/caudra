@@ -85,6 +85,7 @@ struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
+    thinking: maki_providers::ThinkingConfig,
     client_elicits_form: bool,
     session: Option<SessionState>,
 }
@@ -118,6 +119,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
+        thinking: params.thinking.clone(),
         client_elicits_form: false,
         session: None,
     };
@@ -389,8 +391,10 @@ fn spawn_session(
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
+        thinking: params.thinking.clone(),
         system_prompt_profile,
         system_prompt_profile_name: Some(system_prompt_profile_name),
+        prompt_profiles: Arc::clone(&params.prompt_profiles),
         excluded_tools,
         mcp_handle: start.mcp_handle,
         initial_wd: start.cwd,
@@ -692,7 +696,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         mode: session.current_mode.clone(),
         images,
         preamble: Vec::new(),
-        thinking: Default::default(),
+        thinking: srv.thinking.clone(),
         fast: false,
         workflow: false,
         prompt: None,
@@ -1086,6 +1090,7 @@ mod tests {
             out_tx,
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
+            thinking: Default::default(),
             client_elicits_form: false,
             session: Some(SessionState {
                 handle,

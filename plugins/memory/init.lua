@@ -72,6 +72,7 @@ maki.api.register_prompt_hint({
 })
 
 maki.api.register_prompt_hint({
+  prompt = { "system", "general" },
   slot = "tool_usage",
   content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
 })
@@ -184,6 +185,7 @@ end
 
 maki.api.register_tool({
   name = "memory",
+  effect = "mutating",
   permission_scopes = memory_permission_scopes,
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"

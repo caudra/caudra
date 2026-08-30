@@ -15,13 +15,13 @@ use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    ToolContext, ToolEffect, ToolFilter, ToolLive, audited_local_tool,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, InterruptSource, McpSession,
     SteeringQueue, SteeringQueueReceiver, SubagentHistoryError, SubagentHistoryLease, SubagentInfo,
-    ToolDoneEvent, steering_queue,
+    SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolDoneEvent, steering_queue,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -44,6 +44,28 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
+const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Maki's built-in task prompt";
+
+fn parse_task_mode(mode: Option<&str>) -> Result<Option<SubagentTaskMode>, String> {
+    match mode {
+        Some("plan") => Ok(Some(SubagentTaskMode::Plan)),
+        Some("build") => Ok(Some(SubagentTaskMode::Build)),
+        Some(other) => Err(format!("unknown task mode: {other}")),
+        None => Ok(None),
+    }
+}
+
+fn parse_local_tool_effect(effect: Option<&str>) -> Result<ToolEffect, String> {
+    match effect {
+        Some("read_only") => Ok(ToolEffect::ReadOnly),
+        Some("isolated") => Ok(ToolEffect::Isolated),
+        Some("orchestrator") => Ok(ToolEffect::Orchestrator),
+        Some("mutating") => Ok(ToolEffect::Mutating),
+        Some(other) => Err(format!("unknown local tool effect: {other}")),
+        None => Ok(ToolEffect::Unknown),
+    }
+}
 
 fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
     let mut items: Vec<HistoryItem> = Vec::new();
@@ -103,8 +125,7 @@ async fn relay_session_events(
             }
             AgentEvent::Error { .. }
             | AgentEvent::ToolOutput { .. }
-            | AgentEvent::ToolPending { .. }
-            | AgentEvent::SubagentHistory { .. } => continue,
+            | AgentEvent::ToolPending { .. } => continue,
             _ => {}
         }
         envelope.subagent = subagent_info.get().cloned();
@@ -121,13 +142,13 @@ async fn relay_session_events(
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
-///   `tier` (string?) - target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
+///   `tier` (string?) - target tier, one of `"weak"`, `"medium"`, `"strong"`. Clamped to
 ///     the parent tier so you cannot escalate.
-///   `spec` (string?) - exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
+///   `spec` (string?) - exact `provider/model` spec, e.g. `"anthropic/claude-haiku-4-5"`.
 ///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
-/// local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+/// local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
 /// if err then error(err) end
 /// print(model.spec, model.tier)
 #[lua_fn]
@@ -139,10 +160,14 @@ async fn resolve_model(
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
     let tier_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("tier").ok().flatten());
+        .map(|table| table.get::<Option<String>>("tier"))
+        .transpose()?
+        .flatten();
     let spec_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
+        .map(|table| table.get::<Option<String>>("spec"))
+        .transpose()?
+        .flatten();
 
     let model = match spec_str {
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
@@ -238,9 +263,16 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
 
-    let parsed = spec_str
-        .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+    let mut parsed = match spec_str.as_deref() {
+        Some(spec) => Some(try_pair!(Model::from_spec_with_policy(
+            spec,
+            &agent.model_policy
+        ))),
+        None => None,
+    };
+    if let Some(model) = &mut parsed {
+        try_pair!(provider::adjust_model(model, agent.timeouts));
+    }
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -248,17 +280,9 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         (_, Some(e)) => ToolFilter::AllExcept(e),
         _ => ToolFilter::All,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
     let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model))
-        .with_internal_companions()
-        .intersect(&agent.tool_filter);
+        .intersect(&ToolFilter::from_config(&agent.config, model, &[]))
+        .with_internal_companions();
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -290,7 +314,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     annotation event. Must not yield.
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
-/// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
+/// @return (string?, string?, string?, boolean?) Tool output text, error, generated call ID, and whether an error restore is authorized.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
@@ -305,9 +329,12 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<Pair<String>> {
+) -> LuaResult<(Option<String>, Option<String>, Option<String>, Option<bool>)> {
     let input_json = lua_to_json(&lua, &input)?;
-    let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
+    let agent = match dispatch_ctx(&ctx, "call_tool") {
+        Ok(agent) => agent,
+        Err(error) => return Ok((None, Some(error), None, None)),
+    };
     let mut tctx = agent.to_tool_context();
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
@@ -325,7 +352,7 @@ async fn call_tool(
     }
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
+        return Ok((None, Some(e), None, None));
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -343,9 +370,26 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
+    let suffix = done.model_suffix().map(str::to_owned);
+    let error_restore_allowed = done
+        .output
+        .lua_provenance()
+        .is_none_or(|provenance| provenance.error_restore_allowed);
     match interpreter_bridge::flatten(&done) {
-        Ok(text) => Ok((Some(text), None)),
-        Err(err) => Ok((None, Some(err))),
+        Ok(mut text) => {
+            if let Some(suffix) = suffix {
+                text.push_str("\n\n");
+                text.push_str(&suffix);
+            }
+            Ok((Some(text), None, Some(done.id), Some(error_restore_allowed)))
+        }
+        Err(mut err) => {
+            if let Some(suffix) = suffix {
+                err.push_str("\n\n");
+                err.push_str(&suffix);
+            }
+            Ok((None, Some(err), Some(done.id), Some(error_restore_allowed)))
+        }
     }
 }
 
@@ -363,8 +407,9 @@ async fn call_tool(
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
 ///     requires `description` (string), `input_schema` (table), and
-///     `handler` (function). The handler receives the input table and must return
-///     `(string)` or `(nil, err)`.
+///     `handler` (function). Optional `effect` is `read_only`, `isolated`,
+///     `orchestrator`, or `mutating`. The handler receives the input table and
+///     must return `(string)` or `(nil, err)`.
 ///   `name` (string?) - display name for logs and UI.
 ///   `task_id` (string?) - completed task to continue with its existing history.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
@@ -377,6 +422,12 @@ async fn call_tool(
 ///     `"max"`), or a budget integer (token count). Inherits parent setting
 ///     if omitted.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
+///   `task` (boolean?) - enable the host-owned task path. Default: `false`.
+///   `profile` (string?) - task system prompt profile. Requires `task = true`.
+///   `mode` (string?) - task mode: `plan` or `build`. Requires `task = true`.
+/// Task sessions derive model, thinking, system prompt, tools, audience, and
+/// MCP access from the profile and mode. Do not combine `task = true` with the
+/// corresponding generic session options.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -403,28 +454,169 @@ async fn session(
     let name: Option<String> = opts.get("name")?;
     let continued_task_id: Option<String> = opts.get("task_id")?;
     let thinking_val: Option<LuaValue> = opts.get("thinking")?;
-    let audience = match opts.get::<Option<String>>("audience")? {
+    let task: bool = opts.get::<Option<bool>>("task")?.unwrap_or(false);
+    let requested_profile: Option<String> = opts.get("profile")?;
+    let requested_mode: Option<String> = opts.get("mode")?;
+    if !task && (requested_profile.is_some() || requested_mode.is_some()) {
+        return Ok(err_pair("profile and mode require task = true"));
+    }
+    if task && local_tools_tbl.is_some() && !agent_ctx.caller_is_bundled_tool("task") {
+        return Ok(err_pair(
+            "task-local tools are reserved for Maki's bundled task tool",
+        ));
+    }
+    if !task && !matches!(agent_ctx.mode, AgentMode::Build) {
+        return Ok(err_pair(
+            "generic subagent sessions cannot be launched from a read-only or plan-mode parent",
+        ));
+    }
+    let requested_mode = try_pair!(parse_task_mode(requested_mode.as_deref()));
+    let audience_name: Option<String> = opts.get("audience")?;
+    let requested_audience = match audience_name.as_deref() {
         Some(s) => {
-            try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
+            try_pair!(ToolAudience::parse_name(s).ok_or_else(|| format!("unknown audience: {s}")))
         }
         None => DEFAULT_SESSION_AUDIENCE,
     };
+    if !task && requested_audience == ToolAudience::RESEARCH_SUB && local_tools_tbl.is_some() {
+        return Ok(err_pair(
+            "generic research sessions cannot install caller-defined local tools",
+        ));
+    }
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
-
-    let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
+    let mcp_option: Option<bool> = opts.get("mcp")?;
+    let mcp_enabled = mcp_option.unwrap_or(true);
+    if task
+        && (model_spec.is_some()
+            || system.is_some()
+            || tools_val.is_some()
+            || thinking_val.is_some()
+            || audience_name.is_some()
+            || mcp_option.is_some())
     {
-        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
-        let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
-        (m, Arc::from(p))
-    } else {
-        (
-            Model::clone(&agent_ctx.model),
-            Arc::clone(&agent_ctx.provider),
-        )
+        return Ok(err_pair(
+            "task sessions derive model, thinking, system prompt, tools, audience, and MCP policy from their profile and mode",
+        ));
+    }
+
+    let parent_tool_use_id = agent_ctx
+        .tool_use_id
+        .clone()
+        .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    let root_tool_use_id = agent_ctx
+        .root_tool_use_id
+        .clone()
+        .unwrap_or_else(|| parent_tool_use_id.clone());
+    let mut task_id = continued_task_id
+        .clone()
+        .unwrap_or_else(|| parent_tool_use_id.clone());
+    let default_task_spec = SubagentTaskSpec {
+        profile_name: agent_ctx.system_prompt_profile_name.to_string(),
+        mode: SubagentTaskMode::Plan,
+        ..SubagentTaskSpec::default()
     };
+    let history_lease = if task {
+        match continued_task_id {
+            Some(_) => try_pair!(agent_ctx.subagent_history.continue_task_with_defaults(
+                &task_id,
+                SubagentTaskSpecCandidate {
+                    profile_name: requested_profile,
+                    mode: requested_mode,
+                },
+                default_task_spec,
+            )),
+            None => {
+                let spec = SubagentTaskSpec {
+                    profile_name: requested_profile.unwrap_or(default_task_spec.profile_name),
+                    mode: requested_mode.unwrap_or(SubagentTaskMode::Plan),
+                    ..SubagentTaskSpec::default()
+                };
+                match agent_ctx
+                    .subagent_history
+                    .reserve_with_spec(task_id.clone(), spec.clone())
+                {
+                    Ok(lease) => lease,
+                    Err(
+                        SubagentHistoryError::AlreadyActive { .. }
+                        | SubagentHistoryError::AlreadyCompleted { .. },
+                    ) => {
+                        task_id = format!("session-{}", MakiId::generate());
+                        try_pair!(
+                            agent_ctx
+                                .subagent_history
+                                .reserve_with_spec(task_id.clone(), spec)
+                        )
+                    }
+                    Err(error) => return Ok(err_pair(error.to_string())),
+                }
+            }
+        }
+    } else {
+        match continued_task_id {
+            Some(_) => try_pair!(agent_ctx.subagent_history.continue_task(&task_id)),
+            None => match agent_ctx.subagent_history.reserve(task_id.clone()) {
+                Ok(lease) => lease,
+                Err(
+                    SubagentHistoryError::AlreadyActive { .. }
+                    | SubagentHistoryError::AlreadyCompleted { .. },
+                ) => {
+                    task_id = format!("session-{}", MakiId::generate());
+                    try_pair!(agent_ctx.subagent_history.reserve(task_id.clone()))
+                }
+                Err(error) => return Ok(err_pair(error.to_string())),
+            },
+        }
+    };
+
+    let task_spec = task.then(|| {
+        history_lease
+            .spec()
+            .cloned()
+            .expect("task leases always carry a specification")
+    });
+    if task_spec
+        .as_ref()
+        .is_some_and(|spec| spec.mode == SubagentTaskMode::Build)
+        && !matches!(agent_ctx.mode, AgentMode::Build)
+    {
+        return Ok(err_pair(
+            "build-mode task cannot be launched from a read-only or plan-mode parent",
+        ));
+    }
+    let task_bindings = agent_ctx.prompt_profiles.bind_for_tasks(
+        &agent_ctx.model,
+        &agent_ctx.opts.thinking,
+        &agent_ctx.model_policy,
+        agent_ctx.timeouts,
+    );
+    let task_profile = match &task_spec {
+        Some(spec) => {
+            try_pair!(agent_ctx.prompt_profiles.resolve(Some(&spec.profile_name)));
+            Some(try_pair!(task_bindings.resolve(&spec.profile_name)))
+        }
+        None => None,
+    }
+    .flatten();
+
+    let effective_model_spec = task_profile
+        .as_deref()
+        .and_then(|profile| profile.subagent_model())
+        .map(str::to_owned)
+        .or(model_spec);
+
+    let (model, provider): (Model, Arc<dyn provider::Provider>) =
+        if let Some(ref spec) = effective_model_spec {
+            let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
+            let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
+            (m, Arc::from(p))
+        } else {
+            (
+                Model::clone(&agent_ctx.model),
+                Arc::clone(&agent_ctx.provider),
+            )
+        };
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
     if let Some(sink) = &agent_ctx.live_sink {
@@ -457,6 +649,17 @@ async fn session(
                 spec.get::<Function>("handler")
                     .map_err(|_| format!("local_tools.{name}: 'handler' is required"))
             );
+            let effect_name: Option<String> = spec.get("effect")?;
+            let effect = try_pair!(parse_local_tool_effect(effect_name.as_deref()));
+            if task_spec
+                .as_ref()
+                .is_some_and(|task| task.mode == SubagentTaskMode::Plan)
+                && (name != STRUCTURED_OUTPUT_TOOL || effect != ToolEffect::ReadOnly)
+            {
+                return Ok(err_pair(format!(
+                    "local tool {name:?} is not an allowed plan-mode task output tool"
+                )));
+            }
             defs.push(serde_json::json!({
                 "name": name,
                 "description": description,
@@ -465,25 +668,14 @@ async fn session(
             let weak = lua.weak();
             local_map.insert(
                 name,
-                maki_agent::tools::local_tool(move |input, _ctx| {
+                audited_local_tool(effect, move |input, _ctx| {
                     let result = call_local_tool(&weak, &handler, &input);
                     Box::pin(async move { result })
                 }),
             );
         }
     }
-    let tool_filter = ToolFilter::Only(
-        tools_json
-            .as_array()
-            .expect("tools were validated as an array")
-            .iter()
-            .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
-            .collect(),
-    )
-    .intersect(&agent_ctx.tool_filter)
-    .including(local_map.keys().cloned());
-
-    let thinking = match thinking_val {
+    let requested_thinking = match thinking_val {
         Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
             Ok(stored) => ThinkingConfig::from(stored),
             Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
@@ -492,7 +684,7 @@ async fn session(
             Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
             _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
         },
-        Some(LuaValue::Number(n)) if n >= 1.0 && n <= f64::from(u32::MAX) => {
+        Some(LuaValue::Number(n)) if n.fract() == 0.0 && n >= 1.0 && n <= f64::from(u32::MAX) => {
             ThinkingConfig::Budget(n as u32)
         }
         Some(LuaValue::Number(n)) => {
@@ -501,6 +693,103 @@ async fn session(
         Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
         None => agent_ctx.opts.thinking.clone(),
     };
+
+    let thinking = task_profile
+        .as_deref()
+        .and_then(|profile| profile.subagent_thinking().cloned())
+        .map(ThinkingConfig::from)
+        .unwrap_or(requested_thinking);
+    if task_profile.as_ref().is_some_and(|profile| {
+        profile.subagent_model().is_some() || profile.subagent_thinking().is_some()
+    }) && let Err(error) = thinking.resolve_exact(&model)
+    {
+        let profile_name = task_spec
+            .as_ref()
+            .map_or("builtin", |spec| spec.profile_name.as_str());
+        return Ok(err_pair(format!(
+            "system prompt profile {profile_name:?} is unavailable for subagents: thinking {thinking} is incompatible with model {:?}: {error}",
+            model.spec()
+        )));
+    }
+
+    let (agent_mode, audience, system, task_mcp_enabled) = match task_spec.as_ref() {
+        Some(spec) => {
+            let (mode, prompt_id, contract, audience) = match spec.mode {
+                SubagentTaskMode::Plan => (
+                    AgentMode::ReadOnly,
+                    maki_agent::prompt::PromptId::Research,
+                    maki_agent::prompt::TASK_PLAN_CONTRACT,
+                    ToolAudience::RESEARCH_SUB,
+                ),
+                SubagentTaskMode::Build => (
+                    AgentMode::Build,
+                    maki_agent::prompt::PromptId::General,
+                    maki_agent::prompt::TASK_BUILD_CONTRACT,
+                    ToolAudience::GENERAL_SUB,
+                ),
+            };
+            let vars = maki_agent::template::env_vars().set(
+                "{task_system_prompt_profiles}",
+                task_bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
+            );
+            let cwd = vars.apply("{cwd}").into_owned();
+            let instructions =
+                smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await;
+            let assembled = maki_agent::prompt::assemble_task(
+                prompt_id,
+                &agent_ctx.prompt_slots,
+                &instructions,
+                task_profile.as_deref(),
+                contract,
+            );
+
+            let local_definitions = std::mem::take(
+                tools_json
+                    .as_array_mut()
+                    .expect("tools were validated as an array"),
+            );
+            let base_filter =
+                ToolFilter::from_config(&agent_ctx.config, &model, &[]).for_mode(&mode);
+            let description_context = DescriptionContext {
+                filter: &base_filter,
+                audience,
+                workflow: false,
+            };
+            tools_json = ToolRegistry::global().definitions(
+                &vars,
+                &description_context,
+                model.supports_tool_examples(),
+            );
+            tools_json
+                .as_array_mut()
+                .expect("definitions return an array")
+                .extend(local_definitions);
+            (
+                mode,
+                audience,
+                vars.apply(&assembled).into_owned(),
+                spec.mode == SubagentTaskMode::Build,
+            )
+        }
+        None => (
+            AgentMode::Build,
+            requested_audience,
+            system.unwrap_or_default(),
+            mcp_enabled,
+        ),
+    };
+
+    let tool_filter = ToolFilter::Only(
+        tools_json
+            .as_array()
+            .expect("tools were validated as an array")
+            .iter()
+            .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
+            .collect(),
+    )
+    .intersect(&ToolFilter::from_config(&agent_ctx.config, &model, &[]))
+    .including(local_map.keys().cloned())
+    .for_mode(&agent_mode);
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
@@ -520,27 +809,6 @@ async fn session(
     ))
     .detach();
 
-    let parent_tool_use_id = agent_ctx
-        .tool_use_id
-        .clone()
-        .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    let mut task_id = continued_task_id
-        .clone()
-        .unwrap_or_else(|| parent_tool_use_id.clone());
-    let history_lease = match continued_task_id {
-        Some(_) => try_pair!(agent_ctx.subagent_history.continue_task(&task_id)),
-        None => match agent_ctx.subagent_history.reserve(task_id.clone()) {
-            Ok(lease) => lease,
-            Err(
-                SubagentHistoryError::AlreadyActive { .. }
-                | SubagentHistoryError::AlreadyCompleted { .. },
-            ) => {
-                task_id = format!("session-{}", MakiId::generate());
-                try_pair!(agent_ctx.subagent_history.reserve(task_id.clone()))
-            }
-            Err(error) => return Ok(err_pair(error.to_string())),
-        },
-    };
     let history_items = history_lease
         .history()
         .map_or_else(Vec::new, |messages| expand_history(messages));
@@ -566,10 +834,16 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            root_tool_use_id: Some(root_tool_use_id.clone()),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
+            prompt_profiles: Arc::clone(&agent_ctx.prompt_profiles),
+            system_prompt_profile_name: Arc::from(task_spec.as_ref().map_or_else(
+                || agent_ctx.system_prompt_profile_name.as_ref(),
+                |spec| spec.profile_name.as_str(),
+            )),
             subagent_cancels: Arc::new(CancelMap::new()),
             subagent_history: agent_ctx.subagent_history.clone(),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
@@ -577,14 +851,15 @@ async fn session(
             tool_filter,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
-        system: system.unwrap_or_default(),
+        system,
         tools: tools_json,
+        mode: agent_mode,
         thinking,
         fast,
         mcp: agent_ctx
             .mcp
             .as_ref()
-            .filter(|_| mcp_enabled)
+            .filter(|_| task_mcp_enabled)
             .map(McpSession::fresh),
         history,
         history_lease: Some(history_lease),
@@ -596,6 +871,7 @@ async fn session(
         steer_tx: Some(steer_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         parent_tool_use_id,
+        root_tool_use_id,
         task_id,
         cancel_slot,
         parent_event_tx: parent_tx,
@@ -678,10 +954,11 @@ async fn dispatch_racing_live(
     rx: Option<flume::Receiver<ToolLive>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
+    let call_id = MakiId::generate().to_string();
     let run = tool_dispatch::run(
         &tctx.registry,
         tctx.mcp.as_ref(),
-        MakiId::generate().to_string(),
+        call_id,
         name,
         input,
         tctx,
@@ -710,6 +987,7 @@ struct SessionState {
     params: AgentParams,
     system: String,
     tools: JsonValue,
+    mode: AgentMode,
     thinking: ThinkingConfig,
     fast: bool,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -725,6 +1003,7 @@ struct SessionState {
     steer_tx: Option<SteeringQueue>,
     parent_cancels: Arc<CancelMap<String>>,
     parent_tool_use_id: String,
+    root_tool_use_id: String,
     task_id: String,
     /// Which cancellation registration under `task_id` is ours.
     cancel_slot: CancelSlot,
@@ -746,12 +1025,21 @@ impl SessionState {
         self.closed = true;
         self.parent_cancels.retire(&self.task_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        let persisted_spec = self
+            .history_lease
+            .as_ref()
+            .and_then(|lease| lease.spec().cloned());
         if let Some(lease) = self.history_lease.take() {
-            lease.complete(Arc::new(messages.clone()));
+            lease.complete_version(Arc::new(messages.clone()), self.parent_tool_use_id.clone());
         }
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             task_id: self.task_id.clone(),
+            parent_tool_use_id: self.parent_tool_use_id.clone(),
+            root_tool_use_id: self.root_tool_use_id.clone(),
+            name: self.name.clone(),
+            model: self.params.model.spec(),
             messages,
+            spec: persisted_spec,
         });
         info!(
             name = %self.name,
@@ -843,7 +1131,7 @@ async fn prompt(
 
     let input = AgentInput {
         message,
-        mode: AgentMode::Build,
+        mode: s.mode.clone(),
         images: Vec::new(),
         preamble: Vec::new(),
         thinking: s.thinking.clone(),
@@ -1098,6 +1386,15 @@ mod tests {
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
             },
+            AgentEvent::SubagentHistory {
+                task_id: "nested-task".into(),
+                parent_tool_use_id: "nested-call".into(),
+                root_tool_use_id: PARENT_ID.into(),
+                name: "nested".into(),
+                model: "provider/model".into(),
+                messages: Vec::new(),
+                spec: None,
+            },
             AgentEvent::Done {
                 usage: DONE_USAGE,
                 num_turns: 2,
@@ -1131,13 +1428,15 @@ mod tests {
         assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
-        assert_eq!(forwarded.len(), expected.len());
+        assert_eq!(forwarded.len(), expected.len() + 1);
         assert!(forwarded.iter().all(|envelope| {
-            matches!(envelope.event, AgentEvent::TurnComplete(_))
-                && envelope
-                    .subagent
-                    .as_ref()
-                    .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+            matches!(
+                envelope.event,
+                AgentEvent::TurnComplete(_) | AgentEvent::SubagentHistory { .. }
+            ) && envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
     }
 }

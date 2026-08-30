@@ -448,7 +448,8 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
     }
 
-    const UNDECLARED: &str = "plan model has no declared reasoning levels, so effort is unreachable";
+    const UNDECLARED: &str =
+        "plan model has no declared reasoning levels, so effort is unreachable";
 
     #[test]
     fn every_plan_model_declares_its_levels() {

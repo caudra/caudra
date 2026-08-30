@@ -625,7 +625,10 @@ impl EventHandle {
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
-        let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+        let _ = self.tx.send(Request::RestoreToolAsync {
+            item: Box::new(item),
+            event_tx,
+        });
     }
 
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks

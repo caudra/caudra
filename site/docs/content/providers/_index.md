@@ -106,6 +106,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
 | Strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
 | Strong | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Strong | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
 | Strong | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
 | Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
@@ -477,7 +478,7 @@ A `llama-cpp` model can replace Maki's token-budget mapping with its native thin
 }]
 ```
 
-`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
+`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
 
 Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
 

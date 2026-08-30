@@ -113,6 +113,7 @@ fn finish_compact(
     }
 
     response.message.retained_output_refs = retained_output_refs(history.as_slice());
+    response.message.retained_subagent_ids = retained_subagent_ids(history.as_slice());
     response.message.is_compaction_summary = true;
 
     let new_history = vec![
@@ -149,6 +150,21 @@ fn retained_output_refs(messages: &[Message]) -> Vec<maki_storage::tool_outputs:
         .filter(|output_ref| retained_ids.insert(output_ref.id))
         .cloned()
         .collect()
+}
+
+fn retained_subagent_ids(messages: &[Message]) -> Vec<String> {
+    let mut retained = std::collections::HashSet::new();
+    for message in messages {
+        retained.extend(message.retained_subagent_ids.iter().cloned());
+        for block in &message.content {
+            if let ContentBlock::ToolUse { id, .. } = block {
+                retained.insert(id.clone());
+            }
+        }
+    }
+    let mut retained: Vec<_> = retained.into_iter().collect();
+    retained.sort();
+    retained
 }
 
 pub async fn compact(
@@ -842,6 +858,40 @@ mod tests {
         ];
 
         assert_eq!(retained_output_refs(&messages), [current, prior]);
+    }
+
+    #[test]
+    fn compaction_carries_tool_roots_and_prior_subagent_ids() {
+        let messages = [
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use("task-direct", "task", serde_json::json!({})),
+                    ContentBlock::tool_use("batch-root", "batch", serde_json::json!({})),
+                    ContentBlock::tool_use("generic-root", "custom", serde_json::json!({})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "batch".into(),
+                    content: "<task_metadata>\ntask_id: task-nested\n</task_metadata>".into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+            Message {
+                retained_subagent_ids: vec!["task-prior".into(), "task-direct".into()],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            retained_subagent_ids(&messages),
+            ["batch-root", "generic-root", "task-direct", "task-prior"]
+        );
     }
 
     #[track_caller]

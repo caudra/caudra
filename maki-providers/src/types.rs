@@ -234,6 +234,8 @@ pub struct Message {
     /// provider payloads must see retrieval IDs only when summary text cites them.
     #[serde(skip)]
     pub retained_output_refs: Vec<ToolOutputRef>,
+    #[serde(skip)]
+    pub retained_subagent_ids: Vec<String>,
     /// Marks the host-generated summary that replaced prior conversation state.
     #[serde(skip)]
     pub is_compaction_summary: bool,
@@ -419,8 +421,7 @@ impl StopReason {
     }
 }
 
-pub const THINKING_USAGE: &str =
-    "Usage: /thinking [off|adaptive|<effort level>|<token budget>]";
+pub const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<effort level>|<token budget>]";
 
 /// First Claude version that speaks adaptive thinking. Opus got there a
 /// generation early, at 4.7; the other families joined at 5.
@@ -551,6 +552,18 @@ impl std::fmt::Display for ResolvedThinking {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ThinkingCompatibilityError {
+    #[error("model does not support thinking")]
+    Unsupported,
+    #[error("model does not declare whether it accepts this thinking setting")]
+    UnknownOptions,
+    #[error("model does not support adaptive thinking")]
+    AdaptiveUnsupported,
+    #[error("model would resolve thinking as {0}")]
+    Inexact(ResolvedThinking),
+}
+
 /// The thinking setting exactly as the user asked for it. It stays unresolved
 /// so switching models never silently rewrites the request; see
 /// [`ThinkingConfig::resolve`].
@@ -609,6 +622,61 @@ impl ThinkingConfig {
                     ResolvedThinking::On
                 }
             }
+        }
+    }
+
+    /// Resolves only when the model can honor the requested semantics without
+    /// clamping, snapping, promotion, or translation.
+    pub fn resolve_exact(
+        &self,
+        model: &Model,
+    ) -> Result<ResolvedThinking, ThinkingCompatibilityError> {
+        let requested = match self {
+            Self::Effort(level) => Self::Effort(level.trim().to_ascii_lowercase().into()),
+            _ => self.clone(),
+        };
+        if requested.is_enabled() && !model.supports_thinking() {
+            return Err(ThinkingCompatibilityError::Unsupported);
+        }
+
+        let options = model.reasoning_options();
+        let resolved = requested.resolve(model);
+        let exact = match (&requested, &resolved) {
+            (Self::Off, ResolvedThinking::Off) => true,
+            (Self::Off, ResolvedThinking::Effort(level)) => level == EFFORT_NONE,
+            (Self::Adaptive, ResolvedThinking::On) => true,
+            (Self::Effort(requested), ResolvedThinking::Effort(resolved)) => {
+                requested.as_ref() == resolved
+            }
+            (Self::Budget(requested), ResolvedThinking::Budget(resolved)) => requested == resolved,
+            _ => false,
+        };
+        if !exact {
+            return Err(ThinkingCompatibilityError::Inexact(resolved));
+        }
+        match &requested {
+            Self::Adaptive
+                if model
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|id| id.starts_with("claude-"))
+                    && !Self::requires_adaptive(&model.id) =>
+            {
+                Err(ThinkingCompatibilityError::AdaptiveUnsupported)
+            }
+            Self::Effort(level)
+                if !options
+                    .efforts()
+                    .iter()
+                    .any(|value| value == level.as_ref()) =>
+            {
+                Err(ThinkingCompatibilityError::UnknownOptions)
+            }
+            Self::Budget(_) if options.budget_bounds().is_none() => {
+                Err(ThinkingCompatibilityError::UnknownOptions)
+            }
+            _ => Ok(resolved),
         }
     }
 
@@ -1005,7 +1073,7 @@ mod tests {
         ThinkingConfig::Effort(level.into())
     }
 
-    /// `max_output_tokens: 8192`, so a budget ceiling of 8191 unless the model
+    /// `max_output_tokens: 8192`, so the budget ceiling is 4096 unless the model
     /// declares a tighter one.
     fn thinking_model(id: &str) -> crate::model::Model {
         crate::model::Model {
@@ -1105,6 +1173,82 @@ mod tests {
         assert_eq!(config.resolve(&model), expected);
     }
 
+    #[test_case(ThinkingConfig::Off, ReasoningOptions::default(), ResolvedThinking::Off ; "off_without_options")]
+    #[test_case(ThinkingConfig::Off, ReasoningOptions::new(vec![ReasoningOption::Effort { values: vec!["none".into(), "high".into()] }]), ResolvedThinking::Effort("none".into()) ; "off_with_declared_none")]
+    #[test_case(ThinkingConfig::Adaptive, ReasoningOptions::default(), ResolvedThinking::On ; "adaptive")]
+    #[test_case(effort(" HIGH "), ReasoningOptions::new(vec![ReasoningOption::Effort { values: vec!["low".into(), "high".into()] }]), ResolvedThinking::Effort("high".into()) ; "normalized_declared_effort")]
+    #[test_case(ThinkingConfig::Budget(2048), ReasoningOptions::new(vec![ReasoningOption::BudgetTokens { min: None, max: None }]), ResolvedThinking::Budget(2048) ; "declared_unbounded_budget")]
+    fn thinking_resolve_exact_keeps_semantics(
+        config: ThinkingConfig,
+        reasoning_options: ReasoningOptions,
+        expected: ResolvedThinking,
+    ) {
+        let mut model = thinking_model("exact-model");
+        model.reasoning_options = reasoning_options;
+        assert_eq!(config.resolve_exact(&model), Ok(expected));
+    }
+
+    #[test_case(effort("max"), effort_model(&["low", "high"]), ResolvedThinking::Effort("high".into()) ; "effort_snapping")]
+    #[test_case(effort("max"), budget_model(Some(1024), Some(4096)), ResolvedThinking::Budget(4096) ; "effort_to_budget_translation")]
+    #[test_case(ThinkingConfig::Budget(512), budget_model(Some(1024), Some(4096)), ResolvedThinking::Budget(1024) ; "budget_floor")]
+    #[test_case(ThinkingConfig::Budget(8192), budget_model(Some(1024), Some(4096)), ResolvedThinking::Budget(4096) ; "budget_ceiling")]
+    #[test_case(ThinkingConfig::Budget(2048), effort_model(&["low", "high"]), ResolvedThinking::On ; "budget_to_default_translation")]
+    #[test_case(ThinkingConfig::Off, effort_model(&["low", "high"]), ResolvedThinking::Effort("low".into()) ; "required_thinking_promotion")]
+    fn thinking_resolve_exact_rejects_semantic_changes(
+        config: ThinkingConfig,
+        model: crate::model::Model,
+        best_effort: ResolvedThinking,
+    ) {
+        assert_eq!(
+            config.resolve_exact(&model),
+            Err(ThinkingCompatibilityError::Inexact(best_effort))
+        );
+    }
+
+    #[test_case(effort("high") ; "effort_level")]
+    #[test_case(ThinkingConfig::Budget(2048) ; "budget")]
+    fn thinking_resolve_exact_requires_declared_options(config: ThinkingConfig) {
+        let model = thinking_model("unknown-options-model");
+        assert_eq!(
+            config.resolve_exact(&model),
+            Err(ThinkingCompatibilityError::UnknownOptions)
+        );
+    }
+
+    #[test]
+    fn thinking_resolve_exact_rejects_unsupported_thinking() {
+        let mut model = thinking_model("unsupported-model");
+        model.thinking_override = Some(Support::No);
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&model),
+            Err(ThinkingCompatibilityError::Unsupported)
+        );
+        assert_eq!(
+            ThinkingConfig::Off.resolve_exact(&model),
+            Ok(ResolvedThinking::Off)
+        );
+    }
+
+    #[test]
+    fn thinking_resolve_exact_requires_native_adaptive_support_for_claude() {
+        let old_claude = thinking_model("claude-haiku-4-5");
+        let legacy_claude = thinking_model("claude-3-7-sonnet-20250219");
+        let adaptive_claude = thinking_model("claude-opus-4-7");
+
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&old_claude),
+            Err(ThinkingCompatibilityError::AdaptiveUnsupported)
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&legacy_claude),
+            Err(ThinkingCompatibilityError::AdaptiveUnsupported)
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&adaptive_claude),
+            Ok(ResolvedThinking::On)
+        );
+    }
+
     /// llama.cpp models declare no window and no bounds, so the request must
     /// still carry something honest rather than a number maki invented.
     #[test_case(ThinkingConfig::Budget(16384), ResolvedThinking::Budget(16_384) ; "explicit_budget_passes_through")]
@@ -1122,11 +1266,13 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget_clamped_to_the_output_window")]
     fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
         let mut model = budget_model(None, None);
-        model.reasoning_options =
-            ReasoningOptions::new(vec![ReasoningOption::Toggle, ReasoningOption::BudgetTokens {
+        model.reasoning_options = ReasoningOptions::new(vec![
+            ReasoningOption::Toggle,
+            ReasoningOption::BudgetTokens {
                 min: None,
                 max: None,
-            }]);
+            },
+        ]);
         let mut body = json!({});
         config.apply_google_thinking(&mut body, &model);
         assert_eq!(body, expected);

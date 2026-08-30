@@ -158,8 +158,8 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 
 #[cfg(test)]
 mod tests {
-    use crate::ReasoningOptions;
     use super::*;
+    use crate::ReasoningOptions;
     use crate::manifest::ManifestRegistry;
     use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
     use std::sync::Arc;

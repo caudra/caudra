@@ -19,11 +19,9 @@ pub const MIN_THINKING_BUDGET: u32 = 1024;
 
 /// Every effort level the models.dev catalog declares, ascending. Of the 3004
 /// models carrying an effort option, 3001 use only these and 3003 declare them
-/// in this order, so the list doubles as the fallback ladder offered for a model
-/// that declares nothing.
-pub const EFFORT_LEVELS: [&str; 7] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max",
-];
+/// in this order, so its reasoning depths double as the fallback ladder for a
+/// model that declares nothing.
+pub const EFFORT_LEVELS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Wire spelling that disables reasoning on models whose effort parameter takes
 /// an explicit opt-out instead of an omitted field.
@@ -272,8 +270,7 @@ mod tests {
 
     use super::{
         BUDGET_LADDER, EFFORT_LEVELS, ReasoningOption, ReasoningOptions, StoredThinking,
-        ThinkingParseError,
-        effort_rank,
+        ThinkingParseError, effort_rank,
     };
 
     fn efforts(values: &[&str]) -> ReasoningOptions {
@@ -286,10 +283,19 @@ mod tests {
     #[test_case("adaptive", StoredThinking::Adaptive ; "adaptive")]
     #[test_case("  high  ", StoredThinking::Effort { level: "high".into() } ; "trims")]
     #[test_case("XHigh", StoredThinking::Effort { level: "xhigh".into() } ; "lowercases")]
-    #[test_case("turbo", StoredThinking::Effort { level: "turbo".into() } ; "unknown_word_is_a_level")]
     #[test_case("2048", StoredThinking::Budget { tokens: 2048 } ; "budget")]
     fn parse_setting_reads_every_spelling(input: &str, expected: StoredThinking) {
         assert_eq!(StoredThinking::parse_setting(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_setting_rejects_an_unknown_level() {
+        assert_eq!(
+            StoredThinking::parse_setting("turbo").unwrap_err(),
+            ThinkingParseError::UnknownLevel {
+                level: "turbo".into()
+            }
+        );
     }
 
     #[test]
@@ -302,10 +308,13 @@ mod tests {
 
     #[test]
     fn parse_setting_round_trips_through_display() {
-        for input in ["off", "adaptive", "high", "turbo", "4096"] {
+        for input in ["off", "adaptive", "high", "4096"] {
             let parsed = StoredThinking::parse_setting(input).unwrap();
             assert_eq!(parsed.to_string(), input);
-            assert_eq!(StoredThinking::parse_setting(&parsed.to_string()).unwrap(), parsed);
+            assert_eq!(
+                StoredThinking::parse_setting(&parsed.to_string()).unwrap(),
+                parsed
+            );
         }
     }
 
@@ -351,7 +360,10 @@ mod tests {
 
     #[test]
     fn effort_ladder_falls_back_to_the_canonical_levels() {
-        assert_eq!(ReasoningOptions::default().effort_ladder(), EFFORT_LEVELS);
+        assert_eq!(
+            ReasoningOptions::default().effort_ladder(),
+            EFFORT_LEVELS[1..]
+        );
         assert_eq!(efforts(&["high", "max"]).effort_ladder(), ["high", "max"]);
         assert_eq!(budget(Some(1024), None).effort_ladder(), BUDGET_LADDER);
     }
@@ -360,8 +372,8 @@ mod tests {
         ReasoningOptions::new(vec![ReasoningOption::BudgetTokens { min, max }])
     }
 
-    #[test_case(budget(Some(128), Some(32_768)), Some(65_536), Some(32_768) ; "declared_max_wins_over_window")]
-    #[test_case(budget(Some(1024), None), Some(64_000), Some(63_999) ; "window_minus_one_when_undeclared")]
+    #[test_case(budget(Some(128), Some(32_768)), Some(131_072), Some(32_768) ; "declared_max_wins_over_window")]
+    #[test_case(budget(Some(1024), None), Some(64_000), Some(32_000) ; "half_window_when_undeclared")]
     #[test_case(budget(Some(1024), None), None, None ; "unknown_on_both_sides")]
     #[test_case(budget(None, Some(24_576)), None, Some(24_576) ; "declared_max_without_a_window")]
     fn budget_ceiling_takes_the_tighter_bound(
@@ -385,8 +397,8 @@ mod tests {
         assert_eq!(budget(None, None).clamp_budget(1_000_000, None), 1_000_000);
     }
 
-    #[test_case("max", 63_999 ; "top_of_the_ladder_takes_the_ceiling")]
-    #[test_case("high", 31_999 ; "below_the_top_takes_half")]
+    #[test_case("max", 32_000 ; "top_of_the_ladder_takes_the_ceiling")]
+    #[test_case("high", 16_000 ; "below_the_top_takes_half")]
     fn budget_for_effort_derives_two_steps(level: &str, expected: u32) {
         // Claude Sonnet 4.5: declares only a floor, so the window sets the ceiling.
         let options = budget(Some(1024), None);

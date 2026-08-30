@@ -8,7 +8,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 * `index` tool - uses [tree-sitter](https://tree-sitter.github.io/tree-sitter) to parse supported programming languages to produce a high level skeleton of a file, with exact start-end lines of each item (e.g. a function's implementation is in lines 150-165). Encouraged to be used before reads. For my usage it adds 59 tok/turn but saves 224 tok/turn on read calls, saving 165 tok/turn.
 * `code_execution` tool - uses [monty](https://github.com/pydantic/monty) to run an interpreter that has all other tools available as async functions. Maki uses it to filter / summarize / transform / pipe data to other tools as input, without it ever reaching and polluting the context window. Sandbox limited by time & memory.
-* `task` tool - when delegating work to subagents, the AI chooses whether to run weak / medium / strong model of used provider. Think haiku / sonnet / opus.
+* `task` tool - delegates isolated plan or build work to subagents. System prompt profiles can select a subagent model and thinking mode.
 * System prompt, tool descriptions, and tool examples are all concise, I've made sure not to bloat your context.
 
 ### User experience

@@ -9,7 +9,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption};
+use crate::model::{
+    Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption,
+};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -35,70 +37,69 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
-            ModelEntry {
-                prefixes: &["gemini-2.5-pro"],
-                tier: ModelTier::Strong,
-                family: ModelFamily::Gemini,
-                vision: true,
-                default: true,
-                pricing: ModelPricing {
-                    input: 1.25,
-                    output: 5.00,
-                    cache_write: 0.00,
-                    cache_read: 0.31,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: Some(65_536),
-                context_window: 1_048_576,
-                reasoning_options: Some(&[StaticReasoningOption::BudgetTokens {
-                        min: Some(128),
-                        max: Some(32_768),
-                    }]),
+        ModelEntry {
+            prefixes: &["gemini-2.5-pro"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Gemini,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 1.25,
+                output: 5.00,
+                cache_write: 0.00,
+                cache_read: 0.31,
+                fast: None,
+                tiers: Vec::new(),
             },
-            ModelEntry {
-                prefixes: &["gemini-2.5-flash"],
-                tier: ModelTier::Medium,
-                family: ModelFamily::Gemini,
-                vision: true,
-                default: true,
-                pricing: ModelPricing {
-                    input: 0.15,
-                    output: 0.60,
-                    cache_write: 0.00,
-                    cache_read: 0.04,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: Some(65_536),
-                context_window: 1_048_576,
-                reasoning_options: Some(&[
-                        StaticReasoningOption::Toggle,
-                        StaticReasoningOption::BudgetTokens {
-                            min: Some(0),
-                            max: Some(24_576),
-                        },
-                    ]),
+            max_output_tokens: Some(65_536),
+            context_window: 1_048_576,
+            reasoning_options: Some(&[StaticReasoningOption::BudgetTokens {
+                min: Some(128),
+                max: Some(32_768),
+            }]),
+        },
+        ModelEntry {
+            prefixes: &["gemini-2.5-flash"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gemini,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 0.15,
+                output: 0.60,
+                cache_write: 0.00,
+                cache_read: 0.04,
+                fast: None,
+                tiers: Vec::new(),
             },
-            ModelEntry {
-                prefixes: &["gemini-2.0-flash-lite"],
-                tier: ModelTier::Weak,
-                family: ModelFamily::Gemini,
-                vision: true,
-                default: true,
-                pricing: ModelPricing {
-                    input: 0.075,
-                    output: 0.30,
-                    cache_write: 0.00,
-                    cache_read: 0.01,
-                    fast: None,
-                    tiers: Vec::new(),
+            max_output_tokens: Some(65_536),
+            context_window: 1_048_576,
+            reasoning_options: Some(&[
+                StaticReasoningOption::Toggle,
+                StaticReasoningOption::BudgetTokens {
+                    min: Some(0),
+                    max: Some(24_576),
                 },
-                max_output_tokens: Some(65_536),
-                context_window: 1_048_576,
-                reasoning_options: None,
+            ]),
+        },
+        ModelEntry {
+            prefixes: &["gemini-2.0-flash-lite"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Gemini,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 0.075,
+                output: 0.30,
+                cache_write: 0.00,
+                cache_read: 0.01,
+                fast: None,
+                tiers: Vec::new(),
             },
-    
+            max_output_tokens: Some(65_536),
+            context_window: 1_048_576,
+            reasoning_options: None,
+        },
     ];
     MODELS
 }
@@ -675,8 +676,8 @@ async fn parse_sse(
 
 #[cfg(test)]
 mod tests {
-    use crate::ReasoningOptions;
     use super::*;
+    use crate::ReasoningOptions;
     use std::sync::Arc;
     use test_case::test_case;
 

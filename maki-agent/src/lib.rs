@@ -38,7 +38,10 @@ pub use tools::ToolFilter;
 pub mod types;
 pub use stored_session::{StoredSession, latest_stored_session, load_stored_session};
 pub use subagent_history::{
-    SubagentHistoryError, SubagentHistoryLease, SubagentHistorySnapshot, SubagentHistoryStore,
+    SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,
+    SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate,
+    active_task_history_versions, active_task_history_versions_with_batch_state,
+    batch_task_history_versions, history_tool_call_ids,
 };
 
 use std::collections::HashMap;
@@ -53,15 +56,16 @@ use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
-    GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, QueueConsumedItem, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
+    GrepMatchGroup, InstructionBlock, LuaToolProvenance, NO_FILES_FOUND, QueueConsumedItem,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentMode {
     #[default]
     Build,
+    ReadOnly,
     Plan(PathBuf),
 }
 
@@ -69,8 +73,12 @@ impl AgentMode {
     pub fn plan_path(&self) -> Option<&Path> {
         match self {
             Self::Plan(p) => Some(p),
-            Self::Build => None,
+            Self::Build | Self::ReadOnly => None,
         }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly)
     }
 }
 

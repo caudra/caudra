@@ -107,6 +107,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "todo_write",
+  effect = "isolated",
   description = DESCRIPTION,
   schema = {
     type = "object",

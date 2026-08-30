@@ -142,6 +142,27 @@ local function header_spans(tool, params)
   return spans or { { tool, "tool" } }
 end
 
+local function plain_header(tool)
+  return { { tool, "tool" } }
+end
+
+local function presentation_tool(c)
+  local t = maki.api.get_tool(c.tool)
+  local expected = c.lua_provenance
+  if
+    expected
+    and (
+      not t
+      or not t.lua_provenance
+      or t.lua_provenance.plugin ~= expected.plugin
+      or t.lua_provenance.contract ~= expected.contract
+    )
+  then
+    return nil
+  end
+  return t
+end
+
 -- The child's own restore fn builds the body, fed the real is_error, so
 -- a failed child looks exactly like the same tool run standalone. When
 -- restore is missing, throws, or returns no buf, the ToolView fallback
@@ -151,8 +172,11 @@ end
 -- body must not stop the sweep from repainting the rest.
 local function child_body_buf(c, tol)
   local output = c.output or ""
-  local t = maki.api.get_tool(c.tool)
+  local t = presentation_tool(c)
   local buf
+  if c.status == STATUS.ERROR and c.error_restore_allowed ~= true then
+    t = nil
+  end
   if t and t.restore then
     local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
     buf = ok and res or nil
@@ -180,7 +204,7 @@ local function prepare_children(tool_calls)
     elseif c.tool == "batch" then
       c.status, c.output = STATUS.ERROR, NESTED_ERROR
     end
-    c.header = header_spans(c.tool, c.params)
+    c.header = plain_header(c.tool)
     children[i] = c
   end
   return children
@@ -284,6 +308,9 @@ local function to_state(children)
       output = c.output,
       annotation = c.annotation,
       usage = c.usage,
+      lua_provenance = c.lua_provenance,
+      invocation_id = c.invocation_id,
+      error_restore_allowed = c.error_restore_allowed,
     }
   end
   return { children = out }
@@ -431,6 +458,9 @@ function Batch:settle(c, status, output)
   c.swept = nil
   c.status = status
   c.output = output
+  if status == STATUS.SUCCESS then
+    c.header = header_spans(c.tool, c.params)
+  end
   self:attach_body(c)
   self:rerender()
 end
@@ -442,8 +472,10 @@ function Batch:run_child(c, ctx)
     return
   end
   c.status = STATUS.RUNNING
+  local registered = maki.api.get_tool(c.tool)
+  c.lua_provenance = registered and registered.lua_provenance or nil
   self:rerender()
-  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, invocation_id, error_restore_allowed = maki.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
@@ -458,6 +490,8 @@ function Batch:run_child(c, ctx)
       self:rerender()
     end,
   })
+  c.invocation_id = invocation_id
+  c.error_restore_allowed = error_restore_allowed
   -- The sweep may have settled this child mid-call, and the call knows
   -- nothing about that, so its result is moot. Unless it came back with
   -- more than the sweep's bare reason: that partial output is worth
@@ -573,6 +607,14 @@ local function restore(input, output, _is_error, rctx)
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
       c.usage = sc.usage
+      c.lua_provenance = sc.lua_provenance
+      c.invocation_id = sc.invocation_id
+      c.error_restore_allowed = sc.error_restore_allowed
+      if c.status ~= STATUS.ERROR then
+        local t = presentation_tool(c)
+        local spans = t and t.header and t.header(c.params)
+        c.header = spans or plain_header(c.tool)
+      end
     end
     return Batch.new(children, tol).buf
   end
@@ -581,6 +623,7 @@ end
 
 maki.api.register_tool({
   name = "batch",
+  effect = "orchestrator",
   description = description,
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },

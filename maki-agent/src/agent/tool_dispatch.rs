@@ -12,8 +12,8 @@ use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext};
-use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::tools::{DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, ToolContext};
+use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,6 @@ pub enum Emit {
 }
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const SOURCE_NATIVE: &str = "native";
@@ -137,20 +136,40 @@ async fn run_inner(
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
 
-    let done_error = |msg: String| ToolDoneEvent {
-        id: id.clone(),
-        tool: Arc::clone(&tool_id),
-        output: ToolOutput::Plain(msg.into()),
-        is_error: true,
-        annotation: None,
-        written_path: None,
-        written_paths: Vec::new(),
-        output_ref: None,
-        output_limits: None,
-        model_suffix: None,
-        model_output: None,
-        model_output_from_ref: false,
+    let done_error = |msg: String| {
+        let mut output = ToolOutput::Plain(msg.into());
+        if let Some(entry) = &entry {
+            set_lua_provenance(&mut output, &entry.source, false);
+        }
+        ToolDoneEvent {
+            id: id.clone(),
+            tool: Arc::clone(&tool_id),
+            output,
+            is_error: true,
+            annotation: None,
+            written_path: None,
+            written_paths: Vec::new(),
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
+        }
     };
+
+    if ctx.policy().is_read_only() {
+        let allowed = if let Some(local) = local {
+            local.effect.is_safe_in_read_only()
+        } else if let Some(entry) = &entry {
+            entry.is_safe_in_read_only()
+        } else {
+            !mcp.is_some_and(|mcp| name == TOOL_SEARCH_TOOL_NAME || mcp.has_tool(mcp_lookup))
+        };
+        if !allowed {
+            warn!(tool = %name, "blocked tool in strict read-only mode");
+            return done_error(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"));
+        }
+    }
 
     if (local.is_some() || entry.is_some()) && !ctx.tool_filter.matches(name) {
         return done_error(format!("tool {name} is disabled for the current agent"));
@@ -159,7 +178,7 @@ async fn run_inner(
         return run_local_tool(local, id, name, input, ctx, emit).await;
     }
 
-    if let Some(entry) = entry {
+    if let Some(ref entry) = entry {
         if !entry.tool.audience().contains(ctx.audience) {
             return done_error(format!(
                 "tool {name} is unavailable to the current agent audience"
@@ -189,7 +208,23 @@ async fn run_inner(
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
 
-        for target in invocation.mutation_targets(ctx) {
+        let mutation_targets = invocation.mutation_targets(ctx);
+        if ctx.mode.plan_path().is_some()
+            && !entry.effect.is_safe_in_read_only()
+            && !entry.source.is_trusted()
+        {
+            warn!(tool = %name, "blocked untrusted effect in plan mode");
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+        if ctx.mode.plan_path().is_some()
+            && !entry.effect.is_safe_in_read_only()
+            && mutation_targets.is_empty()
+        {
+            warn!(tool = %name, "blocked unscoped effect in plan mode");
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+
+        for target in mutation_targets {
             let is_plan_target = ctx
                 .mode
                 .plan_path()
@@ -244,7 +279,8 @@ async fn run_inner(
 
         let elapsed = started.elapsed();
         match result.output {
-            Ok(output) => {
+            Ok(mut output) => {
+                set_lua_provenance(&mut output, &entry.source, true);
                 let written_path = result
                     .written_path
                     .or_else(|| result.written_paths.first().cloned());
@@ -278,6 +314,7 @@ async fn run_inner(
                     "tool failed"
                 );
                 let mut done = done_error(message).with_model_suffix(result.model_suffix);
+                set_lua_provenance(&mut done.output, &entry.source, true);
                 done.output_limits = result.output_limits;
                 done.output_ref = result.output_ref;
                 done.model_output = result.model_output;
@@ -301,6 +338,23 @@ async fn run_inner(
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
         done_error(msg)
+    }
+}
+
+fn set_lua_provenance(
+    output: &mut ToolOutput,
+    source: &crate::tools::ToolSource,
+    error_restore_allowed: bool,
+) {
+    if let crate::tools::ToolSource::Lua {
+        plugin, contract, ..
+    } = source
+    {
+        output.set_lua_provenance(LuaToolProvenance {
+            plugin: plugin.to_string(),
+            contract: contract.to_string(),
+            error_restore_allowed,
+        });
     }
 }
 
@@ -363,7 +417,7 @@ fn run_tool_search(
 }
 
 async fn run_local_tool(
-    local: &LocalToolFn,
+    local: &LocalToolEntry,
     id: String,
     name: &str,
     input: &Value,
@@ -376,17 +430,23 @@ async fn run_local_tool(
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
     };
-    let (output, is_error) = match local(input.clone(), tool_ctx).await {
+    let (output, is_error) = match local.call(input.clone(), tool_ctx).await {
         Ok(output) => (output, false),
         Err(e) => {
             warn!(tool = %name, error = %e, "local tool failed");
             (e, true)
         }
     };
+    let mut output = ToolOutput::Plain(output.into());
+    output.set_lua_provenance(LuaToolProvenance {
+        plugin: "__session_local__".into(),
+        contract: String::new(),
+        error_restore_allowed: false,
+    });
     ToolDoneEvent {
         id,
         tool: tool_id,
-        output: ToolOutput::Plain(output.into()),
+        output,
         is_error,
         annotation: None,
         written_path: None,
@@ -517,6 +577,10 @@ async fn execute_mcp_tool(
         model_output_from_ref: false,
     };
 
+    if ctx.policy().is_read_only() {
+        return done(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"), true);
+    }
+
     if ctx.mode.plan_path().is_some() {
         return done(MCP_BLOCKED_IN_PLAN.into(), true);
     }
@@ -615,6 +679,7 @@ pub(super) async fn process_tool_calls(
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
+            root_tool_use_id: ctx.root_tool_use_id.clone().or_else(|| Some(id.clone())),
             ..ctx.clone()
         };
         let mcp_owned = mcp.cloned();
@@ -836,6 +901,12 @@ mod tests {
             .await;
             assert!(!done.is_error);
             assert_eq!(done.output.as_text(), r#"local:"/a""#);
+            assert_eq!(
+                done.output
+                    .lua_provenance()
+                    .map(|provenance| provenance.plugin.as_str()),
+                Some("__session_local__")
+            );
 
             let ctx = local_ctx("boom", |_| Err("nope".into()));
             let done = run(
@@ -850,6 +921,55 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    #[test]
+    fn read_only_local_tools_fail_closed_without_an_audit() {
+        smol::block_on(async {
+            let mut ctx = local_ctx("forged_local", |_| Ok("ran".into()));
+            ctx.mode = AgentMode::ReadOnly;
+
+            let done = run(
+                &ctx.registry,
+                None,
+                "local-read-only".into(),
+                "forged_local",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().starts_with(READ_ONLY_TOOL_RESTRICTED));
+        });
+    }
+
+    #[test]
+    fn audited_local_tool_inherits_read_only_context() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::ReadOnly);
+            ctx.local_tools = Arc::new(std::collections::HashMap::from([(
+                "isolated_local".to_owned(),
+                crate::tools::audited_local_tool(crate::tools::ToolEffect::Isolated, |_, ctx| {
+                    Box::pin(async move { Ok(format!("{:?}", ctx.mode)) })
+                }),
+            )]));
+
+            let done = run(
+                &ctx.registry,
+                None,
+                "local-audited".into(),
+                "isolated_local",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), "ReadOnly");
         });
     }
 
@@ -1168,6 +1288,24 @@ mod tests {
     }
 
     #[test]
+    fn forged_mcp_tool_is_blocked_in_read_only_mode() {
+        smol::block_on(async {
+            let result = dispatch_mcp(
+                &crate::tools::test_support::stub_ctx(&AgentMode::ReadOnly),
+                "t1",
+                "myserver.mytool",
+                &serde_json::json!({}),
+            )
+            .await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.output.as_text(),
+                format!("{READ_ONLY_TOOL_RESTRICTED}: myserver.mytool")
+            );
+        });
+    }
+
+    #[test]
     fn mcp_tool_errors_without_mcp_manager() {
         smol::block_on(async {
             let result = dispatch_mcp(
@@ -1232,6 +1370,14 @@ mod tests {
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
+            );
+            assert_eq!(
+                done.output.lua_provenance(),
+                Some(&LuaToolProvenance {
+                    plugin: "test".into(),
+                    contract: "test-contract".into(),
+                    error_restore_allowed: false,
+                })
             );
         });
     }
@@ -1368,6 +1514,185 @@ mod tests {
                 rich_result: self.rich_result,
             }))
         }
+    }
+
+    #[test]
+    fn forged_native_and_unbundled_lua_calls_are_blocked_before_execution() {
+        smol::block_on(async {
+            let registry = ToolRegistry::new();
+            let native_executed = Arc::new(AtomicBool::new(false));
+            registry
+                .register(
+                    Arc::new(NativeProbe {
+                        name: "unknown_native",
+                        executed: Arc::clone(&native_executed),
+                        targets: Vec::new(),
+                        rich_result: false,
+                    }),
+                    ToolSource::Native {
+                        owner: "maki".into(),
+                        contract: "unknown-native/v1".into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let lua_executed = Arc::new(AtomicBool::new(false));
+            registry
+                .register_audited(
+                    Arc::new(NativeProbe {
+                        name: "claimed_safe_lua",
+                        executed: Arc::clone(&lua_executed),
+                        targets: Vec::new(),
+                        rich_result: false,
+                    }),
+                    ToolSource::Lua {
+                        plugin: "external".into(),
+                        contract: "claimed-safe/v1".into(),
+                        bundled: false,
+                    },
+                    crate::tools::ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::ReadOnly);
+
+            for name in ["unknown_native", "claimed_safe_lua"] {
+                let done = run(
+                    &registry,
+                    None,
+                    format!("forged-{name}"),
+                    name,
+                    &serde_json::json!({}),
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await;
+                assert!(done.is_error);
+                assert!(done.output.as_text().starts_with(READ_ONLY_TOOL_RESTRICTED));
+            }
+            assert!(!native_executed.load(Ordering::SeqCst));
+            assert!(!lua_executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn plan_mode_blocks_unscoped_mutating_lua_tool() {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register_audited(
+                    Arc::new(NativeProbe {
+                        name: "memory_like_tool",
+                        executed: Arc::clone(&executed),
+                        targets: Vec::new(),
+                        rich_result: false,
+                    }),
+                    ToolSource::Lua {
+                        plugin: "bundled".into(),
+                        contract: "memory-like/v1".into(),
+                        bundled: true,
+                    },
+                    crate::tools::ToolEffect::Mutating,
+                )
+                .unwrap();
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Plan("/tmp/plan.md".into()));
+
+            let done = run(
+                &registry,
+                None,
+                "plan-memory".into(),
+                "memory_like_tool",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), crate::tools::PLAN_WRITE_RESTRICTED);
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn plan_mode_does_not_trust_unbundled_lua_mutation_targets() {
+        smol::block_on(async {
+            let plan_path = PathBuf::from("/tmp/plan.md");
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register_audited(
+                    Arc::new(NativeProbe {
+                        name: "untrusted_plan_writer",
+                        executed: Arc::clone(&executed),
+                        targets: vec![plan_path.clone()],
+                        rich_result: false,
+                    }),
+                    ToolSource::Lua {
+                        plugin: "external".into(),
+                        contract: "untrusted-plan-writer/v1".into(),
+                        bundled: false,
+                    },
+                    crate::tools::ToolEffect::Unknown,
+                )
+                .unwrap();
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Plan(plan_path));
+
+            let done = run(
+                &registry,
+                None,
+                "plan-untrusted".into(),
+                "untrusted_plan_writer",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), crate::tools::PLAN_WRITE_RESTRICTED);
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn bundled_audited_read_only_tool_can_execute_for_research_child() {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let registry = ToolRegistry::new();
+            registry
+                .register_audited(
+                    Arc::new(NativeProbe {
+                        name: "bundled_read",
+                        executed: Arc::clone(&executed),
+                        targets: Vec::new(),
+                        rich_result: false,
+                    }),
+                    ToolSource::Lua {
+                        plugin: "bundled".into(),
+                        contract: "bundled-read/v1".into(),
+                        bundled: true,
+                    },
+                    crate::tools::ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.audience = crate::tools::ToolAudience::RESEARCH_SUB;
+
+            let done = run(
+                &registry,
+                None,
+                "bundled-read".into(),
+                "bundled_read",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(executed.load(Ordering::SeqCst));
+        });
     }
 
     impl ToolInvocation for ReplacementTaskInvocation {

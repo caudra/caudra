@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -303,6 +303,18 @@ impl App {
 
     pub(super) fn sync_subagents(&mut self) {
         let histories = self.state.session.subagent_messages();
+        let roots: HashMap<&str, Option<String>> = self
+            .state
+            .session
+            .subagents()
+            .iter()
+            .map(|subagent| {
+                (
+                    subagent.tool_use_id.as_str(),
+                    subagent.root_tool_use_id.clone(),
+                )
+            })
+            .collect();
         let subagents = self
             .chats
             .iter()
@@ -316,6 +328,8 @@ impl App {
                 }
                 Some(StoredSubagent {
                     tool_use_id: task_id.to_string(),
+                    parent_tool_use_id: chat.parent_tool_use_id().map(ToString::to_string),
+                    root_tool_use_id: roots.get(task_id.as_ref()).cloned().flatten(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
                 })
@@ -392,6 +406,85 @@ impl App {
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
         );
+        let mut reachable_subagents = reachable_subagent_ids(
+            &active_history,
+            self.state.session.subagent_messages(),
+            self.state.session.tool_outputs(),
+            self.state.session.subagents(),
+        );
+        let legacy_fallback = reachable_subagents.is_empty();
+        let mut active_calls = maki_agent::history_tool_call_ids(&active_history);
+        for task_id in &reachable_subagents {
+            if let Some(history) = self.state.session.subagent_messages().get(task_id) {
+                active_calls.extend(maki_agent::history_tool_call_ids(history));
+            }
+        }
+        reachable_subagents.extend(
+            self.state
+                .session
+                .subagent_task_specs()
+                .iter()
+                .filter(|(task_id, spec)| {
+                    if !spec.is_generic() {
+                        return false;
+                    }
+                    let descriptor = self
+                        .state
+                        .session
+                        .subagents()
+                        .iter()
+                        .find(|subagent| subagent.tool_use_id == **task_id);
+                    descriptor.is_none()
+                        || active_calls.contains(*task_id)
+                        || descriptor
+                            .and_then(|subagent| subagent.root_tool_use_id.as_ref())
+                            .is_some_and(|root| active_calls.contains(root))
+                })
+                .map(|(task_id, _)| task_id.clone()),
+        );
+        if legacy_fallback {
+            reachable_subagents.extend(
+                self.state
+                    .session
+                    .subagent_messages()
+                    .keys()
+                    .filter(|task_id| {
+                        !self
+                            .state
+                            .session
+                            .subagent_task_specs()
+                            .contains_key(*task_id)
+                    })
+                    .filter(|task_id| {
+                        !self.state.session.subagents().iter().any(|subagent| {
+                            subagent.tool_use_id.as_str() != task_id.as_str()
+                                && subagent.parent_tool_use_id.as_ref() == Some(*task_id)
+                        })
+                    })
+                    .cloned(),
+            );
+        }
+        let mut subagent_versions =
+            maki_agent::active_task_history_versions_with_batch_state(&active_history, |call_id| {
+                self.state
+                    .session
+                    .tool_outputs()
+                    .get(call_id)
+                    .and_then(|output| output.state())
+            });
+        for subagent in self.state.session.subagents() {
+            if reachable_subagents.contains(&subagent.tool_use_id)
+                && !subagent_versions.contains_key(&subagent.tool_use_id)
+                && let Some(version_id) = &subagent.parent_tool_use_id
+                && self
+                    .state
+                    .session
+                    .subagent_messages()
+                    .contains_key(version_id)
+            {
+                subagent_versions.insert(subagent.tool_use_id.clone(), version_id.clone());
+            }
+        }
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
         let context_size = self.state.context_size;
@@ -459,13 +552,30 @@ impl App {
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
         // checkpoint write the same list again.
-        for sa in self.state.session.subagents().to_vec() {
+        for sa in self
+            .state
+            .session
+            .subagents()
+            .iter()
+            .filter(|subagent| reachable_subagents.contains(&subagent.tool_use_id))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             // A subagent reaches disk when it spawns but its transcript only
             // when it ends, so one without an entry here never got to finish:
             // leftovers from a kill mid-turn. It has nothing to show, and
             // restoring it would park a task no agent backs at the top of the
             // picker, running forever. `sync_subagents` below drops it for good.
-            let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
+            let version_id = subagent_versions
+                .get(&sa.tool_use_id)
+                .unwrap_or(&sa.tool_use_id);
+            let Some(messages) = self
+                .state
+                .session
+                .subagent_messages()
+                .get(version_id)
+                .or_else(|| self.state.session.subagent_messages().get(&sa.tool_use_id))
+            else {
                 continue;
             };
             let (display, items) = history_to_display(
@@ -481,6 +591,9 @@ impl App {
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
+            if let Some(parent_tool_use_id) = sa.parent_tool_use_id {
+                chat.set_parent_tool_use_id(parent_tool_use_id);
+            }
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
             chat.load_messages(display);
@@ -1112,41 +1225,140 @@ impl App {
         let mut output_ids = HashSet::new();
         let mut output_refs = Vec::new();
         collect_tool_output_refs(&ancestor, &mut output_ids, &mut output_refs);
-        let compacted = ancestor.iter().any(|item| {
-            matches!(
-                &item.kind,
-                HistoryItemKind::AssistantText {
-                    is_compaction_summary: true,
-                    ..
-                }
-            )
-        });
-        if compacted {
-            for history in self.state.session.subagent_messages().values() {
-                collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
+        let mut stored_tool_ids = all_tool_call_ids(&ancestor);
+        let mut reachable = reachable_subagent_ids(
+            &ancestor,
+            self.state.session.subagent_messages(),
+            self.state.session.tool_outputs(),
+            self.state.session.subagents(),
+        );
+        let mut versions =
+            maki_agent::active_task_history_versions_with_batch_state(&ancestor, |call_id| {
+                self.state
+                    .session
+                    .tool_outputs()
+                    .get(call_id)
+                    .and_then(|output| output.state())
+            });
+        reachable.extend(
+            versions
+                .iter()
+                .filter(|(_, version_id)| {
+                    self.state
+                        .session
+                        .subagent_messages()
+                        .contains_key(*version_id)
+                })
+                .map(|(task_id, _)| task_id.clone()),
+        );
+        let legacy_fallback = reachable.is_empty()
+            || ancestor.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    HistoryItemKind::AssistantText {
+                        retained_subagent_ids,
+                        is_compaction_summary: true,
+                        ..
+                    } if retained_subagent_ids.is_empty()
+                )
+            });
+        let mut active_calls = maki_agent::history_tool_call_ids(&ancestor);
+        for task_id in &reachable {
+            if let Some(history) = self.state.session.subagent_messages().get(task_id) {
+                active_calls.extend(maki_agent::history_tool_call_ids(history));
             }
         }
-        let mut reachable = tool_call_ids(&ancestor);
-        let mut copied_subagents = HashSet::new();
-        while let Some(task_id) = reachable
+        reachable.extend(
+            self.state
+                .session
+                .subagent_task_specs()
+                .iter()
+                .filter(|(task_id, spec)| {
+                    if !spec.is_generic() {
+                        return false;
+                    }
+                    let descriptor = self
+                        .state
+                        .session
+                        .subagents()
+                        .iter()
+                        .find(|subagent| subagent.tool_use_id == **task_id);
+                    descriptor.is_none()
+                        || active_calls.contains(*task_id)
+                        || descriptor
+                            .and_then(|subagent| subagent.root_tool_use_id.as_ref())
+                            .is_some_and(|root| active_calls.contains(root))
+                })
+                .map(|(task_id, _)| task_id.clone()),
+        );
+        if legacy_fallback {
+            reachable.extend(
+                self.state
+                    .session
+                    .subagent_messages()
+                    .keys()
+                    .filter(|task_id| {
+                        !self
+                            .state
+                            .session
+                            .subagent_task_specs()
+                            .contains_key(*task_id)
+                    })
+                    .cloned(),
+            );
+        }
+        for subagent in self.state.session.subagents() {
+            if reachable.contains(&subagent.tool_use_id)
+                && !versions.contains_key(&subagent.tool_use_id)
+                && let Some(version_id) = &subagent.parent_tool_use_id
+                && self
+                    .state
+                    .session
+                    .subagent_messages()
+                    .contains_key(version_id)
+            {
+                versions.insert(subagent.tool_use_id.clone(), version_id.clone());
+            }
+        }
+        let version_ids: HashSet<&str> = versions
             .iter()
-            .find(|task_id| {
-                !copied_subagents.contains(*task_id)
+            .filter_map(|(task_id, version_id)| {
+                (task_id != version_id
                     && self
                         .state
                         .session
                         .subagent_messages()
-                        .contains_key(*task_id)
+                        .contains_key(version_id))
+                .then_some(version_id.as_str())
             })
-            .cloned()
+            .collect();
+        for task_id in reachable
+            .iter()
+            .filter(|task_id| !version_ids.contains(task_id.as_str()))
         {
-            let history = self.state.session.subagent_messages()[&task_id].as_ref();
-            reachable.extend(tool_call_ids(history));
+            let version_id = versions.get(task_id).unwrap_or(task_id);
+            let Some(history) = self
+                .state
+                .session
+                .subagent_messages()
+                .get(version_id)
+                .or_else(|| self.state.session.subagent_messages().get(task_id))
+            else {
+                continue;
+            };
             collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
-            child.set_subagent_messages(task_id.clone(), history.to_vec());
-            copied_subagents.insert(task_id);
+            stored_tool_ids.extend(all_tool_call_ids(history));
+            child.set_subagent_history(
+                task_id.clone(),
+                history.to_vec(),
+                self.state
+                    .session
+                    .subagent_task_specs()
+                    .get(task_id)
+                    .cloned(),
+            );
         }
-        for tool_id in &reachable {
+        for tool_id in &stored_tool_ids {
             if let Some(output) = self.state.session.tool_outputs().get(tool_id) {
                 child.insert_tool_output(tool_id.clone(), output.as_ref().clone());
             }
@@ -1423,6 +1635,25 @@ fn source_target_id(source: DisplaySource) -> MakiId {
 }
 
 fn tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for item in items {
+        match &item.kind {
+            HistoryItemKind::ToolCall { call_id, name, .. }
+                if name == "task" || name == "batch" =>
+            {
+                ids.insert(call_id.clone());
+            }
+            HistoryItemKind::AssistantText {
+                retained_subagent_ids,
+                ..
+            } => ids.extend(retained_subagent_ids.iter().cloned()),
+            _ => {}
+        }
+    }
+    ids
+}
+
+fn all_tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
     items
         .iter()
         .filter_map(|item| match &item.kind {
@@ -1430,6 +1661,93 @@ fn tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
             _ => None,
         })
         .collect()
+}
+
+pub(crate) fn reachable_subagent_ids(
+    items: &[HistoryItem],
+    histories: &HashMap<String, Arc<Vec<HistoryItem>>>,
+    tool_outputs: &HashMap<String, Arc<maki_agent::ToolOutput>>,
+    subagents: &[StoredSubagent],
+) -> HashSet<String> {
+    let mut reachable = tool_call_ids(items);
+    let mut active_calls = maki_agent::history_tool_call_ids(items);
+    let mut visited = HashSet::new();
+    loop {
+        for subagent in subagents {
+            if subagent
+                .parent_tool_use_id
+                .as_ref()
+                .is_some_and(|parent| reachable.contains(parent) || active_calls.contains(parent))
+                || subagent
+                    .root_tool_use_id
+                    .as_ref()
+                    .is_some_and(|root| active_calls.contains(root))
+            {
+                reachable.insert(subagent.tool_use_id.clone());
+            }
+        }
+        let Some(task_id) = reachable
+            .iter()
+            .find(|task_id| !visited.contains(*task_id))
+            .cloned()
+        else {
+            break;
+        };
+        visited.insert(task_id.clone());
+        if let Some(state) = tool_outputs.get(&task_id).and_then(|output| output.state()) {
+            collect_task_metadata_from_value(state, &mut reachable);
+        }
+        if let Some(history) = histories.get(&task_id) {
+            reachable.extend(tool_call_ids(history));
+            active_calls.extend(maki_agent::history_tool_call_ids(history));
+        }
+    }
+    reachable
+}
+
+fn collect_task_metadata_from_value(value: &serde_json::Value, ids: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::String(text) => collect_task_metadata(text, ids),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_task_metadata_from_value(value, ids);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if let Some(tool) = values.get("tool").and_then(serde_json::Value::as_str) {
+                if tool == "task" {
+                    if let Some(invocation_id) = values
+                        .get("invocation_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        ids.insert(invocation_id.to_owned());
+                    }
+                    if let Some(output) = values.get("output").and_then(serde_json::Value::as_str) {
+                        collect_task_metadata(output, ids);
+                    }
+                }
+                return;
+            }
+            for value in values.values() {
+                collect_task_metadata_from_value(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
+    for block in content.split("<task_metadata>").skip(1) {
+        let Some(metadata) = block.split("</task_metadata>").next() else {
+            continue;
+        };
+        if let Some(task_id) = metadata
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("task_id: "))
+        {
+            ids.insert(task_id.to_owned());
+        }
+    }
 }
 
 fn collect_tool_output_refs(

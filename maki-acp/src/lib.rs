@@ -12,8 +12,8 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::prompt::profile::PromptProfileCatalog;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_config::ModelPolicy;
-use maki_providers::Timeouts;
 use maki_providers::model::Model;
+use maki_providers::{ThinkingConfig, Timeouts};
 
 pub struct AcpParams {
     pub model: Model,
@@ -22,6 +22,7 @@ pub struct AcpParams {
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
     pub prompt_slots: Arc<ResolvedSlots>,
+    pub thinking: ThinkingConfig,
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub system_prompt_profile_override: Option<String>,
     pub yolo: bool,

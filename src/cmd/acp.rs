@@ -65,6 +65,11 @@ pub fn run(
         .event_handle()
         .collect_prompt_slots(&config.agent);
     let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
+    let thinking = config
+        .always_thinking
+        .clone()
+        .map(maki_providers::ThinkingConfig::from)
+        .unwrap_or_default();
 
     maki_acp::run(maki_acp::AcpParams {
         model,
@@ -73,6 +78,7 @@ pub fn run(
         timeouts,
         initial_wd: cwd,
         prompt_slots: Arc::new(prompt_slots),
+        thinking,
         prompt_profiles,
         system_prompt_profile_override: profile_arg,
         yolo,

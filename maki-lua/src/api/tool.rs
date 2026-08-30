@@ -13,8 +13,8 @@ use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolEffect, ToolExecResult, ToolFilter,
+    ToolInvocation, ToolSource, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
@@ -86,12 +86,18 @@ fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
 fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
         "audience": ctx.audience.name().unwrap_or("main"),
+        "policy": if ctx.policy().is_read_only() { "read_only" } else { "standard" },
         "workflow": ctx.workflow,
     });
-    match ctx.filter {
+    let mut filter = ctx.filter;
+    while let ToolFilter::ReadOnly(inner) = filter {
+        filter = inner;
+    }
+    match filter {
         ToolFilter::All => {}
         ToolFilter::Only(names) => obj["only"] = json!(names),
         ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+        ToolFilter::ReadOnly(_) => unreachable!(),
     }
     obj
 }
@@ -127,6 +133,7 @@ pub(crate) struct PendingTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) effect: ToolEffect,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
@@ -159,6 +166,7 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) contract: Arc<str>,
+    pub(crate) bundled: bool,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
@@ -242,6 +250,7 @@ impl Tool for LuaTool {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             contract: Arc::clone(&self.contract),
+            bundled: self.bundled,
             has_header_fn: self.has_header_fn,
             has_start_fn: self.has_start_fn,
             input: validated,
@@ -263,6 +272,7 @@ struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
     contract: Arc<str>,
+    bundled: bool,
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
@@ -403,6 +413,7 @@ impl ToolInvocation for LuaToolInvocation {
         let plugin = self.plugin;
         let tool = self.tool;
         let contract = self.contract;
+        let bundled = self.bundled;
         let input = self.input;
         let tx = self.tx;
         let tool_timeout = self.timeout;
@@ -427,7 +438,7 @@ impl ToolInvocation for LuaToolInvocation {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id,
             });
-            let lua_ctx = LuaCtx::handler(ctx);
+            let lua_ctx = LuaCtx::handler_for_tool(ctx, Arc::clone(&tool), bundled);
 
             if tx
                 .send_async(Request::CallTool {
@@ -514,6 +525,7 @@ impl ToolInvocation for LuaToolInvocation {
                                     text: s,
                                     instructions: instructions.filter(|b| !b.is_empty()),
                                     state,
+                                    lua_provenance: None,
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -656,6 +668,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                                      `max_lines` and `max_bytes` are required positive
 ///                                                      integers. Overrides the agent defaults.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
+///   effect          (string)   Bundled-tool capability: "read_only", "isolated", "orchestrator", or "mutating". Unbundled claims are ignored.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
@@ -1020,12 +1033,25 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         return Ok(LuaValue::Nil);
     };
     let t = tool_entry_to_lua(lua, &entry)?;
+    if let ToolSource::Lua {
+        plugin, contract, ..
+    } = &entry.source
+    {
+        let provenance = lua.create_table()?;
+        provenance.set("plugin", plugin.as_ref())?;
+        provenance.set("contract", contract.as_ref())?;
+        t.set("lua_provenance", provenance)?;
+    }
     if let Some((header, restore)) = local_tool_handles(&name) {
+        let safe_in_read_only = entry.is_safe_in_read_only();
         if let Some(f) = header {
-            t.set("header", wrap_header(lua, name.clone(), f)?)?;
+            t.set(
+                "header",
+                wrap_header(lua, name.clone(), f, safe_in_read_only)?,
+            )?;
         }
         if let Some(f) = restore {
-            t.set("restore", wrap_restore(lua, name, f)?)?;
+            t.set("restore", wrap_restore(lua, name, f, safe_in_read_only)?)?;
         }
     }
     Ok(LuaValue::Table(t))
@@ -1090,10 +1116,14 @@ fn wrap_nothrow(
     handle: &'static str,
     f: Function,
     norm: fn(&Lua, LuaValue) -> LuaResult<LuaValue>,
+    safe_in_read_only: bool,
 ) -> LuaResult<Function> {
     lua.create_async_function(move |lua, args: MultiValue| {
         let (f, tool) = (f.clone(), tool.clone());
         async move {
+            if !safe_in_read_only && crate::runtime::active_task_is_read_only(&lua) {
+                return Ok(LuaValue::Nil);
+            }
             match f.call_async::<LuaValue>(args).await {
                 Ok(v) => norm(&lua, v),
                 Err(e) => {
@@ -1107,27 +1137,39 @@ fn wrap_nothrow(
 
 /// Normalizes a header fn to one spans line or nil: a plain string gets
 /// the standalone header style, a buf return contributes its first line.
-fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
-    wrap_nothrow(lua, tool, "header", f, |lua, v| match v {
-        LuaValue::String(s) => {
-            let span = lua.create_table()?;
-            span.raw_set(1, s)?;
-            span.raw_set(2, PLAIN_HEADER_STYLE)?;
-            let line = lua.create_table()?;
-            line.raw_set(1, span)?;
-            Ok(LuaValue::Table(line))
-        }
-        LuaValue::UserData(ud) => {
-            let Ok(h) = ud.borrow::<BufHandle>() else {
-                return Ok(LuaValue::Nil);
-            };
-            match h.buf.read().first() {
-                Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
-                None => Ok(LuaValue::Nil),
+fn wrap_header(
+    lua: &Lua,
+    tool: String,
+    f: Function,
+    safe_in_read_only: bool,
+) -> LuaResult<Function> {
+    wrap_nothrow(
+        lua,
+        tool,
+        "header",
+        f,
+        |lua, v| match v {
+            LuaValue::String(s) => {
+                let span = lua.create_table()?;
+                span.raw_set(1, s)?;
+                span.raw_set(2, PLAIN_HEADER_STYLE)?;
+                let line = lua.create_table()?;
+                line.raw_set(1, span)?;
+                Ok(LuaValue::Table(line))
             }
-        }
-        _ => Ok(LuaValue::Nil),
-    })
+            LuaValue::UserData(ud) => {
+                let Ok(h) = ud.borrow::<BufHandle>() else {
+                    return Ok(LuaValue::Nil);
+                };
+                match h.buf.read().first() {
+                    Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
+                    None => Ok(LuaValue::Nil),
+                }
+            }
+            _ => Ok(LuaValue::Nil),
+        },
+        safe_in_read_only,
+    )
 }
 
 /// Normalizes a restore fn to its body buf or nil (whether it returned
@@ -1135,7 +1177,12 @@ fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
 /// another tool's rendering need no pcall of their own. The ctx arg may be
 /// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
 /// batch drives child restores); either way the fn sees a restore `LuaCtx`.
-fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
+fn wrap_restore(
+    lua: &Lua,
+    tool: String,
+    f: Function,
+    safe_in_read_only: bool,
+) -> LuaResult<Function> {
     let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
         let f = f.clone();
         async move {
@@ -1147,18 +1194,25 @@ fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
             f.call_async::<MultiValue>(args).await
         }
     })?;
-    wrap_nothrow(lua, tool, "restore", prepped, |_lua, v| {
-        Ok(match &v {
-            LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
-            LuaValue::Table(t) => t
-                .get::<mlua::AnyUserData>("body")
-                .ok()
-                .filter(|ud| ud.is::<BufHandle>())
-                .map(LuaValue::UserData)
-                .unwrap_or(LuaValue::Nil),
-            _ => LuaValue::Nil,
-        })
-    })
+    wrap_nothrow(
+        lua,
+        tool,
+        "restore",
+        prepped,
+        |_lua, v| {
+            Ok(match &v {
+                LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
+                LuaValue::Table(t) => t
+                    .get::<mlua::AnyUserData>("body")
+                    .ok()
+                    .filter(|ud| ud.is::<BufHandle>())
+                    .map(LuaValue::UserData)
+                    .unwrap_or(LuaValue::Nil),
+                _ => LuaValue::Nil,
+            })
+        },
+        safe_in_read_only,
+    )
 }
 
 fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue> {
@@ -1286,6 +1340,19 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
+fn parse_tool_effect(spec: &Table) -> LuaResult<ToolEffect> {
+    match spec.get::<Option<String>>("effect")?.as_deref() {
+        None | Some("unknown") => Ok(ToolEffect::Unknown),
+        Some("read_only") => Ok(ToolEffect::ReadOnly),
+        Some("isolated") => Ok(ToolEffect::Isolated),
+        Some("orchestrator") => Ok(ToolEffect::Orchestrator),
+        Some("mutating") => Ok(ToolEffect::Mutating),
+        Some(effect) => Err(mlua::Error::runtime(format!(
+            "register_tool: invalid effect '{effect}'"
+        ))),
+    }
+}
+
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -1342,6 +1409,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences)?;
+    let effect = parse_tool_effect(spec)?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1374,6 +1442,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             description,
             schema: param_schema,
             audience,
+            effect,
             kind,
             handler_key,
             header_key,
@@ -1752,6 +1821,34 @@ mod tests {
         assert_eq!(is_valid_tool_name(name), expected);
     }
 
+    #[test_case::test_case(None, ToolEffect::Unknown ; "omitted")]
+    #[test_case::test_case(Some("read_only"), ToolEffect::ReadOnly ; "read_only")]
+    #[test_case::test_case(Some("isolated"), ToolEffect::Isolated ; "isolated")]
+    #[test_case::test_case(Some("orchestrator"), ToolEffect::Orchestrator ; "orchestrator")]
+    #[test_case::test_case(Some("mutating"), ToolEffect::Mutating ; "mutating")]
+    fn tool_effect_parsing(value: Option<&str>, expected: ToolEffect) {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        if let Some(value) = value {
+            spec.set("effect", value).unwrap();
+        }
+        assert_eq!(parse_tool_effect(&spec).unwrap(), expected);
+    }
+
+    #[test]
+    fn invalid_tool_effect_is_rejected() {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        spec.set("effect", "safe").unwrap();
+
+        assert!(
+            parse_tool_effect(&spec)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid effect")
+        );
+    }
+
     #[test_case::test_case(
         r#"{ llm_output = "c", image = { data = "aGVsbG8=" } }"#,
         "missing 'media_type'" ; "missing_media_type")]
@@ -1838,6 +1935,7 @@ mod tests {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
             contract: Arc::from("test-contract"),
+            bundled: false,
             has_header_fn: false,
             input,
             tx,
@@ -1894,6 +1992,7 @@ mod tests {
             tx,
             plugin: Arc::from("test"),
             contract: Arc::from("test-contract"),
+            bundled: false,
             has_header_fn: false,
             permission_scope_kind,
             mutable_path_field: None,
@@ -1997,6 +2096,7 @@ mod tests {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
             contract: Arc::from("test-contract"),
+            bundled: false,
             has_header_fn: false,
             input: serde_json::json!({"command": "ls"}),
             tx,
@@ -2016,6 +2116,7 @@ mod tests {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
             contract: Arc::from("test-contract"),
+            bundled: false,
             has_header_fn: false,
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
@@ -2041,6 +2142,7 @@ mod tests {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
             contract: Arc::from("test-contract"),
+            bundled: false,
             has_header_fn: false,
             input: serde_json::json!({"command": "cargo test"}),
             tx,

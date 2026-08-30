@@ -246,7 +246,16 @@ fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
 /// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
 /// instructions, output lines) is reset so child calls start clean.
 #[derive(Clone)]
-pub(crate) struct AgentContext(ToolContext);
+pub(crate) struct AgentContext {
+    tool: ToolContext,
+    caller: Option<AgentCaller>,
+}
+
+#[derive(Clone)]
+struct AgentCaller {
+    tool: Arc<str>,
+    bundled: bool,
+}
 
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
@@ -255,14 +264,17 @@ impl From<&ToolContext> for AgentContext {
         c.deadline = Deadline::None;
         c.tool_output_lines = ToolOutputLines::default();
         c.local_tools = LocalTools::default();
-        Self(c)
+        Self {
+            tool: c,
+            caller: None,
+        }
     }
 }
 
 impl Deref for AgentContext {
     type Target = ToolContext;
     fn deref(&self) -> &ToolContext {
-        &self.0
+        &self.tool
     }
 }
 
@@ -271,10 +283,21 @@ impl AgentContext {
     /// outer call's id, and `live_sink` so a grandchild never streams into
     /// a sink meant for its parent.
     pub(crate) fn to_tool_context(&self) -> ToolContext {
-        let mut c = self.0.clone();
+        let mut c = self.tool.clone();
         c.tool_use_id = None;
         c.live_sink = None;
         c
+    }
+
+    pub(crate) fn caller_is_bundled_tool(&self, name: &str) -> bool {
+        self.caller
+            .as_ref()
+            .is_some_and(|caller| caller.bundled && caller.tool.as_ref() == name)
+    }
+
+    fn with_caller(mut self, tool: Arc<str>, bundled: bool) -> Self {
+        self.caller = Some(AgentCaller { tool, bundled });
+        self
     }
 }
 
@@ -303,6 +326,7 @@ enum Caps {
         workflow: bool,
         audience: ToolAudience,
         session_id: Option<SessionRef>,
+        read_only: bool,
     },
     Restore {
         state: Option<serde_json::Value>,
@@ -319,11 +343,22 @@ impl LuaCtx {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn handler(ctx: &ToolContext) -> Self {
         Self::new(
             ctx,
             Caps::Handler {
                 agent: Box::new(AgentContext::from(ctx)),
+                loaded_instructions: ctx.loaded_instructions.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn handler_for_tool(ctx: &ToolContext, tool: Arc<str>, bundled: bool) -> Self {
+        Self::new(
+            ctx,
+            Caps::Handler {
+                agent: Box::new(AgentContext::from(ctx).with_caller(tool, bundled)),
                 loaded_instructions: ctx.loaded_instructions.clone(),
             },
         )
@@ -337,6 +372,8 @@ impl LuaCtx {
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 session_id: ctx.session_id.clone(),
+                read_only: !matches!(ctx.mode, maki_agent::AgentMode::Build)
+                    || ctx.policy().is_read_only(),
             },
         )
     }
@@ -358,6 +395,16 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } => Some(agent),
             _ => None,
+        }
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        match &self.caps {
+            Caps::Handler { agent, .. } => {
+                !matches!(agent.mode, maki_agent::AgentMode::Build) || agent.policy().is_read_only()
+            }
+            Caps::Start { read_only, .. } => *read_only,
+            Caps::Restore { .. } => false,
         }
     }
 
@@ -832,6 +879,17 @@ mod tests {
             Some(session_ref()),
             "a dispatched child runs in the same session, unlike tool_use_id"
         );
+    }
+
+    #[test]
+    fn bundled_caller_provenance_requires_matching_name_and_trust() {
+        let ctx = populated_ctx();
+        let trusted = AgentContext::from(&ctx).with_caller(Arc::from("task"), true);
+        let untrusted = AgentContext::from(&ctx).with_caller(Arc::from("task"), false);
+
+        assert!(trusted.caller_is_bundled_tool("task"));
+        assert!(!trusted.caller_is_bundled_tool("batch"));
+        assert!(!untrusted.caller_is_bundled_tool("task"));
     }
 
     #[test]

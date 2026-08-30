@@ -1669,7 +1669,12 @@ fn cancel_resets_all_chats_and_indices() {
 pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::SubagentHistory {
         task_id: id.into(),
+        parent_tool_use_id: id.into(),
+        root_tool_use_id: id.into(),
+        name: "task".into(),
+        model: SONNET_SPEC.into(),
         messages: vec![],
+        spec: None,
     }));
 }
 
@@ -5675,11 +5680,15 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
     session.set_subagents(vec![
         StoredSubagent {
             tool_use_id: "task-live".into(),
+            parent_tool_use_id: Some("task-live".into()),
+            root_tool_use_id: Some("task-live".into()),
             name: "live".into(),
             model: Some("test-model".into()),
         },
         StoredSubagent {
             tool_use_id: "task-late".into(),
+            parent_tool_use_id: Some("task-late".into()),
+            root_tool_use_id: Some("task-late".into()),
             name: "late".into(),
             model: None,
         },
@@ -5708,6 +5717,95 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
     assert!(forked.session.meta.pending_revert.is_none());
     assert!(forked.session.meta.queued_messages.is_empty());
     assert!(forked.session.meta.active_goal.is_none());
+}
+
+#[test]
+fn fork_selects_the_subagent_history_version_on_its_branch() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user("delegate".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "task-root",
+                "task",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "task-root".into(),
+                content: "first".into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        },
+        Message::user("continue".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "continuation-call",
+                "task",
+                serde_json::json!({ "task_id": "task-root" }),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "continuation-call".into(),
+                content: "second".into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        },
+    ]);
+    let first = crate::history_items(&[Message::user("first transcript".into())]);
+    let second = crate::history_items(&[Message::user("continued transcript".into())]);
+    let session = app.state.session_mut();
+    session.replace_messages(items.clone());
+    session.set_subagent_history(
+        "task-root".into(),
+        first.clone(),
+        Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+    );
+    session.set_subagent_history(
+        "continuation-call".into(),
+        second.clone(),
+        Some(maki_storage::sessions::StoredSubagentTaskSpec::version()),
+    );
+
+    let before_continuation = app
+        .fork_at(DisplaySource::ToolCall {
+            id: items[1].id,
+            result_id: Some(items[2].id),
+        })
+        .unwrap();
+    let after_continuation = app
+        .fork_at(DisplaySource::ToolCall {
+            id: items[4].id,
+            result_id: Some(items[5].id),
+        })
+        .unwrap();
+
+    assert_eq!(
+        before_continuation.session.subagent_messages()["task-root"].as_ref(),
+        &first
+    );
+    assert_eq!(
+        after_continuation.session.subagent_messages()["task-root"].as_ref(),
+        &second
+    );
+    assert!(
+        !after_continuation
+            .session
+            .subagent_messages()
+            .contains_key("continuation-call")
+    );
 }
 
 #[test]
@@ -5856,6 +5954,7 @@ fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
             content: vec![ContentBlock::Text {
                 text: format!("Nested output ID: {}", output_ref.id),
             }],
+            retained_subagent_ids: vec!["old-task".into()],
             is_compaction_summary: true,
             ..Default::default()
         },
@@ -5872,12 +5971,16 @@ fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
     }]);
     let session = app.state.session_mut();
     session.replace_messages(items.clone());
-    session.set_subagent_messages("old-task".into(), subagent);
+    session.set_subagent_messages("old-task".into(), subagent.clone());
 
     let forked = app
         .fork_at(DisplaySource::AssistantText(items[1].id))
         .unwrap();
 
+    assert_eq!(
+        forked.session.subagent_messages()["old-task"].as_ref(),
+        &subagent
+    );
     assert_eq!(
         store
             .read(forked.session.id, output_ref.id, 1, 10)
@@ -7540,12 +7643,159 @@ fn subagent_history_finishes_workflow_chat() {
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             task_id: "session-abc".into(),
+            parent_tool_use_id: "workflow-parent".into(),
+            root_tool_use_id: "workflow-parent".into(),
+            name: "researcher".into(),
+            model: SONNET_SPEC.into(),
             messages: vec![],
+            spec: None,
         },
         1,
     ));
     assert!(app.chats[1].is_finished());
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+#[test]
+fn subagent_history_without_prior_events_creates_persisted_chat() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            task_id: "failed-task".into(),
+            parent_tool_use_id: "task-call".into(),
+            root_tool_use_id: "task-call".into(),
+            name: "failed researcher".into(),
+            model: SONNET_SPEC.into(),
+            messages: vec![],
+            spec: Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+        },
+        1,
+    ));
+
+    assert_eq!(app.chats.len(), 2);
+    assert!(app.chats[1].is_finished());
+    assert!(app.state.session.subagent_messages()["failed-task"].is_empty());
+    assert!(
+        app.state
+            .session
+            .subagents()
+            .iter()
+            .any(|subagent| subagent.tool_use_id == "failed-task")
+    );
+}
+
+#[test]
+fn stale_cancelled_subagent_history_is_still_persisted() {
+    let mut app = test_app();
+    app.run_id = 2;
+    for item in crate::history_items(&[Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "task-call".into(),
+            name: "task".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        }],
+        ..Message::default()
+    }]) {
+        app.state.session_mut().push_message(item);
+    }
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            task_id: "cancelled-task".into(),
+            parent_tool_use_id: "task-call".into(),
+            root_tool_use_id: "task-call".into(),
+            name: "cancelled researcher".into(),
+            model: SONNET_SPEC.into(),
+            messages: vec![Message::user("partial transcript".into())],
+            spec: Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+        },
+        1,
+    ));
+
+    assert_eq!(app.chats.len(), 1);
+    assert!(!app.state.session.subagent_messages()["cancelled-task"].is_empty());
+    assert!(
+        app.state
+            .session
+            .subagents()
+            .iter()
+            .any(|subagent| subagent.tool_use_id == "cancelled-task")
+    );
+}
+
+#[test]
+fn stale_subagent_history_from_inactive_branch_is_ignored() {
+    let mut app = test_app();
+    app.run_id = 2;
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            task_id: "abandoned-task".into(),
+            parent_tool_use_id: "abandoned-call".into(),
+            root_tool_use_id: "abandoned-call".into(),
+            name: "abandoned researcher".into(),
+            model: SONNET_SPEC.into(),
+            messages: vec![Message::user("future transcript".into())],
+            spec: Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+        },
+        1,
+    ));
+
+    assert!(
+        !app.state
+            .session
+            .subagent_messages()
+            .contains_key("abandoned-task")
+    );
+}
+
+#[test]
+fn stale_batched_subagent_history_uses_active_root_call() {
+    let mut app = test_app();
+    app.run_id = 2;
+    for item in crate::history_items(&[Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "batch-call".into(),
+            name: "batch".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        }],
+        ..Message::default()
+    }]) {
+        app.state.session_mut().push_message(item);
+    }
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            task_id: "batched-task".into(),
+            parent_tool_use_id: "batch-child-call".into(),
+            root_tool_use_id: "batch-call".into(),
+            name: "batched researcher".into(),
+            model: SONNET_SPEC.into(),
+            messages: vec![Message::user("partial transcript".into())],
+            spec: Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+        },
+        1,
+    ));
+
+    assert!(
+        app.state
+            .session
+            .subagent_messages()
+            .contains_key("batched-task")
+    );
+    assert!(
+        app.state
+            .session
+            .subagent_messages()
+            .contains_key("batch-child-call")
+    );
 }
 
 #[test_case(SONNET_SPEC ; "non_opus_anthropic")]

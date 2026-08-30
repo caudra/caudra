@@ -82,6 +82,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.no_plugins,
                 cli.no_jit,
                 cli.no_rtk,
+                cli.model.as_deref(),
                 cli.system_prompt_profile.as_deref(),
             )?;
         }

@@ -196,8 +196,7 @@ impl Provider for Xai {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, model);
+            opts.thinking.apply_reasoning_effort(&mut body, model);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -290,8 +289,8 @@ fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ReasoningOptions;
     use super::*;
+    use crate::ReasoningOptions;
     use crate::types::ThinkingConfig;
     use crate::{ModelFamily, ModelPricing, ModelTier};
 

@@ -1364,7 +1364,7 @@ mod tests {
         ; "legacy_batch_falls_back_to_text"
     )]
     #[test_case(
-        Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None, state: None })),
+        Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None, state: None, lua_provenance: None })),
         None, "read", true
         ; "readdir_uses_text_field"
     )]

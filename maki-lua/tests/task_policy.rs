@@ -21,7 +21,6 @@ const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
-const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
 const TASK_TOOL: &str = "task";
@@ -144,6 +143,10 @@ maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.session_task_id = opts.task_id
+  recorder.session_is_task = opts.task
+  recorder.session_profile = opts.profile
+  recorder.session_mode = opts.mode
+  recorder.local_effect = opts.local_tools and opts.local_tools.structured_output.effect or nil
   local sess = { opts = opts }
   function sess:id()
     return opts.task_id or "task-test"
@@ -177,6 +180,10 @@ maki.api.register_tool({
       released = recorder.released,
       sem_size = recorder.sem_size,
       session_task_id = recorder.session_task_id,
+      session_is_task = recorder.session_is_task,
+      session_profile = recorder.session_profile,
+      session_mode = recorder.session_mode,
+      local_effect = recorder.local_effect,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -241,45 +248,36 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
     input
 }
 
-const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
-
 #[test]
-fn model_spec_forwards_full_spec_to_resolve_model() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("allow_model".into(), json!(true));
-    let (reg, _host) = load_task_host_with_opts(opts);
+fn task_forwards_profile_and_mode_to_rust_owned_session() {
+    let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
-    input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    input["profile"] = json!("review");
+    input["mode"] = json!("build");
+    let out = exec_tool(&reg, TASK_TOOL, input).expect("profiled task failed");
     assert_eq!(out, PLAIN_TEXT);
 
     let snap = probe(&reg);
-    let opts = snap["resolve_opts"]
-        .as_object()
-        .expect("resolve_opts missing");
-    assert_eq!(opts["spec"], json!(FULL_MODEL_SPEC));
-    assert!(
-        opts.get("tier").is_none_or(Value::is_null),
-        "tier should be unset when only model spec is given"
-    );
+    assert_eq!(snap["session_is_task"], json!(true));
+    assert_eq!(snap["session_profile"], json!("review"));
+    assert_eq!(snap["session_mode"], json!("build"));
 }
 
 #[test]
-fn model_spec_ignored_when_allow_model_off() {
+fn task_schema_removes_legacy_model_and_type_controls() {
     let (reg, _host) = load_task_host();
-    let mut input = task_input(SCENARIO_PLAIN, None);
-    input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
-    assert_eq!(out, PLAIN_TEXT);
-
-    let snap = probe(&reg);
-    let opts = snap["resolve_opts"]
+    let schema = reg.get(TASK_TOOL).expect("task tool missing").tool.schema();
+    let properties = schema["properties"]
         .as_object()
-        .expect("resolve_opts missing");
-    assert!(
-        opts.get("spec").is_none_or(Value::is_null),
-        "spec should not be forwarded when allow_model is off"
-    );
+        .expect("properties missing");
+    assert!(properties.contains_key("profile"));
+    assert!(properties.contains_key("mode"));
+    for removed in ["subagent_type", "model", "model_tier"] {
+        assert!(
+            !properties.contains_key(removed),
+            "legacy field {removed} remains"
+        );
+    }
 }
 
 #[test]
@@ -324,7 +322,6 @@ fn multi_error_schema() -> Value {
     })
 }
 
-#[test_case::test_case(json!({"subagent_type": "bogus"}), UNKNOWN_SUBAGENT_ERR ; "unknown_subagent_type")]
 #[test_case::test_case(json!({"output_schema": {"type": "object", "properties": {"x": {"type": 42}}}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
 #[test_case::test_case(json!({"output_schema": {"type": "array"}}), SCHEMA_ROOT_ERROR ; "non_object_output_schema")]
 #[test_case::test_case(json!({"output_schema": "not an object"}), SCHEMA_ROOT_ERROR ; "non_table_output_schema")]
@@ -340,6 +337,46 @@ fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(0));
     assert_eq!(snap["prompt_count"], json!(0));
+}
+
+#[test]
+fn unknown_mode_is_rejected_by_the_task_schema() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["mode"] = json!("bogus");
+    let parsed = reg
+        .get(TASK_TOOL)
+        .expect("task tool missing")
+        .tool
+        .parse(&input);
+    let error = match parsed {
+        Ok(_) => panic!("unknown mode must fail validation"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("mode"));
+    assert_eq!(probe(&reg)["sessions"], json!(0));
+}
+
+#[test_case::test_case("subagent_type" ; "subagent_type")]
+#[test_case::test_case("model" ; "model")]
+#[test_case::test_case("model_tier" ; "model_tier")]
+fn removed_task_fields_are_rejected(field: &str) {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input[field] = json!("legacy");
+
+    let parsed = reg
+        .get(TASK_TOOL)
+        .expect("task tool missing")
+        .tool
+        .parse(&input);
+    let error = match parsed {
+        Ok(_) => panic!("removed field must fail validation"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains(field));
+    assert_eq!(probe(&reg)["sessions"], json!(0));
 }
 
 #[test]
@@ -359,6 +396,7 @@ fn structured_happy_path_returns_validated_json() {
     assert_eq!(snap["closed"], json!(1));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["has_local_tools"], json!(true));
+    assert_eq!(snap["local_effect"], json!("read_only"));
     assert!(snap["first_ack"].is_string(), "valid input must be acked");
     assert!(snap.get("first_err").is_none_or(Value::is_null));
     let prompt = snap["prompts"][0].as_str().expect("prompt missing");
@@ -515,6 +553,7 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     );
     assert_eq!(snap["acquired"], json!(1));
     assert_eq!(snap["released"], json!(1), "permit not explicitly released");
+    assert_eq!(snap["closed"], json!(1), "failed session was not closed");
 
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();

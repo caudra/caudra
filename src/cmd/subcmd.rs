@@ -661,22 +661,18 @@ pub fn prompt(
     no_plugins: bool,
     no_jit: bool,
     no_rtk: bool,
+    model_arg: Option<&str>,
     profile_arg: Option<&str>,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
-    use maki_agent::prompt::{PromptId, assemble};
+    use maki_agent::prompt::{PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task};
     use maki_agent::template;
     use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
-    use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
     }
-    if profile_arg.is_some() && !matches!(variant, PromptVariant::System) && !tools {
-        bail!("--system-prompt-profile can only be used with the 'system' prompt variant");
-    }
-
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
     let _workcell_host = super::register_workcell(&cwd)?;
@@ -695,13 +691,41 @@ pub fn prompt(
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
+    let cwd_str = cwd.to_string_lossy();
+    let instructions = load_instruction_text(&cwd_str);
+    let slots = host.event_handle().collect_prompt_slots(&config.agent);
+    let prompt_profiles = maki_agent::prompt::profile::PromptProfileCatalog::discover_user();
+    let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
+    let system_prompt_profile = prompt_profiles
+        .resolve(profile_name)
+        .context("resolve system prompt profile")?;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let mut model = crate::setup::resolve_model(model_arg, &config.provider, &storage)?;
+    maki_providers::provider::adjust_model(&mut model, maki_providers::Timeouts::default())?;
+
     if tools {
+        let thinking = config
+            .always_thinking
+            .clone()
+            .map(maki_providers::ThinkingConfig::from)
+            .unwrap_or_default();
+        let bindings = prompt_profiles.bind_for_tasks(
+            &model,
+            &thinking,
+            &config.provider.model_policy,
+            maki_providers::Timeouts::default(),
+        );
+        let vars = vars.set(
+            "{task_system_prompt_profiles}",
+            bindings.task_tool_summary("Maki's built-in task prompt"),
+        );
+        let filter = ToolFilter::from_config(&config.agent, &model, &[]);
         let ctx = DescriptionContext {
-            filter: &ToolFilter::All,
+            filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
         };
-        let defs = reg.definitions(&vars, &ctx, true);
+        let defs = reg.definitions(&vars, &ctx, model.supports_tool_examples());
         if names {
             for name in defs
                 .as_array()
@@ -717,29 +741,13 @@ pub fn prompt(
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy();
-    let instructions = load_instruction_text(&cwd_str);
-    let slots = host.event_handle().collect_prompt_slots(&config.agent);
-
     let output = match variant {
         PromptVariant::System => {
-            let prompt_profiles =
-                maki_agent::prompt::profile::PromptProfileCatalog::discover_user();
-            let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
-            let system_prompt_profile = prompt_profiles
-                .resolve(profile_name)
-                .context("resolve system prompt profile")?;
             let mode = if plan {
                 maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
             } else {
                 maki_agent::AgentMode::Build
             };
-            let model_spec = config
-                .provider
-                .default_model
-                .as_deref()
-                .unwrap_or("anthropic/claude-sonnet-4-20250514");
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
             build_system_prompt(
                 &vars,
                 &mode,
@@ -749,8 +757,24 @@ pub fn prompt(
                 system_prompt_profile.as_deref(),
             )
         }
-        PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
-        PromptVariant::General => assemble(PromptId::General, &slots, &instructions),
+        PromptVariant::Research => vars
+            .apply(&assemble_task(
+                PromptId::Research,
+                &slots,
+                &instructions,
+                system_prompt_profile.as_deref(),
+                TASK_PLAN_CONTRACT,
+            ))
+            .into_owned(),
+        PromptVariant::General => vars
+            .apply(&assemble_task(
+                PromptId::General,
+                &slots,
+                &instructions,
+                system_prompt_profile.as_deref(),
+                TASK_BUILD_CONTRACT,
+            ))
+            .into_owned(),
     };
 
     print!("{output}");

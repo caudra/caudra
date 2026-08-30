@@ -82,6 +82,7 @@ fn restore(
             theme_gen: None,
             clicks,
             state,
+            lua_provenance: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,12 +9,14 @@ use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 #[cfg(test)]
-use maki_providers::{ContentBlock, HistoryItemKind, Message, Role};
-use maki_providers::{HistoryItem, merge_history_items};
+use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{
+    HistoryItem, HistoryItemKind, active_history_items, merge_history_items, resolve_history_head,
+};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::permission_state::PermissionRuleRecord;
-use maki_storage::sessions::{StoredEffect, StoredRule};
+use maki_storage::sessions::{StoredEffect, StoredRule, StoredSubagent};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -21,6 +24,7 @@ use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
+use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use crate::template;
 use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
@@ -61,20 +65,71 @@ impl SessionStore {
     }
 
     fn from_session(dir: StateDir, session: StoredSession) -> Self {
-        let subagent_messages = session
-            .subagent_messages()
+        let head = resolve_history_head(
+            session.messages(),
+            session.meta.history_head,
+            session.meta.pending_revert.is_some(),
+        );
+        let active_history =
+            active_history_items(session.messages(), head).unwrap_or_else(|error| {
+                warn!(%error, "failed to resolve active history for subagent restoration");
+                Vec::new()
+            });
+        let mut reachable = reachable_subagent_ids(&active_history, &session);
+        let mut versions =
+            crate::active_task_history_versions_with_batch_state(&active_history, |call_id| {
+                session
+                    .tool_outputs()
+                    .get(call_id)
+                    .and_then(|output| output.state())
+            });
+        reachable.extend(
+            versions
+                .iter()
+                .filter(|(_, version_id)| session.subagent_messages().contains_key(*version_id))
+                .map(|(task_id, _)| task_id.clone()),
+        );
+        for subagent in session.subagents() {
+            if reachable.contains(&subagent.tool_use_id)
+                && !versions.contains_key(&subagent.tool_use_id)
+                && let Some(version_id) = &subagent.parent_tool_use_id
+                && session.subagent_messages().contains_key(version_id)
+            {
+                versions.insert(subagent.tool_use_id.clone(), version_id.clone());
+            }
+        }
+        let version_ids: HashSet<&str> = versions
             .iter()
-            .filter_map(
-                |(task_id, items)| match History::restored(items.as_ref().clone()) {
+            .filter_map(|(task_id, version_id)| {
+                (task_id != version_id && session.subagent_messages().contains_key(version_id))
+                    .then_some(version_id.as_str())
+            })
+            .collect();
+        let subagent_messages = reachable
+            .iter()
+            .filter(|task_id| !version_ids.contains(task_id.as_str()))
+            .filter_map(|task_id| {
+                let version_id = versions.get(task_id).unwrap_or(task_id);
+                let items = session
+                    .subagent_messages()
+                    .get(version_id)
+                    .or_else(|| session.subagent_messages().get(task_id))?;
+                match History::restored(items.as_ref().clone()) {
                     Ok(history) => Some((task_id.clone(), Arc::new(history.into_vec()))),
                     Err(error) => {
                         warn!(%task_id, %error, "failed to restore subagent history");
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
-        let subagent_history = SubagentHistoryStore::seeded(subagent_messages);
+        let specs = session
+            .subagent_task_specs()
+            .iter()
+            .filter(|(task_id, spec)| reachable.contains(*task_id) && !spec.is_version())
+            .map(|(task_id, spec)| (task_id.clone(), spec.clone()))
+            .collect();
+        let subagent_history = SubagentHistoryStore::seeded_with_specs(subagent_messages, specs);
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
@@ -122,16 +177,46 @@ impl SessionStore {
         self.session.set_model(model_spec);
         let snapshot = self.subagent_history.snapshot();
         if snapshot.revision() != self.persisted_subagent_history.revision() {
-            for (task_id, history) in snapshot.histories() {
+            for (task_id, record) in snapshot.records() {
                 let unchanged = self
                     .persisted_subagent_history
-                    .histories()
+                    .records()
                     .get(task_id)
-                    .is_some_and(|persisted| Arc::ptr_eq(persisted, history));
+                    .is_some_and(|persisted| Arc::ptr_eq(persisted, record));
                 if !unchanged {
-                    let items =
-                        History::new(Arc::unwrap_or_clone(Arc::clone(history))).into_items();
-                    self.session.set_subagent_messages(task_id.clone(), items);
+                    let items = History::new(Arc::unwrap_or_clone(Arc::clone(record.messages())))
+                        .into_items();
+                    if let Some(version_id) = record
+                        .version_id()
+                        .filter(|version_id| *version_id != task_id)
+                    {
+                        if let Some(previous) =
+                            self.session.subagent_messages().get(task_id).cloned()
+                        {
+                            self.session.set_subagent_history(
+                                task_id.clone(),
+                                previous.as_ref().clone(),
+                                record.spec().cloned(),
+                            );
+                        } else {
+                            self.session.set_subagent_history(
+                                task_id.clone(),
+                                items.clone(),
+                                record.spec().cloned(),
+                            );
+                        }
+                        self.session.set_subagent_history(
+                            version_id.to_owned(),
+                            items,
+                            Some(maki_storage::sessions::StoredSubagentTaskSpec::version()),
+                        );
+                    } else {
+                        self.session.set_subagent_history(
+                            task_id.clone(),
+                            items,
+                            record.spec().cloned(),
+                        );
+                    }
                 }
             }
             self.persisted_subagent_history = snapshot;
@@ -139,6 +224,228 @@ impl SessionStore {
         self.sync_permissions(permissions);
         self.session.update_title_if_default();
         self.save();
+    }
+
+    fn record_event(&mut self, envelope: &Envelope) {
+        match &envelope.event {
+            AgentEvent::ToolDone(done) => {
+                self.session
+                    .insert_tool_output(done.id.clone(), done.output.clone());
+            }
+            AgentEvent::SubagentHistory {
+                task_id,
+                parent_tool_use_id,
+                root_tool_use_id,
+                name,
+                model,
+                messages,
+                spec,
+            } => {
+                let items = History::new(messages.clone()).into_items();
+                if parent_tool_use_id == task_id {
+                    self.session
+                        .set_subagent_history(task_id.clone(), items, spec.clone());
+                } else {
+                    if let Some(previous) = self.session.subagent_messages().get(task_id).cloned() {
+                        self.session.set_subagent_history(
+                            task_id.clone(),
+                            previous.as_ref().clone(),
+                            spec.clone(),
+                        );
+                    } else {
+                        self.session.set_subagent_history(
+                            task_id.clone(),
+                            items.clone(),
+                            spec.clone(),
+                        );
+                    }
+                    self.session.set_subagent_history(
+                        parent_tool_use_id.clone(),
+                        items,
+                        Some(maki_storage::sessions::StoredSubagentTaskSpec::version()),
+                    );
+                }
+                let mut subagents = self.session.subagents().to_vec();
+                if let Some(stored) = subagents
+                    .iter_mut()
+                    .find(|stored| stored.tool_use_id == *task_id)
+                {
+                    stored.parent_tool_use_id = Some(parent_tool_use_id.clone());
+                    stored.root_tool_use_id = Some(root_tool_use_id.clone());
+                    stored.name.clone_from(name);
+                    stored.model = Some(model.clone());
+                } else {
+                    subagents.push(StoredSubagent {
+                        tool_use_id: task_id.clone(),
+                        parent_tool_use_id: Some(parent_tool_use_id.clone()),
+                        root_tool_use_id: Some(root_tool_use_id.clone()),
+                        name: name.clone(),
+                        model: Some(model.clone()),
+                    });
+                }
+                self.session.set_subagents(subagents);
+            }
+            _ => return,
+        }
+        self.save();
+    }
+}
+
+fn reachable_subagent_ids(history: &[HistoryItem], session: &StoredSession) -> HashSet<String> {
+    let mut reachable = history_task_ids(history);
+    let mut active_calls = crate::history_tool_call_ids(history);
+    expand_reachable_subagents(&mut reachable, &mut active_calls, session);
+    let legacy_fallback = reachable.is_empty()
+        || history.iter().any(|item| {
+            matches!(
+                &item.kind,
+                HistoryItemKind::AssistantText {
+                    retained_subagent_ids,
+                    is_compaction_summary: true,
+                    ..
+                } if retained_subagent_ids.is_empty()
+            )
+        });
+    reachable.extend(
+        session
+            .subagent_task_specs()
+            .iter()
+            .filter(|(task_id, spec)| {
+                if !spec.is_generic() {
+                    return false;
+                }
+                let descriptor = session
+                    .subagents()
+                    .iter()
+                    .find(|subagent| subagent.tool_use_id == **task_id);
+                descriptor.is_none()
+                    || active_calls.contains(*task_id)
+                    || descriptor
+                        .and_then(|subagent| subagent.root_tool_use_id.as_ref())
+                        .is_some_and(|root| active_calls.contains(root))
+            })
+            .map(|(task_id, _)| task_id.clone()),
+    );
+    if legacy_fallback {
+        reachable.extend(
+            session
+                .subagent_messages()
+                .keys()
+                .filter(|task_id| !session.subagent_task_specs().contains_key(*task_id))
+                .filter(|task_id| {
+                    !session.subagents().iter().any(|subagent| {
+                        subagent.tool_use_id.as_str() != task_id.as_str()
+                            && subagent.parent_tool_use_id.as_ref() == Some(*task_id)
+                    })
+                })
+                .cloned(),
+        );
+    }
+    expand_reachable_subagents(&mut reachable, &mut active_calls, session);
+    reachable
+}
+
+fn expand_reachable_subagents(
+    reachable: &mut HashSet<String>,
+    active_calls: &mut HashSet<String>,
+    session: &StoredSession,
+) {
+    let mut visited = HashSet::new();
+    loop {
+        for subagent in session.subagents() {
+            if subagent
+                .parent_tool_use_id
+                .as_ref()
+                .is_some_and(|parent| reachable.contains(parent) || active_calls.contains(parent))
+                || subagent
+                    .root_tool_use_id
+                    .as_ref()
+                    .is_some_and(|root| active_calls.contains(root))
+            {
+                reachable.insert(subagent.tool_use_id.clone());
+            }
+        }
+        let Some(task_id) = reachable
+            .iter()
+            .find(|task_id| !visited.contains(*task_id))
+            .cloned()
+        else {
+            break;
+        };
+        visited.insert(task_id.clone());
+        if let Some(state) = session
+            .tool_outputs()
+            .get(&task_id)
+            .and_then(|output| output.state())
+        {
+            collect_task_metadata_from_value(state, reachable);
+        }
+        if let Some(nested) = session.subagent_messages().get(&task_id) {
+            reachable.extend(history_task_ids(nested));
+            active_calls.extend(crate::history_tool_call_ids(nested));
+        }
+    }
+}
+
+fn history_task_ids(items: &[HistoryItem]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for item in items {
+        match &item.kind {
+            HistoryItemKind::ToolCall { call_id, name, .. }
+                if name == "task" || name == "batch" =>
+            {
+                ids.insert(call_id.clone());
+            }
+            HistoryItemKind::AssistantText {
+                retained_subagent_ids,
+                ..
+            } => ids.extend(retained_subagent_ids.iter().cloned()),
+            _ => {}
+        }
+    }
+    ids
+}
+
+fn collect_task_metadata_from_value(value: &Value, ids: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => collect_task_metadata(text, ids),
+        Value::Array(values) => {
+            for value in values {
+                collect_task_metadata_from_value(value, ids);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(tool) = values.get("tool").and_then(Value::as_str) {
+                if tool == "task" {
+                    if let Some(invocation_id) = values.get("invocation_id").and_then(Value::as_str)
+                    {
+                        ids.insert(invocation_id.to_owned());
+                    }
+                    if let Some(output) = values.get("output").and_then(Value::as_str) {
+                        collect_task_metadata(output, ids);
+                    }
+                }
+                return;
+            }
+            for value in values.values() {
+                collect_task_metadata_from_value(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
+    for block in content.split("<task_metadata>").skip(1) {
+        let Some(metadata) = block.split("</task_metadata>").next() else {
+            continue;
+        };
+        if let Some(task_id) = metadata
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("task_id: "))
+        {
+            ids.insert(task_id.to_owned());
+        }
     }
 }
 
@@ -183,9 +490,11 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
+    pub thinking: crate::ThinkingConfig,
     pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
     pub system_prompt_profile: Option<Arc<crate::prompt::profile::SystemPromptProfile>>,
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -212,11 +521,19 @@ struct AgentSetup {
     tool_filter: ToolFilter,
 }
 
+struct TaskDescriptionContext<'a> {
+    prompt_profiles: &'a PromptProfileCatalog,
+    thinking: &'a crate::ThinkingConfig,
+    model_policy: &'a ModelPolicy,
+    timeouts: Timeouts,
+}
+
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     workflow: bool,
+    task: TaskDescriptionContext<'_>,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
@@ -227,6 +544,7 @@ fn setup(
         excluded_tools,
         workflow,
         ToolRegistry::global(),
+        task,
     );
 
     AgentSetup {
@@ -246,14 +564,22 @@ fn tool_definitions(
     excluded_tools: &[&'static str],
     workflow: bool,
     registry: &ToolRegistry,
+    task: TaskDescriptionContext<'_>,
 ) -> Value {
     let filter = ToolFilter::from_config(config, model, excluded_tools);
+    let bindings =
+        task.prompt_profiles
+            .bind_for_tasks(model, task.thinking, task.model_policy, task.timeouts);
+    let vars = vars.clone().set(
+        "{task_system_prompt_profiles}",
+        bindings.task_tool_summary("Maki's built-in task prompt"),
+    );
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
         workflow,
     };
-    registry.definitions(vars, &ctx, model.supports_tool_examples())
+    registry.definitions(&vars, &ctx, model.supports_tool_examples())
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
@@ -266,7 +592,10 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
     extract_tool_names(&probe)
 }
 
-pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
+pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
+    if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
+        warn!(%error, "failed to adjust headless model before setup");
+    }
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = AgentMode::Build;
     let AgentSetup {
@@ -279,6 +608,12 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        TaskDescriptionContext {
+            prompt_profiles: &params.prompt_profiles,
+            thinking: &params.thinking,
+            model_policy: &params.model_policy,
+            timeouts: params.timeouts,
+        },
     );
 
     let system = agent::build_system_prompt(
@@ -302,6 +637,12 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let fast = params.fast;
     let workflow = params.workflow;
     let goal = params.goal.clone();
+    let system_prompt_profile_name: Arc<str> = Arc::from(
+        params
+            .system_prompt_profile
+            .as_ref()
+            .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
+    );
     let task = smol::spawn({
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
@@ -333,10 +674,13 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         params.plugin_rules,
                     )),
                     session_id: Some(session_ref_clone.clone()),
+                    root_tool_use_id: None,
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
+                    prompt_profiles: Arc::clone(&params.prompt_profiles),
+                    system_prompt_profile_name,
                     subagent_cancels: Arc::new(CancelMap::new()),
                     subagent_history: SubagentHistoryStore::default(),
                     registry: Arc::clone(ToolRegistry::global_arc()),
@@ -362,7 +706,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     mode,
                     images: params.images,
                     preamble: Vec::new(),
-                    thinking: Default::default(),
+                    thinking: params.thinking,
                     fast,
                     workflow,
                     prompt: None,
@@ -399,8 +743,10 @@ pub struct InteractiveParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: Arc<ResolvedSlots>,
+    pub thinking: crate::ThinkingConfig,
     pub system_prompt_profile: Option<Arc<crate::prompt::profile::SystemPromptProfile>>,
     pub system_prompt_profile_name: Option<String>,
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -432,17 +778,26 @@ pub struct InteractiveHandle {
     pub task: smol::Task<()>,
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
+    if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
+        warn!(%error, "failed to adjust interactive model before setup");
+    }
     let AgentSetup {
         vars,
         instructions,
-        mut tools,
+        tools,
         mut tool_filter,
     } = setup(
         &params.model,
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        TaskDescriptionContext {
+            prompt_profiles: &params.prompt_profiles,
+            thinking: &params.thinking,
+            model_policy: &params.model_policy,
+            timeouts: params.timeouts,
+        },
     );
 
     let restored_history = History::restored(params.initial_history);
@@ -522,6 +877,22 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .as_ref()
                 .map(|store| store.subagent_history.clone())
                 .unwrap_or_default();
+            let store = Arc::new(Mutex::new(store));
+            let (agent_tx, agent_rx) = flume::unbounded();
+            let event_forwarder = smol::spawn({
+                let store = Arc::clone(&store);
+                let raw_tx = raw_tx.clone();
+                async move {
+                    while let Ok(envelope) = agent_rx.recv_async().await {
+                        if let Some(store) = &mut *store.lock().await {
+                            store.record_event(&envelope);
+                        }
+                        if raw_tx.send_async(envelope).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
             let mut run_id: u64 = 0;
 
             while let Ok(input) = input_rx.recv_async().await {
@@ -542,7 +913,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     let _ = cancel.race(mcp.ready()).await;
                 }
 
-                let event_tx = EventSender::new(raw_tx.clone(), run_id);
+                let event_tx = EventSender::new(agent_tx.clone(), run_id);
                 let error_tx = event_tx.clone();
 
                 if let Some(mut new_model) = model_rx
@@ -554,14 +925,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
                         Ok(p) => {
                             provider = Arc::from(p);
-                            tools = tool_definitions(
-                                &vars,
-                                &new_model,
-                                &params.config,
-                                &params.excluded_tools,
-                                params.workflow,
-                                ToolRegistry::global(),
-                            );
                             tool_filter = ToolFilter::from_config(
                                 &params.config,
                                 &new_model,
@@ -579,6 +942,21 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         }
                     }
                 }
+
+                let tools = tool_definitions(
+                    &vars,
+                    &model,
+                    &params.config,
+                    &params.excluded_tools,
+                    input.workflow,
+                    ToolRegistry::global(),
+                    TaskDescriptionContext {
+                        prompt_profiles: &params.prompt_profiles,
+                        thinking: &input.thinking,
+                        model_policy: &params.model_policy,
+                        timeouts: params.timeouts,
+                    },
+                );
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
@@ -605,10 +983,18 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
                         session_id: Some(session_ref_clone.clone()),
+                        root_tool_use_id: None,
                         mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
+                        prompt_profiles: Arc::clone(&params.prompt_profiles),
+                        system_prompt_profile_name: Arc::from(
+                            params
+                                .system_prompt_profile_name
+                                .as_deref()
+                                .unwrap_or(BUILTIN_PROFILE_NAME),
+                        ),
                         subagent_cancels: Arc::new(CancelMap::new()),
                         subagent_history: subagent_history.clone(),
                         registry: Arc::clone(ToolRegistry::global_arc()),
@@ -640,13 +1026,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     });
                 }
 
-                if let Some(store) = &mut store {
+                if let Some(store) = &mut *store.lock().await {
                     store.record_turn(&history, model.spec(), &permissions);
                 }
                 run_id += 1;
             }
 
-            if let Some(store) = &mut store {
+            drop(agent_tx);
+            event_forwarder.await;
+            if let Some(store) = &mut *store.lock().await {
                 store.sync_permissions(&permissions);
                 store.save();
             }
@@ -847,6 +1235,143 @@ mod tests {
         let reopened = store_in(&tmp);
         let lease = reopened.subagent_history.continue_task("task-1").unwrap();
         assert_eq!(lease.history().unwrap()[0].user_text(), Some("investigate"));
+    }
+
+    #[test]
+    fn record_event_persists_tool_state_and_subagent_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let mut done = crate::ToolDoneEvent::error("batch-call".into(), "batch output");
+        done.is_error = false;
+        done.output = crate::ToolOutput::Plain(crate::TextOutput {
+            text: "batch output".into(),
+            instructions: None,
+            state: Some(serde_json::json!({ "task_id": "nested-task" })),
+            lua_provenance: None,
+        });
+        store.record_event(&Envelope {
+            event: AgentEvent::ToolDone(Box::new(done)),
+            subagent: None,
+            run_id: 0,
+        });
+        store.record_event(&Envelope {
+            event: AgentEvent::SubagentHistory {
+                task_id: "nested-task".into(),
+                parent_tool_use_id: "nested-call".into(),
+                root_tool_use_id: "batch-call".into(),
+                name: "researcher".into(),
+                model: MODEL_SPEC.into(),
+                messages: vec![Message::user("investigate".into())],
+                spec: Some(crate::SubagentTaskSpec::default()),
+            },
+            subagent: None,
+            run_id: 0,
+        });
+
+        let loaded = load(&tmp);
+        assert_eq!(
+            loaded.tool_outputs()["batch-call"].state(),
+            Some(&serde_json::json!({ "task_id": "nested-task" }))
+        );
+        assert!(loaded.subagent_messages().contains_key("nested-task"));
+        assert!(loaded.subagent_messages().contains_key("nested-call"));
+        assert!(loaded.subagents().iter().any(|subagent| {
+            subagent.tool_use_id == "nested-task"
+                && subagent.parent_tool_use_id.as_deref() == Some("nested-call")
+                && subagent.root_tool_use_id.as_deref() == Some("batch-call")
+        }));
+    }
+
+    #[test]
+    fn batch_state_accepts_task_metadata_only_from_task_children() {
+        let metadata =
+            |task_id: &str| format!("<task_metadata>\ntask_id: {task_id}\n</task_metadata>");
+        let mut ids = HashSet::new();
+
+        collect_task_metadata_from_value(
+            &serde_json::json!([
+                { "tool": "task", "output": metadata("real-task") },
+                { "tool": "bash", "output": metadata("forged-task") },
+            ]),
+            &mut ids,
+        );
+
+        assert!(ids.contains("real-task"));
+        assert!(!ids.contains("forged-task"));
+    }
+
+    #[test]
+    fn reachability_follows_nested_generic_session_parents() {
+        let tool_call = |id: &str| {
+            History::new(vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    id,
+                    "custom_session_tool",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            }])
+            .into_items()
+        };
+        let main = tool_call("generic-root");
+        let mut session = StoredSession::new(MODEL_SPEC, CWD);
+        session.replace_messages(main.clone());
+        session.set_subagent_history(
+            "generic-root".into(),
+            tool_call("generic-nested"),
+            Some(crate::SubagentTaskSpec::generic()),
+        );
+        session.set_subagent_history(
+            "generic-nested".into(),
+            Vec::new(),
+            Some(crate::SubagentTaskSpec::generic()),
+        );
+        session.set_subagents(vec![
+            StoredSubagent {
+                tool_use_id: "generic-root".into(),
+                parent_tool_use_id: Some("generic-root".into()),
+                root_tool_use_id: Some("generic-root".into()),
+                name: "root".into(),
+                model: None,
+            },
+            StoredSubagent {
+                tool_use_id: "generic-nested".into(),
+                parent_tool_use_id: Some("generic-nested".into()),
+                root_tool_use_id: Some("generic-root".into()),
+                name: "nested".into(),
+                model: None,
+            },
+        ]);
+
+        let reachable = reachable_subagent_ids(&main, &session);
+
+        assert!(reachable.contains("generic-root"));
+        assert!(reachable.contains("generic-nested"));
+    }
+
+    #[test]
+    fn record_turn_persists_continuation_version() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store
+            .subagent_history
+            .reserve("task-1")
+            .unwrap()
+            .complete_version(
+                vec![Message::user("continued".into())],
+                "continuation-call".into(),
+            );
+
+        store.record_turn(
+            &History::default(),
+            MODEL_SPEC.into(),
+            &permission_manager(),
+        );
+
+        let loaded = load(&tmp);
+        assert!(loaded.subagent_messages().contains_key("task-1"));
+        assert!(loaded.subagent_messages().contains_key("continuation-call"));
     }
 
     #[test]

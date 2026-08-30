@@ -35,6 +35,7 @@ end
 
 maki.api.register_tool({
   name = "question",
+  effect = "isolated",
   description = DESCRIPTION,
   schema = {
     type = "object",

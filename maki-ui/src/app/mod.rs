@@ -74,7 +74,7 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -89,7 +89,9 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
-pub(crate) use session::{REVERT_BUSY_MSG, recover_pending_workspace_restore, session_has_content};
+pub(crate) use session::{
+    REVERT_BUSY_MSG, reachable_subagent_ids, recover_pending_workspace_restore, session_has_content,
+};
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
@@ -574,10 +576,11 @@ impl App {
             self.flash(THINKING_UNSUPPORTED_MSG.into());
             return;
         };
-        let next = match &self.state.thinking {
-            ThinkingConfig::Effort(current) => ladder
+        let resolved = self.state.thinking.resolve(&self.state.model);
+        let next = match &resolved {
+            ResolvedThinking::Effort(current) => ladder
                 .iter()
-                .position(|level| *level == &**current)
+                .position(|level| *level == current)
                 .and_then(|index| ladder.get(index + 1)),
             _ => None,
         };
@@ -1796,6 +1799,112 @@ impl App {
             }
             return vec![];
         }
+        if let AgentEvent::SubagentHistory {
+            task_id,
+            parent_tool_use_id,
+            root_tool_use_id,
+            name,
+            model,
+            messages,
+            spec,
+        } = &envelope.event
+        {
+            if envelope.run_id != self.run_id
+                && !crate::active_session_history(&self.state.session).is_ok_and(|items| {
+                    maki_agent::history_tool_call_ids(&items).contains(root_tool_use_id)
+                        || reachable_subagent_ids(
+                            &items,
+                            self.state.session.subagent_messages(),
+                            self.state.session.tool_outputs(),
+                            self.state.session.subagents(),
+                        )
+                        .contains(root_tool_use_id)
+                })
+                && !self.chats.iter().any(|chat| {
+                    chat.parent_tool_use_id().is_some_and(|parent| {
+                        parent.as_ref() == parent_tool_use_id || parent.as_ref() == root_tool_use_id
+                    })
+                })
+            {
+                return vec![];
+            }
+            self.subagent_answers.remove(task_id);
+            self.preserve_unconsumed_steers(task_id);
+            let items = crate::history_items(messages);
+            if parent_tool_use_id == task_id {
+                self.state
+                    .session_mut()
+                    .set_subagent_history(task_id.clone(), items, spec.clone());
+            } else {
+                if let Some(previous) = self.state.session.subagent_messages().get(task_id).cloned()
+                {
+                    self.state.session_mut().set_subagent_history(
+                        task_id.clone(),
+                        previous.as_ref().clone(),
+                        spec.clone(),
+                    );
+                } else {
+                    self.state.session_mut().set_subagent_history(
+                        task_id.clone(),
+                        items.clone(),
+                        spec.clone(),
+                    );
+                }
+                self.state.session_mut().set_subagent_history(
+                    parent_tool_use_id.clone(),
+                    items,
+                    Some(maki_storage::sessions::StoredSubagentTaskSpec::version()),
+                );
+            }
+            if envelope.run_id == self.run_id {
+                let sub_idx = self
+                    .chat_index
+                    .get(task_id.as_str())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.resolve_or_create_chat(&SubagentInfo {
+                            parent_tool_use_id: parent_tool_use_id.clone(),
+                            task_id: task_id.clone(),
+                            name: name.clone(),
+                            prompt: None,
+                            model: Some(model.clone()),
+                            answer_tx: None,
+                            steer_tx: None,
+                        })
+                    });
+                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+                self.sync_subagents();
+            } else {
+                let mut subagents = self.state.session.subagents().to_vec();
+                if let Some(stored) = subagents
+                    .iter_mut()
+                    .find(|stored| stored.tool_use_id == *task_id)
+                {
+                    stored.parent_tool_use_id = Some(parent_tool_use_id.clone());
+                    stored.root_tool_use_id = Some(root_tool_use_id.clone());
+                    stored.name.clone_from(name);
+                    stored.model = Some(model.clone());
+                } else {
+                    subagents.push(maki_storage::sessions::StoredSubagent {
+                        tool_use_id: task_id.clone(),
+                        parent_tool_use_id: Some(parent_tool_use_id.clone()),
+                        root_tool_use_id: Some(root_tool_use_id.clone()),
+                        name: name.clone(),
+                        model: Some(model.clone()),
+                    });
+                }
+                self.state.session_mut().set_subagents(subagents);
+            }
+            let mut subagents = self.state.session.subagents().to_vec();
+            if let Some(stored) = subagents
+                .iter_mut()
+                .find(|stored| stored.tool_use_id == *task_id)
+            {
+                stored.root_tool_use_id = Some(root_tool_use_id.clone());
+                self.state.session_mut().set_subagents(subagents);
+            }
+            return vec![];
+        }
         if envelope.run_id != self.run_id {
             let cancelled_terminal = envelope.subagent.is_none()
                 && self.cancelling_run == Some(envelope.run_id)
@@ -1838,22 +1947,6 @@ impl App {
                 &envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
             );
-
-        if let AgentEvent::SubagentHistory { task_id, messages } = envelope.event {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
-            if let Some(&sub_idx) = self.chat_index.get(task_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            }
-            self.subagent_answers.remove(&task_id);
-            self.preserve_unconsumed_steers(&task_id);
-            self.state
-                .session_mut()
-                .set_subagent_messages(task_id, crate::history_items(&messages));
-            return vec![];
-        }
 
         match &envelope.event {
             AgentEvent::ToolStart(event) => self.fire_session_autocmd(
@@ -2202,6 +2295,7 @@ impl App {
         }
 
         if let Some(&idx) = self.chat_index.get(task_id.as_str()) {
+            self.chats[idx].set_parent_tool_use_id(parent_tool_use_id.clone());
             if self.chats[idx].is_finished() {
                 let chat = &mut self.chats[idx];
                 chat.resume();
@@ -2220,6 +2314,7 @@ impl App {
             .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task_id))
         {
             let chat = &mut self.chats[idx];
+            chat.set_parent_tool_use_id(parent_tool_use_id.clone());
             chat.resume();
             chat.name.clone_from(&subagent.name);
             chat.model_id.clone_from(&subagent.model);
@@ -2234,6 +2329,7 @@ impl App {
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
+            chat.set_parent_tool_use_id(parent_tool_use_id.clone());
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = subagent.model.clone();
             if let Some(ref prompt) = subagent.prompt {

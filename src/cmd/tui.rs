@@ -281,6 +281,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
+        let thinking = stack
+            .config
+            .always_thinking
+            .clone()
+            .map(maki_providers::ThinkingConfig::from)
+            .unwrap_or_default();
         let prompt_slots = stack
             .plugin_host
             .event_handle()
@@ -296,6 +302,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             prompt_profiles: stack.prompt_profiles,
             fast,
             workflow: stack.config.always_workflow,
+            thinking,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
         })
@@ -304,6 +311,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
     if cli.print {
         let fast = stack.config.always_fast && stack.model.supports_fast();
+        let thinking = stack
+            .config
+            .always_thinking
+            .clone()
+            .map(maki_providers::ThinkingConfig::from)
+            .unwrap_or_default();
         let timeouts = stack.timeouts();
         crate::print::run(
             &stack.model,
@@ -317,7 +330,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.event_handle(),
             fast,
             stack.config.always_workflow,
+            thinking,
             stack.default_prompt_profile,
+            Arc::clone(&stack.prompt_profiles),
             Arc::new(stack.config.provider.model_policy.clone()),
             stack.plugin_host.plugin_rules(),
         )

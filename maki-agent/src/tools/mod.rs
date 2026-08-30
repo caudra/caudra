@@ -14,8 +14,8 @@ pub mod schema;
 pub use file_tracker::FileReadTracker;
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
-    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
-    ToolInvocation, ToolRegistry, ToolSource,
+    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolEffect,
+    ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;
@@ -47,12 +47,36 @@ pub struct DescriptionContext<'a> {
     pub workflow: bool,
 }
 
+impl DescriptionContext<'_> {
+    pub fn policy(&self) -> ToolPolicy {
+        if self.audience == ToolAudience::RESEARCH_SUB || self.filter.is_read_only() {
+            ToolPolicy::ReadOnly
+        } else {
+            ToolPolicy::Standard
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPolicy {
+    #[default]
+    Standard,
+    ReadOnly,
+}
+
+impl ToolPolicy {
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum ToolFilter {
     #[default]
     All,
     Only(Vec<String>),
     AllExcept(Vec<String>),
+    ReadOnly(Box<ToolFilter>),
 }
 
 impl ToolFilter {
@@ -61,7 +85,20 @@ impl ToolFilter {
             Self::All => true,
             Self::Only(allowed) => allowed.iter().any(|n| n == name),
             Self::AllExcept(blocked) => !blocked.iter().any(|n| n == name),
+            Self::ReadOnly(inner) => inner.matches(name),
         }
+    }
+
+    pub fn for_mode(self, mode: &AgentMode) -> Self {
+        if mode.is_read_only() {
+            Self::ReadOnly(Box::new(self))
+        } else {
+            self
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly(_))
     }
 
     pub fn excluding(self, names: &[&str]) -> Self {
@@ -84,6 +121,7 @@ impl ToolFilter {
                 }
                 Self::AllExcept(blocked)
             }
+            Self::ReadOnly(inner) => Self::ReadOnly(Box::new(inner.excluding(names))),
         }
     }
 
@@ -102,10 +140,17 @@ impl ToolFilter {
                 blocked.retain(|name| !INTERNAL_COMPANION_TOOL_NAMES.contains(&name.as_str()));
                 Self::AllExcept(blocked)
             }
+            Self::ReadOnly(inner) => Self::ReadOnly(Box::new(inner.with_internal_companions())),
         }
     }
 
     pub fn intersect(self, inherited: &Self) -> Self {
+        if let Self::ReadOnly(requested) = self {
+            return Self::ReadOnly(Box::new(requested.intersect(inherited.unrestricted())));
+        }
+        if let Self::ReadOnly(inherited) = inherited {
+            return Self::ReadOnly(Box::new(self.intersect(inherited)));
+        }
         match (self, inherited) {
             (Self::All, inherited) => inherited.clone(),
             (requested, Self::All) => requested,
@@ -136,11 +181,23 @@ impl ToolFilter {
                 }
                 Self::AllExcept(blocked)
             }
+            (Self::ReadOnly(_), _) | (_, Self::ReadOnly(_)) => unreachable!(),
         }
     }
 
-    pub fn including(mut self, names: impl IntoIterator<Item = String>) -> Self {
-        match &mut self {
+    fn unrestricted(&self) -> &Self {
+        match self {
+            Self::ReadOnly(inner) => inner.unrestricted(),
+            _ => self,
+        }
+    }
+
+    pub fn including(self, names: impl IntoIterator<Item = String>) -> Self {
+        if let Self::ReadOnly(inner) = self {
+            return Self::ReadOnly(Box::new(inner.including(names)));
+        }
+        let mut filter = self;
+        match &mut filter {
             Self::All => {}
             Self::Only(allowed) => {
                 for name in names {
@@ -154,8 +211,9 @@ impl ToolFilter {
                     blocked.retain(|blocked| blocked != &name);
                 }
             }
+            Self::ReadOnly(_) => unreachable!(),
         }
-        self
+        filter
     }
 
     pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
@@ -219,7 +277,9 @@ pub const WRITE_TOOL_NAME: &str = "write";
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] =
     &[TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME];
 
-pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub const READ_ONLY_TOOL_RESTRICTED: &str = "tool is not available in strict read-only mode";
+pub const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 pub const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -284,16 +344,40 @@ pub fn timeout_annotation(secs: u64) -> String {
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
-pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
-pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+type LocalToolHandler = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
+
+#[derive(Clone)]
+pub struct LocalToolEntry {
+    handler: LocalToolHandler,
+    pub effect: ToolEffect,
+}
+
+impl LocalToolEntry {
+    pub fn call(&self, input: Value, ctx: ToolContext) -> LocalToolResult {
+        (self.handler)(input, ctx)
+    }
+}
+
+pub type LocalToolFn = LocalToolEntry;
+pub type LocalTools = Arc<HashMap<String, LocalToolEntry>>;
 
 /// Coerces a closure into a [`LocalToolFn`]; the bound gives the boxed
 /// future a coercion target that `Arc::new` alone does not.
-pub fn local_tool<F>(f: F) -> LocalToolFn
+pub fn local_tool<F>(f: F) -> LocalToolEntry
 where
     F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
 {
-    Arc::new(f)
+    audited_local_tool(ToolEffect::Unknown, f)
+}
+
+pub fn audited_local_tool<F>(effect: ToolEffect, f: F) -> LocalToolEntry
+where
+    F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    LocalToolEntry {
+        handler: Arc::new(f),
+        effect,
+    }
 }
 
 #[derive(Clone)]
@@ -308,6 +392,7 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_use_id: Option<String>,
+    pub root_tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
@@ -319,6 +404,8 @@ pub struct ToolContext {
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
+    pub system_prompt_profile_name: Arc<str>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub subagent_history: SubagentHistoryStore,
@@ -333,6 +420,16 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+}
+
+impl ToolContext {
+    pub fn policy(&self) -> ToolPolicy {
+        if self.mode.is_read_only() || self.audience == ToolAudience::RESEARCH_SUB {
+            ToolPolicy::ReadOnly
+        } else {
+            ToolPolicy::Standard
+        }
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -537,6 +634,7 @@ pub fn interpreter_ctx(
         session_id: None,
         tool_output_store: None,
         tool_use_id: None,
+        root_tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
@@ -548,6 +646,8 @@ pub fn interpreter_ctx(
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
+        system_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         subagent_history: SubagentHistoryStore::default(),

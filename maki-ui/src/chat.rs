@@ -60,6 +60,7 @@ pub struct Chat {
     /// `None` for the main chat, the subagent's `tool_use_id` otherwise. That
     /// is the handle `maki.task` addresses a task by, see `app::tasks`.
     task_id: Option<Arc<str>>,
+    parent_tool_use_id: Option<Arc<str>>,
 }
 
 impl Chat {
@@ -73,6 +74,7 @@ impl Chat {
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finish: None,
             task_id: None,
+            parent_tool_use_id: None,
         }
     }
 
@@ -90,6 +92,14 @@ impl Chat {
 
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
         self.task_id.as_ref()
+    }
+
+    pub(crate) fn parent_tool_use_id(&self) -> Option<&Arc<str>> {
+        self.parent_tool_use_id.as_ref()
+    }
+
+    pub(crate) fn set_parent_tool_use_id(&mut self, id: impl Into<Arc<str>>) {
+        self.parent_tool_use_id = Some(id.into());
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
@@ -601,6 +611,7 @@ pub fn history_to_display(
                         theme_gen: None,
                         clicks: Vec::new(),
                         state,
+                        lua_provenance: stored.and_then(|output| output.lua_provenance().cloned()),
                     });
                 }
                 display.push(DisplayMessage {
@@ -687,6 +698,7 @@ pub(crate) fn restore_item_for(
         theme_gen: Some(theme_gen),
         clicks: Vec::new(),
         state,
+        lua_provenance: stored.lua_provenance().cloned(),
     })
 }
 

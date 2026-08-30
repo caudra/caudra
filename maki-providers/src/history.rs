@@ -55,6 +55,8 @@ pub enum HistoryItemKind {
         state: AssistantTextState,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         retained_output_refs: Vec<ToolOutputRef>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_subagent_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_compaction_summary: bool,
     },
@@ -475,6 +477,7 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
             text: String::new(),
             state: AssistantTextState::Complete,
             retained_output_refs: message.retained_output_refs.clone(),
+            retained_subagent_ids: message.retained_subagent_ids.clone(),
             is_compaction_summary: message.is_compaction_summary,
         }];
     }
@@ -485,6 +488,7 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
         .collect();
     if let Some(HistoryItemKind::AssistantText {
         retained_output_refs,
+        retained_subagent_ids,
         is_compaction_summary,
         ..
     }) = kinds
@@ -492,6 +496,7 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
         .find(|kind| matches!(kind, HistoryItemKind::AssistantText { .. }))
     {
         retained_output_refs.clone_from(&message.retained_output_refs);
+        retained_subagent_ids.clone_from(&message.retained_subagent_ids);
         *is_compaction_summary = message.is_compaction_summary;
     }
     kinds
@@ -507,6 +512,7 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
                 AssistantTextState::Complete
             },
             retained_output_refs: Vec::new(),
+            retained_subagent_ids: Vec::new(),
             is_compaction_summary: false,
         },
         ContentBlock::Thinking {
@@ -731,11 +737,15 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 text,
                 state,
                 retained_output_refs,
+                retained_subagent_ids,
                 is_compaction_summary,
             } => {
                 message
                     .retained_output_refs
                     .extend(retained_output_refs.iter().cloned());
+                message
+                    .retained_subagent_ids
+                    .extend(retained_subagent_ids.iter().cloned());
                 message.is_compaction_summary |= is_compaction_summary;
                 message.content.push(ContentBlock::Text {
                     text: if *state == AssistantTextState::Padding {
@@ -976,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn compacted_output_refs_roundtrip_without_public_serialization() {
+    fn compacted_host_metadata_roundtrips_without_public_serialization() {
         let output_ref = output_ref();
         let message = Message {
             role: Role::Assistant,
@@ -984,6 +994,7 @@ mod tests {
                 text: format!("retained output ID: {}", output_ref.id),
             }],
             retained_output_refs: vec![output_ref.clone()],
+            retained_subagent_ids: vec!["task-1".into()],
             is_compaction_summary: true,
             ..Default::default()
         };
@@ -998,11 +1009,18 @@ mod tests {
         let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
         let projected = project_messages(&items).unwrap();
         assert_eq!(projected[0].retained_output_refs, [output_ref]);
+        assert_eq!(projected[0].retained_subagent_ids, ["task-1"]);
         assert!(projected[0].is_compaction_summary);
         assert!(
             serde_json::to_value(&projected[0])
                 .unwrap()
                 .get("retained_output_refs")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&projected[0])
+                .unwrap()
+                .get("retained_subagent_ids")
                 .is_none()
         );
         assert!(
@@ -1292,6 +1310,7 @@ mod tests {
                 text: "two".into(),
                 state: AssistantTextState::Complete,
                 retained_output_refs: Vec::new(),
+                retained_subagent_ids: Vec::new(),
                 is_compaction_summary: false,
             },
             group_id,

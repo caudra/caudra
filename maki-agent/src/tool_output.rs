@@ -711,6 +711,7 @@ mod tests {
                 content: "keep metadata".into(),
             }]),
             state: Some(serde_json::json!({"cursor": 7})),
+            lua_provenance: None,
         };
         let ctx = context(10, 320);
 
@@ -746,6 +747,7 @@ mod tests {
                 content: "instruction".repeat(1_000),
             }]),
             state: Some(serde_json::json!({"cursor": 7})),
+            lua_provenance: None,
         });
         let full_output = output.as_text();
         let mut done = done(String::new(), false);
@@ -882,6 +884,7 @@ mod tests {
             text: full_text.clone(),
             instructions: Some(instructions.clone()),
             state: None,
+            lua_provenance: None,
         })
         .as_text();
         let original_ref = store.put(session.id(), &full_text).unwrap();
@@ -890,6 +893,7 @@ mod tests {
             text: "placeholder".into(),
             instructions: Some(instructions),
             state: None,
+            lua_provenance: None,
         });
         done.output_ref = Some(original_ref.clone());
         done.model_output_from_ref = true;

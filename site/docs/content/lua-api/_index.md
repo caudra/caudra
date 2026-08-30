@@ -237,6 +237,7 @@ for later retrieval. Truncate in the producer only when loss is intentional.
       `max_lines` and `max_bytes` are required positive
       integers. Overrides the agent defaults.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
+  - `effect` (`string`) Bundled-tool capability: "read_only", "isolated", "orchestrator", or "mutating". Unbundled claims are ignored.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
@@ -777,9 +778,9 @@ The returned table has fields: `id` (string), `tier` (string),
 
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts?}` (`table?`) Optional fields:
-  - `tier` (`string?`) target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
+  - `tier` (`string?`) target tier, one of `"weak"`, `"medium"`, `"strong"`. Clamped to
     the parent tier so you cannot escalate.
-  - `spec` (`string?`) exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
+  - `spec` (`string?`) exact `provider/model` spec, e.g. `"anthropic/claude-haiku-4-5"`.
     Takes precedence over `tier`.
 
 **Returns:** (`table?`, `string?`) Model table on success, or `(nil, err)` on failure.
@@ -787,7 +788,7 @@ The returned table has fields: `id` (string), `tier` (string),
 **Example:**
 
 ```lua
-local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
 if err then error(err) end
 print(model.spec, model.tier)
 ```
@@ -895,7 +896,7 @@ through optional callbacks while the tool runs.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
+**Returns:** (`string?`, `string?`, `string?`, `boolean?`) Tool output text, error, generated call ID, and whether an error restore is authorized.
 
 **Example:**
 
@@ -932,8 +933,9 @@ and tool set.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
-    `handler` (function). The handler receives the input table and must return
-    `(string)` or `(nil, err)`.
+    `handler` (function). Optional `effect` is `read_only`, `isolated`,
+    `orchestrator`, or `mutating`. The handler receives the input table and
+    must return `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `task_id` (`string?`) completed task to continue with its existing history.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
@@ -946,6 +948,18 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits parent setting
     if omitted.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `task` (`boolean?`) enable the host-owned task path. Default: `false`.
+  - `profile` (`string?`) task system prompt profile. Requires `task = true`.
+  - `mode` (`string?`) task mode: `plan` or `build`. Requires `task = true`.
+
+  Task sessions derive model, thinking, system prompt, tools, audience, and
+
+
+  MCP access from the profile and mode. Do not combine `task = true` with the
+
+
+  corresponding generic session options.
+
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 

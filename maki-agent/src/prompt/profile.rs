@@ -2,8 +2,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
+use maki_config::ModelPolicy;
+use maki_providers::{Model, ThinkingConfig, Timeouts, provider};
+use maki_storage::thinking::{StoredThinking, ThinkingParseError};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -12,6 +15,8 @@ pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 const PROFILE_DIR: &str = "system-prompts";
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
+const MAX_TASK_SUMMARY_ENTRIES: usize = 20;
+const MAX_TASK_SUMMARY_DESCRIPTION_BYTES: usize = 160;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +31,24 @@ pub enum PromptProfileLayout {
 struct Frontmatter {
     description: Option<String>,
     layout: PromptProfileLayout,
+    subagent_model: Option<String>,
+    subagent_thinking: Option<FrontmatterThinking>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FrontmatterThinking {
+    Budget(u32),
+    Mode(String),
+}
+
+impl FrontmatterThinking {
+    fn parse(self) -> Result<StoredThinking, ThinkingParseError> {
+        match self {
+            Self::Budget(tokens) => StoredThinking::parse_setting(&tokens.to_string()),
+            Self::Mode(mode) => StoredThinking::parse_setting(&mode),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +56,8 @@ pub struct SystemPromptProfile {
     name: Arc<str>,
     description: Option<Arc<str>>,
     layout: PromptProfileLayout,
+    subagent_model: Option<Arc<str>>,
+    subagent_thinking: Option<StoredThinking>,
     body: Arc<str>,
     path: Arc<Path>,
 }
@@ -50,6 +75,14 @@ impl SystemPromptProfile {
         self.layout
     }
 
+    pub fn subagent_model(&self) -> Option<&str> {
+        self.subagent_model.as_deref()
+    }
+
+    pub fn subagent_thinking(&self) -> Option<&StoredThinking> {
+        self.subagent_thinking.as_ref()
+    }
+
     pub fn body(&self) -> &str {
         &self.body
     }
@@ -63,6 +96,55 @@ impl SystemPromptProfile {
 pub struct PromptProfileCatalog {
     profiles: BTreeMap<Arc<str>, Arc<SystemPromptProfile>>,
     invalid: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskProfileBindings {
+    available: BTreeMap<Arc<str>, Arc<SystemPromptProfile>>,
+    disabled: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+impl TaskProfileBindings {
+    pub fn resolve(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<SystemPromptProfile>>, PromptProfileSelectionError> {
+        if name == BUILTIN_PROFILE_NAME {
+            return Ok(None);
+        }
+        if let Some(profile) = self.available.get(name) {
+            return Ok(Some(Arc::clone(profile)));
+        }
+        if let Some(reason) = self.disabled.get(name) {
+            return Err(PromptProfileSelectionError::Unavailable {
+                name: name.to_owned(),
+                reason: reason.to_string(),
+            });
+        }
+        Err(PromptProfileSelectionError::NotFound {
+            name: name.to_owned(),
+            available: self
+                .available
+                .keys()
+                .map(|name| name.as_ref())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+    }
+
+    pub fn task_tool_summary(&self, builtin_description: &str) -> String {
+        task_tool_summary(
+            self.available.values().map(AsRef::as_ref),
+            self.available.len(),
+            Some(builtin_description),
+        )
+    }
+
+    pub fn disabled(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.disabled
+            .iter()
+            .map(|(name, reason)| (name.as_ref(), reason.as_ref()))
+    }
 }
 
 impl PromptProfileCatalog {
@@ -119,6 +201,48 @@ impl PromptProfileCatalog {
         })
     }
 
+    /// A stable, bounded Markdown list for embedding in a task tool description.
+    /// Passing a description includes the virtual `builtin` profile first.
+    pub fn task_tool_summary(&self, builtin_description: Option<&str>) -> String {
+        task_tool_summary(
+            self.profiles.values().map(AsRef::as_ref),
+            self.profiles.len(),
+            builtin_description,
+        )
+    }
+
+    pub fn bind_for_tasks(
+        &self,
+        parent_model: &Model,
+        parent_thinking: &ThinkingConfig,
+        model_policy: &ModelPolicy,
+        timeouts: Timeouts,
+    ) -> TaskProfileBindings {
+        let mut available = BTreeMap::new();
+        let mut disabled = BTreeMap::new();
+        for (name, profile) in &self.profiles {
+            match validate_task_profile(
+                profile,
+                parent_model,
+                parent_thinking,
+                model_policy,
+                timeouts,
+            ) {
+                Ok(()) => {
+                    available.insert(Arc::clone(name), Arc::clone(profile));
+                }
+                Err(reason) => {
+                    warn_task_profile_once(name, parent_model, &reason);
+                    disabled.insert(Arc::clone(name), Arc::from(reason));
+                }
+            }
+        }
+        TaskProfileBindings {
+            available,
+            disabled,
+        }
+    }
+
     fn load_dir(&mut self, dir: &Path) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -152,6 +276,77 @@ impl PromptProfileCatalog {
     }
 }
 
+fn task_tool_summary<'a>(
+    profiles: impl Iterator<Item = &'a SystemPromptProfile>,
+    profile_count: usize,
+    builtin_description: Option<&str>,
+) -> String {
+    let builtin_entries = usize::from(builtin_description.is_some());
+    let profile_limit = MAX_TASK_SUMMARY_ENTRIES.saturating_sub(builtin_entries);
+    let mut lines = Vec::with_capacity(MAX_TASK_SUMMARY_ENTRIES + 1);
+    if let Some(description) = builtin_description {
+        lines.push(format!(
+            "- `{BUILTIN_PROFILE_NAME}`: {}",
+            bounded_summary_description(description)
+        ));
+    }
+    lines.extend(profiles.take(profile_limit).map(|profile| {
+        let mut line = format!("- `{}`", profile.name());
+        if let Some(description) = profile.description() {
+            line.push_str(": ");
+            line.push_str(&bounded_summary_description(description));
+        }
+        line
+    }));
+    let omitted = profile_count.saturating_sub(profile_limit);
+    if omitted > 0 {
+        lines.push(format!("- ... and {omitted} more"));
+    }
+    lines.join("\n")
+}
+
+fn validate_task_profile(
+    profile: &SystemPromptProfile,
+    parent_model: &Model,
+    parent_thinking: &ThinkingConfig,
+    model_policy: &ModelPolicy,
+    timeouts: Timeouts,
+) -> Result<(), String> {
+    if profile.subagent_model().is_none() && profile.subagent_thinking().is_none() {
+        return Ok(());
+    }
+    let mut model = match profile.subagent_model() {
+        Some(spec) => Model::from_spec_with_policy(spec, model_policy)
+            .map_err(|error| format!("subagent model {spec:?} is unavailable: {error}"))?,
+        None => Model::clone(parent_model),
+    };
+    provider::adjust_model(&mut model, timeouts)
+        .map_err(|error| format!("cannot inspect subagent model {:?}: {error}", model.spec()))?;
+    let thinking = profile
+        .subagent_thinking()
+        .cloned()
+        .map(ThinkingConfig::from)
+        .unwrap_or_else(|| parent_thinking.clone());
+    thinking.resolve_exact(&model).map_err(|error| {
+        format!(
+            "subagent thinking {thinking:?} is incompatible with model {:?}: {error}",
+            model.spec()
+        )
+    })?;
+    Ok(())
+}
+
+fn warn_task_profile_once(name: &str, model: &Model, reason: &str) {
+    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    let key = format!("{name}\0{}\0{reason}", model.spec());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(key) {
+        tracing::warn!(profile = name, model = %model.spec(), reason, "subagent profile disabled");
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PromptProfileSelectionError {
     #[error(
@@ -160,6 +355,8 @@ pub enum PromptProfileSelectionError {
     InvalidName { name: String },
     #[error("system prompt profile {name:?} is invalid: {reason}")]
     InvalidProfile { name: String, reason: String },
+    #[error("system prompt profile {name:?} is unavailable for subagents: {reason}")]
+    Unavailable { name: String, reason: String },
     #[error("system prompt profile {name:?} not found{suffix}", suffix = available_suffix(.available))]
     NotFound { name: String, available: String },
 }
@@ -188,6 +385,10 @@ enum PromptProfileError {
     UnclosedFrontmatter,
     #[error("invalid frontmatter: {0}")]
     InvalidFrontmatter(#[from] serde_yaml::Error),
+    #[error("invalid subagent model {model:?}; expected qualified provider/model syntax")]
+    InvalidSubagentModel { model: String },
+    #[error("invalid subagent thinking: {0}")]
+    InvalidSubagentThinking(#[from] ThinkingParseError),
     #[error("profile body is empty")]
     Empty,
     #[error("unknown template directive {directive:?} on line {line}")]
@@ -211,6 +412,41 @@ fn validate_profile_name(name: &str) -> Result<(), PromptProfileError> {
         return Err(PromptProfileError::InvalidName);
     }
     Ok(())
+}
+
+fn parse_subagent_model(model: String) -> Result<Arc<str>, PromptProfileError> {
+    let model = model.trim();
+    let valid = model.split_once('/').is_some_and(|(provider, model_id)| {
+        !provider.is_empty()
+            && provider.as_bytes()[0].is_ascii_alphanumeric()
+            && provider
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !model_id.is_empty()
+            && model_id.split('/').all(|part| {
+                !part.is_empty()
+                    && part
+                        .chars()
+                        .all(|character| !character.is_whitespace() && !character.is_control())
+            })
+    });
+    if !valid {
+        return Err(PromptProfileError::InvalidSubagentModel {
+            model: model.to_owned(),
+        });
+    }
+    Ok(Arc::from(model))
+}
+
+fn bounded_summary_description(description: &str) -> String {
+    let mut description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if description.len() <= MAX_TASK_SUMMARY_DESCRIPTION_BYTES {
+        return description;
+    }
+    let boundary = description.floor_char_boundary(MAX_TASK_SUMMARY_DESCRIPTION_BYTES - 3);
+    description.truncate(boundary);
+    description.push_str("...");
+    description
 }
 
 fn load_profile(path: &Path, name: Arc<str>) -> Result<SystemPromptProfile, PromptProfileError> {
@@ -237,6 +473,14 @@ fn load_profile(path: &Path, name: Arc<str>) -> Result<SystemPromptProfile, Prom
     if frontmatter.layout == PromptProfileLayout::Custom {
         validate_custom_template(body, body_line)?;
     }
+    let subagent_model = frontmatter
+        .subagent_model
+        .map(parse_subagent_model)
+        .transpose()?;
+    let subagent_thinking = frontmatter
+        .subagent_thinking
+        .map(FrontmatterThinking::parse)
+        .transpose()?;
     let description = frontmatter
         .description
         .map(|description| Arc::from(description.trim()))
@@ -245,6 +489,8 @@ fn load_profile(path: &Path, name: Arc<str>) -> Result<SystemPromptProfile, Prom
         name,
         description,
         layout: frontmatter.layout,
+        subagent_model,
+        subagent_thinking,
         body: Arc::from(body),
         path: Arc::from(path),
     })
@@ -324,12 +570,21 @@ fn validate_custom_template(
 
 #[cfg(test)]
 mod tests {
+    use maki_config::ModelPolicy;
+    use maki_providers::{Model, ThinkingConfig};
+    use maki_storage::thinking::StoredThinking;
     use tempfile::TempDir;
 
     use super::*;
 
     fn discover(dir: &Path) -> PromptProfileCatalog {
         PromptProfileCatalog::discover_with(None, Some(dir))
+    }
+
+    fn profile_dir(dir: &TempDir) -> std::path::PathBuf {
+        let profiles = dir.path().join(PROFILE_DIR);
+        fs::create_dir(&profiles).unwrap();
+        profiles
     }
 
     #[test]
@@ -351,6 +606,188 @@ mod tests {
         let custom = catalog.get("custom").unwrap();
         assert_eq!(custom.layout(), PromptProfileLayout::Custom);
         assert_eq!(custom.description(), Some("Custom layout"));
+    }
+
+    #[test]
+    fn parses_subagent_model_and_semantic_thinking_overrides() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(
+            profiles.join("review.md"),
+            "---\nsubagent_model: custom-provider/org/model\nsubagent_thinking: XHigh\n---\nReview carefully.",
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("budget.md"),
+            "---\nsubagent_thinking: 8192\n---\nUse a budget.",
+        )
+        .unwrap();
+
+        let catalog = discover(dir.path());
+        let review = catalog.get("review").unwrap();
+        assert_eq!(review.subagent_model(), Some("custom-provider/org/model"));
+        assert_eq!(
+            review.subagent_thinking(),
+            Some(&StoredThinking::Effort {
+                level: "xhigh".into()
+            })
+        );
+        assert_eq!(
+            catalog.get("budget").unwrap().subagent_thinking(),
+            Some(&StoredThinking::Budget { tokens: 8192 })
+        );
+    }
+
+    #[test]
+    fn omitted_subagent_overrides_have_no_effect() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(profiles.join("plain.md"), "Plain profile.").unwrap();
+
+        let profile = discover(dir.path()).get("plain").unwrap();
+        assert_eq!(profile.subagent_model(), None);
+        assert_eq!(profile.subagent_thinking(), None);
+    }
+
+    #[test]
+    fn task_bindings_disable_incompatible_profiles_without_invalidating_main_use() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(profiles.join("plain.md"), "Plain profile.").unwrap();
+        fs::write(
+            profiles.join("blocked.md"),
+            "---\nsubagent_model: openai/gpt-5.4\n---\nBlocked child model.",
+        )
+        .unwrap();
+        let catalog = discover(dir.path());
+        let parent = Model::from_spec("anthropic/claude-sonnet-4-6").unwrap();
+        let policy = ModelPolicy::new(&[], &["openai/gpt-5.4".into()]).unwrap();
+
+        let bindings =
+            catalog.bind_for_tasks(&parent, &ThinkingConfig::Off, &policy, Timeouts::default());
+
+        assert!(bindings.resolve("plain").unwrap().is_some());
+        assert!(matches!(
+            bindings.resolve("blocked"),
+            Err(PromptProfileSelectionError::Unavailable { .. })
+        ));
+        assert!(catalog.get("blocked").is_some());
+        let summary = bindings.task_tool_summary("Built in");
+        assert!(summary.contains("`plain`"));
+        assert!(!summary.contains("`blocked`"));
+    }
+
+    #[test]
+    fn rejects_invalid_subagent_model_syntax_without_requiring_known_provider() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        for (name, model) in [
+            ("unqualified", "model"),
+            ("provider", "/model"),
+            ("model", "provider/"),
+            ("empty-segment", "provider/org//model"),
+            ("bad-provider", "provider.name/model"),
+            ("whitespace", "provider/model name"),
+        ] {
+            fs::write(
+                profiles.join(format!("{name}.md")),
+                format!("---\nsubagent_model: {model}\n---\nbody"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            profiles.join("unknown.md"),
+            "---\nsubagent_model: not-installed/model\n---\nbody",
+        )
+        .unwrap();
+
+        let catalog = discover(dir.path());
+        assert_eq!(
+            catalog.get("unknown").unwrap().subagent_model(),
+            Some("not-installed/model")
+        );
+        for name in [
+            "unqualified",
+            "provider",
+            "model",
+            "empty-segment",
+            "bad-provider",
+            "whitespace",
+        ] {
+            let error = catalog.resolve(Some(name)).unwrap_err();
+            assert!(error.to_string().contains("qualified provider/model"));
+        }
+    }
+
+    #[test]
+    fn rejects_thinking_outside_shared_vocabulary() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(
+            profiles.join("bad.md"),
+            "---\nsubagent_thinking: turbo\n---\nbody",
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("zero.md"),
+            "---\nsubagent_thinking: 0\n---\nbody",
+        )
+        .unwrap();
+
+        let catalog = discover(dir.path());
+        assert!(
+            catalog
+                .resolve(Some("bad"))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown thinking level")
+        );
+        assert!(
+            catalog
+                .resolve(Some("zero"))
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+    }
+
+    #[test]
+    fn task_tool_summary_is_sorted_normalized_and_bounded() {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        let long_description = format!("line one\n{}end", "x".repeat(200));
+        for index in (0..25).rev() {
+            let description = if index == 0 {
+                long_description.as_str()
+            } else {
+                "short description"
+            };
+            let description = description.replace('\n', "\n  ");
+            fs::write(
+                profiles.join(format!("p{index:02}.md")),
+                format!("---\ndescription: |\n  {description}\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let catalog = discover(dir.path());
+
+        let summary = catalog.task_tool_summary(Some("Built in\n task prompt"));
+        assert_eq!(
+            summary,
+            catalog.task_tool_summary(Some("Built in\n task prompt"))
+        );
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "- `builtin`: Built in task prompt");
+        assert!(lines[1].starts_with("- `p00`: line one "));
+        assert!(lines[1].ends_with("..."));
+        assert!(lines[1].len() <= "- `p00`: ".len() + MAX_TASK_SUMMARY_DESCRIPTION_BYTES);
+        assert!(lines[2].starts_with("- `p01`:"));
+        assert_eq!(lines[MAX_TASK_SUMMARY_ENTRIES], "- ... and 6 more");
+        assert_eq!(lines.len(), MAX_TASK_SUMMARY_ENTRIES + 1);
+
+        let without_builtin = catalog.task_tool_summary(None);
+        assert!(without_builtin.starts_with("- `p00`"));
+        assert!(without_builtin.ends_with("- ... and 5 more"));
     }
 
     #[test]
@@ -502,5 +939,106 @@ mod tests {
             Some(&profile),
         );
         assert_eq!(output, "{{maki.tools}}");
+    }
+
+    #[test]
+    fn task_overlay_lands_after_default_and_before_mode_contract() {
+        const CONTRACT: &str = "\n<mode-contract>RESEARCH</mode-contract>";
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(profiles.join("review.md"), "PROFILE_OVERLAY").unwrap();
+        let profile = discover(dir.path()).get("review").unwrap();
+
+        let output = crate::prompt::assemble_task(
+            crate::prompt::PromptId::Research,
+            &crate::prompt::ResolvedSlots::default(),
+            "TASK_CONTEXT",
+            Some(&profile),
+            CONTRACT,
+        );
+        assert!(output.starts_with("You are a research agent"));
+        assert!(output.find("TASK_CONTEXT") < output.find("PROFILE_OVERLAY"));
+        assert!(output.ends_with(CONTRACT));
+        assert_eq!(output.matches(CONTRACT).count(), 1);
+    }
+
+    #[test]
+    fn task_custom_default_is_the_full_task_default() {
+        const CONTRACT: &str = "MODE_CONTRACT";
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(
+            profiles.join("custom.md"),
+            "---\nlayout: custom\n---\n{{maki.default}}",
+        )
+        .unwrap();
+        let profile = discover(dir.path()).get("custom").unwrap();
+        let slots = crate::prompt::ResolvedSlots::default();
+        let default =
+            crate::prompt::assemble(crate::prompt::PromptId::General, &slots, "TASK_CONTEXT");
+
+        let output = crate::prompt::assemble_task(
+            crate::prompt::PromptId::General,
+            &slots,
+            "TASK_CONTEXT",
+            Some(&profile),
+            CONTRACT,
+        );
+        assert_eq!(output, format!("{default}{CONTRACT}"));
+    }
+
+    #[test]
+    fn task_custom_directives_use_mode_specific_components() {
+        const CONTRACT: &str = "\nMODE_CONTRACT";
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(
+            profiles.join("custom.md"),
+            concat!(
+                "---\nlayout: custom\n---\n",
+                "{{maki.identity}}\n",
+                "{{maki.style}}\n",
+                "{{maki.tools}}\n",
+                "{{maki.conventions}}\n",
+                "{{maki.completion}}\n",
+                "{{maki.context}}\n",
+                "PLAN_START\n{{maki.plan}}\nPLAN_END",
+            ),
+        )
+        .unwrap();
+        let profile = discover(dir.path()).get("custom").unwrap();
+        let slots = crate::prompt::ResolvedSlots::default();
+
+        let research = crate::prompt::assemble_task(
+            crate::prompt::PromptId::Research,
+            &slots,
+            "TASK_CONTEXT",
+            Some(&profile),
+            CONTRACT,
+        );
+        assert!(research.contains("You are a research agent"));
+        assert!(research.contains("Do NOT modify files"));
+        assert!(research.contains("# Output discipline"));
+        assert!(research.contains("# Tool usage"));
+        assert!(research.contains("# Guidelines"));
+        assert!(research.contains("Environment:"));
+        assert!(research.contains("TASK_CONTEXT"));
+        assert!(research.contains("{platform}\nTASK_CONTEXT"));
+        assert!(!research.contains("# When done"));
+        assert!(research.contains("PLAN_START\nPLAN_END"));
+        assert!(research.ends_with(CONTRACT));
+
+        let general = crate::prompt::assemble_task(
+            crate::prompt::PromptId::General,
+            &slots,
+            "TASK_CONTEXT",
+            Some(&profile),
+            CONTRACT,
+        );
+        assert!(general.contains("You are a general-purpose coding agent"));
+        assert!(general.contains("# Conventions"));
+        assert!(general.contains("# When done"));
+        assert!(!general.contains("# Guidelines"));
+        assert!(general.ends_with(CONTRACT));
     }
 }

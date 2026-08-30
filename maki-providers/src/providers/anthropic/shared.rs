@@ -582,23 +582,32 @@ impl EventParser {
 /// unconditionally unless it declares a toggle, and no Claude model has ever
 /// accepted `minimal`, so the canonical fallback ladder would offer a level the
 /// API rejects.
-const EFFORT_TO_MAX: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"])];
+const EFFORT_TO_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+    "low", "medium", "high", "xhigh", "max",
+])];
 const TOGGLE_WITH_EFFORT_TO_MAX: &[StaticReasoningOption] = &[
     StaticReasoningOption::Toggle,
     StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"]),
 ];
 const EFFORT_TO_MAX_WITH_BUDGET: &[StaticReasoningOption] = &[
     StaticReasoningOption::Effort(&["low", "medium", "high", "max"]),
-    StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None },
+    StaticReasoningOption::BudgetTokens {
+        min: Some(1_024),
+        max: None,
+    },
 ];
 const EFFORT_TO_HIGH_WITH_BUDGET: &[StaticReasoningOption] = &[
     StaticReasoningOption::Effort(&["low", "medium", "high"]),
-    StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None },
+    StaticReasoningOption::BudgetTokens {
+        min: Some(1_024),
+        max: None,
+    },
 ];
 /// Pre-effort models: a token budget is the only knob they take.
-const BUDGET_ONLY: &[StaticReasoningOption] =
-    &[StaticReasoningOption::BudgetTokens { min: Some(1_024), max: None }];
+const BUDGET_ONLY: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetTokens {
+    min: Some(1_024),
+    max: None,
+}];
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[

@@ -83,8 +83,7 @@ impl Opencode {
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
-        opts.thinking
-            .apply_reasoning_effort(&mut body, model);
+        opts.thinking.apply_reasoning_effort(&mut body, model);
         self.chat_compat
             .do_stream(model, &[], &body, event_tx, auth)
             .await

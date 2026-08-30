@@ -85,6 +85,40 @@ impl ToolSource {
             Self::Lua { plugin, .. } => Cow::Owned(format!("lua:{plugin}")),
         }
     }
+
+    pub fn is_trusted(&self) -> bool {
+        match self {
+            Self::Native { trusted, .. } => *trusted,
+            Self::Lua { bundled, .. } => *bundled,
+            Self::Mcp { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffect {
+    ReadOnly,
+    Isolated,
+    Orchestrator,
+    Mutating,
+    #[default]
+    Unknown,
+}
+
+impl ToolEffect {
+    pub fn is_safe_in_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::Isolated | Self::Orchestrator)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Isolated => "isolated",
+            Self::Orchestrator => "orchestrator",
+            Self::Mutating => "mutating",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 pub type ParseError = super::schema::ToolInputError;
@@ -337,6 +371,7 @@ pub trait Tool: Send + Sync + 'static {
 pub struct RegisteredTool {
     pub tool: Arc<dyn Tool>,
     pub source: ToolSource,
+    pub effect: ToolEffect,
 }
 
 impl RegisteredTool {
@@ -347,6 +382,14 @@ impl RegisteredTool {
     /// Parse without naming `ParseError`, handy for crates outside `maki-agent`.
     pub fn try_parse(&self, input: &serde_json::Value) -> Option<Box<dyn ToolInvocation>> {
         self.tool.parse(input).ok()
+    }
+
+    pub fn is_safe_in_read_only(&self) -> bool {
+        self.effect.is_safe_in_read_only()
+            && matches!(
+                self.source,
+                ToolSource::Native { trusted: true, .. } | ToolSource::Lua { bundled: true, .. }
+            )
     }
 }
 
@@ -394,6 +437,15 @@ impl ToolRegistry {
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
+        self.register_audited(tool, source, ToolEffect::Unknown)
+    }
+
+    pub fn register_audited(
+        &self,
+        tool: Arc<dyn Tool>,
+        source: ToolSource,
+        effect: ToolEffect,
+    ) -> Result<(), RegistryError> {
         let name = tool.name().to_owned();
         let mut conflict = None;
         self.tools.rcu(|current| {
@@ -407,6 +459,7 @@ impl ToolRegistry {
             next.push(RegisteredTool {
                 tool: Arc::clone(&tool),
                 source: source.clone(),
+                effect,
             });
             next
         });
@@ -422,12 +475,23 @@ impl ToolRegistry {
         &self,
         entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
+        self.register_many_audited(
+            entries
+                .into_iter()
+                .map(|(tool, source)| (tool, source, ToolEffect::Unknown)),
+        )
+    }
+
+    pub fn register_many_audited(
+        &self,
+        entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource, ToolEffect)>,
+    ) -> Result<(), RegistryError> {
         let entries: Vec<_> = entries.into_iter().collect();
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
             let mut next = Vec::clone(current);
-            for (tool, source) in &entries {
+            for (tool, source, effect) in &entries {
                 let name = tool.name();
                 if let Some(existing) = next.iter().find(|t| t.name() == name) {
                     conflict = Some(RegistryError::NameConflict {
@@ -439,6 +503,7 @@ impl ToolRegistry {
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
                     source: source.clone(),
+                    effect: *effect,
                 });
             }
             next
@@ -466,6 +531,20 @@ impl ToolRegistry {
         plugin: &str,
         new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
+        self.replace_plugin_audited(
+            plugin,
+            new_entries
+                .into_iter()
+                .map(|(tool, source)| (tool, source, ToolEffect::Unknown))
+                .collect(),
+        )
+    }
+
+    pub fn replace_plugin_audited(
+        &self,
+        plugin: &str,
+        new_entries: Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)>,
+    ) -> Result<(), RegistryError> {
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -476,7 +555,7 @@ impl ToolRegistry {
                 )
                 .cloned()
                 .collect();
-            for (tool, source) in &new_entries {
+            for (tool, source, effect) in &new_entries {
                 let name = tool.name();
                 if let Some(existing) = next.iter().find(|t| t.name() == name) {
                     conflict = Some(RegistryError::NameConflict {
@@ -488,6 +567,7 @@ impl ToolRegistry {
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
                     source: source.clone(),
+                    effect: *effect,
                 });
             }
             next
@@ -549,6 +629,9 @@ impl ToolRegistry {
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
             if !entry.tool.audience().contains(ctx.audience) {
+                continue;
+            }
+            if ctx.policy().is_read_only() && !entry.is_safe_in_read_only() {
                 continue;
             }
             if !ctx.filter.matches(entry.name()) {
@@ -890,8 +973,122 @@ mod tests {
             names_for(ToolAudience::MAIN),
             vec!["main_only_tool", "everywhere"]
         );
-        assert_eq!(names_for(ToolAudience::RESEARCH_SUB), vec!["everywhere"]);
+        assert_eq!(names_for(ToolAudience::RESEARCH_SUB), Vec::<String>::new());
         assert_eq!(names_for(ToolAudience::GENERAL_SUB), vec!["everywhere"]);
+    }
+
+    #[test]
+    fn read_only_definitions_require_audited_host_trust_and_safe_effect() {
+        let reg = ToolRegistry::new();
+        let trusted_native = |name: &str| {
+            (
+                mock(name),
+                ToolSource::Native {
+                    owner: "maki".into(),
+                    contract: format!("{name}/v1").into(),
+                    trusted: true,
+                },
+            )
+        };
+
+        for (name, effect) in [
+            ("native_read", ToolEffect::ReadOnly),
+            ("native_isolated", ToolEffect::Isolated),
+            ("native_orchestrator", ToolEffect::Orchestrator),
+            ("native_mutating", ToolEffect::Mutating),
+        ] {
+            let (tool, source) = trusted_native(name);
+            reg.register_audited(tool, source, effect).unwrap();
+        }
+        let (tool, source) = trusted_native("native_unknown");
+        reg.register(tool, source).unwrap();
+        reg.register_audited(
+            mock("native_untrusted"),
+            ToolSource::Native {
+                owner: "third-party".into(),
+                contract: "native-untrusted/v1".into(),
+                trusted: false,
+            },
+            ToolEffect::ReadOnly,
+        )
+        .unwrap();
+        reg.register_audited(
+            mock("lua_bundled"),
+            ToolSource::Lua {
+                plugin: "bundled".into(),
+                contract: "lua-bundled/v1".into(),
+                bundled: true,
+            },
+            ToolEffect::ReadOnly,
+        )
+        .unwrap();
+        reg.register_audited(
+            mock("lua_unbundled"),
+            lua_source("external"),
+            ToolEffect::ReadOnly,
+        )
+        .unwrap();
+        reg.register_audited(
+            mock("mcp_claimed_read"),
+            ToolSource::Mcp {
+                server: "server".into(),
+            },
+            ToolEffect::ReadOnly,
+        )
+        .unwrap();
+
+        let filter = crate::tools::ToolFilter::All.for_mode(&crate::AgentMode::ReadOnly);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        let names: Vec<_> = reg
+            .definitions(&Vars::new(), &ctx, false)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["name"].as_str().unwrap().to_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "native_read",
+                "native_isolated",
+                "native_orchestrator",
+                "lua_bundled"
+            ]
+        );
+    }
+
+    #[test]
+    fn research_audience_uses_read_only_definition_policy() {
+        let reg = ToolRegistry::new();
+        for (name, effect) in [
+            ("read", ToolEffect::ReadOnly),
+            ("write", ToolEffect::Mutating),
+        ] {
+            reg.register_audited(
+                mock(name),
+                ToolSource::Native {
+                    owner: "maki".into(),
+                    contract: format!("{name}/v1").into(),
+                    trusted: true,
+                },
+                effect,
+            )
+            .unwrap();
+        }
+        let ctx = DescriptionContext {
+            filter: &crate::tools::ToolFilter::All,
+            audience: ToolAudience::RESEARCH_SUB,
+            workflow: false,
+        };
+
+        let definitions = reg.definitions(&Vars::new(), &ctx, false);
+        assert_eq!(definitions[0]["name"], "read");
+        assert_eq!(definitions.as_array().unwrap().len(), 1);
     }
 
     #[test]

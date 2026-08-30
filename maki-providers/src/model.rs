@@ -208,9 +208,7 @@ pub enum StaticReasoningOption {
     BudgetTokens { min: Option<u32>, max: Option<u32> },
 }
 
-pub(crate) fn reasoning_options_from_static(
-    options: &[StaticReasoningOption],
-) -> ReasoningOptions {
+pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -> ReasoningOptions {
     ReasoningOptions::new(
         options
             .iter()
@@ -219,12 +217,10 @@ pub(crate) fn reasoning_options_from_static(
                 StaticReasoningOption::Effort(values) => ReasoningOption::Effort {
                     values: values.iter().map(|v| (*v).to_string()).collect(),
                 },
-                StaticReasoningOption::BudgetTokens { min, max } => {
-                    ReasoningOption::BudgetTokens {
-                        min: *min,
-                        max: *max,
-                    }
-                }
+                StaticReasoningOption::BudgetTokens { min, max } => ReasoningOption::BudgetTokens {
+                    min: *min,
+                    max: *max,
+                },
             })
             .collect(),
     )

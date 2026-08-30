@@ -403,6 +403,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
             theme_gen: None,
             clicks,
             state: None,
+            lua_provenance: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );

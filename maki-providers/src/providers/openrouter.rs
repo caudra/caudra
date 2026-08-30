@@ -297,7 +297,9 @@ mod tests {
         });
 
         let info = parse_model(&m).expect("model should parse");
-        let options = info.reasoning_options.expect("reasoning should be declared");
+        let options = info
+            .reasoning_options
+            .expect("reasoning should be declared");
         // Declaration order is the ladder, and a spelling maki does not know is
         // still the provider's to declare.
         assert_eq!(options.efforts(), ["high", "bogus", "low", "none"]);
@@ -345,10 +347,7 @@ mod tests {
             "default_enabled": default_enabled,
             "mandatory": mandatory,
         }));
-        assert_eq!(
-            ThinkingConfig::Off.effort_str(&model).as_deref(),
-            expected
-        );
+        assert_eq!(ThinkingConfig::Off.effort_str(&model).as_deref(), expected);
     }
 
     #[test_case(json!(["image"]), json!(["image"]); "image_only")]

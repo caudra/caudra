@@ -1372,6 +1372,7 @@ fn restore_snapshot_text(
             theme_gen: None,
             clicks,
             state,
+            lua_provenance: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -1521,13 +1522,14 @@ fn agent_api_value_failures_return_err_pairs() {
                 parts[1] = pair_err(maki.agent.system_prompt(ctx, {{ prompt_id = "nope" }})) and "prompt_err" or "prompt_ok"
                 parts[2] = pair_err(maki.agent.tools(ctx, {{ audience = "nope" }})) and "tools_err" or "tools_ok"
                 parts[3] = pair_err(maki.agent.resolve_model(ctx, {{ spec = "not-a-spec" }})) and "model_err" or "model_ok"
+                parts[4] = pair_err(maki.agent.tools(ctx, {{ audience = "main", spec = "not-a-spec" }})) and "tools_model_err" or "tools_model_ok"
                 return table.concat(parts, " ")
             end
         }})"#
     );
     host.load_source("agent_pairs_plugin", &src).unwrap();
     let out = exec_tool(&reg, "agent_pairs_probe", serde_json::json!({})).unwrap();
-    assert_eq!(out, "prompt_err tools_err model_err");
+    assert_eq!(out, "prompt_err tools_err model_err tools_model_err");
 }
 
 /// `spec` must win over `tier` when both are given, proving the task plugin's
@@ -2425,6 +2427,7 @@ fn warm_restore_item(id: &str, clicks: Vec<usize>) -> maki_lua::RestoreItem {
         theme_gen: None,
         clicks,
         state: None,
+        lua_provenance: None,
     }
 }
 
@@ -4326,6 +4329,7 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        lua_provenance: None,
     };
     let unknown_item = maki_lua::RestoreItem {
         tool: Arc::from("definitely_not_a_tool"),
@@ -4337,6 +4341,7 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        lua_provenance: None,
     };
 
     handle.request_restore(unknown_item, event_tx.clone());
@@ -4367,6 +4372,113 @@ fn restore_tool_async_ordering_and_delivery() {
         tool_ids.contains(&"b"),
         "known tool 'b' should emit snapshot"
     );
+}
+
+#[test]
+fn restore_rejects_a_replaced_plugin_contract() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = |body: &str| {
+        format!(
+            r#"maki.api.register_tool({{
+                name = "contract_restore",
+                description = "t",
+                schema = {MINIMAL_SCHEMA},
+                audiences = {{ "main" }},
+                handler = function() return "ok" end,
+                restore = function()
+                    local buf = maki.ui.buf()
+                    buf:line("{body}")
+                    return buf
+                end,
+            }})"#
+        )
+    };
+    host.load_source("contract_plugin", &source("old")).unwrap();
+    let provenance = match &reg.get("contract_restore").unwrap().source {
+        maki_agent::tools::ToolSource::Lua {
+            plugin, contract, ..
+        } => maki_agent::LuaToolProvenance {
+            plugin: plugin.to_string(),
+            contract: contract.to_string(),
+            error_restore_allowed: true,
+        },
+        source => panic!("unexpected source: {source:?}"),
+    };
+    host.load_source("contract_plugin", &source("new")).unwrap();
+
+    let handle = host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from("contract_restore"),
+            tool_use_id: "restore_id".into(),
+            output: "ok".into(),
+            input: serde_json::json!({}),
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+            lua_provenance: Some(provenance),
+        },
+        maki_agent::EventSender::new(tx, 0),
+    );
+    handle.wait_restore_complete_for_test();
+
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn restore_rejects_an_error_that_never_reached_the_tool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"maki.api.register_tool({{
+            name = "blocked_restore",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function() return "ok" end,
+            restore = function()
+                local buf = maki.ui.buf()
+                buf:line("must not run")
+                return buf
+            end,
+        }})"#
+    );
+    host.load_source("blocked_plugin", &source).unwrap();
+    let provenance = match &reg.get("blocked_restore").unwrap().source {
+        maki_agent::tools::ToolSource::Lua {
+            plugin, contract, ..
+        } => maki_agent::LuaToolProvenance {
+            plugin: plugin.to_string(),
+            contract: contract.to_string(),
+            error_restore_allowed: false,
+        },
+        source => panic!("unexpected source: {source:?}"),
+    };
+    let handle = host.event_handle();
+    let (tx, rx) = flume::unbounded();
+
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from("blocked_restore"),
+            tool_use_id: "restore_id".into(),
+            output: "permission denied".into(),
+            input: serde_json::json!({}),
+            is_error: true,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+            lua_provenance: Some(provenance),
+        },
+        maki_agent::EventSender::new(tx, 0),
+    );
+    handle.wait_restore_complete_for_test();
+
+    assert!(rx.is_empty());
 }
 
 #[test_case::test_case(
@@ -4404,6 +4516,7 @@ fn restore_rebuilds_body_from_input_content(
             theme_gen: None,
             clicks: vec![0],
             state: None,
+            lua_provenance: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -5151,11 +5264,13 @@ fn call_tool_resolves_lua_tool_and_reports_unknown() {
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local out, err = maki.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
+                local out, err, call_id = maki.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
                 if err ~= nil then return "unexpected err: " .. err end
-                local out2, err2 = maki.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
+                if type(call_id) ~= "string" then return "missing call id" end
+                local out2, err2, call_id2 = maki.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
                 if out2 ~= nil then return "unexpected output: " .. out2 end
                 if err2 == nil then return "expected err for unknown tool" end
+                if type(call_id2) ~= "string" or call_id2 == call_id then return "bad error call id" end
                 return out
             end
         }})"#
@@ -5225,6 +5340,29 @@ fn lua_model_suffix_reaches_parent_model_but_not_flattened_output(is_error: bool
         maki_providers::ContentBlock::ToolResult { content, is_error: actual_error, .. }
             if content == "visible output\n\nmodel-only context" && *actual_error == is_error
     ));
+
+    let caller = format!(
+        r#"maki.api.register_tool({{
+            name = "model_suffix_caller",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local output, err = maki.agent.call_tool(ctx, "model_suffix_probe", {{}})
+                return err or output
+            end
+        }})"#
+    );
+    host.load_source("model_suffix_caller_plugin", &caller)
+        .unwrap();
+    let called = exec_tool_in(
+        &reg,
+        "model_suffix_caller",
+        json!({}),
+        Some(Arc::clone(&reg)),
+    )
+    .unwrap();
+    assert_eq!(called, format!("{VISIBLE_OUTPUT}\n\n{MODEL_SUFFIX}"));
 }
 
 #[test]
@@ -5280,10 +5418,124 @@ fn session_task_id_reopens_completed_history() {
     assert!(out.starts_with("session-"), "got: {out}");
 }
 
+#[test]
+fn task_session_defaults_to_plan_and_locks_continuation_identity() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "task_session_spec_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local first, first_err = maki.agent.session(ctx, {{ task = true }})
+                if first_err then return first_err end
+                local task_id = first:id()
+                first:close()
+                local continued, continued_err = maki.agent.session(ctx, {{
+                    task = true,
+                    task_id = task_id,
+                    mode = "build",
+                }})
+                if continued then return "unexpected continuation" end
+                return task_id .. "\n" .. continued_err
+            end
+        }})"#
+    );
+    host.load_source("task_session_spec_plugin", &src).unwrap();
+    let entry = reg.get("task_session_spec_probe").unwrap();
+    let invocation = entry.tool.parse(&json!({})).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    let history = ctx.subagent_history.clone();
+    let result = smol::block_on(invocation.execute(&ctx)).output.unwrap();
+    let output = result.as_display_text();
+    let (task_id, error) = output.split_once('\n').unwrap();
+
+    assert!(error.contains("uses Plan mode, not requested Build mode"));
+    let snapshot = history.snapshot();
+    let spec = snapshot.records()[task_id].spec().unwrap();
+    assert_eq!(spec.profile_name, "builtin");
+    assert_eq!(spec.mode, maki_agent::SubagentTaskMode::Plan);
+    assert!(!history.is_active(task_id));
+}
+
+#[test]
+fn plan_parent_cannot_launch_build_task() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "task_build_escalation_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local session, err = maki.agent.session(ctx, {{ task = true, mode = "build" }})
+                if session then return "unexpected session" end
+                return err
+            end
+        }})"#
+    );
+    host.load_source("task_build_escalation_plugin", &src)
+        .unwrap();
+    let entry = reg.get("task_build_escalation_probe").unwrap();
+    let invocation = entry.tool.parse(&json!({})).unwrap();
+    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Plan(
+        "/tmp/plan.md".into(),
+    ));
+    let output = smol::block_on(invocation.execute(&ctx))
+        .output
+        .unwrap()
+        .as_display_text();
+
+    assert_eq!(
+        output,
+        "build-mode task cannot be launched from a read-only or plan-mode parent"
+    );
+}
+
+#[test]
+fn plan_parent_cannot_launch_generic_build_session() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "generic_session_escalation_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local session, err = maki.agent.session(ctx, {{}})
+                if session then return "unexpected session" end
+                return err
+            end
+        }})"#
+    );
+    host.load_source("generic_session_escalation_plugin", &src)
+        .unwrap();
+    let entry = reg.get("generic_session_escalation_probe").unwrap();
+    let invocation = entry.tool.parse(&json!({})).unwrap();
+    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Plan(
+        "/tmp/plan.md".into(),
+    ));
+    let output = smol::block_on(invocation.execute(&ctx))
+        .output
+        .unwrap()
+        .as_display_text();
+
+    assert_eq!(
+        output,
+        "generic subagent sessions cannot be launched from a read-only or plan-mode parent"
+    );
+}
+
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
 #[test_case::test_case("{ task_id = 'missing' }", "unknown subagent task ID `missing`" ; "unknown_task_id")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
+#[test_case::test_case("{ audience = 'research_sub', local_tools = { foo = { description = 'd', input_schema = { type = 'object' }, effect = 'read_only', handler = function() return '' end } } }", "generic research sessions cannot install caller-defined local tools" ; "research_local_tool")]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

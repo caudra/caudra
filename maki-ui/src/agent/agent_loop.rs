@@ -5,7 +5,9 @@ use maki_agent::agent;
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::prompt::profile::SystemPromptProfile;
+use maki_agent::prompt::profile::{
+    BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
+};
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
@@ -56,6 +58,7 @@ pub(super) struct AgentLoop {
     model_policy: Arc<ModelPolicy>,
     goal: GoalHandle,
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
+    prompt_profiles: Arc<PromptProfileCatalog>,
 }
 
 impl AgentLoop {
@@ -83,6 +86,7 @@ impl AgentLoop {
         model_policy: Arc<ModelPolicy>,
         goal: GoalHandle,
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
+        prompt_profiles: Arc<PromptProfileCatalog>,
     ) -> Self {
         let restored_history = History::restored(initial_history);
         let initial_messages = restored_history
@@ -122,6 +126,7 @@ impl AgentLoop {
             model_policy,
             goal,
             system_prompt_profile,
+            prompt_profiles,
         }
     }
 
@@ -277,7 +282,11 @@ impl AgentLoop {
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model, false);
+        self.tools = self.build_tools(
+            &slot.model,
+            &maki_providers::ThinkingConfig::default(),
+            false,
+        );
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
             // startup must still carry the MCP tools.
@@ -348,7 +357,7 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model, input.workflow);
+        self.rebuild_tools(&slot.model, &input.thinking, input.workflow);
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -404,10 +413,17 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                root_tool_use_id: None,
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
+                prompt_profiles: Arc::clone(&self.prompt_profiles),
+                system_prompt_profile_name: Arc::from(
+                    self.system_prompt_profile
+                        .as_ref()
+                        .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
+                ),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
@@ -454,19 +470,36 @@ impl AgentLoop {
 
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        self.tools = self.build_tools(model, workflow);
+    fn rebuild_tools(
+        &mut self,
+        model: &Model,
+        thinking: &maki_providers::ThinkingConfig,
+        workflow: bool,
+    ) {
+        self.tools = self.build_tools(model, thinking, workflow);
     }
 
-    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
+    fn build_tools(
+        &self,
+        model: &Model,
+        thinking: &maki_providers::ThinkingConfig,
+        workflow: bool,
+    ) -> Value {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, model, &[]);
+        let bindings =
+            self.prompt_profiles
+                .bind_for_tasks(model, thinking, &self.model_policy, self.timeouts);
+        let vars = self.vars.clone().set(
+            "{task_system_prompt_profiles}",
+            bindings.task_tool_summary("Maki's built-in task prompt"),
+        );
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow,
         };
-        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
+        ToolRegistry::global().definitions(&vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {

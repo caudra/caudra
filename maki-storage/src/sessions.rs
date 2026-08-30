@@ -38,6 +38,7 @@ const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
+pub const DEFAULT_SUBAGENT_PROFILE_NAME: &str = "builtin";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
@@ -333,6 +334,8 @@ pub struct Session<M, U, T> {
     tool_outputs: HashMap<String, Arc<T>>,
     #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
+    #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
+    subagent_task_specs: HashMap<String, StoredSubagentTaskSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -377,11 +380,75 @@ pub enum StoredEffect {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StoredMode {
+    #[default]
     Build,
     Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSubagentTaskSpec {
+    #[serde(default, skip_serializing_if = "StoredSubagentKind::is_task")]
+    pub kind: StoredSubagentKind,
+    #[serde(default = "default_subagent_profile_name")]
+    pub profile_name: String,
+    #[serde(default)]
+    pub mode: StoredMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredSubagentKind {
+    #[default]
+    Task,
+    Generic,
+    Version,
+}
+
+impl StoredSubagentKind {
+    fn is_task(&self) -> bool {
+        *self == Self::Task
+    }
+}
+
+impl Default for StoredSubagentTaskSpec {
+    fn default() -> Self {
+        Self {
+            kind: StoredSubagentKind::Task,
+            profile_name: default_subagent_profile_name(),
+            mode: StoredMode::default(),
+        }
+    }
+}
+
+impl StoredSubagentTaskSpec {
+    pub fn generic() -> Self {
+        Self {
+            kind: StoredSubagentKind::Generic,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_generic(&self) -> bool {
+        self.kind == StoredSubagentKind::Generic
+    }
+
+    pub fn version() -> Self {
+        Self {
+            kind: StoredSubagentKind::Version,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_version(&self) -> bool {
+        self.kind == StoredSubagentKind::Version
+    }
+}
+
+fn default_subagent_profile_name() -> String {
+    DEFAULT_SUBAGENT_PROFILE_NAME.to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +462,10 @@ pub struct StoredRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_tool_use_id: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -467,6 +538,8 @@ enum LogRecord<M, U, T> {
         subagents: Vec<StoredSubagent>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        subagent_task_specs: HashMap<String, StoredSubagentTaskSpec>,
         #[serde(flatten)]
         meta: Box<SessionMeta>,
     },
@@ -853,6 +926,7 @@ where
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
+            subagent_task_specs: session.subagent_task_specs.clone(),
             meta: Box::new(session.meta.clone()),
         },
     )?;
@@ -953,6 +1027,7 @@ where
     let mut updated_at = 0u64;
     let mut subagents = Vec::new();
     let mut usage_by_model = HashMap::new();
+    let mut subagent_task_specs = HashMap::new();
     let mut meta = SessionMeta::default();
     let mut got_header = false;
 
@@ -1018,6 +1093,7 @@ where
                 updated_at: m_updated,
                 subagents: m_subagents,
                 usage_by_model: m_usage_by_model,
+                subagent_task_specs: m_subagent_task_specs,
                 meta: m_meta,
             } => {
                 messages.append(&mut pending_messages);
@@ -1032,11 +1108,15 @@ where
                         .or_default()
                         .append(&mut entries);
                 }
+                for task_id in m_subagent_task_specs.keys() {
+                    subagent_messages.entry(task_id.clone()).or_default();
+                }
                 title = m_title;
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
                 usage_by_model = m_usage_by_model;
+                subagent_task_specs = m_subagent_task_specs;
                 meta = *m_meta;
             }
         }
@@ -1057,6 +1137,7 @@ where
             .into_iter()
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
+        subagent_task_specs,
         subagents,
         usage_by_model,
         meta,
@@ -1384,6 +1465,9 @@ where
         session
     };
     session.title = normalize_title(&session.title);
+    session
+        .subagent_task_specs
+        .retain(|task_id, _| session.subagent_messages.contains_key(task_id));
     Ok(session)
 }
 
@@ -1407,6 +1491,7 @@ where
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagent_task_specs: HashMap::new(),
             subagents: Vec::new(),
             usage_by_model: HashMap::new(),
             meta: SessionMeta {
@@ -1436,6 +1521,10 @@ where
 
     pub fn subagent_messages(&self) -> &HashMap<String, Arc<Vec<M>>> {
         &self.subagent_messages
+    }
+
+    pub fn subagent_task_specs(&self) -> &HashMap<String, StoredSubagentTaskSpec> {
+        &self.subagent_task_specs
     }
 
     pub fn revision(&self) -> u64 {
@@ -1561,7 +1650,26 @@ where
     }
 
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
-        if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
+        let spec = self.subagent_task_specs.get(&id).cloned();
+        self.set_subagent_history(id, msgs, spec);
+    }
+
+    pub fn set_subagent_history(
+        &mut self,
+        id: String,
+        msgs: Vec<M>,
+        spec: Option<StoredSubagentTaskSpec>,
+    ) {
+        let replaced = self
+            .subagent_messages
+            .insert(id.clone(), Arc::new(msgs))
+            .is_some();
+        if let Some(spec) = spec {
+            self.subagent_task_specs.insert(id, spec);
+        } else {
+            self.subagent_task_specs.remove(&id);
+        }
+        if replaced {
             self.rewrite();
         } else {
             self.touch();
@@ -1664,6 +1772,8 @@ where
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
         let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
         self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        self.subagent_task_specs
+            .retain(|id, _| self.subagent_messages.contains_key(id));
         self.subagents
             .retain(|sa| main_ids.contains(&sa.tool_use_id));
 
@@ -1873,10 +1983,10 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         LOG_FORMAT_VERSION, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, PREVIOUS_LOG_FORMAT_VERSION,
-        SESSION_VERSION, SESSIONS_DIR, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
-        StoredSubagent, TAIL_BUF, finish_delete, generate_title, json_path, jsonl_path,
-        load_cwd_index, meta_record, next_epoch, persisted_session_ids, update_cwd_index,
-        write_full_session,
+        SESSION_VERSION, SESSIONS_DIR, StoredMode, StoredPasteRange, StoredPromptAdmission,
+        StoredQueuedDraft, StoredSubagent, StoredSubagentTaskSpec, TAIL_BUF, finish_delete,
+        generate_title, json_path, jsonl_path, load_cwd_index, meta_record, next_epoch,
+        persisted_session_ids, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, PendingConversationRevert, SCAN_CACHE_FILE, Session, SessionError,
@@ -1905,6 +2015,34 @@ mod tests {
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
+    const SUBAGENT_PROFILE: &str = "review";
+
+    fn subagent_spec() -> StoredSubagentTaskSpec {
+        StoredSubagentTaskSpec {
+            profile_name: SUBAGENT_PROFILE.into(),
+            mode: StoredMode::Plan,
+            ..StoredSubagentTaskSpec::default()
+        }
+    }
+
+    #[test]
+    fn subagent_task_spec_fields_have_legacy_defaults() {
+        let default: StoredSubagentTaskSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, StoredSubagentTaskSpec::default());
+
+        let without_mode: StoredSubagentTaskSpec =
+            serde_json::from_value(serde_json::json!({"profile_name": SUBAGENT_PROFILE})).unwrap();
+        assert_eq!(without_mode.profile_name, SUBAGENT_PROFILE);
+        assert_eq!(without_mode.mode, StoredMode::Build);
+
+        let without_profile: StoredSubagentTaskSpec =
+            serde_json::from_value(serde_json::json!({"mode": "plan"})).unwrap();
+        assert_eq!(
+            without_profile.profile_name,
+            super::DEFAULT_SUBAGENT_PROFILE_NAME
+        );
+        assert_eq!(without_profile.mode, StoredMode::Plan);
+    }
 
     #[test]
     fn old_session_meta_defaults_paste_ranges() {
@@ -2037,6 +2175,8 @@ mod tests {
         fn subagent(id: &str) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
+                parent_tool_use_id: None,
+                root_tool_use_id: None,
                 name: "sub".into(),
                 model: None,
             }
@@ -2050,6 +2190,11 @@ mod tests {
         session
             .subagent_messages
             .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
+        for id in ["task-live", "task-stale", "task-without-history"] {
+            session
+                .subagent_task_specs
+                .insert(id.into(), subagent_spec());
+        }
         session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
         for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
             session.insert_tool_output(id.into(), Value::Null);
@@ -2067,6 +2212,10 @@ mod tests {
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
         assert_eq!(subagent_ids, ["task-live"]);
+        assert_eq!(
+            session.subagent_task_specs().keys().collect::<Vec<_>>(),
+            ["task-live"]
+        );
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
         assert_eq!(outputs, ["sub-tool", "task-live"]);
@@ -2079,9 +2228,10 @@ mod tests {
         let mut session: TestSession =
             Session::new("anthropic/claude-sonnet-4", "/home/test/project");
         session.push_message(user_message("hello"));
-        session.set_subagent_messages(
+        session.set_subagent_history(
             "tool-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
+            Some(subagent_spec()),
         );
         session.save_to(dir).unwrap();
 
@@ -2092,6 +2242,7 @@ mod tests {
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.version, SESSION_VERSION);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
+        assert_eq!(loaded.subagent_task_specs()["tool-1"], subagent_spec());
     }
 
     #[test]
@@ -2297,6 +2448,131 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("tool-1"));
         assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
+    }
+
+    #[test]
+    fn incremental_log_commits_subagent_history_and_spec_together() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+
+        session.set_subagent_history(
+            "sub-1".into(),
+            vec![user_message("sub-prompt")],
+            Some(subagent_spec()),
+        );
+        log.append(&session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.subagent_messages()["sub-1"].len(), 1);
+        assert_eq!(loaded.subagent_task_specs()["sub-1"], subagent_spec());
+    }
+
+    #[test]
+    fn empty_subagent_history_roundtrips_with_its_spec() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_history("sub-1".into(), Vec::new(), Some(subagent_spec()));
+
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert!(loaded.subagent_messages()["sub-1"].is_empty());
+        assert_eq!(loaded.subagent_task_specs()["sub-1"], subagent_spec());
+    }
+
+    #[test]
+    fn generic_subagent_kind_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_history(
+            "generic-1".into(),
+            vec![user_message("prompt")],
+            Some(StoredSubagentTaskSpec::generic()),
+        );
+
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert!(loaded.subagent_task_specs()["generic-1"].is_generic());
+    }
+
+    #[test]
+    fn subagent_version_kind_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_history(
+            "continuation-call".into(),
+            vec![user_message("continued")],
+            Some(StoredSubagentTaskSpec::version()),
+        );
+
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert!(loaded.subagent_task_specs()["continuation-call"].is_version());
+    }
+
+    #[test]
+    fn trailing_uncommitted_subagent_message_keeps_prior_history_and_spec() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_history(
+            "sub-1".into(),
+            vec![user_message("committed")],
+            Some(subagent_spec()),
+        );
+        session.save_to(dir).unwrap();
+        let path = jsonl_path(dir, session.id);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "t": "sub_msg",
+                "sub": "sub-1",
+                "d": user_message("uncommitted"),
+            })
+        )
+        .unwrap();
+        file.write_all(br#"{"t":"meta","title":"partial"#).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(
+            loaded.subagent_messages()["sub-1"].as_slice(),
+            [user_message("committed")]
+        );
+        assert_eq!(loaded.subagent_task_specs()["sub-1"], subagent_spec());
+    }
+
+    #[test]
+    fn legacy_json_and_jsonl_load_without_subagent_task_specs() {
+        let tmp = TempDir::new().unwrap();
+        let json_dir = tmp.path().join("json");
+        let jsonl_dir = tmp.path().join("jsonl");
+        fs::create_dir(&json_dir).unwrap();
+        fs::create_dir(&jsonl_dir).unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_messages("sub-1".into(), vec![user_message("legacy")]);
+
+        fs::write(
+            json_path(&json_dir, session.id),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+        write_legacy_jsonl(&jsonl_path(&jsonl_dir, session.id), &session);
+
+        let from_json = TestSession::load_from(session.id, &json_dir).unwrap();
+        let from_jsonl = TestSession::load_from(session.id, &jsonl_dir).unwrap();
+        assert!(from_json.subagent_task_specs().is_empty());
+        assert!(from_jsonl.subagent_task_specs().is_empty());
+        assert_eq!(from_json.subagent_messages()["sub-1"].len(), 1);
+        assert_eq!(from_jsonl.subagent_messages()["sub-1"].len(), 1);
     }
 
     #[test]
@@ -3672,6 +3948,11 @@ mod tests {
             loaded.subagent_messages(),
             expected.subagent_messages(),
             "subagent messages",
+        );
+        assert_eq!(
+            loaded.subagent_task_specs(),
+            expected.subagent_task_specs(),
+            "subagent task specs",
         );
         assert_eq!(loaded.title, expected.title, "title");
         assert_eq!(loaded.meta, expected.meta, "meta");

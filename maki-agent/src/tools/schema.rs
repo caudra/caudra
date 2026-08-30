@@ -86,6 +86,7 @@ pub enum ParamSchema {
     Object {
         properties: &'static [Property],
         description: &'static str,
+        reject_unknown: bool,
     },
     Any {
         description: &'static str,
@@ -124,6 +125,7 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
         ParamSchema::Object {
             properties,
             description,
+            ..
         } => {
             let props: serde_json::Map<String, Value> = properties
                 .iter()
@@ -252,6 +254,10 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             ParamSchema::Object {
                 properties,
                 description,
+                reject_unknown: v
+                    .get("x-maki-reject-unknown")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }
         }
         _ => ParamSchema::Any { description },
@@ -440,7 +446,11 @@ fn walk(schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Result<Value
         ParamSchema::Primitive { kind, .. } => validate_primitive(*kind, value, path),
         ParamSchema::Enum { variants, .. } => validate_enum(variants, value, path),
         ParamSchema::Array { items, .. } => validate_array(items, value, path),
-        ParamSchema::Object { properties, .. } => validate_object(properties, value, path),
+        ParamSchema::Object {
+            properties,
+            reject_unknown,
+            ..
+        } => validate_object(properties, *reject_unknown, value, path),
     }
 }
 
@@ -527,6 +537,7 @@ fn schema_type_name(schema: &ParamSchema) -> &'static str {
 
 fn validate_object(
     properties: &'static [Property],
+    reject_unknown: bool,
     value: Value,
     path: &mut JsonPath,
 ) -> Result<Value, ToolInputError> {
@@ -566,6 +577,14 @@ fn validate_object(
             }
             None => {}
         }
+    }
+    if reject_unknown && !map.is_empty() {
+        let mut names: Vec<_> = map.keys().cloned().collect();
+        names.sort();
+        return Err(ToolInputError::custom(format!(
+            "unknown parameter(s): {}",
+            names.join(", ")
+        )));
     }
     for (extra_key, _) in map {
         warn!(path = %path, key = %extra_key, "dropped unknown tool parameter");
@@ -851,6 +870,7 @@ mod tests {
             ("replace_all", &BOOL_PRIM, false, &[]),
         ],
         description: "",
+        reject_unknown: false,
     };
 
     const EDITS_ARRAY: ParamSchema = ParamSchema::Array {
@@ -864,6 +884,7 @@ mod tests {
             ("edits", &EDITS_ARRAY, true, &[]),
         ],
         description: "",
+        reject_unknown: false,
     };
 
     const MODE_ENUM: ParamSchema = ParamSchema::Enum {
@@ -882,6 +903,7 @@ mod tests {
         const ALL_OPTIONAL: ParamSchema = ParamSchema::Object {
             properties: &[("hint", &STR_PRIM, false, &[])],
             description: "",
+            reject_unknown: false,
         };
         let v = to_json_schema(&ALL_OPTIONAL);
         assert!(
@@ -1009,6 +1031,7 @@ mod tests {
                 ("hint", &STR_PRIM, false, &[]),
             ],
             description: "",
+            reject_unknown: false,
         };
         let out = validate(&SCHEMA, json!({"name": "x", "hint": null})).unwrap();
         assert_eq!(out["name"], "x");
@@ -1030,6 +1053,7 @@ mod tests {
         const SCHEMA: ParamSchema = ParamSchema::Object {
             properties: &[("name", &STR_PRIM, true, &[])],
             description: "",
+            reject_unknown: false,
         };
         let out = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap();
         assert!(out.get("extra").is_none());
@@ -1061,6 +1085,7 @@ mod tests {
                 ("count", &INT_PRIM, false, &[]),
             ],
             description: "",
+            reject_unknown: false,
         };
         let json_schema = to_json_schema(&SCHEMA);
         let recovered = try_from_json(&json_schema).expect("try_from_json failed");
@@ -1130,6 +1155,7 @@ mod tests {
             ("content", &STR_PRIM, true, &[]),
         ],
         description: "",
+        reject_unknown: false,
     };
 
     #[test_case(json!({"file_path": "/x", "content": "hi"}), "/x" ; "alias_resolves_to_canonical")]

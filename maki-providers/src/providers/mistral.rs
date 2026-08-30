@@ -53,84 +53,83 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
-            ModelEntry {
-                prefixes: &[
-                    "mistral-medium-latest",
-                    "mistral-medium-3.5",
-                    "mistral-medium-3-5",
-                    "mistral-medium-2604",
-                ],
-                tier: ModelTier::Strong,
-                family: ModelFamily::Generic,
-                vision: true,
-                default: true,
-                pricing: ModelPricing {
-                    input: 1.5,
-                    output: 7.5,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: None,
-                context_window: 262_144,
-                reasoning_options: None,
+        ModelEntry {
+            prefixes: &[
+                "mistral-medium-latest",
+                "mistral-medium-3.5",
+                "mistral-medium-3-5",
+                "mistral-medium-2604",
+            ],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 1.5,
+                output: 7.5,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: Vec::new(),
             },
-            ModelEntry {
-                prefixes: &["glm-5-2", "zai-glm-5-2"],
-                tier: ModelTier::Strong,
-                family: ModelFamily::Glm,
-                vision: false,
-                default: false,
-                pricing: ModelPricing {
-                    input: 1.40,
-                    output: 4.40,
-                    cache_write: 0.00,
-                    cache_read: 0.14,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: None,
-                context_window: 1_000_000,
-                reasoning_options: None,
+            max_output_tokens: None,
+            context_window: 262_144,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-5-2", "zai-glm-5-2"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.14,
+                fast: None,
+                tiers: Vec::new(),
             },
-            ModelEntry {
-                prefixes: &["mistral-small-latest", "mistral-small-2603"],
-                tier: ModelTier::Medium,
-                family: ModelFamily::Generic,
-                vision: true,
-                default: true,
-                pricing: ModelPricing {
-                    input: 0.15,
-                    output: 0.60,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: None,
-                context_window: 262_144,
-                reasoning_options: None,
+            max_output_tokens: None,
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["mistral-small-latest", "mistral-small-2603"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 0.15,
+                output: 0.60,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: Vec::new(),
             },
-            ModelEntry {
-                prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
-                tier: ModelTier::Weak,
-                family: ModelFamily::Generic,
-                vision: false,
-                default: true,
-                pricing: ModelPricing {
-                    input: 0.20,
-                    output: 0.20,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                    tiers: Vec::new(),
-                },
-                max_output_tokens: None,
-                context_window: 262_144,
-                reasoning_options: None,
+            max_output_tokens: None,
+            context_window: 262_144,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Generic,
+            vision: false,
+            default: true,
+            pricing: ModelPricing {
+                input: 0.20,
+                output: 0.20,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: Vec::new(),
             },
-    
+            max_output_tokens: None,
+            context_window: 262_144,
+            reasoning_options: None,
+        },
     ];
     MODELS
 }
@@ -226,8 +225,7 @@ impl Provider for Mistral {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, model);
+            opts.thinking.apply_reasoning_effort(&mut body, model);
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 

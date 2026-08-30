@@ -169,12 +169,12 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Maki's built-in prompt. Omitted continuations retain their stored profile. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `task_id` | string | no | A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh. |
-| `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
+| `mode` | string | no | Subagent mode. Defaults to "plan" for a new task; omitted continuations retain their stored mode. |
 
 ### `todo_write` {#todo_write}
 

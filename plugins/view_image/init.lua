@@ -116,6 +116,7 @@ end
 
 maki.api.register_tool({
   name = "view_image",
+  effect = "read_only",
   kind = "read",
   description = DESCRIPTION,
   permission_scopes = function(input)

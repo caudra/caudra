@@ -21,7 +21,8 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{PluginRuleStore, canonical_json_sha256};
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
-    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
+    DOOM_LOOP_MESSAGE, HeaderResult, PLAN_WRITE_RESTRICTED, PermissionScopes,
+    READ_ONLY_TOOL_RESTRICTED, RegistryError, Tool, ToolEffect, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{
@@ -104,6 +105,14 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+
+fn registered_lua_effect(bundled: bool, declared: ToolEffect) -> ToolEffect {
+    if bundled {
+        declared
+    } else {
+        ToolEffect::Unknown
+    }
+}
 
 fn plugin_implementation_digest(source: &str, plugin_dir: Option<&Path>) -> io::Result<String> {
     fn collect(
@@ -228,7 +237,7 @@ pub enum Request {
     },
     Shutdown,
     RestoreToolAsync {
-        item: RestoreItem,
+        item: Box<RestoreItem>,
         event_tx: maki_agent::EventSender,
     },
     RestoreComplete {
@@ -286,6 +295,7 @@ pub struct RestoreItem {
     pub clicks: Vec<usize>,
     /// Structured state the tool persisted alongside its output.
     pub state: Option<Value>,
+    pub lua_provenance: Option<maki_agent::LuaToolProvenance>,
 }
 
 pub(crate) struct ClickFallback {
@@ -396,6 +406,7 @@ pub(crate) struct TaskCell {
     /// can refuse to extend a chain that never ends. Inherited by
     /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
+    read_only: bool,
 }
 
 impl TaskCell {
@@ -420,6 +431,7 @@ impl TaskCell {
             bufs_claim: Weak::new(),
             owns_jobs: true,
             command_depth: 0,
+            read_only: false,
         }
     }
 
@@ -1025,6 +1037,11 @@ pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
 pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     Some(lock_cell(&handle).id)
+}
+
+pub(crate) fn active_task_is_read_only(lua: &Lua) -> bool {
+    lua.app_data_ref::<TaskHandle>()
+        .is_some_and(|handle| lock_cell(&handle).read_only)
 }
 
 /// Slash-command hops that led to the running task; 0 outside a command
@@ -1896,6 +1913,7 @@ impl LuaRuntime {
                 let contract = canonical_json_sha256(&json!({
                     "implementation": &implementation,
                     "tool": tool.name.as_ref(),
+                    "effect": tool.effect.as_str(),
                     "description": &tool.description,
                     "schema": maki_agent::tools::schema::to_json_schema(tool.schema),
                 }));
@@ -1903,7 +1921,7 @@ impl LuaRuntime {
             })
             .collect();
 
-        let registry_entries: Vec<(Arc<dyn Tool>, ToolSource)> = pending
+        let registry_entries: Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> = pending
             .iter()
             .map(|t| {
                 let contract = contracts
@@ -1918,6 +1936,7 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     contract: Arc::clone(contract),
+                    bundled,
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t
@@ -1937,11 +1956,15 @@ impl LuaRuntime {
                         contract: Arc::clone(contract),
                         bundled,
                     },
+                    registered_lua_effect(bundled, t.effect),
                 )
             })
             .collect();
 
-        if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
+        if let Err(e) = self
+            .registry
+            .replace_plugin_audited(&name, registry_entries)
+        {
             self.discard_pending(pending);
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
@@ -2095,6 +2118,47 @@ impl LuaRuntime {
     }
 }
 
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+    use maki_config::PluginsConfig;
+
+    #[test]
+    fn unbundled_lua_cannot_claim_a_safe_effect() {
+        assert_eq!(
+            registered_lua_effect(false, ToolEffect::ReadOnly),
+            ToolEffect::Unknown
+        );
+        assert_eq!(
+            registered_lua_effect(true, ToolEffect::ReadOnly),
+            ToolEffect::ReadOnly
+        );
+    }
+
+    #[test]
+    fn production_bundled_tools_have_explicit_effects() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = crate::PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+
+        for (name, expected) in [
+            ("index", ToolEffect::ReadOnly),
+            ("skill", ToolEffect::Mutating),
+            ("view_image", ToolEffect::ReadOnly),
+            ("todo_write", ToolEffect::Isolated),
+            ("batch", ToolEffect::Orchestrator),
+            ("memory", ToolEffect::Mutating),
+            ("task", ToolEffect::Orchestrator),
+            ("question", ToolEffect::Isolated),
+            ("tool_output_read", ToolEffect::ReadOnly),
+            ("tool_output_grep", ToolEffect::ReadOnly),
+        ] {
+            assert_eq!(registry.get(name).unwrap().effect, expected, "{name}");
+        }
+    }
+}
+
 /// Resolves a plugin callback and converts its json input, warning on
 /// failure. `None` when the tool has no such callback registered.
 fn plugin_fn(
@@ -2177,11 +2241,38 @@ async fn compute_header(
 }
 
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
+    if item.is_error
+        && (item.output == PLAN_WRITE_RESTRICTED
+            || item.output == DOOM_LOOP_MESSAGE
+            || item
+                .output
+                .strip_prefix(READ_ONLY_TOOL_RESTRICTED)
+                .is_some_and(|suffix| suffix.starts_with(':')))
+    {
+        return None;
+    }
     let (func, plugin_name) = {
         let plugins = plugins.borrow();
-        let (pname, tk) = plugins
-            .iter()
-            .find_map(|(pname, tools)| tools.get(&*item.tool).map(|tk| (pname.clone(), tk)))?;
+        let (pname, tk) = if let Some(provenance) = &item.lua_provenance {
+            let tools = plugins.get(provenance.plugin.as_str())?;
+            let tk = tools.get(&*item.tool)?;
+            if tk.contract.as_ref() != provenance.contract {
+                return None;
+            }
+            (Arc::from(provenance.plugin.as_str()), tk)
+        } else {
+            plugins
+                .iter()
+                .find_map(|(pname, tools)| tools.get(&*item.tool).map(|tk| (pname.clone(), tk)))?
+        };
+        if item.is_error
+            && item
+                .lua_provenance
+                .as_ref()
+                .is_some_and(|provenance| !provenance.error_restore_allowed)
+        {
+            return None;
+        }
         let key = tk.restore.as_ref()?;
         (lua.registry_value::<Function>(key).ok()?, pname)
     };
@@ -2503,7 +2594,10 @@ async fn run_tool_start(
     live: LiveCtx,
     ctx: Box<LuaCtx>,
 ) {
-    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
+    let read_only = ctx.is_read_only();
+    let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    cell.read_only = read_only;
+    let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
@@ -2561,6 +2655,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let read_only = ctx.is_read_only();
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -2573,6 +2668,7 @@ async fn run_tool_call(
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
+    cell.read_only = read_only;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
@@ -2930,7 +3026,7 @@ pub fn spawn(
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
-                            spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
+                            spawn_restore(&ex, &gate, &restores, &rt, *item, event_tx);
                         }
                         Request::RestoreComplete { flag } => {
                             restores.complete(flag);

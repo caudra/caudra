@@ -173,6 +173,7 @@ end
 
 maki.api.register_tool({
   name = "skill",
+  effect = "mutating",
   kind = "read",
   description = description,
   permission_scopes = skill_permission_scopes,
