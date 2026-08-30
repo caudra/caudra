@@ -17,6 +17,8 @@ const CASES: &[&str] = &[
     "write.json",
     "edit.json",
     "apply-patch.json",
+    #[cfg(feature = "index")]
+    "index.json",
 ];
 
 #[tokio::test]

@@ -566,6 +566,7 @@ mod tests {
                 "file_write",
                 "file_edit",
                 "file_apply_patch",
+                "index",
                 "websearch",
                 "webfetch",
                 "shell",

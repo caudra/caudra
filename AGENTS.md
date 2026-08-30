@@ -17,7 +17,9 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
   must not depend on any protocol SDK.
 - `crates/workcell` is the embedding facade. It only re-exports; keep logic in the owning crate.
 - `crates/environment` owns execution-environment inspection and its disclosure shape.
-- `crates/mcp-files` owns filesystem schemas, confinement, bounded reads, and mutations.
+- `crates/mcp-files` owns filesystem schemas, confinement, bounded reads, mutations, and the optional
+  native Rust source indexer. Keep every grammar dependency behind its `index` feature; do not add a
+  scripting runtime or runtime-loaded extractor assets.
 - `crates/mcp-shell` owns immutable shell permission policy, command execution, process cleanup,
   output bounds, and progress streaming.
 - `crates/mcp-web` owns web tool schemas, provider lowering, fetch extraction, and parser bounds.
@@ -78,6 +80,7 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
 - Preserve stable catalog order: files, web, shell, code, execution environment.
+- Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.

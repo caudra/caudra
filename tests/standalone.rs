@@ -37,6 +37,12 @@ async fn fixture_server_with_options(
     tokio::fs::write(root.path().join("visible.txt"), "visible\n")
         .await
         .expect("fixture file");
+    tokio::fs::write(
+        root.path().join("visible.rs"),
+        "pub fn visible() -> bool { true }\n",
+    )
+    .await
+    .expect("index fixture");
     let server = WorkcellServer::configured(
         Some(root.path()),
         &[ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
@@ -302,6 +308,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "file_write",
             "file_edit",
             "file_apply_patch",
+            "index",
             "websearch",
             "webfetch",
             "shell",
@@ -319,6 +326,22 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     )
     .await;
     assert!(read_json(&mut read).await.to_string().contains("visible"));
+
+    write_json(
+        &mut write,
+        &mcp_request(
+            31,
+            "tools/call",
+            json!({"name":"index","arguments":{"path":"visible.rs"}}),
+        ),
+    )
+    .await;
+    let indexed = read_json(&mut read).await;
+    assert_eq!(
+        indexed["result"]["content"][0]["text"],
+        "fns:\n  pub visible() -> bool [1]"
+    );
+    assert_eq!(indexed["result"]["structuredContent"]["language"], "rust");
 
     write_json(
         &mut write,
@@ -404,7 +427,7 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
             .as_array()
             .unwrap()
             .len(),
-        10
+        11
     );
 
     let private_route = client
@@ -540,7 +563,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
     .await;
     assert!(!listed.headers().contains_key("mcp-session-id"));
     let listed = final_sse_json(listed).await;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 11);
     assert!(listed["result"].get("ttlMs").is_none());
     assert!(listed["result"].get("cacheScope").is_none());
 
@@ -1047,6 +1070,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             "file_write",
             "file_edit",
             "file_apply_patch",
+            "index",
             "websearch",
             "webfetch",
             "shell",

@@ -42,6 +42,15 @@ itself; the supervising server replaces it. This is process isolation for a lang
 OS sandbox: the worker still runs with the identity and namespace of the deployment, so operator
 isolation remains mandatory.
 
+The optional filesystem indexer parses strict UTF-8 source in-process. Calls read through the normal
+filesystem policy, then run tree-sitter and the bundled first-party extractor logic in `spawn_blocking`
+under a process-wide two-permit semaphore. Source bytes bound parser input, and an absolute deadline
+and cancellation cover blocking-pool queueing, construction, inspection, extraction, and formatting.
+Node-count and depth limits are enforced by post-parse inspection before extraction; tree-sitter does
+not expose a construction-memory ceiling for those limits. Syntax trees and native extractor state are
+dropped after each call; no parser cache or scripting runtime is retained. These controls limit
+accidental and adversarial work but do not turn native parser code into a process-isolated sandbox.
+
 Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
 `execution_environment` tool is called. A non-root Unix process actively runs
 `sudo -n -- <resolved-true>` during each inspection; this may create audit records, update external
@@ -126,6 +135,9 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
   process itself.
 - Native document and image parsing occurs in-process. Internal bounds reduce risk but do not replace
   hard process memory and CPU isolation.
+- Native source indexing and its feature-gated parser bundle also run in-process. Parser defects,
+  construction-memory growth within the source bound, or bound-check defects can affect the server
+  process despite per-call deadlines and post-parse limits.
 - Credential-free Exa MCP search is not private or an availability guarantee. Queries leave the
   execution boundary, and normalized results can still contain inaccurate or malicious web content.
 - A bearer token authenticates one process endpoint. It does not express per-tool, per-user, or

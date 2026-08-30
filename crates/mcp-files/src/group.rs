@@ -22,11 +22,15 @@ use crate::{
         FileResourceAccess, FileWriteInput, FileWriteOutput,
     },
 };
+#[cfg(feature = "index")]
+use crate::{INDEX_MAX_PATH_BYTES, IndexExecutionConfiguration, IndexInput, IndexOutput};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 // This is a protocol compatibility bound, not a deployment tuning default.
 pub(crate) const MCP_RAW_RESULT_CEILING_BYTES: usize = 64_000;
 const TRANSPORT_FRAME_DELIMITER_BYTES: usize = 1;
+#[cfg(all(feature = "index", feature = "mcp"))]
+const INDEX_TRUNCATED: &str = "[truncated]";
 
 #[derive(Serialize)]
 struct McpResponse<'a> {
@@ -176,6 +180,41 @@ impl FileToolGroup {
             .await
     }
 
+    #[cfg(feature = "index")]
+    pub async fn index(
+        &self,
+        input: IndexInput,
+        token: &CancellationToken,
+    ) -> Result<IndexOutput, FilesystemError> {
+        self.index_with_configuration(input, IndexExecutionConfiguration::default(), token)
+            .await
+    }
+
+    #[cfg(feature = "index")]
+    pub async fn index_with_configuration(
+        &self,
+        input: IndexInput,
+        configuration: IndexExecutionConfiguration,
+        token: &CancellationToken,
+    ) -> Result<IndexOutput, FilesystemError> {
+        self.core
+            .index(validate_index(input)?, configuration, token)
+            .await
+    }
+
+    #[cfg(feature = "index")]
+    /// Indexes a resource returned by [`Self::inspect_index`], rejecting path or type changes.
+    pub async fn index_authorized_with_configuration(
+        &self,
+        resource: FileResource,
+        configuration: IndexExecutionConfiguration,
+        token: &CancellationToken,
+    ) -> Result<IndexOutput, FilesystemError> {
+        self.core
+            .index_authorized(resource, configuration, token)
+            .await
+    }
+
     pub async fn inspect_read(
         &self,
         input: &FileReadInput,
@@ -278,6 +317,34 @@ impl FileToolGroup {
             }
         }
         Ok(resources)
+    }
+
+    #[cfg(feature = "index")]
+    pub async fn inspect_index(&self, input: &IndexInput) -> Result<FileResource, FilesystemError> {
+        validate_index(input.clone())?;
+        let path = self.core.policy.resolve(&input.path).await?;
+        let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                FilesystemError::message(format!("Path not found: {}", input.path))
+            } else {
+                FilesystemError::io_path("Cannot inspect", &path, error)
+            }
+        })?;
+        let access = if metadata.is_dir() {
+            FileResourceAccess::Traverse
+        } else if metadata.is_file() {
+            FileResourceAccess::Read
+        } else {
+            return Err(FilesystemError::message(format!(
+                "Path is not a regular file or directory: {}",
+                input.path
+            )));
+        };
+        Ok(FileResource {
+            requested_path: input.path.clone(),
+            path,
+            access,
+        })
     }
 
     /// Fully plan a patch for host authorization without mutating the filesystem.
@@ -386,6 +453,11 @@ impl FileToolGroup {
                 Ok(input) => run(self.file_apply_patch(input, &token).await),
                 Err(error) => tool_error(error),
             },
+            #[cfg(feature = "index")]
+            "index" => match parse_arguments::<IndexInput>(name, arguments) {
+                Ok(input) => run_index(self.index(input, &token).await),
+                Err(error) => tool_error(error),
+            },
             _ => return None,
         };
         Some(result)
@@ -418,6 +490,152 @@ fn success(output: impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
     })
 }
 
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn run_index(
+    result: Result<IndexOutput, FilesystemError>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    match result {
+        Ok(output) => {
+            let output = fit_index_output(output).map_err(|_| {
+                rmcp::ErrorData::internal_error("Failed to serialize index result", None)
+            })?;
+            let structured = serde_json::to_value(&output).map_err(|_| {
+                rmcp::ErrorData::internal_error("Failed to serialize index result", None)
+            })?;
+            let mut result = CallToolResult::default();
+            result.content = vec![ContentBlock::text(output.model_text().to_owned())];
+            result.structured_content = Some(structured);
+            Ok(result)
+        }
+        Err(error) => tool_error(error),
+    }
+}
+
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn fit_index_output(output: IndexOutput) -> Result<IndexOutput, serde_json::Error> {
+    if index_response_size(&output)? <= MCP_RAW_RESULT_CEILING_BYTES {
+        return Ok(output);
+    }
+
+    let retained = index_payload_len(&output);
+    let mut template = output;
+    if index_response_size(&index_prefix(&template, 0))? > MCP_RAW_RESULT_CEILING_BYTES {
+        truncate_index_paths(&mut template);
+    }
+    if index_response_size(&index_prefix(&template, 0))? > MCP_RAW_RESULT_CEILING_BYTES
+        && let IndexOutput::File { language, .. } = &mut template
+    {
+        *language = INDEX_TRUNCATED.to_owned();
+    }
+
+    let mut lower = 0usize;
+    let mut upper = retained;
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if index_response_size(&index_prefix(&template, candidate))? <= MCP_RAW_RESULT_CEILING_BYTES
+        {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    let fitted = index_prefix(&template, lower);
+    debug_assert!(index_response_size(&fitted)? <= MCP_RAW_RESULT_CEILING_BYTES);
+    Ok(fitted)
+}
+
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn index_response_size(output: &IndexOutput) -> Result<usize, serde_json::Error> {
+    let structured = serde_json::to_value(output)?;
+    mcp_response_size_from_parts(&structured, output.model_text())
+}
+
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn index_payload_len(output: &IndexOutput) -> usize {
+    match output {
+        IndexOutput::File { lines, .. } => lines.len().saturating_sub(usize::from(
+            lines
+                .last()
+                .is_some_and(|line| line.text == INDEX_TRUNCATED),
+        )),
+        IndexOutput::Directory { entries, .. } => entries.len(),
+    }
+}
+
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn index_prefix(output: &IndexOutput, retained: usize) -> IndexOutput {
+    let mut output = output.clone();
+    match &mut output {
+        IndexOutput::File {
+            skeleton,
+            lines,
+            truncated,
+            ..
+        } => {
+            let available = lines.len().saturating_sub(usize::from(
+                lines
+                    .last()
+                    .is_some_and(|line| line.text == INDEX_TRUNCATED),
+            ));
+            lines.truncate(retained.min(available));
+            lines.push(crate::IndexOutputLine {
+                output_line: lines.len() + 1,
+                text: INDEX_TRUNCATED.to_owned(),
+                semantic: crate::IndexLineSemantic::Dimmed,
+                body: None,
+                source_range: None,
+            });
+            for (index, line) in lines.iter_mut().enumerate() {
+                line.output_line = index + 1;
+            }
+            *skeleton = lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *truncated = true;
+        }
+        IndexOutput::Directory {
+            entries,
+            truncated,
+            listing,
+            ..
+        } => {
+            entries.truncate(retained.min(entries.len()));
+            let mut lines = entries
+                .iter()
+                .map(|entry| match entry.kind {
+                    crate::IndexDirectoryEntryKind::Directory => format!("{}/", entry.name),
+                    crate::IndexDirectoryEntryKind::File => entry.name.clone(),
+                })
+                .collect::<Vec<_>>();
+            lines.push(INDEX_TRUNCATED.to_owned());
+            *listing = lines.join("\n");
+            *truncated = true;
+        }
+    }
+    output
+}
+
+#[cfg(all(feature = "index", feature = "mcp"))]
+fn truncate_index_paths(output: &mut IndexOutput) {
+    match output {
+        IndexOutput::File {
+            path,
+            relative_path,
+            ..
+        }
+        | IndexOutput::Directory {
+            path,
+            relative_path,
+            ..
+        } => {
+            *path = INDEX_TRUNCATED.to_owned();
+            *relative_path = INDEX_TRUNCATED.to_owned();
+        }
+    }
+}
+
 #[cfg(feature = "mcp")]
 fn build_success_result(output: &impl Serialize) -> Result<CallToolResult, serde_json::Error> {
     let structured = serde_json::to_value(output)?;
@@ -431,13 +649,20 @@ fn build_success_result(output: &impl Serialize) -> Result<CallToolResult, serde
 pub(crate) fn mcp_response_size(output: &impl Serialize) -> Result<usize, serde_json::Error> {
     let structured = serde_json::to_value(output)?;
     let text = serde_json::to_string_pretty(&structured)?;
+    mcp_response_size_from_parts(&structured, &text)
+}
+
+fn mcp_response_size_from_parts(
+    structured: &Value,
+    text: &str,
+) -> Result<usize, serde_json::Error> {
     let result = SerializedToolResult {
         result_type: "complete",
         content: [SerializedTextContent {
             content_type: "text",
-            text: &text,
+            text,
         }],
-        structured_content: &structured,
+        structured_content: structured,
     };
     let envelope = McpResponse {
         jsonrpc: "2.0",
@@ -530,13 +755,30 @@ fn validate_patch(input: FileApplyPatchInput) -> Result<FileApplyPatchInput, Fil
     Ok(input)
 }
 
+#[cfg(feature = "index")]
+fn validate_index(input: IndexInput) -> Result<IndexInput, FilesystemError> {
+    nonempty(&input.path, "path")?;
+    enforce_bytes("path", &input.path, INDEX_MAX_PATH_BYTES)?;
+    Ok(input)
+}
+
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
     use serde_json::json;
 
     use super::{
-        SerializedTextContent, SerializedToolResult, build_success_result, mcp_response_size,
+        ContentBlock, SerializedTextContent, SerializedToolResult, build_success_result,
+        mcp_response_size,
     };
+    #[cfg(feature = "index")]
+    use super::{
+        INDEX_TRUNCATED, MCP_RAW_RESULT_CEILING_BYTES, index_response_size, run_index,
+        validate_index,
+    };
+    #[cfg(feature = "index")]
+    use crate::{IndexDirectoryEntry, IndexDirectoryEntryKind};
+    #[cfg(feature = "index")]
+    use crate::{IndexLineSemantic, IndexOutput, IndexOutputLine, IndexSourceRange};
 
     #[test]
     fn response_size_counts_both_result_forms_and_envelope() {
@@ -566,5 +808,122 @@ mod tests {
 
         assert!(result_size > structured_size * 2);
         assert!(response_size > result_size);
+    }
+
+    #[cfg(feature = "index")]
+    #[test]
+    fn index_path_limit_counts_utf8_bytes() {
+        let character = "é";
+        let exact = character.repeat(crate::INDEX_MAX_PATH_BYTES / character.len());
+        assert!(validate_index(crate::IndexInput { path: exact }).is_ok());
+        let oversized = character.repeat(crate::INDEX_MAX_PATH_BYTES / character.len() + 1);
+        let error = validate_index(crate::IndexInput { path: oversized }).expect_err("byte bound");
+        let expected = format!("{} bytes", crate::INDEX_MAX_PATH_BYTES);
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    #[cfg(feature = "index")]
+    #[test]
+    fn index_dispatch_fits_an_oversized_mcp_envelope() {
+        let line = "x".repeat(1_000);
+        let lines = (1..=40)
+            .map(|output_line| IndexOutputLine {
+                output_line,
+                text: line.clone(),
+                semantic: IndexLineSemantic::Plain,
+                body: Some(line.clone()),
+                source_range: Some(IndexSourceRange {
+                    start_line: output_line,
+                    end_line: output_line,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let output = IndexOutput::File {
+            path: "/workspace/source.rs".into(),
+            relative_path: "source.rs".into(),
+            language: "rust".into(),
+            skeleton: vec![line; lines.len()].join("\n"),
+            lines,
+            source_line_count: 40,
+            parse_error: false,
+            truncated: false,
+        };
+        assert!(output.model_text().len() < 50 * 1024);
+
+        let result = run_index(Ok(output)).expect("tool result");
+
+        assert_ne!(result.is_error, Some(true));
+        let structured = result.structured_content.as_ref().unwrap();
+        let fitted: IndexOutput = serde_json::from_value(structured.clone()).unwrap();
+        let ContentBlock::Text(content) = &result.content[0] else {
+            panic!("expected text")
+        };
+        let IndexOutput::File {
+            skeleton,
+            lines,
+            truncated,
+            ..
+        } = &fitted
+        else {
+            panic!("expected file")
+        };
+        assert!(truncated);
+        assert_eq!(lines.last().unwrap().text, INDEX_TRUNCATED);
+        for line in &lines[..lines.len() - 1] {
+            assert_eq!(line.body.as_deref(), Some(line.text.as_str()));
+            assert_eq!(line.source_range.unwrap().start_line, line.output_line);
+        }
+        assert_eq!(skeleton, &content.text);
+        assert!(index_response_size(&fitted).unwrap() <= MCP_RAW_RESULT_CEILING_BYTES);
+    }
+
+    #[cfg(feature = "index")]
+    #[test]
+    fn index_dispatch_fits_complete_directory_entries() {
+        let entries = (0..1_000)
+            .map(|index| IndexDirectoryEntry {
+                name: format!("entry-{index}-{}", "\\".repeat(80)),
+                kind: IndexDirectoryEntryKind::File,
+            })
+            .collect::<Vec<_>>();
+        let output = IndexOutput::Directory {
+            path: "/workspace".into(),
+            relative_path: ".".into(),
+            listing: entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            total_count: entries.len(),
+            entries,
+            truncated: false,
+        };
+
+        let result = run_index(Ok(output)).expect("tool result");
+
+        assert_ne!(result.is_error, Some(true));
+        let fitted: IndexOutput = serde_json::from_value(
+            result
+                .structured_content
+                .as_ref()
+                .expect("structured")
+                .clone(),
+        )
+        .expect("typed output");
+        let IndexOutput::Directory {
+            entries,
+            total_count,
+            truncated,
+            listing,
+            ..
+        } = &fitted
+        else {
+            panic!("expected directory")
+        };
+        assert!(truncated);
+        assert_eq!(*total_count, 1_000);
+        assert!(entries.len() < *total_count);
+        assert_eq!(listing.lines().last(), Some(INDEX_TRUNCATED));
+        assert!(index_response_size(&fitted).unwrap() <= MCP_RAW_RESULT_CEILING_BYTES);
     }
 }

@@ -9,6 +9,8 @@ mod glob;
 #[cfg(test)]
 mod glob_tests;
 mod group;
+#[cfg(feature = "index")]
+mod index;
 mod mutation_operations;
 mod operations;
 mod patch;
@@ -22,5 +24,7 @@ pub use catalog::catalog;
 pub use catalog::specs;
 pub use error::FilesystemError;
 pub use group::{FileToolGroup, PreparedFilePatch};
+#[cfg(feature = "index")]
+pub use index::*;
 pub use types::*;
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

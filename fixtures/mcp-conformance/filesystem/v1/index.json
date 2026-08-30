@@ -1,0 +1,78 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.index.rust-skeleton",
+  "provenance": [
+    "rust/crates/mcp-files/src/index",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "index",
+  "input": {
+    "path": "index.rs"
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "index.rs",
+        "asset": "assets/filesystem/index.rs"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "imports: [1]\n  std::io\n\nfns:\n  pub run(x: i32) -> i32 [3]",
+    "structuredContent": {
+      "kind": "file",
+      "path": "{{ROOT}}/index.rs",
+      "relativePath": "index.rs",
+      "language": "rust",
+      "skeleton": "imports: [1]\n  std::io\n\nfns:\n  pub run(x: i32) -> i32 [3]",
+      "lines": [
+        {
+          "outputLine": 1,
+          "text": "imports: [1]",
+          "semantic": "section",
+          "body": "imports: ",
+          "sourceRange": { "startLine": 1, "endLine": 1 }
+        },
+        {
+          "outputLine": 2,
+          "text": "  std::io",
+          "semantic": "plain"
+        },
+        {
+          "outputLine": 3,
+          "text": "",
+          "semantic": "plain"
+        },
+        {
+          "outputLine": 4,
+          "text": "fns:",
+          "semantic": "section"
+        },
+        {
+          "outputLine": 5,
+          "text": "  pub run(x: i32) -> i32 [3]",
+          "semantic": "item",
+          "body": "  pub run(x: i32) -> i32",
+          "sourceRange": { "startLine": 3, "endLine": 3 }
+        }
+      ],
+      "sourceLineCount": 4,
+      "parseError": false,
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "index.rs",
+        "asset": "assets/filesystem/index.rs"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

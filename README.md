@@ -61,6 +61,7 @@ sequenceDiagram
 | --- | --- | --- |
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Preview-only unless `--allow-write` is set. |
+| Files | `index` | Bounded source skeletons and deterministic directory listings. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Code | `code_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
@@ -396,6 +397,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | Feature | Provides |
 | --- | --- |
 | `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
+| `files-index` | `files` plus `index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
 | `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis and progress streaming |
 | `code` | `CodeToolGroup`, isolated interpreter execution |
@@ -407,7 +409,8 @@ annotations, presentation profile, and a stable contract identity. A host regist
 Enabling a group's `mcp` feature additionally projects the same spec into an MCP `Tool`, which is how
 the standalone server builds its catalog; without it, `rmcp` is not in the dependency graph at all.
 
-Operations separate preparation from execution. `prepare_apply_patch`, `ShellToolGroup::prepare`, and
+Operations separate preparation from execution. `inspect_index`, `prepare_apply_patch`,
+`ShellToolGroup::prepare`, and
 the web `prepare_*` methods return a prepared value that exposes every resource the call would touch,
 before anything is read, written, or executed. Hosts authorize the prepared resources under their own
 policy, then commit with the matching `execute_*` method.
@@ -506,6 +509,15 @@ lines to 2,000 characters, read windows to 2,000 lines, search results to 100, a
 10,000 entries. Results report truncation when a presentation bound is reached. Embedders using the
 filesystem crate can supply stricter limits.
 
+The optional indexer has independent defaults: 2 MiB of strict UTF-8 source, 50 KiB of model text,
+2,000 bytes per output line, 1,000 returned directory entries, 10,000 scanned directory entries,
+post-parse inspection limits of 200,000 syntax nodes and depth 512, two-second admission and parser
+deadlines, and two process-wide parser slots. Source bytes and the parser deadline bound tree-sitter
+construction work; node and depth limits are checked after construction, before extraction. These
+values are host-only and never appear in model input. Native hosts enable `files-index` and pass
+`IndexExecutionConfiguration` to `index_with_configuration` when a call needs a different source-size
+policy.
+
 #### `file_read`
 
 `file_read` reads a UTF-8 text file window or lists a directory.
@@ -584,6 +596,30 @@ delete sections.
   bounded. Source files are revalidated before publication.
 - A multi-file patch is validated as a unit but is not transactional after publication starts. A later
   operating-system I/O failure can leave earlier sections applied.
+
+#### `index`
+
+`index` accepts one required `path` and returns either a source skeleton or a directory listing.
+
+- Root-relative and absolute paths use the same confined or unconfined policy as every file tool.
+- File output includes the canonical path, detected language, compact skeleton, semantic metadata and
+  source range for each output line, source line count, parse-recovery status, and truncation status.
+- Directory output is deterministic, puts directories before files, appends `/` to directory names,
+  and includes typed entries, total count, listing text, and truncation status. `totalCount` is exact
+  when `truncated` is false and is a lower bound on processed visible entries when `truncated` is true.
+  It does not add or hide harness-specific instruction files.
+- Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java, C/C++/C#, Ruby,
+  PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML, YAML,
+  SQL, CSS, JSON, HCL, Containerfile, and Make.
+- Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
+  not embed a scripting runtime or load extractor code at runtime.
+- MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;
+  complete trailing rows are removed when their duplicated serialized representation would exceed the
+  protocol result ceiling.
+- Parsing runs in `spawn_blocking` under a process-wide semaphore. Admission, queueing, parsing,
+  extraction, and formatting honor cancellation and wall-time limits. Source bytes bound parser input;
+  node and depth limits apply to post-parse inspection and do not impose a tree-construction memory
+  ceiling.
 
 ### Web tools
 

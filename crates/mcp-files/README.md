@@ -1,8 +1,8 @@
 # workcell-mcp-files
 
-`workcell-mcp-files` implements the six first-party filesystem MCP tools. It owns filesystem behavior,
-the reviewed MCP catalog projection, structured results, bounded previews, and tool dispatch. It does
-not own transport, process configuration, or host permission decisions.
+`workcell-mcp-files` implements the six base filesystem tools and the optional `index` tool. It owns
+filesystem behavior, the reviewed MCP catalog projection, structured results, bounded previews, and
+tool dispatch. It does not own transport, process configuration, or host permission decisions.
 
 ## Public API
 
@@ -33,6 +33,16 @@ methods are available alongside JSON MCP dispatch.
 | `file_write`       | Dry-run diff or atomic same-directory replacement.                         |
 | `file_edit`        | Exact unique replacement, optional replace-all, and dry-run diff.          |
 | `file_apply_patch` | Validated add, update, move, and delete sections with bounded results.     |
+| `index`            | Feature-gated source skeletons and deterministic typed directory listings. |
+
+`index` is not part of the base `files` build. Enable the crate's `index` feature, or the facade's
+`files-index` feature, to compile its parser bundle and expose the tool. Native execution uses
+`index` with secure defaults or `index_with_configuration` with host-only `IndexLimits`; limits are
+not accepted in model input. `inspect_index` resolves exactly one existing file (`Read`) or directory
+(`Traverse`) without opening source content.
+
+Language extraction, import merging, section ordering, formatting, and range metadata are native Rust
+tree-sitter visitors. The feature has no scripting interpreter or runtime-loaded extractor assets.
 
 Grep supports common alternation, grouping, classes, anchors, and repetition. Look-around and
 backreferences are rejected because preserving those JavaScript constructs would permit catastrophic
@@ -47,6 +57,11 @@ backtracking controlled by model input.
   extensions do not control classification.
 - Reads, lines, traversal, regexes, globs, patches, diffs, plans, and MCP responses have independent
   limits.
+- Index source, model text, output lines, directory entries/scans, admission, parser wall time, and
+  process-wide concurrency have independent limits. Node and depth limits apply during post-parse
+  inspection and extraction; they do not cap tree-sitter construction memory.
+- Index directory `totalCount` is exact for complete scans and a lower bound on processed visible entries
+  when `truncated` is true.
 - Mutations are read-only by default; dry-run validation remains available.
 - Existing mode bits are preserved and new files use mode `0600` on supported platforms.
 - Replacements use exclusive same-directory temporary files and atomic rename.
@@ -75,6 +90,6 @@ which is disclosed in the catalog and tested independently from the legacy JavaS
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p workcell-mcp-files --all-targets -- -D warnings
-cargo test -p workcell-mcp-files
+cargo clippy -p workcell-mcp-files --all-targets --features index,mcp -- -D warnings
+cargo test -p workcell-mcp-files --features index,mcp
 ```

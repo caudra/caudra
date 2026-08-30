@@ -110,6 +110,19 @@ impl RootPathPolicy {
         }
     }
 
+    #[cfg(feature = "index")]
+    pub(crate) async fn revalidate(&self, authorized: &Path) -> Result<PathBuf, FilesystemError> {
+        let requested = authorized.to_string_lossy();
+        let canonical = canonicalize(authorized).await.map_err(|error| {
+            FilesystemError::io_path("Cannot revalidate authorized path", authorized, error)
+        })?;
+        if self.confined {
+            self.assert_inside(&canonical, &requested)?;
+            self.assert_not_protected(&canonical, &requested)?;
+        }
+        Ok(canonical)
+    }
+
     pub(crate) fn relative(&self, path: &Path) -> Result<String, FilesystemError> {
         if self.confined {
             self.assert_inside(path, &path.to_string_lossy())?;

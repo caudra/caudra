@@ -60,10 +60,11 @@ For example, an actual structured field of `/tmp/run-a/notes.txt` becomes:
 }
 ```
 
-Filesystem `contentText` is the normalized `structuredContent` serialized with
-`JSON.stringify(value, null, 2)`. Newlines, field order, and omission of undefined fields are part of
-the expectation. Read-only cases repeat their unchanged complete post-state so a conforming
-implementation also proves it did not mutate the root.
+Filesystem `contentText` is normally the normalized `structuredContent` serialized with
+`JSON.stringify(value, null, 2)`. The `index` contract deliberately uses its bare skeleton or listing
+instead. Newlines, field order, and omission of undefined fields are part of the expectation. Read-only
+cases repeat their unchanged complete post-state so a conforming implementation also proves it did not
+mutate the root.
 
 The Kagi fixture covers its first-party raw API body, including region/date filters, boolean safe
 search, timeout, redirect denial, and credential exclusion. Separate SerpApi Google and Bing fixtures

@@ -10,6 +10,40 @@ version.workspace = true
 
 [features]
 default = ["mcp"]
+index = [
+  "dep:tree-sitter",
+  "dep:tree-sitter-bash",
+  "dep:tree-sitter-c",
+  "dep:tree-sitter-c-sharp",
+  "dep:tree-sitter-containerfile",
+  "dep:tree-sitter-cpp",
+  "dep:tree-sitter-css",
+  "dep:tree-sitter-dart",
+  "dep:tree-sitter-elixir",
+  "dep:tree-sitter-gleam",
+  "dep:tree-sitter-go",
+  "dep:tree-sitter-hcl",
+  "dep:tree-sitter-html",
+  "dep:tree-sitter-java",
+  "dep:tree-sitter-json",
+  "dep:tree-sitter-kotlin-ng",
+  "dep:tree-sitter-lua",
+  "dep:tree-sitter-make",
+  "dep:tree-sitter-md",
+  "dep:tree-sitter-nix",
+  "dep:tree-sitter-php",
+  "dep:tree-sitter-python",
+  "dep:tree-sitter-ruby",
+  "dep:tree-sitter-rust",
+  "dep:tree-sitter-scala",
+  "dep:tree-sitter-sequel",
+  "dep:tree-sitter-starlark",
+  "dep:tree-sitter-swift",
+  "dep:tree-sitter-toml-ng",
+  "dep:tree-sitter-typescript",
+  "dep:tree-sitter-yaml",
+  "dep:tree-sitter-zig",
+]
 mcp = ["dep:rmcp"]
 
 [dependencies]
@@ -24,6 +58,38 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-c = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-containerfile = { workspace = true, optional = true }
+tree-sitter-cpp = { workspace = true, optional = true }
+tree-sitter-css = { workspace = true, optional = true }
+tree-sitter-dart = { workspace = true, optional = true }
+tree-sitter-elixir = { workspace = true, optional = true }
+tree-sitter-gleam = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-hcl = { workspace = true, optional = true }
+tree-sitter-html = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-kotlin-ng = { workspace = true, optional = true }
+tree-sitter-lua = { workspace = true, optional = true }
+tree-sitter-make = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
+tree-sitter-nix = { workspace = true, optional = true }
+tree-sitter-php = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-ruby = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-scala = { workspace = true, optional = true }
+tree-sitter-sequel = { workspace = true, optional = true }
+tree-sitter-starlark = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
+tree-sitter-zig = { workspace = true, optional = true }
 uuid.workspace = true
 workcell-tool-contract.workspace = true
 

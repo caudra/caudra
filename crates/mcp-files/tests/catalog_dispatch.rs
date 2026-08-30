@@ -13,7 +13,15 @@ fn exposes_exact_order_titles_schemas_annotations_and_presentations() {
     ))
     .expect("filesystem catalog fixture");
     let actual = serde_json::to_value(catalog()).expect("serialize filesystem catalog");
-    assert_eq!(actual, fixture["expected"]["tools"]);
+    #[cfg(feature = "index")]
+    let expected = fixture["expected"]["tools"].clone();
+    #[cfg(not(feature = "index"))]
+    let expected = {
+        let mut expected = fixture["expected"]["tools"].clone();
+        expected.as_array_mut().expect("fixture tools").pop();
+        expected
+    };
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]
@@ -59,6 +67,94 @@ async fn dispatch_routes_known_names_and_returns_pretty_and_structured_json() {
             .dispatch("not_a_file_tool", json!({}), CancellationToken::new())
             .await
             .is_none()
+    );
+}
+
+#[cfg(feature = "index")]
+#[tokio::test]
+async fn index_dispatch_returns_bare_model_text_and_complete_structured_content() {
+    let root = tempdir().expect("root");
+    std::fs::write(root.path().join("source.rs"), "pub fn run() {}\n").expect("file");
+    let group = FileToolGroup::new(root.path(), false, None)
+        .await
+        .expect("group");
+    let result = group
+        .dispatch(
+            "index",
+            json!({"path": "source.rs"}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("known")
+        .expect("result");
+    let ContentBlock::Text(content) = &result.content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(content.text, "fns:\n  pub run() [1]");
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["skeleton"],
+        content.text
+    );
+
+    let directory = group
+        .dispatch("index", json!({"path": "."}), CancellationToken::new())
+        .await
+        .expect("known")
+        .expect("result");
+    let ContentBlock::Text(directory_text) = &directory.content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(directory_text.text, "source.rs");
+    assert_eq!(
+        directory.structured_content.as_ref().unwrap()["kind"],
+        "directory"
+    );
+
+    for arguments in [
+        json!({"path": ""}),
+        json!({"path": "source.rs", "extra": true}),
+    ] {
+        let invalid = group
+            .dispatch("index", arguments, CancellationToken::new())
+            .await
+            .expect("known")
+            .expect("tool error");
+        assert_eq!(invalid.is_error, Some(true));
+    }
+}
+
+#[cfg(feature = "index")]
+#[tokio::test]
+async fn index_dispatch_fits_escape_heavy_source_into_a_successful_result() {
+    let root = tempdir().expect("root");
+    let escaped = "\\".repeat(900);
+    let source = (0..60)
+        .map(|index| format!("<div id=\"item-{index}-{escaped}\"></div>\n"))
+        .collect::<String>();
+    std::fs::write(root.path().join("escaped.html"), source).expect("file");
+    let group = FileToolGroup::new(root.path(), false, None)
+        .await
+        .expect("group");
+
+    let result = group
+        .dispatch(
+            "index",
+            json!({"path": "escaped.html"}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("known")
+        .expect("successful bounded result");
+    assert_ne!(result.is_error, Some(true));
+    let ContentBlock::Text(content) = &result.content[0] else {
+        panic!("expected text")
+    };
+    let structured = result.structured_content.as_ref().unwrap();
+    assert_eq!(structured["truncated"], true);
+    assert_eq!(structured["skeleton"], content.text);
+    assert_eq!(
+        structured["lines"].as_array().unwrap().last().unwrap()["text"],
+        "[truncated]"
     );
 }
 

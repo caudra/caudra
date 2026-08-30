@@ -22,7 +22,7 @@ comma := ,
 empty :=
 space := $(empty) $(empty)
 # Tool groups exposed by the `workcell` embedding facade, each gating one optional dependency.
-NATIVE_GROUPS := files web shell code environment
+NATIVE_GROUPS := files files-index web shell code environment
 NATIVE_FEATURES := $(subst $(space),$(comma),$(NATIVE_GROUPS))
 # Tool crates that must compile with no MCP adapter, so native hosts never link a transport.
 NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-environment
@@ -124,6 +124,21 @@ check-native:
 		printf '%s\n' 'rmcp is reachable from the bundled native code facade'; \
 		exit 2; \
 	fi
+	@if $(CARGO) tree --locked --package workcell --no-default-features \
+		--features files --prefix none 2>/dev/null \
+		| grep -Eq '^(mlua|tree-sitter)[ -]'; then \
+		printf '%s\n' 'the base files facade reaches the optional index parser bundle'; \
+		exit 2; \
+	fi
+	@if $(CARGO) tree --locked --package workcell --no-default-features \
+		--features files-index --prefix none 2>/dev/null \
+		| grep -q '^mlua '; then \
+		printf '%s\n' 'the native index facade reaches a Lua interpreter'; \
+		exit 2; \
+	fi
+	@test ! -e crates/mcp-files/src/index/lua.rs \
+		&& test ! -e crates/mcp-files/src/index/lua/indexer.lua \
+		|| { printf '%s\n' 'the native index contains bundled Lua implementation assets'; exit 2; }
 	@printf '%s\n' 'native facade builds for every tool group with no MCP dependency'
 
 clippy:
@@ -171,6 +186,18 @@ docker-smoke: docker-build
 		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code); \
 	printf '%s\n' "$$output" | grep -q '"outcome":"completed".*"result":10' \
 		|| { printf '%s\n' 'packaged code execution failed'; exit 2; }
+	@printf '%s\n' 'discovering and executing index through the packaged MCP server'
+	@output=$$(printf '%s\n' \
+		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
+		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+		'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{"path":"LICENSE.md"}}}' \
+		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group files \
+			/usr/share/doc/workcell-mcp); \
+	printf '%s\n' "$$output" | grep -q '"name":"index"' \
+		|| { printf '%s\n' 'packaged index catalog is incomplete'; exit 2; }; \
+	printf '%s\n' "$$output" | grep -q '"kind":"file".*"language":"markdown"' \
+		|| { printf '%s\n' 'packaged index execution failed'; exit 2; }
 
 docker-run:
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make docker-run ROOT=/absolute/workspace'; exit 2; }

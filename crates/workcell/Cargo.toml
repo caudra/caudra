@@ -10,6 +10,7 @@ version.workspace = true
 [features]
 default = []
 files = ["dep:workcell-mcp-files"]
+files-index = ["files", "workcell-mcp-files/index"]
 web = ["dep:workcell-mcp-web"]
 shell = ["dep:workcell-mcp-shell"]
 code = ["dep:workcell-mcp-code"]

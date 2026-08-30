@@ -100,6 +100,16 @@ Rules:
 - Prefix new lines with + even when creating a file.
 - This tool is mutating and should run only after a permission decision that shows the full patch preview."#;
 
+#[cfg(feature = "index")]
+const INDEX_DESCRIPTION: &str = r#"Return a compact structural overview of a source file, or a deterministic listing of a directory.
+
+- Use this first to understand file structure before reading specific sections with file_read.
+- File results include imports, declarations, signatures, source ranges, parse recovery status, and semantic output-line metadata.
+- Directory results list directories before files and append / to directory names.
+- The path may be absolute or relative to the configured file root.
+- Unsupported file types, binary files, and non-UTF-8 source are rejected.
+- Parsing, traversal, source, lines, output, admission, and concurrency are bounded by host-only policy."#;
+
 /// Returns fresh values so a composing server may safely augment its own copy.
 /// Order is part of the public compatibility contract and mirrors registration
 /// order in the TypeScript MCP server.
@@ -110,7 +120,7 @@ pub fn catalog() -> Vec<Tool> {
 
 #[must_use]
 pub fn specs() -> Vec<ToolSpec> {
-    vec![
+    let specs = vec![
         spec(
             "file_read",
             "Read file or directory",
@@ -165,7 +175,30 @@ pub fn specs() -> Vec<ToolSpec> {
             "file.diff.v1",
             "file.patch.v1",
         ),
-    ]
+    ];
+    append_index_spec(specs)
+}
+
+#[cfg(feature = "index")]
+fn append_index_spec(mut specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    specs.push(
+        spec(
+            "index",
+            "Index source file or directory",
+            INDEX_DESCRIPTION,
+            index_schema(),
+            read_annotations(),
+            "file.index.v1",
+            "file.index.v1",
+        )
+        .with_output_schema(index_output_schema()),
+    );
+    specs
+}
+
+#[cfg(not(feature = "index"))]
+fn append_index_spec(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    specs
 }
 
 fn spec(
@@ -202,6 +235,10 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
     );
     let tool = match spec.title {
         Some(title) => tool.with_title(title),
+        None => tool,
+    };
+    let tool = match &spec.output_schema {
+        Some(output_schema) => tool.with_raw_output_schema(Arc::new(output_schema.clone())),
         None => tool,
     };
     tool.with_annotations(ToolAnnotations::from_raw(
@@ -378,6 +415,108 @@ fn patch_schema() -> Map<String, Value> {
     }))
 }
 
+#[cfg(feature = "index")]
+fn index_schema() -> Map<String, Value> {
+    schema(json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": format!(
+                    "Root-relative or absolute source file or directory path, limited to {} UTF-8 bytes.",
+                    crate::INDEX_MAX_PATH_BYTES
+                )
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false,
+        "$schema": DRAFT_07
+    }))
+}
+
+#[cfg(feature = "index")]
+fn index_output_schema() -> Map<String, Value> {
+    let source_range = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["startLine", "endLine"],
+        "properties": {
+            "startLine": {"type": "integer", "minimum": 1},
+            "endLine": {"type": "integer", "minimum": 1}
+        }
+    });
+    let output_line = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outputLine", "text", "semantic"],
+        "properties": {
+            "outputLine": {"type": "integer", "minimum": 1},
+            "text": {"type": "string"},
+            "semantic": {
+                "type": "string",
+                "enum": ["section", "item", "dimmed", "plain"]
+            },
+            "body": {"type": "string"},
+            "sourceRange": source_range
+        }
+    });
+    let directory_entry = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "kind"],
+        "properties": {
+            "name": {"type": "string"},
+            "kind": {"type": "string", "enum": ["directory", "file"]}
+        }
+    });
+    schema(json!({
+        "$schema": DRAFT_07,
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "kind", "path", "relativePath", "language", "skeleton", "lines",
+                    "sourceLineCount", "parseError", "truncated"
+                ],
+                "properties": {
+                    "kind": {"const": "file"},
+                    "path": {"type": "string"},
+                    "relativePath": {"type": "string"},
+                    "language": {"type": "string"},
+                    "skeleton": {"type": "string"},
+                    "lines": {"type": "array", "items": output_line},
+                    "sourceLineCount": {"type": "integer", "minimum": 1},
+                    "parseError": {"type": "boolean"},
+                    "truncated": {"type": "boolean"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "kind", "path", "relativePath", "entries", "totalCount", "truncated",
+                    "listing"
+                ],
+                "properties": {
+                    "kind": {"const": "directory"},
+                    "path": {"type": "string"},
+                    "relativePath": {"type": "string"},
+                    "entries": {"type": "array", "items": directory_entry},
+                    "totalCount": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
+                    },
+                    "truncated": {"type": "boolean"},
+                    "listing": {"type": "string"}
+                }
+            }
+        ]
+    }))
+}
+
 fn schema(value: Value) -> Map<String, Value> {
     value.as_object().expect("schema is an object").clone()
 }
@@ -391,19 +530,22 @@ mod tests {
     #[test]
     fn catalog_has_compatible_order_annotations_and_metadata() {
         let tools = catalog();
+        let expected = vec![
+            "file_read",
+            "file_glob",
+            "file_grep",
+            "file_write",
+            "file_edit",
+            "file_apply_patch",
+        ];
+        #[cfg(feature = "index")]
+        let expected = expected.into_iter().chain(["index"]).collect::<Vec<_>>();
         assert_eq!(
             tools
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            [
-                "file_read",
-                "file_glob",
-                "file_grep",
-                "file_write",
-                "file_edit",
-                "file_apply_patch"
-            ]
+            expected
         );
         assert_eq!(
             tools[0].annotations.as_ref().unwrap().read_only_hint,
@@ -426,6 +568,23 @@ mod tests {
             assert_eq!(
                 spec.presentation,
                 tool.meta.as_ref().unwrap().0[PRESENTATION_KEY]
+            );
+        }
+        #[cfg(feature = "index")]
+        {
+            let index = specs().pop().expect("index spec");
+            assert_eq!(index.name, "index");
+            assert_eq!(index.contract_id, "file.index.v1");
+            assert_eq!(index.presentation, "file.index.v1");
+            assert!(index.output_schema.is_some());
+            let path = &index.input_schema["properties"]["path"];
+            assert!(path.get("maxLength").is_none());
+            assert_eq!(
+                path["description"],
+                json!(format!(
+                    "Root-relative or absolute source file or directory path, limited to {} UTF-8 bytes.",
+                    crate::INDEX_MAX_PATH_BYTES
+                ))
             );
         }
     }

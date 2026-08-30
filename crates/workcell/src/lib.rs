@@ -16,6 +16,12 @@ pub use workcell_mcp_code::CodeToolGroup;
 pub use workcell_mcp_files as files;
 #[cfg(feature = "files")]
 pub use workcell_mcp_files::{FileToolGroup, PreparedFilePatch};
+#[cfg(feature = "files-index")]
+pub use workcell_mcp_files::{
+    INDEX_MAX_DEADLINE_MS, INDEX_MAX_PATH_BYTES, INDEX_PARSER_CONCURRENCY, IndexDirectoryEntry,
+    IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
+    IndexLineSemantic, IndexOutput, IndexOutputLine, IndexSourceRange,
+};
 #[cfg(feature = "shell")]
 pub use workcell_mcp_shell as shell;
 #[cfg(feature = "shell")]

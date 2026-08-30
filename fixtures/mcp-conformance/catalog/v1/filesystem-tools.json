@@ -223,7 +223,130 @@
         "_meta": {
           "ai.workcell/presentation-profile": "file.diff.v1"
         }
-      }
-    ]
+        },
+        {
+          "name": "index",
+          "title": "Index source file or directory",
+          "description": "Return a compact structural overview of a source file, or a deterministic listing of a directory.\n\n- Use this first to understand file structure before reading specific sections with file_read.\n- File results include imports, declarations, signatures, source ranges, parse recovery status, and semantic output-line metadata.\n- Directory results list directories before files and append / to directory names.\n- The path may be absolute or relative to the configured file root.\n- Unsupported file types, binary files, and non-UTF-8 source are rejected.\n- Parsing, traversal, source, lines, output, admission, and concurrency are bounded by host-only policy.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Root-relative or absolute source file or directory path, limited to 4096 UTF-8 bytes."
+              }
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "outputSchema": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "path",
+                  "relativePath",
+                  "language",
+                  "skeleton",
+                  "lines",
+                  "sourceLineCount",
+                  "parseError",
+                  "truncated"
+                ],
+                "properties": {
+                  "kind": { "const": "file" },
+                  "path": { "type": "string" },
+                  "relativePath": { "type": "string" },
+                  "language": { "type": "string" },
+                  "skeleton": { "type": "string" },
+                  "lines": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["outputLine", "text", "semantic"],
+                      "properties": {
+                        "outputLine": { "type": "integer", "minimum": 1 },
+                        "text": { "type": "string" },
+                        "semantic": {
+                          "type": "string",
+                          "enum": ["section", "item", "dimmed", "plain"]
+                        },
+                        "body": { "type": "string" },
+                        "sourceRange": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["startLine", "endLine"],
+                          "properties": {
+                            "startLine": { "type": "integer", "minimum": 1 },
+                            "endLine": { "type": "integer", "minimum": 1 }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "sourceLineCount": { "type": "integer", "minimum": 1 },
+                  "parseError": { "type": "boolean" },
+                  "truncated": { "type": "boolean" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "path",
+                  "relativePath",
+                  "entries",
+                  "totalCount",
+                  "truncated",
+                  "listing"
+                ],
+                "properties": {
+                  "kind": { "const": "directory" },
+                  "path": { "type": "string" },
+                  "relativePath": { "type": "string" },
+                  "entries": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["name", "kind"],
+                      "properties": {
+                        "name": { "type": "string" },
+                        "kind": {
+                          "type": "string",
+                          "enum": ["directory", "file"]
+                        }
+                      }
+                    }
+                  },
+                  "totalCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
+                  },
+                  "truncated": { "type": "boolean" },
+                  "listing": { "type": "string" }
+                }
+              }
+            ]
+          },
+          "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+          },
+          "_meta": {
+            "ai.workcell/presentation-profile": "file.index.v1"
+          }
+        }
+      ]
   }
 }
