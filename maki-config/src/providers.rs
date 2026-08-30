@@ -8,6 +8,7 @@ use std::str::FromStr;
 use tracing::debug;
 
 use maki_storage::paths;
+use maki_storage::thinking::ReasoningOptions;
 
 const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
@@ -47,6 +48,11 @@ pub struct ModelDef {
     pub requires_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Reasoning controls this model accepts, in the models.dev shape. Declared
+    /// here for a model no catalog describes, so a level it never advertised is
+    /// snapped into this list instead of being sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_options: Option<ReasoningOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +411,45 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const DECLARED_LEVELS_TOML: &str = r#"
+[local]
+protocol = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+discover_models = true
+
+[[local.models]]
+id = "qwen3.8-27b"
+context_window = 229376
+max_output_tokens = 32768
+
+[[local.models.reasoning_options]]
+type = "effort"
+values = ["none", "low", "medium", "xhigh"]
+"#;
+
+    const DECLARED_WINS: &str =
+        "a level declared in providers.toml is the only description this model has";
+
+    #[test]
+    fn model_def_reads_declared_reasoning_options() {
+        let parsed: ProvidersConfig = toml::from_str(DECLARED_LEVELS_TOML).unwrap();
+        let model = &parsed.get("local").unwrap().models[0];
+
+        assert_eq!(model.id, "qwen3.8-27b");
+        assert_eq!(model.context_window, Some(229_376));
+        assert_eq!(model.max_output_tokens, Some(32_768));
+        let options = model.reasoning_options.clone().expect(DECLARED_WINS);
+        assert_eq!(
+            options.efforts(),
+            ["none", "low", "medium", "xhigh"],
+            "{DECLARED_WINS}"
+        );
+        assert!(
+            options.can_disable(),
+            "a declared none is how off is spelled"
+        );
+    }
 
     #[test]
     fn provider_def_roundtrip() {

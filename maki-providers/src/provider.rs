@@ -595,8 +595,15 @@ pub async fn fetch_all_models(
 
     drop(tx);
 
+    // Batches arrive from independent producers that can name the same model:
+    // a providers.toml entry and the `/models` response that also lists it. The
+    // picker must show it once, and only the first arrival can be the one kept
+    // since callers render each batch as it lands.
+    let mut seen = std::collections::HashSet::new();
     while let Ok(mut batch) = rx.recv_async().await {
-        batch.models.retain(|spec| policy.allows(spec));
+        batch
+            .models
+            .retain(|spec| policy.allows(spec) && seen.insert(spec.clone()));
         on_ready(batch);
     }
     if let Some(done) = on_done {
@@ -607,6 +614,32 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LISTED_ONCE: &str =
+        "a model both declared and discovered must reach the picker once, not twice";
+
+    /// A `providers.toml` entry and the `/models` response that also lists it
+    /// arrive as separate batches, so only the merge point can tell they are
+    /// the same model.
+    #[test]
+    fn duplicate_specs_across_batches_are_listed_once() {
+        let batches = [
+            vec!["local/qwen".to_string(), "local/other".to_string()],
+            vec!["local/qwen".to_string()],
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let listed: Vec<String> = batches
+            .into_iter()
+            .flat_map(|batch| {
+                batch
+                    .into_iter()
+                    .filter(|spec| seen.insert(spec.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(listed, ["local/qwen", "local/other"], "{LISTED_ONCE}");
+    }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(

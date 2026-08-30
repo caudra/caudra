@@ -2495,15 +2495,15 @@ pub(crate) mod schema {
         let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
         Ok(raw
             .into_iter()
-            .filter_map(|(id, value)| {
-                match serde_json::from_value::<CatalogModel>(value) {
+            .filter_map(
+                |(id, value)| match serde_json::from_value::<CatalogModel>(value) {
                     Ok(model) => Some((id, model)),
                     Err(error) => {
                         tracing::debug!(model = %id, %error, "skipping unreadable catalog model");
                         None
                     }
-                }
-            })
+                },
+            )
             .collect())
     }
 
@@ -2587,4 +2587,3 @@ pub(crate) mod schema {
         pub shape: Option<String>,
     }
 }
-

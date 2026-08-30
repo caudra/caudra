@@ -15,7 +15,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::{ReasoningOptions, ThinkingConfig};
+use crate::types::ThinkingConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -156,7 +156,9 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         discovered_free: false,
         max_output_tokens,
         context_window,
-        reasoning_options: ReasoningOptions::default(),
+        reasoning_options: declared
+            .and_then(|m| m.reasoning_options.clone())
+            .unwrap_or_default(),
         thinking_fields: None,
     }
 }
