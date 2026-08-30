@@ -27,10 +27,8 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
-const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits()
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES.bits(),
-);
+const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
 
 pub(crate) struct TerminalGuard;
 
@@ -427,13 +425,10 @@ mod tests {
     use test_case::test_case;
 
     #[test]
-    fn keyboard_enhancements_disambiguate_control_keys() {
-        assert!(
-            KEYBOARD_ENHANCEMENTS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-        assert!(
-            KEYBOARD_ENHANCEMENTS
-                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+    fn keyboard_enhancements_preserve_text_input() {
+        assert_eq!(
+            KEYBOARD_ENHANCEMENTS,
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         );
     }
 
