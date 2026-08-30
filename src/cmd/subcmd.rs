@@ -7,7 +7,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{RegisteredTool, ToolRegistry, is_tool_enabled};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
@@ -591,25 +591,40 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let abs_path = Path::new(path)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(path).to_path_buf());
-    let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(path)});
+    ensure_index_enabled(&config.agent)?;
     let reg = ToolRegistry::global_arc();
     let entry = reg
         .get("index")
         .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
+    print!("{}", execute_index(entry, path, config.agent, &cwd)?);
+    Ok(())
+}
+
+fn ensure_index_enabled(config: &maki_config::AgentConfig) -> Result<()> {
+    if !is_tool_enabled(&config.disabled_tools, "index") {
+        bail!("index is disabled by plugins.index.enabled = false");
+    }
+    Ok(())
+}
+
+fn execute_index(
+    entry: RegisteredTool,
+    path: &str,
+    config: maki_config::AgentConfig,
+    project_cwd: &Path,
+) -> Result<String> {
+    let input = serde_json::json!({"path": path});
     let inv = entry
         .tool
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let ctx = maki_agent::tools::cli_tool_ctx();
+    let mut ctx = maki_agent::tools::cli_tool_ctx(project_cwd);
+    ctx.config = config;
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
-        Ok(output) => print!("{}", output.as_text()),
+        Ok(output) => Ok(output.as_text()),
         Err(e) => bail!("index failed: {e}"),
     }
-    Ok(())
 }
 
 pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
@@ -666,7 +681,9 @@ pub fn prompt(
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
-    use maki_agent::prompt::{PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task};
+    use maki_agent::prompt::{
+        PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task_with_filter,
+    };
     use maki_agent::template;
     use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 
@@ -702,6 +719,7 @@ pub fn prompt(
     let storage = StateDir::resolve().context("resolve data directory")?;
     let mut model = crate::setup::resolve_model(model_arg, &config.provider, &storage)?;
     maki_providers::provider::adjust_model(&mut model, maki_providers::Timeouts::default())?;
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 
     if tools {
         let thinking = config
@@ -719,7 +737,6 @@ pub fn prompt(
             "{task_system_prompt_profiles}",
             bindings.task_tool_summary("Maki's built-in task prompt"),
         );
-        let filter = ToolFilter::from_config(&config.agent, &model, &[]);
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
@@ -753,23 +770,26 @@ pub fn prompt(
                 &mode,
                 &instructions,
                 &slots,
+                &filter,
                 &model,
                 system_prompt_profile.as_deref(),
             )
         }
         PromptVariant::Research => vars
-            .apply(&assemble_task(
+            .apply(&assemble_task_with_filter(
                 PromptId::Research,
                 &slots,
+                &filter,
                 &instructions,
                 system_prompt_profile.as_deref(),
                 TASK_PLAN_CONTRACT,
             ))
             .into_owned(),
         PromptVariant::General => vars
-            .apply(&assemble_task(
+            .apply(&assemble_task_with_filter(
                 PromptId::General,
                 &slots,
+                &filter,
                 &instructions,
                 system_prompt_profile.as_deref(),
                 TASK_BUILD_CONTRACT,
@@ -779,4 +799,57 @@ pub fn prompt(
 
     print!("{output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn one_shot_index_honors_enablement_and_source_size() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        std::fs::write(&source, "pub fn run() {}\n").unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let registry = Arc::new(ToolRegistry::new());
+        let host = maki_workcell::WorkcellHost::new(root.path(), None).unwrap();
+        host.register(&registry).unwrap();
+        let entry = registry.get("index").unwrap();
+
+        let output = execute_index(
+            entry.clone(),
+            "source.rs",
+            maki_config::AgentConfig::default(),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(output, "fns:\n  pub run() [1]");
+
+        let directory = execute_index(
+            entry.clone(),
+            ".",
+            maki_config::AgentConfig::default(),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(directory, "nested/\nsource.rs");
+
+        let disabled = maki_config::AgentConfig {
+            disabled_tools: vec!["index".into()],
+            ..Default::default()
+        };
+        assert!(ensure_index_enabled(&disabled).is_err());
+
+        std::fs::write(&source, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        let limited = maki_config::AgentConfig {
+            index_max_file_size_mb: 1,
+            ..Default::default()
+        };
+        let error = execute_index(entry, "source.rs", limited, root.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds maximum size of 1048576 bytes")
+        );
+    }
 }

@@ -67,3 +67,15 @@ class Account(val id: Int) {
   local text, meta = idx_with_meta(src, "kotlin")
   helpers.assert_ranged_meta(text, meta, { "deposit", "withdraw" })
 end)
+
+case("kotlin_companion_members_preserve_ranges", function()
+  local src = [==[class Service {
+    companion object {
+        val DEFAULT: Int = 1
+        fun create(): Service = Service()
+    }
+}]==]
+  local text, meta = idx_with_meta(src, "kotlin")
+  has(text, { "companion.val DEFAULT", "companion.fun create()" })
+  helpers.assert_ranged_meta(text, meta, { "companion.val DEFAULT", "companion.fun create" })
+end)

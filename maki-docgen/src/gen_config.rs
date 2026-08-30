@@ -7,7 +7,7 @@ use maki_config::{
     DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
     TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
-use maki_lua::{PluginHost, PluginOptionSpecs};
+use maki_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -74,6 +74,15 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
 fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
     for (plugin, options) in specs {
         writeln!(out, "### `plugins.{plugin}`\n").unwrap();
+        if plugin.as_ref() == "index" {
+            writeln!(
+                out,
+                "`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts {} through {} MiB to bound parser memory and work.\n",
+                maki_config::MIN_INDEX_MAX_FILE_SIZE_MB,
+                maki_config::MAX_INDEX_MAX_FILE_SIZE_MB,
+            )
+            .unwrap();
+        }
         writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
         writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
         for o in options {
@@ -107,7 +116,22 @@ fn collect_plugin_options() -> PluginOptionSpecs {
         std::collections::HashMap::new(),
     ))
     .expect("loading builtins");
-    let specs = host.plugin_options().expect("collecting plugin options");
+    let mut specs = host.plugin_options().expect("collecting plugin options");
+    specs.insert(
+        "index".into(),
+        vec![OptionSpec {
+            name: "max_file_size_mb".into(),
+            ty: OptionType::Integer,
+            default: Some(serde_json::json!(
+                maki_config::DEFAULT_INDEX_MAX_FILE_SIZE_MB
+            )),
+            min: Some(maki_config::MIN_INDEX_MAX_FILE_SIZE_MB as f64),
+            desc: format!(
+                "Refuse to index files larger than this many MiB (maximum {}).",
+                maki_config::MAX_INDEX_MAX_FILE_SIZE_MB
+            ),
+        }],
+    );
     assert!(
         !specs.is_empty(),
         "no plugin declared options; the plugins reference would be empty"
@@ -286,10 +310,10 @@ All fields are optional. Typos in field names cause an error right away.
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(
         out,
-        "The `plugins` table turns plugins on or off and passes options to \
-         them. All bundled plugins are on by default. Set \
+        "The `plugins` table turns bundled features and plugins on or off and passes options to \
+         them. All bundled features are on by default. Set \
          `enabled = false` to turn one off.\n\n\
-         Each plugin checks its own options at startup. A typo, a wrong \
+         Each feature checks its own options at startup. A typo, a wrong \
          type, or an unknown plugin name gives you a clear error right \
          away.\n\n\
          The edit plugin's extra tools are options too: \

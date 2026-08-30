@@ -2143,7 +2143,6 @@ mod effect_tests {
             .unwrap();
 
         for (name, expected) in [
-            ("index", ToolEffect::ReadOnly),
             ("skill", ToolEffect::Mutating),
             ("view_image", ToolEffect::ReadOnly),
             ("todo_write", ToolEffect::Isolated),

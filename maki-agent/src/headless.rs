@@ -621,6 +621,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         &mode,
         &instructions.text,
         &params.prompt_slots,
+        &tool_filter,
         &params.model,
         params.system_prompt_profile.as_deref(),
     );
@@ -964,6 +965,7 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &instructions.text,
                         &params.prompt_slots,
+                        &tool_filter,
                         &model,
                         params.system_prompt_profile.as_deref(),
                     )

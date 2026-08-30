@@ -94,9 +94,13 @@ fn restore_history(entries: impl IntoIterator<Item = PersistedHistoryEntry>) -> 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
-    use crate::History;
+    use crate::{
+        History, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic,
+        IndexOutput, IndexSourceRange,
+    };
     use maki_providers::{ContentBlock, Role, active_history_items, resolve_history_head};
 
     const CWD: &str = "/repo";
@@ -156,5 +160,67 @@ mod tests {
                 .user_text(),
             Some("readable")
         );
+    }
+
+    fn native_file_index() -> ToolOutput {
+        ToolOutput::Index(IndexOutput::File {
+            path: "/repo/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            language: "rust".into(),
+            skeleton: "fns:\n  pub run() [2]".into(),
+            lines: vec![IndexLine {
+                output_line: 2,
+                text: "  pub run() [2]".into(),
+                semantic: IndexLineSemantic::Item,
+                body: Some("  pub run()".into()),
+                source_range: Some(IndexSourceRange {
+                    start_line: 2,
+                    end_line: 2,
+                }),
+            }],
+            source_line_count: 2,
+            parse_error: false,
+            truncated: false,
+            instructions: None,
+            state: Some(serde_json::json!({"kind": "file", "language": "rust"})),
+        })
+    }
+
+    fn native_directory_index() -> ToolOutput {
+        ToolOutput::Index(IndexOutput::Directory {
+            path: "/repo".into(),
+            relative_path: ".".into(),
+            entries: vec![IndexDirectoryEntry {
+                name: "src".into(),
+                kind: IndexDirectoryEntryKind::Directory,
+            }],
+            total_count: 2,
+            truncated: true,
+            listing: "src/\n[truncated]".into(),
+            instructions: None,
+            state: Some(serde_json::json!({
+                "kind": "directory",
+                "listing": "src/",
+                "truncated": true
+            })),
+        })
+    }
+
+    #[test_case(native_file_index() ; "file")]
+    #[test_case(native_directory_index() ; "directory")]
+    fn native_index_output_survives_persisted_session_roundtrip(output: ToolOutput) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let expected = serde_json::to_value(&output).unwrap();
+        let mut session = StoredSession::new(MODEL, CWD);
+        let id = session.id;
+        session.insert_tool_output("index-call".into(), output);
+        session.save(&storage).unwrap();
+
+        let loaded = load_stored_session(id, &storage).unwrap();
+        let actual = loaded.tool_outputs().get("index-call").unwrap();
+
+        assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
+        assert!(matches!(actual.as_ref(), ToolOutput::Index(_)));
     }
 }

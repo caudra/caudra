@@ -60,7 +60,7 @@ Rust workspace, key crates in root dir:
 - maki-acp: ACP ndjson stdio server
 - maki-workcell: Native Workcell adapter, Maki authorization integration, and tool-result presentation
 
-First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, websearch, webfetch, shell, code_execution, and execution_environment.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, index, websearch, webfetch, shell, code_execution, and execution_environment.
 Maki owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
 lifecycle. Keep Workcell logic in Workcell rather than duplicating it in `maki-workcell`.
@@ -75,7 +75,7 @@ For worker or release changes, run the production bundled-worker execution test 
 worker, not only a catalog check. Release smoke tests must fail when `code_execution` is reserved but
 unavailable. Keep Monty's worker and `monty-pool` versions in lockstep.
 
-Active built-in Lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources remain in-tree for tests and reference but are not loaded in production.
+Active built-in Lua plugins in ./plugins: question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources, including index, remain in-tree for tests and reference but are not loaded in production.
 
 ## Docs
 

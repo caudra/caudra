@@ -399,11 +399,13 @@ impl AgentLoop {
             .lua_handle
             .collect_prompt_slots_async(&self.config)
             .await;
+        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
             &self.vars,
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
+            &tool_filter,
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );
@@ -436,7 +438,7 @@ impl AgentLoop {
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
-                tool_filter: ToolFilter::from_config(&self.config, &slot.model, &[]),
+                tool_filter,
                 model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {
@@ -525,11 +527,13 @@ impl AgentLoop {
         opts: RequestOptions,
     ) {
         let slot = self.model_slot.load();
+        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
+            &tool_filter,
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );

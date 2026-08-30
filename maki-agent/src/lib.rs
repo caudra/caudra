@@ -56,9 +56,11 @@ use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
-    GrepMatchGroup, InstructionBlock, LuaToolProvenance, NO_FILES_FOUND, QueueConsumedItem,
-    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
+    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine,
+    IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, LuaToolProvenance,
+    NO_FILES_FOUND, QueueConsumedItem, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits,
+    ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

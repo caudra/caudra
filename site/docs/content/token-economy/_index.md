@@ -21,7 +21,9 @@ So Maki attacks the two multipliers: how much each step adds to context, and how
 
 ## Smaller results
 
-**index instead of file_read.** The `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+**index instead of file_read.** The native `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+
+Directory indexing follows Workcell's generic listing contract. Instruction files appear as ordinary visible entries, and the call does not discover their contents. Restored legacy index results keep instruction blocks that were stored with the session.
 
 ```
 file_read main.rs            index main.rs

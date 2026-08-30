@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
-use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::chat::{Chat, DONE_TEXT, history_to_display_in_project};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
@@ -137,10 +137,11 @@ impl App {
                         session.update_title_if_default();
                     }
                     if added {
-                        let (messages, _) = history_to_display(
+                        let (messages, _) = history_to_display_in_project(
                             &snapshot.messages,
                             self.state.session.tool_outputs(),
                             &self.ui_config.tool_output_lines,
+                            std::path::Path::new(&self.state.session.cwd),
                         );
                         self.main_chat().bind_sources(&messages);
                     }
@@ -401,10 +402,11 @@ impl App {
                 Vec::new()
             }
         };
-        let (display_msgs, restore_items) = history_to_display(
+        let (display_msgs, restore_items) = history_to_display_in_project(
             &active_history,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
+            std::path::Path::new(&self.state.session.cwd),
         );
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
@@ -578,10 +580,11 @@ impl App {
             else {
                 continue;
             };
-            let (display, items) = history_to_display(
+            let (display, items) = history_to_display_in_project(
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
+                std::path::Path::new(&self.state.session.cwd),
             );
             self.chat_index
                 .insert(sa.tool_use_id.clone(), self.chats.len());

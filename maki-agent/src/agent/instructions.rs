@@ -57,6 +57,7 @@ pub fn build_system_prompt(
     mode: &AgentMode,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
+    tool_filter: &crate::tools::ToolFilter,
     model: &Model,
     profile: Option<&SystemPromptProfile>,
 ) -> String {
@@ -71,7 +72,12 @@ pub fn build_system_prompt(
     } else {
         String::new()
     };
-    crate::prompt::assemble_system(slots, &instructions, &plan, profile)
+    crate::prompt::assemble_system(
+        &slots.with_native_hints(tool_filter),
+        &instructions,
+        &plan,
+        profile,
+    )
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -228,7 +234,15 @@ mod tests {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(&vars, mode, "", &slots, &model, None);
+        let prompt = build_system_prompt(
+            &vars,
+            mode,
+            "",
+            &slots,
+            &crate::tools::ToolFilter::All,
+            &model,
+            None,
+        );
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
@@ -255,6 +269,7 @@ mod tests {
             &AgentMode::Plan(PathBuf::from("plan.md")),
             &format!("\n{INSTR}"),
             &slots,
+            &crate::tools::ToolFilter::All,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             None,
         );

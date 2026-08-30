@@ -136,7 +136,7 @@ Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand fla
 maki index path/to/file.rs
 ```
 
-Runs the `index` tool on a file and prints the skeleton, so you can see what the agent will get before a session. Builtin plugins always load here; `--no-plugins` only skips user `init.lua`.
+Runs the native `index` tool and prints its compact file skeleton or directory listing. It honors `plugins.index.enabled` and `plugins.index.max_file_size_mb`. `--no-plugins` skips user `init.lua`, so default index settings apply.
 
 ### `maki prompt`
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
 const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
 const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
 const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
+const INDEX_TOOL_USAGE: &str = "- Use the **index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.";
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
 
@@ -143,12 +145,13 @@ impl PromptId {
 impl ValidNames for Slot {}
 impl ValidNames for PromptId {}
 
+#[derive(Clone)]
 pub struct SlotEntry {
     pub plugin: Arc<str>,
     pub content: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ResolvedSlots {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
 }
@@ -163,6 +166,32 @@ impl ResolvedSlots {
 
     pub fn insert(&mut self, prompt: PromptId, slot: Slot, entry: SlotEntry) {
         self.entries.entry((prompt, slot)).or_default().push(entry);
+    }
+
+    pub fn with_native_hints(&self, filter: &crate::tools::ToolFilter) -> Cow<'_, Self> {
+        if !filter.matches(crate::tools::INDEX_TOOL_NAME) {
+            return Cow::Borrowed(self);
+        }
+        let mut slots = self.clone();
+        for &prompt in PromptId::ALL {
+            slots.insert(
+                prompt,
+                Slot::ToolUsage,
+                SlotEntry {
+                    plugin: Arc::from("native:index"),
+                    content: INDEX_TOOL_USAGE.into(),
+                },
+            );
+            slots.insert(
+                prompt,
+                Slot::EfficientTools,
+                SlotEntry {
+                    plugin: Arc::from("native:index"),
+                    content: crate::tools::INDEX_TOOL_NAME.into(),
+                },
+            );
+        }
+        Cow::Owned(slots)
     }
 }
 
@@ -496,6 +525,23 @@ pub fn assemble_task(
     output
 }
 
+pub fn assemble_task_with_filter(
+    mode: PromptId,
+    slots: &ResolvedSlots,
+    filter: &crate::tools::ToolFilter,
+    instructions: &str,
+    profile: Option<&SystemPromptProfile>,
+    mode_contract: &str,
+) -> String {
+    assemble_task(
+        mode,
+        &slots.with_native_hints(filter),
+        instructions,
+        profile,
+        mode_contract,
+    )
+}
+
 /// Fill each host template marker once. Inserted content is opaque and is not
 /// scanned again for markers.
 pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
@@ -594,6 +640,19 @@ mod tests {
         );
         let out = assemble(PromptId::System, &s, "");
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
+    }
+
+    #[test_case(crate::tools::ToolFilter::All, true ; "enabled")]
+    #[test_case(crate::tools::ToolFilter::AllExcept(vec!["index".into()]), false ; "disabled")]
+    fn native_index_hints_follow_effective_filter(
+        filter: crate::tools::ToolFilter,
+        expected: bool,
+    ) {
+        let slots = ResolvedSlots::default();
+        let filtered = slots.with_native_hints(&filter);
+        let output = assemble(PromptId::System, &filtered, "");
+        assert_eq!(output.contains(INDEX_TOOL_USAGE), expected);
+        assert_eq!(output.contains("task, index."), expected);
     }
 
     #[test_case(PromptId::Research ; "research")]

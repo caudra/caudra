@@ -15,6 +15,7 @@ use crate::agent::{GoalResult, GoalVerdict};
 use crate::permissions::PermissionRequest;
 
 pub const NO_FILES_FOUND: &str = "No files found";
+pub const INDEX_TRUNCATED: &str = "[truncated]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -122,7 +123,7 @@ pub enum ToolInput {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionBlock {
     pub path: String,
     pub content: String,
@@ -156,6 +157,74 @@ pub struct LuaToolProvenance {
     pub contract: String,
     #[serde(default)]
     pub error_restore_allowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexLineSemantic {
+    Section,
+    Item,
+    Dimmed,
+    Plain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSourceRange {
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLine {
+    pub output_line: usize,
+    pub text: String,
+    pub semantic: IndexLineSemantic,
+    pub body: Option<String>,
+    pub source_range: Option<IndexSourceRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexDirectoryEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDirectoryEntry {
+    pub name: String,
+    pub kind: IndexDirectoryEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum IndexOutput {
+    File {
+        path: String,
+        relative_path: String,
+        language: String,
+        skeleton: String,
+        lines: Vec<IndexLine>,
+        source_line_count: usize,
+        parse_error: bool,
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<Vec<InstructionBlock>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<serde_json::Value>,
+    },
+    Directory {
+        path: String,
+        relative_path: String,
+        entries: Vec<IndexDirectoryEntry>,
+        total_count: usize,
+        truncated: bool,
+        listing: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<Vec<InstructionBlock>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<serde_json::Value>,
+    },
 }
 
 impl From<String> for TextOutput {
@@ -243,6 +312,7 @@ pub enum ToolOutput {
     GrepResult {
         entries: Vec<GrepFileEntry>,
     },
+    Index(IndexOutput),
     /// Only here so legacy sessions still deserialize. Batch is a Lua
     /// plugin now and stores plain text plus a `state` payload, so the old
     /// per-child `entries` are dropped on load: nothing can render them.
@@ -293,6 +363,16 @@ impl ToolOutput {
                 let n = t.text.lines().count();
                 Some(format!("{n} entries"))
             }
+            Self::Index(IndexOutput::File { lines, .. }) => Some(format!("{} lines", lines.len())),
+            Self::Index(IndexOutput::Directory {
+                total_count,
+                truncated,
+                ..
+            }) => Some(if *truncated {
+                format!("at least {total_count} entries")
+            } else {
+                format!("{total_count} entries")
+            }),
             Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
                 let n = text.text.lines().count();
                 Some(format!("{n} lines"))
@@ -320,6 +400,8 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.instructions.as_deref(),
             Self::ReadCode { instructions, .. } => instructions.as_deref(),
+            Self::Index(IndexOutput::File { instructions, .. })
+            | Self::Index(IndexOutput::Directory { instructions, .. }) => instructions.as_deref(),
             _ => None,
         }
     }
@@ -337,6 +419,8 @@ impl ToolOutput {
     pub fn state(&self) -> Option<&serde_json::Value> {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
+            Self::Index(IndexOutput::File { state, .. })
+            | Self::Index(IndexOutput::Directory { state, .. }) => state.as_ref(),
             _ => None,
         }
     }
@@ -361,6 +445,7 @@ impl ToolOutput {
             | Self::ReadDir(_)
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
+            | Self::Index(_)
             | Self::TodoList(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -369,6 +454,8 @@ impl ToolOutput {
     pub fn is_empty_result(&self) -> bool {
         match self {
             Self::GrepResult { entries } => entries.is_empty(),
+            Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.is_empty(),
+            Self::Index(IndexOutput::Directory { listing, .. }) => listing.is_empty(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
             _ => false,
         }
@@ -392,6 +479,14 @@ impl ToolOutput {
                 }
                 out
             }
+            Self::Index(IndexOutput::File { instructions, .. })
+            | Self::Index(IndexOutput::Directory { instructions, .. }) => {
+                let mut out = self.as_display_text();
+                if let Some(blocks) = instructions {
+                    append_instructions(&mut out, blocks);
+                }
+                out
+            }
             _ => self.as_display_text(),
         }
     }
@@ -399,6 +494,8 @@ impl ToolOutput {
     pub fn as_display_text(&self) -> String {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
+            Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
+            Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
             Self::ReadCode {
                 start_line,
                 lines,
@@ -1100,6 +1197,25 @@ mod tests {
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    #[test]
+    fn truncated_index_directory_annotation_is_a_lower_bound() {
+        let output = ToolOutput::Index(IndexOutput::Directory {
+            path: "/project".into(),
+            relative_path: ".".into(),
+            entries: Vec::new(),
+            total_count: 10_000,
+            truncated: true,
+            listing: String::new(),
+            instructions: None,
+            state: None,
+        });
+
+        assert_eq!(
+            output.annotation().as_deref(),
+            Some("at least 10000 entries")
+        );
     }
 
     #[test_case(None ; "no_stop_reason")]

@@ -52,6 +52,14 @@ Use file_apply_patch to edit files with a stripped-down, file-oriented diff form
 | `patchText` | string | yes | Complete stripped-down file patch. |
 | `dryRun` | boolean | no | Validate and preview the patch without changing files. |
 
+### `index` {#index}
+
+Return a compact structural overview of a source file, or a deterministic listing of a directory.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Root-relative or absolute source file or directory path, limited to 4096 UTF-8 bytes. |
+
 ### `file_glob` {#file_glob}
 
 Fast file pattern matching tool for files under the file root.
@@ -94,14 +102,6 @@ Search managed tool output owned by the current session using a regex.
 | `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
 | `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
 | `limit` | integer | no | 100; capped at 200 | Maximum matches to return. |
-
-### `index` {#index}
-
-Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | yes | Absolute path to the file |
 
 ### `view_image` {#view_image}
 

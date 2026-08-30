@@ -14,10 +14,14 @@ use maki_agent::permissions::{
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionIntent, PermissionScopes, RegistryError, Tool, ToolAudience, ToolContext, ToolEffect,
-    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
 };
 use maki_agent::{
-    AgentEvent, GrepFileEntry, GrepMatchGroup, SnapshotLine, TextOutput, ToolInput, ToolOutput,
+    AgentEvent, GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
+    IndexDirectoryEntry as AgentIndexDirectoryEntry,
+    IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
+    IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
+    IndexSourceRange as AgentIndexSourceRange, SnapshotLine, TextOutput, ToolInput, ToolOutput,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -33,7 +37,9 @@ use workcell::environment::{
 use workcell::files::{
     FileApplyPatchInput, FileApplyPatchOutput, FileEditInput, FileEditOutput, FileGlobInput,
     FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
-    FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput, PreparedFilePatch,
+    FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput, IndexDirectoryEntryKind,
+    IndexExecutionConfiguration, IndexInput, IndexLimits, IndexLineSemantic,
+    IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
 };
 use workcell::shell::{
     PreparedShell, ShellExecution, ShellInput, ShellProgressChunk, ShellProgressSink,
@@ -53,6 +59,7 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "file_write",
     "file_edit",
     "file_apply_patch",
+    "index",
     "websearch",
     "webfetch",
     "shell",
@@ -63,6 +70,7 @@ const CODE_WORKER_UNAVAILABLE: &str =
     "Workcell code_execution is unavailable: no code worker path was supplied";
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
+const BYTES_PER_MIB: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -307,14 +315,14 @@ impl WorkcellHost {
         specs.push(workcell::environment::spec());
         specs
             .into_iter()
-            .map(|spec| {
-                let kind = ToolKind::from_name(spec.name);
+            .filter_map(|spec| {
+                let kind = ToolKind::from_name(spec.name)?;
                 let source = ToolSource::Native {
                     owner: OWNER.into(),
                     contract: spec.contract_id.into(),
                     trusted: true,
                 };
-                (
+                Some((
                     Arc::new(WorkcellTool {
                         kind,
                         spec,
@@ -322,7 +330,7 @@ impl WorkcellHost {
                     }) as Arc<dyn Tool>,
                     source,
                     kind.effect(),
-                )
+                ))
             })
             .collect()
     }
@@ -336,6 +344,7 @@ enum ToolKind {
     FileWrite,
     FileEdit,
     FileApplyPatch,
+    Index,
     Websearch,
     Webfetch,
     Shell,
@@ -344,26 +353,28 @@ enum ToolKind {
 }
 
 impl ToolKind {
-    fn from_name(name: &str) -> Self {
+    fn from_name(name: &str) -> Option<Self> {
         match name {
-            "file_read" => Self::FileRead,
-            "file_glob" => Self::FileGlob,
-            "file_grep" => Self::FileGrep,
-            "file_write" => Self::FileWrite,
-            "file_edit" => Self::FileEdit,
-            "file_apply_patch" => Self::FileApplyPatch,
-            "websearch" => Self::Websearch,
-            "webfetch" => Self::Webfetch,
-            "shell" => Self::Shell,
-            "code_execution" => Self::Code,
-            "execution_environment" => Self::Environment,
-            _ => unreachable!("specs contain only known Workcell tools"),
+            "file_read" => Some(Self::FileRead),
+            "file_glob" => Some(Self::FileGlob),
+            "file_grep" => Some(Self::FileGrep),
+            "file_write" => Some(Self::FileWrite),
+            "file_edit" => Some(Self::FileEdit),
+            "file_apply_patch" => Some(Self::FileApplyPatch),
+            "index" => Some(Self::Index),
+            "websearch" => Some(Self::Websearch),
+            "webfetch" => Some(Self::Webfetch),
+            "shell" => Some(Self::Shell),
+            "code_execution" => Some(Self::Code),
+            "execution_environment" => Some(Self::Environment),
+            _ => None,
         }
     }
 
     fn audience(self) -> ToolAudience {
         let read = ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB;
         match self {
+            Self::Index => ToolAudience::all(),
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch | Self::Shell => {
                 ToolAudience::MAIN | ToolAudience::GENERAL_SUB
             }
@@ -373,7 +384,7 @@ impl ToolKind {
 
     fn presentation_kind(self) -> &'static str {
         match self {
-            Self::FileRead => "read",
+            Self::FileRead | Self::Index => "read",
             Self::FileGlob | Self::FileGrep | Self::Websearch => "search",
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
@@ -383,9 +394,12 @@ impl ToolKind {
 
     fn effect(self) -> ToolEffect {
         match self {
-            Self::FileRead | Self::FileGlob | Self::FileGrep | Self::Websearch | Self::Webfetch => {
-                ToolEffect::ReadOnly
-            }
+            Self::FileRead
+            | Self::FileGlob
+            | Self::FileGrep
+            | Self::Index
+            | Self::Websearch
+            | Self::Webfetch => ToolEffect::ReadOnly,
             Self::Code => ToolEffect::Isolated,
             Self::FileWrite
             | Self::FileEdit
@@ -462,6 +476,7 @@ enum Input {
     FileWrite(FileWriteInput),
     FileEdit(FileEditInput),
     FileApplyPatch(FileApplyPatchInput),
+    Index(IndexInput),
     Websearch(WebsearchInput),
     Webfetch(WebfetchInput),
     Shell(ShellInput),
@@ -480,6 +495,7 @@ impl Input {
             ToolKind::FileApplyPatch => {
                 parse_input("file_apply_patch", input).map(Self::FileApplyPatch)
             }
+            ToolKind::Index => parse_input("index", input).map(Self::Index),
             ToolKind::Websearch => parse_input("websearch", input).map(Self::Websearch),
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
@@ -502,6 +518,7 @@ fn parse_input<T: DeserializeOwned>(name: &str, input: Value) -> Result<T, Strin
 
 enum PreparedExecution {
     File(FileToolGroup, Input),
+    Index(FileToolGroup, FileResource),
     FilePatch(FileToolGroup, PreparedFilePatch),
     Websearch(PreparedWebsearch),
     Webfetch(PreparedWebfetch),
@@ -711,6 +728,25 @@ impl WorkcellInvocation {
                 check_stale(ctx, &stale_paths)?;
                 file_patch_prepared(resources, &project, group, patch)
             }
+            Input::Index(input) => {
+                let host = Arc::clone(&self.host);
+                let cwd = project.clone();
+                let mut inspection_input = input.clone();
+                inspection_input.path = expand_tilde(&inspection_input.path)?;
+                let (group, resource) = self
+                    .host
+                    .run(ctx, move |_| async move {
+                        let groups = host.project_groups(cwd).await?;
+                        let resource = groups
+                            .files
+                            .inspect_index(&inspection_input)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>((groups.files, resource))
+                    })
+                    .await??;
+                index_prepared(resource, &project, group)
+            }
             Input::Websearch(input) => {
                 let prepared = self.host.web.prepare_websearch(input.clone())?;
                 let intent = PermissionIntent::new(
@@ -822,6 +858,7 @@ impl ToolInvocation for WorkcellInvocation {
             Input::FileWrite(input) => input.file_path.clone(),
             Input::FileEdit(input) => input.file_path.clone(),
             Input::FileApplyPatch(_) => "file patch".into(),
+            Input::Index(input) => input.path.clone(),
             Input::Websearch(input) => input.query.clone(),
             Input::Webfetch(input) => input.url.clone(),
             Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
@@ -1014,6 +1051,38 @@ impl WorkcellInvocation {
                     Err(error) => Err(error).into(),
                 }
             }
+            (Input::Index(_), PreparedExecution::Index(group, resource)) => {
+                let Some(max_source_bytes) =
+                    ctx.config.index_max_file_size_mb.checked_mul(BYTES_PER_MIB)
+                else {
+                    return Err("index max file size exceeds this platform's byte range".to_owned())
+                        .into();
+                };
+                let limits = IndexLimits {
+                    max_source_bytes,
+                    ..IndexLimits::default()
+                };
+                let max_model_output_bytes = limits.max_model_output_bytes;
+                let configuration = IndexExecutionConfiguration { limits };
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group
+                            .index_authorized_with_configuration(resource, configuration, &token)
+                            .await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        if let WorkcellIndexOutput::File { path, .. } = &output {
+                            ctx.file_tracker.record_read(Path::new(path));
+                        }
+                        index_result(output, max_model_output_bytes)
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
             (Input::Websearch(_), PreparedExecution::Websearch(prepared)) => {
                 match self
                     .host
@@ -1160,6 +1229,30 @@ fn file_prepared(
         }),
         execution: PreparedExecution::File(group, input),
         mutation_targets,
+    }
+}
+
+fn index_prepared(
+    resource: FileResource,
+    project: &Path,
+    group: FileToolGroup,
+) -> PreparedInvocation {
+    let (scopes, permission_resources, _) =
+        file_permissions(std::slice::from_ref(&resource), project);
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes {
+                scopes,
+                force_prompt: false,
+            },
+            permission_resources,
+            PermissionRisk::Low,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        }),
+        execution: PreparedExecution::Index(group, resource),
+        mutation_targets: Vec::new(),
     }
 }
 
@@ -1417,6 +1510,122 @@ fn file_grep_result(output: FileGrepOutput) -> ToolExecResult {
         .with_model_output(Some(exact))
 }
 
+fn index_result(output: WorkcellIndexOutput, max_model_output_bytes: usize) -> ToolExecResult {
+    let state = serde_json::to_value(&output).expect("index output serializes");
+    let (output, model_output) = match output {
+        WorkcellIndexOutput::File {
+            path,
+            relative_path,
+            language,
+            skeleton,
+            lines,
+            source_line_count,
+            parse_error,
+            truncated,
+        } => {
+            let model_output = skeleton.clone();
+            (
+                AgentIndexOutput::File {
+                    path,
+                    relative_path,
+                    language,
+                    skeleton,
+                    lines: lines
+                        .into_iter()
+                        .map(|line| AgentIndexLine {
+                            output_line: line.output_line,
+                            text: line.text,
+                            semantic: match line.semantic {
+                                IndexLineSemantic::Section => AgentIndexLineSemantic::Section,
+                                IndexLineSemantic::Item => AgentIndexLineSemantic::Item,
+                                IndexLineSemantic::Dimmed => AgentIndexLineSemantic::Dimmed,
+                                IndexLineSemantic::Plain => AgentIndexLineSemantic::Plain,
+                            },
+                            body: line.body,
+                            source_range: line.source_range.map(|range| AgentIndexSourceRange {
+                                start_line: range.start_line,
+                                end_line: range.end_line,
+                            }),
+                        })
+                        .collect(),
+                    source_line_count,
+                    parse_error,
+                    truncated,
+                    instructions: None,
+                    state: Some(state),
+                },
+                model_output,
+            )
+        }
+        WorkcellIndexOutput::Directory {
+            path,
+            relative_path,
+            entries,
+            total_count,
+            truncated,
+            listing,
+        } => {
+            let listing =
+                directory_listing_with_truncation(&listing, truncated, max_model_output_bytes);
+            let model_output = listing.clone();
+            (
+                AgentIndexOutput::Directory {
+                    path,
+                    relative_path,
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| AgentIndexDirectoryEntry {
+                            name: entry.name,
+                            kind: match entry.kind {
+                                IndexDirectoryEntryKind::Directory => {
+                                    AgentIndexDirectoryEntryKind::Directory
+                                }
+                                IndexDirectoryEntryKind::File => AgentIndexDirectoryEntryKind::File,
+                            },
+                        })
+                        .collect(),
+                    total_count,
+                    truncated,
+                    listing,
+                    instructions: None,
+                    state: Some(state),
+                },
+                model_output,
+            )
+        }
+    };
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::Index(output)))
+        .with_model_output(Some(model_output))
+}
+
+fn directory_listing_with_truncation(listing: &str, truncated: bool, max_bytes: usize) -> String {
+    if !truncated || listing.lines().last() == Some(INDEX_TRUNCATED) {
+        return listing.to_owned();
+    }
+    if listing.is_empty() {
+        return INDEX_TRUNCATED.to_owned();
+    }
+
+    let suffix = format!("\n{INDEX_TRUNCATED}");
+    let budget = max_bytes.saturating_sub(suffix.len());
+    if listing.len() <= budget {
+        return format!("{listing}{suffix}");
+    }
+    let mut end = budget.min(listing.len());
+    while !listing.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let prefix = &listing[..end];
+    let prefix = prefix
+        .rfind('\n')
+        .map_or("", |line_end| &prefix[..line_end]);
+    if prefix.is_empty() {
+        INDEX_TRUNCATED.to_owned()
+    } else {
+        format!("{prefix}{suffix}")
+    }
+}
+
 fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult {
     let exact = model_text(&output);
     let written = output.applied.then(|| output.path.clone());
@@ -1594,7 +1803,9 @@ impl ShellProgressSink for NativeProgressSink {
 mod tests {
     use super::*;
     use maki_agent::cancel::CancelToken;
-    use maki_agent::permissions::{PermissionManager, PermissionResourceAccess};
+    use maki_agent::permissions::{
+        PermissionManager, PermissionResourceAccess, PermissionResourceKind,
+    };
     use maki_agent::tools::{FileReadTracker, interpreter_ctx};
     use maki_agent::{AgentMode, Envelope, EventSender};
     use maki_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
@@ -1733,6 +1944,309 @@ mod tests {
     }
 
     #[test]
+    fn index_uses_workcell_schema_contract_and_native_policy() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let expected = workcell::files::specs()
+            .into_iter()
+            .find(|spec| spec.name == "index")
+            .expect("index spec");
+        let registered = registry.get("index").expect("registered index");
+
+        assert_eq!(
+            registered.tool.schema(),
+            Value::Object(expected.input_schema)
+        );
+        assert_eq!(registered.tool.audience(), ToolAudience::all());
+        assert_eq!(registered.tool.tool_kind(), Some("read"));
+        assert_eq!(registered.effect, ToolEffect::ReadOnly);
+        assert!(matches!(
+            registered.source,
+            ToolSource::Native {
+                ref owner,
+                ref contract,
+                trusted: true,
+            } if owner.as_ref() == OWNER && contract.as_ref() == "file.index.v1"
+        ));
+        assert!(
+            registered
+                .tool
+                .parse(&json!({"path": "src/lib.rs"}))
+                .is_ok()
+        );
+        assert!(registered.tool.parse(&json!({})).is_err());
+        assert!(
+            registered
+                .tool
+                .parse(&json!({"path": "src/lib.rs", "maxSourceBytes": 1}))
+                .is_err()
+        );
+
+        for audience in [
+            ToolAudience::MAIN,
+            ToolAudience::RESEARCH_SUB,
+            ToolAudience::GENERAL_SUB,
+            ToolAudience::INTERPRETER,
+            ToolAudience::WORKFLOW,
+        ] {
+            let definitions = registry.definitions(
+                &maki_agent::template::Vars::new(),
+                &DescriptionContext {
+                    filter: &maki_agent::tools::ToolFilter::All,
+                    audience,
+                    workflow: audience == ToolAudience::WORKFLOW,
+                },
+                false,
+            );
+            assert!(
+                definitions
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|definition| definition["name"] == "index"),
+                "index missing for {audience:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registering_workcell_twice_does_not_duplicate_index() {
+        let root = TempDir::new().expect("tempdir");
+        let host = WorkcellHost::new(root.path(), None).unwrap();
+        let registry = Arc::new(ToolRegistry::new());
+        host.register(&registry).unwrap();
+        let count = registry.iter().len();
+
+        assert!(host.register(&registry).is_err());
+        assert_eq!(registry.iter().len(), count);
+        assert_eq!(
+            registry
+                .iter()
+                .iter()
+                .filter(|entry| entry.name() == "index")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn index_preflight_canonicalizes_file_and_directory_intents() {
+        let root = TempDir::new().expect("tempdir");
+        let file = root.path().join("source.rs");
+        let directory = root.path().join("src");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+
+        for (path, kind, access) in [
+            (
+                file.as_path(),
+                PermissionResourceKind::File,
+                PermissionResourceAccess::Read,
+            ),
+            (
+                directory.as_path(),
+                PermissionResourceKind::Directory,
+                PermissionResourceAccess::Search,
+            ),
+        ] {
+            let invocation = registry
+                .get("index")
+                .unwrap()
+                .tool
+                .parse(&json!({"path": path}))
+                .unwrap();
+            let intent = smol::block_on(invocation.preflight(&ctx))
+                .unwrap()
+                .expect("permission intent");
+            assert_eq!(intent.resources.len(), 1);
+            assert_eq!(intent.resources[0].kind, kind);
+            assert_eq!(intent.resources[0].access, Some(access));
+            assert_eq!(
+                Path::new(&intent.resources[0].value),
+                path.canonicalize().unwrap()
+            );
+            assert_eq!(intent.risk, PermissionRisk::Low);
+        }
+    }
+
+    #[test]
+    fn index_relative_path_uses_project_root_when_process_cwd_differs() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("source.rs");
+        std::fs::write(&path, "pub fn rooted() {}\n").unwrap();
+        assert_ne!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("index")
+            .unwrap()
+            .tool
+            .parse(&json!({"path": "source.rs"}))
+            .unwrap();
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .unwrap()
+            .expect("permission intent");
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert_eq!(
+            Path::new(&intent.resources[0].value),
+            path.canonicalize().unwrap()
+        );
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some("fns:\n  pub rooted() [1]")
+        );
+    }
+
+    #[test]
+    fn index_file_preserves_model_and_structured_output_and_tracks_read() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("source.rs");
+        std::fs::write(&path, "use std::io;\n\npub fn run() {}\n").unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("index")
+            .unwrap()
+            .tool
+            .parse(&json!({"path": path}))
+            .unwrap();
+
+        let intent = smol::block_on(invocation.preflight(&ctx)).unwrap();
+        assert!(intent.is_some());
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some("imports: [1]\n  std::io\n\nfns:\n  pub run() [3]")
+        );
+        let output = result.output.expect("index output");
+        let state = output.state().expect("complete Workcell state");
+        assert_eq!(state["kind"], "file");
+        assert_eq!(state["language"], "rust");
+        let ToolOutput::Index(AgentIndexOutput::File {
+            path: output_path,
+            language,
+            skeleton,
+            lines,
+            ..
+        }) = output
+        else {
+            panic!("expected native file index output")
+        };
+        assert_eq!(Path::new(&output_path), path.canonicalize().unwrap());
+        assert_eq!(language, "rust");
+        assert_eq!(skeleton, result.model_output.unwrap());
+        assert_eq!(lines[0].semantic, AgentIndexLineSemantic::Section);
+
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        assert!(ctx.file_tracker.check_before_edit(&path).is_err());
+    }
+
+    #[test]
+    fn index_directory_preserves_listing_entries_without_tracking_directory() {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("index")
+            .unwrap()
+            .tool
+            .parse(&json!({"path": root.path()}))
+            .unwrap();
+        smol::block_on(invocation.preflight(&ctx)).unwrap();
+
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert_eq!(result.model_output.as_deref(), Some("src/\nCargo.toml"));
+        let output = result.output.expect("directory output");
+        assert_eq!(output.state().unwrap()["kind"], "directory");
+        let ToolOutput::Index(AgentIndexOutput::Directory {
+            entries,
+            total_count,
+            listing,
+            ..
+        }) = output
+        else {
+            panic!("expected native directory index output")
+        };
+        assert_eq!(total_count, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(listing, "src/\nCargo.toml");
+
+        std::fs::write(root.path().join("new.txt"), "new").unwrap();
+        assert!(ctx.file_tracker.check_before_edit(root.path()).is_ok());
+    }
+
+    #[test]
+    fn index_directory_truncation_is_explicit_and_state_stays_exact() {
+        let output = WorkcellIndexOutput::Directory {
+            path: "/project".into(),
+            relative_path: ".".into(),
+            entries: vec![workcell::files::IndexDirectoryEntry {
+                name: "src".into(),
+                kind: IndexDirectoryEntryKind::Directory,
+            }],
+            total_count: 2,
+            truncated: true,
+            listing: "src/".into(),
+        };
+
+        let result = index_result(output, IndexLimits::default().max_model_output_bytes);
+
+        assert_eq!(result.model_output.as_deref(), Some("src/\n[truncated]"));
+        let output = result.output.unwrap();
+        assert_eq!(output.as_display_text(), "src/\n[truncated]");
+        assert_eq!(output.state().unwrap()["listing"], "src/");
+        assert_eq!(output.state().unwrap()["truncated"], true);
+
+        let bounded = directory_listing_with_truncation("first\nsecond\nthird", true, 20);
+        assert!(bounded.len() <= 20);
+        assert!(bounded.ends_with(INDEX_TRUNCATED));
+    }
+
+    #[test]
+    fn index_uses_configured_source_size_limit() {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join("large.rs");
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.config.index_max_file_size_mb = 1;
+        let invocation = registry
+            .get("index")
+            .unwrap()
+            .tool
+            .parse(&json!({"path": path}))
+            .unwrap();
+        smol::block_on(invocation.preflight(&ctx)).unwrap();
+
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .unwrap_err()
+                .contains("exceeds maximum size of 1048576 bytes")
+        );
+    }
+
+    #[test]
     fn registered_effects_match_workcell_boundaries() {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
@@ -1741,6 +2255,7 @@ mod tests {
             ("file_read", ToolEffect::ReadOnly),
             ("file_glob", ToolEffect::ReadOnly),
             ("file_grep", ToolEffect::ReadOnly),
+            ("index", ToolEffect::ReadOnly),
             ("websearch", ToolEffect::ReadOnly),
             ("webfetch", ToolEffect::ReadOnly),
             ("execution_environment", ToolEffect::Mutating),

@@ -133,6 +133,7 @@ impl HighlightRequest {
             | ToolOutput::WriteCode { .. }
             | ToolOutput::Diff { .. }
             | ToolOutput::GrepResult { .. }
+            | ToolOutput::Index(_)
             | ToolOutput::Instructions { .. } => Some(o),
             ToolOutput::Plain(_)
             | ToolOutput::Markdown(_)
@@ -344,6 +345,7 @@ impl ToolLineBuilder {
         header: &str,
         annotation: Option<&str>,
         render_header: Option<&BufferSnapshot>,
+        output: Option<&ToolOutput>,
     ) {
         let mut spans = vec![Span::styled(
             format!("{tool_name}> "),
@@ -364,7 +366,12 @@ impl ToolLineBuilder {
                 );
             }
         } else {
-            spans.push(Span::styled(header.to_owned(), theme::current().tool));
+            let style = if matches!(output, Some(ToolOutput::Index(_))) {
+                theme::current().tool_path
+            } else {
+                theme::current().tool
+            };
+            spans.push(Span::styled(header.to_owned(), style));
         }
         let mut copy = format!("{tool_name}> {header}");
         if let Some(ann) = annotation {
@@ -654,6 +661,7 @@ pub fn build_tool_lines(
         header,
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
+        msg.tool_output.as_deref(),
     );
     b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
@@ -748,7 +756,7 @@ pub fn build_instructions_lines(
         code_view::instruction_limit(expanded),
         Indicator::Success,
     );
-    b.push_header("load", header, annotation.as_deref(), None);
+    b.push_header("load", header, annotation.as_deref(), None, None);
     b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
@@ -1100,6 +1108,61 @@ mod tests {
         assert!(text.contains("line_0"));
         assert!(!text.contains("line_149"));
         assert!(text.contains(TRUNCATION_PREFIX));
+    }
+
+    #[test]
+    fn native_index_uses_path_style_and_click_expandable_head() {
+        let lines = (1..=8)
+            .map(|line| maki_agent::IndexLine {
+                output_line: line,
+                text: format!("fn item_{line}() [{line}]"),
+                semantic: maki_agent::IndexLineSemantic::Item,
+                body: Some(format!("fn item_{line}()")),
+                source_range: Some(maki_agent::IndexSourceRange {
+                    start_line: line,
+                    end_line: line,
+                }),
+            })
+            .collect();
+        let mut msg = index_msg("");
+        msg.text = "src/lib.rs".into();
+        msg.tool_output = Some(Arc::new(ToolOutput::Index(maki_agent::IndexOutput::File {
+            path: "/project/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            language: "rust".into(),
+            skeleton: String::new(),
+            lines,
+            source_line_count: 8,
+            parse_error: false,
+            truncated: false,
+            instructions: None,
+            state: None,
+        })));
+        let collapsed = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let expanded = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags {
+                script: false,
+                output: true,
+            },
+        );
+
+        assert!(collapsed.truncation.output);
+        assert!(lines_text(&collapsed).contains("item_1"));
+        assert!(!lines_text(&collapsed).contains("item_8"));
+        assert!(lines_text(&expanded).contains("item_8"));
+        assert!(
+            collapsed.lines[0].spans.iter().any(
+                |span| span.content == "src/lib.rs" && span.style == theme::current().tool_path
+            )
+        );
     }
 
     fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {

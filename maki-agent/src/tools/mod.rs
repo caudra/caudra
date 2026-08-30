@@ -264,6 +264,7 @@ pub const FILE_READ_TOOL_NAME: &str = "file_read";
 pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
+pub const INDEX_TOOL_NAME: &str = "index";
 pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
@@ -439,16 +440,20 @@ pub enum ToolLive {
     Usage(String),
 }
 
-pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+pub fn expand_tilde(path: &str) -> Result<String, String> {
+    if let Some(rest) = path.strip_prefix("~/") {
         let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.join(rest).to_string_lossy().into_owned()
+        Ok(home.join(rest).to_string_lossy().into_owned())
     } else if path == "~" {
         let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.to_string_lossy().into_owned()
+        Ok(home.to_string_lossy().into_owned())
     } else {
-        path.to_string()
-    };
+        Ok(path.to_owned())
+    }
+}
+
+pub fn resolve_path(path: &str) -> Result<String, String> {
+    let expanded = expand_tilde(path)?;
 
     if Path::new(&expanded).is_relative() {
         let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
@@ -663,7 +668,7 @@ pub fn interpreter_ctx(
 
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
-pub fn cli_tool_ctx() -> ToolContext {
+pub fn cli_tool_ctx(project_cwd: &Path) -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
     interpreter_ctx(
@@ -676,7 +681,7 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            project_cwd.to_path_buf(),
             Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
@@ -1156,6 +1161,8 @@ mod tests {
             home.join("foo/bar").to_string_lossy()
         );
         assert_eq!(resolve_path("~").unwrap(), home.to_string_lossy());
+        assert_eq!(expand_tilde("src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(expand_tilde("~other/file.rs").unwrap(), "~other/file.rs");
         assert_eq!(
             resolve_path("src/main.rs").unwrap(),
             cwd.join("src/main.rs").to_string_lossy()

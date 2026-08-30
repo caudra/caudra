@@ -57,6 +57,11 @@ pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_INDEX_MAX_FILE_SIZE_MB: usize = 2;
+pub const MIN_INDEX_MAX_FILE_SIZE_MB: usize = 1;
+/// Workcell briefly holds the input bytes and parser-owned source together,
+/// so this caps those two buffers at 32 MiB before tree allocation.
+pub const MAX_INDEX_MAX_FILE_SIZE_MB: usize = 16;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
@@ -82,7 +87,6 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 
 pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[
     "batch",
-    "index",
     "memory",
     "question",
     "sessions",
@@ -99,6 +103,7 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "file_grep",
     "file_read",
     "file_write",
+    "index",
     "websearch",
     "webfetch",
     "shell",
@@ -205,6 +210,8 @@ pub enum ConfigError {
          (bundled plugins: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
+    #[error("invalid config: plugins.index.{field}: {message}")]
+    InvalidIndexOption { field: String, message: String },
     #[error(
         "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
          (plugins can provide more than tools).\n\n\
@@ -311,6 +318,7 @@ impl RawConfig {
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         self.validate_plugin_tables()?;
+        let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let disabled_tools: Vec<String> = self
             .plugins
             .iter()
@@ -326,7 +334,12 @@ impl RawConfig {
                 .map(AlwaysThinking::resolve)
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
+            agent: AgentConfig::from_file(
+                self.agent,
+                no_rtk,
+                disabled_tools,
+                index_max_file_size_mb,
+            ),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             telemetry: self.telemetry,
@@ -359,6 +372,44 @@ impl RawConfig {
             });
         }
         Ok(())
+    }
+
+    fn index_max_file_size_mb(&self) -> Result<usize, ConfigError> {
+        let Some(index) = self.plugins.get("index") else {
+            return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
+        };
+        if let Some(field) = index
+            .opts
+            .keys()
+            .find(|field| field.as_str() != "max_file_size_mb")
+        {
+            return Err(ConfigError::InvalidIndexOption {
+                field: field.clone(),
+                message: "unknown option (expected max_file_size_mb)".into(),
+            });
+        }
+        let Some(value) = index.opts.get("max_file_size_mb") else {
+            return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
+        };
+        let value = value
+            .as_u64()
+            .ok_or_else(|| ConfigError::InvalidIndexOption {
+                field: "max_file_size_mb".into(),
+                message: "expected an integer".into(),
+            })?;
+        if value < MIN_INDEX_MAX_FILE_SIZE_MB as u64 {
+            return Err(ConfigError::InvalidIndexOption {
+                field: "max_file_size_mb".into(),
+                message: format!("{value} is below minimum ({MIN_INDEX_MAX_FILE_SIZE_MB})"),
+            });
+        }
+        if value > MAX_INDEX_MAX_FILE_SIZE_MB as u64 {
+            return Err(ConfigError::InvalidIndexOption {
+                field: "max_file_size_mb".into(),
+                message: format!("{value} exceeds maximum ({MAX_INDEX_MAX_FILE_SIZE_MB})"),
+            });
+        }
+        Ok(value as usize)
     }
 }
 
@@ -1184,10 +1235,18 @@ pub struct AgentConfig {
 
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
+
+    #[config(skip, default = DEFAULT_INDEX_MAX_FILE_SIZE_MB)]
+    pub index_max_file_size_mb: usize,
 }
 
 impl AgentConfig {
-    fn from_file(file: AgentFileConfig, no_rtk: bool, disabled_tools: Vec<String>) -> Self {
+    fn from_file(
+        file: AgentFileConfig,
+        no_rtk: bool,
+        disabled_tools: Vec<String>,
+        index_max_file_size_mb: usize,
+    ) -> Self {
         Self {
             no_rtk,
             system_prompt_profile: file
@@ -1205,6 +1264,7 @@ impl AgentConfig {
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
+            index_max_file_size_mb,
         }
     }
 }
@@ -3405,6 +3465,47 @@ mod tests {
         let bash = &raw.plugins["bash"];
         assert_eq!(bash.enabled, Some(true));
         assert_eq!(bash.opts["timeout_secs"], serde_json::json!(180));
+    }
+
+    #[test]
+    fn index_config_defaults_and_wires_native_host_limit() {
+        let config = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(
+            config.agent.index_max_file_size_mb,
+            DEFAULT_INDEX_MAX_FILE_SIZE_MB
+        );
+        assert!(config.plugins.names.contains(&"index".into()));
+
+        let config: RawConfig =
+            toml::from_str("[plugins.index]\nenabled = false\nmax_file_size_mb = 4\n").unwrap();
+        let config = config.into_config(false).unwrap();
+        assert_eq!(config.agent.index_max_file_size_mb, 4);
+        assert!(config.agent.disabled_tools.contains(&"index".into()));
+        assert!(!config.plugins.names.contains(&"index".into()));
+    }
+
+    #[test_case("max_file_size_mb = 0", "below minimum" ; "below_minimum")]
+    #[test_case("max_file_size_mb = 17", "exceeds maximum" ; "above_maximum")]
+    #[test_case("max_file_size_mb = 9223372036854775807", "exceeds maximum" ; "multiplication_overflow")]
+    #[test_case("max_file_size_mb = \"2\"", "expected an integer" ; "wrong_type")]
+    #[test_case("max_file_size = 2", "unknown option" ; "unknown_field")]
+    fn index_config_is_strict(option: &str, expected: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[plugins.index]\n{option}\n")).unwrap();
+        let error = raw.into_config(false).err().expect("invalid index option");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn index_config_accepts_checked_maximum() {
+        let raw: RawConfig = toml::from_str(&format!(
+            "[plugins.index]\nmax_file_size_mb = {MAX_INDEX_MAX_FILE_SIZE_MB}\n"
+        ))
+        .unwrap();
+
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.index_max_file_size_mb,
+            MAX_INDEX_MAX_FILE_SIZE_MB
+        );
     }
 
     #[test]

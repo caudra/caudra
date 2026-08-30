@@ -3,7 +3,10 @@ use crate::markdown::{should_truncate, truncation_notice};
 use crate::theme;
 
 use maki_agent::diff::{DiffLine, DiffSpan, compute_hunks};
-use maki_agent::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
+use maki_agent::{
+    GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic,
+    IndexOutput, IndexSourceRange, InstructionBlock, ToolInput, ToolOutput,
+};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -357,6 +360,120 @@ fn render_grep_results(
     (out, truncated)
 }
 
+fn index_range(range: IndexSourceRange) -> String {
+    if range.start_line == range.end_line {
+        format!("[{}]", range.start_line)
+    } else {
+        format!("[{}-{}]", range.start_line, range.end_line)
+    }
+}
+
+fn index_highlight_token(language: &str) -> &str {
+    match language {
+        "c_sharp" => "cs",
+        "lua_lang" => "lua",
+        "bazel_build" | "bazel_module" | "bazel_bzl" => "bzl",
+        "containerfile" => "dockerfile",
+        "make" => "Makefile",
+        _ => language,
+    }
+}
+
+fn render_index_file(
+    language: &str,
+    index_lines: &[IndexLine],
+    max_lines: usize,
+    highlight: bool,
+) -> (Vec<Line<'static>>, bool) {
+    let capped = index_lines.len().min(max_lines);
+    let hidden = index_lines.len().saturating_sub(capped);
+    let truncated = should_truncate(hidden);
+    let display_count = if truncated { capped } else { index_lines.len() };
+    let mut lines = Vec::with_capacity(display_count + usize::from(truncated));
+    for line in index_lines.iter().take(display_count) {
+        let body = line.body.as_deref().unwrap_or(&line.text);
+        let mut spans = match line.semantic {
+            IndexLineSemantic::Section => {
+                vec![Span::styled(
+                    body.to_owned(),
+                    theme::current().index_section,
+                )]
+            }
+            IndexLineSemantic::Dimmed => {
+                vec![Span::styled(line.text.clone(), theme::current().tool_dim)]
+            }
+            IndexLineSemantic::Item | IndexLineSemantic::Plain if highlight => highlight_spans(
+                &mut maki_highlight::Highlighter::for_token(index_highlight_token(language)),
+                body,
+            ),
+            IndexLineSemantic::Item | IndexLineSemantic::Plain => {
+                vec![Span::styled(body.to_owned(), theme::current().tool)]
+            }
+        };
+        if let Some(range) = line.source_range {
+            if !body.ends_with(' ') {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                index_range(range),
+                theme::current().index_line_nr,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if truncated {
+        lines.push(truncation_line(hidden));
+    }
+    (lines, truncated)
+}
+
+fn render_index_directory(output: &IndexOutput, max_lines: usize) -> (Vec<Line<'static>>, bool) {
+    let IndexOutput::Directory {
+        entries,
+        listing,
+        truncated: source_truncated,
+        ..
+    } = output
+    else {
+        return (Vec::new(), false);
+    };
+    let mut listing_lines = listing.lines().collect::<Vec<_>>();
+    if *source_truncated && listing_lines.last() == Some(&INDEX_TRUNCATED) {
+        listing_lines.pop();
+    }
+    let capped = listing_lines.len().min(max_lines);
+    let hidden = listing_lines.len().saturating_sub(capped);
+    let truncated = should_truncate(hidden);
+    let display_count = if truncated {
+        capped
+    } else {
+        listing_lines.len()
+    };
+    let mut lines = listing_lines
+        .into_iter()
+        .take(display_count)
+        .enumerate()
+        .map(|(index, text)| {
+            let style = match entries.get(index).map(|entry| entry.kind) {
+                Some(IndexDirectoryEntryKind::Directory) => theme::current().tool_path,
+                Some(IndexDirectoryEntryKind::File) => theme::current().tool,
+                None => theme::current().tool_dim,
+            };
+            Line::from(Span::styled(text.to_owned(), style))
+        })
+        .collect::<Vec<_>>();
+    if truncated {
+        lines.push(truncation_line(hidden));
+    }
+    if *source_truncated {
+        lines.push(Line::from(Span::styled(
+            INDEX_TRUNCATED,
+            theme::current().tool_dim,
+        )));
+    }
+    (lines, truncated)
+}
+
 pub(crate) fn render_instructions(
     blocks: &[InstructionBlock],
     lines: &mut Vec<Line<'static>>,
@@ -506,6 +623,12 @@ pub fn render_tool_content(
         ),
         Some(ToolOutput::GrepResult { entries }) => {
             render_grep_results(entries, limits.output, highlight)
+        }
+        Some(ToolOutput::Index(IndexOutput::File {
+            language, lines, ..
+        })) => render_index_file(language, lines, limits.output, highlight),
+        Some(ToolOutput::Index(output @ IndexOutput::Directory { .. })) => {
+            render_index_directory(output, limits.output)
         }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();
@@ -789,6 +912,136 @@ mod tests {
         let truncated = render_instructions(&blocks, &mut lines, MAX_INSTRUCTION_LINES, false);
         assert!(!truncated);
         assert_eq!(lines.len(), 0);
+    }
+
+    fn index_line(
+        output_line: usize,
+        text: &str,
+        semantic: IndexLineSemantic,
+        body: Option<&str>,
+        source_range: Option<(usize, usize)>,
+    ) -> IndexLine {
+        IndexLine {
+            output_line,
+            text: text.into(),
+            semantic,
+            body: body.map(str::to_owned),
+            source_range: source_range.map(|(start_line, end_line)| IndexSourceRange {
+                start_line,
+                end_line,
+            }),
+        }
+    }
+
+    #[test]
+    fn index_file_renders_semantics_ranges_and_declaration_highlights() {
+        let source = vec![
+            index_line(1, "fns:", IndexLineSemantic::Section, None, None),
+            index_line(
+                2,
+                "  pub run() [10-12]",
+                IndexLineSemantic::Item,
+                Some("  pub run()"),
+                Some((10, 12)),
+            ),
+            index_line(
+                3,
+                "  [2 more truncated]",
+                IndexLineSemantic::Dimmed,
+                None,
+                None,
+            ),
+        ];
+
+        let (lines, truncated) = render_index_file("rust", &source, usize::MAX, true);
+
+        assert!(!truncated);
+        assert_eq!(lines[0].spans[0].style, theme::current().index_section);
+        assert_eq!(
+            lines[1].spans.last().unwrap().style,
+            theme::current().index_line_nr
+        );
+        assert_eq!(line_text(&lines[1]), "  pub run() [10-12]");
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("pub") && span.style != theme::current().tool)
+        );
+        assert_eq!(lines[2].spans[0].style, theme::current().tool_dim);
+    }
+
+    #[test]
+    fn index_file_and_directory_use_head_caps() {
+        let source = (1..=4)
+            .map(|line| {
+                index_line(
+                    line,
+                    &format!("fn item_{line}() [{line}]"),
+                    IndexLineSemantic::Item,
+                    Some(&format!("fn item_{line}()")),
+                    Some((line, line)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (file, file_truncated) = render_index_file("rust", &source, 1, false);
+        assert!(file_truncated);
+        assert!(line_text(&file[0]).contains("item_1"));
+        assert!(line_text(file.last().unwrap()).contains(TRUNCATION_PREFIX));
+
+        let directory = IndexOutput::Directory {
+            path: "/tmp".into(),
+            relative_path: ".".into(),
+            entries: vec![
+                maki_agent::IndexDirectoryEntry {
+                    name: "src".into(),
+                    kind: IndexDirectoryEntryKind::Directory,
+                },
+                maki_agent::IndexDirectoryEntry {
+                    name: "a.rs".into(),
+                    kind: IndexDirectoryEntryKind::File,
+                },
+                maki_agent::IndexDirectoryEntry {
+                    name: "b.rs".into(),
+                    kind: IndexDirectoryEntryKind::File,
+                },
+            ],
+            total_count: 3,
+            truncated: false,
+            listing: "src/\na.rs\nb.rs".into(),
+            instructions: None,
+            state: None,
+        };
+        let (directory, directory_truncated) = render_index_directory(&directory, 1);
+        assert!(directory_truncated);
+        assert_eq!(line_text(&directory[0]), "src/");
+        assert_eq!(directory[0].spans[0].style, theme::current().tool_path);
+    }
+
+    #[test]
+    fn truncated_directory_marker_is_visible_when_collapsed_and_expanded() {
+        let directory = IndexOutput::Directory {
+            path: "/tmp".into(),
+            relative_path: ".".into(),
+            entries: vec![maki_agent::IndexDirectoryEntry {
+                name: "src".into(),
+                kind: IndexDirectoryEntryKind::Directory,
+            }],
+            total_count: 2,
+            truncated: true,
+            listing: "src/".into(),
+            instructions: None,
+            state: Some(serde_json::json!({"truncated": true})),
+        };
+
+        for max_lines in [1, usize::MAX] {
+            let (lines, _) = render_index_directory(&directory, max_lines);
+            assert_eq!(line_text(lines.last().unwrap()), INDEX_TRUNCATED);
+            assert_eq!(
+                lines.last().unwrap().spans[0].style,
+                theme::current().tool_dim
+            );
+        }
     }
 
     #[test_case("héllo",           &["hé", "llo"]          ; "accented")]

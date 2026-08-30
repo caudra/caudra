@@ -184,9 +184,9 @@ Every field also has an environment variable, shown in the Env column, and the v
 
 ## Plugins
 
-The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
+The `plugins` table turns bundled features and plugins on or off and passes options to them. All bundled features are on by default. Set `enabled = false` to turn one off.
 
-Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
+Each feature checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
 
@@ -203,9 +203,11 @@ maki.setup({
 
 ### `plugins.index`
 
+`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts 1 through 16 MiB to bound parser memory and work.
+
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
+| `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MiB (maximum 16). |
 
 ### `plugins.skill`
 

@@ -735,9 +735,12 @@ async fn session(
             let cwd = vars.apply("{cwd}").into_owned();
             let instructions =
                 smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await;
-            let assembled = maki_agent::prompt::assemble_task(
+            let base_filter =
+                ToolFilter::from_config(&agent_ctx.config, &model, &[]).for_mode(&mode);
+            let assembled = maki_agent::prompt::assemble_task_with_filter(
                 prompt_id,
                 &agent_ctx.prompt_slots,
+                &base_filter,
                 &instructions,
                 task_profile.as_deref(),
                 contract,
@@ -748,8 +751,6 @@ async fn session(
                     .as_array_mut()
                     .expect("tools were validated as an array"),
             );
-            let base_filter =
-                ToolFilter::from_config(&agent_ctx.config, &model, &[]).for_mode(&mode);
             let description_context = DescriptionContext {
                 filter: &base_filter,
                 audience,

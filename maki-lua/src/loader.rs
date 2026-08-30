@@ -315,6 +315,9 @@ impl PluginHost {
         allowlist: Option<&[&str]>,
     ) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
+            if plugin == "index" {
+                continue;
+            }
             let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
             if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
                 return Err(PluginError::UnknownPluginOptions {
@@ -717,13 +720,15 @@ mod tests {
     }
 
     #[test]
-    fn production_builtins_exclude_workcell_replacements() {
+    fn production_builtins_leave_index_to_workcell() {
         let reg = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
 
-        assert!(reg.get("index").is_some());
+        assert!(reg.get("index").is_none());
+        assert!(!maki_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(&"index"));
+        assert!(maki_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"index"));
         assert!(reg.get("tool_output_read").is_some());
         for name in [
             "bash",

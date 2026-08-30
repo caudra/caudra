@@ -254,6 +254,15 @@ fn bound_presentation(
         return;
     }
 
+    if let ToolOutput::Index(index) = output {
+        let preview = preview_body(&rendered, marker, "", max_lines, max_bytes);
+        match index {
+            crate::IndexOutput::File { skeleton, .. } => *skeleton = preview,
+            crate::IndexOutput::Directory { listing, .. } => *listing = preview,
+        }
+        return;
+    }
+
     if let Some(text) = text_output_mut(output) {
         let source = text.text.clone();
         let trailer = rendered.strip_prefix(&source).unwrap_or_default();
@@ -734,6 +743,54 @@ mod tests {
             assert_eq!(text.instructions.unwrap()[0].content, "keep metadata");
             assert_eq!(text.state, Some(serde_json::json!({"cursor": 7})));
         }
+    }
+
+    #[test]
+    fn index_presentation_is_bounded_without_losing_structured_state() {
+        let state = serde_json::json!({"symbols": ["alpha", "omega"]});
+        let mut done = done(String::new(), false);
+        done.output = ToolOutput::Index(crate::IndexOutput::File {
+            path: "/workspace/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            language: "rust".into(),
+            skeleton: (0..100)
+                .map(|line| format!("fn symbol_{line}() {{}}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            lines: vec![crate::IndexLine {
+                output_line: 1,
+                text: "fn symbol_0() {}".into(),
+                semantic: crate::IndexLineSemantic::Item,
+                body: Some("fn symbol_0() {}".into()),
+                source_range: None,
+            }],
+            source_line_count: 100,
+            parse_error: false,
+            truncated: false,
+            instructions: None,
+            state: Some(state.clone()),
+        });
+        let ctx = context(8, 360);
+
+        smol::block_on(limit(&mut done, &ctx));
+
+        assert!(fits(
+            &done.output.as_text(),
+            ctx.config.max_output_lines,
+            ctx.config.max_output_bytes
+        ));
+        let ToolOutput::Index(crate::IndexOutput::File {
+            skeleton,
+            lines,
+            state: retained_state,
+            ..
+        }) = done.output
+        else {
+            unreachable!();
+        };
+        assert!(skeleton.contains("Tool output truncated"));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(retained_state, Some(state));
     }
 
     #[test]
