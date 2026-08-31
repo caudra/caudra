@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
+use crate::markdown::{LinkMap, TerminalLink};
+
 use super::layout::SegmentChrome;
 
 pub(super) const EXPAND_AFFORDANCE: &str = "click to expand";
@@ -25,15 +27,17 @@ pub(super) struct RenderCursor {
     y: u16,
     bottom: u16,
     viewport: Rect,
+    terminal_links: Vec<TerminalLink>,
 }
 
 impl RenderCursor {
-    pub fn new(scroll_top: u16, viewport: Rect) -> Self {
+    pub fn new(scroll_top: u16, viewport: Rect, terminal_links: Vec<TerminalLink>) -> Self {
         Self {
             skip: scroll_top,
             y: viewport.y,
             bottom: viewport.y + viewport.height,
             viewport,
+            terminal_links,
         }
     }
 
@@ -41,15 +45,20 @@ impl RenderCursor {
         self.y >= self.bottom
     }
 
+    pub fn into_terminal_links(self) -> Vec<TerminalLink> {
+        self.terminal_links
+    }
+
     pub fn render(
         &mut self,
-        lines: &[Line<'static>],
+        content: (&[Line<'static>], Option<&LinkMap>),
         h: u16,
         chrome: SegmentChrome,
         styles: (Option<Style>, Option<Style>),
         feedback: RenderFeedback,
         frame: &mut Frame,
     ) {
+        let (lines, links) = content;
         if self.skip >= h {
             self.skip -= h;
             return;
@@ -113,6 +122,15 @@ impl RenderCursor {
                 .style(base)
                 .scroll((content_visible_start - content_start, 0));
             frame.render_widget(paragraph, content_area);
+            if let Some(links) = links {
+                links.append_terminal_links(
+                    lines,
+                    content_area.width,
+                    content_visible_start - content_start,
+                    content_area,
+                    &mut self.terminal_links,
+                );
+            }
         }
         self.skip = 0;
         self.y += visible_h;

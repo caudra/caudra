@@ -36,6 +36,7 @@ use maki_storage::sessions::{
 };
 use maki_storage::thinking::StoredThinking;
 use maki_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -2253,6 +2254,64 @@ fn short_left_click_does_not_open_message_actions() {
     ));
 
     assert!(!app.message_actions.is_open());
+}
+
+#[test]
+fn transcript_links_are_encoded_for_the_terminal_host() {
+    const URL: &str = "https://example.com/docs";
+    let mut app = test_app();
+    app.main_chat().push_user_message(format!("[docs]({URL})"));
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+            app.apply_terminal_links(frame.buffer_mut());
+        })
+        .unwrap();
+
+    let linked = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .filter(|cell| cell.symbol().contains(URL))
+        .collect::<Vec<_>>();
+    assert_eq!(linked.len(), "docs".len());
+    assert!(linked.iter().all(|cell| matches!(
+        cell.diff_option,
+        CellDiffOption::ForcedWidth(width) if width.get() == 1
+    )));
+}
+
+#[test]
+fn matching_link_click_uses_the_local_fallback_only_when_available() {
+    const URL: &str = "https://example.com/docs";
+    let mut app = test_app();
+    app.main_chat().push_user_message(format!("[docs]({URL})"));
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+    let (row, column) = (area.y..area.bottom())
+        .flat_map(|row| (area.x..area.right()).map(move |column| (row, column)))
+        .find(|&(row, column)| app.chats[0].link_at(row, column, area).as_deref() == Some(URL))
+        .expect("rendered link cell");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    let actions = app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    if crate::terminal::local_url_opener_available() {
+        assert!(matches!(&actions[..], [Action::OpenUrl(target)] if target == URL));
+    } else {
+        assert!(actions.is_empty());
+    }
 }
 
 #[test]

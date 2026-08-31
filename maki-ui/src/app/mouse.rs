@@ -163,6 +163,7 @@ impl App {
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
+                self.link_mouse_down = None;
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
                     self.status_mouse_down = self.status_hit_at(event.row, event.column);
@@ -189,6 +190,16 @@ impl App {
                             self.open_paste_editor(id);
                             return Vec::new();
                         }
+                    }
+                    if zone.zone == SelectionZone::Messages
+                        && !self.has_modal_overlay()
+                        && crate::terminal::local_url_opener_available()
+                    {
+                        self.link_mouse_down = self.chats[self.active_chat].link_at(
+                            event.row,
+                            event.column,
+                            self.msg_area(),
+                        );
                     }
                     if zone.zone == SelectionZone::Messages
                         && self.is_main_chat()
@@ -220,6 +231,7 @@ impl App {
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
+                self.link_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -230,15 +242,33 @@ impl App {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
                     self.message_mouse_down = None;
+                    self.link_mouse_down = None;
                     return self.handle_streaming_admission(pressed.admission);
                 }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
                     if !sel.is_empty() {
                         self.queue_mouse_down = None;
+                        self.link_mouse_down = None;
                         self.selection_state = Some(SelectionState::PendingCopy { sel });
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if zone == SelectionZone::Messages
+                            && !self.has_modal_overlay()
+                            && self
+                                .zone_at(event.row, event.column)
+                                .is_some_and(|zone| zone.zone == SelectionZone::Messages)
+                            && let Some(target) = self.link_mouse_down.take()
+                            && self.chats[self.active_chat]
+                                .link_at(event.row, event.column, self.msg_area())
+                                .as_deref()
+                                == Some(target.as_ref())
+                        {
+                            self.message_mouse_down = None;
+                            self.queue_mouse_down = None;
+                            self.status_mouse_down = None;
+                            return vec![crate::components::Action::OpenUrl(target.to_string())];
+                        }
                         if zone == SelectionZone::Messages
                             && self.is_main_chat()
                             && let Some(pressed) = self.message_mouse_down.take()
@@ -290,6 +320,7 @@ impl App {
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
+                self.link_mouse_down = None;
             }
             MouseEventKind::Moved => {
                 if self.has_modal_overlay() {

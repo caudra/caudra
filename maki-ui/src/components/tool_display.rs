@@ -17,7 +17,9 @@ use unicode_width::UnicodeWidthStr;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
+use crate::markdown::{
+    LinkMap, should_truncate, text_to_painted, truncate_output, truncation_notice,
+};
 use maki_agent::{
     BufferSnapshot, InstructionBlock, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
@@ -101,6 +103,7 @@ pub fn done_style() -> RoleStyle {
 
 pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
+    pub links: LinkMap,
     pub search_text: String,
     pub highlight: Option<HighlightRequest>,
     pub spinner_lines: Vec<(usize, usize)>,
@@ -300,6 +303,7 @@ fn resolve_output<'a>(
 
 struct ToolLineBuilder {
     lines: Vec<Line<'static>>,
+    link_rows: Vec<(usize, Vec<Option<Arc<str>>>)>,
     search_text: String,
     spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
@@ -321,6 +325,7 @@ impl ToolLineBuilder {
         let limits = RenderLimits::new(expanded, max_output_lines);
         Self {
             lines: Vec::new(),
+            link_rows: Vec::new(),
             search_text: String::new(),
             spinner_lines: Vec::new(),
             snapshot_base: None,
@@ -462,16 +467,19 @@ impl ToolLineBuilder {
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
         let indent = TOOL_BODY_INDENT.len() as u16;
-        let md_lines = text_to_lines(
+        let (painted, _) = text_to_painted(
             text,
             "",
             style,
             style,
             self.width.saturating_sub(indent),
             Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+            Vec::new(),
         );
-        for mut line in md_lines {
+        for (mut line, mut links) in painted.lines.into_iter().zip(painted.links.rows) {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            links.insert(0, None);
+            self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
         }
     }
@@ -514,8 +522,13 @@ impl ToolLineBuilder {
         content_indent: &'static str,
     ) -> ToolLines {
         let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
+        let mut links = LinkMap::none_for(&self.lines);
+        for (line, row) in self.link_rows {
+            links.rows[line] = row;
+        }
         ToolLines {
             lines: self.lines,
+            links,
             search_text: self.search_text,
             highlight,
             spinner_lines: self.spinner_lines,
@@ -971,6 +984,36 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains("bold"));
         assert!(text.contains("code"));
+    }
+
+    #[test]
+    fn markdown_tool_output_retains_link_targets() {
+        let msg = task_msg("[docs](https://example.com)".into());
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let (row, line) = tl
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.spans.iter().any(|span| span.content == "docs"))
+            .expect("markdown link line");
+        let column = line
+            .spans
+            .iter()
+            .take_while(|span| span.content != "docs")
+            .map(Span::width)
+            .sum::<usize>() as u16;
+
+        assert_eq!(
+            tl.links
+                .target_at(&tl.lines, 80, row as u16, column)
+                .as_deref(),
+            Some("https://example.com")
+        );
     }
 
     fn task_msg(output: String) -> DisplayMessage {

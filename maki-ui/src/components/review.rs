@@ -800,7 +800,7 @@ pub(crate) fn card_lines(
     notes: &[ParsedNote],
     width: u16,
     text_style: Style,
-) -> (Vec<Line<'static>>, Vec<LineProvenance>) {
+) -> (Vec<Line<'static>>, Vec<LineProvenance>, markdown::LinkMap) {
     let theme = theme::current();
     let bar_width = u16::try_from(CARD_BAR.chars().count()).unwrap_or(2);
     let quote_width = width.saturating_sub(bar_width).max(1);
@@ -813,21 +813,25 @@ pub(crate) fn card_lines(
         ),
     ])];
     let mut provenance = vec![LineProvenance::chrome(lines[0].spans.len())];
+    let mut links = markdown::LinkMap::none_for(&lines);
 
     for note in notes {
         lines.push(Line::default());
         provenance.push(LineProvenance::chrome(0));
+        links.rows.push(Vec::new());
         if let Some(surface) = &note.surface {
             lines.push(Line::from(Span::styled(
                 format!("{CARD_BAR}{surface}"),
                 theme.item_desc,
             )));
             provenance.push(LineProvenance::chrome(1));
+            links.rows.push(vec![None]);
         }
         for line in &note.quote {
             push_source_line(
                 &mut lines,
                 &mut provenance,
+                &mut links,
                 line,
                 quote_width,
                 theme.tool_dim,
@@ -835,10 +839,18 @@ pub(crate) fn card_lines(
             );
         }
         for line in &note.comment {
-            push_source_line(&mut lines, &mut provenance, line, width, text_style, None);
+            push_source_line(
+                &mut lines,
+                &mut provenance,
+                &mut links,
+                line,
+                width,
+                text_style,
+                None,
+            );
         }
     }
-    (lines, provenance)
+    (lines, provenance, links)
 }
 
 /// Renders one source line and rebases its span provenance onto the compiled
@@ -847,20 +859,28 @@ pub(crate) fn card_lines(
 fn push_source_line(
     lines: &mut Vec<Line<'static>>,
     provenance: &mut Vec<LineProvenance>,
+    links: &mut markdown::LinkMap,
     source: &ParsedLine,
     width: u16,
     style: Style,
     bar: Option<Span<'static>>,
 ) {
     let painted = markdown::text_to_painted_at(&source.text, style, width, source.body);
-    for (mut line, mut line_provenance) in painted.lines.into_iter().zip(painted.provenance) {
+    for ((mut line, mut line_provenance), mut line_links) in painted
+        .lines
+        .into_iter()
+        .zip(painted.provenance)
+        .zip(painted.links.rows)
+    {
         if let Some(bar) = bar.clone() {
             line.spans.insert(0, bar);
             line_provenance.spans.insert(0, SpanSource::Chrome);
+            line_links.insert(0, None);
         }
         line_provenance.line = Some(source.range.clone());
         lines.push(line);
         provenance.push(line_provenance);
+        links.rows.push(line_links);
     }
 }
 
@@ -1189,8 +1209,9 @@ mod tests {
             note("b", "second comment", TOOL_LABEL),
         ]))
         .expect("round trip");
-        let (lines, provenance) = card_lines(&notes, 40, Style::default());
+        let (lines, provenance, links) = card_lines(&notes, 40, Style::default());
         assert_eq!(lines.len(), provenance.len());
+        assert!(links.is_aligned(&lines));
         let rendered = lines
             .iter()
             .map(ToString::to_string)
@@ -1202,6 +1223,26 @@ mod tests {
         assert!(rendered.contains("second comment"));
         assert!(rendered.contains(TOOL_LABEL));
         assert!(!rendered.contains(REVIEW_OPEN));
+    }
+
+    #[test]
+    fn card_keeps_markdown_link_targets_aligned() {
+        let notes = parse(&compile(&[note(
+            "[docs](https://example.com)",
+            "see [guide](https://example.com/guide)",
+            ASSISTANT_LABEL,
+        )]))
+        .expect("round trip");
+        let (lines, _, links) = card_lines(&notes, 40, Style::default());
+
+        assert!(links.is_aligned(&lines));
+        assert!(
+            links
+                .rows
+                .iter()
+                .flatten()
+                .any(|target| target.as_deref() == Some("https://example.com/guide"))
+        );
     }
 
     #[test]

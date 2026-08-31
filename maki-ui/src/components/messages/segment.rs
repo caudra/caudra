@@ -1,4 +1,4 @@
-use crate::markdown::DiagramSpan;
+use crate::markdown::{DiagramSpan, LinkMap};
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
@@ -57,6 +57,7 @@ pub(super) struct Segment {
     /// Drawn diagrams in `lines`, so a hover or a pan can find one by row.
     /// Like `provenance`, cleared by `set_lines` and restored after it.
     diagrams: Vec<DiagramSpan>,
+    links: LinkMap,
     pub search_text: String,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
@@ -153,6 +154,26 @@ impl Segment {
         self.diagrams = diagrams;
     }
 
+    pub fn set_links(&mut self, links: LinkMap) {
+        debug_assert!(links.is_aligned(&self.lines));
+        self.links = links;
+    }
+
+    pub fn links(&self) -> &LinkMap {
+        &self.links
+    }
+
+    pub fn link_at(&self, rel_row: u16, rel_col: u16, width: u16) -> Option<std::sync::Arc<str>> {
+        let chrome = self.chrome(width);
+        let row = rel_row.checked_sub(chrome.content_start())?;
+        if row >= self.content_height(width) {
+            return None;
+        }
+        let col = rel_col.checked_sub(chrome.left)?;
+        let content_width = chrome.content_width(width);
+        self.links.target_at(&self.lines, content_width, row, col)
+    }
+
     /// The diagram drawn on `line`, if any.
     pub fn diagram_at_line(&self, line: usize) -> Option<&DiagramSpan> {
         self.diagrams.iter().find(|span| span.rows.contains(&line))
@@ -161,6 +182,7 @@ impl Segment {
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
         self.diagrams.clear();
+        self.links = LinkMap::none_for(&self.lines);
         // Line indices moved, so any provenance recorded for the old vector
         // no longer lines up.
         self.provenance = None;
@@ -266,7 +288,7 @@ impl Segment {
         Some(self.lines[s..e].to_vec())
     }
 
-    pub fn apply_highlight(&mut self, tl: ToolLines, worker: &RenderWorker) {
+    pub fn apply_highlight(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
         if self.kind != SegmentKind::Instruction {
             self.set_kind(tool_kind(&tl));
         }
@@ -277,7 +299,9 @@ impl Segment {
         self.snapshot_base = tl.snapshot_base;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
+        let links = std::mem::take(&mut tl.links);
         self.set_lines(tl.lines);
+        self.set_links(links);
     }
 
     pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
@@ -289,12 +313,19 @@ impl Segment {
             let hl_lines = self.reuse_highlight(&key, req.range)?;
             let (s, _) = req.range;
             let new_end = s + hl_lines.len();
+            let link_rows = hl_lines
+                .iter()
+                .map(|line| vec![None; line.spans.len()])
+                .collect::<Vec<_>>();
             tl.lines.splice(s..req.range.1, hl_lines);
+            tl.links.rows.splice(s..req.range.1, link_rows);
             Some((s, new_end))
         });
         self.truncation = tl.truncation;
         if let Some((s, e)) = reused {
+            let links = std::mem::take(&mut tl.links);
             self.set_lines(tl.lines);
+            self.set_links(links);
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
@@ -310,6 +341,9 @@ impl Segment {
     }
 
     pub fn apply_highlight_result(&mut self, lines: Vec<Line<'static>>) {
+        if !self.links.is_aligned(&self.lines) {
+            self.links = LinkMap::none_for(&self.lines);
+        }
         if let Some((start, end)) = self.highlight_range {
             let indent = self.content_indent;
             let indented: Vec<Line<'static>> = lines
@@ -322,7 +356,12 @@ impl Segment {
                 })
                 .collect();
             let new_end = start + indented.len();
+            let link_rows = indented
+                .iter()
+                .map(|line| vec![None; line.spans.len()])
+                .collect::<Vec<_>>();
             self.lines.splice(start..end, indented);
+            self.links.rows.splice(start..end, link_rows);
             self.highlight_range = Some((start, new_end));
             self.shift_after(end, new_end as isize - end as isize);
             self.invalidate_height();

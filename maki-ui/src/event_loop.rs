@@ -837,6 +837,7 @@ impl<'t> EventLoop<'t> {
                 if let Err(e) = self.terminal.draw(|f| {
                     app.view(f);
                     color_compat::downgrade_if_needed(f.buffer_mut());
+                    app.apply_terminal_links(f.buffer_mut());
                 }) {
                     break Err(e.into());
                 }
@@ -1879,6 +1880,22 @@ impl<'t> EventLoop<'t> {
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
+            }
+            Action::OpenUrl(target) => {
+                if terminal::local_url_opener_available() {
+                    let valid = url::Url::parse(&target).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    });
+                    if !valid {
+                        self.sessions[idx]
+                            .app
+                            .flash(format!("Invalid web URL: {target}"));
+                    } else if let Err(error) = open::that(&target) {
+                        self.sessions[idx]
+                            .app
+                            .flash(format!("Failed to open URL: {error}"));
+                    }
+                }
             }
             Action::EditInputInEditor => {
                 let current_text = self.sessions[idx].app.input_box.expanded_text();

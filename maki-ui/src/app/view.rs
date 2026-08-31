@@ -13,7 +13,9 @@ use crate::theme;
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
@@ -52,6 +54,40 @@ impl App {
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
+    }
+
+    pub(crate) fn apply_terminal_links(&self, buffer: &mut Buffer) {
+        let Some(chat) = self.chats.get(self.active_chat) else {
+            return;
+        };
+        for link in chat.terminal_links() {
+            if !(0..link.width).all(|offset| {
+                self.zones
+                    .zone_at(link.position.y, link.position.x.saturating_add(offset))
+                    .is_some_and(|zone| zone.zone == SelectionZone::Messages)
+            }) {
+                continue;
+            }
+            let encoded = buffer.cell_mut(link.position).is_some_and(|cell| {
+                cell.modifier.contains(Modifier::UNDERLINED)
+                    && crate::terminal::encode_hyperlink_cell(
+                        cell,
+                        &link.symbol,
+                        link.width,
+                        &link.target,
+                    )
+            });
+            if encoded
+                && link.width == 1
+                && let Some(cell) = buffer.cell_mut(Position::new(
+                    link.position.x.saturating_add(1),
+                    link.position.y,
+                ))
+                && cell.diff_option == CellDiffOption::None
+            {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
     }
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
@@ -388,6 +424,9 @@ impl App {
             settings_clickable: main_chat,
             hovered: (!self.has_modal_overlay())
                 .then_some(self.status_hover)
+                .flatten(),
+            hover_url: (!self.has_modal_overlay())
+                .then(|| chat.hovered_link())
                 .flatten(),
         };
         self.status_hits = self.status_bar.view(frame, status_area, &ctx);

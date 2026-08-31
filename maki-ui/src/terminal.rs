@@ -1,5 +1,6 @@
 use shell_words::split;
 use std::io::{Write, stdout};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use crossterm::event::{
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
+use ratatui::buffer::{Cell, CellDiffOption};
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
@@ -24,6 +26,9 @@ const BELL_SEQUENCE: &str = "\u{7}";
 /// title outlives the session. Terminals without a title stack ignore both.
 const PUSH_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[22;2t";
 const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
+const OSC8_OPEN: &str = "\u{1b}]8;;";
+const OSC8_CLOSE: &str = "\u{1b}]8;;\u{1b}\\";
+const STRING_TERMINATOR: &str = "\u{1b}\\";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -231,6 +236,41 @@ fn write_sequence(sequence: &str) -> std::io::Result<()> {
         .and_then(|()| stdout.flush())
 }
 
+pub(crate) fn encode_hyperlink_cell(
+    cell: &mut Cell,
+    expected_symbol: &str,
+    width: u16,
+    target: &str,
+) -> bool {
+    let Some(width) = NonZeroU16::new(width) else {
+        return false;
+    };
+    if cell.symbol() != expected_symbol || target.chars().any(char::is_control) {
+        return false;
+    }
+    let encoded = format!("{OSC8_OPEN}{target}{STRING_TERMINATOR}{expected_symbol}{OSC8_CLOSE}");
+    cell.set_symbol(&encoded)
+        .set_diff_option(CellDiffOption::ForcedWidth(width));
+    true
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) const fn local_url_opener_available() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) fn local_url_opener_available() -> bool {
+    [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "WSL_INTEROP",
+        "WSL_DISTRO_NAME",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 fn notification_sequence(notifier: ResolvedNotifier, mux: TerminalMux, message: &str) -> String {
     match notifier {
         ResolvedNotifier::Osc9 => {
@@ -422,6 +462,9 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::{Backend, CrosstermBackend};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
     #[test]
@@ -430,6 +473,115 @@ mod tests {
             KEYBOARD_ENHANCEMENTS,
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         );
+    }
+
+    #[test]
+    fn hyperlink_cell_has_a_self_contained_osc8_sequence_and_forced_width() {
+        const TARGET: &str = "https://example.com/docs";
+        let mut cell = Cell::default();
+        cell.set_symbol("界");
+
+        assert!(encode_hyperlink_cell(&mut cell, "界", 2, TARGET));
+        assert_eq!(
+            cell.symbol(),
+            format!("{OSC8_OPEN}{TARGET}{STRING_TERMINATOR}界{OSC8_CLOSE}")
+        );
+        assert!(matches!(
+            cell.diff_option,
+            CellDiffOption::ForcedWidth(width) if width.get() == 2
+        ));
+    }
+
+    #[test]
+    fn hyperlink_cell_rejects_stale_symbols_and_control_characters() {
+        let mut cell = Cell::default();
+        cell.set_symbol("x");
+
+        assert!(!encode_hyperlink_cell(
+            &mut cell,
+            "y",
+            1,
+            "https://example.com"
+        ));
+        assert!(!encode_hyperlink_cell(
+            &mut cell,
+            "x",
+            1,
+            "https://example.com/\u{1b}escape"
+        ));
+        assert_eq!(cell.symbol(), "x");
+        assert_eq!(cell.diff_option, CellDiffOption::None);
+    }
+
+    #[test]
+    fn crossterm_backend_writes_hyperlink_sequences_verbatim() {
+        const TARGET: &str = "https://example.com";
+        let mut cell = Cell::default();
+        cell.set_symbol("x");
+        assert!(encode_hyperlink_cell(&mut cell, "x", 1, TARGET));
+        let encoded = cell.symbol().as_bytes().to_vec();
+        let mut output = Vec::new();
+        CrosstermBackend::new(&mut output)
+            .draw(std::iter::once((0, 0, &cell)))
+            .unwrap();
+
+        assert!(
+            output
+                .windows(encoded.len())
+                .any(|window| window == encoded)
+        );
+    }
+
+    #[test]
+    fn hyperlink_identity_participates_in_buffer_diffing() {
+        let mut plain = Buffer::empty(Rect::new(0, 0, 1, 1));
+        plain.cell_mut((0, 0)).unwrap().set_symbol("x");
+        let mut first = plain.clone();
+        assert!(encode_hyperlink_cell(
+            first.cell_mut((0, 0)).unwrap(),
+            "x",
+            1,
+            "https://example.com/first"
+        ));
+        let mut second = plain.clone();
+        assert!(encode_hyperlink_cell(
+            second.cell_mut((0, 0)).unwrap(),
+            "x",
+            1,
+            "https://example.com/second"
+        ));
+
+        assert_eq!(plain.diff_iter(&first).count(), 1);
+        assert_eq!(first.diff_iter(&first).count(), 0);
+        assert_eq!(first.diff_iter(&second).count(), 1);
+        assert_eq!(first.diff_iter(&plain).count(), 1);
+
+        let mut previous_wide = Buffer::empty(Rect::new(0, 0, 2, 1));
+        previous_wide.cell_mut((0, 0)).unwrap().set_symbol("界");
+        assert!(encode_hyperlink_cell(
+            previous_wide.cell_mut((0, 0)).unwrap(),
+            "界",
+            2,
+            "https://example.com"
+        ));
+        let mut next_narrow = Buffer::empty(Rect::new(0, 0, 2, 1));
+        next_narrow.cell_mut((0, 0)).unwrap().set_symbol("x");
+        assert!(encode_hyperlink_cell(
+            next_narrow.cell_mut((0, 0)).unwrap(),
+            "x",
+            1,
+            "https://example.com"
+        ));
+        next_narrow
+            .cell_mut((1, 0))
+            .unwrap()
+            .set_diff_option(CellDiffOption::AlwaysUpdate);
+
+        let positions = previous_wide
+            .diff_iter(&next_narrow)
+            .map(|(x, y, _)| (x, y))
+            .collect::<Vec<_>>();
+        assert_eq!(positions, [(0, 0), (1, 0)]);
     }
 
     fn env<'a>(term_program: Option<&'a str>) -> TerminalEnvironment<'a> {

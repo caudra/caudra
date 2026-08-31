@@ -1267,6 +1267,7 @@ mod tests {
                 },
                 emphasis: maki_markdown::Emphasis::default(),
                 source: maki_markdown::render::SpanSource::Unknown,
+                link: None,
             };
             let val = span_style_to_lua(&lua, &span).unwrap();
             let tbl = match val {

@@ -1,9 +1,9 @@
 use crate::animation::Typewriter;
-use crate::markdown::paint_semantic;
+use crate::markdown::{LinkMap, paint_semantic};
 use crate::theme;
 
 use maki_markdown::render::Renderer;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -25,6 +25,7 @@ const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 struct StreamingCache {
     key: Option<CacheKey>,
     lines: Vec<Line<'static>>,
+    links: LinkMap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,11 +53,13 @@ impl StreamingCache {
     fn invalidate(&mut self) {
         self.key = None;
         self.lines.clear();
+        self.links.rows.clear();
     }
 
     /// Returns `true` when the cache was repopulated. The caller passes a
     /// renderer so the highlighter/table-width state persists across calls
     /// for a stable streamed view.
+    #[cfg(test)]
     fn get_or_update(
         &mut self,
         renderer: &mut Renderer,
@@ -66,6 +69,25 @@ impl StreamingCache {
         prefix_style: Style,
         width: u16,
     ) -> bool {
+        self.get_or_update_with_links(
+            renderer,
+            visible,
+            prefix,
+            (text_style, prefix_style),
+            width,
+            true,
+        )
+    }
+
+    fn get_or_update_with_links(
+        &mut self,
+        renderer: &mut Renderer,
+        visible: &str,
+        prefix: &str,
+        styles: (Style, Style),
+        width: u16,
+        interactive_links: bool,
+    ) -> bool {
         let theme_gen = theme::generation();
         let key = CacheKey::for_text(visible, width, theme_gen);
         if self.key == Some(key) {
@@ -73,7 +95,18 @@ impl StreamingCache {
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
         let semantic = renderer.render(text.as_ref(), width, theme_gen);
-        self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style).lines;
+        let mut painted = paint_semantic(&semantic, prefix, styles.0, styles.1);
+        if !interactive_links {
+            for (line, links) in painted.lines.iter_mut().zip(&mut painted.links.rows) {
+                for (span, target) in line.spans.iter_mut().zip(links) {
+                    if target.take().is_some() {
+                        span.style = span.style.remove_modifier(Modifier::UNDERLINED);
+                    }
+                }
+            }
+        }
+        self.lines = painted.lines;
+        self.links = painted.links;
         self.key = Some(key);
         true
     }
@@ -86,6 +119,7 @@ pub(crate) struct StreamingContent {
     prefix: &'static str,
     text_style: Style,
     prefix_style: Style,
+    interactive_links: bool,
 }
 
 impl StreamingContent {
@@ -95,6 +129,25 @@ impl StreamingContent {
         prefix_style: Style,
         ms_per_char: u64,
     ) -> Self {
+        Self::with_interactive_links(prefix, text_style, prefix_style, ms_per_char, true)
+    }
+
+    pub fn new_noninteractive(
+        prefix: &'static str,
+        text_style: Style,
+        prefix_style: Style,
+        ms_per_char: u64,
+    ) -> Self {
+        Self::with_interactive_links(prefix, text_style, prefix_style, ms_per_char, false)
+    }
+
+    fn with_interactive_links(
+        prefix: &'static str,
+        text_style: Style,
+        prefix_style: Style,
+        ms_per_char: u64,
+        interactive_links: bool,
+    ) -> Self {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
@@ -102,6 +155,7 @@ impl StreamingContent {
             prefix,
             text_style,
             prefix_style,
+            interactive_links,
         }
     }
 
@@ -145,20 +199,34 @@ impl StreamingContent {
     }
 
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
+        self.update_render(width);
+        &self.cache.lines
+    }
+
+    pub fn update_render(&mut self, width: u16) -> bool {
         self.typewriter.tick();
-        self.cache.get_or_update(
+        self.cache.get_or_update_with_links(
             &mut self.renderer,
             self.typewriter.visible(),
             self.prefix,
-            self.text_style,
-            self.prefix_style,
+            (self.text_style, self.prefix_style),
             width,
-        );
-        &self.cache.lines
+            self.interactive_links,
+        )
     }
 
     pub fn cached_lines(&self) -> &[Line<'static>] {
         &self.cache.lines
+    }
+
+    pub fn links(&self) -> &LinkMap {
+        &self.cache.links
+    }
+
+    pub fn link_at(&self, width: u16, row: u16, col: u16) -> Option<std::sync::Arc<str>> {
+        self.cache
+            .links
+            .target_at(&self.cache.lines, width, row, col)
     }
 
     #[cfg(test)]
@@ -299,6 +367,35 @@ mod tests {
         cache.invalidate();
         cache.get_or_update(&mut renderer, text, "", style, style, width);
         assert_eq!(cache_lines_text(&cache), full_render_lines(text, "", width));
+    }
+
+    #[test]
+    fn streaming_cache_exposes_link_targets() {
+        let mut content = StreamingContent::new("", Style::default(), Style::default(), 0);
+        content.set_buffer("[docs](https://example.com)");
+        content.render_lines(80);
+
+        assert_eq!(
+            content.link_at(80, 0, 0).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(content.link_at(80, 0, 4), None);
+    }
+
+    #[test]
+    fn noninteractive_stream_does_not_style_links_as_clickable() {
+        let mut content =
+            StreamingContent::new_noninteractive("", Style::default(), Style::default(), 0);
+        content.set_buffer("[docs](https://example.com)");
+        let lines = content.render_lines(80);
+        let docs = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "docs")
+            .expect("link label");
+
+        assert!(!docs.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(content.link_at(80, 0, 0), None);
     }
 
     #[test]

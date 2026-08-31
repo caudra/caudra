@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -7,8 +9,11 @@ use crate::theme;
 use crate::theme::Theme;
 use maki_markdown::Emphasis;
 use maki_markdown::render::{self, Line as RLine, LineKind, Span as RSpan, SpanSource, StyleToken};
+use ratatui::buffer::CellWidth;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use url::Url;
 
 pub const TRUNCATION_PREFIX: &str = "...";
 const MIN_TRUNCATABLE_LINES: usize = 2;
@@ -100,30 +105,44 @@ fn style_for_token(
 
 /// Heading lines preserve heading colour through emphasis. Code lines start
 /// from `Style::default()` so highlighter colours stand alone.
-fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
+fn paint_line(
+    line: &RLine,
+    text_style: Style,
+    t: &Theme,
+) -> (Line<'static>, Vec<Option<Arc<str>>>) {
     let (base, preserve_color) = match line.kind {
         LineKind::Heading => (t.heading, true),
         LineKind::Code => (Style::default(), false),
         _ => (text_style, false),
     };
-    let spans = line
-        .spans
-        .iter()
-        .map(
-            |RSpan {
-                 text,
-                 style,
-                 emphasis,
-                 source: _,
-             }| {
-                Span::styled(
-                    text.clone(),
-                    style_for_token(style, *emphasis, base, preserve_color, t),
-                )
-            },
-        )
-        .collect::<Vec<_>>();
-    Line::from(spans)
+    let mut spans = Vec::with_capacity(line.spans.len());
+    let mut links = Vec::with_capacity(line.spans.len());
+    for RSpan {
+        text,
+        style,
+        emphasis,
+        source: _,
+        link,
+    } in &line.spans
+    {
+        let link = link.as_deref().and_then(interactive_link_target);
+        let mut style = style_for_token(style, *emphasis, base, preserve_color, t);
+        if link.is_some() {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        spans.push(Span::styled(text.clone(), style));
+        links.push(link);
+    }
+    (Line::from(spans), links)
+}
+
+fn interactive_link_target(target: &str) -> Option<Arc<str>> {
+    if target.chars().any(char::is_control) {
+        return None;
+    }
+    let url = Url::parse(target).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .then(|| Arc::from(target))
 }
 
 fn line_provenance(line: &RLine) -> LineProvenance {
@@ -216,12 +235,230 @@ pub(crate) struct DiagramSpan {
     pub full_width: u16,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LinkMap {
+    pub rows: Vec<Vec<Option<Arc<str>>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalLink {
+    pub position: Position,
+    pub symbol: String,
+    pub width: u16,
+    pub target: Arc<str>,
+}
+
+impl LinkMap {
+    pub fn none_for(lines: &[Line<'_>]) -> Self {
+        Self {
+            rows: lines
+                .iter()
+                .map(|line| vec![None; line.spans.len()])
+                .collect(),
+        }
+    }
+
+    pub fn target_at(
+        &self,
+        lines: &[Line<'_>],
+        width: u16,
+        wrapped_row: u16,
+        column: u16,
+    ) -> Option<Arc<str>> {
+        if width == 0 || column >= width || self.rows.len() != lines.len() {
+            return None;
+        }
+
+        let mut row = 0u16;
+        for (line, links) in lines.iter().zip(&self.rows) {
+            if links.len() != line.spans.len() {
+                return None;
+            }
+            let graphemes = linked_graphemes(line, links);
+            for wrapped in link_wrapped_rows(&graphemes, width) {
+                if row == wrapped_row {
+                    return link_in_wrapped_row(&graphemes, &wrapped, column);
+                }
+                row = row.saturating_add(1);
+            }
+        }
+        None
+    }
+
+    pub fn is_aligned(&self, lines: &[Line<'_>]) -> bool {
+        self.rows.len() == lines.len()
+            && self
+                .rows
+                .iter()
+                .zip(lines)
+                .all(|(links, line)| links.len() == line.spans.len())
+    }
+
+    pub fn append_terminal_links(
+        &self,
+        lines: &[Line<'_>],
+        width: u16,
+        scroll: u16,
+        area: Rect,
+        output: &mut Vec<TerminalLink>,
+    ) {
+        if width == 0 || area.is_empty() || !self.is_aligned(lines) {
+            return;
+        }
+
+        let visible_end = scroll.saturating_add(area.height);
+        let mut wrapped_row = 0u16;
+        for (line, links) in lines.iter().zip(&self.rows) {
+            let graphemes = linked_graphemes(line, links);
+            for wrapped in link_wrapped_rows(&graphemes, width) {
+                if wrapped_row >= visible_end {
+                    return;
+                }
+                if wrapped_row >= scroll {
+                    let mut column = 0u16;
+                    for index in wrapped {
+                        let grapheme = &graphemes[index];
+                        if grapheme.width > 0
+                            && column < area.width
+                            && let Some(target) = grapheme.link
+                        {
+                            output.push(TerminalLink {
+                                position: Position::new(
+                                    area.x.saturating_add(column),
+                                    area.y.saturating_add(wrapped_row - scroll),
+                                ),
+                                symbol: grapheme.symbol.to_owned(),
+                                width: grapheme.width,
+                                target: Arc::clone(target),
+                            });
+                        }
+                        column = column.saturating_add(grapheme.width);
+                    }
+                }
+                wrapped_row = wrapped_row.saturating_add(1);
+            }
+        }
+    }
+}
+
+struct LinkedGrapheme<'a> {
+    symbol: &'a str,
+    width: u16,
+    whitespace: bool,
+    link: &'a Option<Arc<str>>,
+}
+
+fn linked_graphemes<'a>(
+    line: &'a Line<'a>,
+    links: &'a [Option<Arc<str>>],
+) -> Vec<LinkedGrapheme<'a>> {
+    line.spans
+        .iter()
+        .zip(links)
+        .flat_map(|(span, link)| {
+            span.styled_graphemes(Style::default())
+                .map(move |grapheme| LinkedGrapheme {
+                    symbol: grapheme.symbol,
+                    width: grapheme.symbol.cell_width(),
+                    whitespace: grapheme.is_whitespace(),
+                    link,
+                })
+        })
+        .collect()
+}
+
+fn link_wrapped_rows(graphemes: &[LinkedGrapheme<'_>], max_width: u16) -> Vec<Vec<usize>> {
+    let mut rows = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut pending_word = Vec::new();
+    let mut pending_whitespace = VecDeque::<usize>::new();
+    let mut line_width = 0;
+    let mut word_width = 0;
+    let mut whitespace_width = 0;
+    let mut previous_was_text = false;
+
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        if grapheme.width > max_width {
+            continue;
+        }
+        let word_found = previous_was_text && grapheme.whitespace;
+        let segment_overflow =
+            pending_line.is_empty() && word_width + whitespace_width + grapheme.width > max_width;
+        if word_found || segment_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width += whitespace_width;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= max_width;
+        let word_overflow =
+            grapheme.width > 0 && line_width + whitespace_width + word_width >= max_width;
+        if line_full || word_overflow {
+            let mut remaining = max_width.saturating_sub(line_width);
+            rows.push(mem::take(&mut pending_line));
+            line_width = 0;
+            while let Some(index) = pending_whitespace.front() {
+                let width = graphemes[*index].width;
+                if width > remaining {
+                    break;
+                }
+                whitespace_width -= width;
+                remaining -= width;
+                pending_whitespace.pop_front();
+            }
+            if grapheme.whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if grapheme.whitespace {
+            whitespace_width += grapheme.width;
+            pending_whitespace.push_back(index);
+        } else {
+            word_width += grapheme.width;
+            pending_word.push(index);
+        }
+        previous_was_text = !grapheme.whitespace;
+    }
+
+    pending_line.extend(pending_whitespace);
+    pending_line.extend(pending_word);
+    if !pending_line.is_empty() {
+        rows.push(pending_line);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+fn link_in_wrapped_row(
+    graphemes: &[LinkedGrapheme<'_>],
+    wrapped: &[usize],
+    target_column: u16,
+) -> Option<Arc<str>> {
+    let mut column = 0u16;
+    for &index in wrapped {
+        let grapheme = &graphemes[index];
+        let width = grapheme.width;
+        if width > 0 && column <= target_column && target_column < column + width {
+            return grapheme.link.clone();
+        }
+        column += width;
+    }
+    None
+}
+
 /// Painted markdown together with the provenance that lets a selection copy
 /// the source instead of the glyphs.
 pub(crate) struct Painted {
     pub lines: Vec<Line<'static>>,
     pub provenance: Vec<LineProvenance>,
     pub diagrams: Vec<DiagramSpan>,
+    pub links: LinkMap,
 }
 
 /// Consecutive rows carrying the same diagram id collapse into one span.
@@ -252,20 +489,26 @@ pub(crate) fn paint_semantic(
     prefix_style: Style,
 ) -> Painted {
     let t = theme::current();
-    let mut lines: Vec<Line<'static>> = semantic
-        .iter()
-        .map(|l| paint_line(l, text_style, &t))
-        .collect();
+    let mut lines = Vec::with_capacity(semantic.len());
+    let mut link_rows = Vec::with_capacity(semantic.len());
+    for line in semantic {
+        let (painted, links) = paint_line(line, text_style, &t);
+        lines.push(painted);
+        link_rows.push(links);
+    }
+    let mut links = LinkMap { rows: link_rows };
     let mut provenance: Vec<LineProvenance> = semantic.iter().map(line_provenance).collect();
     let mut diagrams = diagram_spans(semantic);
 
     if lines.is_empty() {
         lines.push(prefix_line(prefix, prefix_style));
         provenance.push(LineProvenance::chrome(lines[0].spans.len()));
+        links.rows.push(vec![None; lines[0].spans.len()]);
         return Painted {
             lines,
             provenance,
             diagrams,
+            links,
         };
     }
 
@@ -275,10 +518,12 @@ pub(crate) fn paint_semantic(
         if !prefix.is_empty() {
             lines[0].spans.insert(0, prefix_span(prefix, prefix_style));
             provenance[0].spans.insert(0, SpanSource::Chrome);
+            links.rows[0].insert(0, None);
         }
     } else if !prefix.is_empty() {
         let leader = prefix_line(prefix, prefix_style);
         provenance.insert(0, LineProvenance::chrome(leader.spans.len()));
+        links.rows.insert(0, vec![None; leader.spans.len()]);
         lines.insert(0, leader);
         for span in &mut diagrams {
             span.rows.start += 1;
@@ -290,6 +535,7 @@ pub(crate) fn paint_semantic(
         lines,
         provenance,
         diagrams,
+        links,
     }
 }
 
@@ -337,6 +583,7 @@ pub(crate) fn text_to_painted_at(text: &str, style: Style, width: u16, base: u32
     painted
 }
 
+#[cfg(test)]
 pub fn text_to_lines(
     text: &str,
     prefix: &str,
@@ -667,6 +914,113 @@ mod tests {
         assert!(
             code.style.add_modifier.contains(Modifier::BOLD),
             "inline code inside bold should inherit BOLD modifier"
+        );
+    }
+
+    #[test]
+    fn links_are_underlined_without_losing_nested_style() {
+        let style = Style::default();
+        let lines = text_to_lines(
+            "[**bold** and `code`](https://example.com)",
+            "",
+            style,
+            style,
+            TEST_WIDTH,
+        );
+        let bold = find_span(&lines, "bold");
+        let code = find_span(&lines, "code");
+        assert!(bold.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert!(code.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(code.style.fg, theme::current().inline_code.fg);
+    }
+
+    #[test]
+    fn link_map_tracks_wrapped_and_wide_link_cells() {
+        let target: Arc<str> = "https://example.com".into();
+        let lines = vec![Line::from(vec![
+            Span::raw("aa "),
+            Span::raw("link"),
+            Span::raw(" z"),
+        ])];
+        let links = LinkMap {
+            rows: vec![vec![None, Some(Arc::clone(&target)), None]],
+        };
+
+        assert_eq!(links.target_at(&lines, 4, 1, 0), Some(Arc::clone(&target)));
+        assert_eq!(links.target_at(&lines, 4, 1, 3), Some(Arc::clone(&target)));
+        assert_eq!(links.target_at(&lines, 4, 0, 0), None);
+        assert_eq!(links.target_at(&lines, 4, 2, 0), None);
+
+        let mut terminal_links = Vec::new();
+        links.append_terminal_links(&lines, 4, 1, Rect::new(10, 20, 4, 1), &mut terminal_links);
+        assert_eq!(terminal_links.len(), 4);
+        assert_eq!(terminal_links[0].position, Position::new(10, 20));
+        assert_eq!(terminal_links[3].position, Position::new(13, 20));
+        assert_eq!(terminal_links[0].symbol, "l");
+        assert!(
+            terminal_links
+                .iter()
+                .all(|link| link.target.as_ref() == "https://example.com")
+        );
+
+        let wide_lines = vec![Line::from(Span::raw("界"))];
+        let wide_links = LinkMap {
+            rows: vec![vec![Some(Arc::clone(&target))]],
+        };
+        assert_eq!(
+            wide_links.target_at(&wide_lines, 4, 0, 1),
+            Some(Arc::clone(&target))
+        );
+
+        let emoji_lines = vec![Line::from(vec![Span::raw("👩‍💻"), Span::raw("docs")])];
+        let emoji_links = LinkMap {
+            rows: vec![vec![None, Some(target)]],
+        };
+        assert_eq!(
+            emoji_links.target_at(&emoji_lines, 8, 0, 2).as_deref(),
+            Some("https://example.com")
+        );
+
+        let whitespace_lines = vec![Line::raw("aaa  "), Line::raw("x")];
+        let whitespace_links = LinkMap {
+            rows: vec![vec![None], vec![Some("https://example.com".into())]],
+        };
+        assert_eq!(
+            whitespace_links
+                .target_at(&whitespace_lines, 4, 1, 0)
+                .as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn malformed_web_target_is_not_interactive() {
+        let style = Style::default();
+        let (painted, _) = text_to_painted(
+            "[bad](https://)",
+            "",
+            style,
+            style,
+            TEST_WIDTH,
+            None,
+            Vec::new(),
+        );
+        let bad = find_span(&painted.lines, "bad");
+
+        assert!(!bad.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(painted.links.rows.iter().flatten().all(Option::is_none));
+    }
+
+    #[test]
+    fn interactive_link_targets_preserve_source_and_reject_controls() {
+        assert_eq!(
+            interactive_link_target("HTTPS://EXAMPLE.COM/path").as_deref(),
+            Some("HTTPS://EXAMPLE.COM/path")
+        );
+        assert_eq!(
+            interactive_link_target("https://example.com/\ntrimmed"),
+            None
         );
     }
 }

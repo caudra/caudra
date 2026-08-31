@@ -1412,6 +1412,27 @@ fn ordinary_message_rows_never_become_transcript_hover_controls() {
 }
 
 #[test]
+fn message_link_hit_testing_accounts_for_segment_chrome() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "[docs](https://example.com)".into(),
+    ));
+    panel.viewport_width = 80;
+    panel.rebuild_line_cache();
+    panel.set_scroll_top(0);
+    let area = Rect::new(5, 7, 80, 5);
+    let segment = panel.cache.get(0).expect("assistant segment");
+    let row = area.y + segment.chrome(80).content_start();
+    let column = area.x + segment.chrome(80).left;
+
+    panel.update_hover(row, column, area, false);
+    assert_eq!(panel.hovered_link(), Some("https://example.com"));
+    panel.update_hover(row, column + 4, area, false);
+    assert_eq!(panel.hovered_link(), None);
+}
+
+#[test]
 fn extract_selection_copies_visible_content_only() {
     let panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);

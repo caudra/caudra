@@ -69,6 +69,7 @@ pub struct StatusBarContext<'a> {
     pub mode_clickable: bool,
     pub settings_clickable: bool,
     pub hovered: Option<StatusBarHitTarget>,
+    pub hover_url: Option<&'a str>,
 }
 
 pub struct StatusBar {
@@ -146,6 +147,16 @@ impl StatusBar {
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<StatusBarHit> {
+        if let Some(url) = ctx.hover_url.filter(|_| self.flash.is_none()) {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {url}"),
+                    theme::current().status_notice,
+                ))),
+                area,
+            );
+            return Vec::new();
+        }
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -632,6 +643,7 @@ mod tests {
         show_global: bool,
         yolo: bool,
         hovered: Option<StatusBarHitTarget>,
+        hover_url: Option<&str>,
     ) -> (String, Vec<StatusBarHit>, Vec<Style>) {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -661,6 +673,7 @@ mod tests {
             mode_clickable: true,
             settings_clickable: true,
             hovered,
+            hover_url,
         };
         let mut hits = Vec::new();
         terminal
@@ -676,7 +689,7 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_at(BAR_WIDTH, global_cost, show_global, yolo, None).0
+        render_at(BAR_WIDTH, global_cost, show_global, yolo, None, None).0
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -716,7 +729,7 @@ mod tests {
     #[test_case(40 ; "medium")]
     #[test_case(BAR_WIDTH ; "wide")]
     fn status_hits_stay_inside_the_rendered_area(width: u16) {
-        let (_, hits, _) = render_at(width, Some(SESSION_COST), true, true, None);
+        let (_, hits, _) = render_at(width, Some(SESSION_COST), true, true, None, None);
         let area = Rect::new(0, 0, width, 1);
         assert!(hits.iter().all(|hit| {
             hit.area.width > 0
@@ -727,7 +740,7 @@ mod tests {
 
     #[test]
     fn compact_status_preserves_mode_control() {
-        let (_, hits, _) = render_at(20, None, false, false, None);
+        let (_, hits, _) = render_at(20, None, false, false, None, None);
         assert!(
             hits.iter()
                 .any(|hit| hit.target == StatusBarHitTarget::Mode)
@@ -736,7 +749,7 @@ mod tests {
 
     #[test]
     fn wide_status_exposes_all_main_controls() {
-        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None);
+        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None);
         for target in [
             StatusBarHitTarget::Mode,
             StatusBarHitTarget::Model,
@@ -759,7 +772,7 @@ mod tests {
             StatusBarHitTarget::Model,
             StatusBarHitTarget::Thinking,
         ] {
-            let (_, hits, styles) = render_at(BAR_WIDTH, None, false, false, Some(target));
+            let (_, hits, styles) = render_at(BAR_WIDTH, None, false, false, Some(target), None);
             let hit = hits.iter().find(|hit| hit.target == target).unwrap();
             let start = usize::from(hit.area.x);
             let end = usize::from(hit.area.right());
@@ -771,6 +784,15 @@ mod tests {
                     .all(|style| style.add_modifier.contains(Modifier::REVERSED))
             );
         }
+    }
+
+    #[test]
+    fn hovered_url_replaces_status_content() {
+        const URL: &str = "https://example.com/docs";
+        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, Some(URL));
+
+        assert!(text.trim_start().starts_with(URL));
+        assert!(hits.is_empty());
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

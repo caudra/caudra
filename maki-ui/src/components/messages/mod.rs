@@ -21,7 +21,7 @@ use super::{
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
 use crate::markdown::{
-    DiagramSpan, hr_line, plain_lines, text_to_lines, text_to_painted, truncate_output,
+    DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
 };
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
@@ -32,6 +32,7 @@ use crate::update;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,6 +57,7 @@ const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 
 #[derive(Debug, PartialEq, Eq)]
 enum HoverTarget {
+    Link(Arc<str>),
     CachedThinking(usize),
     StreamingThinking,
     Tool { id: String, feedback: HoverFeedback },
@@ -140,6 +142,7 @@ pub struct MessagesPanel {
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
     hover: Option<HoverTarget>,
+    terminal_links: Vec<TerminalLink>,
 }
 
 impl MessagesPanel {
@@ -188,6 +191,7 @@ impl MessagesPanel {
             rebake_requested: HashMap::new(),
             prompt_progress: None,
             hover: None,
+            terminal_links: Vec::new(),
         }
     }
 
@@ -260,10 +264,12 @@ impl MessagesPanel {
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
+        self.clear_hover();
         self.streaming_thinking.push(text);
     }
 
     pub fn text_delta(&mut self, text: &str) {
+        self.clear_hover();
         self.flush_thinking();
         self.streaming_text.push(text);
     }
@@ -750,6 +756,36 @@ impl MessagesPanel {
         self.hover = None;
     }
 
+    pub(crate) fn hovered_link(&self) -> Option<&str> {
+        match &self.hover {
+            Some(HoverTarget::Link(target)) => Some(target),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn terminal_links(&self) -> &[TerminalLink] {
+        &self.terminal_links
+    }
+
+    pub(crate) fn link_at(&self, row: u16, col: u16, area: Rect) -> Option<Arc<str>> {
+        if area.height == 0
+            || row < area.y
+            || row >= area.bottom()
+            || col < area.x
+            || col >= area.right()
+        {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let rel_col = col - area.x;
+        if let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) {
+            let rel_row = u16::try_from(doc_row - start).ok()?;
+            return segment.link_at(rel_row, rel_col, width);
+        }
+        self.streaming_link_at(doc_row, rel_col, width)
+    }
+
     fn hover_target_at(
         &self,
         row: u16,
@@ -768,6 +804,9 @@ impl MessagesPanel {
         let width = self.viewport_width;
         let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
         let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
+            if let Some(target) = self.streaming_link_at(doc_row, col - area.x, width) {
+                return Some(HoverTarget::Link(target));
+            }
             return self
                 .is_collapsed_streaming_thinking_row(doc_row, width)
                 .then_some(HoverTarget::StreamingThinking);
@@ -775,6 +814,9 @@ impl MessagesPanel {
         let rel = u16::try_from(doc_row - start).ok()?;
         if rel < segment.chrome(width).margin_top {
             return None;
+        }
+        if let Some(target) = segment.link_at(rel, col - area.x, width) {
+            return Some(HoverTarget::Link(target));
         }
         let Some(tool_id) = segment.tool_id.as_deref() else {
             let msg_index = segment.msg_index?;
@@ -831,11 +873,52 @@ impl MessagesPanel {
                 Some(*feedback)
             }
             Some(HoverTarget::CachedThinking(_))
+            | Some(HoverTarget::Link(_))
             | Some(HoverTarget::StreamingThinking)
             | Some(HoverTarget::Tool { .. })
             | Some(HoverTarget::Diagram(_))
             | None => None,
         }
+    }
+
+    fn streaming_link_at(&self, doc_row: u32, col: u16, width: u16) -> Option<Arc<str>> {
+        let mut block_start = self.cache.total_height(width);
+        let mut has_previous = self.cache.len() != 0;
+        let streams = [
+            (
+                &self.streaming_thinking,
+                self.streaming_thinking_collapsed(),
+                SegmentKind::Thinking,
+            ),
+            (&self.streaming_text, false, SegmentKind::Assistant),
+        ];
+        for (stream, collapsed, kind) in streams {
+            if stream.is_empty() {
+                continue;
+            }
+            if has_previous {
+                block_start = block_start.saturating_add(1);
+            }
+            let chrome = SegmentChrome::for_kind(kind, width, 0);
+            let content_width = chrome.content_width(width);
+            let lines = if collapsed {
+                None
+            } else {
+                Some(stream.cached_lines())
+            };
+            let height = lines.map_or_else(
+                || wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width),
+                |lines| wrapped_line_count(lines, content_width),
+            ) as u32;
+            if !collapsed && (block_start..block_start + height).contains(&doc_row) {
+                let row = u16::try_from(doc_row - block_start).ok()?;
+                let col = col.checked_sub(chrome.left)?;
+                return stream.link_at(content_width, row, col);
+            }
+            block_start = block_start.saturating_add(height);
+            has_previous = true;
+        }
+        None
     }
 
     /// The diagram drawn on `rel`, a row relative to the segment. Diagram
@@ -1105,6 +1188,7 @@ impl MessagesPanel {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
+        self.terminal_links.clear();
         if self.viewport_area != area {
             self.clear_hover();
             self.viewport_area = area;
@@ -1174,7 +1258,10 @@ impl MessagesPanel {
         } else if !self.streaming_thinking.is_empty() {
             let content_width =
                 SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
-            let lines = self.streaming_thinking.render_lines(content_width);
+            if self.streaming_thinking.update_render(content_width) {
+                self.clear_hover();
+            }
+            let lines = self.streaming_thinking.cached_lines();
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
@@ -1184,7 +1271,10 @@ impl MessagesPanel {
         if !self.streaming_text.is_empty() {
             let content_width =
                 SegmentChrome::for_kind(SegmentKind::Assistant, width, 0).content_width(width);
-            let lines = self.streaming_text.render_lines(content_width);
+            if self.streaming_text.update_render(content_width) {
+                self.clear_hover();
+            }
+            let lines = self.streaming_text.cached_lines();
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
@@ -1205,7 +1295,11 @@ impl MessagesPanel {
         }
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
-        let mut cursor = RenderCursor::new(self.scroll_top, viewport);
+        let mut cursor = RenderCursor::new(
+            self.scroll_top,
+            viewport,
+            mem::take(&mut self.terminal_links),
+        );
 
         let accent = self.accent.resolve();
         for (i, seg) in self.cache.segments().iter().enumerate() {
@@ -1218,7 +1312,7 @@ impl MessagesPanel {
                 .hover_feedback_for_segment(seg)
                 .map(|feedback| (feedback, accent));
             cursor.render(
-                seg.lines(),
+                (seg.lines(), Some(seg.links())),
                 h,
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent),
@@ -1244,7 +1338,7 @@ impl MessagesPanel {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 cursor.render(
-                    &spacer_lines,
+                    (&spacer_lines, None),
                     h,
                     SegmentChrome::for_kind(SegmentKind::Assistant, width, 0),
                     (None, None),
@@ -1259,7 +1353,7 @@ impl MessagesPanel {
                     let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
                         .then_some((HoverFeedback::Affordance, accent));
                     cursor.render(
-                        &collapsed_thinking_lines,
+                        (&collapsed_thinking_lines, None),
                         h,
                         SegmentChrome::for_kind(kind, width, 0),
                         (None, None),
@@ -1271,7 +1365,7 @@ impl MessagesPanel {
                     );
                 } else {
                     cursor.render(
-                        sc.cached_lines(),
+                        (sc.cached_lines(), Some(sc.links())),
                         h,
                         SegmentChrome::for_kind(kind, width, 0),
                         (None, None),
@@ -1281,6 +1375,7 @@ impl MessagesPanel {
                 }
             }
         }
+        self.terminal_links = cursor.into_terminal_links();
 
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
@@ -1306,6 +1401,8 @@ impl MessagesPanel {
                     bar_width,
                 },
             );
+            self.terminal_links
+                .retain(|link| !bar_area.contains(link.position));
         }
 
         if total_lines > area.height {
@@ -1588,6 +1685,7 @@ impl MessagesPanel {
                 Some(ts),
                 rctx.width,
             );
+            tl.links.rows[0] = vec![None; tl.lines[0].spans.len()];
         }
         tl
     }
@@ -1657,20 +1755,24 @@ impl MessagesPanel {
         else {
             return;
         };
-        let lines = if collapsed {
-            self.build_cached_thinking_indicator(&text)
+        let (lines, links) = if collapsed {
+            let lines = self.build_cached_thinking_indicator(&text);
+            let links = LinkMap::none_for(&lines);
+            (lines, links)
         } else {
             let style = thinking_style();
             let content_width =
                 SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
-            text_to_lines(
+            let (painted, _) = text_to_painted(
                 &text,
                 style.prefix,
                 style.text_style,
                 style.prefix_style,
                 content_width,
                 None,
-            )
+                Vec::new(),
+            );
+            (painted.lines, painted.links)
         };
         let search_text = format!("thinking> {text}");
         let seg_idx = self
@@ -1681,6 +1783,7 @@ impl MessagesPanel {
         let Some(seg_idx) = seg_idx else { return };
         if let Some(seg) = self.cache.get_mut(seg_idx) {
             seg.set_lines(lines);
+            seg.set_links(links);
             seg.search_text = search_text;
         }
     }
@@ -1712,6 +1815,7 @@ impl MessagesPanel {
     }
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
+        self.clear_hover();
         let Some(msg) = self
             .messages
             .iter()
@@ -1782,6 +1886,7 @@ impl MessagesPanel {
                     let lines = self.build_cached_thinking_indicator(&text);
                     let search_text = format!("thinking> {text}");
                     let mut segment = Segment::with_lines(lines, search_text, Some(i));
+                    segment.set_links(LinkMap::none_for(segment.lines()));
                     segment.set_kind(SegmentKind::Thinking);
                     self.cache.push(segment);
                     continue;
@@ -1791,6 +1896,7 @@ impl MessagesPanel {
                 segment.set_kind(segment_kind(&msg.role));
                 segment.set_provenance(built.provenance);
                 segment.set_diagrams(built.diagrams);
+                segment.set_links(built.links);
                 self.cache.push(segment);
             }
         }
@@ -1933,6 +2039,7 @@ impl MessagesPanel {
         seg.set_lines(built.lines);
         seg.set_provenance(built.provenance);
         seg.set_diagrams(built.diagrams);
+        seg.set_links(built.links);
         seg.search_text = built.search_text;
     }
 
@@ -2043,15 +2150,16 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         .then(|| review::parse(&msg.text))
         .flatten()
     {
-        let (lines, provenance) = review::card_lines(&notes, width, style.text_style);
+        let (lines, provenance, links) = review::card_lines(&notes, width, style.text_style);
         return BuiltMessage {
             search_text: review_search_text(&notes),
+            links,
             lines,
             provenance: Some(Provenance::new(msg.text.as_str().into(), provenance)),
             diagrams: Vec::new(),
         };
     }
-    let (mut lines, mut provenance, mut diagrams) = if style.use_markdown {
+    let (mut lines, mut provenance, mut diagrams, mut links) = if style.use_markdown {
         let (painted, parsed) = text_to_painted(
             &msg.text,
             prefix,
@@ -2065,13 +2173,12 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
             painted.lines,
             Some(Provenance::new(parsed, painted.provenance)),
             painted.diagrams,
+            painted.links,
         )
     } else {
-        (
-            plain_lines(&msg.text, prefix, style.text_style, style.prefix_style),
-            None,
-            Vec::new(),
-        )
+        let lines = plain_lines(&msg.text, prefix, style.text_style, style.prefix_style);
+        let links = LinkMap::none_for(&lines);
+        (lines, None, Vec::new(), links)
     };
     if let Some(pp) = &msg.plan_path {
         // Plan messages splice in rules and a footer, so the recorded line
@@ -2081,17 +2188,28 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         if !msg.text.is_empty() {
             let rule = hr_line(width, theme::current().plan_rule);
             lines.insert(0, rule.clone());
+            links.rows.insert(0, vec![None; rule.spans.len()]);
             lines.push(rule);
+            links
+                .rows
+                .push(vec![None; lines.last().unwrap().spans.len()]);
         } else {
             lines.clear();
+            links.rows.clear();
         }
         if !msg.text.is_empty() {
             lines.push(Line::from(""));
+            links
+                .rows
+                .push(vec![None; lines.last().unwrap().spans.len()]);
         }
         lines.push(Line::from(Span::styled(
             pp.to_owned(),
             theme::current().plan_path,
         )));
+        links
+            .rows
+            .push(vec![None; lines.last().unwrap().spans.len()]);
         lines.push(Line::from(Span::styled(
             format!(
                 "{} to open in editor ($VISUAL / $EDITOR)",
@@ -2099,6 +2217,9 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
             ),
             theme::current().tool_dim,
         )));
+        links
+            .rows
+            .push(vec![None; lines.last().unwrap().spans.len()]);
     }
     let search_text = format!("{prefix}{}", msg.text);
     BuiltMessage {
@@ -2106,6 +2227,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         search_text,
         provenance,
         diagrams,
+        links,
     }
 }
 
@@ -2114,6 +2236,7 @@ struct BuiltMessage {
     search_text: String,
     provenance: Option<Provenance>,
     diagrams: Vec<DiagramSpan>,
+    links: LinkMap,
 }
 
 /// Search should reach what the card shows, not the tags behind it.

@@ -243,6 +243,7 @@ pub enum Action {
     TrustMcpProject(String),
     RejectMcp(String),
     OpenEditor(PathBuf),
+    OpenUrl(String),
     EditInputInEditor,
     Btw(String),
     Suspend,

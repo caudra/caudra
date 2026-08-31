@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::iter;
 use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use maki_highlight::CodeHighlighter;
@@ -149,6 +150,7 @@ pub struct Span {
     pub style: StyleToken,
     pub emphasis: Emphasis,
     pub source: SpanSource,
+    pub link: Option<Arc<str>>,
 }
 
 impl Span {
@@ -159,6 +161,7 @@ impl Span {
             style,
             emphasis: Emphasis::default(),
             source: SpanSource::Chrome,
+            link: None,
         }
     }
 
@@ -168,6 +171,7 @@ impl Span {
             style,
             emphasis: Emphasis::default(),
             source: SpanSource::Unknown,
+            link: None,
         }
     }
 
@@ -177,6 +181,7 @@ impl Span {
             style,
             emphasis,
             source: SpanSource::Unknown,
+            link: None,
         }
     }
 
@@ -191,7 +196,13 @@ impl Span {
             style,
             emphasis,
             source: SpanSource::Range(source),
+            link: None,
         }
+    }
+
+    pub fn with_link(mut self, link: Option<Arc<str>>) -> Self {
+        self.link = link;
+        self
     }
 
     /// Byte sub-slice of this span. Verbatim ranges narrow with the text;
@@ -212,6 +223,7 @@ impl Span {
             style: self.style.clone(),
             emphasis: self.emphasis,
             source,
+            link: self.link.clone(),
         }
     }
 }
@@ -520,6 +532,7 @@ fn coalesce_adjacent_spans(spans: &mut Vec<Span>) {
     for read in 1..spans.len() {
         if spans[write].style == spans[read].style
             && spans[write].emphasis == spans[read].emphasis
+            && spans[write].link == spans[read].link
             && let Some(source) = merge_sources(&spans[write].source, &spans[read].source)
         {
             let tail = mem::take(&mut spans[read].text);
@@ -709,6 +722,7 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
         kind: sk,
         emphasis,
         source,
+        link,
     } in parse_inline_at(&lb.inline, lb.inline_start)
     {
         // Code and maths keep their own token inside headings so consumers
@@ -719,7 +733,7 @@ fn render_line_block(lb: &LineBlock, lines: &mut Vec<Line>, ctx: &RenderCtx) {
             SpanKind::Text if is_heading => (StyleToken::Heading, text),
             SpanKind::Text => (StyleToken::Text, text),
         };
-        content_spans.push(Span::sourced(text, style, emphasis, source));
+        content_spans.push(Span::sourced(text, style, emphasis, source).with_link(link));
     }
 
     let marker_width = marker.as_ref().map_or(0, |m| m.text.width());
@@ -1020,6 +1034,7 @@ fn cell_spans(cell: &str, header: bool, row: Option<&Range<u32>>, math: MathStyl
                  kind,
                  emphasis,
                  source: _,
+                 link,
              }| {
                 let mut emphasis = emphasis;
                 if header {
@@ -1036,6 +1051,7 @@ fn cell_spans(cell: &str, header: bool, row: Option<&Range<u32>>, math: MathStyl
                     }
                     None => Span::with_emphasis(text, style, emphasis),
                 }
+                .with_link(link)
             },
         )
         .collect()
@@ -1494,6 +1510,42 @@ mod tests {
         let lines = render("a `b` c", TEST_WIDTH);
         let code = find_span(&lines, "b").expect("code span");
         assert_eq!(code.style, StyleToken::InlineCode);
+    }
+
+    #[test]
+    fn render_link_preserves_target_across_nested_styles() {
+        let lines = render("[**bold** and `code`](https://example.com)", TEST_WIDTH);
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 3);
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.link.as_deref() == Some("https://example.com"))
+        );
+        assert_eq!(spans[0].emphasis, Emphasis::BOLD);
+        assert_eq!(spans[2].style, StyleToken::InlineCode);
+    }
+
+    #[test]
+    fn render_wrapped_link_slices_keep_target() {
+        let lines = render("[abcdefghij](https://example.com)", 4);
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.link.as_deref() == Some("https://example.com"))
+        );
+    }
+
+    #[test]
+    fn render_table_link_keeps_target() {
+        let lines = render(
+            "| Link |\n| --- |\n| [site](https://example.com) |",
+            TEST_WIDTH,
+        );
+        let link = find_span(&lines, "site").expect("table link span");
+        assert_eq!(link.link.as_deref(), Some("https://example.com"));
     }
 
     #[test_case(1; "h1")]

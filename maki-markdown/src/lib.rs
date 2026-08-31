@@ -13,12 +13,15 @@ pub mod latex;
 pub mod mermaid;
 pub mod render;
 
+use std::collections::HashMap;
 use std::ops::{Not, Range};
+use std::sync::Arc;
 
 const BULLET: &str = "• ";
 const LIST_INDENT_STEP: usize = 2;
 const MAX_HEADING_LEVEL: u8 = 6;
 const FENCE_MIN: usize = 3;
+const MAX_LINK_DESTINATION_BYTES: usize = 2_048;
 const MATH_FENCE: &str = "$$";
 const MATH_PAREN_OPEN: &str = "\\(";
 const MATH_PAREN_CLOSE: &str = "\\)";
@@ -122,6 +125,7 @@ pub struct InlineSpan {
     pub kind: SpanKind,
     pub emphasis: Emphasis,
     pub source: Source,
+    pub link: Option<Arc<str>>,
 }
 
 impl InlineSpan {
@@ -131,6 +135,7 @@ impl InlineSpan {
             kind: SpanKind::Text,
             emphasis,
             source,
+            link: None,
         }
     }
 
@@ -140,6 +145,7 @@ impl InlineSpan {
             kind: SpanKind::Code,
             emphasis,
             source,
+            link: None,
         }
     }
 
@@ -149,7 +155,13 @@ impl InlineSpan {
             kind: SpanKind::Math,
             emphasis,
             source,
+            link: None,
         }
+    }
+
+    fn with_link(mut self, link: Option<Arc<str>>) -> Self {
+        self.link = link;
+        self
     }
 }
 
@@ -723,7 +735,7 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
 /// reports its own slice of it, so consumers can map a rendered cell back to
 /// the markdown that produced it.
 pub fn parse_inline_at(text: &str, offset: u32) -> Vec<InlineSpan> {
-    parse_inline_impl(text, offset, Emphasis::default(), ParseMode::WithCode)
+    parse_inline_impl(text, offset, Emphasis::default(), ParseMode::WithCode, true)
 }
 
 /// `EmphasisOnly` is for rescanning a region the outer pass already split on
@@ -739,8 +751,11 @@ fn parse_inline_impl(
     offset: u32,
     emphasis: Emphasis,
     mode: ParseMode,
+    allow_links: bool,
 ) -> Vec<InlineSpan> {
     let bytes = text.as_bytes();
+    let link_label_ends = (allow_links && mode == ParseMode::WithCode && bytes.contains(&b'['))
+        .then(|| scan_link_label_ends(text));
     let mut spans = Vec::new();
     let mut pos = 0;
     let mut plain_start = 0;
@@ -758,6 +773,7 @@ fn parse_inline_impl(
                 at,
                 emphasis,
                 ParseMode::EmphasisOnly,
+                allow_links,
             )),
             ParseMode::EmphasisOnly => spans.push(InlineSpan::text(
                 plain.to_owned(),
@@ -781,6 +797,86 @@ fn parse_inline_impl(
                 Source::atomic(offset + pos as u32..offset + math.end as u32),
             ));
             pos = math.end;
+            plain_start = pos;
+            continue;
+        }
+
+        if allow_links
+            && mode == ParseMode::WithCode
+            && bytes[pos] == b'!'
+            && let Some(label_end) = link_label_ends
+                .as_ref()
+                .and_then(|ends| ends.get(&(pos + 1)))
+                .copied()
+            && let Some(image) = try_explicit_link(text, pos + 1, label_end)
+        {
+            pos = image.end;
+            continue;
+        }
+
+        if allow_links
+            && mode == ParseMode::WithCode
+            && !pos.checked_sub(1).is_some_and(|i| bytes[i] == b'!')
+            && let Some(label_end) = link_label_ends
+                .as_ref()
+                .and_then(|ends| ends.get(&pos))
+                .copied()
+            && let Some(link) = try_explicit_link(text, pos, label_end)
+        {
+            flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+            let target = http_target(&text[link.target.clone()]);
+            let source = Source::atomic(offset + pos as u32..offset + link.end as u32);
+            let mut label = parse_inline_impl(
+                &text[link.label.clone()],
+                offset + link.label.start as u32,
+                emphasis,
+                ParseMode::WithCode,
+                false,
+            );
+            for span in &mut label {
+                span.source = source.clone();
+                span.link = target.clone();
+            }
+            spans.extend(label);
+            pos = link.end;
+            plain_start = pos;
+            continue;
+        }
+
+        if allow_links
+            && mode == ParseMode::WithCode
+            && let Some(link) = try_autolink(text, pos)
+        {
+            flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+            let target = Arc::<str>::from(&text[link.target.clone()]);
+            spans.push(
+                InlineSpan::text(
+                    target.to_string(),
+                    emphasis,
+                    Source::atomic(offset + pos as u32..offset + link.end as u32),
+                )
+                .with_link(Some(target)),
+            );
+            pos = link.end;
+            plain_start = pos;
+            continue;
+        }
+
+        if allow_links
+            && mode == ParseMode::WithCode
+            && let Some(end) = bare_url_end(text, pos)
+        {
+            flush_plain(&mut spans, &text[plain_start..pos], plain_start);
+            let target = Arc::<str>::from(&text[pos..end]);
+            spans.push(
+                InlineSpan::text(
+                    target.to_string(),
+                    emphasis,
+                    Source::verbatim(offset + pos as u32..offset + end as u32),
+                )
+                .with_link(Some(target)),
+            );
+            pos = end;
             plain_start = pos;
             continue;
         }
@@ -824,6 +920,7 @@ fn parse_inline_impl(
                     offset + content_start as u32,
                     emphasis.merge(found),
                     mode,
+                    allow_links,
                 ));
                 pos = close + delim_len;
                 plain_start = pos;
@@ -837,6 +934,248 @@ fn parse_inline_impl(
         flush_plain(&mut spans, &text[plain_start..], plain_start);
     }
     spans
+}
+
+struct ExplicitLink {
+    label: Range<usize>,
+    target: Range<usize>,
+    end: usize,
+}
+
+fn try_explicit_link(text: &str, pos: usize, label_end: usize) -> Option<ExplicitLink> {
+    let bytes = text.as_bytes();
+    let mut limit = label_end
+        .saturating_add(2)
+        .saturating_add(MAX_LINK_DESTINATION_BYTES)
+        .min(bytes.len());
+    while !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    if bytes.get(pos) != Some(&b'[') {
+        return None;
+    }
+
+    if bytes.get(label_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut at = label_end + 2;
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+
+    let (target, mut at) = if bytes.get(at) == Some(&b'<') {
+        let start = at + 1;
+        let end = find_unescaped(&bytes[..limit], start, b'>')?;
+        if text[start..end].contains(['\n', '\r', '<']) {
+            return None;
+        }
+        (start..end, end + 1)
+    } else {
+        let start = at;
+        let mut depth = 0usize;
+        while at < limit {
+            match bytes[at] {
+                b'\\' if at + 1 < bytes.len() => at += 2,
+                b'(' => {
+                    depth += 1;
+                    at += 1;
+                }
+                b')' if depth > 0 => {
+                    depth -= 1;
+                    at += 1;
+                }
+                b')' | b' ' | b'\t' | b'\n' | b'\r' if depth == 0 => break,
+                _ => at += 1,
+            }
+        }
+        if at == start {
+            return None;
+        }
+        (start..at, at)
+    };
+
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b')') {
+        let quote = *bytes.get(at)?;
+        let close = match quote {
+            b'\'' | b'"' => quote,
+            b'(' => b')',
+            _ => return None,
+        };
+        at = find_unescaped(&bytes[..limit], at + 1, close)? + 1;
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b')') {
+            return None;
+        }
+    }
+
+    Some(ExplicitLink {
+        label: pos + 1..label_end,
+        target,
+        end: at + 1,
+    })
+}
+
+fn scan_link_label_ends(text: &str) -> HashMap<usize, usize> {
+    let bytes = text.as_bytes();
+    let mut ends = HashMap::new();
+    let mut openings = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if matches!(bytes[at], b'$' | b'\\')
+            && let Some(math) = try_inline_math(text, at)
+        {
+            at = math.end;
+            continue;
+        }
+        match bytes[at] {
+            b'\\' if at + 1 < bytes.len() => at += 2,
+            b'`' => {
+                let run_len = count_backtick_run(bytes, at);
+                at = find_code_span_close(bytes, at, run_len)
+                    .map_or(at + run_len, |(_, _, close_end)| close_end);
+            }
+            b'[' => {
+                openings.push(at);
+                at += 1;
+            }
+            b']' => {
+                if let Some(open) = openings.pop() {
+                    ends.insert(open, at);
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    ends
+}
+
+fn find_unescaped(bytes: &[u8], mut at: usize, needle: u8) -> Option<usize> {
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            at += 2;
+        } else if bytes[at] == needle {
+            return Some(at);
+        } else {
+            at += 1;
+        }
+    }
+    None
+}
+
+struct Autolink {
+    target: Range<usize>,
+    end: usize,
+}
+
+fn try_autolink(text: &str, pos: usize) -> Option<Autolink> {
+    if text.as_bytes().get(pos) != Some(&b'<') {
+        return None;
+    }
+    let start = pos + 1;
+    if !starts_http_scheme(&text[start..]) {
+        return None;
+    }
+    let search_end = start
+        .saturating_add(MAX_LINK_DESTINATION_BYTES + 1)
+        .min(text.len());
+    let close = text.as_bytes()[start..search_end]
+        .iter()
+        .position(|byte| *byte == b'>')?
+        + start;
+    if text[start..close]
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '<')
+    {
+        return None;
+    }
+    Some(Autolink {
+        target: start..close,
+        end: close + 1,
+    })
+}
+
+fn http_target(target: &str) -> Option<Arc<str>> {
+    let mut decoded = String::with_capacity(target.len());
+    let mut chars = target.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(escaped) = chars.clone().next()
+            && escaped.is_ascii_punctuation()
+        {
+            decoded.push(escaped);
+            chars.next();
+        } else {
+            decoded.push(ch);
+        }
+    }
+    starts_http_scheme(&decoded).then(|| Arc::from(decoded))
+}
+
+fn starts_http_scheme(text: &str) -> bool {
+    text.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || text
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn bare_url_end(text: &str, pos: usize) -> Option<usize> {
+    if !starts_http_scheme_at(text, pos)
+        || pos.checked_sub(1).is_some_and(|i| {
+            text.as_bytes()[i].is_ascii_alphanumeric() || text.as_bytes()[i] == b'_'
+        })
+    {
+        return None;
+    }
+
+    let mut at = pos;
+    let mut parentheses = 0usize;
+    for (relative, ch) in text[pos..].char_indices() {
+        if ch.is_whitespace()
+            || ch.is_control()
+            || matches!(ch, '<' | '>' | '"' | '`' | '*' | '[' | ']')
+        {
+            break;
+        }
+        if relative + ch.len_utf8() > MAX_LINK_DESTINATION_BYTES {
+            return None;
+        }
+        if ch == '(' {
+            parentheses += 1;
+        } else if ch == ')' {
+            if parentheses == 0 {
+                break;
+            }
+            parentheses -= 1;
+        }
+        at = pos + relative + ch.len_utf8();
+    }
+    while at > pos
+        && text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | ',' | '!' | '?' | ';' | ':' | '\''))
+    {
+        at -= text[..at].chars().next_back().unwrap().len_utf8();
+    }
+    (at > pos).then_some(at)
+}
+
+fn starts_http_scheme_at(text: &str, pos: usize) -> bool {
+    let Some(rest) = text.as_bytes().get(pos..) else {
+        return false;
+    };
+    rest.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+        || rest
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
 }
 
 struct InlineMath {
@@ -1198,6 +1537,115 @@ mod tests {
         assert_eq!(spans[1].kind, SpanKind::Code);
         assert_eq!(spans[2].text, " bold");
         assert_eq!(spans[2].emphasis, Emphasis::BOLD);
+    }
+
+    #[test]
+    fn parse_inline_markdown_link_uses_label_and_keeps_raw_target() {
+        let input = "Read [the docs](https://example.com/path?q=1) now";
+        let spans = parse_inline(input);
+        assert_eq!(span_text(&spans), "Read the docs now");
+        let link = spans.iter().find(|span| span.text == "the docs").unwrap();
+        assert_eq!(link.link.as_deref(), Some("https://example.com/path?q=1"));
+        assert_eq!(link.source, Source::atomic(5..45));
+    }
+
+    #[test]
+    fn parse_inline_link_label_keeps_nested_styles_and_one_target() {
+        let input = "[**bold** and `code`](https://example.com)";
+        let spans = parse_inline(input);
+        assert_eq!(span_text(&spans), "bold and code");
+        assert_eq!(spans[0].emphasis, Emphasis::BOLD);
+        assert_eq!(spans[2].kind, SpanKind::Code);
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.link.as_deref() == Some("https://example.com"))
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.source == Source::atomic(0..42))
+        );
+    }
+
+    #[test_case("[array[i]](https://example.com)" => "array[i]"; "nested_brackets")]
+    #[test_case("[value `]` here](https://example.com)" => "value ] here"; "code_bracket")]
+    #[test_case("[$x]$](https://example.com)" => "x]"; "math_bracket")]
+    fn parse_inline_link_label_balances_brackets(input: &str) -> String {
+        let spans = parse_inline(input);
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.link.as_deref() == Some("https://example.com"))
+        );
+        span_text(&spans)
+    }
+
+    #[test]
+    fn parse_inline_link_decodes_escaped_target_punctuation() {
+        let spans = parse_inline(r"[site](https://example.com/a\(b\))");
+
+        assert_eq!(spans[0].link.as_deref(), Some("https://example.com/a(b)"));
+    }
+
+    #[test_case("<https://example.com/a>", "https://example.com/a"; "autolink")]
+    #[test_case("HTTPS://example.com/a", "HTTPS://example.com/a"; "uppercase_bare")]
+    #[test_case("https://example.com/a.", "https://example.com/a"; "trailing_period")]
+    #[test_case(
+        "https://en.wikipedia.org/wiki/Function_(mathematics)",
+        "https://en.wikipedia.org/wiki/Function_(mathematics)";
+        "balanced_parentheses"
+    )]
+    fn parse_inline_visible_http_urls_are_links(input: &str, expected: &str) {
+        let spans = parse_inline(input);
+        let link = spans.iter().find(|span| span.link.is_some()).unwrap();
+        assert_eq!(link.text, expected);
+        assert_eq!(link.link.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn parse_inline_rejects_overlong_visible_urls() {
+        let target = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_LINK_DESTINATION_BYTES)
+        );
+
+        assert!(parse_inline(&target).iter().all(|span| span.link.is_none()));
+        assert!(
+            parse_inline(&format!("<{target}>"))
+                .iter()
+                .all(|span| span.link.is_none())
+        );
+    }
+
+    #[test]
+    fn parse_inline_parenthesized_bare_url_drops_prose_closer() {
+        let spans = parse_inline("See (https://example.com/path). Then");
+        let link = spans.iter().find(|span| span.link.is_some()).unwrap();
+        assert_eq!(link.text, "https://example.com/path");
+        assert_eq!(span_text(&spans), "See (https://example.com/path). Then");
+    }
+
+    #[test]
+    fn parse_inline_relative_link_renders_label_but_is_not_clickable() {
+        let spans = parse_inline("[local](../README.md)");
+        assert_eq!(span_text(&spans), "local");
+        assert!(spans.iter().all(|span| span.link.is_none()));
+        assert_eq!(spans[0].source, Source::atomic(0..21));
+    }
+
+    #[test]
+    fn parse_inline_link_title_is_not_part_of_target() {
+        let spans = parse_inline("[site](https://example.com \"Example\")");
+        assert_eq!(span_text(&spans), "site");
+        assert_eq!(spans[0].link.as_deref(), Some("https://example.com"));
+    }
+
+    #[test_case("`https://example.com`"; "code")]
+    #[test_case("$https://example.com$"; "math")]
+    #[test_case("![alt](https://example.com/image.png)"; "image")]
+    fn parse_inline_non_link_constructs_do_not_expose_urls(input: &str) {
+        assert!(parse_inline(input).iter().all(|span| span.link.is_none()));
     }
 
     #[test]

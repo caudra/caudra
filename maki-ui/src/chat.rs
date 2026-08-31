@@ -411,6 +411,18 @@ impl Chat {
         self.messages_panel.clear_hover();
     }
 
+    pub(crate) fn hovered_link(&self) -> Option<&str> {
+        self.messages_panel.hovered_link()
+    }
+
+    pub(crate) fn terminal_links(&self) -> &[crate::markdown::TerminalLink] {
+        self.messages_panel.terminal_links()
+    }
+
+    pub(crate) fn link_at(&self, row: u16, col: u16, area: Rect) -> Option<Arc<str>> {
+        self.messages_panel.link_at(row, col, area)
+    }
+
     pub(crate) fn pan_hovered_diagram(&mut self, delta: i32) -> bool {
         self.messages_panel.pan_hovered_diagram(delta)
     }
