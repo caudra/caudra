@@ -430,6 +430,7 @@ pub struct UiFileConfig {
     pub scrollbar: Option<bool>,
     pub notifications: Option<NotificationMethod>,
     pub math: Option<MathStyle>,
+    pub mermaid: Option<MermaidStyle>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -449,6 +450,7 @@ impl UiFileConfig {
             splash_animation,
             scrollbar,
             math,
+            mermaid,
             notifications,
             flash_duration_ms,
             typewriter_ms_per_char,
@@ -473,6 +475,14 @@ pub enum MathStyle {
     #[default]
     Unicode,
     Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MermaidStyle {
+    #[default]
+    Unicode,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -1011,6 +1021,14 @@ pub struct UiConfig {
     )]
     pub math: MathStyle,
 
+    #[config(
+        default = MermaidStyle::Unicode,
+        ty = "string",
+        default_doc = "unicode",
+        desc = "How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code)"
+    )]
+    pub mermaid: MermaidStyle,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
@@ -1057,6 +1075,7 @@ impl UiConfig {
             scrollbar: f.scrollbar.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
             math: f.math.unwrap_or_default(),
+            mermaid: f.mermaid.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char

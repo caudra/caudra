@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     Block, BlockKind, Emphasis, InlineSpan, LineBlock, Source, SpanKind, block_prefix, latex,
-    parse_at, parse_inline, parse_inline_at,
+    mermaid, parse_at, parse_inline, parse_inline_at,
 };
 
 pub const CODE_BAR: &str = "│ ";
@@ -26,6 +26,16 @@ pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 1_500;
 const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
+const MERMAID_LANG: &str = "mermaid";
+/// Marks a diagram row that continues past an edge.
+const DIAGRAM_MORE_RIGHT: &str = "›";
+const DIAGRAM_MORE_LEFT: &str = "‹";
+
+/// Furthest a diagram may pan before its right edge is on screen. One column
+/// is owed to the `‹` marker that a panned diagram always carries.
+pub fn diagram_max_pan(full_width: u16, width: u16) -> u16 {
+    full_width.saturating_sub(width.saturating_sub(1).max(1))
+}
 
 /// Semantic style token. Emphasis (bold/italic/strike/underline) lives on
 /// the `Span`, not here, so they compose independently.
@@ -47,6 +57,9 @@ pub enum StyleToken {
     TableBorder,
     HorizontalRule,
     Math,
+    /// Box-drawing and connector cells of a rendered diagram. Node and edge
+    /// labels inside one stay `Text` so they read as prose.
+    Diagram,
 }
 
 /// How LaTeX is presented. Terminals cannot typeset maths, so the choice is
@@ -86,6 +99,34 @@ impl MathStyle {
             Self::Unicode => latex::to_unicode(latex),
             Self::Raw => None,
         }
+    }
+}
+
+/// How ```` ```mermaid ```` blocks are presented. Unlike maths there is a real
+/// `Off`: a flowchart that cannot be laid out well is better read as source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MermaidStyle {
+    /// Lay the flowchart out and draw it with box-drawing characters.
+    Unicode,
+    /// Leave the block as a syntax-highlighted fence.
+    Off,
+}
+
+static MERMAID_STYLE: AtomicU8 = AtomicU8::new(MermaidStyle::Unicode as u8);
+
+impl Default for MermaidStyle {
+    fn default() -> Self {
+        match MERMAID_STYLE.load(Ordering::Relaxed) {
+            x if x == Self::Off as u8 => Self::Off,
+            _ => Self::Unicode,
+        }
+    }
+}
+
+impl MermaidStyle {
+    /// Applies to renderers built after this call.
+    pub fn set_global(self) {
+        MERMAID_STYLE.store(self as u8, Ordering::Relaxed);
     }
 }
 
@@ -185,6 +226,13 @@ pub enum LineKind {
     TableRow,
     HorizontalRule,
     Math,
+    /// One row of drawn diagram. `id` counts diagrams within the message and
+    /// `full_width` is the unclipped art width, which is what a horizontal
+    /// pan needs to know how far it may travel.
+    Diagram {
+        id: u16,
+        full_width: u16,
+    },
     Blank,
 }
 
@@ -226,9 +274,19 @@ pub fn render(text: &str, width: u16) -> Vec<Line> {
 pub struct Renderer {
     highlighters: Vec<CodeHighlighter>,
     table_col_widths: Vec<Vec<usize>>,
+    diagrams: Vec<Diagram>,
+    diagram_pans: Vec<u16>,
     theme_gen: u64,
     wrap_paragraphs: bool,
     math: MathStyle,
+    mermaid: MermaidStyle,
+}
+
+/// A laid-out flowchart kept beside its source so a re-render of the same
+/// block during streaming does not repeat the layout.
+struct Diagram {
+    code: String,
+    canvas: mermaid::Canvas,
 }
 
 impl Default for Renderer {
@@ -236,9 +294,12 @@ impl Default for Renderer {
         Self {
             highlighters: Vec::new(),
             table_col_widths: Vec::new(),
+            diagrams: Vec::new(),
+            diagram_pans: Vec::new(),
             theme_gen: 0,
             wrap_paragraphs: true,
             math: MathStyle::default(),
+            mermaid: MermaidStyle::default(),
         }
     }
 }
@@ -262,6 +323,18 @@ impl Renderer {
         self
     }
 
+    pub fn with_mermaid(mut self, mermaid: MermaidStyle) -> Self {
+        self.mermaid = mermaid;
+        self
+    }
+
+    /// Horizontal offset per diagram, indexed by the `id` on
+    /// [`LineKind::Diagram`]. Missing entries pan to zero.
+    pub fn with_diagram_pans(mut self, pans: Vec<u16>) -> Self {
+        self.diagram_pans = pans;
+        self
+    }
+
     pub fn render(&mut self, text: &str, width: u16, theme_gen: u64) -> Vec<Line> {
         if theme_gen != self.theme_gen {
             self.highlighters.clear();
@@ -273,13 +346,17 @@ impl Renderer {
         let mut state = RenderState {
             code_idx: 0,
             table_idx: 0,
+            diagram_idx: 0,
             highlighters: &mut self.highlighters,
             table_col_widths: &mut self.table_col_widths,
+            diagrams: &mut self.diagrams,
         };
         let ctx = RenderCtx {
             width,
             wrap_paragraphs: self.wrap_paragraphs,
             math: self.math,
+            mermaid: self.mermaid,
+            diagram_pans: &self.diagram_pans,
         };
 
         for block in &blocks {
@@ -288,22 +365,128 @@ impl Renderer {
 
         state.highlighters.truncate(state.code_idx);
         state.table_col_widths.truncate(state.table_idx);
+        state.diagrams.truncate(state.diagram_idx);
         finalize_lines(&mut lines);
         lines
     }
 }
 
-struct RenderCtx {
+struct RenderCtx<'a> {
     width: u16,
     wrap_paragraphs: bool,
     math: MathStyle,
+    mermaid: MermaidStyle,
+    diagram_pans: &'a [u16],
 }
 
 struct RenderState<'a> {
     code_idx: usize,
     table_idx: usize,
+    diagram_idx: usize,
     highlighters: &'a mut Vec<CodeHighlighter>,
     table_col_widths: &'a mut Vec<Vec<usize>>,
+    diagrams: &'a mut Vec<Diagram>,
+}
+
+/// Draws a ```` ```mermaid ```` block, reporting whether it was understood.
+/// A refusal leaves `lines` untouched so the caller can fall back to the
+/// ordinary code path.
+fn render_diagram(
+    code: &str,
+    source: &Range<u32>,
+    lines: &mut Vec<Line>,
+    state: &mut RenderState<'_>,
+    ctx: &RenderCtx<'_>,
+) -> bool {
+    let index = state.diagram_idx;
+    let fresh = match state.diagrams.get(index) {
+        Some(cached) if cached.code == code => None,
+        _ => match mermaid::render(code) {
+            Ok(canvas) => Some(Diagram {
+                code: code.to_owned(),
+                canvas,
+            }),
+            Err(_) => return false,
+        },
+    };
+    if let Some(diagram) = fresh {
+        match state.diagrams.get_mut(index) {
+            Some(slot) => *slot = diagram,
+            None => state.diagrams.push(diagram),
+        }
+    }
+
+    let canvas = &state.diagrams[index].canvas;
+    let full_width = canvas.width.min(u16::MAX as usize) as u16;
+    let id = index.min(u16::MAX as usize) as u16;
+    let pan = ctx
+        .diagram_pans
+        .get(index)
+        .copied()
+        .unwrap_or(0)
+        .min(diagram_max_pan(full_width, ctx.width));
+
+    for row in canvas.rows() {
+        lines.push(diagram_line(row, source, id, full_width, pan, ctx.width));
+    }
+    state.diagram_idx += 1;
+    true
+}
+
+/// Slices one canvas row to the viewport at `pan`. Rows leave here already
+/// fitted, so nothing downstream ever wraps a diagram.
+fn diagram_line(
+    row: &[mermaid::Cell],
+    source: &Range<u32>,
+    id: u16,
+    full_width: u16,
+    pan: u16,
+    width: u16,
+) -> Line {
+    // Each marker costs a column, so the window is whatever is left after
+    // accounting for the ones this row actually needs.
+    let lead = pan > 0;
+    let mut visible = width.saturating_sub(u16::from(lead)).max(1);
+    let trail = (pan as usize + visible as usize) < full_width as usize;
+    if trail {
+        visible = visible.saturating_sub(1);
+    }
+    let window = row
+        .iter()
+        .skip(pan as usize)
+        .take(visible as usize)
+        .filter(|cell| cell.ch != mermaid::CONTINUATION);
+
+    let mut spans: Vec<Span> = Vec::new();
+    if lead {
+        spans.push(Span::chrome(DIAGRAM_MORE_LEFT, StyleToken::Diagram));
+    }
+    for cell in window {
+        let style = match cell.role {
+            mermaid::Role::Label => StyleToken::Text,
+            _ => StyleToken::Diagram,
+        };
+        // The whole fence is one atomic range, so any selection touching a
+        // drawn cell copies back the mermaid source instead of the glyphs.
+        match spans.last_mut() {
+            Some(last) if last.style == style => last.text.push(cell.ch),
+            _ => spans.push(Span::sourced(
+                cell.ch.to_string(),
+                style,
+                Emphasis::default(),
+                Source::atomic(source.clone()),
+            )),
+        }
+    }
+    if trail {
+        spans.push(Span::chrome(DIAGRAM_MORE_RIGHT, StyleToken::Diagram));
+    }
+
+    Line {
+        kind: LineKind::Diagram { id, full_width },
+        spans,
+        source: Some(source.clone()),
+    }
 }
 
 /// Streaming can split tokens differently than a oneshot render because the
@@ -369,10 +552,22 @@ fn render_block(
             code,
             source,
             code_start,
+            closed,
         } => {
             ensure_blank_line(lines);
             if state.code_idx >= state.highlighters.len() {
                 state.highlighters.push(CodeHighlighter::new(lang));
+            }
+            // A diagram still claims its highlighter slot. Streaming shows the
+            // block as code until the closing fence lands, and the slot has to
+            // stay put across that switch or later blocks read a stale cache.
+            if *closed && lang == MERMAID_LANG && ctx.mermaid == MermaidStyle::Unicode {
+                state.code_idx += 1;
+                if render_diagram(code, source, lines, state, ctx) {
+                    ensure_blank_line(lines);
+                    return;
+                }
+                state.code_idx -= 1;
             }
             let segments: Vec<_> = state.highlighters[state.code_idx].update(code).to_vec();
             let start = lines.len();
@@ -1445,6 +1640,175 @@ mod tests {
     #[test]
     fn render_width_zero_does_not_panic() {
         let _ = render("```\nhello\n```", 0);
+    }
+
+    const FLOWCHART: &str = "```mermaid\nflowchart TD\n  A[Start] --> B[Stop]\n```";
+    const UNSUPPORTED: &str = "```mermaid\nsequenceDiagram\n  A ->> B: hi\n```";
+
+    fn diagram_rows(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| matches!(line.kind, LineKind::Diagram { .. }))
+            .map(|line| line.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect()
+    }
+
+    fn mermaid_render(text: &str, width: u16) -> Vec<Line> {
+        Renderer::new()
+            .with_mermaid(MermaidStyle::Unicode)
+            .render(text, width, 0)
+    }
+
+    #[test]
+    fn a_flowchart_fence_becomes_diagram_lines() {
+        let lines = mermaid_render(FLOWCHART, TEST_WIDTH);
+        let rows = diagram_rows(&lines);
+        assert!(!rows.is_empty(), "expected drawn rows");
+        assert!(rows.iter().any(|row| row.contains("Start")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains('▼')), "{rows:?}");
+        assert!(
+            !lines_text(&lines).iter().any(|row| row.contains("-->")),
+            "the source must not survive alongside the drawing"
+        );
+    }
+
+    #[test_case(UNSUPPORTED                                     ; "other_diagram_family")]
+    #[test_case("```mermaid\nflowchart TD\n  A ~~~ B\n```"      ; "unknown_operator")]
+    #[test_case("```mermaid\nflowchart TD\n  A --> A\n```"      ; "self_loop")]
+    fn unsupported_mermaid_falls_back_to_a_code_block(source: &str) {
+        let lines = mermaid_render(source, TEST_WIDTH);
+        assert!(diagram_rows(&lines).is_empty());
+        assert!(lines.iter().any(|line| line.kind == LineKind::Code));
+    }
+
+    #[test]
+    fn mermaid_off_leaves_the_fence_as_code() {
+        let lines = Renderer::new()
+            .with_mermaid(MermaidStyle::Off)
+            .render(FLOWCHART, TEST_WIDTH, 0);
+        assert!(diagram_rows(&lines).is_empty());
+        assert!(lines.iter().any(|line| line.kind == LineKind::Code));
+    }
+
+    #[test]
+    fn an_unterminated_fence_stays_code_while_it_streams() {
+        let partial = "```mermaid\nflowchart TD\n  A[Start] --> B[Stop]";
+        assert!(diagram_rows(&mermaid_render(partial, TEST_WIDTH)).is_empty());
+        assert!(!diagram_rows(&mermaid_render(FLOWCHART, TEST_WIDTH)).is_empty());
+    }
+
+    #[test_case(80 ; "wide")]
+    #[test_case(20 ; "narrow")]
+    #[test_case(4  ; "tiny")]
+    fn diagram_rows_never_exceed_the_width(width: u16) {
+        let lines = mermaid_render(FLOWCHART, width);
+        for row in diagram_rows(&lines) {
+            assert!(row.width() <= width as usize, "{:?} at {width}", row);
+        }
+    }
+
+    #[test]
+    fn a_clipped_diagram_is_marked_and_a_fitting_one_is_not() {
+        let narrow = diagram_rows(&mermaid_render(FLOWCHART, 8));
+        assert!(narrow.iter().all(|row| row.ends_with(DIAGRAM_MORE_RIGHT)));
+        let wide = diagram_rows(&mermaid_render(FLOWCHART, TEST_WIDTH));
+        assert!(wide.iter().all(|row| !row.ends_with(DIAGRAM_MORE_RIGHT)));
+    }
+
+    fn panned_rows(pan: u16, width: u16) -> Vec<String> {
+        diagram_rows(
+            &Renderer::new()
+                .with_mermaid(MermaidStyle::Unicode)
+                .with_diagram_pans(vec![pan])
+                .render(FLOWCHART, width, 0),
+        )
+    }
+
+    #[test]
+    fn panning_shifts_the_window_without_changing_the_row_count() {
+        let (start, panned) = (panned_rows(0, 8), panned_rows(3, 8));
+        assert_eq!(start.len(), panned.len(), "pan must not change height");
+        assert_ne!(start, panned, "pan must move the window");
+    }
+
+    #[test]
+    fn a_panned_diagram_is_marked_on_the_left() {
+        assert!(
+            panned_rows(0, 8)
+                .iter()
+                .all(|row| !row.starts_with(DIAGRAM_MORE_LEFT))
+        );
+        assert!(
+            panned_rows(3, 8)
+                .iter()
+                .all(|row| row.starts_with(DIAGRAM_MORE_LEFT))
+        );
+    }
+
+    #[test]
+    fn panning_to_the_limit_reveals_the_last_column() {
+        const WIDTH: u16 = 12;
+        let full = match mermaid_render(FLOWCHART, WIDTH)
+            .iter()
+            .find_map(|line| match line.kind {
+                LineKind::Diagram { full_width, .. } => Some(full_width),
+                _ => None,
+            }) {
+            Some(width) => width,
+            None => panic!("expected a diagram"),
+        };
+        let rows = panned_rows(diagram_max_pan(full, WIDTH), WIDTH);
+        assert!(
+            rows.iter().all(|row| !row.ends_with(DIAGRAM_MORE_RIGHT)),
+            "the far edge must be reachable: {rows:?}"
+        );
+        let unpanned = panned_rows(0, WIDTH);
+        let tail: String = unpanned.concat();
+        assert!(!tail.is_empty());
+    }
+
+    #[test]
+    fn a_pan_past_the_limit_clamps_instead_of_emptying_the_window() {
+        let rows = panned_rows(u16::MAX, 12);
+        assert!(rows.iter().any(|row| row.chars().count() > 1), "{rows:?}");
+    }
+
+    #[test]
+    fn copying_a_diagram_returns_the_mermaid_source() {
+        let lines = mermaid_render(FLOWCHART, TEST_WIDTH);
+        let ranges = lines
+            .iter()
+            .filter(|line| matches!(line.kind, LineKind::Diagram { .. }))
+            .filter_map(|line| line.source.clone());
+        let merged = merge_source_ranges(FLOWCHART, ranges);
+        assert_eq!(source_text(FLOWCHART, merged), FLOWCHART);
+    }
+
+    #[test]
+    fn every_drawn_span_is_atomic_so_partial_selections_stay_whole() {
+        let lines = mermaid_render(FLOWCHART, TEST_WIDTH);
+        for line in lines
+            .iter()
+            .filter(|line| matches!(line.kind, LineKind::Diagram { .. }))
+        {
+            for span in &line.spans {
+                match &span.source {
+                    SpanSource::Range(source) => assert!(!source.verbatim, "{span:?}"),
+                    SpanSource::Chrome => {}
+                    other => panic!("unexpected provenance {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_diagram_keeps_its_neighbours_highlighters_aligned() {
+        let text = format!("```rust\nfn a() {{}}\n```\n\n{FLOWCHART}\n\n```rust\nfn b() {{}}\n```");
+        let mut renderer = Renderer::new().with_mermaid(MermaidStyle::Unicode);
+        let first = renderer.render(&text, TEST_WIDTH, 0);
+        let second = renderer.render(&text, TEST_WIDTH, 0);
+        assert_eq!(lines_text(&first), lines_text(&second));
+        assert!(lines_text(&second).iter().any(|row| row.contains("fn b()")));
     }
 
     #[test]

@@ -740,6 +740,11 @@ impl<'t> EventLoop<'t> {
             maki_config::MathStyle::Raw => maki_markdown::render::MathStyle::Raw,
         }
         .set_global();
+        match ui_config.mermaid {
+            maki_config::MermaidStyle::Unicode => maki_markdown::render::MermaidStyle::Unicode,
+            maki_config::MermaidStyle::Off => maki_markdown::render::MermaidStyle::Off,
+        }
+        .set_global();
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {

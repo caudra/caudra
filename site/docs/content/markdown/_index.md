@@ -8,7 +8,7 @@ group = "Reference"
 # Markdown
 
 Maki renders model replies as markdown: headings, emphasis, lists, tables,
-code blocks with syntax highlighting, and maths.
+code blocks with syntax highlighting, maths, and mermaid flowcharts.
 
 ## Maths
 
@@ -74,6 +74,67 @@ reflowing the text around them.
 Maths inside a code block is code, and a code fence inside display maths is
 maths. Whichever opens first wins.
 
+## Diagrams
+
+A ```` ```mermaid ```` block holding a flowchart is laid out and drawn with
+box-drawing characters. Nothing is downloaded and no browser is involved, so
+diagrams appear at the same speed as the rest of the reply.
+
+````
+```mermaid
+flowchart LR
+  A[Parse] --> B{Ok?}
+  B -->|yes| C[Draw]
+  B -->|no| D[Code block]
+```
+````
+
+```
+                     yes ┌──────┐
+                    ┌───▶│ Draw │
+┌───────┐  ╭───────╮│ no └──────┘
+│ Parse ├─▶‹  Ok?  ›┴┐
+└───────┘  ╰───────╯ │
+                     │   ┌────────────┐
+                     └──▶│ Code block │
+                         └────────────┘
+```
+
+Only `flowchart` and `graph` are drawn. Both keywords accept `TD`, `TB`,
+`BT`, `LR`, and `RL`.
+
+| Syntax | Support |
+| --- | --- |
+| `A --> B`, `A --- B`, `A -.-> B`, `A ==> B` | arrows, open links, dotted, thick |
+| `A -->\|text\| B`, `A -- text --> B` | edge labels |
+| `A --> B --> C`, `A & B --> C & D` | chains and fan-out |
+| `[]`, `()`, `([])`, `[[]]`, `[()]`, `(())`, `{}`, `{{}}`, `>]` | node shapes |
+| `subgraph Name ... end` | one level, drawn as a dashed frame |
+| `<br/>` in a label | line break |
+| `%%`, `style`, `classDef`, `class`, `click`, `linkStyle` | accepted and skipped |
+
+A terminal cell cannot carry nine distinct outlines, so shapes collapse onto
+four frames: square corners, round corners, a doubled edge for subroutines,
+and `‹ ›` caps for decisions. Decisions are capped rather than drawn as a
+diamond because a diagonal glyph meets the corner of its cell while `─` runs
+through the middle, so the two never join.
+
+Anything outside that table leaves the block as a highlighted code fence.
+Sequence diagrams, class diagrams, pie charts, nested subgraphs, and self
+loops all fall back this way. A half-drawn diagram would be worse than the
+source, so Maki draws only what it fully understands, and it waits for the
+closing fence before laying anything out.
+
+A diagram wider than the transcript clips at the right edge and marks the cut
+with `›`.
+
+Set `ui.mermaid = "off"` to leave every mermaid block as code.
+
+```toml
+[ui]
+mermaid = "off"
+```
+
 ## Copying
 
 Selecting text and pressing `Alt+C` copies the markdown source, not the
@@ -83,7 +144,9 @@ back what the model wrote.
 
 Rendering is lossy in both directions, so some constructs copy whole. Select
 part of an equation, a table row, or a list marker and you get the entire
-construct, because half of `\frac{a}{b}` is not valid LaTeX. Emphasis,
-headings, and inline code copy at character precision.
+construct, because half of `\frac{a}{b}` is not valid LaTeX. Touching any cell
+of a drawn diagram copies the whole fenced block, fence lines included, since
+no part of the artwork maps back to a slice of the source. Emphasis, headings,
+and inline code copy at character precision.
 
 The role prefix is part of the interface and never reaches the clipboard.

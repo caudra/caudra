@@ -372,6 +372,7 @@ pub fn style_by_name(name: &str) -> Style {
         "bold_italic" => t.bold_italic,
         "inline_code" => t.inline_code,
         "math" => t.math,
+        "diagram" => t.diagram,
         "strikethrough" => t.strikethrough,
         "heading" => t.heading,
         "list_marker" => t.list_marker,
@@ -426,6 +427,7 @@ pub struct Theme {
     pub bold_italic: Style,
     pub inline_code: Style,
     pub math: Style,
+    pub diagram: Style,
     pub code_block: Style,
     pub code_gutter: Style,
     pub strikethrough: Style,
@@ -800,6 +802,11 @@ impl Theme {
             math: derived_style(
                 "math",
                 &["constant.numeric", "constant", "function"],
+                Modifier::empty(),
+            ),
+            diagram: derived_style(
+                "diagram",
+                &["comment", "variable.parameter", "string"],
                 Modifier::empty(),
             ),
             code_block: style("code_block"),

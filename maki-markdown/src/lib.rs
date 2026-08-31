@@ -10,6 +10,7 @@
 //! back without storing a second copy of the text.
 
 pub mod latex;
+pub mod mermaid;
 pub mod render;
 
 use std::ops::{Not, Range};
@@ -185,6 +186,10 @@ pub enum Block {
         source: Range<u32>,
         /// Absolute offset of the first byte of `code`.
         code_start: u32,
+        /// Whether the closing fence has arrived. Streaming shows a block
+        /// before it does, and anything that reshapes the content whole
+        /// (a diagram) has to wait for the real end.
+        closed: bool,
     },
     Table {
         rows: Vec<Vec<String>>,
@@ -227,6 +232,7 @@ pub fn parse_at(text: &str, base: usize) -> Vec<Block> {
                     code: fence.code.to_owned(),
                     source: range_at(base + fence.before_end, base + fence.block_end),
                     code_start: (base + fence.code_start) as u32,
+                    closed: fence.closed,
                 });
                 fence.block_end
             }
@@ -633,6 +639,7 @@ struct CodeFence<'a> {
     code: &'a str,
     code_start: usize,
     block_end: usize,
+    closed: bool,
 }
 
 fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
@@ -700,6 +707,7 @@ fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
             code,
             code_start,
             block_end,
+            closed: close.is_some(),
         });
     }
     None

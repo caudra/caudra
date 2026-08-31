@@ -3589,6 +3589,7 @@ dependencies = [
  "fastrand",
  "maki-highlight",
  "test-case",
+ "thiserror 2.0.18",
  "unicode-width",
 ]
 

@@ -73,6 +73,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `scrollbar` | bool | `true` | - | - | Show vertical scrollbar in scrollable areas |
 | `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off |
 | `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
+| `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |
 | `flash_duration_ms` | u64 | `1500` | - | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |

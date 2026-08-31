@@ -89,6 +89,7 @@ fn style_for_token(
             s
         }
         StyleToken::Math => apply_emphasis(t.math, emphasis, true, t),
+        StyleToken::Diagram => t.diagram,
         StyleToken::CodeBar => t.code_gutter,
         StyleToken::ListMarker => t.list_marker,
         StyleToken::TableBorder => t.table_border,

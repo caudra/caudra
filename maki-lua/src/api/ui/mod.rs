@@ -625,6 +625,7 @@ fn span_style_to_lua(lua: &Lua, span: &maki_markdown::render::Span) -> LuaResult
         }
         StyleToken::InlineCode => mlua::Value::String(lua.create_string("inline_code")?),
         StyleToken::Math => mlua::Value::String(lua.create_string("math")?),
+        StyleToken::Diagram => mlua::Value::String(lua.create_string("diagram")?),
         StyleToken::Highlight {
             fg,
             bold,
