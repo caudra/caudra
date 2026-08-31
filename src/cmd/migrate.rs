@@ -1,16 +1,23 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use maki_storage::input_history::MAX_ENTRIES;
 use maki_storage::paths;
+use maki_storage::sessions::{SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionDatabase};
+use maki_storage::{StateDir, lock_session_artifacts};
+use tempfile::NamedTempFile;
 
 #[cfg(unix)]
 const AUTH_FILE_MODE: u32 = 0o600;
+const TOOL_OUTPUT_DIR: &str = "tool-output";
+const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
+const RETAINED_SESSION_STATE: [&str; 3] = ["sessions", TOOL_OUTPUT_DIR, SESSION_SNAPSHOT_DIR];
 
 fn tilde(path: &Path) -> String {
     match paths::home() {
@@ -32,8 +39,12 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", tilde(parent)))?;
     }
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
+    match maki_storage::durable_rename(src, dst) {
+        Ok(()) => {
+            sync_parent(dst)?;
+            sync_parent(src)?;
+            Ok(())
+        }
         Err(e) if is_cross_device(&e) => {
             fs::copy(src, dst).with_context(|| format!("copy {} -> {}", tilde(src), tilde(dst)))?;
             #[cfg(unix)]
@@ -43,11 +54,33 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
                     .unwrap_or(0o644);
                 fs::set_permissions(dst, fs::Permissions::from_mode(mode)).ok();
             }
-            fs::remove_file(src).with_context(|| format!("remove source {}", tilde(src)))?;
+            fs::File::open(dst)?.sync_all()?;
+            sync_parent(dst)?;
+            remove_file_durable(src).with_context(|| format!("remove source {}", tilde(src)))?;
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("move {} -> {}", tilde(src), tilde(dst))),
     }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn remove_file_durable(path: &Path) -> Result<()> {
+    fs::remove_file(path)?;
+    sync_parent(path)
+}
+
+fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    maki_storage::atomic_write(path, data)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -80,7 +113,8 @@ fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(target_dir).with_context(|| format!("create {}", tilde(target_dir)))?;
+    create_directory_tree_durable(target_dir)
+        .with_context(|| format!("create {}", tilde(target_dir)))?;
 
     let count = entries.len();
     for entry in &entries {
@@ -90,7 +124,9 @@ fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {
         }
         move_file(&entry.path(), &dst)?;
         #[cfg(unix)]
-        fs::set_permissions(&dst, fs::Permissions::from_mode(AUTH_FILE_MODE)).ok();
+        if fs::set_permissions(&dst, fs::Permissions::from_mode(AUTH_FILE_MODE)).is_ok() {
+            fs::File::open(&dst)?.sync_all()?;
+        }
     }
     fs::remove_dir(legacy_dir).ok();
 
@@ -119,9 +155,9 @@ fn merge_json_file(legacy: &Path, target: &Path, name: &str) -> Result<()> {
         serde_json::from_slice(&legacy_bytes).unwrap_or_default();
     merged.extend(legacy_map);
 
-    fs::write(target, serde_json::to_vec_pretty(&merged)?)
+    write_file_atomically(target, &serde_json::to_vec_pretty(&merged)?)
         .with_context(|| format!("write {}", tilde(target)))?;
-    fs::remove_file(legacy)?;
+    remove_file_durable(legacy)?;
     log_move(name, target.parent().unwrap_or(target), Some("merged"));
     Ok(())
 }
@@ -151,9 +187,9 @@ fn merge_input_history(legacy: &Path, target: &Path) -> Result<()> {
     merged.dedup();
     merged.truncate(MAX_ENTRIES);
 
-    fs::write(target, serde_json::to_vec(&merged)?)
+    write_file_atomically(target, &serde_json::to_vec(&merged)?)
         .with_context(|| format!("write {}", tilde(target)))?;
-    fs::remove_file(legacy)?;
+    remove_file_durable(legacy)?;
     log_move(
         "input_history.json",
         target.parent().unwrap_or(target),
@@ -168,7 +204,7 @@ fn merge_dir(legacy: &Path, target: &Path, subdir: &str, recursive: bool) -> Res
     if !src.is_dir() {
         return Ok((0, 0));
     }
-    fs::create_dir_all(&dst).with_context(|| format!("create {}", tilde(&dst)))?;
+    create_directory_tree_durable(&dst).with_context(|| format!("create {}", tilde(&dst)))?;
 
     let mut moved = 0u32;
     let mut skipped = 0u32;
@@ -206,6 +242,170 @@ fn merge_dir(legacy: &Path, target: &Path, subdir: &str, recursive: bool) -> Res
     Ok((moved, skipped))
 }
 
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+    loop {
+        let left_count = left.read(&mut left_buffer)?;
+        let right_count = right.read(&mut right_buffer)?;
+        if left_count != right_count || left_buffer[..left_count] != right_buffer[..right_count] {
+            return Ok(false);
+        }
+        if left_count == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn copy_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    let mut source_options = fs::OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options.open(source)?;
+    std::io::copy(&mut source_file, &mut temporary)?;
+    temporary.flush()?;
+    #[cfg(unix)]
+    fs::set_permissions(temporary.path(), fs::metadata(source)?.permissions())?;
+    temporary.as_file().sync_all()?;
+    #[cfg(windows)]
+    {
+        let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
+        drop(file);
+        if let Err(error) = maki_storage::durable_rename_noreplace(&temporary_path, destination) {
+            let _ = fs::remove_file(temporary_path);
+            return Err(error.into());
+        }
+    }
+    #[cfg(not(windows))]
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn create_directory_tree_durable(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(color_eyre::eyre::eyre!(
+                "{} is not a real directory",
+                tilde(path)
+            ));
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent != path {
+        create_directory_tree_durable(parent)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "{} is not a real directory",
+            tilde(path)
+        ));
+    }
+    Ok(())
+}
+
+fn copy_session_state(legacy: &Path, target: &Path, subdir: &Path) -> Result<(u32, u32)> {
+    let src = legacy.join(subdir);
+    let dst = target.join(subdir);
+    let source_metadata = match fs::symlink_metadata(&src) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error.into()),
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "session state source {} is not a real directory",
+            tilde(&src)
+        ));
+    }
+    if !target.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "session state target root {} is not a directory",
+            tilde(target)
+        ));
+    }
+    if fs::symlink_metadata(target)?.file_type().is_symlink() {
+        return Err(color_eyre::eyre::eyre!(
+            "session state target root {} cannot be a symlink",
+            tilde(target)
+        ));
+    }
+    if subdir.as_os_str().is_empty() {
+        return Ok((0, 0));
+    }
+    create_directory_tree_durable(&dst).with_context(|| format!("create {}", tilde(&dst)))?;
+    let mut copied = 0;
+    let mut skipped = 0;
+    for entry in fs::read_dir(&src).with_context(|| format!("read {}", tilde(&src)))? {
+        let entry = entry?;
+        let relative = subdir.join(entry.file_name());
+        let destination = target.join(&relative);
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(color_eyre::eyre::eyre!(
+                "session state source {} is a symlink",
+                tilde(&entry.path())
+            ));
+        }
+        if file_type.is_dir() {
+            let (nested_copied, nested_skipped) = copy_session_state(legacy, target, &relative)?;
+            copied += nested_copied;
+            skipped += nested_skipped;
+        } else if !file_type.is_file() {
+            return Err(color_eyre::eyre::eyre!(
+                "session state source {} is not a regular file",
+                tilde(&entry.path())
+            ));
+        } else if destination.exists() {
+            let metadata = fs::symlink_metadata(&destination)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(color_eyre::eyre::eyre!(
+                    "session state target {} is not a regular file",
+                    tilde(&destination)
+                ));
+            }
+            if files_equal(&entry.path(), &destination)? {
+                skipped += 1;
+            } else {
+                return Err(color_eyre::eyre::eyre!(
+                    "session rollback source {} conflicts with {}",
+                    tilde(&entry.path()),
+                    tilde(&destination)
+                ));
+            }
+        } else {
+            copy_file_atomically(&entry.path(), &destination).with_context(|| {
+                format!("copy {} -> {}", tilde(&entry.path()), tilde(&destination))
+            })?;
+            copied += 1;
+        }
+    }
+    Ok((copied, skipped))
+}
+
 fn move_logs(legacy: &Path, logs_dir: &Path) -> Result<()> {
     let entries: Vec<_> = fs::read_dir(legacy)
         .with_context(|| format!("read {}", tilde(legacy)))?
@@ -221,7 +421,8 @@ fn move_logs(legacy: &Path, logs_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(logs_dir).with_context(|| format!("create {}", tilde(logs_dir)))?;
+    create_directory_tree_durable(logs_dir)
+        .with_context(|| format!("create {}", tilde(logs_dir)))?;
 
     for entry in &entries {
         let dst = logs_dir.join(entry.file_name());
@@ -242,6 +443,15 @@ fn list_remaining(dir: &Path) -> Vec<String> {
     };
     entries
         .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            name != SESSIONS_DB_LOCK_FILE
+                && name != paths::XDG_MIGRATED_MARKER
+                && !RETAINED_SESSION_STATE
+                    .iter()
+                    .any(|retained| name == *retained)
+                && !name.to_string_lossy().starts_with(SESSIONS_DB_FILE)
+        })
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
 }
@@ -255,14 +465,43 @@ pub fn xdg() -> Result<()> {
     let xdg = paths::xdg_paths().context("determine XDG directories")?;
 
     for dir in [&xdg.state, &xdg.config, &xdg.logs] {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", tilde(dir)))?;
+        create_directory_tree_durable(dir).with_context(|| format!("create {}", tilde(dir)))?;
     }
 
     println!("Moving files from ~/.maki/ ...\n");
 
+    let legacy_state = StateDir::from_path(legacy.clone());
+    let target_state = StateDir::from_path(xdg.state.clone());
+    let session_migration = SessionDatabase::migrate(&legacy_state, &target_state)?;
+    // Database and external-artifact locks share one cutover lifetime. Once
+    // acquired, every copied file belongs to the same quiescent source state.
+    let _legacy_artifacts = lock_session_artifacts(&legacy_state)?;
+    let _target_artifacts = lock_session_artifacts(&target_state)?;
+    if session_migration.copied_database() {
+        log_move(
+            SESSIONS_DB_FILE,
+            &xdg.state,
+            Some("consistent SQLite backup"),
+        );
+    }
+
     move_auth(&legacy.join("auth"), &xdg.state.join("auth"))?;
 
-    merge_dir(&legacy, &xdg.state, "sessions", false)?;
+    // Database references, legacy rows, managed outputs, and restore snapshots
+    // must cross the cutover together. Copies retain one coherent rollback set
+    // under ~/.maki while the marker makes the XDG copy canonical.
+    for subdir in RETAINED_SESSION_STATE {
+        let (copied, skipped) = copy_session_state(&legacy, &xdg.state, Path::new(subdir))?;
+        if copied > 0 || skipped > 0 {
+            log_move(
+                &format!("{subdir}/"),
+                &xdg.state.join(subdir),
+                Some(&format!(
+                    "{copied} files copied, {skipped} skipped; rollback retained"
+                )),
+            );
+        }
+    }
     merge_dir(&legacy, &xdg.state, "plans", false)?;
     merge_dir(&legacy, &xdg.state, "projects", true)?;
     merge_dir(&legacy, &xdg.config, "providers", false)?;
@@ -311,20 +550,25 @@ pub fn xdg() -> Result<()> {
     let has_leftovers = !remaining.is_empty();
     let backup = legacy.with_file_name(".maki.bak");
     if has_leftovers {
-        fs::create_dir_all(&backup).context("create ~/.maki.bak/")?;
+        create_directory_tree_durable(&backup).context("create ~/.maki.bak/")?;
         for name in &remaining {
             let src = legacy.join(name);
             let dst = backup.join(name);
             if dst.exists() {
                 println!("  {name} (skipped, already in ~/.maki.bak/)");
-            } else if let Err(e) = fs::rename(&src, &dst) {
+            } else if let Err(e) = move_file(&src, &dst) {
                 eprintln!("  warning: could not move {name} to ~/.maki.bak/: {e}");
             }
         }
     }
 
-    if legacy.is_dir() {
-        fs::remove_dir_all(&legacy).context("remove ~/.maki/")?;
+    session_migration.finish()?;
+    let unresolved = list_remaining(&legacy);
+    if !unresolved.is_empty() {
+        eprintln!(
+            "  warning: kept ~/.maki/ because these entries could not be moved: {}",
+            unresolved.join(", ")
+        );
     }
 
     println!(
@@ -335,10 +579,15 @@ pub fn xdg() -> Result<()> {
          \x20          sessions, auth, plans, memories, input history, preferences\n\n\
          \x20 Logs     {}\n\n\
          Per-project settings (.maki/ in your repos) are not affected.\n\n\
-         Removed ~/.maki/.",
+         {} ~/.maki/.",
         tilde(&xdg.config),
         tilde(&xdg.state),
         tilde(&xdg.logs),
+        if unresolved.is_empty() {
+            "Retired"
+        } else {
+            "Kept"
+        },
     );
 
     if has_leftovers {
@@ -358,4 +607,107 @@ pub fn xdg() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaining_files_exclude_retained_session_rollback_state() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            SESSIONS_DB_FILE,
+            "sessions.sqlite3-wal",
+            SESSIONS_DB_LOCK_FILE,
+            paths::XDG_MIGRATED_MARKER,
+            "unrecognized",
+        ] {
+            fs::write(temp.path().join(name), b"data").unwrap();
+        }
+        fs::create_dir(temp.path().join("sessions")).unwrap();
+
+        assert_eq!(list_remaining(temp.path()), ["unrecognized"]);
+    }
+
+    #[test]
+    fn session_state_copy_is_atomic_and_rejects_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        let target = temp.path().join("target");
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(legacy.join("sessions/session.jsonl"), b"complete").unwrap();
+
+        assert_eq!(
+            copy_session_state(&legacy, &target, Path::new("sessions")).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            fs::read(target.join("sessions/session.jsonl")).unwrap(),
+            b"complete"
+        );
+        fs::write(target.join("sessions/session.jsonl"), b"partial").unwrap();
+        assert!(copy_session_state(&legacy, &target, Path::new("sessions")).is_err());
+        assert!(legacy.join("sessions/session.jsonl").exists());
+    }
+
+    #[test]
+    fn retained_session_state_includes_outputs_and_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        for subdir in RETAINED_SESSION_STATE {
+            fs::create_dir_all(legacy.join(subdir)).unwrap();
+            fs::write(legacy.join(subdir).join("state"), subdir).unwrap();
+            copy_session_state(&legacy, &target, Path::new(subdir)).unwrap();
+            assert_eq!(
+                fs::read_to_string(target.join(subdir).join("state")).unwrap(),
+                subdir
+            );
+            assert!(legacy.join(subdir).join("state").exists());
+        }
+        assert!(list_remaining(&legacy).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_state_copy_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        let target = temp.path().join("target");
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(temp.path().join("outside"), b"outside").unwrap();
+        symlink(
+            temp.path().join("outside"),
+            legacy.join("sessions/session.jsonl"),
+        )
+        .unwrap();
+
+        assert!(copy_session_state(&legacy, &target, Path::new("sessions")).is_err());
+        assert!(!target.join("sessions/session.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_state_copy_rejects_symlinked_target_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        let target = temp.path().join("target");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(legacy.join("sessions/session.jsonl"), b"session").unwrap();
+        symlink(&outside, target.join("sessions")).unwrap();
+
+        assert!(copy_session_state(&legacy, &target, Path::new("sessions")).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
 }

@@ -63,6 +63,10 @@ impl History {
         &self.snapshot.messages
     }
 
+    pub fn snapshot(&self) -> &HistorySnapshot {
+        &self.snapshot
+    }
+
     pub fn item_head(&self) -> Option<MakiId> {
         self.active_items().last().map(|item| item.id)
     }

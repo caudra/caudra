@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ignore::WalkBuilder;
 use maki_storage::id::MakiId;
+use maki_storage::{SessionArtifactLock, StateDir, lock_session_artifacts};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -291,11 +292,18 @@ pub struct SnapshotStore {
     dir: PathBuf,
     cap_bytes: u64,
     hasher: Arc<dyn ContentHasher>,
+    artifact_state: Option<StateDir>,
 }
 
 impl SnapshotStore {
     pub fn new(snapshots_dir: PathBuf) -> Self {
         Self::with_cap(snapshots_dir, DEFAULT_SNAPSHOT_CAP_BYTES)
+    }
+
+    pub fn new_managed(state_dir: StateDir, snapshots_dir: PathBuf) -> Self {
+        let mut store = Self::new(snapshots_dir);
+        store.artifact_state = Some(state_dir);
+        store
     }
 
     pub fn with_cap(snapshots_dir: PathBuf, cap_bytes: u64) -> Self {
@@ -307,10 +315,20 @@ impl SnapshotStore {
             dir: snapshots_dir,
             cap_bytes,
             hasher,
+            artifact_state: None,
         }
     }
 
+    fn lock_artifacts(&self) -> Result<Option<SessionArtifactLock>, SnapshotError> {
+        self.artifact_state
+            .as_ref()
+            .map(lock_session_artifacts)
+            .transpose()
+            .map_err(|error| io::Error::other(error).into())
+    }
+
     pub fn snapshot_session_start(&self, cwd: &Path) -> Result<Manifest, SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         if self.has_session_start() {
@@ -321,6 +339,7 @@ impl SnapshotStore {
     }
 
     pub fn snapshot(&self, cwd: &Path, checkpoint: MakiId) -> Result<Manifest, SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         let path = self.manifest_path(SnapshotKey::Checkpoint(checkpoint));
@@ -461,6 +480,7 @@ impl SnapshotStore {
         policy: ConflictPolicy,
         operation_id: Option<MakiId>,
     ) -> Result<RestoreReport, SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         if let Some(report) = self.finish_matching_pending(&root, true, operation_id)? {
@@ -528,6 +548,7 @@ impl SnapshotStore {
         policy: ConflictPolicy,
         operation_id: Option<MakiId>,
     ) -> Result<RestoreReport, SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         if let Some(report) = self.finish_matching_pending(&root, true, operation_id)? {
@@ -576,6 +597,7 @@ impl SnapshotStore {
     }
 
     pub fn recover(&self, cwd: &Path) -> Result<Option<RestoreReport>, SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         self.finish_pending(&root, true)
@@ -602,6 +624,7 @@ impl SnapshotStore {
         cwd: &Path,
         operation_id: MakiId,
     ) -> Result<(), SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let root = self.bind_root(cwd)?;
         let journal = match self.read_journal() {
@@ -642,6 +665,7 @@ impl SnapshotStore {
         destination: &SnapshotStore,
         checkpoints: &[MakiId],
     ) -> Result<(), SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         let mut manifests = Vec::new();
         if self.has_session_start() {
@@ -710,14 +734,20 @@ impl SnapshotStore {
     }
 
     pub fn enforce_cap(&self) -> Result<(), SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
         self.ensure_dirs()?;
         self.enforce_cap_preserving(None)
     }
 
     fn ensure_dirs(&self) -> Result<(), SnapshotError> {
-        fs::create_dir_all(&self.dir)?;
-        fs::create_dir_all(self.objects_dir())?;
+        if let Some(state_dir) = &self.artifact_state {
+            create_managed_directory(state_dir, &self.dir)?;
+            create_managed_directory(state_dir, &self.objects_dir())?;
+        } else {
+            fs::create_dir_all(&self.dir)?;
+            fs::create_dir_all(self.objects_dir())?;
+        }
         Ok(())
     }
 
@@ -1300,7 +1330,11 @@ impl SnapshotStore {
     /// the set of live objects, so a delete racing that read lets the sweep
     /// collect objects only the unrevert still needs.
     pub fn discard_unrevert(&self) -> Result<(), SnapshotError> {
+        let _artifact_lock = self.lock_artifacts()?;
         let _guard = lock_store()?;
+        if self.dir.try_exists()? {
+            self.ensure_dirs()?;
+        }
         self.remove_unrevert()
     }
 
@@ -1635,6 +1669,50 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), SnapshotError> 
 
 fn lock_store() -> Result<MutexGuard<'static, ()>, SnapshotError> {
     STORE_LOCK.lock().map_err(|_| SnapshotError::LockPoisoned)
+}
+
+fn create_managed_directory(state_dir: &StateDir, target: &Path) -> Result<(), SnapshotError> {
+    let relative = target.strip_prefix(state_dir.path()).map_err(|_| {
+        SnapshotError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed snapshot path is outside the state directory",
+        ))
+    })?;
+    let mut path = state_dir.path().to_path_buf();
+    validate_or_create_directory(&path, false)?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed snapshot path is not normalized",
+            )));
+        };
+        path.push(component);
+        validate_or_create_directory(&path, true)?;
+    }
+    Ok(())
+}
+
+fn validate_or_create_directory(path: &Path, create: bool) -> Result<(), SnapshotError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            fs::create_dir(path)?;
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            fs::symlink_metadata(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("snapshot path {} is not a real directory", path.display()),
+        )));
+    }
+    Ok(())
 }
 
 fn remove_file_durable(path: &Path) -> Result<(), SnapshotError> {
@@ -2231,6 +2309,33 @@ mod tests {
             workspace_key(&root).unwrap(),
             workspace_key(&other).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_store_rejects_symlinked_snapshot_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let outside = temp.path().join("outside");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(state_dir.path()).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        symlink(&outside, state_dir.path().join(SESSION_SNAPSHOTS_DIR)).unwrap();
+        let session_id = MakiId::generate();
+        let store = SnapshotStore::new_managed(
+            state_dir.clone(),
+            state_dir
+                .path()
+                .join(SESSION_SNAPSHOTS_DIR)
+                .join(session_id.to_string())
+                .join("workspace-key"),
+        );
+
+        assert!(store.snapshot(&workspace, MakiId::generate()).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]

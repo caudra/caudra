@@ -45,6 +45,10 @@ impl MakiId {
     pub fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
     }
+
+    pub fn from_bytes(bytes: [u8; UUID_BYTES]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for MakiId {

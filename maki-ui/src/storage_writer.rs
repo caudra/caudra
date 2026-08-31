@@ -1,11 +1,13 @@
-//! Coalescing write-behind cache with incremental JSONL persistence.
+//! Coalescing write-behind cache with transactional SQLite persistence.
 //!
 //! Apps post session snapshots keyed by session id; the writer thread drains
-//! the newest snapshot of every session per wake and performs O(delta)
-//! appends. Deletes travel through the same per-session slot as saves, so
+//! the newest snapshot of every session per wake and performs suffix writes
+//! when cursor classification proves the collections are append-only. Deletes
+//! travel through the same per-session slot as saves, so
 //! whichever the app asked for last is what reaches disk.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::mem;
@@ -13,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SESSIONS_DIR, SessionError, SessionLog};
+#[cfg(test)]
+use maki_storage::sessions::SESSIONS_DB_FILE;
+use maki_storage::sessions::{SessionCursor, SessionDatabase, SessionError};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -21,6 +25,10 @@ use crate::AppSession;
 
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
+const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
+const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
+const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
+const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 
 type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
 
@@ -47,7 +55,7 @@ impl StorageWriter {
     pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
-        let (wake, wake_rx) = flume::unbounded::<()>();
+        let (wake, wake_rx) = flume::bounded::<()>(1);
         let (done_tx, done_rx) = flume::bounded::<()>(1);
 
         std::thread::Builder::new()
@@ -56,13 +64,24 @@ impl StorageWriter {
                 let mut writer = Writer {
                     dir,
                     warn_tx,
-                    logs: HashMap::new(),
+                    database: None,
+                    cursors: HashMap::new(),
+                    deleted_versions: HashMap::new(),
                     failing: HashSet::new(),
+                    size_warning_level: 0,
+                    wal_warning_active: false,
+                    commits_since_checkpoint: 0,
+                    checkpoint_stalls: 0,
                 };
                 while wake_rx.recv().is_ok() {
                     writer.flush(&writer_pending);
                 }
                 writer.flush(&writer_pending);
+                if let Some(database) = &writer.database
+                    && let Err(error) = database.checkpoint(false)
+                {
+                    warn!(%error, "session database checkpoint failed during shutdown");
+                }
                 let _ = done_tx.send(());
             })
             .expect("failed to spawn storage writer thread");
@@ -85,9 +104,9 @@ impl StorageWriter {
         done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
     }
 
-    /// Delete a session's files on the writer thread; `done` fires there, so
-    /// callers never block on disk. Deleting a session that was never written
-    /// reports success, and a save enqueued afterwards supersedes the delete.
+    /// Queue deletion on the writer thread; `done` fires after the canonical
+    /// row is gone and external cleanup is durably queued. Deleting a session
+    /// that was never written reports success, and a later save supersedes it.
     pub fn delete(&self, id: MakiId, done: impl FnOnce(Result<(), SessionError>) + Send + 'static) {
         self.enqueue(id, Entry::Delete(Box::new(done)));
     }
@@ -97,10 +116,16 @@ impl StorageWriter {
         if let Some(superseded) = superseded {
             resolve_entry(superseded, Err(superseded_error(id)));
         }
-        if self.wake.send(()).is_err()
-            && let Some(entry) = lock(&self.pending).remove(&id)
-        {
-            resolve_entry(entry, Err(writer_gone()));
+        // One token is enough because a wake drains the whole coalesced map.
+        // Keeping this bounded prevents a stalled disk from accumulating a
+        // second unbounded queue beside the snapshots.
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => {}
+            Err(flume::TrySendError::Disconnected(())) => {
+                if let Some(entry) = lock(&self.pending).remove(&id) {
+                    resolve_entry(entry, Err(writer_gone()));
+                }
+            }
         }
     }
 
@@ -142,16 +167,23 @@ fn resolve_entry(entry: Entry, result: Result<(), SessionError>) {
 struct Writer {
     dir: StateDir,
     warn_tx: flume::Sender<String>,
-    /// Only cursors that still describe their file.
-    logs: HashMap<MakiId, SessionLog>,
+    database: Option<SessionDatabase>,
+    cursors: HashMap<MakiId, SessionCursor>,
+    /// Explicit recreation capability retained only by the writer that
+    /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
+    deleted_versions: HashMap<MakiId, i64>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     failing: HashSet<MakiId>,
+    size_warning_level: u32,
+    wal_warning_active: bool,
+    commits_since_checkpoint: u32,
+    checkpoint_stalls: u32,
 }
 
 impl Writer {
     fn forget(&mut self, id: MakiId) {
-        self.logs.remove(&id);
+        self.cursors.remove(&id);
         self.failing.remove(&id);
     }
 
@@ -163,7 +195,7 @@ impl Writer {
             match entry {
                 Entry::Save(session) => {
                     let result = self.write(&session);
-                    if result.is_err() {
+                    if result.as_ref().is_err_and(retryable) {
                         // `checkpoint` never resends an unchanged revision, so
                         // a dropped snapshot would miss disk for good.
                         // `or_insert` lets a newer op win; the shutdown flush
@@ -178,47 +210,71 @@ impl Writer {
                     let _ = done.send(result);
                 }
                 Entry::Delete(done) => {
-                    self.forget(id);
-                    let session_result = match AppSession::delete(id, &self.dir) {
-                        Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
-                        result => result,
-                    };
-                    let snapshots = self
-                        .dir
-                        .path()
-                        .join(maki_agent::snapshots::SESSION_SNAPSHOTS_DIR)
-                        .join(id.to_string());
-                    let snapshot_result = match fs::remove_dir_all(snapshots) {
-                        Ok(()) => Ok(()),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                        Err(error) => Err(SessionError::Storage(error.into())),
-                    };
-                    done(session_result.and(snapshot_result));
+                    let (session_result, deleted_version) = self.delete(id);
+                    if session_result.is_ok() {
+                        self.forget(id);
+                        if let Some(deleted_version) = deleted_version {
+                            self.deleted_versions.insert(id, deleted_version);
+                        }
+                        self.checkpoint(true);
+                    }
+                    done(session_result);
                 }
             }
         }
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
-        let sessions_dir = self.dir.ensure_subdir(SESSIONS_DIR)?;
-        if let Some(mut log) = self.logs.remove(&session.id) {
-            // A failed `append` rolls the file back to the last record boundary,
-            // so the cursor still fits and is worth keeping: rebuilding it costs
-            // a second full write, the last thing a failing disk needs.
-            // Divergence is the one answer a cursor cannot survive.
-            let appended = log.append(session);
-            if !matches!(appended, Err(SessionError::LogDiverged { .. })) {
-                self.logs.insert(session.id, log);
-                return appended;
+        if self.database.is_none() {
+            self.database = Some(SessionDatabase::open(&self.dir)?);
+        }
+        let database = self.database.as_mut().expect("database initialized");
+        if let Some(cursor) = self.cursors.get(&session.id)
+            && cursor.shares_lineage(session)
+            && session
+                .persisted_write_version()
+                .is_none_or(|base| base < cursor.write_version())
+        {
+            // This queue is the serialization proof: a snapshot enqueued while
+            // its predecessor was committing is causally newer, so it may adopt
+            // that commit before the repository checks its frozen base.
+            session.adopt_persisted_write_version(cursor.write_version());
+        }
+        let saved = if let Some(&deleted_version) = self.deleted_versions.get(&session.id) {
+            database.recreate(session, deleted_version)?
+        } else {
+            // Borrow rather than remove: a retryable failure must retain the
+            // latest committed cursor instead of falling back to a stale full write.
+            database.save(session, self.cursors.get(&session.id))?
+        };
+        self.deleted_versions.remove(&session.id);
+        self.cursors.insert(session.id, saved);
+        self.commits_since_checkpoint = self.commits_since_checkpoint.saturating_add(1);
+        self.checkpoint(false);
+        self.report_storage_growth();
+        Ok(())
+    }
+
+    fn delete(&mut self, id: MakiId) -> (Result<(), SessionError>, Option<i64>) {
+        if self.database.is_none() {
+            match SessionDatabase::open(&self.dir) {
+                Ok(database) => self.database = Some(database),
+                Err(error) => return (Err(error), None),
             }
         }
-        // No usable cursor, whether because this thread never wrote the file
-        // or because the log diverged, so the file starts over. Reading the
-        // old file back gains nothing: a cursor recovered from disk describes
-        // the session that was stored, never the live one.
-        self.logs
-            .insert(session.id, SessionLog::rewrite(&sessions_dir, session)?);
-        Ok(())
+        let database = self.database.as_mut().expect("database initialized");
+        let expected = match self.cursors.get(&id).map(SessionCursor::write_version) {
+            Some(version) => Some(version),
+            None => match database.write_version(id) {
+                Ok(version) => version,
+                Err(error) => return (Err(error), None),
+            },
+        };
+        match AppSession::delete_for_recreation(id, &self.dir, expected) {
+            Ok(version) => (Ok(()), Some(version)),
+            Err(SessionError::Storage(StorageError::NotFound(_))) => (Ok(()), None),
+            Err(error) => (Err(error), None),
+        }
     }
 
     fn report(&mut self, id: MakiId, result: &Result<(), impl std::fmt::Display>) {
@@ -236,6 +292,85 @@ impl Writer {
             }
         }
     }
+
+    fn checkpoint(&mut self, force: bool) {
+        if !force && self.commits_since_checkpoint < CHECKPOINT_COMMIT_INTERVAL {
+            return;
+        }
+        self.commits_since_checkpoint = 0;
+        let Some(database) = &self.database else {
+            return;
+        };
+        match database.checkpoint(false) {
+            Ok(result) => {
+                tracing::debug!(
+                    busy = result.busy,
+                    log_frames = result.log_frames,
+                    checkpointed_frames = result.checkpointed_frames,
+                    "session database passive checkpoint"
+                );
+                let stalled =
+                    result.busy > 0 || (result.log_frames > 0 && result.checkpointed_frames == 0);
+                if stalled {
+                    self.checkpoint_stalls = self.checkpoint_stalls.saturating_add(1);
+                    if self.checkpoint_stalls == CHECKPOINT_STALL_WARNING_COUNT {
+                        let _ = self.warn_tx.send(format!(
+                            "Session WAL checkpoint made no progress ({} frames remain)",
+                            result.log_frames
+                        ));
+                    }
+                } else {
+                    self.checkpoint_stalls = 0;
+                }
+            }
+            Err(error) => warn!(%error, "session database passive checkpoint failed"),
+        }
+    }
+
+    fn report_storage_growth(&mut self) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        let Ok(stats) = database.stats() else {
+            return;
+        };
+        let total = stats.database_bytes.saturating_add(stats.wal_bytes);
+        let threshold = STORAGE_WARNING_BYTES
+            .checked_shl(self.size_warning_level)
+            .unwrap_or(u64::MAX);
+        if total >= threshold {
+            let _ = self.warn_tx.send(format!(
+                "Session storage is {} MiB (database plus WAL)",
+                total / (1024 * 1024)
+            ));
+            self.size_warning_level = self.size_warning_level.saturating_add(1);
+        }
+        if stats.wal_bytes >= WAL_WARNING_BYTES && !self.wal_warning_active {
+            let _ = self.warn_tx.send(format!(
+                "Session WAL is {} MiB; a reader may be blocking checkpoints",
+                stats.wal_bytes / (1024 * 1024)
+            ));
+            self.wal_warning_active = true;
+        } else if stats.wal_bytes < WAL_WARNING_BYTES / 2 {
+            self.wal_warning_active = false;
+        }
+    }
+}
+
+fn retryable(error: &SessionError) -> bool {
+    !matches!(
+        error,
+        SessionError::AlreadyExists { .. }
+            | SessionError::ConcurrentSessionWriter { .. }
+            | SessionError::UnsupportedSchemaVersion { .. }
+            | SessionError::CorruptDatabaseValue { .. }
+            | SessionError::LimitExceeded { .. }
+            | SessionError::LoadBudgetExceeded { .. }
+            | SessionError::LegacySourceChanged { .. }
+            | SessionError::VersionMismatch { .. }
+            | SessionError::CorruptHeaderId { .. }
+            | SessionError::IdMismatch { .. }
+    )
 }
 
 #[cfg(test)]
@@ -279,10 +414,8 @@ mod tests {
         maki_providers::Message::user(msg_text(n))
     }
 
-    /// A plain file where the sessions dir should be. `create_dir_all` cannot
-    /// turn that into a directory, so every flush fails until it is removed.
-    fn block_sessions_dir(dir: &StateDir) {
-        std::fs::write(dir.path().join(SESSIONS_DIR), "").unwrap();
+    fn block_session_database(dir: &StateDir) {
+        std::fs::create_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
     }
 
     /// Snapshots must coalesce per session id, not into one `latest` slot:
@@ -425,10 +558,9 @@ mod tests {
         assert!(matches!(lock(&pending).get(&id), Some(Entry::Save(_))));
     }
 
-    /// A fresh writer over an existing file has no cursor, so it re-opens the
-    /// log and gets cursors for the loaded session, not the live one. The first
-    /// append must diverge into a full rewrite instead of landing on stale
-    /// offsets.
+    /// A fresh writer has no in-memory cursor for this live snapshot. Its first
+    /// save must use persisted version state and replace a diverged collection,
+    /// never infer a suffix from an unrelated cursor.
     #[test]
     fn reopened_log_rewrites_diverged_file_instead_of_appending() {
         let (_tmp, dir) = state_dir();
@@ -474,7 +606,7 @@ mod tests {
     #[test]
     fn failing_flush_warns_once_and_reports_recovery() {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
+        block_session_database(&dir);
         let (writer, warn_rx) = writer(&dir);
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
@@ -493,7 +625,7 @@ mod tests {
         assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
         assert!(warn_rx.is_empty(), "second failure warned again");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        std::fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
         writer.send(session);
         let recovered = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert_eq!(recovered, SAVE_RECOVERED);
@@ -522,7 +654,12 @@ mod tests {
         writer.send(Arc::new(session));
         writer.shutdown(DRAIN_TIMEOUT);
 
-        let loaded = AppSession::load(id, &dir).unwrap();
+        let loaded = AppSession::load(id, &dir).unwrap_or_else(|error| {
+            panic!(
+                "recreated session missing: {error}; warnings: {:?}",
+                warn_rx.try_iter().collect::<Vec<_>>()
+            )
+        });
         assert_eq!(
             message_texts(&loaded),
             [msg_text(0), RESUMED_MSG.to_string()]
@@ -536,7 +673,7 @@ mod tests {
     #[test]
     fn failed_write_is_retried_by_a_later_flush() {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
+        block_session_database(&dir);
         let (writer, warn_rx) = writer(&dir);
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
@@ -545,17 +682,111 @@ mod tests {
         let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        std::fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
         writer.shutdown(DRAIN_TIMEOUT);
 
         assert!(AppSession::load(id, &dir).is_ok());
         assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);
     }
 
-    /// After a delete the cursor still holds an open handle to the unlinked
-    /// file, which still looks unchanged, so an append would write the session
-    /// into nothing. Forgetting the cursor makes the next snapshot write a
-    /// whole file.
+    #[test]
+    fn failed_write_keeps_its_cursor_for_retry() {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            database: None,
+            cursors: HashMap::new(),
+            deleted_versions: HashMap::new(),
+            failing: HashSet::new(),
+            size_warning_level: 0,
+            wal_warning_active: false,
+            commits_since_checkpoint: 0,
+            checkpoint_stalls: 0,
+        };
+        let mut stale = AppSession::new(MODEL, CWD);
+        let id = stale.id;
+        writer.write(&stale).unwrap();
+        let mut external = AppSession::load(id, &dir).unwrap();
+        external.set_title("external".into());
+        external.save(&dir).unwrap();
+        stale.set_title("stale".into());
+
+        let error = writer.write(&stale).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::ConcurrentSessionWriter { .. }
+        ));
+        assert_eq!(writer.cursors[&id].write_version(), 0);
+    }
+
+    #[test]
+    fn queued_resumed_snapshot_adopts_the_writers_own_commit() {
+        let (_tmp, dir) = state_dir();
+        let mut stored = AppSession::new(MODEL, CWD);
+        stored.save(&dir).unwrap();
+        let first = stored.clone();
+        let mut queued = stored.clone();
+        queued.set_title("queued".into());
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut writer = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            database: None,
+            cursors: HashMap::new(),
+            deleted_versions: HashMap::new(),
+            failing: HashSet::new(),
+            size_warning_level: 0,
+            wal_warning_active: false,
+            commits_since_checkpoint: 0,
+            checkpoint_stalls: 0,
+        };
+
+        writer.write(&first).unwrap();
+        writer.write(&queued).unwrap();
+
+        assert_eq!(AppSession::load(stored.id, &dir).unwrap().title, "queued");
+        assert!(warn_rx.is_empty());
+    }
+
+    #[test]
+    fn queued_snapshot_never_adopts_an_unrelated_lineage() {
+        let (_tmp, dir) = state_dir();
+        let mut stored = AppSession::new(MODEL, CWD);
+        stored.save(&dir).unwrap();
+        let first = AppSession::load(stored.id, &dir).unwrap();
+        let mut unrelated = AppSession::load(stored.id, &dir).unwrap();
+        unrelated.set_title("unrelated stale".into());
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            database: None,
+            cursors: HashMap::new(),
+            deleted_versions: HashMap::new(),
+            failing: HashSet::new(),
+            size_warning_level: 0,
+            wal_warning_active: false,
+            commits_since_checkpoint: 0,
+            checkpoint_stalls: 0,
+        };
+        writer.write(&first).unwrap();
+
+        assert!(matches!(
+            writer.write(&unrelated),
+            Err(SessionError::ConcurrentSessionWriter { .. })
+        ));
+        assert_ne!(
+            AppSession::load(stored.id, &dir).unwrap().title,
+            unrelated.title
+        );
+    }
+
+    /// A delete invalidates the ordinary cursor and creates a tombstone. The
+    /// deleting writer alone retains the explicit version needed to recreate
+    /// the session from a later snapshot.
     #[test]
     fn session_recreated_after_delete_is_written_in_full() {
         let (_tmp, dir) = state_dir();

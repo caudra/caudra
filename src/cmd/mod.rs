@@ -1,5 +1,6 @@
 mod acp;
 mod migrate;
+mod storage;
 mod subcmd;
 mod tui;
 
@@ -68,6 +69,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
         },
+        Some(Command::Storage { action }) => storage::run(action)?,
         Some(Command::Prompt {
             variant,
             plan,

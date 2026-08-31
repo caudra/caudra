@@ -6,6 +6,7 @@ use etcetera::base_strategy::BaseStrategy;
 
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
+pub const XDG_MIGRATED_MARKER: &str = ".xdg-migrated";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
@@ -172,7 +173,9 @@ fn resolve() -> Option<&'static Paths> {
             let fallback_dir = etcetera::home_dir()
                 .ok()
                 .map(|h| h.join(FALLBACK_DIR))
-                .filter(|d| d.is_dir());
+                // XDG cutover leaves a durable marker so cached legacy paths
+                // cannot recreate state while new processes select XDG.
+                .filter(|d| d.is_dir() && !d.join(XDG_MIGRATED_MARKER).is_file());
             let xdg_config = s.config_dir().join(APP_NAME);
             let (data, cache, config) = match &fallback_dir {
                 Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
@@ -211,9 +214,33 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
     Ok(path.to_path_buf())
 }
 
+fn xdg_only_paths() -> Result<Paths, std::io::Error> {
+    let strategy = etcetera::choose_base_strategy().map_err(|_| err())?;
+    let data = strategy.data_dir().join(APP_NAME);
+    let cache = strategy.cache_dir().join(APP_NAME);
+    let config = strategy.config_dir().join(APP_NAME);
+    let (state, logs) = state_logs(&strategy, &data);
+    Ok(Paths {
+        config: config.clone(),
+        data,
+        state,
+        logs,
+        cache,
+        xdg_config: config,
+    })
+}
+
+fn active_path(field: fn(&Paths) -> &Path) -> Result<PathBuf, std::io::Error> {
+    let cached = resolve().ok_or_else(err)?;
+    if cached.state.join(XDG_MIGRATED_MARKER).is_file() {
+        let xdg = xdg_only_paths()?;
+        return ensure(field(&xdg));
+    }
+    ensure(field(cached))
+}
+
 pub fn config_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.config)
+    active_path(|paths| &paths.config)
 }
 
 pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
@@ -222,23 +249,19 @@ pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
 }
 
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.data)
+    active_path(|paths| &paths.data)
 }
 
 pub fn state_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.state)
+    active_path(|paths| &paths.state)
 }
 
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.logs)
+    active_path(|paths| &paths.logs)
 }
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.cache)
+    active_path(|paths| &paths.cache)
 }
 
 pub struct XdgPaths {
@@ -266,7 +289,7 @@ pub fn legacy_home_dir() -> Option<PathBuf> {
     etcetera::home_dir()
         .ok()
         .map(|h| h.join(FALLBACK_DIR))
-        .filter(|d| d.is_dir())
+        .filter(|d| d.is_dir() && !d.join(XDG_MIGRATED_MARKER).is_file())
 }
 
 /// Candidate config directories for `subdir` from `home` and `xdg_config`.

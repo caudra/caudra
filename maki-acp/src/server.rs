@@ -279,6 +279,7 @@ async fn new_session(
         SessionStart {
             cwd: req.cwd,
             session_id: None,
+            expected_write_version: None,
             history: Vec::new(),
             permissions: (Vec::new(), Vec::new(), None),
             profile: (profile_name, profile),
@@ -328,6 +329,7 @@ async fn load_session(
         SessionStart {
             cwd: req.cwd,
             session_id: Some(session_ref),
+            expected_write_version: restored.write_version,
             history: history.into_items(),
             permissions: (
                 std::mem::take(&mut restored.session_rules),
@@ -361,6 +363,7 @@ async fn load_session(
 struct SessionStart {
     cwd: PathBuf,
     session_id: Option<SessionRef>,
+    expected_write_version: Option<i64>,
     history: Vec<HistoryItem>,
     permissions: (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>),
     profile: (String, Option<Arc<SystemPromptProfile>>),
@@ -399,6 +402,7 @@ fn spawn_session(
         mcp_handle: start.mcp_handle,
         initial_wd: start.cwd,
         session_id: start.session_id,
+        expected_write_version: start.expected_write_version,
         initial_history: start.history,
         yolo: params.yolo,
         session_rules,
@@ -643,6 +647,7 @@ struct Restored {
     structured_permission_rules: Vec<PermissionRuleRecord>,
     yolo: Option<bool>,
     system_prompt_profile: Option<String>,
+    write_version: Option<i64>,
 }
 
 fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
@@ -682,6 +687,7 @@ fn load_history_from(
         structured_permission_rules: session.meta.structured_permission_rules.clone(),
         yolo: session.meta.yolo,
         system_prompt_profile: session.meta.system_prompt_profile.clone(),
+        write_version: session.persisted_write_version(),
         history,
     })
 }

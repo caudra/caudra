@@ -11,12 +11,15 @@ use maki_providers::provider::{self, Provider};
 #[cfg(test)]
 use maki_providers::{ContentBlock, Message, Role};
 use maki_providers::{
-    HistoryItem, HistoryItemKind, active_history_items, merge_history_items, resolve_history_head,
+    HistoryItem, HistoryItemKind, TokenUsage, active_history_items, merge_history_items,
+    resolve_history_head,
 };
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::permission_state::PermissionRuleRecord;
-use maki_storage::sessions::{StoredEffect, StoredRule, StoredSubagent};
+use maki_storage::sessions::{
+    SessionCursor, SessionDatabase, StoredEffect, StoredRule, StoredSubagent,
+};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -32,39 +35,66 @@ use crate::tools::{
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
-    StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutputLines,
+    StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput, ToolOutputLines,
     load_stored_session,
 };
 
 struct SessionStore {
     dir: StateDir,
+    database: Option<SessionDatabase>,
+    cursor: Option<SessionCursor>,
     session: StoredSession,
+    created: bool,
     subagent_history: SubagentHistoryStore,
     persisted_subagent_history: SubagentHistorySnapshot,
 }
 
 impl SessionStore {
-    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
+    fn open(
+        session_id: MakiId,
+        cwd: &str,
+        model_spec: &str,
+    ) -> Result<Self, maki_storage::sessions::SessionError> {
+        let dir = StateDir::resolve()?;
+        Self::open_in(dir, session_id, cwd, model_spec)
     }
 
-    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
+    fn open_in(
+        dir: StateDir,
+        session_id: MakiId,
+        cwd: &str,
+        model_spec: &str,
+    ) -> Result<Self, maki_storage::sessions::SessionError> {
         match load_stored_session(session_id, &dir) {
-            Ok(session) => Self::from_session(dir, session),
-            Err(_) => {
+            Ok(session) => Ok(Self::from_session(dir, session, false)),
+            Err(maki_storage::sessions::SessionError::Storage(
+                maki_storage::StorageError::NotFound(_),
+            )) => {
                 let mut session = StoredSession::new(model_spec, cwd);
                 session.id = session_id;
-                let mut store = Self::from_session(dir, session);
-                store.save();
-                store
+                let mut store = Self::from_session(dir, session, true);
+                store.save()?;
+                Ok(store)
             }
+            Err(error) => Err(error),
         }
     }
 
-    fn from_session(dir: StateDir, session: StoredSession) -> Self {
+    fn from_session(dir: StateDir, session: StoredSession, created: bool) -> Self {
+        let database = SessionDatabase::open(&dir)
+            .map_err(|error| warn!(%error, "session database unavailable"))
+            .ok();
+        let cursor = database
+            .as_ref()
+            .and_then(|database| {
+                database
+                    .load_with_cursor::<HistoryItem, TokenUsage, ToolOutput>(session.id)
+                    .ok()
+            })
+            .map(|(_, cursor)| cursor)
+            // The compatibility loader and cursor lookup are separate reads.
+            // Never let a newer cursor authenticate saving an older snapshot.
+            .filter(|cursor| session.persisted_write_version() == Some(cursor.write_version()));
         let head = resolve_history_head(
             session.messages(),
             session.meta.history_head,
@@ -133,15 +163,34 @@ impl SessionStore {
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
+            database,
+            cursor,
             session,
+            created,
             subagent_history,
             persisted_subagent_history,
         }
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
+    fn save(&mut self) -> Result<(), maki_storage::sessions::SessionError> {
+        self.session.updated_at = maki_storage::now_epoch();
+        if self.database.is_none() {
+            self.database = SessionDatabase::open(&self.dir)
+                .map_err(|error| warn!(%error, "session database unavailable"))
+                .ok();
+        }
+        let Some(database) = self.database.as_mut() else {
+            return Err(maki_storage::StorageError::Io(std::io::Error::other(
+                "session database unavailable",
+            ))
+            .into());
+        };
+        match database.save(&self.session, self.cursor.as_ref()) {
+            Ok(cursor) => {
+                self.cursor = Some(cursor);
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -158,20 +207,39 @@ impl SessionStore {
         }
     }
 
+    fn verify_start_version(
+        &self,
+        expected_write_version: Option<i64>,
+    ) -> Result<(), maki_storage::sessions::SessionError> {
+        let actual = self.session.persisted_write_version();
+        match (expected_write_version, actual, self.created) {
+            (Some(expected), Some(actual), _) if expected == actual => Ok(()),
+            (Some(expected), actual, _) => Err(
+                maki_storage::sessions::SessionError::ConcurrentSessionWriter {
+                    id: self.session.id,
+                    expected,
+                    actual: actual.unwrap_or(-1),
+                },
+            ),
+            (None, _, true) => Ok(()),
+            (None, _, false) => Err(maki_storage::sessions::SessionError::AlreadyExists {
+                id: self.session.id,
+            }),
+        }
+    }
+
     fn record_turn(
         &mut self,
         history: &History,
         model_spec: String,
         permissions: &PermissionManager,
-    ) {
+    ) -> Result<(), maki_storage::sessions::SessionError> {
         let mut merged = self.session.messages().to_vec();
         if let Err(error) = merge_history_items(&mut merged, history.active_items()) {
             warn!(%error, "refusing to persist invalid history graph");
-            return;
+            return Ok(());
         }
-        if merged.as_slice() != self.session.messages() {
-            self.session.replace_messages(merged);
-        }
+        self.session.merge_history(history.snapshot(), merged);
         self.session
             .set_conversation_state(history.item_head(), None);
         self.session.set_model(model_spec);
@@ -219,14 +287,18 @@ impl SessionStore {
                     }
                 }
             }
-            self.persisted_subagent_history = snapshot;
         }
         self.sync_permissions(permissions);
         self.session.update_title_if_default();
-        self.save();
+        self.save()?;
+        self.persisted_subagent_history = snapshot;
+        Ok(())
     }
 
-    fn record_event(&mut self, envelope: &Envelope) {
+    fn record_event(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<(), maki_storage::sessions::SessionError> {
         match &envelope.event {
             AgentEvent::ToolDone(done) => {
                 self.session
@@ -285,9 +357,9 @@ impl SessionStore {
                 }
                 self.session.set_subagents(subagents);
             }
-            _ => return,
+            _ => return Ok(()),
         }
-        self.save();
+        self.save()
     }
 }
 
@@ -752,6 +824,7 @@ pub struct InteractiveParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub session_id: Option<SessionRef>,
+    pub expected_write_version: Option<i64>,
     pub initial_history: Vec<HistoryItem>,
     pub yolo: bool,
     pub session_rules: Vec<StoredRule>,
@@ -869,26 +942,57 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
-            if let Some(store) = &mut store {
-                store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
-                store.save();
+            let mut store = match SessionStore::open(session_id, &working_dir, &model.spec()) {
+                Ok(store) => store,
+                Err(error) => {
+                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
+                        message: format!("Session persistence unavailable: {error}"),
+                    });
+                    return;
+                }
+            };
+            if let Err(error) = store.verify_start_version(params.expected_write_version) {
+                let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
+                    message: format!("Session changed before startup: {error}"),
+                });
+                return;
             }
-            let subagent_history = store
-                .as_ref()
-                .map(|store| store.subagent_history.clone())
-                .unwrap_or_default();
-            let store = Arc::new(Mutex::new(store));
+            store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
+            if let Err(error) = store.save() {
+                let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
+                    message: format!("Failed to persist session: {error}"),
+                });
+                return;
+            }
+            let subagent_history = store.subagent_history.clone();
+            let store = Arc::new(Mutex::new(Some(store)));
             let (agent_tx, agent_rx) = flume::unbounded();
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
                 async move {
                     while let Ok(envelope) = agent_rx.recv_async().await {
-                        if let Some(store) = &mut *store.lock().await {
-                            store.record_event(&envelope);
-                        }
+                        let persistence_error = if let Some(store) = &mut *store.lock().await {
+                            store.record_event(&envelope).err()
+                        } else {
+                            None
+                        };
+                        let run_id = envelope.run_id;
                         if raw_tx.send_async(envelope).await.is_err() {
+                            break;
+                        }
+                        if let Some(error) = persistence_error
+                            && raw_tx
+                                .send_async(Envelope {
+                                    event: AgentEvent::Error {
+                                        message: format!("Failed to persist session: {error}"),
+                                    },
+                                    subagent: None,
+                                    run_id,
+                                })
+                                .await
+                                .is_err()
+                        {
                             break;
                         }
                     }
@@ -1028,8 +1132,12 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
                     });
                 }
 
-                if let Some(store) = &mut *store.lock().await {
-                    store.record_turn(&history, model.spec(), &permissions);
+                if let Some(store) = &mut *store.lock().await
+                    && let Err(error) = store.record_turn(&history, model.spec(), &permissions)
+                {
+                    let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
+                        message: format!("Failed to persist session: {error}"),
+                    });
                 }
                 run_id += 1;
             }
@@ -1038,7 +1146,11 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
             event_forwarder.await;
             if let Some(store) = &mut *store.lock().await {
                 store.sync_permissions(&permissions);
-                store.save();
+                if let Err(error) = store.save() {
+                    let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
+                        message: format!("Failed to persist session: {error}"),
+                    });
+                }
             }
 
             if let Some(handle) = params.mcp_handle {
@@ -1096,10 +1208,20 @@ mod tests {
             CWD,
             MODEL_SPEC,
         )
+        .unwrap()
     }
 
     fn load(tmp: &TempDir) -> StoredSession {
         StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
+    }
+
+    fn write_version(tmp: &TempDir) -> i64 {
+        SessionDatabase::open(&StateDir::from_path(tmp.path().to_path_buf()))
+            .unwrap()
+            .load_with_cursor::<HistoryItem, TokenUsage, ToolOutput>(session_id())
+            .unwrap()
+            .1
+            .write_version()
     }
 
     fn permission_manager() -> PermissionManager {
@@ -1119,6 +1241,32 @@ mod tests {
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
         assert!(loaded.messages().is_empty());
+        assert_eq!(write_version(&tmp), 0);
+    }
+
+    #[test]
+    fn startup_rejects_a_cursor_newer_than_the_caller_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        assert!(store.verify_start_version(None).is_ok());
+        store
+            .record_turn(
+                &History::new(vec![Message::user("newer".into())]),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
+        let reopened = store_in(&tmp);
+
+        assert!(matches!(
+            reopened.verify_start_version(Some(0)),
+            Err(maki_storage::sessions::SessionError::ConcurrentSessionWriter { .. })
+        ));
+        assert!(reopened.verify_start_version(Some(1)).is_ok());
+        assert!(matches!(
+            reopened.verify_start_version(None),
+            Err(maki_storage::sessions::SessionError::AlreadyExists { .. })
+        ));
     }
 
     #[test]
@@ -1127,7 +1275,9 @@ mod tests {
         let mut store = store_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
         let history = History::new(messages.clone());
-        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
+        store
+            .record_turn(&history, MODEL_SPEC.into(), &permission_manager())
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 1);
@@ -1142,7 +1292,9 @@ mod tests {
             Message::user("fix the login bug".into()),
             Message::observation("build failed".into()),
         ]);
-        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
+        store
+            .record_turn(&history, MODEL_SPEC.into(), &permission_manager())
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
@@ -1181,7 +1333,9 @@ mod tests {
             },
         ]);
 
-        store.record_turn(&history, MODEL_SPEC.into(), &permission_manager());
+        store
+            .record_turn(&history, MODEL_SPEC.into(), &permission_manager())
+            .unwrap();
 
         let loaded = load(&tmp);
         let restored = loaded.messages().iter().find_map(|item| match &item.kind {
@@ -1195,23 +1349,51 @@ mod tests {
     fn reopening_resumes_existing_session() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        store.record_turn(
-            &History::new(vec![Message::user("first prompt".into())]),
-            MODEL_SPEC.into(),
-            &permission_manager(),
-        );
+        store
+            .record_turn(
+                &History::new(vec![Message::user("first prompt".into())]),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
         drop(store);
+        let version_before_reopen = write_version(&tmp);
 
         let mut store = store_in(&tmp);
         assert_eq!(store.session.messages().len(), 1);
+        assert_eq!(write_version(&tmp), version_before_reopen);
 
         let mut history = History::restored(store.session.messages().to_vec()).unwrap();
         history.push(Message::user("second prompt".into()));
-        store.record_turn(&history, "other/model".into(), &permission_manager());
+        store
+            .record_turn(&history, "other/model".into(), &permission_manager())
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    #[test]
+    fn newer_cursor_never_authenticates_an_older_headless_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut original = StoredSession::new(MODEL_SPEC, CWD);
+        original.id = session_id();
+        original.save(&dir).unwrap();
+        let stale = load_stored_session(session_id(), &dir).unwrap();
+        let mut current = load_stored_session(session_id(), &dir).unwrap();
+        current.set_title("current".into());
+        current.save(&dir).unwrap();
+        let mut store = SessionStore::from_session(dir, stale, false);
+        store.session.set_title("stale".into());
+
+        let error = store.save().unwrap_err();
+
+        assert!(matches!(
+            error,
+            maki_storage::sessions::SessionError::ConcurrentSessionWriter { .. }
+        ));
     }
 
     #[test]
@@ -1223,11 +1405,13 @@ mod tests {
             .reserve("task-1")
             .unwrap()
             .complete(vec![Message::user("investigate".into())]);
-        store.record_turn(
-            &History::default(),
-            MODEL_SPEC.into(),
-            &permission_manager(),
-        );
+        store
+            .record_turn(
+                &History::default(),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
 
         let loaded = load(&tmp);
         let task_history =
@@ -1251,24 +1435,28 @@ mod tests {
             state: Some(serde_json::json!({ "task_id": "nested-task" })),
             lua_provenance: None,
         });
-        store.record_event(&Envelope {
-            event: AgentEvent::ToolDone(Box::new(done)),
-            subagent: None,
-            run_id: 0,
-        });
-        store.record_event(&Envelope {
-            event: AgentEvent::SubagentHistory {
-                task_id: "nested-task".into(),
-                parent_tool_use_id: "nested-call".into(),
-                root_tool_use_id: "batch-call".into(),
-                name: "researcher".into(),
-                model: MODEL_SPEC.into(),
-                messages: vec![Message::user("investigate".into())],
-                spec: Some(crate::SubagentTaskSpec::default()),
-            },
-            subagent: None,
-            run_id: 0,
-        });
+        store
+            .record_event(&Envelope {
+                event: AgentEvent::ToolDone(Box::new(done)),
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+        store
+            .record_event(&Envelope {
+                event: AgentEvent::SubagentHistory {
+                    task_id: "nested-task".into(),
+                    parent_tool_use_id: "nested-call".into(),
+                    root_tool_use_id: "batch-call".into(),
+                    name: "researcher".into(),
+                    model: MODEL_SPEC.into(),
+                    messages: vec![Message::user("investigate".into())],
+                    spec: Some(crate::SubagentTaskSpec::default()),
+                },
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(
@@ -1365,11 +1553,13 @@ mod tests {
                 "continuation-call".into(),
             );
 
-        store.record_turn(
-            &History::default(),
-            MODEL_SPEC.into(),
-            &permission_manager(),
-        );
+        store
+            .record_turn(
+                &History::default(),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
 
         let loaded = load(&tmp);
         assert!(loaded.subagent_messages().contains_key("task-1"));
@@ -1407,7 +1597,9 @@ mod tests {
         permissions.load_structured_conversation_rules(vec![structured.clone()]);
         permissions.set_session_yolo(Some(true));
 
-        store.record_turn(&History::default(), MODEL_SPEC.into(), &permissions);
+        store
+            .record_turn(&History::default(), MODEL_SPEC.into(), &permissions)
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(loaded.meta.session_rules.len(), 1);
@@ -1441,7 +1633,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
         store.set_system_prompt_profile(Some(PROFILE));
-        store.save();
+        store.save().unwrap();
 
         assert_eq!(
             load(&tmp).meta.system_prompt_profile.as_deref(),

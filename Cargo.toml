@@ -93,6 +93,7 @@ maki-workcell = { path = "maki-workcell" }
 workcell = { path = "../workcell-mcp/crates/workcell", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "environment"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
 bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
@@ -148,7 +149,7 @@ futures = "0.3"
 isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl", "http2"] }
 flate2 = "1"
 libc = "0.2"
-windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"
 open = "5"

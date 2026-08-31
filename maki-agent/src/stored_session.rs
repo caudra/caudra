@@ -46,6 +46,7 @@ fn convert_session(
     session: CompatibleSession,
     storage: &StateDir,
 ) -> Result<StoredSession, SessionError> {
+    let write_version = session.persisted_write_version();
     let migrated = session
         .messages()
         .iter()
@@ -67,6 +68,7 @@ fn convert_session(
     value["subagent_messages"] =
         serde_json::to_value(subagent_messages).map_err(StorageError::from)?;
     let mut session: StoredSession = serde_json::from_value(value).map_err(StorageError::from)?;
+    session.set_persisted_write_version(write_version);
     if migrated && let Err(error) = session.save(storage) {
         warn!(
             %error,

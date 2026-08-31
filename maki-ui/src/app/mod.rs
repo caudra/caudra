@@ -449,9 +449,10 @@ impl App {
         session_id: maki_storage::id::MakiId,
         cwd: &std::path::Path,
     ) -> Result<Arc<SnapshotStore>, SnapshotError> {
-        Ok(Arc::new(SnapshotStore::new(Self::snapshot_store_path(
-            storage, session_id, cwd,
-        )?)))
+        Ok(Arc::new(SnapshotStore::new_managed(
+            storage.clone(),
+            Self::snapshot_store_path(storage, session_id, cwd)?,
+        )))
     }
 
     fn snapshot_store_path(

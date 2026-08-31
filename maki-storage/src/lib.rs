@@ -18,9 +18,11 @@ pub mod tool_outputs;
 pub mod version;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::thread;
@@ -33,9 +35,14 @@ use paths::state_dir;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
+const SESSION_ARTIFACT_LOCK_FILE: &str = "sessions.sqlite3.artifacts.lock";
 
 #[derive(Debug, Clone)]
 pub struct StateDir(PathBuf);
+
+pub struct SessionArtifactLock {
+    _file: File,
+}
 
 impl StateDir {
     pub fn resolve() -> Result<Self, StorageError> {
@@ -118,10 +125,13 @@ pub fn atomic_write_permissions(path: &Path, data: &[u8], mode: u32) -> Result<(
 pub(crate) fn exclusive_state_lock(path: &Path, mode: u32) -> Result<File, StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
+    validate_lock_path(path)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).write(true);
     #[cfg(unix)]
-    options.mode(mode);
+    options
+        .mode(mode)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     #[cfg(not(unix))]
     let _ = mode;
     let file = options.open(path)?;
@@ -129,6 +139,78 @@ pub(crate) fn exclusive_state_lock(path: &Path, mode: u32) -> Result<File, Stora
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.lock()?;
     Ok(file)
+}
+
+pub(crate) fn shared_state_lock(path: &Path, mode: u32) -> Result<File, StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    validate_lock_path(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options
+        .mode(mode)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+pub(crate) fn shared_existing_state_lock(path: &Path) -> Result<File, StorageError> {
+    validate_lock_path(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let file = options.open(path)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+fn validate_lock_path(path: &Path) -> Result<(), StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(StorageError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("lock parent {} is not a real directory", parent.display()),
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("lock path {} is not a regular file", path.display()),
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn lock_session_artifacts(state_dir: &StateDir) -> Result<SessionArtifactLock, StorageError> {
+    let marker = state_dir.path().join(paths::XDG_MIGRATED_MARKER);
+    if marker.is_file() {
+        return Err(StorageError::Io(io::Error::other(format!(
+            "state directory {} was retired",
+            state_dir.path().display()
+        ))));
+    }
+    let file = exclusive_state_lock(&state_dir.path().join(SESSION_ARTIFACT_LOCK_FILE), 0o600)?;
+    // A cutover may have completed while this caller waited for an in-flight
+    // artifact operation. Never publish into the retained rollback tree.
+    if marker.is_file() {
+        return Err(StorageError::Io(io::Error::other(format!(
+            "state directory {} was retired",
+            state_dir.path().display()
+        ))));
+    }
+    Ok(SessionArtifactLock { _file: file })
 }
 
 /// `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
@@ -149,6 +231,15 @@ fn rename_into_place(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError
     })
 }
 
+pub fn durable_rename(src: &Path, dest: &Path) -> io::Result<()> {
+    retry_rename(src, dest)
+}
+
+#[cfg(windows)]
+pub fn durable_rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
+    retry_rename_with(src, dest, false)
+}
+
 /// A rename is durable only once the directory entry reaches disk; without
 /// this a freshly created file can vanish after power loss even though the
 /// write returned Ok. Best effort: not every filesystem accepts a directory
@@ -161,6 +252,20 @@ pub(crate) fn sync_parent_dir(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+pub(crate) fn sync_parent_dir_durable(path: &Path) -> Result<(), StorageError> {
+    sync_parent_dir_io(path).map_err(StorageError::from)
+}
+
+pub(crate) fn sync_parent_dir_io(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn sync_dir_handle(dir: &Path) {
@@ -181,21 +286,82 @@ fn sync_dir_handle(dir: &Path) {
 /// retrying will not fix, so we just call rename once.
 #[cfg(windows)]
 fn retry_rename(src: &Path, dest: &Path) -> std::io::Result<()> {
+    retry_rename_with(src, dest, true)
+}
+
+#[cfg(windows)]
+fn retry_rename_with(src: &Path, dest: &Path, replace: bool) -> std::io::Result<()> {
+    let original_permissions = if replace {
+        fs::metadata(dest)
+            .ok()
+            .map(|metadata| metadata.permissions())
+            .filter(fs::Permissions::readonly)
+    } else {
+        None
+    };
+    if let Some(permissions) = &original_permissions {
+        let mut writable = permissions.clone();
+        writable.set_readonly(false);
+        fs::set_permissions(dest, writable)?;
+    }
     let mut a: u64 = 0;
     let mut b: u64 = 1;
-    for _ in 0..RENAME_ATTEMPTS {
-        match fs::rename(src, dest) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                thread::sleep(Duration::from_millis(b));
-                let next = a.saturating_add(b);
-                a = b;
-                b = next;
+    let result = (|| {
+        for _ in 0..RENAME_ATTEMPTS {
+            match move_file_write_through(src, dest, replace) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    thread::sleep(Duration::from_millis(b));
+                    let next = a.saturating_add(b);
+                    a = b;
+                    b = next;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
+        move_file_write_through(src, dest, replace)
+    })();
+    if result.is_err()
+        && let Some(permissions) = original_permissions
+    {
+        let _ = fs::set_permissions(dest, permissions);
     }
-    fs::rename(src, dest)
+    result
+}
+
+#[cfg(windows)]
+fn move_file_write_through(src: &Path, dest: &Path, replace: bool) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let src = windows_wide_path(src)?;
+    let dest = windows_wide_path(dest)?;
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    if unsafe { MoveFileExW(src.as_ptr(), dest.as_ptr(), flags) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    let path = match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    };
+    Ok(path.as_os_str().encode_wide().chain(Some(0)).collect())
 }
 
 #[cfg(not(windows))]

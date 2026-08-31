@@ -506,6 +506,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let working_dir = cwd.to_string_lossy().into_owned();
     let ResolvedSession {
         session_id,
+        expected_write_version,
         initial_history,
         session_rules,
         structured_permission_rules,
@@ -593,6 +594,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         mcp_handle,
         initial_wd: cwd.clone(),
         session_id,
+        expected_write_version,
         initial_history,
         yolo: requested_permission_mode == PermissionMode::BypassPermissions,
         session_rules,
@@ -755,6 +757,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 struct ResolvedSession {
     session_id: Option<SessionRef>,
+    expected_write_version: Option<i64>,
     initial_history: Vec<HistoryItem>,
     session_rules: Vec<StoredRule>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
@@ -796,6 +799,7 @@ fn resolve_session(
 
     let (
         resumed_id,
+        expected_write_version,
         initial_history,
         session_rules,
         structured_permission_rules,
@@ -888,6 +892,7 @@ fn resolve_session(
             }
             (
                 Some(target),
+                Some(0),
                 history,
                 session_rules,
                 structured_permission_rules,
@@ -907,6 +912,7 @@ fn resolve_session(
                 session_permissions(&session, false);
             (
                 Some(session_ref),
+                session.persisted_write_version(),
                 history,
                 session_rules,
                 structured_permission_rules,
@@ -923,6 +929,7 @@ fn resolve_session(
                     session_permissions(&session, false);
                 (
                     Some(SessionRef::from(session.id)),
+                    session.persisted_write_version(),
                     history,
                     session_rules,
                     structured_permission_rules,
@@ -930,14 +937,15 @@ fn resolve_session(
                     session.meta.system_prompt_profile.clone(),
                 )
             }
-            _ => (None, Vec::new(), Vec::new(), Vec::new(), None, None),
+            _ => (None, None, Vec::new(), Vec::new(), Vec::new(), None, None),
         }
     } else {
-        (None, Vec::new(), Vec::new(), Vec::new(), None, None)
+        (None, None, Vec::new(), Vec::new(), Vec::new(), None, None)
     };
 
     Ok(ResolvedSession {
         session_id: cli_session_id.or(resumed_id),
+        expected_write_version,
         initial_history,
         session_rules,
         structured_permission_rules,

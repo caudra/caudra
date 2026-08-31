@@ -261,6 +261,36 @@ pub enum Command {
         #[command(subcommand)]
         action: MigrateAction,
     },
+    /// Inspect and maintain session storage
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StorageAction {
+    /// Print the session database path
+    Path,
+    /// Show aggregate database and row statistics
+    Stats {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check database and foreign-key integrity
+    Check,
+    /// Checkpoint the write-ahead log
+    Checkpoint {
+        /// Truncate the WAL after checkpointing
+        #[arg(long)]
+        truncate: bool,
+    },
+    /// Reclaim a bounded number of freelist pages
+    Vacuum {
+        #[arg(long, default_value_t = 1024)]
+        pages: u32,
+    },
 }
 
 #[derive(Subcommand)]

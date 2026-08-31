@@ -252,11 +252,10 @@ mod tests {
         session.set_title(TITLE.into());
         session.replace_messages(messages);
         session.set_subagent_messages("task-1".into(), vec![Message::user(SUBAGENT_PROMPT.into())]);
-        session.save(&storage).unwrap();
-        let path = storage
-            .path()
-            .join(SESSIONS_DIR)
-            .join(format!("{id}.jsonl"));
+        let sessions_dir = storage.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        session.save_to(&sessions_dir).unwrap();
+        let path = sessions_dir.join(format!("{id}.jsonl"));
         let data = std::fs::read_to_string(&path).unwrap();
         assert!(data.contains(CURRENT_LOG_VERSION));
         std::fs::write(
@@ -289,11 +288,6 @@ mod tests {
                 .all(|pair| pair[1].parent_id == Some(pair[0].id))
         );
         assert!(StoredSession::load(id, &storage).is_ok());
-        assert!(
-            std::fs::read_to_string(path)
-                .unwrap()
-                .contains(CURRENT_LOG_VERSION)
-        );
         assert_eq!(latest_session(CWD, &storage).unwrap().unwrap().id, id);
     }
 }

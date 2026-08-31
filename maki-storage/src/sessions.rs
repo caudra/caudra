@@ -1,11 +1,8 @@
-//! Session persistence with append-only JSONL log format.
+//! Session state with canonical SQLite persistence and legacy JSONL support.
 //!
-//! Each session is stored as `{uuid}.jsonl`, one JSON record per line. The format is
-//! crash-safe: on load, any trailing run of unparseable lines is discarded (a partial
-//! flush may corrupt multiple trailing records). `SessionLog` tracks cursor state to
-//! enable O(delta) incremental saves.
-//!
-//! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
+//! `StateDir` APIs use the global SQLite repository. Path-based APIs retain the
+//! tolerant JSON/JSONL reader, writer, and archive format for import, rollback,
+//! and explicit export without becoming a second canonical store.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
@@ -21,12 +18,21 @@ use tracing::{info, warn};
 use crate::id::{MakiId, MakiIdParseError};
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
+#[cfg(test)]
 use crate::tool_outputs::delete_session_outputs;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch};
+
+#[path = "sessions/database.rs"]
+mod database;
+
+pub use database::{
+    CheckpointResult, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor, SessionDatabase,
+    SessionMigration, SessionStorageStats,
+};
 
 const SESSION_VERSION: u32 = 1;
 const PREVIOUS_LOG_FORMAT_VERSION: u32 = 2;
@@ -53,7 +59,7 @@ pub(crate) const ARCHIVE_DIR: &str = "archive";
 /// timer.
 const ARCHIVE_KEEP: usize = 3;
 /// Three copies of a log full of tool output add up fast, so the bytes get a
-/// budget of their own. The newest archive always survives, whatever it weighs.
+/// strict budget of their own. A candidate larger than the budget is skipped.
 const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
 const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
@@ -82,6 +88,36 @@ pub enum SessionError {
     },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("session {id} already exists")]
+    AlreadyExists { id: MakiId },
+    #[error(
+        "session {id} was modified concurrently: expected write version {expected}, found {actual}"
+    )]
+    ConcurrentSessionWriter {
+        id: MakiId,
+        expected: i64,
+        actual: i64,
+    },
+    #[error("database schema version {found} is newer than supported version {supported}")]
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
+    #[error("invalid database value in {field}: {reason}")]
+    CorruptDatabaseValue { field: &'static str, reason: String },
+    #[error("{kind} is {actual}, maximum is {maximum}")]
+    LimitExceeded {
+        kind: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    #[error("session {id} requires {logical_bytes} bytes, eager-load limit is {maximum}")]
+    LoadBudgetExceeded {
+        id: MakiId,
+        logical_bytes: usize,
+        maximum: usize,
+    },
+    #[error("legacy session source changed while importing: {path}")]
+    LegacySourceChanged { path: String },
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -311,17 +347,15 @@ impl<M> Default for HistorySnapshot<M> {
 
 /// The conversation collections are private so every change goes through a
 /// mutator that classifies itself: `revision` says "this needs writing",
-/// `epoch` says "append cursors into the log are void". The other fields stay
-/// public because the meta record is rewritten in full on every append, so
-/// they hold no cursor to spoil. `cwd` and `model` are the exception: they
-/// live in the header record, which only a rewrite touches, so changes must
-/// go through their setters.
+/// `epoch` says append cursors are void, and `rewrites` identifies replacement
+/// of existing canonical values. `cwd` and `model` go through setters because
+/// changing either also invalidates append classification.
 ///
 /// [`SessionMeta`] is the part the owner mirrors from its own live state and
 /// hands over whole on every checkpoint. Whatever the session maintains itself
 /// gets a field of its own instead, so a checkpoint never copies it out and
 /// back in only to compare it against itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Session<M, U, T> {
     pub version: u32,
     pub id: MakiId,
@@ -364,6 +398,52 @@ pub struct Session<M, U, T> {
     /// erase a locally minted void: cursor validity is the pair.
     #[serde(skip)]
     rewrites: u64,
+    /// Frozen expected database version for this snapshot. Clones capture the
+    /// latest committed value from the shared atomic, while a clone already in
+    /// flight keeps its base so a later commit makes that snapshot stale.
+    #[serde(skip, default = "default_write_version")]
+    base_write_version: AtomicI64,
+    /// Communicates successful commits only to snapshots cloned afterwards; it
+    /// is not itself the expected version of every existing clone.
+    #[serde(skip, default = "new_write_version")]
+    write_version: Arc<AtomicI64>,
+}
+
+impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
+    fn clone(&self) -> Self {
+        let write_version = self.write_version.load(Ordering::Acquire);
+        Self {
+            version: self.version,
+            id: self.id,
+            title: self.title.clone(),
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            messages: Arc::clone(&self.messages),
+            token_usage: self.token_usage.clone(),
+            tool_outputs: self.tool_outputs.clone(),
+            subagent_messages: self.subagent_messages.clone(),
+            subagent_task_specs: self.subagent_task_specs.clone(),
+            subagents: self.subagents.clone(),
+            usage_by_model: self.usage_by_model.clone(),
+            meta: self.meta.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            revision: self.revision,
+            content_revision: self.content_revision,
+            epoch: self.epoch,
+            rewrites: self.rewrites,
+            base_write_version: AtomicI64::new(write_version),
+            write_version: Arc::clone(&self.write_version),
+        }
+    }
+}
+
+fn default_write_version() -> AtomicI64 {
+    AtomicI64::new(-1)
+}
+
+fn new_write_version() -> Arc<AtomicI64> {
+    Arc::new(AtomicI64::new(-1))
 }
 
 #[derive(Serialize)]
@@ -589,7 +669,16 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
     let existing = archives_newest_first(&archive_dir);
     let next = existing.first().map_or(0, |a| a.seq) + 1;
     let archive_path = archive_dir.join(format!("{next}.jsonl"));
-    let bytes = match link_archive(&path, &archive_path) {
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > ARCHIVE_MAX_BYTES) {
+        warn!(session_id = %session.id, "session log exceeds archive byte budget; skipping archive");
+        return;
+    }
+    let source_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    if let Err(error) = prune_archives(existing, source_bytes) {
+        warn!(%error, session_id = %session.id, "cannot make room for session archive");
+        return;
+    }
+    let bytes = match copy_archive(&path, &archive_path) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -600,7 +689,11 @@ fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
             return;
         }
     };
-    prune_archives(existing, bytes);
+    if bytes > ARCHIVE_MAX_BYTES {
+        let _ = fs::remove_file(&archive_path);
+        warn!(session_id = %session.id, bytes, "session archive exceeds byte budget; skipping");
+        return;
+    }
     // The live log is about to be renamed away. If the archive's directory
     // entry is not durable by then, a crash frees the only inode holding the
     // dropped turns, which is the loss this whole function exists to prevent.
@@ -643,19 +736,14 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
     }
 }
 
-/// The archive is a second name for the log's current inode. The rewrite
-/// renames a fresh file over the path, so the old bytes stay whole under the
-/// new name and not one of them is copied. Filesystems with no links (FAT32 on
-/// a stick) fall back to a plain copy. The size is for the byte budget.
-fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
-    if fs::hard_link(from, to).is_err() {
-        // `create_new` first: the name is only free if the seq scan saw every
-        // archive, and `fs::copy` would truncate the one it collided with.
-        OpenOptions::new().write(true).create_new(true).open(to)?;
-        fs::copy(from, to).inspect_err(|_| {
-            let _ = fs::remove_file(to);
-        })?;
-    }
+/// Copy into a distinct inode so an older append descriptor cannot grow a
+/// supposedly bounded archive after admission. `create_new` prevents a stale
+/// sequence scan from truncating an existing recovery point.
+fn copy_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
+    OpenOptions::new().write(true).create_new(true).open(to)?;
+    fs::copy(from, to).inspect_err(|_| {
+        let _ = fs::remove_file(to);
+    })?;
     Ok(fs::metadata(to)?.len())
 }
 
@@ -676,6 +764,9 @@ fn archives_newest_first(archive_dir: &Path) -> Vec<Archive> {
     let mut archives: Vec<Archive> = entries
         .flatten()
         .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
             let path = entry.path();
             if !is_jsonl(&path) {
                 return None;
@@ -692,9 +783,9 @@ fn archives_newest_first(archive_dir: &Path) -> Vec<Archive> {
 }
 
 /// Walks from the newest and keeps what both budgets allow, so the rest go.
-/// `new_bytes` is the archive we just made: it is not in `existing`, so it can
-/// never be the one dropped.
-fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
+/// `new_bytes` is already known to fit the strict byte budget. It is not in
+/// `existing`, so pruning only decides which older recovery points still fit.
+fn prune_archives(existing: Vec<Archive>, new_bytes: u64) -> Result<(), std::io::Error> {
     let mut total = new_bytes;
     let mut room = ARCHIVE_KEEP.saturating_sub(1);
     for archive in existing {
@@ -703,8 +794,23 @@ fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
             room -= 1;
             continue;
         }
-        let _ = fs::remove_file(&archive.path);
+        fs::remove_file(&archive.path)?;
     }
+    Ok(())
+}
+
+fn prune_archives_to_budget(archives: Vec<Archive>) -> Result<(), std::io::Error> {
+    let mut total = 0u64;
+    let mut room = ARCHIVE_KEEP;
+    for archive in archives {
+        if room > 0 && total.saturating_add(archive.size) <= ARCHIVE_MAX_BYTES {
+            room -= 1;
+            total += archive.size;
+        } else {
+            fs::remove_file(&archive.path)?;
+        }
+    }
+    Ok(())
 }
 
 impl SessionLog {
@@ -1147,6 +1253,8 @@ where
         content_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        base_write_version: AtomicI64::new(-1),
+        write_version: new_write_version(),
     })
 }
 
@@ -1391,13 +1499,28 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
         .collect())
 }
 
-pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<MakiId>, StorageError> {
-    let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-    Ok(session_entries(&sessions_dir)?
+pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<MakiId>, SessionError> {
+    let database = SessionDatabase::open(dir)?;
+    let imported = database.imported_session_ids()?;
+    let mut ids: HashSet<MakiId> = database.persisted_session_ids()?.into_iter().collect();
+    ids.extend(
+        legacy_session_ids(dir)?
+            .into_iter()
+            .filter(|id| !imported.contains(id)),
+    );
+    Ok(ids.into_iter().collect())
+}
+
+fn legacy_session_ids(dir: &StateDir) -> Result<HashSet<MakiId>, StorageError> {
+    let sessions_dir = dir.path().join(SESSIONS_DIR);
+    let entries = match session_entries(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(StorageError::Io(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    Ok(entries
         .into_iter()
         .filter_map(|path| path.file_stem()?.to_str()?.parse().ok())
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect())
 }
 
@@ -1446,16 +1569,28 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    parse_session_at(path, &data, accept_previous_version)
+}
+
+fn parse_session_at<M, U, T>(
+    path: &Path,
+    data: &[u8],
+    accept_previous_version: bool,
+) -> Result<Session<M, U, T>, SessionError>
+where
+    M: DeserializeOwned,
+    U: DeserializeOwned + Default,
+    T: DeserializeOwned,
+{
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(
-            &data,
+            data,
             &path.display().to_string(),
             LOG_FORMAT_VERSION,
             accept_previous_version,
         )?
     } else {
-        let session: Session<M, U, T> =
-            serde_json::from_slice(&data).map_err(StorageError::from)?;
+        let session: Session<M, U, T> = serde_json::from_slice(data).map_err(StorageError::from)?;
         if session.version != SESSION_VERSION {
             return Err(SessionError::VersionMismatch {
                 found: session.version,
@@ -1504,6 +1639,8 @@ where
             content_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
+            base_write_version: AtomicI64::new(-1),
+            write_version: new_write_version(),
         }
     }
 
@@ -1533,6 +1670,23 @@ where
 
     pub fn content_revision(&self) -> u64 {
         self.content_revision
+    }
+
+    pub fn persisted_write_version(&self) -> Option<i64> {
+        let version = self.base_write_version.load(Ordering::Acquire);
+        (version >= 0).then_some(version)
+    }
+
+    pub fn set_persisted_write_version(&mut self, version: Option<i64>) {
+        let version = version.unwrap_or(-1);
+        self.base_write_version.store(version, Ordering::Release);
+        self.write_version.store(version, Ordering::Release);
+    }
+
+    /// A serialized writer may adopt its own latest commit for a newer queued
+    /// snapshot that was cloned while the preceding write was still in flight.
+    pub fn adopt_persisted_write_version(&self, version: i64) {
+        self.base_write_version.store(version, Ordering::Release);
     }
 
     fn touch(&mut self) {
@@ -1660,19 +1814,37 @@ where
         msgs: Vec<M>,
         spec: Option<StoredSubagentTaskSpec>,
     ) {
-        let replaced = self
+        let append_only = self.subagent_messages.get(&id).is_none_or(|stored| {
+            let Some(prefix) = msgs.get(..stored.len()) else {
+                return false;
+            };
+            match (
+                serde_json::to_vec(stored.as_slice()),
+                serde_json::to_vec(prefix),
+            ) {
+                (Ok(stored), Ok(prefix)) => stored == prefix,
+                _ => false,
+            }
+        });
+        let changed = self
             .subagent_messages
-            .insert(id.clone(), Arc::new(msgs))
-            .is_some();
+            .get(&id)
+            .is_none_or(|stored| stored.len() != msgs.len() || !append_only);
+        let previous_spec = self.subagent_task_specs.get(&id);
+        let spec_changed = previous_spec != spec.as_ref();
+        self.subagent_messages.insert(id.clone(), Arc::new(msgs));
         if let Some(spec) = spec {
             self.subagent_task_specs.insert(id, spec);
         } else {
             self.subagent_task_specs.remove(&id);
         }
-        if replaced {
-            self.rewrite();
-        } else {
+        if !changed && !spec_changed {
+            return;
+        }
+        if append_only {
             self.touch();
+        } else {
+            self.rewrite();
         }
     }
 
@@ -1789,24 +1961,58 @@ where
     }
 
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        self.save_to(&sessions_dir)
+        self.updated_at = now_epoch();
+        // SQLite is authoritative after cutover; normal saves never dual-write
+        // JSONL because two canonical stores would create split-brain recovery.
+        let cursor = SessionDatabase::open(dir)?.save(self, None)?;
+        self.set_persisted_write_version(Some(cursor.write_version()));
+        Ok(())
     }
 
     pub fn save_to(&mut self, dir: &Path) -> Result<(), SessionError> {
+        // Path-based APIs remain an explicit legacy/export surface. StateDir
+        // APIs above and below are the canonical SQLite repository.
         self.updated_at = now_epoch();
         SessionLog::rewrite(dir, self)?;
         Ok(())
     }
 
     pub fn load(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::load_from(id, &sessions_dir)
+        Self::load_database_or_legacy(id, dir, false)
     }
 
     pub fn load_compatible(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        Self::load_database_or_legacy(id, dir, true)
+    }
+
+    fn load_database_or_legacy(
+        id: MakiId,
+        dir: &StateDir,
+        accept_previous_version: bool,
+    ) -> Result<Self, SessionError> {
+        let mut database = SessionDatabase::open(dir)?;
+        match database.load(id) {
+            Ok(session) => return Ok(session),
+            Err(SessionError::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
+        }
+        if database.was_imported(id)? {
+            return Err(StorageError::NotFound(id.to_string()).into());
+        }
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::load_compatible_from(id, &sessions_dir)
+        let Some(path) = locate_session_file(&sessions_dir, id) else {
+            return Err(StorageError::NotFound(id.to_string()).into());
+        };
+        // Lazy import preserves the tolerant JSONL commit-boundary reader and
+        // leaves source files untouched as rollback data.
+        let data = fs::read(&path).map_err(StorageError::from)?;
+        let mut session = parse_session_at::<M, U, T>(&path, &data, accept_previous_version)?;
+        match database.import_legacy(&path, &data, &session) {
+            Ok(cursor) => session.set_persisted_write_version(Some(cursor.write_version())),
+            Err(SessionError::AlreadyExists { .. }) => return database.load(id),
+            Err(error) => return Err(error),
+        }
+        Ok(session)
     }
 
     pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
@@ -1836,8 +2042,27 @@ where
     }
 
     pub fn list(cwd: &str, dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
+        let database = SessionDatabase::open(dir)?;
+        let imported = database.imported_session_ids()?;
+        let mut summaries = database.list(cwd)?;
+        let database_ids: HashSet<MakiId> = database.persisted_session_ids()?.into_iter().collect();
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::list_in(cwd, &sessions_dir)
+        // During cutover, list only unmigrated legacy sources. Ledger entries,
+        // including tombstones, prevent deleted sessions from resurfacing.
+        summaries.extend(
+            Self::list_in(cwd, &sessions_dir)?
+                .into_iter()
+                .filter(|summary| {
+                    !imported.contains(&summary.id) && !database_ids.contains(&summary.id)
+                }),
+        );
+        summaries.sort_unstable_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.id.as_bytes().cmp(left.id.as_bytes()))
+        });
+        Ok(summaries)
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
@@ -1847,13 +2072,22 @@ where
     }
 
     pub fn latest(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::latest_in(cwd, &sessions_dir)
+        Self::latest_database_or_legacy(cwd, dir, false)
     }
 
     pub fn latest_compatible(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::latest_compatible_in(cwd, &sessions_dir)
+        Self::latest_database_or_legacy(cwd, dir, true)
+    }
+
+    fn latest_database_or_legacy(
+        cwd: &str,
+        dir: &StateDir,
+        accept_previous_version: bool,
+    ) -> Result<Option<Self>, SessionError> {
+        let Some(summary) = Self::list(cwd, dir)?.into_iter().next() else {
+            return Ok(None);
+        };
+        Self::load_database_or_legacy(summary.id, dir, accept_previous_version).map(Some)
     }
 
     pub fn latest_in(cwd: &str, dir: &Path) -> Result<Option<Self>, SessionError> {
@@ -1917,16 +2151,41 @@ where
     }
 
     pub fn delete(id: MakiId, dir: &StateDir) -> Result<(), SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        let session_result = match delete_session_files(id, &sessions_dir) {
-            Ok(true) => remove_from_cwd_index(&sessions_dir, id).map_err(SessionError::from),
-            Ok(false) => match remove_from_cwd_index(&sessions_dir, id) {
-                Ok(()) => Err(StorageError::NotFound(id.to_string()).into()),
-                Err(error) => Err(error.into()),
-            },
-            Err(error) => return Err(error),
+        Self::delete_with_version(id, dir, None)
+    }
+
+    pub fn delete_with_version(
+        id: MakiId,
+        dir: &StateDir,
+        expected_write_version: Option<i64>,
+    ) -> Result<(), SessionError> {
+        Self::delete_impl(id, dir, expected_write_version, false).map(|_| ())
+    }
+
+    pub fn delete_for_recreation(
+        id: MakiId,
+        dir: &StateDir,
+        expected_write_version: Option<i64>,
+    ) -> Result<i64, SessionError> {
+        Self::delete_impl(id, dir, expected_write_version, true)
+    }
+
+    fn delete_impl(
+        id: MakiId,
+        dir: &StateDir,
+        expected_write_version: Option<i64>,
+        allow_missing: bool,
+    ) -> Result<i64, SessionError> {
+        let mut database = SessionDatabase::open(dir)?;
+        let result = match database.delete(id, expected_write_version) {
+            Ok(version) => Ok(version),
+            Err(SessionError::Storage(StorageError::NotFound(_))) if allow_missing => database
+                .tombstone_version(id)?
+                .ok_or_else(|| StorageError::NotFound(id.to_string()).into()),
+            Err(error) => Err(error),
         };
-        finish_delete(id, dir, session_result)
+        database.process_cleanup_jobs()?;
+        result
     }
 
     pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
@@ -1939,6 +2198,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn finish_delete(
     id: MakiId,
     dir: &StateDir,
@@ -2963,6 +3223,27 @@ mod tests {
     }
 
     #[test]
+    fn oversized_newest_archive_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(dir).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(jsonl_path(dir, session.id))
+            .unwrap()
+            .set_len(ARCHIVE_MAX_BYTES + 1)
+            .unwrap();
+        session.replace_messages(vec![user_message("summary")]);
+
+        session.save_to(dir).unwrap();
+
+        assert!(archive_paths(dir, session.id).is_empty());
+    }
+
+    #[test]
     fn delete_removes_archive_dir() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -3330,13 +3611,15 @@ mod tests {
     }
 
     #[test]
-    fn public_delete_retry_cleans_a_stale_cwd_index() {
+    fn public_delete_retry_cleans_outputs_after_database_row_is_gone() {
         let tmp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: TestSession = Session::new("m", "/project");
         session.save(&state_dir).unwrap();
-        let sessions_dir = state_dir.path().join(SESSIONS_DIR);
-        fs::remove_file(jsonl_path(&sessions_dir, session.id)).unwrap();
+        super::SessionDatabase::open(&state_dir)
+            .unwrap()
+            .delete(session.id, None)
+            .unwrap();
         let store = ToolOutputStore::new(state_dir.clone());
         let output = store.put(session.id, "leftover output").unwrap();
 
@@ -3346,11 +3629,6 @@ mod tests {
             error,
             SessionError::Storage(StorageError::NotFound(_))
         ));
-        assert!(
-            !load_cwd_index(&sessions_dir)
-                .values()
-                .any(|indexed| indexed == &session.id.to_string())
-        );
         assert!(matches!(
             store.read(session.id, output.id, 1, 1),
             Err(ToolOutputError::NotFound { .. })

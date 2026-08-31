@@ -29,7 +29,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::id::{MakiId, MakiIdParseError};
-use crate::{StateDir, StorageError, sync_parent_dir};
+use crate::{StateDir, StorageError, lock_session_artifacts, sync_parent_dir};
 
 const TOOL_OUTPUT_DIR: &str = "tool-output";
 const OUTPUT_EXTENSION: &str = "txt";
@@ -263,6 +263,7 @@ impl Drop for StagedOutput {
 
 #[derive(Debug)]
 pub struct ToolOutputSink {
+    state_dir: StateDir,
     file: Option<StagedOutput>,
     directory: OutputDirectory,
     final_name: String,
@@ -323,8 +324,11 @@ impl ToolOutputSink {
         };
         file.file_mut()?.flush()?;
         file.file()?.sync_all()?;
+        // Cleanup and recreation use this same cross-process lock, so an old
+        // generation cannot delete an output while publication is in flight.
+        let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
         self.directory.publish(&mut file, &self.final_name)?;
-        self.directory.sync();
+        self.directory.sync()?;
         Ok(ToolOutputRef {
             id: self.id,
             byte_count: self.byte_count,
@@ -371,7 +375,7 @@ impl OutputDirectory {
         )
         .map_err(std::io::Error::from)?;
         if root_created {
-            let _ = rustix::fs::fsync(&state);
+            rustix::fs::fsync(&state).map_err(std::io::Error::from)?;
         }
 
         let session_name = session_id.to_string();
@@ -384,7 +388,7 @@ impl OutputDirectory {
         )
         .map_err(std::io::Error::from)?;
         if created {
-            let _ = rustix::fs::fsync(&root);
+            rustix::fs::fsync(&root).map_err(std::io::Error::from)?;
         }
         Ok(Self {
             fd,
@@ -589,11 +593,12 @@ impl OutputDirectory {
         let _ = fs::remove_file(self.path.join(name));
     }
 
-    fn sync(&self) {
+    fn sync(&self) -> std::io::Result<()> {
         #[cfg(unix)]
-        let _ = rustix::fs::fsync(&self.fd);
+        rustix::fs::fsync(&self.fd).map_err(std::io::Error::from)?;
         #[cfg(not(unix))]
-        sync_parent_dir(&self.path.join("entry"));
+        crate::sync_parent_dir_durable(&self.path.join("entry")).map_err(std::io::Error::from)?;
+        Ok(())
     }
 
     fn remove_if_created(&mut self) {
@@ -685,6 +690,7 @@ impl ToolOutputStore {
                 }
             };
             return Ok(ToolOutputSink {
+                state_dir: self.state_dir.clone(),
                 file: Some(file),
                 directory,
                 final_name,
@@ -823,6 +829,7 @@ impl ToolOutputStore {
     }
 
     pub fn delete_session(&self, session_id: MakiId) -> Result<(), ToolOutputError> {
+        let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
         delete_session_outputs(&self.state_dir, session_id).map_err(Into::into)
     }
 
@@ -882,6 +889,7 @@ impl ToolOutputStore {
         }
 
         let mut published: Vec<(String, usize)> = Vec::with_capacity(staged.len());
+        let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
         for index in 0..staged.len() {
             let name = output_name(staged[index].0);
             if let Err(error) = directory.publish(&mut staged[index].1, &name) {
@@ -890,12 +898,12 @@ impl ToolOutputStore {
                         directory.remove_created_file(published_name, file);
                     }
                 }
-                directory.sync();
+                let _ = directory.sync();
                 return Err(error.into());
             }
             published.push((name, index));
         }
-        directory.sync();
+        directory.sync()?;
         Ok(())
     }
 
@@ -919,11 +927,15 @@ impl ToolOutputStore {
                 && live.contains(&session_id)
             {
                 let referenced = self.referenced_outputs(session_id);
+                let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
                 removed += self.cleanup_live_session(&entry.path(), now, referenced.as_ref())?;
-            } else if is_stale(&entry.path(), now, self.orphan_grace)?
-                && remove_artifact(&entry.path(), file_type.is_dir())?
-            {
-                removed += 1;
+            } else {
+                let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
+                if is_stale(&entry.path(), now, self.orphan_grace)?
+                    && remove_artifact(&entry.path(), file_type.is_dir())?
+                {
+                    removed += 1;
+                }
             }
         }
 
@@ -957,49 +969,71 @@ impl ToolOutputStore {
 
     fn referenced_outputs(&self, session_id: MakiId) -> Option<HashSet<ToolOutputId>> {
         let sessions_dir = self.state_dir.path().join(crate::sessions::SESSIONS_DIR);
-        let entries = fs::read_dir(&sessions_dir).ok()?;
-        let mut found_session = false;
         let mut referenced = HashSet::new();
-        for entry in entries {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if !path.is_file()
-                || !matches!(
-                    path.extension().and_then(OsStr::to_str),
-                    Some("json" | "jsonl")
-                )
-                || path
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .and_then(|stem| stem.parse::<MakiId>().ok())
-                    != Some(session_id)
-            {
-                continue;
+        let mut found_session = false;
+        // `None` is fail-closed: callers retain every managed output whenever
+        // the canonical reference snapshot cannot be read or parsed.
+        match crate::sessions::SessionDatabase::open(&self.state_dir) {
+            Ok(database) => {
+                let mut valid = true;
+                match database.visit_payload_json(session_id, |payload| {
+                    let Ok(value) = serde_json::from_str(payload) else {
+                        valid = false;
+                        return;
+                    };
+                    collect_output_ids(&value, &mut referenced);
+                }) {
+                    Ok(()) if valid => {
+                        found_session = true;
+                    }
+                    Ok(()) => return None,
+                    Err(crate::sessions::SessionError::Storage(StorageError::NotFound(_))) => {}
+                    Err(_) => return None,
+                }
             }
-            found_session = true;
-            collect_references_from_session_file(&path, &mut referenced)?;
+            Err(_) => return None,
         }
-        if found_session {
-            let archive_dir = sessions_dir
-                .join(crate::sessions::ARCHIVE_DIR)
-                .join(session_id.to_string());
-            match fs::read_dir(archive_dir) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let path = entry.ok()?.path();
-                        if path
-                            .extension()
-                            .is_some_and(|extension| extension == "jsonl")
-                        {
-                            collect_references_from_session_file(&path, &mut referenced)?;
-                        }
+        if !found_session {
+            for entry in fs::read_dir(&sessions_dir).ok()? {
+                let path = entry.ok()?.path();
+                if path.is_file()
+                    && matches!(
+                        path.extension().and_then(OsStr::to_str),
+                        Some("json" | "jsonl")
+                    )
+                    && path
+                        .file_stem()
+                        .and_then(OsStr::to_str)
+                        .and_then(|stem| stem.parse::<MakiId>().ok())
+                        == Some(session_id)
+                {
+                    found_session = true;
+                    collect_references_from_session_file(&path, &mut referenced)?;
+                }
+            }
+        }
+        if !found_session {
+            return None;
+        }
+        let archive_dir = sessions_dir
+            .join(crate::sessions::ARCHIVE_DIR)
+            .join(session_id.to_string());
+        match fs::read_dir(archive_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry.ok()?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                    {
+                        collect_references_from_session_file(&path, &mut referenced)?;
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(_) => return None,
             }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
-        found_session.then_some(referenced)
+        Some(referenced)
     }
 
     fn ensure_size(&self, byte_count: usize) -> Result<(), ToolOutputError> {
@@ -1097,7 +1131,10 @@ pub(crate) fn delete_session_outputs(
             ));
         }
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            crate::sync_parent_dir_io(&path)?;
+            return Ok(());
+        }
         Err(error) => return Err(error),
     }
     #[cfg(unix)]
@@ -1107,7 +1144,7 @@ pub(crate) fn delete_session_outputs(
     }
     match fs::remove_dir_all(&path) {
         Ok(()) => {
-            sync_parent_dir(&path);
+            crate::sync_parent_dir_io(&path)?;
             Ok(())
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -3079,6 +3116,35 @@ mod tests {
 
         assert_eq!(removed, 0);
         assert!(store.output_path(session_id, output.id).exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_fall_back_to_stale_legacy_data_after_database_error() {
+        let (temp, mut store) = test_store();
+        store.orphan_grace = Duration::ZERO;
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        let sessions_dir = state_dir
+            .ensure_subdir(crate::sessions::SESSIONS_DIR)
+            .unwrap();
+        let mut session: Session<Value, Value, Value> = Session::new("model", "/project");
+        let current = store.put(session.id, "current").unwrap();
+        let stale = store.put(session.id, "stale").unwrap();
+        session.push_message(serde_json::json!({"output_ref": current}));
+        session.save(&state_dir).unwrap();
+        let mut legacy: Session<Value, Value, Value> = Session::new("model", "/project");
+        legacy.id = session.id;
+        legacy.push_message(serde_json::json!({"output_ref": stale}));
+        legacy.save_to(&sessions_dir).unwrap();
+        let database = state_dir.path().join(crate::sessions::SESSIONS_DB_FILE);
+        fs::write(&database, b"corrupt").unwrap();
+        let _ = fs::remove_file(format!("{}-wal", database.display()));
+        let _ = fs::remove_file(format!("{}-shm", database.display()));
+
+        let removed = store.cleanup_orphans(&[session.id]).unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(store.output_path(session.id, current.id).exists());
+        assert!(store.output_path(session.id, stale.id).exists());
     }
 
     #[test]
