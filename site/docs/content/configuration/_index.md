@@ -241,6 +241,8 @@ Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `
 
 `~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 
+Development builds compiled with debug assertions use `maki-debug` for every platform directory and `~/.maki-debug/` for the legacy fallback. This keeps global config, sessions, auth, logs, and caches separate from release builds. Per-project `.maki/` directories remain shared.
+
 ### Migrating from ~/.maki/
 
 ```

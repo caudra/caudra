@@ -1388,7 +1388,7 @@ maki.env.state_dir()
 ```
 
 Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
-Typically something like `~/.local/state/maki`.
+Typically `~/.local/state/maki`, or `~/.local/state/maki-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1409,7 +1409,7 @@ maki.env.config_dir()
 ```
 
 Return the directory where maki looks for user configuration files.
-Typically something like `~/.config/maki`.
+Typically `~/.config/maki`, or `~/.config/maki-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1430,7 +1430,7 @@ maki.env.logs_dir()
 ```
 
 Return the directory where maki writes its log files (`maki.log`).
-Typically something like `~/.local/logs/maki`.
+Typically `~/.local/logs/maki`, or `~/.local/logs/maki-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1450,7 +1450,8 @@ local dir = maki.env.logs_dir()
 maki.env.legacy_dir()
 ```
 
-Return the legacy config path (`~/.maki`), if it exists on disk.
+Return the active build's legacy config path, if it exists on disk.
+This is `~/.maki` in release builds and `~/.maki-debug` in debug builds.
 Useful for migration logic. Returns nil when there is no legacy directory.
 
 Requires the `env` [plugin permission](#plugin-permissions).

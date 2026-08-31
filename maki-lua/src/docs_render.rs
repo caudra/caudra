@@ -68,11 +68,13 @@ reference is at the end of this document.
 
 ## Where plugin code goes
 
-Plugins live in the maki config dir. There are two of them, same layout:
+Plugins live in one of two config directories with the same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one instead)
+- `maki.env.config_dir()` - global, every project
 - `<project>/.maki/` - this project only
+
+Release builds normally return `~/.config/maki/`. Debug builds return
+`~/.config/maki-debug/`. An active legacy directory takes precedence.
 
 ```
 init.lua        the only file maki runs; require()s plugins, calls maki.setup()
@@ -87,7 +89,8 @@ that directory, you cannot reach files outside it.
 
 ## Creating a plugin
 
-1. Write the code in `~/.config/maki/lua/<name>.lua`. The `maki` global is
+1. Write the code in `<config>/lua/<name>.lua`, where `<config>` is the global
+   config directory above. The `maki` global is
    already there, nothing to import. For a project-only plugin use
    `<project>/.maki/` here and in every step below.
 
@@ -102,13 +105,13 @@ maki.api.register_tool({
 })
 ```
 
-2. Load it from `~/.config/maki/init.lua`, creating that file if missing:
+2. Load it from `<config>/init.lua`, creating that file if missing:
 
 ```lua
 require("hello")
 ```
 
-3. Grant the permissions it needs in `~/.config/maki/plugin.toml`, creating
+3. Grant the permissions it needs in `<config>/plugin.toml`, creating
    that file if missing. Without the file every gated call is denied.
 
 ```toml
@@ -132,7 +135,7 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 runs, an edited plugin is still the old one.
 
 To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
-in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/maki/`). When
+in the directory `maki.env.logs_dir()` returns. When
 a backtrace comes out useless, start maki with `--no-jit`: plugins then run on
 the interpreter, with full debug info.
 
@@ -164,8 +167,8 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the maki repo holds the plugins that ship with maki, compiled into the
   binary, so a file dropped there does nothing until maki is rebuilt. That
   holds even when the project you have open is a maki checkout.
-- Both global config dirs can exist, and `~/.maki/` wins, so look before you
-  write.
+- The platform config and active legacy directories can both exist. The legacy
+  directory returned by `maki.env.legacy_dir()` wins, so look before you write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with `file_write` and `file_edit`.
 - You cannot run slash commands or restart maki, so ask the user to run

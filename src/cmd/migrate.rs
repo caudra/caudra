@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -456,6 +456,10 @@ fn list_remaining(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+fn legacy_backup_path(legacy: &Path) -> PathBuf {
+    legacy.with_extension("bak")
+}
+
 pub fn xdg() -> Result<()> {
     let Some(legacy) = paths::legacy_home_dir() else {
         println!("Nothing to migrate. You are already using XDG directories.");
@@ -468,7 +472,7 @@ pub fn xdg() -> Result<()> {
         create_directory_tree_durable(dir).with_context(|| format!("create {}", tilde(dir)))?;
     }
 
-    println!("Moving files from ~/.maki/ ...\n");
+    println!("Moving files from {}/ ...\n", tilde(&legacy));
 
     let legacy_state = StateDir::from_path(legacy.clone());
     let target_state = StateDir::from_path(xdg.state.clone());
@@ -489,7 +493,7 @@ pub fn xdg() -> Result<()> {
 
     // Database references, legacy rows, managed outputs, and restore snapshots
     // must cross the cutover together. Copies retain one coherent rollback set
-    // under ~/.maki while the marker makes the XDG copy canonical.
+    // under the legacy directory while the marker makes the XDG copy canonical.
     for subdir in RETAINED_SESSION_STATE {
         let (copied, skipped) = copy_session_state(&legacy, &xdg.state, Path::new(subdir))?;
         if copied > 0 || skipped > 0 {
@@ -548,16 +552,20 @@ pub fn xdg() -> Result<()> {
 
     let remaining = list_remaining(&legacy);
     let has_leftovers = !remaining.is_empty();
-    let backup = legacy.with_file_name(".maki.bak");
+    let backup = legacy_backup_path(&legacy);
     if has_leftovers {
-        create_directory_tree_durable(&backup).context("create ~/.maki.bak/")?;
+        create_directory_tree_durable(&backup)
+            .with_context(|| format!("create {}", tilde(&backup)))?;
         for name in &remaining {
             let src = legacy.join(name);
             let dst = backup.join(name);
             if dst.exists() {
-                println!("  {name} (skipped, already in ~/.maki.bak/)");
+                println!("  {name} (skipped, already in {}/)", tilde(&backup));
             } else if let Err(e) = move_file(&src, &dst) {
-                eprintln!("  warning: could not move {name} to ~/.maki.bak/: {e}");
+                eprintln!(
+                    "  warning: could not move {name} to {}/: {e}",
+                    tilde(&backup)
+                );
             }
         }
     }
@@ -566,7 +574,8 @@ pub fn xdg() -> Result<()> {
     let unresolved = list_remaining(&legacy);
     if !unresolved.is_empty() {
         eprintln!(
-            "  warning: kept ~/.maki/ because these entries could not be moved: {}",
+            "  warning: kept {}/ because these entries could not be moved: {}",
+            tilde(&legacy),
             unresolved.join(", ")
         );
     }
@@ -579,7 +588,7 @@ pub fn xdg() -> Result<()> {
          \x20          sessions, auth, plans, memories, input history, preferences\n\n\
          \x20 Logs     {}\n\n\
          Per-project settings (.maki/ in your repos) are not affected.\n\n\
-         {} ~/.maki/.",
+         {} {}.",
         tilde(&xdg.config),
         tilde(&xdg.state),
         tilde(&xdg.logs),
@@ -588,6 +597,7 @@ pub fn xdg() -> Result<()> {
         } else {
             "Kept"
         },
+        tilde(&legacy),
     );
 
     if has_leftovers {
@@ -612,6 +622,18 @@ pub fn xdg() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    #[test_case(".maki", ".maki.bak"; "release")]
+    #[test_case(".maki-debug", ".maki-debug.bak"; "debug")]
+    fn legacy_backup_preserves_directory_name(legacy_name: &str, expected_name: &str) {
+        let legacy = Path::new("/home/test").join(legacy_name);
+
+        assert_eq!(
+            legacy_backup_path(&legacy),
+            Path::new("/home/test").join(expected_name)
+        );
+    }
 
     #[test]
     fn remaining_files_exclude_retained_session_rollback_state() {

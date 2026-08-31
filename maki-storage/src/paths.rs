@@ -4,8 +4,17 @@ use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
-const FALLBACK_DIR: &str = ".maki";
-const APP_NAME: &str = "maki";
+const fn directory_names(debug_assertions: bool) -> (&'static str, &'static str) {
+    if debug_assertions {
+        ("maki-debug", ".maki-debug")
+    } else {
+        ("maki", ".maki")
+    }
+}
+
+const DIRECTORY_NAMES: (&str, &str) = directory_names(cfg!(debug_assertions));
+const APP_DIR_NAME: &str = DIRECTORY_NAMES.0;
+const LEGACY_DIR_NAME: &str = DIRECTORY_NAMES.1;
 pub const XDG_MIGRATED_MARKER: &str = ".xdg-migrated";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
@@ -153,51 +162,61 @@ fn strip_windows_extended_prefix(canon: &Path) -> PathBuf {
     canon.to_path_buf()
 }
 
-fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
+fn state_logs(s: &impl BaseStrategy, fallback: &Path, app_dir_name: &str) -> (PathBuf, PathBuf) {
     let state_base = s.state_dir();
     let state = state_base
         .as_ref()
-        .map(|d| d.join(APP_NAME))
+        .map(|d| d.join(app_dir_name))
         .unwrap_or_else(|| fallback.to_path_buf());
     let logs = state_base
         .as_ref()
-        .and_then(|d| d.parent().map(|p| p.join("logs").join(APP_NAME)))
+        .and_then(|d| d.parent().map(|p| p.join("logs").join(app_dir_name)))
         .unwrap_or_else(|| fallback.to_path_buf());
     (state, logs)
+}
+
+fn paths_for(
+    strategy: &impl BaseStrategy,
+    fallback_dir: Option<&Path>,
+    app_dir_name: &str,
+) -> Paths {
+    let xdg_config = strategy.config_dir().join(app_dir_name);
+    let (data, cache, config) = match fallback_dir {
+        Some(dir) => (dir.to_path_buf(), dir.to_path_buf(), dir.to_path_buf()),
+        None => (
+            strategy.data_dir().join(app_dir_name),
+            strategy.cache_dir().join(app_dir_name),
+            xdg_config.clone(),
+        ),
+    };
+    let (state, logs) = if fallback_dir.is_some() {
+        (data.clone(), data.clone())
+    } else {
+        state_logs(strategy, &data, app_dir_name)
+    };
+    Paths {
+        config,
+        data,
+        state,
+        logs,
+        cache,
+        xdg_config,
+    }
+}
+
+fn existing_legacy_dir(home: Option<PathBuf>, legacy_dir_name: &str) -> Option<PathBuf> {
+    home.map(|path| path.join(legacy_dir_name))
+        // XDG cutover leaves a durable marker so cached legacy paths cannot
+        // recreate state while new processes select XDG.
+        .filter(|path| path.is_dir() && !path.join(XDG_MIGRATED_MARKER).is_file())
 }
 
 fn resolve() -> Option<&'static Paths> {
     STRATEGY
         .get_or_init(|| {
             let s = etcetera::choose_base_strategy().ok()?;
-            let fallback_dir = etcetera::home_dir()
-                .ok()
-                .map(|h| h.join(FALLBACK_DIR))
-                // XDG cutover leaves a durable marker so cached legacy paths
-                // cannot recreate state while new processes select XDG.
-                .filter(|d| d.is_dir() && !d.join(XDG_MIGRATED_MARKER).is_file());
-            let xdg_config = s.config_dir().join(APP_NAME);
-            let (data, cache, config) = match &fallback_dir {
-                Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
-                None => (
-                    s.data_dir().join(APP_NAME),
-                    s.cache_dir().join(APP_NAME),
-                    xdg_config.clone(),
-                ),
-            };
-            let (state, logs) = if fallback_dir.is_some() {
-                (data.clone(), data.clone())
-            } else {
-                state_logs(&s, &data)
-            };
-            Some(Paths {
-                config,
-                data,
-                state,
-                logs,
-                cache,
-                xdg_config,
-            })
+            let fallback_dir = existing_legacy_dir(etcetera::home_dir().ok(), LEGACY_DIR_NAME);
+            Some(paths_for(&s, fallback_dir.as_deref(), APP_DIR_NAME))
         })
         .as_ref()
 }
@@ -216,18 +235,7 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
 
 fn xdg_only_paths() -> Result<Paths, std::io::Error> {
     let strategy = etcetera::choose_base_strategy().map_err(|_| err())?;
-    let data = strategy.data_dir().join(APP_NAME);
-    let cache = strategy.cache_dir().join(APP_NAME);
-    let config = strategy.config_dir().join(APP_NAME);
-    let (state, logs) = state_logs(&strategy, &data);
-    Ok(Paths {
-        config: config.clone(),
-        data,
-        state,
-        logs,
-        cache,
-        xdg_config: config,
-    })
+    Ok(paths_for(&strategy, None, APP_DIR_NAME))
 }
 
 fn active_path(field: fn(&Paths) -> &Path) -> Result<PathBuf, std::io::Error> {
@@ -272,12 +280,11 @@ pub struct XdgPaths {
 
 pub fn xdg_paths() -> Result<XdgPaths, std::io::Error> {
     let s = etcetera::choose_base_strategy().map_err(|_| err())?;
-    let data = s.data_dir().join(APP_NAME);
-    let (state, logs) = state_logs(&s, &data);
+    let paths = paths_for(&s, None, APP_DIR_NAME);
     Ok(XdgPaths {
-        config: s.config_dir().join(APP_NAME),
-        state,
-        logs,
+        config: paths.config,
+        state: paths.state,
+        logs: paths.logs,
     })
 }
 
@@ -286,23 +293,20 @@ pub fn home() -> Option<PathBuf> {
 }
 
 pub fn legacy_home_dir() -> Option<PathBuf> {
-    etcetera::home_dir()
-        .ok()
-        .map(|h| h.join(FALLBACK_DIR))
-        .filter(|d| d.is_dir() && !d.join(XDG_MIGRATED_MARKER).is_file())
+    existing_legacy_dir(etcetera::home_dir().ok(), LEGACY_DIR_NAME)
 }
 
 /// Candidate config directories for `subdir` from `home` and `xdg_config`.
 /// Pure: no env reads, no process-home fallback. Production callers pass
 /// `config_dir().ok()` as `xdg_config` (which honors `XDG_CONFIG_HOME`, the
-/// `~/.maki` fallback, and the Windows `AppData\Roaming` strategy via
+/// active legacy fallback, and the Windows `AppData\Roaming` strategy via
 /// `resolve()`); tests pass tempdirs.
 pub fn user_config_dirs(
     home: Option<&Path>,
     xdg_config: Option<&Path>,
     subdir: &str,
 ) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(FALLBACK_DIR).join(subdir));
+    let legacy = home.map(|h| h.join(LEGACY_DIR_NAME).join(subdir));
     let xdg = xdg_config.map(|d| d.join(subdir));
     [legacy, xdg].into_iter().flatten().collect()
 }
@@ -310,6 +314,119 @@ pub fn user_config_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestStrategy {
+        home: PathBuf,
+        config: PathBuf,
+        data: PathBuf,
+        cache: PathBuf,
+        state: Option<PathBuf>,
+    }
+
+    impl TestStrategy {
+        fn new(root: &Path, has_state_dir: bool) -> Self {
+            Self {
+                home: root.join("home"),
+                config: root.join("config"),
+                data: root.join("data"),
+                cache: root.join("cache"),
+                state: has_state_dir.then(|| root.join("state")),
+            }
+        }
+    }
+
+    impl BaseStrategy for TestStrategy {
+        fn home_dir(&self) -> &Path {
+            &self.home
+        }
+
+        fn config_dir(&self) -> PathBuf {
+            self.config.clone()
+        }
+
+        fn data_dir(&self) -> PathBuf {
+            self.data.clone()
+        }
+
+        fn cache_dir(&self) -> PathBuf {
+            self.cache.clone()
+        }
+
+        fn state_dir(&self) -> Option<PathBuf> {
+            self.state.clone()
+        }
+
+        fn runtime_dir(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    #[test]
+    fn directory_names_are_isolated_by_build_profile() {
+        assert_eq!(directory_names(false), ("maki", ".maki"));
+        assert_eq!(directory_names(true), ("maki-debug", ".maki-debug"));
+    }
+
+    #[test]
+    fn paths_use_selected_app_directory_name() {
+        let root = tempfile::tempdir().unwrap();
+        let strategy = TestStrategy::new(root.path(), true);
+
+        let paths = paths_for(&strategy, None, "maki-debug");
+
+        assert_eq!(paths.config, root.path().join("config/maki-debug"));
+        assert_eq!(paths.data, root.path().join("data/maki-debug"));
+        assert_eq!(paths.state, root.path().join("state/maki-debug"));
+        assert_eq!(paths.logs, root.path().join("logs/maki-debug"));
+        assert_eq!(paths.cache, root.path().join("cache/maki-debug"));
+        assert_eq!(paths.xdg_config, root.path().join("config/maki-debug"));
+    }
+
+    #[test]
+    fn paths_without_state_directory_use_namespaced_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let strategy = TestStrategy::new(root.path(), false);
+
+        let paths = paths_for(&strategy, None, "maki-debug");
+        let data = root.path().join("data/maki-debug");
+
+        assert_eq!(paths.state, data);
+        assert_eq!(paths.logs, data);
+    }
+
+    #[test]
+    fn debug_legacy_directory_does_not_select_release_directory() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".maki")).unwrap();
+
+        assert_eq!(
+            existing_legacy_dir(Some(home.path().into()), ".maki-debug"),
+            None
+        );
+
+        let debug = home.path().join(".maki-debug");
+        fs::create_dir(&debug).unwrap();
+        assert_eq!(
+            existing_legacy_dir(Some(home.path().into()), ".maki-debug"),
+            Some(debug)
+        );
+    }
+
+    #[test]
+    fn legacy_directory_collapses_all_active_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let strategy = TestStrategy::new(root.path(), true);
+        let legacy = root.path().join("home/.maki-debug");
+
+        let paths = paths_for(&strategy, Some(&legacy), "maki-debug");
+
+        assert_eq!(paths.config, legacy);
+        assert_eq!(paths.data, legacy);
+        assert_eq!(paths.state, legacy);
+        assert_eq!(paths.logs, legacy);
+        assert_eq!(paths.cache, legacy);
+        assert_eq!(paths.xdg_config, root.path().join("config/maki-debug"));
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {
@@ -375,13 +492,13 @@ mod tests {
     #[test]
     fn user_config_dirs_returns_legacy_and_xdg() {
         let home = tempfile::tempdir().unwrap();
-        let xdg = home.path().join(".config").join(APP_NAME);
+        let xdg = home.path().join(".config").join(APP_DIR_NAME);
 
         let dirs = user_config_dirs(Some(home.path()), Some(&xdg), "AGENTS.md");
         assert_eq!(
             dirs,
             vec![
-                home.path().join(FALLBACK_DIR).join("AGENTS.md"),
+                home.path().join(LEGACY_DIR_NAME).join("AGENTS.md"),
                 xdg.join("AGENTS.md"),
             ]
         );
@@ -400,13 +517,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         let dirs = user_config_dirs(Some(home.path()), None, "AGENTS.md");
-        assert_eq!(dirs, vec![home.path().join(FALLBACK_DIR).join("AGENTS.md")]);
+        assert_eq!(
+            dirs,
+            vec![home.path().join(LEGACY_DIR_NAME).join("AGENTS.md")]
+        );
     }
 
     #[test]
     fn user_config_dirs_neither_depends_on_process_env() {
         let home_a = tempfile::tempdir().unwrap();
-        let xdg_a = home_a.path().join(".config").join(APP_NAME);
+        let xdg_a = home_a.path().join(".config").join(APP_DIR_NAME);
 
         let hostile = tempfile::tempdir().unwrap();
 

@@ -238,7 +238,10 @@ mod tests {
         .unwrap();
 
         let global = TempDir::new().unwrap();
-        let global_cmd_dir = global.path().join(".maki/commands");
+        let global_cmd_dir =
+            maki_storage::paths::user_config_dirs(Some(global.path()), None, "commands")
+                .pop()
+                .unwrap();
         fs::create_dir_all(&global_cmd_dir).unwrap();
         fs::write(
             global_cmd_dir.join("overlap.md"),

@@ -295,7 +295,7 @@ pub enum StorageAction {
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
-    /// Migrate files from ~/.maki/ to XDG directories
+    /// Migrate files from the active legacy directory to platform directories
     Xdg,
 }
 

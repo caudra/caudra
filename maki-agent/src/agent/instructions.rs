@@ -342,8 +342,11 @@ mod tests {
     fn load_instructions_includes_global_from_home() {
         let cwd = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".maki")).unwrap();
-        fs::write(home.path().join(".maki").join("AGENTS.md"), "global rules").unwrap();
+        let global = maki_storage::paths::user_config_dirs(Some(home.path()), None, "AGENTS.md")
+            .pop()
+            .unwrap();
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(global, "global rules").unwrap();
 
         let text =
             load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
