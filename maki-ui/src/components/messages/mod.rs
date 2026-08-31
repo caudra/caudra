@@ -897,18 +897,18 @@ impl MessagesPanel {
     /// target for a key that has no pointer to disambiguate it.
     fn pan_range(&self, key: DiagramKey) -> Option<(usize, u16)> {
         let width = self.viewport_width;
-        let (seg_idx, full_width) = self
-            .cache
-            .segments()
-            .iter()
-            .enumerate()
-            .find_map(|(idx, segment)| {
-                if segment.msg_index != Some(key.msg_index) {
-                    return None;
-                }
-                let span = segment.diagrams().iter().find(|span| span.id == key.id)?;
-                Some((idx, span.full_width))
-            })?;
+        let (seg_idx, full_width) =
+            self.cache
+                .segments()
+                .iter()
+                .enumerate()
+                .find_map(|(idx, segment)| {
+                    if segment.msg_index != Some(key.msg_index) {
+                        return None;
+                    }
+                    let span = segment.diagrams().iter().find(|span| span.id == key.id)?;
+                    Some((idx, span.full_width))
+                })?;
         let content = self
             .cache
             .get(seg_idx)

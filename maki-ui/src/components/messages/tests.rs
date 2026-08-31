@@ -3255,7 +3255,10 @@ const NARROW_CHART: &str = "```mermaid\nflowchart TD\n  A[Go] --> B[Ok]\n```";
 #[test]
 fn the_keyboard_skips_a_chart_that_already_fits() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.push(DisplayMessage::new(DisplayRole::Assistant, WIDE_CHART.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        WIDE_CHART.into(),
+    ));
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
         format!("{NARROW_CHART}\n\n{NARROW_CHART}"),
@@ -3270,9 +3273,7 @@ fn the_keyboard_skips_a_chart_that_already_fits() {
         panel.pan_range(wide).is_some_and(|(_, max)| max > 0),
         "the fixture's first chart must overflow"
     );
-    let fitting: Vec<DiagramKey> = (0..2)
-        .map(|id| DiagramKey { msg_index: 1, id })
-        .collect();
+    let fitting: Vec<DiagramKey> = (0..2).map(|id| DiagramKey { msg_index: 1, id }).collect();
     for key in &fitting {
         assert_eq!(
             panel.pan_range(*key).map(|(_, max)| max),
@@ -3282,7 +3283,10 @@ fn the_keyboard_skips_a_chart_that_already_fits() {
     }
 
     let panned = panel.pan_visible_diagram(PAN_STEP_TEST);
-    assert!(panned, "a pannable chart is on screen, so the key must move it");
+    assert!(
+        panned,
+        "a pannable chart is on screen, so the key must move it"
+    );
     assert_eq!(
         panel.diagram_pans.keys().copied().collect::<Vec<_>>(),
         vec![wide],
@@ -3293,7 +3297,10 @@ fn the_keyboard_skips_a_chart_that_already_fits() {
 #[test]
 fn a_chart_that_fits_leaves_the_arrow_keys_alone() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.push(DisplayMessage::new(DisplayRole::Assistant, NARROW_CHART.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        NARROW_CHART.into(),
+    ));
     render(&mut panel, 120, PAN_HEIGHT);
 
     assert!(panel.most_visible_diagram().is_none());

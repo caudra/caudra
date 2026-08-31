@@ -424,7 +424,6 @@ impl Chat {
         self.messages_panel.panned_diagram_count()
     }
 
-
     pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
         self.messages_panel.tool_id_at(row, area)
     }
