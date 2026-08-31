@@ -411,6 +411,20 @@ impl Chat {
         self.messages_panel.clear_hover();
     }
 
+    pub(crate) fn pan_hovered_diagram(&mut self, delta: i32) -> bool {
+        self.messages_panel.pan_hovered_diagram(delta)
+    }
+
+    pub(crate) fn pan_visible_diagram(&mut self, delta: i32) -> bool {
+        self.messages_panel.pan_visible_diagram(delta)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panned_diagram_count(&self) -> usize {
+        self.messages_panel.panned_diagram_count()
+    }
+
+
     pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
         self.messages_panel.tool_id_at(row, area)
     }

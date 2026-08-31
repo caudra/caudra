@@ -9001,3 +9001,95 @@ fn alt_m_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+const PAN_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write store]\n```";
+const CURSOR_PROBE: &str = "abc";
+
+fn app_with_chart() -> App {
+    let mut app = test_app();
+    app.chats[0].push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        PAN_CHART.into(),
+    ));
+    let _ = rendered(&mut app);
+    app
+}
+
+#[test]
+fn shift_arrows_pan_a_wide_diagram() {
+    let mut app = app_with_chart();
+
+    app.update(Msg::Key(kb::PAN_RIGHT.to_key_event()));
+    let _ = rendered(&mut app);
+    assert_eq!(
+        app.chats[0].panned_diagram_count(),
+        1,
+        "shift+right must pan the visible diagram"
+    );
+
+    app.update(Msg::Key(kb::PAN_LEFT.to_key_event()));
+    let _ = rendered(&mut app);
+    assert_eq!(app.chats[0].panned_diagram_count(), 0, "shift+left returns");
+}
+
+#[test]
+fn shift_arrows_still_move_the_cursor_when_no_diagram_is_visible() {
+    let mut app = test_app();
+    for character in CURSOR_PROBE.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    app.update(Msg::Key(kb::PAN_LEFT.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Char('X'))));
+    assert_eq!(app.input_box.buffer.value(), "abXc");
+}
+
+#[test]
+fn plain_arrows_never_pan_a_diagram() {
+    let mut app = app_with_chart();
+    app.update(Msg::Key(key(KeyCode::Right)));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    assert_eq!(
+        app.chats[0].panned_diagram_count(),
+        0,
+        "plain arrows belong to the input box"
+    );
+}
+
+#[test]
+fn a_sideways_wheel_pans_the_diagram_under_the_pointer() {
+    let mut app = app_with_chart();
+    let reachable: Vec<u16> = (0..24)
+        .filter(|&row| {
+            app.update(mouse_event(MouseEventKind::ScrollRight, 5, row));
+            let panned = app.chats[0].panned_diagram_count() > 0;
+            if panned {
+                app.update(mouse_event(MouseEventKind::ScrollLeft, 5, row));
+                assert_eq!(app.chats[0].panned_diagram_count(), 0, "row {row} resets");
+            }
+            panned
+        })
+        .collect();
+
+    assert!(
+        !reachable.is_empty(),
+        "the wheel must reach the diagram rows"
+    );
+    assert!(
+        reachable.len() < 24,
+        "rows outside the diagram must not pan: {reachable:?}"
+    );
+}
+
+#[test]
+fn a_sideways_wheel_over_prose_pans_nothing() {
+    let mut app = test_app();
+    app.chats[0].push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "just some prose".into(),
+    ));
+    let _ = rendered(&mut app);
+    for row in 0..24 {
+        app.update(mouse_event(MouseEventKind::ScrollRight, 5, row));
+    }
+    assert_eq!(app.chats[0].panned_diagram_count(), 0);
+}

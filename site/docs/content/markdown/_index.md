@@ -125,8 +125,11 @@ loops all fall back this way. A half-drawn diagram would be worse than the
 source, so Maki draws only what it fully understands, and it waits for the
 closing fence before laying anything out.
 
-A diagram wider than the transcript clips at the right edge and marks the cut
-with `›`.
+Wide diagrams clip at the edges and mark each cut with `‹` or `›`. Hover one
+and scroll sideways, or press `Shift+Left` and `Shift+Right`, to pan it in
+place. Panning never changes a diagram's height, so the transcript around it
+stays put. The keys move whichever diagram shows the most rows on screen,
+preferring the later message when two are equal.
 
 Set `ui.mermaid = "off"` to leave every mermaid block as code.
 

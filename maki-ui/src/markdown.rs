@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::provenance::LineProvenance;
@@ -205,11 +206,41 @@ pub fn plain_lines(
     lines
 }
 
+/// Where a drawn diagram sits in the painted lines, and how far it may pan.
+/// Rows are indices into [`Painted::lines`], which a diagram never wraps
+/// because the renderer slices it to the viewport first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiagramSpan {
+    pub id: u16,
+    pub rows: Range<usize>,
+    pub full_width: u16,
+}
+
 /// Painted markdown together with the provenance that lets a selection copy
 /// the source instead of the glyphs.
 pub(crate) struct Painted {
     pub lines: Vec<Line<'static>>,
     pub provenance: Vec<LineProvenance>,
+    pub diagrams: Vec<DiagramSpan>,
+}
+
+/// Consecutive rows carrying the same diagram id collapse into one span.
+fn diagram_spans(semantic: &[RLine]) -> Vec<DiagramSpan> {
+    let mut spans: Vec<DiagramSpan> = Vec::new();
+    for (row, line) in semantic.iter().enumerate() {
+        let LineKind::Diagram { id, full_width } = line.kind else {
+            continue;
+        };
+        match spans.last_mut() {
+            Some(last) if last.id == id => last.rows.end = row + 1,
+            _ => spans.push(DiagramSpan {
+                id,
+                rows: row..row + 1,
+                full_width,
+            }),
+        }
+    }
+    spans
 }
 
 /// Paint semantic lines into ratatui lines, splicing the prefix onto
@@ -226,11 +257,16 @@ pub(crate) fn paint_semantic(
         .map(|l| paint_line(l, text_style, &t))
         .collect();
     let mut provenance: Vec<LineProvenance> = semantic.iter().map(line_provenance).collect();
+    let mut diagrams = diagram_spans(semantic);
 
     if lines.is_empty() {
         lines.push(prefix_line(prefix, prefix_style));
         provenance.push(LineProvenance::chrome(lines[0].spans.len()));
-        return Painted { lines, provenance };
+        return Painted {
+            lines,
+            provenance,
+            diagrams,
+        };
     }
 
     // The prefix is UI chrome with no markdown behind it, so it is recorded
@@ -244,9 +280,17 @@ pub(crate) fn paint_semantic(
         let leader = prefix_line(prefix, prefix_style);
         provenance.insert(0, LineProvenance::chrome(leader.spans.len()));
         lines.insert(0, leader);
+        for span in &mut diagrams {
+            span.rows.start += 1;
+            span.rows.end += 1;
+        }
     }
 
-    Painted { lines, provenance }
+    Painted {
+        lines,
+        provenance,
+        diagrams,
+    }
 }
 
 /// Renders markdown and keeps the text the provenance ranges index. That is
@@ -258,12 +302,15 @@ pub(crate) fn text_to_painted(
     prefix_style: Style,
     width: u16,
     max_line_bytes: Option<usize>,
+    diagram_pans: Vec<u16>,
 ) -> (Painted, Arc<str>) {
     let parsed: Arc<str> = match max_line_bytes {
         Some(limit) => render::truncate_long_lines_at(text, limit).as_ref().into(),
         None => text.into(),
     };
-    let semantic = render::Renderer::unwrapped().render(&parsed, width, 0);
+    let semantic = render::Renderer::unwrapped()
+        .with_diagram_pans(diagram_pans)
+        .render(&parsed, width, 0);
     (
         paint_semantic(&semantic, prefix, text_style, prefix_style),
         parsed,
@@ -305,6 +352,7 @@ pub fn text_to_lines(
         prefix_style,
         width,
         max_line_bytes,
+        Vec::new(),
     )
     .0
     .lines

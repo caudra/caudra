@@ -137,6 +137,18 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "PageDown",
     };
+    /// Shift is the only free arrow modifier: plain, Ctrl, Alt and Super all
+    /// move the input cursor, and neither text buffer inspects Shift.
+    pub const PAN_LEFT: Bind = Bind {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::SHIFT,
+        label: "Shift+Left",
+    };
+    pub const PAN_RIGHT: Bind = Bind {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers::SHIFT,
+        label: "Shift+Right",
+    };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
@@ -473,6 +485,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
         description: "Scroll half page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::PAN_LEFT.label, key::PAN_RIGHT.label),
+        description: "Pan a wide diagram left / right",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

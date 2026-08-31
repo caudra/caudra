@@ -95,6 +95,8 @@ pub(crate) use session::{
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+/// Columns a diagram travels per pan keystroke or wheel notch.
+const PAN_STEP: i32 = 4;
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
@@ -827,6 +829,13 @@ impl App {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(-half);
             return Some(vec![]);
+        }
+        // Only claimed when a diagram actually moves, so the binding stays
+        // out of the way in a transcript that has none.
+        for (bind, delta) in [(key::PAN_LEFT, -PAN_STEP), (key::PAN_RIGHT, PAN_STEP)] {
+            if bind.matches(key) && self.active_chat().pan_visible_diagram(delta) {
+                return Some(vec![]);
+            }
         }
         if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();

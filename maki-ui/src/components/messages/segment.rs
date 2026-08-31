@@ -1,3 +1,4 @@
+use crate::markdown::DiagramSpan;
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
@@ -53,6 +54,9 @@ pub(super) struct Segment {
     /// Set only for segments rendered from markdown. Selection uses it to
     /// copy the source; without it copy falls back to scraping cells.
     provenance: Option<Provenance>,
+    /// Drawn diagrams in `lines`, so a hover or a pan can find one by row.
+    /// Like `provenance`, cleared by `set_lines` and restored after it.
+    diagrams: Vec<DiagramSpan>,
     pub search_text: String,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
@@ -141,8 +145,22 @@ impl Segment {
         self.provenance = provenance;
     }
 
+    pub fn diagrams(&self) -> &[DiagramSpan] {
+        &self.diagrams
+    }
+
+    pub fn set_diagrams(&mut self, diagrams: Vec<DiagramSpan>) {
+        self.diagrams = diagrams;
+    }
+
+    /// The diagram drawn on `line`, if any.
+    pub fn diagram_at_line(&self, line: usize) -> Option<&DiagramSpan> {
+        self.diagrams.iter().find(|span| span.rows.contains(&line))
+    }
+
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
+        self.diagrams.clear();
         // Line indices moved, so any provenance recorded for the old vector
         // no longer lines up.
         self.provenance = None;

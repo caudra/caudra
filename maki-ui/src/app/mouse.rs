@@ -308,6 +308,19 @@ impl App {
                 self.update_input_hover(event.row, event.column);
                 self.update_transcript_hover(event.row, event.column);
             }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                if self.has_modal_overlay() {
+                    return Vec::new();
+                }
+                // Hover decides the target, so a sideways wheel only reaches
+                // the diagram the pointer is actually over.
+                self.update_transcript_hover(event.row, event.column);
+                let delta = match event.kind {
+                    MouseEventKind::ScrollLeft => -super::PAN_STEP,
+                    _ => super::PAN_STEP,
+                };
+                self.chats[self.active_chat].pan_hovered_diagram(delta);
+            }
             _ => {}
         }
         Vec::new()

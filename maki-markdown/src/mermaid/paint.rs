@@ -195,11 +195,24 @@ pub fn paint(graph: &Graph, layout: &Layout) -> Canvas {
     for edge in &layout.edges {
         draw_edge(&mut canvas, edge);
     }
+    // Heads go on after every line, because a line says where an edge runs
+    // while a head says which way it points. One edge joining a border must
+    // not cost another edge its arrow.
+    for edge in &layout.edges {
+        draw_arrow(&mut canvas, edge);
+    }
     // Ornaments carry the node's shape, so they outrank a line crossing the
     // cell they sit on. In a left-to-right chart an edge leaves a decision
     // exactly where its cap goes.
     for placed in &layout.nodes {
         draw_ornaments(&mut canvas, graph.nodes[placed.node].shape, placed);
+    }
+    // Labels are text, so they outrank every line they cross. Layout has
+    // already nudged them clear of the boxes and of each other.
+    for edge in &layout.edges {
+        if let Some(label) = &edge.label {
+            write_text(&mut canvas, label.x, label.y, &label.text, Role::Label);
+        }
     }
     // Titles go on last: an edge leaving a subgraph crosses the frame, and a
     // readable name is worth more than the few cells of line it covers.
@@ -329,19 +342,19 @@ fn draw_edge(canvas: &mut Canvas, edge: &super::layout::PlacedEdge) {
             }
         }
     }
+}
 
-    if let Some((x, y, arrow)) = edge.arrow {
-        let head = match arrow {
-            Arrow::Up => '▲',
-            Arrow::Down => '▼',
-            Arrow::Left => '◀',
-            Arrow::Right => '▶',
-        };
-        canvas.put(x, y, head, Role::Edge);
-    }
-    if let Some(label) = &edge.label {
-        write_text(canvas, label.x, label.y, &label.text, Role::Label);
-    }
+fn draw_arrow(canvas: &mut Canvas, edge: &super::layout::PlacedEdge) {
+    let Some((x, y, arrow)) = edge.arrow else {
+        return;
+    };
+    let head = match arrow {
+        Arrow::Up => '▲',
+        Arrow::Down => '▼',
+        Arrow::Left => '◀',
+        Arrow::Right => '▶',
+    };
+    canvas.put(x, y, head, Role::Edge);
 }
 
 #[cfg(test)]
@@ -395,6 +408,27 @@ mod tests {
     fn an_edge_leaving_a_decision_does_not_erase_its_cap() {
         let art = render("flowchart LR\n  A{Ok?} --> B[Yes]");
         assert!(art.contains(DECISION_CAPS.1), "{art}");
+    }
+
+    /// A returning edge leaves the same border an incoming edge arrives at,
+    /// and its line used to erase the arrow head that was already there.
+    #[test]
+    fn a_returning_edge_does_not_erase_the_arrow_it_crosses() {
+        let art = render("flowchart LR\n A[Run] --> B{Pass?}\n B -->|No| C[Debug]\n C --> A");
+        let heads = art
+            .chars()
+            .filter(|ch| matches!(ch, '\u{25b6}' | '\u{25c0}' | '\u{25b2}' | '\u{25bc}'))
+            .count();
+        assert_eq!(heads, 3, "every edge keeps its head: {art}");
+    }
+
+    #[test]
+    fn two_branch_labels_stay_whole() {
+        let art = render(
+            "flowchart LR\n A[Run] --> B{Pass?}\n B -->|No| C[Debug]\n C --> A\n B -->|Yes| D[Ship]",
+        );
+        assert_eq!(art.matches("Yes").count(), 1, "{art}");
+        assert_eq!(art.matches("No").count(), 1, "{art}");
     }
 
     #[test]

@@ -38,6 +38,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+A` | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
 | `Ctrl+U` / `PageDown` | Scroll half page up / down |
+| `Shift+Left` / `Shift+Right` | Pan a wide diagram left / right |
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |

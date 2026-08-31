@@ -18,6 +18,13 @@ const NODE_GAP: usize = 2;
 const LABEL_OFFSET: usize = 1;
 const ORDER_PASSES: usize = 6;
 const ALIGN_PASSES: usize = 4;
+/// Blank columns kept either side of an edge label so two of them never read
+/// as one word.
+const LABEL_CLEARANCE: usize = 1;
+/// How far a label may be nudged across the flow before it is left where it
+/// started. Past this it is further from its own edge than from someone
+/// else's, which is worse than the overlap it is avoiding.
+const LABEL_NUDGE_LIMIT: isize = 8;
 /// A cluster border plus the blank ring that keeps it off its members.
 const CLUSTER_PAD: usize = 2;
 
@@ -724,7 +731,8 @@ impl<'a> Builder<'a> {
             .collect();
         nodes.sort_by_key(|placed| placed.node);
 
-        let edges = self.assemble(routes, &mapper);
+        let mut edges = self.assemble(routes, &mapper);
+        place_labels(&mut edges, &nodes, self.vertical);
         let clusters = self.enclose(bands, &mapper);
         let reach = |axis: fn(usize, usize) -> usize| {
             clusters
@@ -838,6 +846,75 @@ impl<'a> Builder<'a> {
             });
         }
         edges
+    }
+}
+
+/// Half-open rectangle used only to keep labels off each other and off the
+/// boxes.
+struct Occupied {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Occupied {
+    fn hits(&self, x: usize, y: usize, width: usize) -> bool {
+        x < self.x + self.width && self.x < x + width && y < self.y + self.height && self.y <= y
+    }
+}
+
+/// Edge labels are the only text that can land on top of other text, so they
+/// are positioned after everything else and nudged across the flow until they
+/// sit clear. Routing decides where a label wants to go, which is why two
+/// edges leaving one decision can both ask for the same cell.
+fn place_labels(edges: &mut [PlacedEdge], nodes: &[PlacedNode], vertical: bool) {
+    let mut taken: Vec<Occupied> = nodes
+        .iter()
+        .map(|node| Occupied {
+            x: node.x,
+            y: node.y,
+            width: node.width,
+            height: node.height,
+        })
+        .collect();
+
+    for edge in edges.iter_mut() {
+        let Some(label) = edge.label.as_mut() else {
+            continue;
+        };
+        // The clearance is carried in the test rectangle rather than in the
+        // label's own position, so a label at the canvas edge is not pushed
+        // off it.
+        let left = label.x.saturating_sub(LABEL_CLEARANCE);
+        let width = label.text.width() + LABEL_CLEARANCE + (label.x - left);
+
+        let mut spot = None;
+        for step in (0..=LABEL_NUDGE_LIMIT).flat_map(|step| [step, -step]) {
+            // A vertical chart writes labels beside the channel and a
+            // horizontal one above it, so each nudges along its free axis.
+            let (x, y) = match vertical {
+                true => (left.checked_add_signed(step), Some(label.y)),
+                false => (Some(left), label.y.checked_add_signed(step)),
+            };
+            let (Some(x), Some(y)) = (x, y) else {
+                continue;
+            };
+            if !taken.iter().any(|rect| rect.hits(x, y, width)) {
+                spot = Some((x, y));
+                break;
+            }
+        }
+
+        let (x, y) = spot.unwrap_or((left, label.y));
+        label.x = x + (label.x - left);
+        label.y = y;
+        taken.push(Occupied {
+            x,
+            y,
+            width,
+            height: 1,
+        });
     }
 }
 
@@ -999,6 +1076,55 @@ mod tests {
 
     fn place(source: &str) -> Layout {
         layout(&parse::parse(source).expect("fixture should parse"))
+    }
+
+    /// A decision with two labelled branches used to place both labels in the
+    /// same gap, so one overwrote the other.
+    const BRANCHES: &str = "flowchart LR\n A{Ok?} -->|No| B[Fix]\n A -->|Yes| C[Ship]";
+    /// The label sits in a gap that a returning edge also runs through.
+    const LOOPING: &str =
+        "flowchart LR\n A[Run] --> B{Pass?}\n B -->|No| C[Debug]\n C --> A\n B -->|Yes| D[Ship]";
+
+    fn label_rects(layout: &Layout) -> Vec<(usize, usize, usize, &str)> {
+        layout
+            .edges
+            .iter()
+            .filter_map(|edge| edge.label.as_ref())
+            .map(|label| (label.x, label.y, label.text.width(), label.text.as_str()))
+            .collect()
+    }
+
+    #[test_case(BRANCHES ; "two_branches_out_of_one_decision")]
+    #[test_case(LOOPING  ; "a_branch_beside_a_returning_edge")]
+    #[test_case(DIAMOND  ; "a_diamond")]
+    fn edge_labels_never_share_a_cell(source: &str) {
+        let layout = place(source);
+        let labels = label_rects(&layout);
+        for (i, &(ax, ay, aw, at)) in labels.iter().enumerate() {
+            for &(bx, by, bw, bt) in &labels[i + 1..] {
+                assert!(
+                    ay != by || ax + aw <= bx || bx + bw <= ax,
+                    "{at:?} and {bt:?} overlap in {source:?}: {labels:?}"
+                );
+            }
+        }
+    }
+
+    #[test_case(BRANCHES ; "two_branches_out_of_one_decision")]
+    #[test_case(LOOPING  ; "a_branch_beside_a_returning_edge")]
+    fn an_edge_label_never_lands_on_a_box(source: &str) {
+        let layout = place(source);
+        for (x, y, width, text) in label_rects(&layout) {
+            for node in &layout.nodes {
+                assert!(
+                    x + width <= node.x
+                        || node.x + node.width <= x
+                        || y < node.y
+                        || node.y + node.height <= y,
+                    "{text:?} lands on a box in {source:?}"
+                );
+            }
+        }
     }
 
     fn overlaps(a: &PlacedNode, b: &PlacedNode) -> bool {

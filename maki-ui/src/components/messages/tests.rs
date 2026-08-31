@@ -2964,3 +2964,339 @@ fn replace_past_the_end_is_a_noop() {
     assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
     assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
 }
+
+const WIDE_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write to store]\n```";
+const PAN_WIDTH: u16 = 40;
+const PAN_HEIGHT: u16 = 20;
+
+fn panel_with_chart() -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        WIDE_CHART.into(),
+    ));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    panel
+}
+
+fn diagram_text(panel: &MessagesPanel) -> Vec<String> {
+    let segment = panel.cache.get(0).expect("one segment");
+    segment
+        .diagrams()
+        .iter()
+        .flat_map(|span| span.rows.clone())
+        .filter_map(|row| segment.lines().get(row))
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn a_wide_chart_records_a_diagram_span_wider_than_the_viewport() {
+    let panel = panel_with_chart();
+    let spans = panel.cache.get(0).expect("one segment").diagrams();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].id, 0);
+    assert!(
+        spans[0].full_width > PAN_WIDTH,
+        "fixture must overflow: {spans:?}"
+    );
+    assert!(!spans[0].rows.is_empty());
+}
+
+#[test]
+fn panning_moves_the_window_and_keeps_the_height() {
+    let mut panel = panel_with_chart();
+    let before = diagram_text(&panel);
+    let height: u16 = panel.segment_heights().iter().sum();
+
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+
+    let after = diagram_text(&panel);
+    assert_ne!(before, after, "pan must move the window");
+    assert_eq!(before.len(), after.len(), "pan must not change row count");
+    assert_eq!(
+        height,
+        panel.segment_heights().iter().sum::<u16>(),
+        "pan must not change segment height"
+    );
+}
+
+const PAN_STEP_TEST: i32 = 4;
+
+#[test]
+fn panning_left_at_the_origin_does_nothing() {
+    let mut panel = panel_with_chart();
+    assert!(!panel.pan_visible_diagram(-PAN_STEP_TEST));
+}
+
+#[test]
+fn panning_right_stops_at_the_far_edge() {
+    let mut panel = panel_with_chart();
+    for _ in 0..200 {
+        if !panel.pan_visible_diagram(PAN_STEP_TEST) {
+            break;
+        }
+        render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    }
+    assert!(
+        !panel.pan_visible_diagram(PAN_STEP_TEST),
+        "pan must clamp at the far edge"
+    );
+    let rows = diagram_text(&panel);
+    assert!(
+        rows.iter().all(|row| !row.ends_with('›')),
+        "the far edge must be fully revealed: {rows:?}"
+    );
+}
+
+#[test]
+fn a_panned_chart_returns_to_the_origin() {
+    let mut panel = panel_with_chart();
+    let origin = diagram_text(&panel);
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    assert!(panel.pan_visible_diagram(-PAN_STEP_TEST));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    assert_eq!(diagram_text(&panel), origin);
+    assert!(
+        panel.diagram_pans.is_empty(),
+        "returning to the origin must drop the entry"
+    );
+}
+
+#[test]
+fn a_transcript_without_a_diagram_refuses_to_pan() {
+    let mut panel = panel_with_msgs(&["just some prose"], PAN_WIDTH, PAN_HEIGHT);
+    assert!(!panel.pan_visible_diagram(PAN_STEP_TEST));
+    assert!(!panel.pan_visible_diagram(-PAN_STEP_TEST));
+}
+
+#[test]
+fn hovering_a_diagram_row_targets_it() {
+    let mut panel = panel_with_chart();
+    let area = Rect::new(0, 0, PAN_WIDTH, PAN_HEIGHT);
+    let segment = panel.cache.get(0).expect("one segment");
+    let content_start = segment.chrome(panel.viewport_width).content_start();
+    let row = content_start + segment.diagrams()[0].rows.start as u16;
+
+    panel.update_hover(row, 1, area, false);
+    assert!(
+        matches!(panel.hover, Some(HoverTarget::Diagram(_))),
+        "{:?}",
+        panel.hover
+    );
+
+    panel.update_hover(0, 1, area, false);
+    assert!(
+        !matches!(panel.hover, Some(HoverTarget::Diagram(_))),
+        "a prose row is not a diagram: {:?}",
+        panel.hover
+    );
+}
+
+#[test]
+fn a_hovered_diagram_pans_and_an_unhovered_one_does_not() {
+    let mut panel = panel_with_chart();
+    let area = Rect::new(0, 0, PAN_WIDTH, PAN_HEIGHT);
+    assert!(!panel.pan_hovered_diagram(PAN_STEP_TEST), "no hover yet");
+
+    let segment = panel.cache.get(0).expect("one segment");
+    let content_start = segment.chrome(panel.viewport_width).content_start();
+    let row = content_start + segment.diagrams()[0].rows.start as u16;
+    panel.update_hover(row, 1, area, false);
+    assert!(panel.pan_hovered_diagram(PAN_STEP_TEST));
+}
+
+#[test]
+fn copying_a_panned_diagram_still_yields_the_source() {
+    let mut panel = panel_with_chart();
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+
+    let total: u16 = panel.segment_heights().iter().sum();
+    let area = Rect::new(0, 0, PAN_WIDTH, total.max(1));
+    let sel = make_sel(area, (0, 0), ((total.saturating_sub(1)) as u32, 0));
+    let copied = panel.extract_selection_text(&sel, area);
+    assert!(copied.contains("flowchart LR"), "{copied:?}");
+    assert!(copied.contains("```mermaid"), "{copied:?}");
+}
+
+const PROSE: &str = "Here is a fairly long sentence of prose that will certainly wrap across several rows at this width, which is exactly the case that separates a naive row calculation from a correct one.";
+
+#[test]
+fn the_keyboard_finds_a_diagram_below_wrapping_prose() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "draw it".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{PROSE}\n\n{WIDE_CHART}"),
+    ));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+
+    assert!(
+        !panel
+            .cache
+            .get(1)
+            .expect("assistant segment")
+            .diagrams()
+            .is_empty(),
+        "fixture must contain a diagram"
+    );
+    assert!(
+        panel.most_visible_diagram().is_some(),
+        "the keyboard must find the diagram under wrapping prose"
+    );
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+}
+
+#[test]
+fn the_keyboard_and_the_pointer_agree_on_the_target() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "draw it".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{PROSE}\n\n{WIDE_CHART}"),
+    ));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    let area = Rect::new(0, 0, PAN_WIDTH, PAN_HEIGHT);
+
+    let hovered: Vec<DiagramKey> = (0..PAN_HEIGHT)
+        .filter_map(|row| {
+            panel.update_hover(row, 1, area, false);
+            match panel.hover {
+                Some(HoverTarget::Diagram(key)) => Some(key),
+                _ => None,
+            }
+        })
+        .collect();
+
+    assert!(!hovered.is_empty(), "the pointer must reach the diagram");
+    assert_eq!(
+        panel.most_visible_diagram(),
+        Some(hovered[0]),
+        "keyboard target must be the diagram the pointer sees"
+    );
+}
+
+/// Enough wrapped prose above the chart that a row calculation which mistakes
+/// line indices for display rows lands outside the viewport entirely.
+#[test]
+fn the_keyboard_finds_a_chart_under_heavily_wrapped_prose() {
+    let prose = (0..24)
+        .map(|i| format!("Paragraph {i} is long enough to wrap several times at this narrow width, which is what pushes the chart away from its line index."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{prose}\n\n{WIDE_CHART}"),
+    ));
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+    panel.enable_auto_scroll();
+    render(&mut panel, PAN_WIDTH, PAN_HEIGHT);
+
+    let area = Rect::new(0, 0, PAN_WIDTH, PAN_HEIGHT);
+    let seen: Vec<DiagramKey> = (0..PAN_HEIGHT)
+        .filter_map(|row| {
+            panel.update_hover(row, 1, area, false);
+            match panel.hover {
+                Some(HoverTarget::Diagram(key)) => Some(key),
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(
+        !seen.is_empty(),
+        "the chart must be on screen to be pannable"
+    );
+
+    assert_eq!(
+        panel.most_visible_diagram(),
+        Some(seen[0]),
+        "the keyboard must agree with the pointer"
+    );
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+}
+
+#[test]
+fn two_equally_visible_charts_hand_the_keys_to_the_later_one() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        WIDE_CHART.into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        WIDE_CHART.into(),
+    ));
+    render(&mut panel, PAN_WIDTH, 60);
+
+    let key = panel.most_visible_diagram().expect("a chart is on screen");
+    assert_eq!(key.msg_index, 1, "the later message wins an equal split");
+
+    assert!(panel.pan_visible_diagram(PAN_STEP_TEST));
+    assert_eq!(
+        panel.diagram_pans.keys().copied().collect::<Vec<_>>(),
+        vec![key],
+        "only the targeted chart moves"
+    );
+}
+
+const NARROW_CHART: &str = "```mermaid\nflowchart TD\n  A[Go] --> B[Ok]\n```";
+
+/// The pointer can single out a chart, a key cannot. Targeting the chart with
+/// the most rows strands the keys when that chart already fits.
+#[test]
+fn the_keyboard_skips_a_chart_that_already_fits() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, WIDE_CHART.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("{NARROW_CHART}\n\n{NARROW_CHART}"),
+    ));
+    render(&mut panel, PAN_WIDTH, 60);
+
+    let wide = DiagramKey {
+        msg_index: 0,
+        id: 0,
+    };
+    assert!(
+        panel.pan_range(wide).is_some_and(|(_, max)| max > 0),
+        "the fixture's first chart must overflow"
+    );
+    let fitting: Vec<DiagramKey> = (0..2)
+        .map(|id| DiagramKey { msg_index: 1, id })
+        .collect();
+    for key in &fitting {
+        assert_eq!(
+            panel.pan_range(*key).map(|(_, max)| max),
+            Some(0),
+            "the later message's charts must already fit, so rows alone would strand the keys"
+        );
+    }
+
+    let panned = panel.pan_visible_diagram(PAN_STEP_TEST);
+    assert!(panned, "a pannable chart is on screen, so the key must move it");
+    assert_eq!(
+        panel.diagram_pans.keys().copied().collect::<Vec<_>>(),
+        vec![wide],
+        "the keys must reach the only chart that can move"
+    );
+}
+
+#[test]
+fn a_chart_that_fits_leaves_the_arrow_keys_alone() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, NARROW_CHART.into()));
+    render(&mut panel, 120, PAN_HEIGHT);
+
+    assert!(panel.most_visible_diagram().is_none());
+    assert!(!panel.pan_visible_diagram(PAN_STEP_TEST));
+    assert!(!panel.pan_visible_diagram(-PAN_STEP_TEST));
+}

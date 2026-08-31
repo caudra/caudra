@@ -20,7 +20,9 @@ use super::{
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
-use crate::markdown::{hr_line, plain_lines, text_to_lines, text_to_painted, truncate_output};
+use crate::markdown::{
+    DiagramSpan, hr_line, plain_lines, text_to_lines, text_to_painted, truncate_output,
+};
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
@@ -57,6 +59,16 @@ enum HoverTarget {
     CachedThinking(usize),
     StreamingThinking,
     Tool { id: String, feedback: HoverFeedback },
+    Diagram(DiagramKey),
+}
+
+/// Identifies one drawn diagram across rebuilds. The message index is the
+/// same backlink segments already carry, and `id` counts diagrams within
+/// that message, so both survive a reflow.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DiagramKey {
+    msg_index: usize,
+    id: u16,
 }
 
 /// A rendered segment handed to the review modal. `provenance` is absent for
@@ -106,6 +118,9 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
+    /// Horizontal offset per drawn diagram. Absent means unpanned, so the
+    /// map stays empty for the overwhelming majority of transcripts.
+    diagram_pans: HashMap<DiagramKey, u16>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
@@ -160,6 +175,7 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
+            diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
@@ -762,6 +778,11 @@ impl MessagesPanel {
         }
         let Some(tool_id) = segment.tool_id.as_deref() else {
             let msg_index = segment.msg_index?;
+            // A diagram row wins over the thinking toggle: it is the only
+            // target inside a text segment that reacts to the pointer.
+            if let Some(key) = self.diagram_key_at(segment, msg_index, rel, width) {
+                return Some(HoverTarget::Diagram(key));
+            }
             return self
                 .messages
                 .get(msg_index)
@@ -812,8 +833,132 @@ impl MessagesPanel {
             Some(HoverTarget::CachedThinking(_))
             | Some(HoverTarget::StreamingThinking)
             | Some(HoverTarget::Tool { .. })
+            | Some(HoverTarget::Diagram(_))
             | None => None,
         }
+    }
+
+    /// The diagram drawn on `rel`, a row relative to the segment. Diagram
+    /// rows are pre-sliced to the viewport, so the display row maps straight
+    /// onto a line index.
+    fn diagram_key_at(
+        &self,
+        segment: &Segment,
+        msg_index: usize,
+        rel: u16,
+        width: u16,
+    ) -> Option<DiagramKey> {
+        if segment.diagrams().is_empty() {
+            return None;
+        }
+        let line = segment.source_line_at(rel, width)?;
+        segment.diagram_at_line(line).map(|span| DiagramKey {
+            msg_index,
+            id: span.id,
+        })
+    }
+
+    /// The diagram the keyboard pans: whichever shows the most rows, and the
+    /// later message when two show the same. Rows resolve through the lookup
+    /// the pointer uses, because a line index is not a display row once
+    /// anything above the diagram wraps.
+    fn most_visible_diagram(&self) -> Option<DiagramKey> {
+        let width = self.viewport_width;
+        let mut rows: Vec<(DiagramKey, u16)> = Vec::new();
+        for offset in 0..self.viewport_height {
+            let doc_row = self.scroll_top as u32 + offset as u32;
+            let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
+                continue;
+            };
+            let Some(key) = segment
+                .msg_index
+                .zip(u16::try_from(doc_row - start).ok())
+                .and_then(|(msg_index, rel)| self.diagram_key_at(segment, msg_index, rel, width))
+            else {
+                continue;
+            };
+            match rows.iter_mut().find(|(seen, _)| *seen == key) {
+                Some((_, count)) => *count += 1,
+                None => rows.push((key, 1)),
+            }
+        }
+        // A chart that already fits has nothing to show for a keypress, and
+        // targeting it would strand the keys on a wide chart further up.
+        rows.retain(|(key, _)| self.pan_range(*key).is_some_and(|(_, max)| max > 0));
+        // Rows are collected top down, so taking the last of the equal maxima
+        // is what breaks a tie toward the later message.
+        rows.into_iter()
+            .reduce(|best, next| if next.1 >= best.1 { next } else { best })
+            .map(|(key, _)| key)
+    }
+
+    /// The segment holding a chart and how far it may travel. The ceiling is
+    /// zero for a chart that already fits, which is what makes it a poor
+    /// target for a key that has no pointer to disambiguate it.
+    fn pan_range(&self, key: DiagramKey) -> Option<(usize, u16)> {
+        let width = self.viewport_width;
+        let (seg_idx, full_width) = self
+            .cache
+            .segments()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, segment)| {
+                if segment.msg_index != Some(key.msg_index) {
+                    return None;
+                }
+                let span = segment.diagrams().iter().find(|span| span.id == key.id)?;
+                Some((idx, span.full_width))
+            })?;
+        let content = self
+            .cache
+            .get(seg_idx)
+            .map_or(width, |segment| segment.content_width(width));
+        Some((
+            seg_idx,
+            maki_markdown::render::diagram_max_pan(full_width, content),
+        ))
+    }
+
+    /// Scrolls a drawn diagram sideways, reporting whether anything moved.
+    fn pan_diagram(&mut self, key: DiagramKey, delta: i32) -> bool {
+        let width = self.viewport_width;
+        let Some((seg_idx, ceiling)) = self.pan_range(key) else {
+            return false;
+        };
+
+        let current = self.diagram_pans.get(&key).copied().unwrap_or(0);
+        let next = (current as i32 + delta).clamp(0, ceiling as i32) as u16;
+        if next == current {
+            return false;
+        }
+        match next {
+            0 => self.diagram_pans.remove(&key),
+            _ => self.diagram_pans.insert(key, next),
+        };
+        self.reflow_text_segment(seg_idx, width);
+        self.cache.update_margins(width);
+        true
+    }
+
+    /// Pans the diagram under the pointer. Used by horizontal wheel events.
+    pub(crate) fn pan_hovered_diagram(&mut self, delta: i32) -> bool {
+        let Some(HoverTarget::Diagram(key)) = self.hover else {
+            return false;
+        };
+        self.pan_diagram(key, delta)
+    }
+
+    /// Pans without a pointer, for the keyboard bindings.
+    pub(crate) fn pan_visible_diagram(&mut self, delta: i32) -> bool {
+        let Some(key) = self.most_visible_diagram() else {
+            return false;
+        };
+        self.pan_diagram(key, delta)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panned_diagram_count(&self) -> usize {
+        self.diagram_pans.len()
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
@@ -1641,10 +1786,11 @@ impl MessagesPanel {
                     self.cache.push(segment);
                     continue;
                 }
-                let built = build_message_lines(msg, self.viewport_width);
+                let built = build_message_lines(msg, self.viewport_width, self.pans_for(i));
                 let mut segment = Segment::with_lines(built.lines, built.search_text, Some(i));
                 segment.set_kind(segment_kind(&msg.role));
                 segment.set_provenance(built.provenance);
+                segment.set_diagrams(built.diagrams);
                 self.cache.push(segment);
             }
         }
@@ -1780,13 +1926,36 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let built = build_message_lines(msg, width);
+        let built = build_message_lines(msg, width, self.pans_for(msg_idx));
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
         seg.set_lines(built.lines);
         seg.set_provenance(built.provenance);
+        seg.set_diagrams(built.diagrams);
         seg.search_text = built.search_text;
+    }
+
+    /// Pans for one message, indexed by diagram id. Empty when nothing in
+    /// the message has been panned, which is the usual case.
+    fn pans_for(&self, msg_index: usize) -> Vec<u16> {
+        let highest = self
+            .diagram_pans
+            .keys()
+            .filter(|key| key.msg_index == msg_index)
+            .map(|key| key.id)
+            .max();
+        let Some(highest) = highest else {
+            return Vec::new();
+        };
+        (0..=highest)
+            .map(|id| {
+                self.diagram_pans
+                    .get(&DiagramKey { msg_index, id })
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect()
     }
 }
 
@@ -1855,7 +2024,7 @@ fn segment_styles(kind: SegmentKind, accent: Color) -> (Option<Style>, Option<St
 /// given width, returning the lines and search text. Shared by
 /// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
 /// messages) so both paths produce identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
+fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
     let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
     let style = match &msg.role {
         DisplayRole::User => user_style(),
@@ -1879,9 +2048,10 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
             search_text: review_search_text(&notes),
             lines,
             provenance: Some(Provenance::new(msg.text.as_str().into(), provenance)),
+            diagrams: Vec::new(),
         };
     }
-    let (mut lines, mut provenance) = if style.use_markdown {
+    let (mut lines, mut provenance, mut diagrams) = if style.use_markdown {
         let (painted, parsed) = text_to_painted(
             &msg.text,
             prefix,
@@ -1889,21 +2059,25 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
             style.prefix_style,
             width,
             style.max_line_bytes,
+            diagram_pans,
         );
         (
             painted.lines,
             Some(Provenance::new(parsed, painted.provenance)),
+            painted.diagrams,
         )
     } else {
         (
             plain_lines(&msg.text, prefix, style.text_style, style.prefix_style),
             None,
+            Vec::new(),
         )
     };
     if let Some(pp) = &msg.plan_path {
         // Plan messages splice in rules and a footer, so the recorded line
         // indices no longer match and provenance is dropped.
         provenance = None;
+        diagrams.clear();
         if !msg.text.is_empty() {
             let rule = hr_line(width, theme::current().plan_rule);
             lines.insert(0, rule.clone());
@@ -1931,6 +2105,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> BuiltMessage {
         lines,
         search_text,
         provenance,
+        diagrams,
     }
 }
 
@@ -1938,6 +2113,7 @@ struct BuiltMessage {
     lines: Vec<Line<'static>>,
     search_text: String,
     provenance: Option<Provenance>,
+    diagrams: Vec<DiagramSpan>,
 }
 
 /// Search should reach what the card shows, not the tags behind it.
