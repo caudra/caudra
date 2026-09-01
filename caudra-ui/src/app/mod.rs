@@ -30,6 +30,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
@@ -223,6 +224,7 @@ pub struct App {
     subagent_input_task: Option<String>,
     subagent_drafts: HashMap<String, InputDraft>,
     pub(super) command_palette: CommandPalette,
+    pub(super) command_modal: CommandModal,
     pub(super) theme_picker: ThemePicker,
     pub(super) prompt_profile_picker: PromptProfilePicker,
     pub(super) model_picker: ModelPicker,
@@ -365,6 +367,7 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
             ),
+            command_modal: CommandModal::new(),
             theme_picker: ThemePicker::new(),
             prompt_profile_picker: PromptProfilePicker::new(Arc::clone(&prompt_profiles)),
             model_picker: ModelPicker::new(available_models),
@@ -767,6 +770,7 @@ impl App {
                 }
             };
         }
+        try_picker!(self.command_modal);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
         try_picker!(self.review);
@@ -820,6 +824,9 @@ impl App {
                     vec![]
                 },
             );
+        }
+        if key::COMMAND_PALETTE.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::CommandPalette));
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
@@ -1012,6 +1019,11 @@ impl App {
             return Some(self.handle_review_action(action));
         }
 
+        if self.command_modal.is_open() {
+            let action = self.command_modal.handle_key(key);
+            return Some(self.handle_command_modal_action(action));
+        }
+
         if self.theme_picker.is_open() {
             let action = self.theme_picker.handle_key(key);
             return Some(self.handle_theme_picker_action(action));
@@ -1084,6 +1096,13 @@ impl App {
                 Some(Vec::new())
             }
             CommandAction::Passthrough => None,
+        }
+    }
+
+    fn handle_command_modal_action(&mut self, action: CommandModalAction) -> Vec<Action> {
+        match action {
+            CommandModalAction::Consumed | CommandModalAction::Closed => Vec::new(),
+            CommandModalAction::Execute(cmd) => self.execute_command(cmd, 0),
         }
     }
 
@@ -1316,6 +1335,10 @@ impl App {
     /// original key's behavior.
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
+            BuiltinAction::CommandPalette => {
+                let rows = self.command_palette.rows();
+                self.command_modal.open(rows);
+            }
             BuiltinAction::FilePicker => {
                 self.file_picker.open(&self.state.session.cwd);
             }
@@ -2718,7 +2741,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 18] {
+    fn overlays(&self) -> [&dyn Overlay; 19] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2731,6 +2754,7 @@ impl App {
             &self.rewind_picker,
             &self.message_actions,
             &self.review,
+            &self.command_modal,
             &self.theme_picker,
             &self.prompt_profile_picker,
             &self.model_picker,
@@ -2741,7 +2765,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2754,6 +2778,7 @@ impl App {
             &mut self.rewind_picker,
             &mut self.message_actions,
             &mut self.review,
+            &mut self.command_modal,
             &mut self.theme_picker,
             &mut self.prompt_profile_picker,
             &mut self.model_picker,
@@ -2955,6 +2980,7 @@ impl App {
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
         try_picker!(self.review);
+        try_picker!(self.command_modal);
         try_picker!(self.theme_picker);
         try_picker!(self.prompt_profile_picker);
         try_picker!(self.model_picker);

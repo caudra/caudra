@@ -16,7 +16,7 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
 const PLUGIN_BINDS: &[(&str, &str)] =
-    &[("`Ctrl+P`", "Browse sessions"), ("`Ctrl+X`", "Open tasks")];
+    &[("`Alt+P`", "Browse sessions"), ("`Ctrl+X`", "Open tasks")];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,

@@ -278,10 +278,10 @@ fn set_window_title(
 /// your terminal grabs it first: bind a new key with `caudra.keymap.set`
 /// and call this from it.
 ///
-/// Valid names: `"file_picker"`, `"search"`, `"help"`,
-/// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"copy_message"`,
-/// `"review"`, `"view_toggle"`.
+/// Valid names: `"command_palette"`, `"file_picker"`, `"search"`,
+/// `"help"`, `"plan_toggle"`, `"plan_editor"`, `"edit_input"`,
+/// `"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
+/// `"copy_message"`, `"review"`, `"view_toggle"`.
 ///
 /// For slash commands rather than keybound actions, see
 /// `caudra.api.run_command`.
@@ -696,6 +696,31 @@ mod tests {
 
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
+    const ACTION_DOC_MARKER: &str = "/// Valid names:";
+
+    /// The `caudra.ui.action` doc comment is hand-written but ships to users
+    /// as the authoritative name list, so it has to track the enum.
+    #[test]
+    fn action_doc_lists_every_builtin_action() {
+        let source = include_str!("mod.rs");
+        let doc: String = source
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with(ACTION_DOC_MARKER))
+            .take_while(|line| line.contains('`'))
+            .collect();
+        for name in BuiltinAction::VARIANTS {
+            assert!(
+                doc.contains(&format!("`\"{name}\"`")),
+                "{name} missing from the caudra.ui.action doc list"
+            );
+        }
+        let documented = doc.matches("`\"").count();
+        assert_eq!(
+            documented,
+            BuiltinAction::VARIANTS.len(),
+            "doc list has entries the enum does not"
+        );
+    }
 
     fn footer_entry(lua: &Lua, key: &str, label: &str) -> Table {
         let t = lua.create_table().unwrap();

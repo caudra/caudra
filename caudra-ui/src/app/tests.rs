@@ -3908,6 +3908,53 @@ fn help_toggles_modal() {
 }
 
 #[test]
+fn command_palette_key_opens_the_modal() {
+    let mut app = test_app();
+    assert!(!app.command_modal.is_open());
+    app.update(Msg::Key(kb::COMMAND_PALETTE.to_key_event()));
+    assert!(app.command_modal.is_open());
+}
+
+/// The composer keeps its draft: unlike the inline `/` dropdown, nothing
+/// the user typed was part of invoking the modal.
+#[test]
+fn command_palette_key_preserves_the_draft() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('h'))));
+    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    app.update(Msg::Key(kb::COMMAND_PALETTE.to_key_event()));
+    assert!(app.command_modal.is_open());
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+#[test]
+fn command_palette_runs_the_selected_command() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::COMMAND_PALETTE.to_key_event()));
+    for c in "help".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.command_modal.is_open());
+    assert!(app.help_modal.is_open());
+}
+
+/// Every source the inline dropdown enumerates has to reach the modal too,
+/// including the plugin commands that only exist at runtime.
+#[test]
+fn command_palette_lists_builtin_and_plugin_commands() {
+    let mut app = test_app();
+    let names: Vec<String> = app
+        .command_palette
+        .rows()
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "/help"));
+    assert!(names.iter().any(|n| n == "/model"));
+}
+
+#[test]
 fn view_toggle_flips_density_for_every_chat() {
     let mut app = test_app();
     assert!(!app.compact);

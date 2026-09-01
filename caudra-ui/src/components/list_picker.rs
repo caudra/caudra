@@ -366,8 +366,20 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn clear_search(&mut self) {
+        self.set_search_text("");
+    }
+
+    pub fn search_text(&self) -> String {
+        self.state
+            .as_ref()
+            .map(|state| state.search.value())
+            .unwrap_or_default()
+    }
+
+    pub fn set_search_text(&mut self, text: &str) {
         if let Some(state) = self.state.as_mut() {
-            state.search = TextBuffer::new(String::new());
+            state.search = TextBuffer::new(text.to_string());
+            state.search.move_to_end();
             state.update_search_and_clamp();
         }
     }

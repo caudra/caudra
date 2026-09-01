@@ -559,7 +559,7 @@ caudra.api.register_command({
   handler = open,
 })
 
-caudra.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
+caudra.keymap.set("n", "<A-p>", open, { desc = "Browse sessions" })
 
 caudra.api.register_command({
   name = "/rename",

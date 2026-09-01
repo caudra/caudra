@@ -13,9 +13,9 @@ use caudra_storage::auth::{
 };
 use caudra_storage::model::persist_model;
 
-use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
+use crate::components::{Overlay, input_line_with_cursor};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -805,22 +805,6 @@ impl Overlay for LoginPicker {
     fn close(&mut self) {
         self.step = Step::Closed;
     }
-}
-
-fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
-    let t = theme::current();
-    let value = input.value();
-    let cursor_byte = TextBuffer::char_to_byte(&value, input.x());
-    let (before, rest) = value.split_at(cursor_byte);
-    let mut chars = rest.chars();
-    let cursor_char = chars.next().unwrap_or(' ');
-    let after = chars.as_str();
-    Line::from(vec![
-        super::chevron_span(),
-        Span::raw(before.to_string()),
-        Span::styled(cursor_char.to_string(), t.cursor),
-        Span::raw(after.to_string()),
-    ])
 }
 
 pub enum LoginPickerAction {

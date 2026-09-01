@@ -1,6 +1,7 @@
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
+pub(crate) mod command_modal;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod goal_modal;
@@ -47,6 +48,22 @@ pub(crate) const CHEVRON: &str = "❯ ";
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
+}
+
+/// A single-line prompt with the cursor painted onto the cell it occupies.
+/// The terminal cursor never moves, so end-of-line needs a space to style.
+pub(crate) fn input_line_with_cursor(input: &crate::text_buffer::TextBuffer) -> Line<'static> {
+    let value = input.value();
+    let cursor_byte = crate::text_buffer::TextBuffer::char_to_byte(&value, input.x());
+    let (before, rest) = value.split_at(cursor_byte);
+    let mut chars = rest.chars();
+    let cursor_char = chars.next().unwrap_or(' ');
+    Line::from(vec![
+        chevron_span(),
+        Span::raw(before.to_string()),
+        Span::styled(cursor_char.to_string(), crate::theme::current().cursor),
+        Span::raw(chars.as_str().to_string()),
+    ])
 }
 
 pub(crate) trait Overlay {

@@ -4508,10 +4508,10 @@ would. Handy when a default key never reaches caudra because tmux or
 your terminal grabs it first: bind a new key with `caudra.keymap.set`
 and call this from it.
 
-Valid names: `"file_picker"`, `"search"`, `"help"`,
-`"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"copy_message"`,
-`"review"`, `"view_toggle"`.
+Valid names: `"command_palette"`, `"file_picker"`, `"search"`,
+`"help"`, `"plan_toggle"`, `"plan_editor"`, `"edit_input"`,
+`"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
+`"copy_message"`, `"review"`, `"view_toggle"`.
 
 For slash commands rather than keybound actions, see
 `caudra.api.run_command`.

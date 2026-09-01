@@ -461,6 +461,7 @@ pub struct WinView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, VariantNames)]
 #[strum(serialize_all = "snake_case")]
 pub enum BuiltinAction {
+    CommandPalette,
     FilePicker,
     Search,
     Help,

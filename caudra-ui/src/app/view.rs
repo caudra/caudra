@@ -322,6 +322,7 @@ impl App {
             };
         }
 
+        render_if_open!(self.command_modal);
         render_if_open!(self.rewind_picker);
         render_if_open!(self.message_actions);
         render_if_open!(self.review);

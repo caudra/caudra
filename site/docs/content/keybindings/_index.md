@@ -15,6 +15,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+C` | Quit / clear input |
 | `Ctrl+D Ctrl+D` | Exit |
+| `Ctrl+P` | Command palette |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Alt+C` | Copy last reply as markdown |
@@ -127,7 +128,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+P` | Browse sessions |
+| `Alt+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
 
 ## Context Inheritance

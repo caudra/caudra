@@ -66,6 +66,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.command_modal.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.command_modal.handle_mouse(event),
+                |app, action| app.handle_command_modal_action(action),
+            ) {
+                return actions;
+            }
         } else if self.theme_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,

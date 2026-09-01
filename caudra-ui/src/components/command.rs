@@ -13,9 +13,44 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::components::list_picker::PickerItem;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
+pub(crate) const SECTION_BUILTIN: &str = "Built-in";
+const SECTION_CUSTOM: &str = "Project & User";
+const SECTION_MCP: &str = "MCP Prompts";
+const SECTION_PLUGIN: &str = "Plugins";
+
+/// A command as the modal palette sees it: flat, owned, and independent of
+/// the index-based [`CommandType`] the inline dropdown matches against.
+#[derive(Clone)]
+pub struct CommandRow {
+    pub name: String,
+    pub description: String,
+    pub max_args: usize,
+    pub section: &'static str,
+}
+
+impl CommandRow {
+    pub fn takes_args(&self) -> bool {
+        self.max_args > 0
+    }
+}
+
+impl PickerItem for CommandRow {
+    fn label(&self) -> &str {
+        &self.name
+    }
+
+    fn detail(&self) -> Option<&str> {
+        (!self.description.is_empty()).then_some(&self.description)
+    }
+
+    fn section(&self) -> Option<&str> {
+        Some(self.section)
+    }
+}
 
 pub struct BuiltinCommand {
     pub name: &'static str,
@@ -411,18 +446,56 @@ impl CommandPalette {
         !self.filtered.is_empty()
     }
 
-    pub fn sync(&mut self, input: &str) {
-        self.invalidate_mouse_geometry();
+    /// Pulls MCP prompts and Lua commands forward when either side has
+    /// published a new snapshot. Both palettes read the same sources, so
+    /// neither may skip this before enumerating.
+    fn refresh_sources(&mut self) {
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();
-        if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
-        {
-            self.mcp_generation = mcp_snap.generation;
-            self.mcp_prompts = mcp_snap.prompts.clone();
-            self.lua_generation = lua_snap.generation;
-            self.lua_commands = lua_snap.commands.clone();
-            self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+        if mcp_snap.generation == self.mcp_generation && lua_snap.generation == self.lua_generation {
+            return;
         }
+        self.mcp_generation = mcp_snap.generation;
+        self.mcp_prompts = mcp_snap.prompts.clone();
+        self.lua_generation = lua_snap.generation;
+        self.lua_commands = lua_snap.commands.clone();
+        self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+    }
+
+    /// Every command as a modal picker row, grouped by source.
+    pub fn rows(&mut self) -> Vec<CommandRow> {
+        self.refresh_sources();
+        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
+            .map(|item| CommandRow {
+                description: self.describe(&item.command_type).to_string(),
+                section: Self::section_of(&item.command_type),
+                name: item.name,
+                max_args: item.max_args,
+            })
+            .collect()
+    }
+
+    fn section_of(command_type: &CommandType) -> &'static str {
+        match command_type {
+            CommandType::Builtin(_) => SECTION_BUILTIN,
+            CommandType::Custom(_) => SECTION_CUSTOM,
+            CommandType::McpPrompt(_) => SECTION_MCP,
+            CommandType::Lua(_) => SECTION_PLUGIN,
+        }
+    }
+
+    fn describe(&self, command_type: &CommandType) -> &str {
+        match command_type {
+            CommandType::Builtin(cmd) => cmd.description,
+            CommandType::Custom(i) => &self.custom[*i].description,
+            CommandType::McpPrompt(i) => &self.mcp_prompts[*i].description,
+            CommandType::Lua(i) => &self.lua_commands[*i].description,
+        }
+    }
+
+    pub fn sync(&mut self, input: &str) {
+        self.invalidate_mouse_geometry();
+        self.refresh_sources();
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
@@ -546,12 +619,7 @@ impl CommandPalette {
     }
 
     fn item_description(&self, m: &Match) -> &str {
-        match &m.command_type {
-            CommandType::Builtin(cmd) => cmd.description,
-            CommandType::Custom(i) => &self.custom[*i].description,
-            CommandType::McpPrompt(i) => &self.mcp_prompts[*i].description,
-            CommandType::Lua(i) => &self.lua_commands[*i].description,
-        }
+        self.describe(&m.command_type)
     }
 
     pub fn confirm(&self, input: &str) -> Option<ParsedCommand> {

@@ -130,7 +130,7 @@ pub mod key {
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const EXIT: Bind = ctrl_bind!('d');
     pub const HELP: Bind = ctrl_bind!('h');
-    pub const SESSIONS: Bind = ctrl_bind!('p');
+    pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = Bind {
         code: KeyCode::PageDown,
@@ -361,6 +361,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Ctrl+D Ctrl+D"),
         description: "Exit",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::COMMAND_PALETTE.label),
+        description: "Command palette",
         context: KeybindContext::General,
         platform: Platform::All,
     },
