@@ -25,7 +25,7 @@ fn exposes_exact_order_titles_schemas_annotations_and_presentations() {
 }
 
 #[tokio::test]
-async fn dispatch_routes_known_names_and_returns_pretty_and_structured_json() {
+async fn dispatch_routes_known_names_and_separates_rendering_from_record() {
     let root = tempdir().expect("root");
     std::fs::write(root.path().join("visible.txt"), "visible\n").expect("file");
     let group = FileToolGroup::new(root.path(), false, None)
@@ -45,11 +45,12 @@ async fn dispatch_routes_known_names_and_returns_pretty_and_structured_json() {
     let ContentBlock::Text(content) = &result.content[0] else {
         panic!("expected text content");
     };
-    assert_eq!(
-        content.text,
-        serde_json::to_string_pretty(&structured).unwrap()
-    );
-    assert_eq!(structured["numberedText"], json!("1: visible"));
+    // The content block is the model-facing rendering and the structured
+    // content is the canonical record, so neither restates the other.
+    assert_eq!(content.text, "1: visible");
+    assert_eq!(structured["text"], json!("visible"));
+    assert_eq!(structured["lineStart"], json!(1));
+    assert_eq!(structured.get("numberedText"), None);
 
     let invalid = group
         .dispatch(
@@ -91,8 +92,18 @@ async fn index_dispatch_returns_bare_model_text_and_complete_structured_content(
         panic!("expected text")
     };
     assert_eq!(content.text, "fns:\n  pub run() [1]");
+    // The outline is the content block. The record carries `lines`, which the
+    // outline is joined from, so it is not repeated in structured output.
+    let structured = result.structured_content.as_ref().unwrap();
+    assert_eq!(structured.get("skeleton"), None);
     assert_eq!(
-        result.structured_content.as_ref().unwrap()["skeleton"],
+        structured["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
         content.text
     );
 
@@ -151,7 +162,17 @@ async fn index_dispatch_fits_escape_heavy_source_into_a_successful_result() {
     };
     let structured = result.structured_content.as_ref().unwrap();
     assert_eq!(structured["truncated"], true);
-    assert_eq!(structured["skeleton"], content.text);
+    assert_eq!(structured.get("skeleton"), None);
+    assert_eq!(
+        structured["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        content.text
+    );
     assert_eq!(
         structured["lines"].as_array().unwrap().last().unwrap()["text"],
         "[truncated]"

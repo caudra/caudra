@@ -37,6 +37,7 @@ pub async fn run(
             web,
             web_icons: options.web_icons,
             shell_policy,
+            shell_output_filter: options.shell_output_filter,
             code: CodeConfiguration {
                 worker: options.code_worker.as_deref().map_or(
                     WorkerSource::Discover {

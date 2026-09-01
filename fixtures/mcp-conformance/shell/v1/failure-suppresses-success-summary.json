@@ -1,0 +1,52 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "shell.filter.failure-not-success",
+  "provenance": [
+    "rust/crates/mcp-shell/src/group.rs",
+    "rust/crates/output-filter/src/pipeline.rs",
+    "rust/crates/mcp-shell/tests/conformance_fixtures.rs"
+  ],
+  "tool": "shell",
+  "input": {
+    "command": "make broken",
+    "timeout": 60000
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "Makefile",
+        "asset": "assets/shell/Makefile"
+      }
+    ]
+  },
+  "configuration": {
+    "shellPolicy": "yolo",
+    "shellOutputFilter": true
+  },
+  "expected": {
+    "invariants": {
+      "contentIncludes": [
+        "stderr tail:"
+      ],
+      "contentExcludes": [
+        "make: ok"
+      ],
+      "structuredStdoutIncludes": [
+        "make[1]: Entering directory"
+      ],
+      "exitCodeZero": false
+    }
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      },
+      {
+        "placeholder": "{{DURATION_MS}}",
+        "source": "measured command wall-clock duration"
+      }
+    ]
+  }
+}

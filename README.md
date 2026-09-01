@@ -363,6 +363,48 @@ Workcell then publishes each accepted output chunk before the final tool result:
 - Child programs may buffer output when connected to pipes instead of a terminal. Use program-specific
   unbuffered or line-buffered modes when immediate output matters.
 
+### Shell Output Filtering
+
+Build tools, test runners, and package managers spend most of their output on progress rather than
+information. Workcell filters the model-facing shell rendering through a built-in rule corpus so a
+successful `cargo build` returns its warnings instead of several hundred `Compiling` lines. Filtering
+is on by default.
+
+Rules match the same tree-sitter command scope that shell policy authorizes, not the raw command
+string, so shell metacharacters cannot steer rule selection. A rule applies only when the command
+resolves to exactly one non-opaque scope; output from a pipeline or chain belongs to more than one
+program and is returned unfiltered. A rule that would replace output with a success summary is
+suppressed unless the command actually exited zero, so a failing command is never rendered as success.
+
+The corpus covers common build, test, package-manager, and container commands, including `cargo`,
+`go`, `mvn`, `git`, `npm`, `pip`, `apt`, `pytest`, `jest`, `vitest`, `tar`, `wget`, `docker build`,
+`docker pull`, and `docker compose`. A command with no matching rule is returned unchanged.
+
+Rules are scoped to the subcommands whose output is progress. A command whose output is the result
+the caller asked for is left alone: `apt list`, `tar -t`, `docker compose logs`, and `docker run`
+have no rule, and the container's own output is never reinterpreted.
+
+The corpus is fixed at build time and is not operator-extensible. There is no project-local rule file,
+so a rule cannot be introduced by the contents of a workspace. A command that resolves to more than
+one scope, or that carries an inline environment assignment such as `FOO=bar cmd`, is opaque to scope
+analysis and is never filtered.
+
+Filtering never enlarges a result. The notice a filtered rendering carries is not free, so when a
+rule strips nothing, or strips less than the notice costs, Workcell returns the complete capture
+instead. A filtered rendering is therefore always smaller than the unfiltered one it replaced.
+
+Filtering affects only the rendering:
+
+- The structured result always carries the unfiltered bounded tails and the complete byte accounting.
+- `notifications/progress` chunks are streamed unfiltered as the process produces them, because
+  filtering requires the whole output and an exit code.
+- Filtered renderings are annotated with the rule that produced them.
+
+Disable filtering with `--no-shell-output-filter` or `WORKCELL_MCP_SHELL_OUTPUT_FILTER=false` to
+return raw command output. Rules in `crates/output-filter/rules/` are vendored from
+[RTK](https://github.com/rtk-ai/rtk) under Apache-2.0; rules in `crates/output-filter/rules-workcell/`
+are original to this project. See `crates/output-filter/NOTICE`.
+
 Clients may negotiate `ai.workcell/execution-environment` version `v1` to receive a sanitized startup
 snapshot during discovery. The `execution_environment` tool returns the same descriptor shape from a
 fresh bounded inspection, so clients can observe later command installation or version changes,
@@ -414,6 +456,13 @@ Operations separate preparation from execution. `inspect_index`, `prepare_apply_
 the web `prepare_*` methods return a prepared value that exposes every resource the call would touch,
 before anything is read, written, or executed. Hosts authorize the prepared resources under their own
 policy, then commit with the matching `execute_*` method.
+
+A shell execution returns both renderings on one value. `ShellExecution::model_text` is the filtered,
+model-facing form and `ShellExecution::output` is the unfiltered capture with the complete byte
+accounting, so a host that keeps a transcript or builds its own presentation never has to disable
+filtering to obtain the real bytes. Live output is independent of both: chunks delivered to a
+`ShellProgressSink` are published while the process runs, before an exit code exists, and are never
+filtered. Filtering therefore changes only what a model reads, never what a host can observe.
 
 ### Confinement is a host decision
 
@@ -710,6 +759,9 @@ where possible so icon discovery does not refetch the page body.
   timeout/output-limit state, final progress sequence, per-stream byte accounting, bounded stdout and
   stderr tails, and truncation flags. Non-zero exits are completed tool results rather than transport
   failures.
+- The model-facing rendering is filtered by a built-in rule corpus so that a successful build, test, or
+  package-manager run returns its diagnostics rather than its progress noise. The structured result
+  always carries the unfiltered capture. See [Shell Output Filtering](#shell-output-filtering).
 - Workcell retains at most 1 MiB per stream for tail accounting, returns a combined 24 KiB fallback
   preview, and terminates production commands after more than 100 MiB of combined raw output.
 - Cancellation, timeout, output overflow, and descendants that keep output pipes open trigger

@@ -18,6 +18,7 @@ members = [
   "crates/mcp-web",
   "crates/monty-worker",
   "crates/net",
+  "crates/output-filter",
   "crates/source-icons",
   "crates/tool-contract",
   "crates/workcell",

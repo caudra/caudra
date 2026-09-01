@@ -4783,6 +4783,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-bash",
+ "workcell-output-filter",
  "workcell-tool-contract",
 ]
 
@@ -4841,6 +4842,15 @@ dependencies = [
  "tokio-util",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "workcell-output-filter"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "toml",
 ]
 
 [[package]]

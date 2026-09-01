@@ -1,0 +1,33 @@
+workcell-output-filter
+Copyright The Workcell MCP authors
+
+This product includes the declarative command-output filter rules in `rules/`,
+which were copied verbatim from the RTK project.
+
+    RTK (Rust Token Killer)
+    https://github.com/rtk-ai/rtk
+    Copyright Patrick Szymkowiak and the RTK contributors
+    Licensed under the Apache License, Version 2.0
+
+    Vendored revision: aa408534859949ebac1dcc82ec4d25b575a539fa
+    Vendored tag:      dev-0.47.0-rc.386
+    Upstream path:     src/filters/*.toml
+
+The files in `rules/` are unmodified. The filter engine in `src/` is an
+independent implementation and is not derived from RTK source code.
+
+The rules in `rules-workcell/` are original to this project and are not derived
+from RTK. They are kept in a separate directory so that refreshing the vendored
+corpus stays a clean copy of `rules/`, and so that provenance is visible without
+reading individual files. Both directories are concatenated at build time and a
+file name may not appear in both.
+
+Behavioral changes relative to RTK, applied by this engine rather than by
+editing the vendored rules:
+
+  * `on_empty` and `match_output` short-circuit messages are suppressed when the
+    command exited non-zero, so a failing command is never reported as success.
+  * Rules are matched against a normalized command scope produced by
+    tree-sitter Bash parsing rather than the raw command string.
+  * Only the built-in rule set is loaded. Project-local and user-global rule
+    files are deliberately unsupported.

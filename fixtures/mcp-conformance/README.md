@@ -15,6 +15,7 @@ otherwise.
 - `catalog/v1/`: ordered MCP tool catalogs emitted by the Rust server.
 - `filesystem/v1/`: independent filesystem calls with setup, normalized MCP output, and complete
   expected post-state.
+- `shell/v1/`: shell calls that pin the filtered model rendering against the unfiltered capture.
 - `network/v1/`: mocked search-backend normalization and webfetch dispatch cases.
 - `assets/`: static bodies referenced by setup or mocked responses.
 
@@ -29,7 +30,9 @@ optional sections:
 - `setup.files`: root-relative files. `asset` is a corpus-relative UTF-8 input.
 - `setup.mockResponses`: ordered mocked HTTP responses. `bodyAsset` is corpus-relative; an optional
   `bodyEncoding` of `base64` decodes the asset before constructing the response.
-- `configuration`: non-secret execution configuration.
+- `configuration`: non-secret execution configuration. Shell cases select a reviewed permission
+  policy by name in `shellPolicy` and set `shellOutputFilter`, because shell policy and filtering are
+  startup configuration rather than tool input.
 - `expected.contentText`: exact model-visible text.
 - `expected.structuredContent`: structurally compared JSON output.
 - `expected.isError`: expected MCP tool-error classification.
@@ -46,10 +49,11 @@ injected-clock timestamps, and cache counters. They must not normalize semantic 
 classification, tool schemas, descriptions, annotations, presentation profiles, or model-facing
 text.
 
-This initial corpus uses only `{{ROOT}}` and `{{CURRENT_YEAR}}`. A runner replaces the canonical
-filesystem root with `{{ROOT}}` in every actual string before comparison. It replaces the year in the
-websearch description with `{{CURRENT_YEAR}}` before catalog comparison. No wildcard or regular
-expression normalization is implied.
+This corpus uses only `{{ROOT}}`, `{{CURRENT_YEAR}}`, and `{{DURATION_MS}}`. A runner replaces the
+canonical filesystem root with `{{ROOT}}` in every actual string before comparison. It replaces the
+year in the websearch description with `{{CURRENT_YEAR}}` before catalog comparison. It replaces the
+shell result's measured `durationMs` with `{{DURATION_MS}}`, which is the only shell field whose value
+a run cannot reproduce. No wildcard or regular expression normalization is implied.
 
 For example, an actual structured field of `/tmp/run-a/notes.txt` becomes:
 
@@ -60,11 +64,23 @@ For example, an actual structured field of `/tmp/run-a/notes.txt` becomes:
 }
 ```
 
-Filesystem `contentText` is normally the normalized `structuredContent` serialized with
-`JSON.stringify(value, null, 2)`. The `index` contract deliberately uses its bare skeleton or listing
-instead. Newlines, field order, and omission of undefined fields are part of the expectation. Read-only
-cases repeat their unchanged complete post-state so a conforming implementation also proves it did not
-mutate the root.
+Filesystem `contentText` is the model-facing rendering and `structuredContent` is the canonical
+record, so neither restates the other: a read returns numbered lines, a directory read its listing,
+`file_glob` its relative paths, `file_grep` its `path:line: text` rows, `index` its skeleton or
+listing, and every mutation its unified diff. A field is omitted from the structured record only when
+it is exactly derivable from a field that remains, so `numberedText`, directory `entries`, the
+combined `file_apply_patch` `diff`, and the `index` `skeleton` and `listing` are rendering-only. Newlines, field order, and omission of undefined fields are part of the expectation.
+Read-only cases repeat their unchanged complete post-state so a conforming implementation also proves
+it did not mutate the root.
+
+Shell `contentText` is the model-facing rendering and is subject to output filtering;
+`structuredContent` is the unfiltered capture and never is. Cases drive a fixture-provided `Makefile`,
+so command output is determined by the corpus rather than by the host, and every case pins both forms
+so the two cannot silently converge. Coverage includes a matched single-scope rule, an `on_empty`
+success summary, a pipeline that is exempt because its output belongs to more than one program, the
+`--no-shell-output-filter` opt-out, and a failing command whose success summary must be suppressed.
+That last case uses `expected.invariants` because `make` reports its own diagnostic, whose wording
+varies by implementation and version; its assertions use only contract-owned text.
 
 The Kagi fixture covers its first-party raw API body, including region/date filters, boolean safe
 search, timeout, redirect denial, and credential exclusion. Separate SerpApi Google and Bing fixtures

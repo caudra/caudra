@@ -14,8 +14,8 @@ use crate::{
     process::{exit_signal, platform_command, terminate_and_reap, terminate_residual_group},
     progress::{ProgressPump, ShellProgressSink, receive_failure},
     types::{
-        DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellExecution, ShellInput, ShellOutput,
-        ShellStream,
+        DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellExecution,
+        ShellInput, ShellOutput, ShellStream,
     },
     workdir,
 };
@@ -36,6 +36,7 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+use workcell_output_filter::Rule as FilterRule;
 
 const SHELL_CONCURRENCY: usize = 4;
 // After child completion, allow trailing pipe data to reset this grace window before treating open
@@ -52,6 +53,7 @@ pub struct ShellToolGroup {
     root: PathBuf,
     policy: ShellPermissionPolicy,
     confined: bool,
+    output_filter: bool,
 }
 #[derive(Debug)]
 pub struct ShellBuildError;
@@ -115,7 +117,20 @@ impl ShellToolGroup {
             root,
             policy,
             confined,
+            output_filter: true,
         })
+    }
+
+    /// Enables or disables declarative filtering of the model-facing rendering.
+    ///
+    /// Filtering only changes the rendering. The structured result always
+    /// carries the unfiltered capture, so disabling this cannot reveal output
+    /// that was otherwise withheld, and enabling it cannot hide output a caller
+    /// could not still read.
+    #[must_use]
+    pub const fn with_output_filter(mut self, enabled: bool) -> Self {
+        self.output_filter = enabled;
+        self
     }
 
     #[must_use]
@@ -210,7 +225,8 @@ impl ShellToolGroup {
         cancellation: CancellationToken,
         progress: Option<Arc<dyn ShellProgressSink>>,
     ) -> Result<Option<ShellExecution>, String> {
-        let (command_text, timeout_ms, workdir, relative_workdir) = prepared.into_execution_parts();
+        let (command_text, timeout_ms, workdir, relative_workdir, analysis) =
+            prepared.into_execution_parts();
         let mut progress = progress.map(ProgressPump::start);
         // Queue admission remains cancellable; holding the permit through final progress drain keeps
         // all per-execution resources inside the global concurrency budget.
@@ -327,9 +343,80 @@ impl ShellToolGroup {
             stderr_preview_truncated,
         };
         Ok(Some(ShellExecution {
-            model_text: model_text(&output),
+            model_text: self.render(&output, &analysis, &stdout_tail, &stderr_tail),
             output,
         }))
+    }
+
+    /// Builds the model-facing rendering for a completed execution.
+    ///
+    /// Filtering is applied to the full retained tails rather than to the
+    /// previews already placed in the structured result. Reducing first means
+    /// the same preview budget carries what survived filtering instead of the
+    /// raw end of the stream.
+    fn render(
+        &self,
+        output: &ShellOutput,
+        analysis: &ShellCommandAnalysis,
+        stdout_tail: &Tail,
+        stderr_tail: &Tail,
+    ) -> String {
+        let unfiltered = model_text(output);
+        let Some(rule) = self.matching_rule(analysis) else {
+            return unfiltered;
+        };
+        let filtered = rule.apply(&stdout_tail.text(), &stderr_tail.text(), output.exit_code);
+        if !filtered.lossy {
+            // The rule matched but removed nothing. Announcing a filter that did
+            // not filter would tell a reader to go looking for output that was
+            // never dropped.
+            return unfiltered;
+        }
+        let mut rendered = filtered.text;
+        if !filtered.consumed_stderr && !output.stderr.is_empty() {
+            // A rule that describes stdout must not make a diagnostic written to
+            // stderr disappear from the rendering.
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str("stderr tail:\n");
+            rendered.push_str(&output.stderr);
+        }
+        if rendered.trim().is_empty() {
+            return unfiltered;
+        }
+        // The notice is deliberately terse. It is paid on every filtered result
+        // and is compared against the complete capture below, so a verbose
+        // notice would stop small reductions from ever being worth taking.
+        let candidate = format!(
+            "{}\n[filtered: {}]",
+            bound_rendering(&rendered),
+            rule.name()
+        );
+        // Filtering exists to reduce what a model reads, and the notice is not
+        // free. A rendering that is not smaller than the complete capture is
+        // strictly worse than it: it costs more and says less.
+        if candidate.len() >= unfiltered.len() {
+            return unfiltered;
+        }
+        candidate
+    }
+
+    /// Selects the rule for a command, or `None` when none should apply.
+    ///
+    /// A rule is only used for a request that resolves to exactly one
+    /// classified command scope. In a pipeline the captured output belongs to
+    /// the last stage rather than the program a rule names, and in a chain it
+    /// belongs to several programs at once, so applying a single rule would
+    /// describe output it did not produce.
+    fn matching_rule(&self, analysis: &ShellCommandAnalysis) -> Option<&'static FilterRule> {
+        if !self.output_filter || analysis.opaque {
+            return None;
+        }
+        let [scope] = analysis.scopes.as_slice() else {
+            return None;
+        };
+        workcell_output_filter::builtin().find(&scope.normalized)
     }
 
     pub async fn execute(
@@ -349,6 +436,22 @@ async fn wait_for_pipe_deadline(deadline: Option<tokio::time::Instant>) {
         std::future::pending().await
     }
 }
+/// Caps a filtered rendering at the same budget the unfiltered one uses.
+///
+/// A rule reduces output but does not guarantee a bound, so the rendering is
+/// capped independently. The tail is kept for the same reason the capture ring
+/// keeps it: failures and summaries appear last.
+fn bound_rendering(rendered: &str) -> &str {
+    if rendered.len() <= FALLBACK_PREVIEW_BYTES {
+        return rendered;
+    }
+    let start = rendered.len() - FALLBACK_PREVIEW_BYTES;
+    let start = (start..rendered.len())
+        .find(|index| rendered.is_char_boundary(*index))
+        .unwrap_or(rendered.len());
+    &rendered[start..]
+}
+
 fn model_text(output: &ShellOutput) -> String {
     if output.stdout.is_empty() && output.stderr.is_empty() {
         format!(
@@ -381,6 +484,185 @@ fn tool_error(error: impl Into<String>) -> CallToolResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Builds a completed result carrying the given previews. Callers pass the
+    /// same text they push into the corresponding tail, because in execution the
+    /// previews are derived from the tails and the two cannot disagree.
+    fn rendered_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> ShellOutput {
+        ShellOutput {
+            version: 1,
+            kind: "shell",
+            relative_workdir: ".".into(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            duration_ms: 0,
+            exit_code,
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 0,
+            stdout_utf8_bytes: 0,
+            stderr_utf8_bytes: 0,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+        }
+    }
+
+    fn tail(bytes: &str) -> Tail {
+        let mut tail = Tail::default();
+        tail.push(bytes.as_bytes());
+        tail
+    }
+
+    const MAKE_OUTPUT: &str =
+        "make[1]: Entering directory '/x'\ngcc -O2 foo.c\nmake[1]: Leaving directory '/x'\n";
+
+    async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::new(root.path())
+            .await
+            .unwrap()
+            .with_output_filter(output_filter);
+        (root, group)
+    }
+
+    #[tokio::test]
+    async fn a_matched_single_scope_is_filtered_and_labelled() {
+        let (_root, group) = group_for_render(true).await;
+        let analysis = crate::permission::inspect("make build");
+        let rendered = group.render(
+            &rendered_output(MAKE_OUTPUT, "", Some(0)),
+            &analysis,
+            &tail(MAKE_OUTPUT),
+            &Tail::default(),
+        );
+        assert!(rendered.starts_with("gcc -O2 foo.c"), "{rendered}");
+        assert!(!rendered.contains("Entering directory"), "{rendered}");
+        assert!(rendered.contains("[filtered: make]"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn filtering_never_returns_a_larger_rendering() {
+        let (_root, group) = group_for_render(true).await;
+        // A matched rule that strips nothing, or strips less than the notice
+        // costs, must fall back to the complete capture. Otherwise announcing
+        // the filter makes the rendering larger than the output it reduced.
+        let clean = "gcc -O2 foo.c\n";
+        let analysis = crate::permission::inspect("make build");
+        let rendered = group.render(
+            &rendered_output(clean, "", Some(0)),
+            &analysis,
+            &tail(clean),
+            &Tail::default(),
+        );
+        assert_eq!(rendered, format!("stdout tail:\n{clean}\nstderr tail:\n"));
+        assert!(!rendered.contains("[filtered:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn multi_scope_requests_are_never_filtered() {
+        let (_root, group) = group_for_render(true).await;
+        // The capture belongs to the last stage of a pipeline and to several
+        // programs in a chain, so no single rule describes it.
+        for command in ["make build | cat", "make build && echo done"] {
+            let analysis = crate::permission::inspect(command);
+            let rendered = group.render(
+                &rendered_output(MAKE_OUTPUT, "", Some(0)),
+                &analysis,
+                &tail(MAKE_OUTPUT),
+                &Tail::default(),
+            );
+            assert!(rendered.contains("Entering directory"), "{command}");
+            assert!(!rendered.contains("[filtered:"), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_commands_are_never_filtered() {
+        let (_root, group) = group_for_render(true).await;
+        let analysis = crate::permission::inspect("eval \"$CMD\"");
+        assert!(analysis.opaque);
+        let rendered = group.render(
+            &rendered_output(MAKE_OUTPUT, "", Some(0)),
+            &analysis,
+            &tail(MAKE_OUTPUT),
+            &Tail::default(),
+        );
+        assert!(rendered.contains("Entering directory"));
+    }
+
+    #[tokio::test]
+    async fn disabling_the_filter_restores_the_unfiltered_rendering() {
+        let (_root, group) = group_for_render(false).await;
+        let analysis = crate::permission::inspect("make build");
+        let rendered = group.render(
+            &rendered_output(MAKE_OUTPUT, "", Some(0)),
+            &analysis,
+            &tail(MAKE_OUTPUT),
+            &Tail::default(),
+        );
+        assert_eq!(
+            rendered,
+            format!("stdout tail:\n{MAKE_OUTPUT}\nstderr tail:\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_command_is_never_rendered_as_success() {
+        let (_root, group) = group_for_render(true).await;
+        let analysis = crate::permission::inspect("make build");
+        // Every line of this capture is stripped by the rule, which would
+        // otherwise emit the rule's `on_empty` success message.
+        let stripped = "make[1]: Entering directory '/x'\n";
+        let rendered = group.render(
+            &rendered_output(stripped, "ld: undefined reference", Some(2)),
+            &analysis,
+            &tail(stripped),
+            &Tail::default(),
+        );
+        assert!(!rendered.contains("make: ok"), "{rendered}");
+        assert!(rendered.contains("ld: undefined reference"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn stderr_survives_a_rule_that_only_describes_stdout() {
+        let (_root, group) = group_for_render(true).await;
+        let analysis = crate::permission::inspect("make build");
+        let rendered = group.render(
+            &rendered_output(MAKE_OUTPUT, "warning: deprecated", Some(0)),
+            &analysis,
+            &tail(MAKE_OUTPUT),
+            &Tail::default(),
+        );
+        assert!(rendered.contains("gcc -O2 foo.c"), "{rendered}");
+        assert!(rendered.contains("warning: deprecated"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn filtering_leaves_the_structured_capture_unfiltered() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let result = call(
+            &group,
+            json!({"command":"printf 'make[1]: Entering directory\\ngcc -O2 foo.c\\n'"}),
+        )
+        .await;
+        let structured = result.structured_content.unwrap();
+        // `printf` matches no rule, so this also pins that an unmatched command
+        // keeps the unfiltered rendering.
+        assert!(
+            structured["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("Entering directory")
+        );
+    }
+
     async fn call(group: &ShellToolGroup, args: Value) -> CallToolResult {
         group
             .dispatch("shell", args, CancellationToken::new(), None)

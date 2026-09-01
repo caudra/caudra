@@ -22,12 +22,11 @@
     ]
   },
   "expected": {
-    "contentText": "{\n  \"kind\": \"directory\",\n  \"path\": \"{{ROOT}}\",\n  \"relativePath\": \".\",\n  \"entries\": [\n    \"docs/\",\n    \"notes.txt\"\n  ],\n  \"entryDetails\": [\n    {\n      \"relativePath\": \"docs/\",\n      \"kind\": \"directory\"\n    },\n    {\n      \"relativePath\": \"notes.txt\",\n      \"kind\": \"file\",\n      \"sizeBytes\": 22,\n      \"lineCount\": 4\n    }\n  ],\n  \"truncated\": false\n}",
+    "contentText": "docs/\nnotes.txt",
     "structuredContent": {
       "kind": "directory",
       "path": "{{ROOT}}",
       "relativePath": ".",
-      "entries": ["docs/", "notes.txt"],
       "entryDetails": [
         {
           "relativePath": "docs/",

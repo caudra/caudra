@@ -23,7 +23,7 @@
     ]
   },
   "expected": {
-    "contentText": "{\n  \"kind\": \"edit\",\n  \"path\": \"{{ROOT}}/new.txt\",\n  \"relativePath\": \"new.txt\",\n  \"applied\": true,\n  \"diff\": {\n    \"file\": \"{{ROOT}}/new.txt\",\n    \"relativePath\": \"new.txt\",\n    \"patch\": \"--- new.txt\\n+++ new.txt\\n@@ -1,2 +1,2 @@\\n one\\n-two\\n+three\",\n    \"additions\": 1,\n    \"deletions\": 1\n  }\n}",
+    "contentText": "--- new.txt\n+++ new.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three",
     "structuredContent": {
       "kind": "edit",
       "path": "{{ROOT}}/new.txt",

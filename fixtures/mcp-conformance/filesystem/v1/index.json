@@ -24,7 +24,6 @@
       "path": "{{ROOT}}/index.rs",
       "relativePath": "index.rs",
       "language": "rust",
-      "skeleton": "imports: [1]\n  std::io\n\nfns:\n  pub run(x: i32) -> i32 [3]",
       "lines": [
         {
           "outputLine": 1,

@@ -20,13 +20,12 @@
     ]
   },
   "expected": {
-    "contentText": "{\n  \"kind\": \"file\",\n  \"path\": \"{{ROOT}}/notes.txt\",\n  \"relativePath\": \"notes.txt\",\n  \"text\": \"beta\\nalpha beta\",\n  \"numberedText\": \"2: beta\\n3: alpha beta\",\n  \"lineStart\": 2,\n  \"lineEnd\": 3,\n  \"totalLines\": 4,\n  \"truncated\": true\n}",
+    "contentText": "2: beta\n3: alpha beta",
     "structuredContent": {
       "kind": "file",
       "path": "{{ROOT}}/notes.txt",
       "relativePath": "notes.txt",
       "text": "beta\nalpha beta",
-      "numberedText": "2: beta\n3: alpha beta",
       "lineStart": 2,
       "lineEnd": 3,
       "totalLines": 4,

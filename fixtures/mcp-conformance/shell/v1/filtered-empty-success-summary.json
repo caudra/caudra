@@ -1,0 +1,61 @@
+{
+  "caseID": "shell.filter.on-empty-success",
+  "configuration": {
+    "shellOutputFilter": true,
+    "shellPolicy": "yolo"
+  },
+  "expected": {
+    "contentText": "make: ok\n[filtered: make]",
+    "structuredContent": {
+      "durationMs": "{{DURATION_MS}}",
+      "exitCode": 0,
+      "finalSequence": 1,
+      "kind": "shell",
+      "outputLimitExceeded": false,
+      "relativeWorkdir": ".",
+      "signal": null,
+      "stderr": "",
+      "stderrCaptureTruncated": false,
+      "stderrPreviewTruncated": false,
+      "stderrUtf8Bytes": 0,
+      "stdout": "make[1]: Entering directory '/workspace'\nmake[1]: Leaving directory '/workspace'\n",
+      "stdoutCaptureTruncated": false,
+      "stdoutPreviewTruncated": false,
+      "stdoutUtf8Bytes": 81,
+      "timedOut": false,
+      "timeoutMs": 60000,
+      "version": 1
+    }
+  },
+  "fixtureVersion": 1,
+  "input": {
+    "command": "make silent",
+    "timeout": 60000
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      },
+      {
+        "placeholder": "{{DURATION_MS}}",
+        "source": "measured command wall-clock duration"
+      }
+    ]
+  },
+  "provenance": [
+    "rust/crates/mcp-shell/src/group.rs",
+    "rust/crates/output-filter/src/pipeline.rs",
+    "rust/crates/mcp-shell/tests/conformance_fixtures.rs"
+  ],
+  "setup": {
+    "files": [
+      {
+        "asset": "assets/shell/Makefile",
+        "path": "Makefile"
+      }
+    ]
+  },
+  "tool": "shell"
+}

@@ -27,6 +27,11 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
   rendering, and the failure taxonomy.
 - `crates/monty-worker` owns build-time worker validation, embedded bytes, secure extraction, and
   executable leases. It must remain optional for native code consumers.
+- `crates/output-filter` owns the declarative rule corpus and the engine that renders command output
+  for a model. `rules/` is vendored verbatim from RTK and must stay byte-identical so a refresh is a
+  clean copy; `rules-workcell/` holds rules authored here. Both are build inputs; do not add operator
+  or project-local rule loading. Write a rule against output captured from the real tool in
+  `crates/output-filter/evals`, never from a remembered format, and ship inline expectations with it.
 - `crates/net` owns outbound URL, DNS, redirect, retry, and response-body policy.
 - `crates/source-icons` owns bounded source-icon discovery and normalization.
 - `fixtures/mcp-conformance` contains committed public-contract fixtures.

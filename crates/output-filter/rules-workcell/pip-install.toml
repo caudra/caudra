@@ -1,0 +1,70 @@
+[filters.pip-install]
+description = "Compact pip install resolution, download, and progress-bar output"
+match_command = "^pip3?\\s+install\\b|^python3?\\s+-m\\s+pip\\s+install\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^Collecting ",
+  "^\\s*(Downloading|Using cached) ",
+  "^Requirement already satisfied:",
+  "^Installing collected packages:",
+  "^\\s+(Obtaining|Preparing metadata|Getting requirements|Installing build dependencies|Checking if build backend|Building wheel|Created wheel|Stored in directory|Link is a directory)",
+  # A download bar is redrawn as a full line per refresh and is the single
+  # largest contributor to the size of a routine install.
+  "^\\s*[\\x{2500}\\x{2501}\\x{2578}\\x{2579}\\x{257a}]+",
+  "\\seta\\s+\\d+:\\d+:\\d+$",
+  # Advice about the invoking environment, not about the requested packages.
+  "^WARNING: Running pip as the 'root' user",
+  "^\\s*\\[notice\\] (A new release of pip|To update, run)",
+  "^\\s*$",
+]
+on_empty = "pip: ok"
+
+[[tests.pip-install]]
+name = "keeps the installed set and drops resolution traffic"
+input = """
+Collecting requests
+  Downloading requests-2.34.2-py3-none-any.whl.metadata (4.8 kB)
+Collecting idna<4,>=2.5 (from requests)
+  Downloading idna-3.19-py3-none-any.whl.metadata (9.2 kB)
+Downloading requests-2.34.2-py3-none-any.whl (73 kB)
+   \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 73.1/73.1 kB 29.5 MB/s eta 0:00:00
+Downloading idna-3.19-py3-none-any.whl (68 kB)
+   \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 68.5/68.5 kB 36.3 MB/s eta 0:00:00
+Installing collected packages: idna, requests
+Successfully installed idna-3.19 requests-2.34.2
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+"""
+expected = """
+Successfully installed idna-3.19 requests-2.34.2
+"""
+
+[[tests.pip-install]]
+name = "an already-satisfied install reports success"
+input = """
+Requirement already satisfied: requests in /usr/lib/python3/dist-packages (2.34.2)
+Requirement already satisfied: idna<4,>=2.5 in /usr/lib/python3/dist-packages (from requests) (3.19)
+"""
+expected = "pip: ok"
+
+[[tests.pip-install]]
+name = "resolution errors survive"
+input = """
+ERROR: Could not find a version that satisfies the requirement this-package-does-not-exist-xyz (from versions: none)
+ERROR: No matching distribution found for this-package-does-not-exist-xyz
+"""
+expected = """
+ERROR: Could not find a version that satisfies the requirement this-package-does-not-exist-xyz (from versions: none)
+ERROR: No matching distribution found for this-package-does-not-exist-xyz
+"""
+
+[[tests.pip-install]]
+name = "unrelated warnings are retained"
+input = """
+Installing collected packages: requests
+WARNING: The script normalizer is installed in '/root/.local/bin' which is not on PATH.
+Successfully installed requests-2.34.2
+"""
+expected = """
+WARNING: The script normalizer is installed in '/root/.local/bin' which is not on PATH.
+Successfully installed requests-2.34.2
+"""

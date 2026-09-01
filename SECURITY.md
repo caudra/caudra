@@ -127,6 +127,12 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
   through an allowed Bash, JavaScript, Python, Perl, or other interpreter. Policy checks the visible
   invocation, not script contents; denying one utility does not deny equivalent behavior implemented by
   another allowed executable.
+- Shell output filtering changes what a model reads, not what ran. A rule can omit output a reader
+  would have judged relevant, and the corpus matches on program name, so a different program invoked
+  under a matched name is rendered by that program's rule. Filtering is applied only to
+  single-scope, non-opaque commands, success-summary rules are suppressed unless the command exited
+  zero, and the unfiltered capture stays in the structured result. Use
+  `--no-shell-output-filter` where the raw rendering is required for review.
 - Filesystem authorization is path based and retains a potential time-of-check/time-of-use window under
   malicious concurrent filesystem mutation.
 - A native host embedding the tool crates with an `_unconfined` constructor supplies the entire

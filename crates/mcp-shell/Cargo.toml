@@ -23,6 +23,7 @@ tokio-util.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
+workcell-output-filter = { path = "../output-filter" }
 workcell-tool-contract.workspace = true
 
 [dev-dependencies]

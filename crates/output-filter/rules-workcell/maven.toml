@@ -1,0 +1,111 @@
+[filters.maven]
+description = "Compact Maven lifecycle output, keeping the build result, warnings, and errors"
+# Goals are matched explicitly rather than by the `mvn` program alone so that
+# `mvn spring-boot:run` still reaches the dedicated Spring Boot filter, which
+# sorts later and would otherwise never be consulted.
+match_command = "^(mvn|mvnw|\\./mvnw)\\s+(-\\S+\\s+)*(clean|validate|compile|test|package|verify|install|deploy|site)\\b"
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  "^\\[INFO\\]\\s*$",
+  # Plugin banners, module headers, and rule-off separators are all rendered as
+  # an [INFO] line that begins with dashes.
+  "^\\[INFO\\] -{3,}",
+  "^\\[INFO\\] Scanning for projects",
+  "^\\[INFO\\] Building \\S+ [\\d.]+(-SNAPSHOT)?( \\[\\d+/\\d+\\])?$",
+  "^\\[INFO\\] Using '.*' encoding",
+  "^\\[INFO\\] skip non existing resourceDirectory",
+  "^\\[INFO\\] (Changes detected|Nothing to compile|No sources to compile|No tests to run)",
+  "^\\[INFO\\] (Compiling|Copying) \\d+ (source file|resource)",
+  "^\\[INFO\\] (Downloading|Downloaded|Installing) ",
+  "^Progress \\(\\d+\\):",
+  # Counts restated from the [ERROR] lines that remain.
+  "^\\[INFO\\] \\d+ (error|warning)s?$",
+  "^\\[INFO\\] (Total time|Finished at):",
+  "^\\[ERROR\\]\\s*$",
+  "^\\[ERROR\\] -> \\[Help \\d+\\]",
+  "^\\[ERROR\\] (To see the full stack trace|Re-run Maven|For more information about the errors)",
+  "^\\[ERROR\\] \\[Help \\d+\\]",
+  "^\\s*$",
+]
+on_empty = "mvn: ok"
+
+[[tests.maven]]
+name = "a successful build reduces to its result"
+input = """
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ------------------------< com.example:mvndemo >-------------------------
+[INFO] Building mvndemo 1.0.0
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- maven-resources-plugin:2.6:resources (default-resources) @ mvndemo ---
+[INFO] Using 'UTF-8' encoding to copy filtered resources.
+[INFO] skip non existing resourceDirectory /work/mvndemo/src/main/resources
+[INFO] 
+[INFO] --- maven-compiler-plugin:3.1:compile (default-compile) @ mvndemo ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 1 source file to /work/mvndemo/target/classes
+[INFO] 
+[INFO] --- maven-surefire-plugin:2.12.4:test (default-test) @ mvndemo ---
+[INFO] No tests to run.
+[INFO] 
+[INFO] --- maven-jar-plugin:2.4:jar (default-jar) @ mvndemo ---
+[INFO] Building jar: /work/mvndemo/target/mvndemo-1.0.0.jar
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  1.293 s
+[INFO] Finished at: 2026-09-01T11:57:18Z
+[INFO] ------------------------------------------------------------------------
+"""
+expected = """
+[INFO] Building jar: /work/mvndemo/target/mvndemo-1.0.0.jar
+[INFO] BUILD SUCCESS
+"""
+
+[[tests.maven]]
+name = "compilation errors and the failure result survive"
+input = """
+[INFO] --- maven-compiler-plugin:3.1:compile (default-compile) @ mvndemo ---
+[INFO] Compiling 2 source files to /work/mvndemo/target/classes
+[INFO] -------------------------------------------------------------
+[ERROR] COMPILATION ERROR :
+[INFO] -------------------------------------------------------------
+[ERROR] /work/mvndemo/src/main/java/com/example/Broken.java:[1,24] illegal start of expression
+[INFO] 1 error
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  0.949 s
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.1:compile (default-compile) on project mvndemo: Compilation failure
+[ERROR] /work/mvndemo/src/main/java/com/example/Broken.java:[1,24] illegal start of expression
+[ERROR] -> [Help 1]
+[ERROR] 
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[ERROR] 
+[ERROR] For more information about the errors and possible solutions, please read the following articles:
+[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException
+"""
+expected = """
+[ERROR] COMPILATION ERROR :
+[ERROR] /work/mvndemo/src/main/java/com/example/Broken.java:[1,24] illegal start of expression
+[INFO] BUILD FAILURE
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.1:compile (default-compile) on project mvndemo: Compilation failure
+[ERROR] /work/mvndemo/src/main/java/com/example/Broken.java:[1,24] illegal start of expression
+"""
+
+[[tests.maven]]
+name = "test results and warnings are retained"
+input = """
+[INFO] --- maven-surefire-plugin:2.12.4:test (default-test) @ mvndemo ---
+[WARNING] Corrupted STDOUT by directly writing to native stream in forked JVM
+[INFO] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+"""
+expected = """
+[WARNING] Corrupted STDOUT by directly writing to native stream in forked JVM
+[INFO] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+"""

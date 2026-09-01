@@ -55,6 +55,7 @@ async fn fixture_server_with_options(
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
             shell_policy,
+            shell_output_filter: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1027,6 +1028,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
             shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Path(&worker),
                 type_check: true,

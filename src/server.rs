@@ -60,6 +60,7 @@ pub struct ToolConfiguration<'a> {
     pub web: WebsearchExecutionConfiguration,
     pub web_icons: bool,
     pub shell_policy: ShellPermissionPolicy,
+    pub shell_output_filter: bool,
     pub code: CodeConfiguration<'a>,
 }
 
@@ -129,7 +130,8 @@ impl WorkcellServer {
                     tools.shell_policy,
                 )
                 .await
-                .map_err(|_| ServerBuildError::Filesystem)?,
+                .map_err(|_| ServerBuildError::Filesystem)?
+                .with_output_filter(tools.shell_output_filter),
             )
         } else {
             None
@@ -533,6 +535,7 @@ mod tests {
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
             shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,

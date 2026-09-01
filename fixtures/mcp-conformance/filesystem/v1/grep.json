@@ -19,7 +19,7 @@
     ]
   },
   "expected": {
-    "contentText": "{\n  \"cwd\": \"{{ROOT}}\",\n  \"relativePath\": \".\",\n  \"pattern\": \"^alpha\",\n  \"include\": \"*.txt\",\n  \"rows\": [\n    {\n      \"path\": \"{{ROOT}}/notes.txt\",\n      \"relativePath\": \"notes.txt\",\n      \"line\": 1,\n      \"text\": \"alpha\"\n    },\n    {\n      \"path\": \"{{ROOT}}/notes.txt\",\n      \"relativePath\": \"notes.txt\",\n      \"line\": 3,\n      \"text\": \"alpha beta\"\n    }\n  ],\n  \"matches\": 2,\n  \"truncated\": false\n}",
+    "contentText": "notes.txt:1: alpha\nnotes.txt:3: alpha beta",
     "structuredContent": {
       "cwd": "{{ROOT}}",
       "relativePath": ".",

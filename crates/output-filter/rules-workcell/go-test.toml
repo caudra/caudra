@@ -1,0 +1,57 @@
+[filters.go-test]
+description = "Collapse per-package go test results, keeping failures and their detail"
+match_command = "^go\\s+test\\b"
+filter_stderr = true
+strip_lines_matching = [
+  # One line per package. A repository with many packages spends most of its
+  # output restating that nothing went wrong.
+  "^ok\\s",
+  "^\\?\\s+\\S+\\s+\\[no test files\\]",
+  "^go: downloading ",
+  "^go: (finding|extracting) ",
+  "^\\s*$",
+]
+on_empty = "go test: ok"
+
+[[tests.go-test]]
+name = "an all-passing run collapses to a success line"
+input = """
+ok  	gomulti/pkg1	0.002s
+ok  	gomulti/pkg2	0.002s
+ok  	gomulti/pkg3	(cached)
+?   	gomulti/internal	[no test files]
+"""
+expected = "go test: ok"
+
+[[tests.go-test]]
+name = "failures and their detail survive"
+input = """
+ok  	gomulti/pkg1	(cached)
+ok  	gomulti/pkg2	(cached)
+--- FAIL: TestF (0.00s)
+    a_test.go:7: unexpected
+FAIL
+FAIL	gomulti/pkg3	0.003s
+ok  	gomulti/pkg4	(cached)
+FAIL
+"""
+expected = """
+--- FAIL: TestF (0.00s)
+    a_test.go:7: unexpected
+FAIL
+FAIL	gomulti/pkg3	0.003s
+FAIL
+"""
+
+[[tests.go-test]]
+name = "build failures survive"
+input = """
+# gomulti/pkg3
+pkg3/a.go:3:14: undefined: missingSymbol
+FAIL	gomulti/pkg3 [build failed]
+"""
+expected = """
+# gomulti/pkg3
+pkg3/a.go:3:14: undefined: missingSymbol
+FAIL	gomulti/pkg3 [build failed]
+"""

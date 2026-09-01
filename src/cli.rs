@@ -92,6 +92,10 @@ pub struct RawOptions {
     #[arg(long)]
     pub yolo: bool,
 
+    /// Return raw command output instead of the filtered shell rendering.
+    #[arg(long)]
+    pub no_shell_output_filter: bool,
+
     /// Path to the `monty` worker binary used by the code tool group.
     #[arg(long)]
     pub code_worker: Option<PathBuf>,
@@ -149,6 +153,7 @@ pub struct CliOptions {
     pub web_icons: bool,
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
+    pub shell_output_filter: bool,
     pub code_worker: Option<PathBuf>,
     pub code_worker_cache: Option<PathBuf>,
     pub code_type_check: bool,
@@ -175,6 +180,7 @@ impl fmt::Debug for CliOptions {
                 &self.shell_policy_file.as_ref().map(|_| "[CONFIGURED]"),
             )
             .field("yolo", &self.yolo)
+            .field("shell_output_filter", &self.shell_output_filter)
             .field(
                 "code_worker",
                 &self.code_worker.as_ref().map(|_| "[CONFIGURED]"),
@@ -230,7 +236,7 @@ impl fmt::Display for CliError {
             Self::AllowWriteRequiresFiles => "--allow-write requires the files tool group",
             Self::WebIconsRequireWeb => "--web-icons requires the web tool group",
             Self::ShellOptionRequiresShell => {
-                "--shell-policy and --yolo require the shell tool group"
+                "--shell-policy, --yolo, and --no-shell-output-filter require the shell tool group"
             }
             Self::CodeOptionRequiresCode => {
                 "--code-worker, --code-worker-cache, and --no-code-type-check require the code tool group"
@@ -251,7 +257,8 @@ impl RawOptions {
             || self.http_bind.is_some()
             || self.http_token_file.is_some()
             || !self.allowed_hosts.is_empty();
-        let explicit_shell_options = self.shell_policy.is_some() || self.yolo;
+        let explicit_shell_options =
+            self.shell_policy.is_some() || self.yolo || self.no_shell_output_filter;
         let explicit_code_options = self.code_worker.is_some()
             || self.code_worker_cache.is_some()
             || self.no_code_type_check;
@@ -335,6 +342,15 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let shell_output_filter = if self.no_shell_output_filter {
+            false
+        } else {
+            match environment_value(environment, "WORKCELL_MCP_SHELL_OUTPUT_FILTER")?.as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(_) => return Err(CliError::InvalidEnvironment),
+            }
+        };
         let web_icons = if self.web_icons {
             true
         } else {
@@ -409,6 +425,7 @@ impl RawOptions {
             web_icons,
             shell_policy_file,
             yolo,
+            shell_output_filter,
             code_worker,
             code_worker_cache: code_worker_cache.or_else(default_code_worker_cache),
             code_type_check,
@@ -507,6 +524,39 @@ mod tests {
     fn shell_policy_options_require_the_shell_group() {
         let raw =
             RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web", "--yolo"]).unwrap();
+        let environment = StartupEnvironment::load(None).unwrap();
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::ShellOptionRequiresShell
+        );
+    }
+
+    #[test]
+    fn shell_output_filtering_is_on_by_default_and_opt_out() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let default = RawOptions::try_parse_from(["workcell-mcp", "/"])
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert!(default.shell_output_filter);
+
+        let disabled =
+            RawOptions::try_parse_from(["workcell-mcp", "--no-shell-output-filter", "/"])
+                .unwrap()
+                .resolve(&environment)
+                .unwrap();
+        assert!(!disabled.shell_output_filter);
+    }
+
+    #[test]
+    fn shell_output_filter_opt_out_requires_the_shell_group() {
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "web",
+            "--no-shell-output-filter",
+        ])
+        .unwrap();
         let environment = StartupEnvironment::load(None).unwrap();
         assert_eq!(
             raw.resolve(&environment).unwrap_err(),

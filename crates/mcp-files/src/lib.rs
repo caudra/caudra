@@ -11,6 +11,7 @@ mod glob_tests;
 mod group;
 #[cfg(feature = "index")]
 mod index;
+mod model_text;
 mod mutation_operations;
 mod operations;
 mod patch;

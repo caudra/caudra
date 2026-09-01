@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "mcp")]
 use crate::catalog::catalog;
+use crate::model_text::ModelText;
 use crate::mutation_operations::{PlannedChange, PlannedChangeType};
 use crate::{
     FilesystemError, FilesystemLimits,
@@ -471,7 +472,7 @@ fn parse_arguments<T: DeserializeOwned>(name: &str, value: Value) -> Result<T, S
 }
 
 #[cfg(feature = "mcp")]
-fn run<T: Serialize>(
+fn run<T: Serialize + ModelText>(
     result: Result<T, FilesystemError>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
@@ -481,7 +482,7 @@ fn run<T: Serialize>(
 }
 
 #[cfg(feature = "mcp")]
-fn success(output: impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
+fn success(output: impl Serialize + ModelText) -> Result<CallToolResult, rmcp::ErrorData> {
     build_success_result(&output).map_err(|error| {
         rmcp::ErrorData::internal_error(
             "Failed to serialize filesystem tool result",
@@ -637,19 +638,21 @@ fn truncate_index_paths(output: &mut IndexOutput) {
 }
 
 #[cfg(feature = "mcp")]
-fn build_success_result(output: &impl Serialize) -> Result<CallToolResult, serde_json::Error> {
+fn build_success_result(
+    output: &(impl Serialize + ModelText),
+) -> Result<CallToolResult, serde_json::Error> {
     let structured = serde_json::to_value(output)?;
-    let text = serde_json::to_string_pretty(&structured)?;
     let mut result = CallToolResult::default();
-    result.content = vec![ContentBlock::text(text)];
+    result.content = vec![ContentBlock::text(output.model_text().into_owned())];
     result.structured_content = Some(structured);
     Ok(result)
 }
 
-pub(crate) fn mcp_response_size(output: &impl Serialize) -> Result<usize, serde_json::Error> {
+pub(crate) fn mcp_response_size(
+    output: &(impl Serialize + ModelText),
+) -> Result<usize, serde_json::Error> {
     let structured = serde_json::to_value(output)?;
-    let text = serde_json::to_string_pretty(&structured)?;
-    mcp_response_size_from_parts(&structured, &text)
+    mcp_response_size_from_parts(&structured, &output.model_text())
 }
 
 fn mcp_response_size_from_parts(
@@ -764,17 +767,16 @@ fn validate_index(input: IndexInput) -> Result<IndexInput, FilesystemError> {
 
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
-    use serde_json::json;
-
     use super::{
-        ContentBlock, SerializedTextContent, SerializedToolResult, build_success_result,
+        ContentBlock, ModelText, SerializedTextContent, SerializedToolResult, build_success_result,
         mcp_response_size,
     };
     #[cfg(feature = "index")]
     use super::{
-        INDEX_TRUNCATED, MCP_RAW_RESULT_CEILING_BYTES, index_response_size, run_index,
+        INDEX_TRUNCATED, MCP_RAW_RESULT_CEILING_BYTES, mcp_response_size_from_parts, run_index,
         validate_index,
     };
+    use crate::types::{FileGrepOutput, FileGrepRow};
     #[cfg(feature = "index")]
     use crate::{IndexDirectoryEntry, IndexDirectoryEntryKind};
     #[cfg(feature = "index")]
@@ -782,16 +784,35 @@ mod tests {
 
     #[test]
     fn response_size_counts_both_result_forms_and_envelope() {
-        let output = json!({ "value": "x".repeat(1_000) });
-        let structured_size = serde_json::to_vec(&output)
-            .expect("structured output")
+        let output = FileGrepOutput {
+            cwd: "/root".into(),
+            relative_path: ".".into(),
+            pattern: "x".into(),
+            include: None,
+            rows: vec![FileGrepRow {
+                path: "/root/a.txt".into(),
+                relative_path: "a.txt".into(),
+                line: 1,
+                text: "x".repeat(1_000),
+            }],
+            matches: 1,
+            truncated: false,
+        };
+        let structured = serde_json::to_value(&output).expect("structured output");
+        let structured_size = serde_json::to_vec(&structured)
+            .expect("serialized structured output")
             .len();
-        let result_size =
-            serde_json::to_vec(&build_success_result(&output).expect("call tool result"))
-                .expect("serialized call tool result")
-                .len();
-        let structured = serde_json::to_value(&output).unwrap();
-        let text = serde_json::to_string_pretty(&structured).unwrap();
+        let result = build_success_result(&output).expect("call tool result");
+        let result_size = serde_json::to_vec(&result)
+            .expect("serialized call tool result")
+            .len();
+
+        // The content block carries the rendering and the structured content
+        // carries the record, so a result is not two copies of one payload.
+        let text = output.model_text();
+        assert!(!text.contains("relativePath"));
+        assert!(result_size < structured_size * 2);
+
         let neutral = SerializedToolResult {
             result_type: "complete",
             content: [SerializedTextContent {
@@ -802,11 +823,10 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(neutral).unwrap(),
-            serde_json::to_value(build_success_result(&output).unwrap()).unwrap()
+            serde_json::to_value(&result).unwrap()
         );
-        let response_size = mcp_response_size(&output).expect("response size");
 
-        assert!(result_size > structured_size * 2);
+        let response_size = mcp_response_size(&output).expect("response size");
         assert!(response_size > result_size);
     }
 
@@ -859,10 +879,7 @@ mod tests {
             panic!("expected text")
         };
         let IndexOutput::File {
-            skeleton,
-            lines,
-            truncated,
-            ..
+            lines, truncated, ..
         } = &fitted
         else {
             panic!("expected file")
@@ -873,8 +890,21 @@ mod tests {
             assert_eq!(line.body.as_deref(), Some(line.text.as_str()));
             assert_eq!(line.source_range.unwrap().start_line, line.output_line);
         }
-        assert_eq!(skeleton, &content.text);
-        assert!(index_response_size(&fitted).unwrap() <= MCP_RAW_RESULT_CEILING_BYTES);
+        // The outline is the content block, and it is exactly the retained
+        // lines, which is what lets the record omit it.
+        assert_eq!(
+            content.text,
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // Both published forms are charged against the protocol ceiling.
+        assert!(
+            mcp_response_size_from_parts(structured, &content.text).unwrap()
+                <= MCP_RAW_RESULT_CEILING_BYTES
+        );
     }
 
     #[cfg(feature = "index")]
@@ -902,19 +932,15 @@ mod tests {
         let result = run_index(Ok(output)).expect("tool result");
 
         assert_ne!(result.is_error, Some(true));
-        let fitted: IndexOutput = serde_json::from_value(
-            result
-                .structured_content
-                .as_ref()
-                .expect("structured")
-                .clone(),
-        )
-        .expect("typed output");
+        let structured = result.structured_content.as_ref().expect("structured");
+        let fitted: IndexOutput = serde_json::from_value(structured.clone()).expect("typed output");
+        let ContentBlock::Text(content) = &result.content[0] else {
+            panic!("expected text")
+        };
         let IndexOutput::Directory {
             entries,
             total_count,
             truncated,
-            listing,
             ..
         } = &fitted
         else {
@@ -923,7 +949,11 @@ mod tests {
         assert!(truncated);
         assert_eq!(*total_count, 1_000);
         assert!(entries.len() < *total_count);
-        assert_eq!(listing.lines().last(), Some(INDEX_TRUNCATED));
-        assert!(index_response_size(&fitted).unwrap() <= MCP_RAW_RESULT_CEILING_BYTES);
+        // The listing is the content block; the record carries the entries.
+        assert_eq!(content.text.lines().last(), Some(INDEX_TRUNCATED));
+        assert!(
+            mcp_response_size_from_parts(structured, &content.text).unwrap()
+                <= MCP_RAW_RESULT_CEILING_BYTES
+        );
     }
 }

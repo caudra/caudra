@@ -93,7 +93,7 @@ impl FilesystemCore {
     }
 
     fn validate_patch_output(&self, output: &FileApplyPatchOutput) -> Result<(), FilesystemError> {
-        let output_size = mcp_response_size(&output)
+        let output_size = mcp_response_size(output)
             .map_err(|_| FilesystemError::message("Cannot serialize patch result"))?;
         let output_limit = self
             .limits

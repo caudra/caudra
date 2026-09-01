@@ -1,0 +1,41 @@
+[filters.docker-pull]
+description = "Drop per-layer transfer progress from docker pull, keeping the resulting status"
+# `docker run` is deliberately absent: its output belongs to the container's
+# own program, which this corpus must never reinterpret.
+match_command = "^docker\\s+pull\\b"
+filter_stderr = true
+strip_lines_matching = [
+  # Five or more status transitions are emitted per layer, so this dominates
+  # the output of any image with a realistic number of layers.
+  "^[0-9a-f]{8,}: (Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Already exists|Retrying in)",
+  "^\\S+: Pulling from ",
+  "^Digest: sha256:",
+  "^\\s*$",
+]
+on_empty = "docker pull: ok"
+
+[[tests.docker-pull]]
+name = "layer progress is dropped and the status kept"
+input = """
+1.36: Pulling from library/busybox
+034d6572bf28: Pulling fs layer
+034d6572bf28: Verifying Checksum
+034d6572bf28: Download complete
+034d6572bf28: Pull complete
+Digest: sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+Status: Downloaded newer image for busybox:1.36
+docker.io/library/busybox:1.36
+"""
+expected = """
+Status: Downloaded newer image for busybox:1.36
+docker.io/library/busybox:1.36
+"""
+
+[[tests.docker-pull]]
+name = "errors survive"
+input = """
+Error response from daemon: manifest for busybox:nope not found: manifest unknown: manifest unknown
+"""
+expected = """
+Error response from daemon: manifest for busybox:nope not found: manifest unknown: manifest unknown
+"""

@@ -44,6 +44,15 @@ impl Tail {
         }
         self.bytes.extend(bytes);
     }
+    /// The complete retained tail.
+    ///
+    /// Result rendering filters this rather than the model-facing preview, so a
+    /// transformation sees the whole retained window and the preview budget is
+    /// then spent on what survived.
+    pub(crate) fn text(&self) -> String {
+        self.preview(usize::MAX).0
+    }
+
     pub(crate) fn preview(&self, limit: usize) -> (String, bool) {
         let all = self.bytes.iter().copied().collect::<Vec<_>>();
         let truncated = all.len() > limit;

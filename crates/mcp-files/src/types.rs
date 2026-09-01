@@ -150,6 +150,9 @@ pub enum FileReadOutput {
     Directory {
         path: String,
         relative_path: String,
+        /// Rendered listing. Derived from `entry_details`, so it is the
+        /// model-facing form rather than part of the structured record.
+        #[serde(skip)]
         entries: Vec<String>,
         entry_details: Vec<DirectoryEntryDetail>,
         truncated: bool,
@@ -159,6 +162,10 @@ pub enum FileReadOutput {
         path: String,
         relative_path: String,
         text: String,
+        /// Line-numbered rendering of `text`. Charged against the read byte
+        /// budget because it is what the caller receives, and derived from
+        /// `text` and `line_start`, so it is not part of the structured record.
+        #[serde(skip)]
         numbered_text: String,
         line_start: usize,
         line_end: usize,
@@ -306,6 +313,9 @@ pub enum FileEditKind {
 pub struct FileApplyPatchOutput {
     pub kind: FilePatchKind,
     pub applied: bool,
+    /// Combined preview. Concatenates `files[].patch`, so it is the
+    /// model-facing form rather than part of the structured record.
+    #[serde(skip)]
     pub diff: String,
     pub files: Vec<FileMutation>,
     #[serde(default, skip_serializing_if = "is_false")]

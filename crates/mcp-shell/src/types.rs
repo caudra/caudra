@@ -134,12 +134,21 @@ impl PreparedShell {
         }
     }
 
-    pub(crate) fn into_execution_parts(self) -> (String, u64, PathBuf, String) {
+    /// Consumes the prepared command into the parts execution needs.
+    ///
+    /// The analysis is carried through rather than dropped so result rendering
+    /// can reuse the parsed command scopes. Re-deriving them from the raw
+    /// command string would reintroduce the shell-lexical evasions the parser
+    /// already resolves.
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (String, u64, PathBuf, String, ShellCommandAnalysis) {
         (
             self.command,
             self.timeout_ms,
             self.workdir,
             self.relative_workdir,
+            self.analysis,
         )
     }
 }

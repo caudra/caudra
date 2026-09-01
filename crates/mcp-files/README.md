@@ -80,6 +80,20 @@ ambient pathname operations have a malicious symlink-swap TOCTOU window between 
 A complete fix requires retaining descriptor-relative capability handles through reads, writes,
 renames, and deletes, or running inside an OS sandbox.
 
+## Result Shape
+
+Every tool result carries two forms. The content block is the model-facing rendering: numbered lines
+for a file read, a listing for a directory read, relative paths for `file_glob`, `path:line: text`
+rows for `file_grep`, a skeleton or listing for `index`, and a unified diff for every mutation. The
+structured content is the canonical record a program consumes.
+
+Neither form restates the other. A field is omitted from the structured record only when it is
+exactly derivable from a field that remains, so `numberedText` follows from `text` and `lineStart`, a
+directory listing from its entry details, the combined `file_apply_patch` `diff` from the per-file
+patches, and the `index` `skeleton` and `listing` from `lines` and `entries`. Native callers still read every field on the Rust types; only the serialized record
+is deduplicated. Both forms are charged against the protocol ceiling and the configured result
+budgets.
+
 ## Compatibility
 
 Shared fixtures under `fixtures/mcp-conformance` define deterministic catalog, model-text, structured

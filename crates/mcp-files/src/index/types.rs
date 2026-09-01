@@ -113,6 +113,9 @@ pub enum IndexOutput {
         path: String,
         relative_path: String,
         language: String,
+        /// Rendered outline. Concatenates `lines[].text`, so it is the
+        /// model-facing form rather than part of the structured record.
+        #[serde(skip)]
         skeleton: String,
         lines: Vec<IndexOutputLine>,
         source_line_count: usize,
@@ -126,6 +129,9 @@ pub enum IndexOutput {
         entries: Vec<IndexDirectoryEntry>,
         total_count: usize,
         truncated: bool,
+        /// Rendered listing. Derived from `entries`, so it is the model-facing
+        /// form rather than part of the structured record.
+        #[serde(skip)]
         listing: String,
     },
 }
