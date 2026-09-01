@@ -33,6 +33,7 @@ mod event_loop;
 mod input;
 mod terminal;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use color_eyre::Result;
@@ -85,6 +86,11 @@ pub(crate) fn push_history_message(session: &mut AppSession, message: Message) {
 pub(crate) use agent::AgentCommand;
 pub use event_loop::EventLoopParams;
 
+pub struct SessionTab {
+    pub session: AppSession,
+    pub lease: Arc<maki_storage::sessions::SessionLease>,
+}
+
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk.
 pub enum RunOutcome {
@@ -93,7 +99,7 @@ pub enum RunOutcome {
         code: i32,
     },
     Reload {
-        tabs: Vec<AppSession>,
+        tabs: Vec<SessionTab>,
         focused: usize,
     },
 }
@@ -114,8 +120,8 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             let session_id = report
                 .tabs
                 .get(report.focused)
-                .filter(|s| app::session_has_content(s))
-                .map(|s| s.id);
+                .filter(|tab| app::session_has_content(&tab.session))
+                .map(|tab| tab.session.id);
             let started = Instant::now();
             drop(report);
             tracing::info!(

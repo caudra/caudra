@@ -141,6 +141,31 @@ pub(crate) fn exclusive_state_lock(path: &Path, mode: u32) -> Result<File, Stora
     Ok(file)
 }
 
+pub(crate) fn try_exclusive_state_lock(
+    path: &Path,
+    mode: u32,
+) -> Result<Option<File>, StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    validate_lock_path(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options
+        .mode(mode)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 pub(crate) fn shared_state_lock(path: &Path, mode: u32) -> Result<File, StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;

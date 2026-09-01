@@ -111,6 +111,14 @@ impl StorageWriter {
         self.enqueue(id, Entry::Delete(Box::new(done)));
     }
 
+    pub fn delete_sync(&self, id: MakiId) -> Result<(), SessionError> {
+        let (done_tx, done_rx) = flume::bounded(1);
+        self.delete(id, move |result| {
+            let _ = done_tx.send(result);
+        });
+        done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
+    }
+
     fn enqueue(&self, id: MakiId, entry: Entry) {
         let superseded = { lock(&self.pending).insert(id, entry) };
         if let Some(superseded) = superseded {
@@ -361,6 +369,7 @@ fn retryable(error: &SessionError) -> bool {
     !matches!(
         error,
         SessionError::AlreadyExists { .. }
+            | SessionError::SessionInUse { .. }
             | SessionError::ConcurrentSessionWriter { .. }
             | SessionError::UnsupportedSchemaVersion { .. }
             | SessionError::CorruptDatabaseValue { .. }

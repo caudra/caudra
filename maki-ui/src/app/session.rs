@@ -20,7 +20,7 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
+    SessionLease, SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
     StoredPromptAdmission, StoredQueuedDraft, StoredSubagent,
 };
 use maki_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
@@ -683,13 +683,20 @@ impl App {
         }
     }
 
-    pub(super) fn reset_session(&mut self) -> Vec<Action> {
+    pub(crate) fn reset_session(&mut self) -> Vec<Action> {
         if self.cancelling_run.is_some() {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
             return Vec::new();
         }
-        self.checkpoint_now();
         let replacement = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        let lease = match SessionLease::acquire(&self.storage, replacement.id) {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                self.status_bar
+                    .flash(format!("Failed to reserve new session: {error}"));
+                return Vec::new();
+            }
+        };
         let replacement_store = match Self::snapshot_store_for(
             &self.storage,
             replacement.id,
@@ -702,6 +709,11 @@ impl App {
                 return Vec::new();
             }
         };
+        if let Err(error) = self.retire_current_session() {
+            self.status_bar
+                .flash(format!("Failed to retire current session: {error}"));
+            return Vec::new();
+        }
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
@@ -727,7 +739,7 @@ impl App {
             Some(&self.state.session.id.to_string()),
         );
         self.install_local_history();
-        vec![Action::NewSession]
+        vec![Action::NewSession(lease)]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
@@ -1204,6 +1216,10 @@ impl App {
         let ancestor = active_history_items(self.state.session.messages(), target.head)
             .map_err(|error| format!("Failed to read session history: {error}"))?;
         let mut child = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        let lease = Arc::new(
+            SessionLease::acquire(&self.storage, child.id)
+                .map_err(|error| format!("Failed to reserve fork session: {error}"))?,
+        );
         child.meta = SessionMeta {
             system_prompt_profile: if self.state.system_prompt_profile_override {
                 self.state.session.meta.system_prompt_profile.clone()
@@ -1396,6 +1412,7 @@ impl App {
 
         Ok(ForkedSession {
             session: child,
+            lease,
             draft: target
                 .draft
                 .map(|(text, images)| ForkDraft { text, images }),
@@ -1441,7 +1458,8 @@ impl App {
         )
         .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
         recover_pending_workspace_restore(&mut session, &snapshot_store, &self.storage_writer)?;
-        self.checkpoint_now();
+        self.retire_current_session()
+            .map_err(|error| format!("Failed to retire current session: {error}"))?;
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.permissions
@@ -1457,6 +1475,16 @@ impl App {
         self.restore_display();
 
         Ok(self.install_local_history())
+    }
+
+    fn retire_current_session(&mut self) -> Result<(), maki_storage::sessions::SessionError> {
+        self.checkpoint_now();
+        if self.has_content() {
+            self.storage_writer
+                .save_sync(Arc::clone(&self.state.session))
+        } else {
+            self.storage_writer.delete_sync(self.state.session.id)
+        }
     }
 
     #[cfg(test)]

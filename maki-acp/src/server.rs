@@ -37,9 +37,10 @@ use maki_providers::{
 };
 #[cfg(test)]
 use maki_providers::{Message, expand_message};
+use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::permission_state::PermissionRuleRecord;
-use maki_storage::sessions::{StoredRule, StoredTokenUsage};
+use maki_storage::sessions::{SessionError, SessionLease, StoredRule, StoredTokenUsage};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -48,6 +49,7 @@ use tracing::{debug, warn};
 use crate::{AcpParams, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const SESSION_IN_USE_ERROR_CODE: i32 = -32001;
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
 
@@ -268,24 +270,29 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
+    let session_id = SessionRef::generate();
+    let session_lease = acquire_session_lease(session_id.id())?;
     let (profile_name, profile) = resolve_prompt_profile(params, None)?;
     preflight_mcp(&req.cwd, &req.mcp_servers).await?;
-    close_session(srv).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await?;
     let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(
+    let (mut prepared, pending) = prepare_session(
         srv,
         params,
         SessionStart {
-            cwd: req.cwd,
-            session_id: None,
+            cwd: cwd.clone(),
+            session_id,
+            session_lease,
             expected_write_version: None,
             history: Vec::new(),
             permissions: (Vec::new(), Vec::new(), None),
             profile: (profile_name, profile),
-            mcp_handle: mcp.clone(),
         },
-    );
+    )
+    .await?;
+    close_session(srv).await;
+    let mcp = start_mcp(&cwd, &req.mcp_servers).await;
+    prepared.set_mcp_handle(mcp.clone());
+    let handle = headless::spawn_prepared_interactive(prepared);
     maki_otel::emit::session_started(
         maki_otel::emit::START_FRESH,
         Some(handle.session_id.as_str()),
@@ -308,27 +315,34 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
+    let replacing_current = srv
+        .session
+        .as_ref()
+        .is_some_and(|state| state.handle.session_id.id() == session_ref.id());
+    if replacing_current {
+        return Err(session_lease_error(SessionError::SessionInUse {
+            id: session_ref.id(),
+        }));
+    }
+    let session_lease = acquire_session_lease(session_ref.id())?;
     let mut restored = load_history(session_ref.id())?;
     let (profile_name, profile) =
         resolve_prompt_profile(params, restored.system_prompt_profile.as_deref())?;
+    let history = History::restored(restored.history)
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
     preflight_mcp(&req.cwd, &req.mcp_servers).await?;
-    close_session(srv).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await?;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
-    let history = History::restored(restored.history)
-        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
-    for update in translate::replay_history(history.as_slice(), replay_cwd, home.as_deref()) {
-        session_update(&srv.out_tx, &sid, update);
-    }
+    let replay_updates = translate::replay_history(history.as_slice(), replay_cwd, home.as_deref());
     let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(
+    let (mut prepared, pending) = prepare_session(
         srv,
         params,
         SessionStart {
-            cwd: req.cwd,
-            session_id: Some(session_ref),
+            cwd: cwd.clone(),
+            session_id: session_ref,
+            session_lease,
             expected_write_version: restored.write_version,
             history: history.into_items(),
             permissions: (
@@ -337,9 +351,16 @@ async fn load_session(
                 restored.yolo,
             ),
             profile: (profile_name, profile),
-            mcp_handle: mcp.clone(),
         },
-    );
+    )
+    .await?;
+    close_session(srv).await;
+    let mcp = start_mcp(&cwd, &req.mcp_servers).await;
+    prepared.set_mcp_handle(mcp.clone());
+    let handle = headless::spawn_prepared_interactive(prepared);
+    for update in replay_updates {
+        session_update(&srv.out_tx, &sid, update);
+    }
     maki_otel::emit::session_started(
         maki_otel::emit::START_RESUME,
         Some(handle.session_id.as_str()),
@@ -362,19 +383,19 @@ async fn load_session(
 
 struct SessionStart {
     cwd: PathBuf,
-    session_id: Option<SessionRef>,
+    session_id: SessionRef,
+    session_lease: Arc<SessionLease>,
     expected_write_version: Option<i64>,
     history: Vec<HistoryItem>,
     permissions: (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>),
     profile: (String, Option<Arc<SystemPromptProfile>>),
-    mcp_handle: Option<McpHandle>,
 }
 
-fn spawn_session(
+async fn prepare_session(
     srv: &Server,
     params: &AcpParams,
     start: SessionStart,
-) -> (InteractiveHandle, PendingState) {
+) -> Result<(headless::PreparedInteractive, PendingState), AcpError> {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
@@ -388,7 +409,7 @@ fn spawn_session(
     };
     let (session_rules, structured_permission_rules, session_yolo) = start.permissions;
     let (system_prompt_profile_name, system_prompt_profile) = start.profile;
-    let handle = headless::spawn_interactive(InteractiveParams {
+    let prepared = headless::prepare_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
@@ -399,9 +420,10 @@ fn spawn_session(
         system_prompt_profile_name: Some(system_prompt_profile_name),
         prompt_profiles: Arc::clone(&params.prompt_profiles),
         excluded_tools,
-        mcp_handle: start.mcp_handle,
+        mcp_handle: None,
         initial_wd: start.cwd,
         session_id: start.session_id,
+        session_lease: start.session_lease,
         expected_write_version: start.expected_write_version,
         initial_history: start.history,
         yolo: params.yolo,
@@ -414,8 +436,10 @@ fn spawn_session(
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
         local_tools,
-    });
-    (handle, pending)
+    })
+    .await
+    .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    Ok((prepared, pending))
 }
 
 fn resolve_prompt_profile(
@@ -547,7 +571,7 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
 
 /// MCP is per session: the client picks the cwd and may inject its own servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
-async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Result<Option<McpHandle>, AcpError> {
+async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
     let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
@@ -562,14 +586,13 @@ async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Result<Option<McpHandle
             .map(|info| info.name.clone())
             .collect();
         if !awaiting.is_empty() {
-            let message = format!(
-                "project MCP servers require startup trust: {}. Run `maki`, review them with `/mcp`, then retry",
-                awaiting.join(", ")
+            warn!(
+                servers = %awaiting.join(", "),
+                "MCP trust changed after preflight; leaving servers parked"
             );
-            return Err(AcpError::invalid_params().data(json_str(&message)));
         }
     }
-    Ok(handle)
+    handle
 }
 
 async fn preflight_mcp(cwd: &Path, servers: &[McpServer]) -> Result<(), AcpError> {
@@ -587,8 +610,24 @@ async fn preflight_mcp(cwd: &Path, servers: &[McpServer]) -> Result<(), AcpError
     Err(AcpError::invalid_params().data(json_str(&message)))
 }
 
-/// Stop the old session before the next one starts, so two generations of the
-/// same MCP servers never fight over a port or a lock file.
+fn acquire_session_lease(id: MakiId) -> Result<Arc<SessionLease>, AcpError> {
+    let storage =
+        StateDir::resolve().map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    SessionLease::acquire(&storage, id)
+        .map(Arc::new)
+        .map_err(session_lease_error)
+}
+
+fn session_lease_error(error: SessionError) -> AcpError {
+    match error {
+        SessionError::SessionInUse { .. } => {
+            AcpError::new(SESSION_IN_USE_ERROR_CODE, error.to_string())
+        }
+        _ => AcpError::internal_error().data(json_str(&error)),
+    }
+}
+
+/// Stop the installed session and release its per-session resources.
 async fn close_session(srv: &mut Server) {
     let Some(state) = srv.session.take() else {
         return;
@@ -1067,6 +1106,19 @@ mod tests {
         assert_eq!(permission_answer(&raw, exact_project_deny), expected);
     }
 
+    #[test]
+    fn session_in_use_has_a_distinct_server_error() {
+        let id = MakiId::generate();
+
+        let error = session_lease_error(SessionError::SessionInUse { id });
+
+        assert_eq!(
+            error.code,
+            agent_client_protocol_schema::ErrorCode::Other(SESSION_IN_USE_ERROR_CODE)
+        );
+        assert!(error.message.contains(&id.to_string()));
+    }
+
     fn permission_manager() -> Arc<PermissionManager> {
         Arc::new(PermissionManager::new_nonpersistent(
             maki_config::PermissionsConfig::default(),
@@ -1081,6 +1133,16 @@ mod tests {
     ) -> (Server, Receiver<String>, Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
+        let session_id = SessionRef::from(MakiId::generate());
+        static LEASE_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+        let lease_dir = LEASE_DIR.get_or_init(|| TempDir::new().unwrap());
+        let session_lease = Arc::new(
+            SessionLease::acquire(
+                &StateDir::from_path(lease_dir.path().to_path_buf()),
+                session_id.id(),
+            )
+            .unwrap(),
+        );
         let handle = InteractiveHandle {
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
@@ -1088,7 +1150,8 @@ mod tests {
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
-            session_id: SessionRef::from(MakiId::generate()),
+            session_id,
+            session_lease,
             permissions,
             task: smol::spawn(async {}),
         };

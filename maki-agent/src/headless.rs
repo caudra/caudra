@@ -18,7 +18,7 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::permission_state::PermissionRuleRecord;
 use maki_storage::sessions::{
-    SessionCursor, SessionDatabase, StoredEffect, StoredRule, StoredSubagent,
+    SessionCursor, SessionDatabase, SessionLease, StoredEffect, StoredRule, StoredSubagent,
 };
 use serde_json::Value;
 use tracing::{error, warn};
@@ -41,6 +41,7 @@ use crate::{
 
 struct SessionStore {
     dir: StateDir,
+    _lease: Arc<SessionLease>,
     database: Option<SessionDatabase>,
     cursor: Option<SessionCursor>,
     session: StoredSession,
@@ -54,25 +55,39 @@ impl SessionStore {
         session_id: MakiId,
         cwd: &str,
         model_spec: &str,
+        lease: Arc<SessionLease>,
     ) -> Result<Self, maki_storage::sessions::SessionError> {
         let dir = StateDir::resolve()?;
-        Self::open_in(dir, session_id, cwd, model_spec)
+        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease)
     }
 
+    #[cfg(test)]
     fn open_in(
         dir: StateDir,
         session_id: MakiId,
         cwd: &str,
         model_spec: &str,
     ) -> Result<Self, maki_storage::sessions::SessionError> {
+        let lease = Arc::new(SessionLease::acquire(&dir, session_id)?);
+        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease)
+    }
+
+    fn open_in_with_lease(
+        dir: StateDir,
+        session_id: MakiId,
+        cwd: &str,
+        model_spec: &str,
+        lease: Arc<SessionLease>,
+    ) -> Result<Self, maki_storage::sessions::SessionError> {
+        lease.validate(&dir, session_id)?;
         match load_stored_session(session_id, &dir) {
-            Ok(session) => Ok(Self::from_session(dir, session, false)),
+            Ok(session) => Ok(Self::from_session(dir, session, false, lease)),
             Err(maki_storage::sessions::SessionError::Storage(
                 maki_storage::StorageError::NotFound(_),
             )) => {
                 let mut session = StoredSession::new(model_spec, cwd);
                 session.id = session_id;
-                let mut store = Self::from_session(dir, session, true);
+                let mut store = Self::from_session(dir, session, true, lease);
                 store.save()?;
                 Ok(store)
             }
@@ -80,7 +95,12 @@ impl SessionStore {
         }
     }
 
-    fn from_session(dir: StateDir, session: StoredSession, created: bool) -> Self {
+    fn from_session(
+        dir: StateDir,
+        session: StoredSession,
+        created: bool,
+        lease: Arc<SessionLease>,
+    ) -> Self {
         let database = SessionDatabase::open(&dir)
             .map_err(|error| warn!(%error, "session database unavailable"))
             .ok();
@@ -163,6 +183,7 @@ impl SessionStore {
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
+            _lease: lease,
             database,
             cursor,
             session,
@@ -823,7 +844,8 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<SessionRef>,
+    pub session_id: SessionRef,
+    pub session_lease: Arc<SessionLease>,
     pub expected_write_version: Option<i64>,
     pub initial_history: Vec<HistoryItem>,
     pub yolo: bool,
@@ -848,21 +870,84 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub session_id: SessionRef,
+    pub session_lease: Arc<SessionLease>,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
 
-pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InteractiveStartError(String);
+
+pub struct PreparedInteractive {
+    params: InteractiveParams,
+    history: History,
+    model: Model,
+    provider: Arc<dyn Provider>,
+    store: SessionStore,
+}
+
+impl PreparedInteractive {
+    pub fn set_mcp_handle(&mut self, mcp_handle: Option<McpHandle>) {
+        self.params.mcp_handle = mcp_handle;
+    }
+}
+
+pub async fn prepare_interactive(
+    mut params: InteractiveParams,
+) -> Result<PreparedInteractive, InteractiveStartError> {
     if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
         warn!(%error, "failed to adjust interactive model before setup");
     }
+    let history = History::restored(std::mem::take(&mut params.initial_history))
+        .map_err(|error| InteractiveStartError(format!("Failed to restore history: {error}")))?;
+    let mut model = params.model.clone();
+    let provider: Arc<dyn Provider> = provider::from_model_async(&mut model, params.timeouts)
+        .await
+        .map(Arc::from)
+        .map_err(|error| InteractiveStartError(error.user_message()))?;
+    let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let session_id = params.session_id.id();
+    let mut store = SessionStore::open(
+        session_id,
+        &working_dir,
+        &model.spec(),
+        Arc::clone(&params.session_lease),
+    )
+    .map_err(|error| InteractiveStartError(format!("Session persistence unavailable: {error}")))?;
+    store
+        .verify_start_version(params.expected_write_version)
+        .map_err(|error| {
+            InteractiveStartError(format!("Session changed before startup: {error}"))
+        })?;
+    store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
+    store
+        .save()
+        .map_err(|error| InteractiveStartError(format!("Failed to persist session: {error}")))?;
+    Ok(PreparedInteractive {
+        params,
+        history,
+        model,
+        provider,
+        store,
+    })
+}
+
+pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveHandle {
+    let PreparedInteractive {
+        params,
+        mut history,
+        mut model,
+        mut provider,
+        store,
+    } = prepared;
     let AgentSetup {
         vars,
         instructions,
         tools,
         mut tool_filter,
     } = setup(
-        &params.model,
+        &model,
         &params.config,
         &params.excluded_tools,
         params.workflow,
@@ -874,16 +959,18 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
         },
     );
 
-    let restored_history = History::restored(params.initial_history);
-    let initial_messages = restored_history
-        .as_ref()
-        .map(|history| history.as_slice())
-        .unwrap_or_default();
+    let initial_messages = history.as_slice();
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, initial_messages));
     let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+
+    let session_ref = params.session_id.clone();
+    let session_id = session_ref.id();
+    let session_lease = Arc::clone(&params.session_lease);
+    let subagent_history = store.subagent_history.clone();
+    let store = Arc::new(Mutex::new(Some(store)));
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -891,16 +978,8 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let (session_id, session_ref) = match params.session_id.clone() {
-        Some(w) => (w.id(), w),
-        None => {
-            let id = MakiId::generate();
-            (id, SessionRef::from(id))
-        }
-    };
     let mailbox = SessionMailbox::register(session_id);
 
-    let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new_persistent(
@@ -919,53 +998,6 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         async move {
-            let mut history = match restored_history {
-                Ok(history) => history,
-                Err(error) => {
-                    error!(%error, "failed to restore history");
-                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
-                        message: format!("Failed to restore history: {error}"),
-                    });
-                    return;
-                }
-            };
-            let mut model = params.model;
-            let mut provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
-                            message: e.user_message(),
-                        });
-                        return;
-                    }
-                };
-
-            let mut store = match SessionStore::open(session_id, &working_dir, &model.spec()) {
-                Ok(store) => store,
-                Err(error) => {
-                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
-                        message: format!("Session persistence unavailable: {error}"),
-                    });
-                    return;
-                }
-            };
-            if let Err(error) = store.verify_start_version(params.expected_write_version) {
-                let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
-                    message: format!("Session changed before startup: {error}"),
-                });
-                return;
-            }
-            store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
-            if let Err(error) = store.save() {
-                let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
-                    message: format!("Failed to persist session: {error}"),
-                });
-                return;
-            }
-            let subagent_history = store.subagent_history.clone();
-            let store = Arc::new(Mutex::new(Some(store)));
             let (agent_tx, agent_rx) = flume::unbounded();
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
@@ -1167,9 +1199,18 @@ pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
         cancel_tx,
         model_tx,
         session_id: session_ref,
+        session_lease,
         permissions,
         task,
     }
+}
+
+pub async fn spawn_interactive(
+    params: InteractiveParams,
+) -> Result<InteractiveHandle, InteractiveStartError> {
+    prepare_interactive(params)
+        .await
+        .map(spawn_prepared_interactive)
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {
@@ -1209,6 +1250,25 @@ mod tests {
             MODEL_SPEC,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_store_rejects_duplicate_active_open() {
+        let tmp = TempDir::new().unwrap();
+        let first = store_in(&tmp);
+
+        assert!(matches!(
+            SessionStore::open_in(
+                StateDir::from_path(tmp.path().to_path_buf()),
+                session_id(),
+                CWD,
+                MODEL_SPEC,
+            ),
+            Err(maki_storage::sessions::SessionError::SessionInUse { id }) if id == session_id()
+        ));
+
+        drop(first);
+        assert_eq!(store_in(&tmp).session.id, session_id());
     }
 
     fn load(tmp: &TempDir) -> StoredSession {
@@ -1256,6 +1316,7 @@ mod tests {
                 &permission_manager(),
             )
             .unwrap();
+        drop(store);
         let reopened = store_in(&tmp);
 
         assert!(matches!(
@@ -1385,7 +1446,8 @@ mod tests {
         let mut current = load_stored_session(session_id(), &dir).unwrap();
         current.set_title("current".into());
         current.save(&dir).unwrap();
-        let mut store = SessionStore::from_session(dir, stale, false);
+        let lease = Arc::new(SessionLease::acquire(&dir, stale.id).unwrap());
+        let mut store = SessionStore::from_session(dir, stale, false, lease);
         store.session.set_title("stale".into());
 
         let error = store.save().unwrap_err();
@@ -1418,6 +1480,7 @@ mod tests {
             History::restored(loaded.subagent_messages()["task-1"].as_ref().clone()).unwrap();
         assert_eq!(task_history.as_slice()[0].user_text(), Some("investigate"));
 
+        drop(store);
         let reopened = store_in(&tmp);
         let lease = reopened.subagent_history.continue_task("task-1").unwrap();
         assert_eq!(lease.history().unwrap()[0].user_text(), Some("investigate"));

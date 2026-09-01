@@ -1110,7 +1110,7 @@ fn enter_executes_new_command() {
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::NewSession));
+    assert!(matches!(&actions[0], Action::RequestNewSession));
     assert!(!app.command_palette.is_active());
 }
 
@@ -1159,7 +1159,7 @@ fn reset_session_clears_plan() {
     let (trigger, _cancel) = maki_agent::CancelToken::new();
     app.btw_modal.open("q", rx, trigger);
     let actions = app.reset_session();
-    assert!(matches!(&actions[0], Action::NewSession));
+    assert!(matches!(&actions[0], Action::NewSession(_)));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.chats[0].context_size, 0);
@@ -4713,7 +4713,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
 
     let actions = app.run_cmdline(cmdline, 0).unwrap();
 
-    assert!(matches!(&actions[..], [Action::NewSession]));
+    assert!(matches!(&actions[..], [Action::RequestNewSession]));
 }
 
 #[test]
@@ -7259,7 +7259,9 @@ fn plan_form_menu_options(
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
     assert_eq!(
-        actions.iter().any(|a| matches!(a, Action::NewSession)),
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::RequestNewSession)),
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());

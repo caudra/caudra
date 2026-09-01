@@ -216,7 +216,8 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
-    NewSession,
+    RequestNewSession,
+    NewSession(Arc<maki_storage::sessions::SessionLease>),
     LoadSession(Box<LoadedSession>),
     ForkSession(Box<ForkedSession>),
     RevertSession {
@@ -251,6 +252,7 @@ pub enum Action {
 
 pub struct ForkedSession {
     pub session: crate::AppSession,
+    pub lease: Arc<maki_storage::sessions::SessionLease>,
     pub draft: Option<ForkDraft>,
 }
 

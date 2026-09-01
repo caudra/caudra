@@ -37,7 +37,7 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use maki_storage::permission_state::PermissionRuleRecord;
-use maki_storage::sessions::{SessionError, StoredRule};
+use maki_storage::sessions::{SessionError, SessionLease, StoredRule};
 use maki_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use maki_storage::{StateDir, StorageError};
 use serde::Serialize;
@@ -506,6 +506,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let working_dir = cwd.to_string_lossy().into_owned();
     let ResolvedSession {
         session_id,
+        session_lease,
         expected_write_version,
         initial_history,
         session_rules,
@@ -525,7 +526,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         } else {
             maki_otel::emit::START_RESUME
         },
-        session_id.as_ref(),
+        Some(&session_id),
     );
 
     let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
@@ -580,7 +581,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     )?;
 
     let startup_model = model.clone();
-    let handle = headless::spawn_interactive(InteractiveParams {
+    let handle = smol::block_on(headless::spawn_interactive(InteractiveParams {
         model,
         config,
         permissions_config,
@@ -594,6 +595,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         mcp_handle,
         initial_wd: cwd.clone(),
         session_id,
+        session_lease,
         expected_write_version,
         initial_history,
         yolo: requested_permission_mode == PermissionMode::BypassPermissions,
@@ -606,7 +608,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
-    });
+    }))
+    .map_err(|error| eyre!(error))?;
     let permission_mode =
         effective_permission_mode(requested_permission_mode, handle.permissions.is_yolo());
 
@@ -756,7 +759,8 @@ pub fn run(params: SdkParams) -> Result<()> {
 }
 
 struct ResolvedSession {
-    session_id: Option<SessionRef>,
+    session_id: SessionRef,
+    session_lease: Arc<SessionLease>,
     expected_write_version: Option<i64>,
     initial_history: Vec<HistoryItem>,
     session_rules: Vec<StoredRule>,
@@ -787,6 +791,7 @@ fn resolve_session(
     configured_profile: Option<&str>,
     raw_prompt_override: bool,
 ) -> Result<ResolvedSession> {
+    let storage = StateDir::resolve().context("resolve state dir")?;
     let cli_session_id = cli
         .session_id
         .as_deref()
@@ -797,19 +802,15 @@ fn resolve_session(
         })
         .transpose()?;
 
-    let (
-        resumed_id,
-        expected_write_version,
-        initial_history,
-        session_rules,
-        structured_permission_rules,
-        session_yolo,
-        stored_system_prompt_profile,
-    ) = if let Some(id) = &cli.session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
+    if let Some(id) = &cli.session {
         let session_ref: SessionRef = id
             .parse()
             .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
+        let source_lease = if cli.fork_session {
+            None
+        } else {
+            Some(Arc::new(SessionLease::acquire(&storage, session_ref.id())?))
+        };
         let session = crate::setup::load_session(session_ref.id(), &storage)
             .map_err(|e| eyre!("load session {id}: {e}"))?;
         let history = crate::setup::active_session_history(&session)
@@ -830,6 +831,7 @@ fn resolve_session(
                     "fork session ID must differ from source session {id}"
                 ));
             }
+            let session_lease = Arc::new(SessionLease::acquire(&storage, target.id())?);
             ensure_fork_target_available(&storage, &target)?;
             let mut reachable = reachable_subagent_ids(&history, &session);
             let mut versions =
@@ -890,67 +892,72 @@ fn resolve_session(
                 let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
                 return Err(error);
             }
-            (
-                Some(target),
-                Some(0),
-                history,
+            return Ok(ResolvedSession {
+                session_id: target,
+                session_lease,
+                expected_write_version: Some(0),
+                initial_history: history,
                 session_rules,
                 structured_permission_rules,
                 session_yolo,
-                session.meta.system_prompt_profile.clone(),
-            )
-        } else {
-            if cli_session_id
-                .as_ref()
-                .is_some_and(|target| target.id() != session_ref.id())
-            {
-                return Err(eyre!(
-                    "--session-id cannot replace the resumed session ID without --fork-session"
-                ));
-            }
-            let (session_rules, structured_permission_rules, session_yolo) =
-                session_permissions(&session, false);
-            (
-                Some(session_ref),
-                session.persisted_write_version(),
-                history,
-                session_rules,
-                structured_permission_rules,
-                session_yolo,
-                session.meta.system_prompt_profile.clone(),
-            )
+                stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+            });
         }
-    } else if cli.continue_session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
-        match crate::setup::latest_session(cwd, &storage) {
-            Ok(Some(session)) => {
-                let history = crate::setup::active_session_history(&session)?;
-                let (session_rules, structured_permission_rules, session_yolo) =
-                    session_permissions(&session, false);
-                (
-                    Some(SessionRef::from(session.id)),
-                    session.persisted_write_version(),
-                    history,
-                    session_rules,
-                    structured_permission_rules,
-                    session_yolo,
-                    session.meta.system_prompt_profile.clone(),
-                )
-            }
-            _ => (None, None, Vec::new(), Vec::new(), Vec::new(), None, None),
-        }
-    } else {
-        (None, None, Vec::new(), Vec::new(), Vec::new(), None, None)
-    };
 
+        if cli_session_id
+            .as_ref()
+            .is_some_and(|target| target.id() != session_ref.id())
+        {
+            return Err(eyre!(
+                "--session-id cannot replace the resumed session ID without --fork-session"
+            ));
+        }
+        let (session_rules, structured_permission_rules, session_yolo) =
+            session_permissions(&session, false);
+        return Ok(ResolvedSession {
+            session_id: session_ref,
+            session_lease: source_lease.expect("non-fork resume has a lease"),
+            expected_write_version: session.persisted_write_version(),
+            initial_history: history,
+            session_rules,
+            structured_permission_rules,
+            session_yolo,
+            stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+        });
+    }
+
+    if cli.continue_session
+        && let Some(summary) = StoredSession::list(cwd, &storage)?.into_iter().next()
+    {
+        let session_ref = SessionRef::from(summary.id);
+        let session_lease = Arc::new(SessionLease::acquire(&storage, summary.id)?);
+        let session = crate::setup::load_session(summary.id, &storage)?;
+        let history = crate::setup::active_session_history(&session)?;
+        let (session_rules, structured_permission_rules, session_yolo) =
+            session_permissions(&session, false);
+        return Ok(ResolvedSession {
+            session_id: session_ref,
+            session_lease,
+            expected_write_version: session.persisted_write_version(),
+            initial_history: history,
+            session_rules,
+            structured_permission_rules,
+            session_yolo,
+            stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+        });
+    }
+
+    let session_id = cli_session_id.unwrap_or_else(SessionRef::generate);
+    let session_lease = Arc::new(SessionLease::acquire(&storage, session_id.id())?);
     Ok(ResolvedSession {
-        session_id: cli_session_id.or(resumed_id),
-        expected_write_version,
-        initial_history,
-        session_rules,
-        structured_permission_rules,
-        session_yolo,
-        stored_system_prompt_profile,
+        session_id,
+        session_lease,
+        expected_write_version: None,
+        initial_history: Vec::new(),
+        session_rules: Vec::new(),
+        structured_permission_rules: Vec::new(),
+        session_yolo: None,
+        stored_system_prompt_profile: None,
     })
 }
 

@@ -16,7 +16,8 @@ use maki_lua::PluginHost;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use maki_ui::{AppSession, RunOutcome};
+use maki_storage::sessions::SessionLease;
+use maki_ui::{AppSession, RunOutcome, SessionTab};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -222,32 +223,29 @@ fn resolve_session(
     model: &str,
     cwd: &str,
     storage: &StateDir,
-) -> Result<AppSession> {
+) -> Result<SessionTab> {
     if let Some(raw) = session_id {
         let id: MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
+        let lease = Arc::new(SessionLease::acquire(storage, id)?);
         let session = setup::load_session(id, storage)?;
         setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
-        return Ok(session);
+        return Ok(SessionTab { session, lease });
     }
     if continue_session {
-        match setup::latest_session(cwd, storage) {
-            Ok(Some(session)) => {
-                setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
-                return Ok(session);
-            }
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
-            }
+        if let Some(summary) = AppSession::list(cwd, storage)?.into_iter().next() {
+            let lease = Arc::new(SessionLease::acquire(storage, summary.id)?);
+            let session = setup::load_session(summary.id, storage)?;
+            setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
+            return Ok(SessionTab { session, lease });
         }
+        tracing::info!("no previous session found for this directory, starting new");
     }
     let session = AppSession::new(model, cwd);
+    let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
     setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-    Ok(session)
+    Ok(SessionTab { session, lease })
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -354,7 +352,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut teardown = Teardown::default();
 
     loop {
-        for session in &mut tabs {
+        for tab in &mut tabs {
+            let session = &mut tab.session;
             if setup::session_history_head(session).is_none() {
                 session.meta.fast |= stack.config.always_fast;
                 session.meta.workflow |= stack.config.always_workflow;
@@ -363,7 +362,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
             }
         }
-        let focused_tab = &tabs[focused];
+        let focused_tab = &tabs[focused].session;
         let model = if setup::session_history_head(focused_tab).is_none()
             || !stack
                 .config
@@ -453,8 +452,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
+                    let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
                     setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-                    tabs.push(session);
+                    tabs.push(SessionTab { session, lease });
                 }
                 stack = new_stack;
                 warnings = new_warnings;
@@ -527,6 +527,62 @@ mod tests {
 
         std::panic::set_hook(prev_hook);
         assert!(after_panic_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_resume_rejects_an_active_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = AppSession::new("test/model", "/project");
+        let id = session.id;
+        session.save(&storage).unwrap();
+        let first = resolve_session(
+            false,
+            Some(&id.to_string()),
+            "test/model",
+            "/project",
+            &storage,
+        )
+        .unwrap();
+
+        let error = resolve_session(
+            false,
+            Some(&id.to_string()),
+            "test/model",
+            "/project",
+            &storage,
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("already open"), "{error}");
+        drop(first);
+        assert!(
+            resolve_session(
+                false,
+                Some(&id.to_string()),
+                "test/model",
+                "/project",
+                &storage,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn continue_does_not_fall_back_when_latest_session_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = AppSession::new("test/model", "/project");
+        session.save(&storage).unwrap();
+        let first = resolve_session(true, None, "test/model", "/project", &storage).unwrap();
+
+        let error = resolve_session(true, None, "test/model", "/project", &storage)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("already open"), "{error}");
+        drop(first);
     }
 
     fn test_config() -> Config {

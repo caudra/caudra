@@ -20,6 +20,7 @@ use maki_agent::{
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionLease;
 
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
@@ -91,6 +92,7 @@ impl AgentHandles {
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         session_id: Option<SessionRef>,
+        session_lease: Option<Arc<SessionLease>>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
@@ -111,6 +113,7 @@ impl AgentHandles {
             mcp_handle,
             mcp_config_errors,
             session_id,
+            session_lease,
             timeouts,
             lua_handle,
             model_policy,
@@ -185,6 +188,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         app: &mut App,
         lua_handle: EventHandle,
+        session_lease: Option<Arc<SessionLease>>,
     ) {
         // The output channel survives the respawn, so this bump is the only
         // thing that makes the old loop's in-flight envelopes stale. It lives
@@ -213,6 +217,7 @@ impl AgentHandles {
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(SessionRef::from(app.state.session.id)),
+            session_lease,
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
@@ -281,6 +286,7 @@ fn spawn_agent_internal(
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
+    session_lease: Option<Arc<SessionLease>>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
@@ -338,7 +344,10 @@ fn spawn_agent_internal(
         Arc::clone(&prompt_profiles),
     );
 
-    let task = smol::spawn(agent_loop.run());
+    let task = smol::spawn(async move {
+        let _session_lease = session_lease;
+        agent_loop.run().await;
+    });
 
     AgentHandles {
         cmd_tx,
@@ -533,6 +542,18 @@ mod tests {
         Arc<ArcSwap<ModelSlot>>,
         Arc<PermissionManager>,
     ) {
+        stub_spawn_with_session(initial_history, None, None)
+    }
+
+    fn stub_spawn_with_session(
+        initial_history: Vec<Message>,
+        session_id: Option<SessionRef>,
+        session_lease: Option<Arc<SessionLease>>,
+    ) -> (
+        AgentHandles,
+        Arc<ArcSwap<ModelSlot>>,
+        Arc<PermissionManager>,
+    ) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
@@ -548,7 +569,8 @@ mod tests {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            None,
+            session_id,
+            session_lease,
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
             None,
@@ -560,6 +582,28 @@ mod tests {
             Arc::new(PromptProfileCatalog::default()),
         );
         (handles, model_slot, permissions)
+    }
+
+    #[test]
+    fn agent_task_holds_the_session_lease_until_termination() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = maki_storage::StateDir::from_path(temp.path().to_path_buf());
+        let id = maki_storage::id::MakiId::generate();
+        let lease = Arc::new(SessionLease::acquire(&state_dir, id).unwrap());
+        let (handles, _, _) = stub_spawn_with_session(
+            Vec::new(),
+            Some(SessionRef::from(id)),
+            Some(Arc::clone(&lease)),
+        );
+        drop(lease);
+
+        assert!(matches!(
+            SessionLease::acquire(&state_dir, id),
+            Err(maki_storage::sessions::SessionError::SessionInUse { .. })
+        ));
+
+        smol::block_on(handles.into_task().cancel());
+        assert!(SessionLease::acquire(&state_dir, id).is_ok());
     }
 
     fn respawn(
@@ -576,6 +620,7 @@ mod tests {
             permissions,
             app,
             EventHandle::disconnected_for_test(),
+            None,
         );
     }
 
@@ -671,6 +716,7 @@ mod tests {
             &permissions,
             &mut app,
             EventHandle::disconnected_for_test(),
+            None,
         );
 
         let mirror = app

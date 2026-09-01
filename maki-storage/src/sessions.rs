@@ -28,11 +28,14 @@ use crate::{StateDir, StorageError, atomic_write, now_epoch};
 
 #[path = "sessions/database.rs"]
 mod database;
+#[path = "sessions/lease.rs"]
+mod lease;
 
 pub use database::{
     CheckpointResult, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor, SessionDatabase,
     SessionMigration, SessionStorageStats,
 };
+pub use lease::SessionLease;
 
 const SESSION_VERSION: u32 = 1;
 const PREVIOUS_LOG_FORMAT_VERSION: u32 = 2;
@@ -92,6 +95,8 @@ pub enum SessionError {
     Sqlite(#[from] rusqlite::Error),
     #[error("session {id} already exists")]
     AlreadyExists { id: MakiId },
+    #[error("session {id} is already open in another Maki instance")]
+    SessionInUse { id: MakiId },
     #[error(
         "session {id} was modified concurrently: expected write version {expected}, found {actual}"
     )]

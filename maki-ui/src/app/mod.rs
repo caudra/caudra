@@ -2415,7 +2415,7 @@ impl App {
             "/goal" => self.execute_goal(&cmd.args),
             "/goal-clear" => self.clear_goal(),
             "/goal-model" => self.open_goal_model_picker(),
-            "/new" => self.reset_session(),
+            "/new" => vec![Action::RequestNewSession],
             "/queue" => {
                 self.focus_active_queue();
                 vec![]
@@ -3005,7 +3005,7 @@ impl App {
         self.state.mode = Mode::Build;
 
         let mut actions = if clear_context {
-            self.reset_session()
+            vec![Action::RequestNewSession]
         } else {
             vec![]
         };

@@ -37,11 +37,10 @@ use maki_providers::{HistoryItem, Message, Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::sessions::{SessionError, StoredImage, normalize_title};
+use maki_storage::sessions::{SessionError, SessionLease, StoredImage, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::session_state::stored_to_rules;
 use crate::app::shell::{ShellEvent, spawn_shell};
@@ -56,6 +55,7 @@ use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::input::InputReader;
 use crate::load_app_session;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::{AppSession, SessionTab};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -64,6 +64,7 @@ use crate::terminal;
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
+const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
@@ -83,7 +84,7 @@ fn preset_label(tier: ModelTier) -> &'static str {
 /// disk round-trip; `session_has_content` tells which ones were saved.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<AppSession>,
+    pub tabs: Vec<SessionTab>,
     pub focused: usize,
 }
 
@@ -91,7 +92,7 @@ pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
-    pub sessions: Vec<AppSession>,
+    pub sessions: Vec<SessionTab>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub storage: StateDir,
@@ -283,6 +284,7 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
 
 struct SessionRuntime {
     app: App,
+    lease: Arc<SessionLease>,
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -312,23 +314,27 @@ impl SessionRuntime {
     /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
     /// after an agent error.
     fn quiescent(&self) -> bool {
-        runtime_state_quiescent(
-            SessionStatus::of(&self.app),
-            self.handles.queue.is_empty() && !self.handles.queue.is_processing(),
-            self.handles.active_background_tasks(),
-            self.app.shell.active_ids().len(),
-            self.app.holds_recovery_text(),
-            self.app
+        SessionStatus::of(&self.app) == SessionStatus::Idle && self.work_quiescent()
+    }
+
+    fn work_quiescent(&self) -> bool {
+        self.handles.queue.is_empty()
+            && !self.handles.queue.is_processing()
+            && self.handles.active_background_tasks() == 0
+            && self.app.shell.active_ids().is_empty()
+            && !self.app.holds_recovery_text()
+            && !self
+                .app
                 .state
                 .session
                 .meta
                 .pending_revert
                 .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some()),
-        )
+                .is_some_and(|pending| pending.restore_operation.is_some())
     }
 }
 
+#[cfg(test)]
 fn runtime_state_quiescent(
     status: SessionStatus,
     queue_empty: bool,
@@ -408,11 +414,25 @@ fn recover_stored_sessions_in_cwd(
     storage: &StateDir,
     storage_writer: &StorageWriter,
     cwd: &Path,
+    active: &std::collections::HashSet<MakiId>,
 ) -> Result<(), String> {
     let cwd_text = cwd.to_string_lossy();
     let sessions = AppSession::list(&cwd_text, storage)
         .map_err(|error| format!("Failed to scan sessions for workspace recovery: {error}"))?;
     for summary in sessions {
+        if active.contains(&summary.id) {
+            continue;
+        }
+        let _lease = match SessionLease::acquire(storage, summary.id) {
+            Ok(lease) => lease,
+            Err(SessionError::SessionInUse { .. }) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Failed to reserve session {} for workspace recovery: {error}",
+                    summary.id
+                ));
+            }
+        };
         let mut session = load_app_session(summary.id, storage).map_err(|error| {
             format!(
                 "Failed to load session {} for workspace recovery: {error}",
@@ -488,7 +508,11 @@ impl SpawnCtx {
         }
     }
 
-    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime, String> {
+    fn spawn_runtime(&self, tab: SessionTab) -> Result<SessionRuntime, String> {
+        let SessionTab { session, lease } = tab;
+        lease
+            .validate(&self.storage, session.id)
+            .map_err(|error| error.to_string())?;
         let (session, snapshot_store) =
             prepare_session_for_runtime(&self.storage, &self.storage_writer, session)?;
         let initial_history = match crate::active_session_history(&session) {
@@ -513,6 +537,7 @@ impl SpawnCtx {
             self.ui_config.tool_output_lines,
             &permissions,
             Some(SessionRef::from(session.id)),
+            Some(Arc::clone(&lease)),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -556,6 +581,7 @@ impl SpawnCtx {
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(SessionRuntime {
             app,
+            lease,
             handles,
             shell_tx,
             shell_rx,
@@ -770,12 +796,13 @@ impl<'t> EventLoop<'t> {
             prompt_profile_override,
         };
 
-        recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd)
+        let active = sessions.iter().map(|tab| tab.session.id).collect();
+        recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd, &active)
             .map_err(|error| eyre!(error))?;
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|session| ctx.spawn_runtime(session))
+            .map(|tab| ctx.spawn_runtime(tab))
             .collect::<Result<_, _>>()
             .map_err(|error| eyre!(error))?;
         if runtimes.is_empty() {
@@ -1246,15 +1273,30 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                if let Some(i) = self.position(id) {
+                let lease = if let Some(i) = self.position(id) {
                     if i == self.focused {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
                         return;
                     }
+                    if !self.sessions[i].quiescent() {
+                        let _ = reply_tx.send(Err(DELETE_BUSY_ERR.into()));
+                        return;
+                    }
                     let rt = self.remove_runtime(i);
-                    rt.handles.cancel();
-                }
+                    let SessionRuntime { handles, lease, .. } = rt;
+                    handles.cancel();
+                    lease
+                } else {
+                    match SessionLease::acquire(&self.ctx.storage, id) {
+                        Ok(lease) => Arc::new(lease),
+                        Err(error) => {
+                            let _ = reply_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    }
+                };
                 self.ctx.storage_writer.delete(id, move |res| {
+                    let _lease = lease;
                     let reply = match res {
                         Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
                             Ok(json!(true))
@@ -1290,7 +1332,14 @@ impl<'t> EventLoop<'t> {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                     AppSession::new(&slot.model.spec(), &cwd.to_string_lossy())
                 };
-                let runtime = match self.ctx.spawn_runtime(session) {
+                let lease = match SessionLease::acquire(&self.ctx.storage, session.id) {
+                    Ok(lease) => Arc::new(lease),
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error));
@@ -1338,10 +1387,15 @@ impl<'t> EventLoop<'t> {
                     if let Some(i) = self.position(id) {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
+                        let _lease = SessionLease::acquire(&self.ctx.storage, id)
+                            .map_err(|error| error.to_string())?;
                         let mut session =
                             load_app_session(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session));
+                        self.ctx
+                            .storage_writer
+                            .save_sync(Arc::new(session))
+                            .map_err(|error| error.to_string())?;
                     }
                     Ok(json!(true))
                 })();
@@ -1453,6 +1507,10 @@ impl<'t> EventLoop<'t> {
             self.focused = i;
             return Ok(());
         }
+        let lease = Arc::new(
+            SessionLease::acquire(&self.ctx.storage, id)
+                .map_err(|error| format!("Failed to open session: {error}"))?,
+        );
         let session = load_app_session(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
         let process_cwd = canonical_cwd(
@@ -1462,7 +1520,7 @@ impl<'t> EventLoop<'t> {
         validate_session_cwd(&session, &process_cwd)?;
         let (profile_name, profile, profile_warning) = self.ctx.resolve_prompt_profile(&session);
         let focused = &mut self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
+        if focused.quiescent() && !focused.app.has_content() {
             let model = focused.app.state.model.clone();
             let loaded = focused.app.apply_loaded_session(session, &model)?;
             focused.app.state.system_prompt_profile_name = profile_name;
@@ -1472,10 +1530,12 @@ impl<'t> EventLoop<'t> {
             if let Some(warning) = profile_warning {
                 focused.app.flash(warning);
             }
+            let old_lease = std::mem::replace(&mut self.sessions[self.focused].lease, lease);
             self.dispatch(self.focused, vec![Action::LoadSession(Box::new(loaded))]);
+            drop(old_lease);
             return Ok(());
         }
-        let runtime = self.ctx.spawn_runtime(session)?;
+        let runtime = self.ctx.spawn_runtime(SessionTab { session, lease })?;
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
@@ -1582,10 +1642,55 @@ impl<'t> EventLoop<'t> {
         (latest, leftover)
     }
 
-    fn dispatch(&mut self, idx: usize, actions: Vec<Action>) {
+    fn dispatch(&mut self, mut idx: usize, actions: Vec<Action>) {
         for action in actions {
+            if matches!(&action, Action::RequestNewSession) {
+                if !self.request_new_session(idx) {
+                    break;
+                }
+                idx = self.focused;
+                continue;
+            }
             self.handle_action(idx, action);
         }
+    }
+
+    fn request_new_session(&mut self, idx: usize) -> bool {
+        if !self.sessions[idx].work_quiescent() {
+            let session = {
+                let current = &self.sessions[idx].app.state.session;
+                AppSession::new(&current.model, &current.cwd)
+            };
+            let lease = match SessionLease::acquire(&self.ctx.storage, session.id) {
+                Ok(lease) => Arc::new(lease),
+                Err(error) => {
+                    self.sessions[idx]
+                        .app
+                        .flash(format!("Failed to reserve new session: {error}"));
+                    return false;
+                }
+            };
+            let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.sessions[idx].app.flash(error);
+                    return false;
+                }
+            };
+            let child = self.push_runtime(runtime);
+            self.focused = child;
+            maki_otel::emit::session_started(
+                maki_otel::emit::START_FRESH,
+                Some(&self.sessions[child].id().to_string()),
+            );
+            return true;
+        }
+        let actions = self.sessions[idx].app.reset_session();
+        if actions.is_empty() {
+            return false;
+        }
+        self.dispatch(idx, actions);
+        true
     }
 
     fn workspace_group_quiescent(&self, idx: usize) -> bool {
@@ -1688,6 +1793,7 @@ impl<'t> EventLoop<'t> {
             &permissions,
             &mut rt.app,
             lua_handle,
+            Some(Arc::clone(&rt.lease)),
         );
     }
 
@@ -1719,8 +1825,11 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
-            Action::NewSession => {
+            Action::RequestNewSession => unreachable!("handled by dispatch"),
+            Action::NewSession(lease) => {
+                let old_lease = std::mem::replace(&mut self.sessions[idx].lease, lease);
                 self.respawn_agent(idx, Vec::new());
+                drop(old_lease);
             }
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
@@ -1738,11 +1847,15 @@ impl<'t> EventLoop<'t> {
                 self.respawn_agent(idx, loaded.messages);
             }
             Action::ForkSession(forked) => {
-                let ForkedSession { mut session, draft } = *forked;
+                let ForkedSession {
+                    mut session,
+                    lease,
+                    draft,
+                } = *forked;
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
                 }
-                let runtime = match self.ctx.spawn_runtime(session) {
+                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);
@@ -2097,10 +2210,13 @@ impl<'t> EventLoop<'t> {
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
-                mut app, handles, ..
+                mut app,
+                lease,
+                handles,
+                ..
             } = rt;
             app.disconnect_agent_queue();
-            apps.push(app);
+            apps.push((app, lease));
             agent_tasks.push(handles.into_task());
         }
         crate::agent::join_all(
@@ -2113,7 +2229,7 @@ impl<'t> EventLoop<'t> {
         // Split across the three operations so a slow exit points at one of
         // them instead of at the whole phase.
         let (mut snapshot_ms, mut checkpoint_ms, mut session_clone_ms) = (0, 0, 0);
-        for mut app in apps {
+        for (mut app, lease) in apps {
             let mut step = Instant::now();
             let mut step_ms = || {
                 let elapsed = step.elapsed().as_millis() as u64;
@@ -2126,7 +2242,10 @@ impl<'t> EventLoop<'t> {
             snapshot_ms += step_ms();
             app.checkpoint_now();
             checkpoint_ms += step_ms();
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            tabs.push(SessionTab {
+                session: Arc::unwrap_or_clone(app.state.session),
+                lease,
+            });
             session_clone_ms += step_ms();
         }
         let save_sessions_ms = lap();
@@ -2454,7 +2573,13 @@ mod tests {
         corrupt_restore_journal(&storage, &unopened, &cwd);
         let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
 
-        let error = recover_stored_sessions_in_cwd(&storage, &writer, &cwd).unwrap_err();
+        let error = recover_stored_sessions_in_cwd(
+            &storage,
+            &writer,
+            &cwd,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap_err();
 
         assert!(
             error.contains("inspect workspace restore journal"),
@@ -2525,7 +2650,8 @@ mod tests {
             .unwrap();
         let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
 
-        recover_stored_sessions_in_cwd(&storage, &writer, &cwd).unwrap();
+        recover_stored_sessions_in_cwd(&storage, &writer, &cwd, &std::collections::HashSet::new())
+            .unwrap();
 
         let recovered = load_app_session(unopened.id, &storage).unwrap();
         assert_eq!(crate::session_history_head(&recovered), Some(target_head));

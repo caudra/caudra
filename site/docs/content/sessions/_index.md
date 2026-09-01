@@ -9,6 +9,16 @@ group = "Guides"
 
 Maki stores conversation history as parent-linked items. User prompts, assistant text, reasoning, tool calls, and tool results are separate items. A session head selects the active path through those items. Moving the head keeps the abandoned path available for unrevert and later forks.
 
+## Active sessions
+
+One Maki runtime can own a session ID at a time. Opening that session from
+another Maki process fails before the agent starts or executes tools. Sessions
+with different IDs can run together, including background tabs in one TUI.
+
+Maki releases ownership on normal exit, process termination, or a crash. A
+running process that has stopped responding still owns its session. Forking an
+active session remains available because the child receives a new ID.
+
 ## Message actions
 
 Right-click a message, or hold the left mouse button for half a second, to open Message Actions. Normal left clicks still select text, expand reasoning, and interact with tool output.

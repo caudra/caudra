@@ -387,6 +387,7 @@ impl QueueReceiver {
         if self.paused.load(Ordering::Acquire) {
             return Vec::new();
         }
+        self.processing.store(true, Ordering::Release);
         loop {
             let immediate = self.queue.claim_one_matching(|item| {
                 matches!(
@@ -423,6 +424,7 @@ impl QueueReceiver {
                     .queue
                     .has_matching(|item| item.admission() == PromptAdmission::Steer)
                 {
+                    self.processing.store(false, Ordering::Release);
                     return Vec::new();
                 } else {
                     self.queue.claim(|item| {
@@ -438,6 +440,7 @@ impl QueueReceiver {
                 }
             };
             if claimed.is_empty() {
+                self.processing.store(false, Ordering::Release);
                 return claimed;
             }
             let claimed = claimed
@@ -447,7 +450,6 @@ impl QueueReceiver {
             if claimed.is_empty() {
                 continue;
             }
-            self.processing.store(true, Ordering::Release);
             if let Some(run_id) = claimed.iter().rev().find_map(|(_, item)| match item {
                 QueueItem::Message { run_id, .. } => Some(*run_id),
                 QueueItem::Compact { .. } => None,
