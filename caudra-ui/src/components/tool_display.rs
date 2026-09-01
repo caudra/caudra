@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolStatus};
+use super::{DisplayMessage, ToolProgress, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -22,7 +22,8 @@ use crate::markdown::{
     truncation_notice,
 };
 use caudra_agent::{
-    BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle, SubagentProgress,
+    ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -42,6 +43,8 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+const ACTIVITY_PREFIX: &str = "  ├ ";
+const ACTIVITY_SEPARATOR: &str = " · ";
 pub const RAW_AFFORDANCE: &str = "click for raw";
 pub const FILTERED_AFFORDANCE: &str = "click for filtered";
 const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
@@ -606,6 +609,49 @@ impl ToolLineBuilder {
         self.lines[0].spans.insert(0, Span::styled(text, style));
     }
 
+    fn is_in_progress(&self) -> bool {
+        matches!(self.indicator, Indicator::InProgress)
+    }
+
+    /// A running call reports what it is doing and how far it has got; a
+    /// finished one is described by its output, so only the tally survives.
+    fn progress_spans(&self, progress: &ToolProgress, out: &mut Vec<Span<'static>>) {
+        let theme = theme::current();
+        if self.is_in_progress() {
+            out.push(Span::styled(
+                progress.report.activity.label().to_owned(),
+                theme.tool_prefix,
+            ));
+            if let Some(detail) = progress.report.activity.detail() {
+                out.push(Span::styled(format!(" {detail}"), theme.tool_dim));
+            }
+            out.push(Span::styled(ACTIVITY_SEPARATOR, theme.tool_dim));
+        }
+        out.push(Span::styled(
+            SubagentProgress::tally(progress.report.tools, progress.elapsed()),
+            theme.tool_dim,
+        ));
+    }
+
+    /// Must run after `prepend_indicator`, which owns row 0 and shifts the
+    /// spinner spans sitting on it.
+    fn push_progress(&mut self, progress: &ToolProgress) {
+        let mut spans = vec![Span::styled(ACTIVITY_PREFIX, theme::current().tool_dim)];
+        self.progress_spans(progress, &mut spans);
+        self.lines.push(Line::from(spans));
+    }
+
+    /// A compact row is one line by contract, so progress joins the header
+    /// instead of sitting under it.
+    fn append_progress(&mut self, progress: &ToolProgress) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let mut spans = vec![Span::styled(ACTIVITY_SEPARATOR, theme::current().tool_dim)];
+        self.progress_spans(progress, &mut spans);
+        self.lines[0].spans.append(&mut spans);
+    }
+
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits);
         self.truncation.script |= content.truncation.script;
@@ -904,6 +950,13 @@ pub fn build_tool_lines(
         );
         b.prepend_indicator(rctx.started_at);
     }
+    if let Some(progress) = msg.progress.as_ref() {
+        if rctx.compact {
+            b.append_progress(progress);
+        } else {
+            b.push_progress(progress);
+        }
+    }
     if expansion.is_none() {
         // Nothing is drawn below the header, but the reader still needs a
         // click target whenever there is something to reveal.
@@ -1087,8 +1140,10 @@ mod tests {
     use crate::markdown::TRUNCATION_PREFIX;
     use caudra_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
     use caudra_agent::{
-        ShellFilterInfo, SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput,
+        ShellFilterInfo, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
+        ToolOutput,
     };
+    use std::time::Duration;
     use test_case::test_case;
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
@@ -1188,6 +1243,7 @@ mod tests {
             tool_output: output.map(Arc::new),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             truncated_lines: 0,
             timestamp: None,
@@ -1438,6 +1494,7 @@ mod tests {
             tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,
@@ -1535,6 +1592,7 @@ mod tests {
             tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,
@@ -1635,6 +1693,7 @@ mod tests {
             tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,
@@ -1950,6 +2009,7 @@ mod tests {
             tool_output,
             live_output,
             annotation: None,
+            progress: None,
             plan_path: None,
             truncated_lines,
             timestamp: None,
@@ -2073,6 +2133,7 @@ mod tests {
             })),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             truncated_lines: 0,
             timestamp: None,
@@ -2157,6 +2218,124 @@ mod tests {
 
         assert_eq!(tl.lines.len(), 1);
         assert!(!tl.truncation.any());
+    }
+
+    const SUBAGENT_ELAPSED: Duration = Duration::from_millis(63_400);
+
+    fn report(activity: SubagentActivity, tools: u32) -> SubagentProgress {
+        SubagentProgress {
+            activity,
+            tools,
+            elapsed: SUBAGENT_ELAPSED,
+        }
+    }
+
+    fn running_tool_report(tools: u32) -> SubagentProgress {
+        report(
+            SubagentActivity::tool(Arc::from(BASH_TOOL_NAME), "cargo nextest run"),
+            tools,
+        )
+    }
+
+    /// Settled progress reports the run it measured, so the row is stable to
+    /// assert on and the clock cannot drift mid-test.
+    fn subagent_msg(status: ToolStatus, report: Option<SubagentProgress>) -> DisplayMessage {
+        let mut msg = bash_msg("find the auth middleware", status, None, None);
+        msg.progress = report.map(|report| {
+            let mut progress = ToolProgress::live(report);
+            progress.report.elapsed = Duration::ZERO;
+            progress.settle();
+            progress.report.elapsed = SUBAGENT_ELAPSED;
+            progress
+        });
+        msg
+    }
+
+    /// A collapsed row hides the body but not the progress: it is the only
+    /// sign that the subagent behind it is alive.
+    #[test_case(None                        ; "collapsed")]
+    #[test_case(Some(SectionFlags::default()) ; "expanded")]
+    fn a_running_subagent_reports_its_tool_under_the_header(expansion: Option<SectionFlags>) {
+        let msg = subagent_msg(ToolStatus::InProgress, Some(running_tool_report(3)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), expansion);
+
+        assert_eq!(tl.lines.len(), 2, "{}", lines_text(&tl));
+        let progress_line: String = tl.lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            progress_line,
+            "  ├ bash cargo nextest run · 3 tools · 1m 3.4s"
+        );
+    }
+
+    /// What it was doing is stale the moment it stops; what it did is not.
+    #[test_case(ToolStatus::Success ; "success")]
+    #[test_case(ToolStatus::Error   ; "error")]
+    fn a_settled_subagent_keeps_only_its_tally(status: ToolStatus) {
+        let msg = subagent_msg(status, Some(running_tool_report(7)));
+
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(SectionFlags::default()));
+
+        let text = lines_text(&tl);
+        assert!(text.contains("├ 7 tools · 1m 3.4s"), "{text}");
+        assert!(!text.contains("cargo nextest run"), "{text}");
+    }
+
+    #[test_case(0, "1m 3.4s"          ; "nothing_run_yet_reports_only_the_clock")]
+    #[test_case(1, "1 tool · 1m 3.4s" ; "one_tool_is_singular")]
+    #[test_case(2, "2 tools · 1m 3.4s"; "more_than_one_is_plural")]
+    fn the_tally_counts_what_the_subagent_started(tools: u32, expected: &str) {
+        let msg = subagent_msg(
+            ToolStatus::Success,
+            Some(report(SubagentActivity::Thinking { title: None }, tools)),
+        );
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(SectionFlags::default()),
+        );
+
+        assert!(
+            lines_text(&tl).contains(&format!("├ {expected}")),
+            "{}",
+            lines_text(&tl)
+        );
+    }
+
+    #[test]
+    fn a_plain_tool_reports_no_progress() {
+        let msg = subagent_msg(ToolStatus::InProgress, None);
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(SectionFlags::default()),
+        );
+
+        assert!(!lines_text(&tl).contains('├'));
+    }
+
+    /// A compact row is one line by contract, so progress has to ride the
+    /// header rather than claim a second row.
+    #[test]
+    fn a_compact_row_keeps_the_progress_on_the_header() {
+        let msg = subagent_msg(ToolStatus::InProgress, Some(running_tool_report(3)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &compact_rctx(80), None);
+
+        assert_eq!(tl.lines.len(), 1);
+        let text = lines_text(&tl);
+        assert!(
+            text.contains(" · bash cargo nextest run · 3 tools · 1m 3.4s"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2246,6 +2425,7 @@ mod tests {
             tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,
@@ -2287,6 +2467,7 @@ mod tests {
             tool_output: None,
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,

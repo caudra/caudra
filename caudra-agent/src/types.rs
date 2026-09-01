@@ -3,6 +3,7 @@ use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use caudra_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -16,6 +17,17 @@ use crate::permissions::PermissionRequest;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
+
+const SECONDS_PER_MINUTE: u64 = 60;
+const TALLY_SEPARATOR: &str = " · ";
+const THOUGHT_TITLE_FENCE: &str = "**";
+const PARAGRAPH_BREAK: &str = "\n\n";
+const CRLF_PARAGRAPH_BREAK: &str = "\r\n\r\n";
+const THINKING_LABEL: &str = "thinking";
+const RESPONDING_LABEL: &str = "responding";
+const COMPACTING_LABEL: &str = "compacting";
+const RETRYING_LABEL: &str = "retrying";
+const AWAITING_PERMISSION_LABEL: &str = "awaiting permission";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -909,6 +921,11 @@ pub enum AgentEvent {
     },
     AuthRequired,
     Nudge,
+    /// A subagent's progress moved. Only ever stamped with [`SubagentInfo`],
+    /// so the parent knows which task header to update.
+    SubagentProgress {
+        progress: SubagentProgress,
+    },
     SubagentHistory {
         task_id: String,
         parent_tool_use_id: String,
@@ -1173,6 +1190,171 @@ pub struct TurnCompleteEvent {
     /// The model's context window, so consumers can gauge `context_size`
     /// against the ceiling without resolving the model.
     pub context_window: u32,
+}
+
+/// A reasoning block that opens with a bold line names itself; everything
+/// after that line is the thought proper. A block that does not follow the
+/// shape is all body, so a stray `**` in prose is never mistaken for a title.
+pub struct ReasoningSummary<'a> {
+    pub title: Option<&'a str>,
+    pub body: &'a str,
+}
+
+pub fn reasoning_summary(text: &str) -> ReasoningSummary<'_> {
+    let content = text.trim();
+    let untitled = ReasoningSummary {
+        title: None,
+        body: content,
+    };
+    let Some(after_open) = content.strip_prefix(THOUGHT_TITLE_FENCE) else {
+        return untitled;
+    };
+    let Some(close) = after_open.find(THOUGHT_TITLE_FENCE) else {
+        return untitled;
+    };
+    let title = after_open[..close].trim();
+    if title.is_empty()
+        || title
+            .chars()
+            .any(|character| matches!(character, '*' | '\n' | '\r'))
+    {
+        return untitled;
+    }
+    let suffix = &after_open[close + THOUGHT_TITLE_FENCE.len()..];
+    let body = if suffix.is_empty() {
+        ""
+    } else if let Some(body) = suffix
+        .strip_prefix(CRLF_PARAGRAPH_BREAK)
+        .or_else(|| suffix.strip_prefix(PARAGRAPH_BREAK))
+    {
+        body.trim_end()
+    } else {
+        return untitled;
+    };
+    ReasoningSummary {
+        title: Some(title),
+        body,
+    }
+}
+
+/// What a subagent is doing right now, so a parent watching only the task
+/// header can tell a stalled run from a busy one. Derived from the child's own
+/// event stream; the parent never inspects the child transcript for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "activity", rename_all = "snake_case")]
+pub enum SubagentActivity {
+    /// The block's own bold heading, once enough of it has streamed in.
+    Thinking {
+        title: Option<String>,
+    },
+    Responding,
+    Tool {
+        name: Arc<str>,
+        summary: String,
+    },
+    Compacting,
+    Retrying,
+    AwaitingPermission,
+}
+
+impl SubagentActivity {
+    /// A tool header can wrap or carry padding, and this renders on one line
+    /// beside the spinner, so it is flattened once here rather than at each
+    /// consumer.
+    pub fn tool(name: Arc<str>, summary: &str) -> Self {
+        Self::Tool {
+            name,
+            summary: summary.split_whitespace().collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    /// `None` for events that leave the activity as it was, so callers can
+    /// treat every `Some` as a change worth publishing.
+    pub fn from_event(event: &AgentEvent) -> Option<Self> {
+        match event {
+            // A title needs the whole block, which one delta does not carry;
+            // whoever accumulates the stream fills it in.
+            AgentEvent::ThinkingDelta { .. } => Some(Self::Thinking { title: None }),
+            AgentEvent::TextDelta { .. } => Some(Self::Responding),
+            // The input is still streaming, so there is no header to show yet.
+            AgentEvent::ToolPending { name, .. } => Some(Self::tool(Arc::from(name.as_str()), "")),
+            AgentEvent::ToolStart(start) => {
+                Some(Self::tool(Arc::clone(&start.tool), &start.summary))
+            }
+            AgentEvent::AutoCompacting => Some(Self::Compacting),
+            AgentEvent::Retry { .. } => Some(Self::Retrying),
+            AgentEvent::PermissionRequest(_) => Some(Self::AwaitingPermission),
+            _ => None,
+        }
+    }
+
+    /// The leading word, styled like a tool prefix when it names one.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Thinking { .. } => THINKING_LABEL,
+            Self::Responding => RESPONDING_LABEL,
+            Self::Tool { name, .. } => name,
+            Self::Compacting => COMPACTING_LABEL,
+            Self::Retrying => RETRYING_LABEL,
+            Self::AwaitingPermission => AWAITING_PERMISSION_LABEL,
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Tool { summary, .. } if !summary.is_empty() => Some(summary),
+            Self::Thinking { title } => title.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// A subagent's progress digest, published whenever any part of it changes.
+/// `elapsed` is measured by the relay rather than by each consumer, so the
+/// task header and a batch child row cannot disagree about the same run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubagentProgress {
+    pub activity: SubagentActivity,
+    /// Tool calls the subagent has started, the one in `activity` included.
+    pub tools: u32,
+    pub elapsed: Duration,
+}
+
+impl SubagentProgress {
+    /// A subagent with nothing to tally yet reports only its clock, so a run
+    /// still thinking does not claim "0 tools".
+    ///
+    /// `elapsed` is a parameter because a live consumer keeps counting past
+    /// the last report, and both consumers must still spell it the same way.
+    pub fn tally(tools: u32, elapsed: Duration) -> String {
+        let clock = format_live_duration(elapsed);
+        match tools {
+            0 => clock,
+            1 => format!("1 tool{TALLY_SEPARATOR}{clock}"),
+            many => format!("{many} tools{TALLY_SEPARATOR}{clock}"),
+        }
+    }
+
+    pub fn tally_now(&self) -> String {
+        Self::tally(self.tools, self.elapsed)
+    }
+}
+
+/// Tenth-second resolution, because this redraws while the clock runs and a
+/// millisecond tail would be unreadable noise.
+pub fn format_live_duration(duration: Duration) -> String {
+    let tenths = duration.as_millis() / 100;
+    let seconds = tenths / 10;
+    if seconds < u128::from(SECONDS_PER_MINUTE) {
+        format!("{}.{}s", seconds, tenths % 10)
+    } else {
+        format!(
+            "{}m {}.{}s",
+            seconds / u128::from(SECONDS_PER_MINUTE),
+            seconds % u128::from(SECONDS_PER_MINUTE),
+            tenths % 10
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2041,5 +2223,93 @@ mod tests {
         let display = output.as_display_text();
         assert!(display.contains("fn main()"), "{EXCLUDES_MSG}");
         assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
+    }
+
+    fn tool_start(tool: &str, summary: &str) -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "toolu_01".into(),
+            tool: Arc::from(tool),
+            summary: summary.into(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+        }))
+    }
+
+    #[test_case(
+        AgentEvent::ThinkingDelta { text: "**Weighing it up**".into() },
+        Some((THINKING_LABEL, None))
+        ; "one_delta_cannot_name_the_block_it_opens"
+    )]
+    #[test_case(
+        AgentEvent::TextDelta { text: "hi".into() },
+        Some((RESPONDING_LABEL, None))
+        ; "text_delta"
+    )]
+    #[test_case(
+        AgentEvent::ToolPending { id: "toolu_01".into(), name: "shell".into() },
+        Some(("shell", None))
+        ; "pending_tool_has_no_header_yet"
+    )]
+    #[test_case(
+        tool_start("shell", "cargo nextest run"),
+        Some(("shell", Some("cargo nextest run")))
+        ; "started_tool_carries_its_header"
+    )]
+    #[test_case(
+        tool_start("shell", "  rg -n\n  'AgentEvent'  "),
+        Some(("shell", Some("rg -n 'AgentEvent'")))
+        ; "a_wrapped_header_collapses_to_one_line"
+    )]
+    #[test_case(AgentEvent::AutoCompacting, Some((COMPACTING_LABEL, None)) ; "compacting")]
+    #[test_case(
+        AgentEvent::Retry { attempt: 1, message: "overloaded".into(), delay_ms: 10 },
+        Some((RETRYING_LABEL, None))
+        ; "retrying"
+    )]
+    #[test_case(AgentEvent::CompactionDone, None ; "unrelated_event_leaves_it_unchanged")]
+    #[test_case(AgentEvent::Nudge, None ; "nudge_leaves_it_unchanged")]
+    fn activity_reads_the_childs_own_events(
+        event: AgentEvent,
+        expected: Option<(&str, Option<&str>)>,
+    ) {
+        let activity = SubagentActivity::from_event(&event);
+        assert_eq!(
+            activity
+                .as_ref()
+                .map(|activity| (activity.label(), activity.detail())),
+            expected
+        );
+    }
+
+    #[test_case("**Weighing it up**", Some("Weighing it up"), "" ; "a_title_alone_has_no_body_yet")]
+    #[test_case(
+        "**Weighing it up**\n\nBoth read the same file.",
+        Some("Weighing it up"),
+        "Both read the same file."
+        ; "a_blank_line_separates_the_two"
+    )]
+    #[test_case(
+        "**Weighing it up**\r\n\r\nBoth read the same file.",
+        Some("Weighing it up"),
+        "Both read the same file."
+        ; "crlf_separates_them_too"
+    )]
+    #[test_case(
+        "**Weighing it up**\nBoth read the same file.",
+        None,
+        "**Weighing it up**\nBoth read the same file."
+        ; "one_newline_is_emphasis_mid_sentence_not_a_heading"
+    )]
+    #[test_case("**Weighing", None, "**Weighing" ; "an_unclosed_fence_names_nothing")]
+    #[test_case("Both read the same file.", None, "Both read the same file." ; "plain_prose")]
+    #[test_case("****\n\nbody", None, "****\n\nbody" ; "an_empty_title_is_not_one")]
+    #[test_case("**a**b**\n\nbody", None, "**a**b**\n\nbody" ; "a_stray_star_disqualifies_it")]
+    fn a_thought_is_named_only_by_a_leading_bold_line(text: &str, title: Option<&str>, body: &str) {
+        let summary = reasoning_summary(text);
+        assert_eq!(summary.title, title);
+        assert_eq!(summary.body, body);
     }
 }

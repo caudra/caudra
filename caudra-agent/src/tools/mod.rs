@@ -33,7 +33,9 @@ use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore};
+use crate::{
+    AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
+};
 use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_providers::Model;
 use caudra_providers::RequestOptions;
@@ -446,6 +448,7 @@ pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
     Usage(String),
+    Progress(SubagentProgress),
 }
 
 pub fn expand_tilde(path: &str) -> Result<String, String> {

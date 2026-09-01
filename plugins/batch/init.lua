@@ -17,6 +17,7 @@ local MAX_BATCH_SIZE = 25
 local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
 local ANNOTATION_SEP = " · "
+local ACTIVITY_PREFIX = "  ├ "
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
@@ -261,6 +262,21 @@ local function child_body_lines(c)
   return c.body_lines
 end
 
+-- How a subagent child is getting on. A settled child is described by its
+-- output, so what it was doing gives way to what it did.
+local function child_progress_line(c, settled)
+  local spans = { { ACTIVITY_PREFIX, "dim" } }
+  if not settled then
+    spans[#spans + 1] = { c.progress.label, "tool_prefix" }
+    if c.progress.detail then
+      spans[#spans + 1] = { " " .. c.progress.detail, "dim" }
+    end
+    spans[#spans + 1] = { ANNOTATION_SEP, "dim" }
+  end
+  spans[#spans + 1] = { c.progress.tally, "dim" }
+  return spans
+end
+
 -- Lines and click ranges come out of the same pass, so the row -> child
 -- map can never drift from what is on screen. Bodies come from each
 -- child's cache; headers are one line each, cheaper to rebuild than to
@@ -273,12 +289,19 @@ local function render_children(children)
     end
     local first = #lines + 1
     lines[#lines + 1] = child_header_line(c)
+    -- The progress row sits between the header and the body, so a click below
+    -- it still resolves to the buffer row it looks like it is on.
+    local shift = 0
+    if c.progress then
+      lines[#lines + 1] = child_progress_line(c, TERMINAL[c.status])
+      shift = 1
+    end
     if c.buf then
       for _, l in ipairs(child_body_lines(c)) do
         lines[#lines + 1] = l
       end
     end
-    ranges[i] = { first = first, last = #lines }
+    ranges[i] = { first = first, shift = shift, last = #lines }
   end
   return lines, ranges
 end
@@ -435,7 +458,7 @@ function Batch:route_click(row)
       if row >= r.first and row <= r.last then
         local c = self.children[i]
         if c.buf then
-          c.buf:click({ row = row - r.first })
+          c.buf:click({ row = math.max(row - r.first - r.shift, 0) })
         end
         return
       end
@@ -494,6 +517,10 @@ function Batch:run_child(c, ctx)
     end,
     on_usage = function(usage)
       c.usage = usage
+      self:rerender()
+    end,
+    on_progress = function(label, detail, tally)
+      c.progress = { label = label, detail = detail, tally = tally }
       self:rerender()
     end,
   })

@@ -19,8 +19,9 @@ use caudra_agent::tools::{
 use caudra_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, InterruptSource, McpSession,
-    SteeringQueue, SteeringQueueReceiver, SubagentHistoryError, SubagentHistoryLease, SubagentInfo,
-    SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolDoneEvent, steering_queue,
+    SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
+    SubagentHistoryLease, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
+    SubagentTaskSpecCandidate, ToolDoneEvent, reasoning_summary, steering_queue,
 };
 use caudra_lua_macro::{lua_class, lua_fn, lua_table};
 use caudra_providers::model::ModelTier;
@@ -46,6 +47,10 @@ const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra's built-in task prompt";
+/// A thought's title is its first bold line. Past this the block is into
+/// prose and will never resolve one, so it stops being accumulated and a
+/// long reasoning stream cannot be buffered a second time for nothing.
+const THOUGHT_TITLE_SCAN_LIMIT: usize = 200;
 
 fn parse_task_mode(mode: Option<&str>) -> Result<Option<SubagentTaskMode>, String> {
     match mode {
@@ -102,7 +107,8 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
 /// turn's tokens plus the run's summed cost), and one total per run on
-/// `usage_tx`, which `prompt` waits for.
+/// `usage_tx`, which `prompt` waits for. Progress takes the same two paths, so
+/// a standalone task and a batch child both report the same run.
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
     parent_tx: EventSender,
@@ -111,7 +117,9 @@ async fn relay_session_events(
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
     let mut cost = None;
+    let mut progress = ProgressRelay::new();
     while let Ok(mut envelope) = sub_rx.recv_async().await {
+        progress.relay(&envelope, &parent_tx, &subagent_info, live_sink.as_ref());
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -130,6 +138,111 @@ async fn relay_session_events(
         }
         envelope.subagent = subagent_info.get().cloned();
         let _ = parent_tx.send_envelope(envelope);
+    }
+}
+
+/// Keeps the running digest one subagent reports to its parent.
+struct ProgressRelay {
+    started: Instant,
+    tools: u32,
+    thought: String,
+    thought_title: Option<String>,
+    last: Option<SubagentActivity>,
+}
+
+impl ProgressRelay {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            tools: 0,
+            thought: String::new(),
+            thought_title: None,
+            last: None,
+        }
+    }
+
+    /// The stateful half of [`SubagentActivity::from_event`]: a thought names
+    /// itself over several deltas, and a tool can rename itself long after it
+    /// started, so both need what came before.
+    fn activity(&mut self, event: &AgentEvent) -> Option<SubagentActivity> {
+        match event {
+            AgentEvent::ThinkingDelta { text } => {
+                // The title fence can straddle two deltas, so once it parses
+                // it is kept: a heading that blinks off reads as a fault.
+                if self.thought_title.is_none() && self.thought.len() < THOUGHT_TITLE_SCAN_LIMIT {
+                    self.thought.push_str(text);
+                    self.thought_title = reasoning_summary(&self.thought).title.map(str::to_owned);
+                }
+                Some(SubagentActivity::Thinking {
+                    title: self.thought_title.clone(),
+                })
+            }
+            // The header a plugin paints mid-run is the one its transcript
+            // shows, and it arrives without a tool name to match on.
+            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => match &self.last {
+                Some(SubagentActivity::Tool { name, .. }) => Some(SubagentActivity::tool(
+                    Arc::clone(name),
+                    &snapshot.first_line_text(),
+                )),
+                _ => None,
+            },
+            _ => {
+                let activity = SubagentActivity::from_event(event);
+                // A turn ends the thought even with nothing after it, and the
+                // next one must not inherit this heading.
+                if activity.is_some() || matches!(event, AgentEvent::TurnComplete(_)) {
+                    self.thought.clear();
+                    self.thought_title = None;
+                }
+                activity
+            }
+        }
+    }
+
+    /// Publishes on every change, and only on a change: text and thinking
+    /// arrive one delta at a time and would otherwise repaint the parent
+    /// header on every token.
+    ///
+    /// An envelope that already carries a subagent came from deeper down, and
+    /// this session is blocked on the nested task that produced it, so
+    /// relaying a grandchild's progress here would read as this session doing
+    /// that work.
+    fn relay(
+        &mut self,
+        envelope: &Envelope,
+        parent_tx: &EventSender,
+        subagent_info: &OnceLock<SubagentInfo>,
+        live_sink: Option<&flume::Sender<ToolLive>>,
+    ) {
+        if envelope.subagent.is_some() {
+            return;
+        }
+        // `ToolPending` announces the same call, so counting that instead
+        // would double every tool the subagent runs.
+        let counted = matches!(envelope.event, AgentEvent::ToolStart(_));
+        self.tools += u32::from(counted);
+        let Some(activity) = self.activity(&envelope.event) else {
+            return;
+        };
+        // Two identical calls in a row leave the activity untouched, and the
+        // count is the only thing that moved.
+        if !counted && self.last.as_ref() == Some(&activity) {
+            return;
+        }
+        self.last = Some(activity.clone());
+        let progress = SubagentProgress {
+            activity,
+            tools: self.tools,
+            elapsed: self.started.elapsed(),
+        };
+        if let Some(sink) = live_sink {
+            let _ = sink.send(ToolLive::Progress(progress.clone()));
+        }
+        let _ = parent_tx.send_envelope(Envelope {
+            event: AgentEvent::SubagentProgress { progress },
+            subagent: subagent_info.get().cloned(),
+            run_id: parent_tx.run_id(),
+        });
     }
 }
 
@@ -314,6 +427,11 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     annotation event. Must not yield.
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
+///   `on_progress` (function?) - called with `(label, detail, tally)` whenever a
+///     dispatched subagent moves. `label` is a tool name or one of `"thinking"`,
+///     `"responding"`, `"compacting"`, `"retrying"`, `"awaiting permission"`;
+///     `detail` is the tool header, or nil; `tally` reads like `"3 tools · 12.4s"`.
+///     Must not yield.
 /// @return (string?, string?, string?, boolean?) Tool output text, error, generated call ID, and whether an error restore is authorized.
 /// @example
 /// local out, err = caudra.agent.call_tool(ctx, "bash", {
@@ -336,7 +454,8 @@ async fn call_tool(
         Err(error) => return Ok((None, Some(error), None, None)),
     };
     let mut tctx = agent.to_tool_context();
-    let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut on_progress, mut rx) =
+        (None, None, None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
@@ -344,7 +463,8 @@ async fn call_tool(
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
         on_usage = o.get::<Option<Function>>("on_usage")?;
-        if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() {
+        on_progress = o.get::<Option<Function>>("on_progress")?;
+        if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() || on_progress.is_some() {
             let (tx, r) = flume::unbounded();
             tctx.live_sink = Some(tx);
             rx = Some(r);
@@ -359,6 +479,7 @@ async fn call_tool(
         on_buf,
         on_ann,
         on_usage,
+        on_progress,
     };
     let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
@@ -923,6 +1044,7 @@ struct LiveCallbacks<'a> {
     on_buf: Option<Function>,
     on_ann: Option<Function>,
     on_usage: Option<Function>,
+    on_progress: Option<Function>,
 }
 
 impl LiveCallbacks<'_> {
@@ -931,6 +1053,14 @@ impl LiveCallbacks<'_> {
             ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
             ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
+            ToolLive::Progress(progress) => {
+                let args = (
+                    progress.activity.label().to_owned(),
+                    progress.activity.detail().map(str::to_owned),
+                    progress.tally_now(),
+                );
+                call_opt(&self.on_progress, args).await
+            }
         };
         if let Some(Err(e)) = res {
             tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
@@ -1331,8 +1461,14 @@ mod tests {
 
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
+    const TOOL_ID: &str = "toolu_01";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
+    /// Spelt out rather than read back off the activity, so a rename in
+    /// caudra-agent fails here instead of passing silently.
+    const THINKING_LABEL: &str = "thinking";
+    const RESPONDING_LABEL: &str = "responding";
+    const THOUGHT_TITLE: &str = "Weighing the options";
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
         TokenUsage {
@@ -1351,6 +1487,21 @@ mod tests {
         }
     }
 
+    fn parent_info() -> Arc<OnceLock<SubagentInfo>> {
+        let info = Arc::new(OnceLock::new());
+        info.set(SubagentInfo {
+            parent_tool_use_id: PARENT_ID.into(),
+            task_id: PARENT_ID.into(),
+            name: "research".into(),
+            prompt: None,
+            model: None,
+            answer_tx: None,
+            steer_tx: None,
+        })
+        .unwrap();
+        info
+    }
+
     fn turn(usage: TokenUsage, cost: f64) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
             message: Message::default(),
@@ -1366,18 +1517,7 @@ mod tests {
     fn relay_session_events_reports_live_usage_and_done_total() {
         let (sub_tx, sub_rx) = flume::unbounded();
         let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let subagent_info = Arc::new(OnceLock::new());
-        subagent_info
-            .set(SubagentInfo {
-                parent_tool_use_id: PARENT_ID.into(),
-                task_id: PARENT_ID.into(),
-                name: "research".into(),
-                prompt: None,
-                model: None,
-                answer_tx: None,
-                steer_tx: None,
-            })
-            .unwrap();
+        let subagent_info = parent_info();
         let (usage_tx, usage_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
@@ -1439,5 +1579,255 @@ mod tests {
                 .as_ref()
                 .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+    }
+
+    fn text_delta() -> AgentEvent {
+        AgentEvent::TextDelta {
+            text: "summarising".into(),
+        }
+    }
+
+    /// Deltas arrive one token at a time, and a nested task's events pass
+    /// through here already stamped while this session sits blocked on it.
+    /// Neither may reach the parent header.
+    #[test]
+    fn relay_publishes_activity_once_per_change_and_ignores_nested_events() {
+        let (sub_tx, sub_rx) = flume::unbounded();
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (usage_tx, _usage_rx) = flume::unbounded();
+        let (live_tx, live_rx) = flume::unbounded();
+
+        for event in [text_delta(), text_delta()] {
+            sub_tx.send(envelope(event)).unwrap();
+        }
+        sub_tx
+            .send(envelope(AgentEvent::ThinkingDelta { text: "hm".into() }))
+            .unwrap();
+        let mut nested = envelope(text_delta());
+        nested.subagent = Some(parent_info().get().unwrap().clone());
+        sub_tx.send(nested).unwrap();
+        drop(sub_tx);
+
+        smol::block_on(relay_session_events(
+            sub_rx,
+            EventSender::new(parent_raw_tx, RUN_ID),
+            parent_info(),
+            usage_tx,
+            Some(live_tx),
+        ));
+
+        let live = live_rx
+            .drain()
+            .map(|event| match event {
+                ToolLive::Progress(progress) => progress.activity.label().to_owned(),
+                _ => panic!("relay must only publish progress here"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live, [RESPONDING_LABEL, THINKING_LABEL]);
+
+        assert_eq!(
+            relayed_progress(&parent_rx),
+            [
+                (RESPONDING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
+                (THINKING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
+            ]
+        );
+    }
+
+    fn relayed_progress(rx: &flume::Receiver<Envelope>) -> Vec<(String, u32, Option<String>)> {
+        rx.drain()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::SubagentProgress { progress } => Some((
+                    progress.activity.label().to_owned(),
+                    progress.tools,
+                    envelope.subagent.map(|info| info.parent_tool_use_id),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_start(tool: &str) -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(caudra_agent::ToolStartEvent {
+            id: TOOL_ID.into(),
+            tool: Arc::from(tool),
+            summary: String::new(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+        }))
+    }
+
+    /// Drives the relay's stateful half directly: the published sequence is
+    /// what a parent header would show, in order.
+    fn activities(events: Vec<AgentEvent>) -> Vec<(String, Option<String>)> {
+        let (sub_tx, sub_rx) = flume::unbounded();
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (usage_tx, _usage_rx) = flume::unbounded();
+        for event in events {
+            sub_tx.send(envelope(event)).unwrap();
+        }
+        drop(sub_tx);
+
+        smol::block_on(relay_session_events(
+            sub_rx,
+            EventSender::new(parent_raw_tx, RUN_ID),
+            parent_info(),
+            usage_tx,
+            None,
+        ));
+
+        parent_rx
+            .drain()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::SubagentProgress { progress } => Some((
+                    progress.activity.label().to_owned(),
+                    progress.activity.detail().map(str::to_owned),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn thinking(text: &str) -> AgentEvent {
+        AgentEvent::ThinkingDelta { text: text.into() }
+    }
+
+    fn thought(title: Option<&str>) -> (String, Option<String>) {
+        (THINKING_LABEL.to_owned(), title.map(str::to_owned))
+    }
+
+    /// A thought names itself in a heading that no single delta carries, so
+    /// the relay has to accumulate the block to read it.
+    #[test]
+    fn a_thought_is_named_once_its_heading_has_streamed_in() {
+        let published = activities(vec![
+            thinking("**Weighing"),
+            thinking(" the options"),
+            thinking("**"),
+            thinking("\n\nBoth read the same file."),
+        ]);
+
+        assert_eq!(published, [thought(None), thought(Some(THOUGHT_TITLE))]);
+    }
+
+    /// The heading is split across deltas, so a parse that reran per delta
+    /// would drop it the moment a chunk landed between the fence and the
+    /// blank line. It must survive that.
+    #[test]
+    fn a_named_thought_keeps_its_heading_through_the_rest_of_the_block() {
+        let published = activities(vec![
+            thinking("**Weighing the options**"),
+            thinking("\n"),
+            thinking("\nBoth read the same file."),
+        ]);
+
+        assert_eq!(published, [thought(Some(THOUGHT_TITLE))]);
+    }
+
+    /// An unnamed thought would otherwise be buffered in full a second time,
+    /// and a reasoning stream runs to tens of kilobytes.
+    #[test]
+    fn an_unnamed_thought_stops_being_accumulated() {
+        let mut relay = ProgressRelay::new();
+        let text = "prose ".repeat(THOUGHT_TITLE_SCAN_LIMIT);
+        let delta = thinking(&text);
+
+        for _ in 0..3 {
+            assert_eq!(
+                relay.activity(&delta),
+                Some(SubagentActivity::Thinking { title: None })
+            );
+        }
+
+        assert_eq!(
+            relay.thought.len(),
+            text.len(),
+            "the delta that passes the limit is the last one buffered"
+        );
+    }
+
+    /// Two thoughts in a row with only a turn boundary between them: the
+    /// second is unnamed and must say so rather than wear the first's name.
+    #[test]
+    fn a_new_turn_starts_a_new_thought() {
+        let published = activities(vec![
+            thinking("**Weighing the options**\n\nBoth read the same file."),
+            turn(TokenUsage::default(), 0.0),
+            thinking("Still unsure."),
+        ]);
+
+        assert_eq!(published, [thought(Some(THOUGHT_TITLE)), thought(None)]);
+    }
+
+    fn header_snapshot(text: &str) -> AgentEvent {
+        AgentEvent::ToolHeaderSnapshot {
+            id: TOOL_ID.into(),
+            snapshot: caudra_agent::BufferSnapshot::plain_text(text.into()),
+            theme_gen: None,
+        }
+    }
+
+    /// A plugin paints its real header after the call starts, and that is the
+    /// text its transcript shows. The snapshot names no tool, so it can only
+    /// retitle the call already on the header.
+    #[test]
+    fn a_mid_run_header_retitles_the_tool_it_belongs_to() {
+        let published = activities(vec![
+            tool_start("batch"),
+            header_snapshot("3 tools"),
+            AgentEvent::TextDelta {
+                text: "done".into(),
+            },
+            header_snapshot("stray"),
+        ]);
+
+        assert_eq!(
+            published,
+            [
+                ("batch".to_owned(), None),
+                ("batch".to_owned(), Some("3 tools".to_owned())),
+                (RESPONDING_LABEL.to_owned(), None),
+            ]
+        );
+    }
+
+    /// `ToolPending` announces the call the following `ToolStart` runs, so a
+    /// relay counting both would report twice the work. Two identical calls
+    /// in a row leave the activity untouched, and the count is then the only
+    /// thing that says anything happened.
+    #[test]
+    fn relay_counts_started_tools_once_each() {
+        let (sub_tx, sub_rx) = flume::unbounded();
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (usage_tx, _usage_rx) = flume::unbounded();
+
+        for event in [
+            AgentEvent::ToolPending {
+                id: "toolu_01".into(),
+                name: "shell".into(),
+            },
+            tool_start("shell"),
+            tool_start("shell"),
+        ] {
+            sub_tx.send(envelope(event)).unwrap();
+        }
+        drop(sub_tx);
+
+        smol::block_on(relay_session_events(
+            sub_rx,
+            EventSender::new(parent_raw_tx, RUN_ID),
+            parent_info(),
+            usage_tx,
+            None,
+        ));
+
+        let counts: Vec<u32> = relayed_progress(&parent_rx)
+            .into_iter()
+            .map(|(_, tools, _)| tools)
+            .collect();
+        assert_eq!(counts, [0, 1, 2]);
     }
 }

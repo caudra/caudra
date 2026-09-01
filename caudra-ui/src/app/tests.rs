@@ -8,7 +8,7 @@ use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
-use crate::components::{DisplaySource, ExitRequest, buffer_text, key, test_model};
+use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
@@ -17,8 +17,9 @@ use caudra_agent::permissions::{PermissionManager, PermissionRequest};
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use caudra_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
+    SubagentActivity, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -1514,6 +1515,90 @@ fn status_bar_sigma_draws_the_session_cost() {
         rendered(&mut app).contains(&sigma),
         "{SIGMA_MISSING}: {sigma}"
     );
+}
+
+const SUBAGENT_ELAPSED: Duration = Duration::from_millis(63_400);
+
+fn progress_event(activity: SubagentActivity, tools: u32) -> AgentEvent {
+    AgentEvent::SubagentProgress {
+        progress: SubagentProgress {
+            activity,
+            tools,
+            elapsed: SUBAGENT_ELAPSED,
+        },
+    }
+}
+
+fn parent_progress(app: &App, index: usize) -> Option<(&str, Option<&str>, u32)> {
+    let report = &app.chats[0].message_at(index)?.progress.as_ref()?.report;
+    Some((
+        report.activity.label(),
+        report.activity.detail(),
+        report.tools,
+    ))
+}
+
+/// The subagent's own work goes to its transcript; only the digest of it
+/// belongs on the parent header, and only on the header it came from.
+#[test]
+fn subagent_progress_lands_on_its_own_parent_header() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start("task2", "task")));
+
+    app.update(subagent_msg(
+        progress_event(
+            SubagentActivity::tool(Arc::from("shell"), "cargo nextest run"),
+            3,
+        ),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+
+    assert_eq!(
+        parent_progress(&app, 0),
+        Some(("shell", Some("cargo nextest run"), 3))
+    );
+    assert_eq!(parent_progress(&app, 1), None);
+}
+
+/// The tally has to survive the call it describes, or the transcript loses
+/// the only record of how much the subagent actually did.
+#[test]
+fn a_finished_subagent_keeps_the_tally_it_ended_on() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(
+        progress_event(SubagentActivity::Responding, 7),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+
+    finish_subagent(&mut app, TASK_ID, false);
+
+    let progress = app.chats[0].message_at(0).unwrap().progress.as_ref();
+    assert_eq!(progress.map(|p| p.report.tools), Some(7));
+    assert_eq!(progress.map(ToolProgress::is_live), Some(false));
+    assert!(
+        progress.is_some_and(|p| p.elapsed() >= SUBAGENT_ELAPSED),
+        "a settled report keeps the clock it stopped at"
+    );
+}
+
+/// A batch child's parent id is synthetic, so there is no header here to
+/// stamp. It must fall through quietly instead of landing on the main chat.
+#[test]
+fn a_dispatched_subagents_progress_finds_no_header_and_is_dropped() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "batch")));
+
+    app.update(subagent_msg(
+        progress_event(SubagentActivity::Thinking { title: None }, 0),
+        "session-generated",
+        Some(SUBAGENT_NAME),
+    ));
+
+    assert_eq!(parent_progress(&app, 0), None);
 }
 
 #[test]

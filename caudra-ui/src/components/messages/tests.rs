@@ -3947,7 +3947,7 @@ fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &s
 #[test_case(Duration::from_millis(9_700), "9.7s" ; "under_a_minute")]
 #[test_case(Duration::from_millis(125_340), "2m 5.3s" ; "over_a_minute")]
 fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str) {
-    assert_eq!(format_live_thinking_duration(duration), expected);
+    assert_eq!(format_live_duration(duration), expected);
 }
 
 #[test]

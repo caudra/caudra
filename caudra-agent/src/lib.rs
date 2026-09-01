@@ -59,9 +59,10 @@ pub use types::{
     GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine,
     IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, LuaToolProvenance,
     NO_FILES_FOUND, QueueConsumedItem, SharedBuf, ShellFilterInfo, ShellOutput, SnapshotLine,
-    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
+    SnapshotSpan, SpanStyle, SubagentActivity, SubagentInfo, SubagentProgress, TextOutput,
+    ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
+pub use types::{ReasoningSummary, format_live_duration, reasoning_summary};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentMode {

@@ -17,8 +17,8 @@ use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use caudra_agent::{
     AgentEvent, BufferSnapshot, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind,
-    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock,
+    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -272,7 +272,9 @@ impl Chat {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
             AgentEvent::QueueDrained => {}
-            AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
+            AgentEvent::Retry { .. } | AgentEvent::SubagentProgress { .. } => {
+                unreachable!("handled before handle_event")
+            }
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
@@ -551,6 +553,10 @@ impl Chat {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
+        self.messages_panel.set_tool_progress(tool_id, report);
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages_panel.load_messages(msgs);
     }
@@ -778,6 +784,7 @@ fn history_to_display_with_project(
                     tool_output,
                     live_output: None,
                     annotation,
+                    progress: None,
                     plan_path: None,
                     timestamp: None,
                     turn_usage: None,

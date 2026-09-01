@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
-use caudra_agent::{BufferSnapshot, ImageSource, ToolInput, ToolOutput};
+use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
 use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
 use caudra_providers::{CaudraId, HistoryItem, ModelTier};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -359,6 +359,38 @@ pub enum ToolStatus {
     Error,
 }
 
+/// A subagent's last progress report, plus when it landed so the row keeps
+/// counting between reports. A report only moves on a state change, and a
+/// single tool call can run for minutes.
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub report: SubagentProgress,
+    /// `None` once the call ended and the report is the final word.
+    since: Option<Instant>,
+}
+
+impl ToolProgress {
+    pub fn live(report: SubagentProgress) -> Self {
+        Self {
+            report,
+            since: Some(Instant::now()),
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.since.is_some()
+    }
+
+    pub fn settle(&mut self) {
+        self.report.elapsed = self.elapsed();
+        self.since = None;
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.report.elapsed + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
     pub role: DisplayRole,
@@ -369,6 +401,10 @@ pub struct DisplayMessage {
     pub tool_output: Option<Arc<ToolOutput>>,
     pub live_output: Option<String>,
     pub annotation: Option<String>,
+    /// How the subagent behind this tool call is getting on. Absent for every
+    /// other tool, and for a restored one: it is live chrome, like
+    /// [`Self::turn_usage`].
+    pub progress: Option<ToolProgress>,
     pub plan_path: Option<String>,
     pub timestamp: Option<String>,
     pub turn_usage: Option<String>,
@@ -393,6 +429,7 @@ impl DisplayMessage {
             tool_output: None,
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: None,
             timestamp: None,
             turn_usage: None,
@@ -415,6 +452,7 @@ impl DisplayMessage {
             tool_output: None,
             live_output: None,
             annotation: None,
+            progress: None,
             plan_path: Some(plan_path),
             timestamp: None,
             turn_usage: None,

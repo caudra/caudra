@@ -895,6 +895,11 @@ through optional callbacks while the tool runs.
     annotation event. Must not yield.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
+  - `on_progress` (`function?`) called with `(label, detail, tally)` whenever a
+    dispatched subagent moves. `label` is a tool name or one of `"thinking"`,
+    `"responding"`, `"compacting"`, `"retrying"`, `"awaiting permission"`;
+    `detail` is the tool header, or nil; `tally` reads like `"3 tools · 12.4s"`.
+    Must not yield.
 
 **Returns:** (`string?`, `string?`, `string?`, `boolean?`) Tool output text, error, generated call ID, and whether an error restore is authorized.
 

@@ -279,6 +279,7 @@ pub fn run(
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest(_)
             | AgentEvent::PermissionRequestResolved { .. }
+            | AgentEvent::SubagentProgress { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

@@ -39,6 +39,13 @@ const BOOM_ERR: &str = "stub tool exploded";
 const PARTIAL_TOOL: &str = "partial";
 const PARTIAL_ERR: &str = "half the output [cancelled by user; output above is partial]";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
+const CHILD_ACTIVITY: &str = "cargo nextest run";
+/// The relay formats the tally; batch only places it, so the stub feeds a
+/// fixed one and keeps the clock out of the assertion.
+const CHILD_TALLY: &str = "3 tools · 1.2s";
+const ACTIVITY_PREFIX: &str = "  ├ ";
+const ANNOTATION_SEP: &str = " · ";
+const DIM_STYLE: &str = "dim";
 /// Wildly generous vs the expected kill (one poll plus one
 /// [`KILL_GRACE`]); only a watchdog that never fires gets here.
 const RUNAWAY_BUDGET_GRACES: u32 = 20;
@@ -81,6 +88,14 @@ caudra.agent.call_tool = function(ctx, name, input, opts)
       opts.on_usage("@CHILD_USAGE@")
     end
     return "used_done"
+  elseif name == "busy" then
+    -- Reports, then parks like a real subagent mid-turn, so the paint that
+    -- carries the progress is observable before the child settles.
+    if opts and opts.on_progress then
+      opts.on_progress("shell", "@CHILD_ACTIVITY@", "@CHILD_TALLY@")
+    end
+    caudra.fn.jobwait(caudra.fn.jobstart("sleep @PARK_SECS@"))
+    return "busy_done"
   elseif name == "park" then
     -- Deadlocks unless a sibling runs concurrently and releases.
     local p = sem:acquire()
@@ -169,14 +184,20 @@ fn load_batch_host() -> (Arc<ToolRegistry>, PluginHost) {
 
 /// `child_src` registers extra child tools next to the stub ones, so a
 /// test can give a child its own header/restore behaviour.
+fn stub_prelude() -> String {
+    STUB_PRELUDE
+        .replace("@BOOM_ERR@", BOOM_ERR)
+        .replace("@CHILD_ACTIVITY@", CHILD_ACTIVITY)
+        .replace("@CHILD_TALLY@", CHILD_TALLY)
+        .replace("@CHILD_USAGE@", CHILD_USAGE)
+        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
+        .replace("@PARK_SECS@", &PARK_SECS.to_string())
+}
+
 fn load_batch_host_with(child_src: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let prelude = STUB_PRELUDE
-        .replace("@BOOM_ERR@", BOOM_ERR)
-        .replace("@CHILD_USAGE@", CHILD_USAGE)
-        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
-        .replace("@PARK_SECS@", &PARK_SECS.to_string());
+    let prelude = stub_prelude();
     host.load_source(
         "batch_policy",
         &format!("{prelude}\n{child_src}\n{BATCH_PLUGIN_SRC}"),
@@ -363,11 +384,7 @@ fn restore_does_not_run_replaced_child_presentation_contract() {
     let input = batch_input(calls.clone());
     let state = run_batch_state(&reg, calls);
     let output = format!("{}{}", section("hdrtool", "unused"), summary_all_ok(1));
-    let prelude = STUB_PRELUDE
-        .replace("@BOOM_ERR@", BOOM_ERR)
-        .replace("@CHILD_USAGE@", CHILD_USAGE)
-        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
-        .replace("@PARK_SECS@", &PARK_SECS.to_string());
+    let prelude = stub_prelude();
     host.load_source(
         "batch_policy",
         &format!("{prelude}\n{BATCH_PLUGIN_SRC}\n-- changed implementation"),
@@ -927,6 +944,68 @@ fn usage_renders_inline_on_matching_child() {
         text.matches(CHILD_USAGE).count(),
         1,
         "usage belongs to one child only: {text}"
+    );
+}
+
+fn progress_line(buf: &caudra_agent::SharedBuf) -> Option<Vec<(String, SpanStyle)>> {
+    buf.take()
+        .lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .first()
+                .is_some_and(|s| s.text == ACTIVITY_PREFIX)
+        })
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| (s.text.clone(), s.style.clone()))
+                .collect()
+        })
+}
+
+fn dim(text: &str) -> (String, SpanStyle) {
+    (text.to_owned(), SpanStyle::Named(DIM_STYLE.to_owned()))
+}
+
+/// A subagent child reports what it is doing on its own row under the
+/// header. What it was doing is stale once it settles; what it did is the
+/// only record of the work its output does not show, so the tally stays.
+#[test]
+fn a_running_child_shows_its_progress_and_keeps_the_tally_once_it_settles() {
+    let batch = start_batch(json!([{ "tool": "busy", "parameters": {} }]));
+
+    let deadline = Instant::now() + PAINT_TIMEOUT;
+    let line = loop {
+        if let Some(line) = progress_line(&batch.body) {
+            break line;
+        }
+        assert!(Instant::now() < deadline, "no paint carried the progress");
+        std::thread::sleep(PAINT_POLL_INTERVAL);
+    };
+    assert_eq!(
+        line,
+        [
+            dim(ACTIVITY_PREFIX),
+            (
+                "shell".to_owned(),
+                SpanStyle::Named("tool_prefix".to_owned())
+            ),
+            dim(&format!(" {CHILD_ACTIVITY}")),
+            dim(ANNOTATION_SEP),
+            dim(CHILD_TALLY),
+        ]
+    );
+
+    batch
+        .result
+        .recv_timeout(BATCH_RESULT_TIMEOUT)
+        .expect("batch never settled")
+        .expect("batch failed");
+    assert_eq!(
+        progress_line(&batch.body),
+        Some(vec![dim(ACTIVITY_PREFIX), dim(CHILD_TALLY)]),
+        "a settled child keeps what it did, not what it was doing"
     );
 }
 

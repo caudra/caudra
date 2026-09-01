@@ -15,8 +15,8 @@ use super::tool_display::{
     thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, apply_scroll_delta,
-    code_view::SectionFlags, review,
+    DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
+    apply_scroll_delta, code_view::SectionFlags, review,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use caudra_agent::{
-    BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, SubagentProgress,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration, reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 
@@ -54,7 +54,6 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const THOUGHT_PREFIX: &str = "Thought";
-const THOUGHT_TITLE_FENCE: &str = "**";
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
@@ -446,6 +445,9 @@ impl MessagesPanel {
                 ToolStatus::Success
             };
         }
+        if let Some(progress) = &mut msg.progress {
+            progress.settle();
+        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -511,6 +513,12 @@ impl MessagesPanel {
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    }
+
+    pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
+        self.update_tool(tool_id, |msg| {
+            msg.progress = Some(ToolProgress::live(report));
+        });
     }
 
     pub fn tool_snapshot(
@@ -1399,6 +1407,7 @@ impl MessagesPanel {
         }
         if self.in_progress_count() > 0 {
             self.update_spinners();
+            self.refresh_live_progress();
         }
 
         let cached_count = self.cache.len();
@@ -2018,6 +2027,26 @@ impl MessagesPanel {
         }
     }
 
+    /// The one row whose text is a function of the wall clock. Only a running
+    /// subagent has it, and its segment is a header plus that row until the
+    /// call returns, so rebuilding at the spinner cadence stays cheap.
+    fn refresh_live_progress(&mut self) {
+        let live: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|msg| msg.progress.as_ref().is_some_and(ToolProgress::is_live))
+            .filter_map(|msg| match &msg.role {
+                DisplayRole::Tool(tool) if tool.status == ToolStatus::InProgress => {
+                    Some(tool.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for tool_id in live {
+            self.rebuild_tool_lines(&tool_id);
+        }
+    }
+
     fn drain_highlights(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         while let Some(result) = self.hl_worker.try_recv() {
@@ -2036,6 +2065,12 @@ impl MessagesPanel {
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
         self.clear_hover();
+        self.rebuild_tool_lines(tool_id);
+    }
+
+    /// Leaves hover alone, so the clock-driven refresh cannot cancel the
+    /// reader's pointer every frame.
+    fn rebuild_tool_lines(&mut self, tool_id: &str) {
         let Some(msg) = self
             .messages
             .iter()
@@ -2319,78 +2354,13 @@ fn thought_line(text: &str, duration: Option<Duration>, done: bool) -> Vec<Line<
                 if done {
                     format_thought_duration(duration)
                 } else {
-                    format_live_thinking_duration(duration)
+                    format_live_duration(duration)
                 }
             ),
             theme.tool_dim,
         ));
     }
     vec![Line::from(spans)]
-}
-
-fn format_live_thinking_duration(duration: Duration) -> String {
-    let tenths = duration.as_millis() / 100;
-    let seconds = tenths / 10;
-    if seconds < u128::from(SECONDS_PER_MINUTE) {
-        format!("{}.{}s", seconds, tenths % 10)
-    } else {
-        format!(
-            "{}m {}.{}s",
-            seconds / u128::from(SECONDS_PER_MINUTE),
-            seconds % u128::from(SECONDS_PER_MINUTE),
-            tenths % 10
-        )
-    }
-}
-
-struct ReasoningSummary<'a> {
-    title: Option<&'a str>,
-    body: &'a str,
-}
-
-fn reasoning_summary(text: &str) -> ReasoningSummary<'_> {
-    let content = text.trim();
-    let Some(after_open) = content.strip_prefix(THOUGHT_TITLE_FENCE) else {
-        return ReasoningSummary {
-            title: None,
-            body: content,
-        };
-    };
-    let Some(close) = after_open.find(THOUGHT_TITLE_FENCE) else {
-        return ReasoningSummary {
-            title: None,
-            body: content,
-        };
-    };
-    let title = &after_open[..close];
-    let title = title.trim();
-    if title.is_empty()
-        || title
-            .chars()
-            .any(|character| matches!(character, '*' | '\n' | '\r'))
-    {
-        return ReasoningSummary {
-            title: None,
-            body: content,
-        };
-    }
-    let suffix = &after_open[close + THOUGHT_TITLE_FENCE.len()..];
-    let body = if suffix.is_empty() {
-        ""
-    } else if let Some(body) = suffix.strip_prefix("\r\n\r\n") {
-        body.trim_end()
-    } else if let Some(body) = suffix.strip_prefix("\n\n") {
-        body.trim_end()
-    } else {
-        return ReasoningSummary {
-            title: None,
-            body: content,
-        };
-    };
-    ReasoningSummary {
-        title: Some(title),
-        body,
-    }
 }
 
 fn format_thought_duration(duration: Duration) -> String {
