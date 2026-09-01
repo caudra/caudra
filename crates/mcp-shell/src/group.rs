@@ -15,7 +15,7 @@ use crate::{
     progress::{ProgressPump, ShellProgressSink, receive_failure},
     types::{
         DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellExecution,
-        ShellInput, ShellOutput, ShellStream,
+        ShellFilterInfo, ShellInput, ShellOutput, ShellStream,
     },
     workdir,
 };
@@ -342,9 +342,12 @@ impl ShellToolGroup {
             stdout_preview_truncated,
             stderr_preview_truncated,
         };
+        let (model_text, filter) =
+            self.render_with_filter(&output, &analysis, &stdout_tail, &stderr_tail);
         Ok(Some(ShellExecution {
-            model_text: self.render(&output, &analysis, &stdout_tail, &stderr_tail),
             output,
+            model_text,
+            filter,
         }))
     }
 
@@ -354,6 +357,7 @@ impl ShellToolGroup {
     /// previews already placed in the structured result. Reducing first means
     /// the same preview budget carries what survived filtering instead of the
     /// raw end of the stream.
+    #[cfg(test)]
     fn render(
         &self,
         output: &ShellOutput,
@@ -361,16 +365,27 @@ impl ShellToolGroup {
         stdout_tail: &Tail,
         stderr_tail: &Tail,
     ) -> String {
+        self.render_with_filter(output, analysis, stdout_tail, stderr_tail)
+            .0
+    }
+
+    fn render_with_filter(
+        &self,
+        output: &ShellOutput,
+        analysis: &ShellCommandAnalysis,
+        stdout_tail: &Tail,
+        stderr_tail: &Tail,
+    ) -> (String, Option<ShellFilterInfo>) {
         let unfiltered = model_text(output);
         let Some(rule) = self.matching_rule(analysis) else {
-            return unfiltered;
+            return (unfiltered, None);
         };
         let filtered = rule.apply(&stdout_tail.text(), &stderr_tail.text(), output.exit_code);
         if !filtered.lossy {
             // The rule matched but removed nothing. Announcing a filter that did
             // not filter would tell a reader to go looking for output that was
             // never dropped.
-            return unfiltered;
+            return (unfiltered, None);
         }
         let mut rendered = filtered.text;
         if !filtered.consumed_stderr && !output.stderr.is_empty() {
@@ -383,7 +398,7 @@ impl ShellToolGroup {
             rendered.push_str(&output.stderr);
         }
         if rendered.trim().is_empty() {
-            return unfiltered;
+            return (unfiltered, None);
         }
         // The notice is deliberately terse. It is paid on every filtered result
         // and is compared against the complete capture below, so a verbose
@@ -397,9 +412,14 @@ impl ShellToolGroup {
         // free. A rendering that is not smaller than the complete capture is
         // strictly worse than it: it costs more and says less.
         if candidate.len() >= unfiltered.len() {
-            return unfiltered;
+            return (unfiltered, None);
         }
-        candidate
+        let filter = ShellFilterInfo {
+            rule: rule.name().to_owned(),
+            unfiltered_utf8_bytes: unfiltered.len(),
+            filtered_utf8_bytes: candidate.len(),
+        };
+        (candidate, Some(filter))
     }
 
     /// Selects the rule for a command, or `None` when none should apply.
@@ -519,6 +539,8 @@ mod tests {
 
     const MAKE_OUTPUT: &str =
         "make[1]: Entering directory '/x'\ngcc -O2 foo.c\nmake[1]: Leaving directory '/x'\n";
+    const CARGO_TEST_STDOUT: &str = "running 2 tests\ntest sdk_mode::tests::wire_init ... ok\ntest sdk_mode::tests::wire_result ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+    const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
         let root = tempfile::tempdir().unwrap();
@@ -542,6 +564,27 @@ mod tests {
         assert!(rendered.starts_with("gcc -O2 foo.c"), "{rendered}");
         assert!(!rendered.contains("Entering directory"), "{rendered}");
         assert!(rendered.contains("[filtered: make]"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn cargo_test_hides_passing_rows_and_keeps_summary_and_warnings() {
+        let (_root, group) = group_for_render(true).await;
+        let analysis = crate::permission::inspect("cargo test");
+        let rendered = group.render(
+            &rendered_output(CARGO_TEST_STDOUT, CARGO_TEST_STDERR, Some(0)),
+            &analysis,
+            &tail(CARGO_TEST_STDOUT),
+            &tail(CARGO_TEST_STDERR),
+        );
+
+        assert!(!rendered.contains("wire_init"), "{rendered}");
+        assert!(!rendered.contains("wire_result"), "{rendered}");
+        assert!(rendered.contains("test result: ok. 2 passed"), "{rendered}");
+        assert!(
+            rendered.contains("warning: future incompatibility"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[filtered: cargo-test]"), "{rendered}");
     }
 
     #[tokio::test]

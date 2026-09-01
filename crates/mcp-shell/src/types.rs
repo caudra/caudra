@@ -153,8 +153,16 @@ impl PreparedShell {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellFilterInfo {
+    pub rule: String,
+    pub unfiltered_utf8_bytes: usize,
+    pub filtered_utf8_bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct ShellExecution {
     pub output: ShellOutput,
     pub model_text: String,
+    pub filter: Option<ShellFilterInfo>,
 }

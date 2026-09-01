@@ -96,6 +96,15 @@ async fn native_hosts_see_the_filtered_rendering_and_the_raw_capture() {
     );
     assert!(execution.output.stdout.contains("real build line"));
     assert_eq!(execution.output.exit_code, Some(0));
+    let filter = execution.filter.as_ref().expect("make output is filtered");
+    assert_eq!(filter.rule, "make");
+    let unfiltered = format!(
+        "stdout tail:\n{}\nstderr tail:\n{}",
+        execution.output.stdout, execution.output.stderr
+    );
+    assert_eq!(filter.unfiltered_utf8_bytes, unfiltered.len());
+    assert_eq!(filter.filtered_utf8_bytes, execution.model_text.len());
+    assert!(filter.filtered_utf8_bytes < filter.unfiltered_utf8_bytes);
 
     // Byte accounting describes the process, not the rendering.
     assert!(execution.output.stdout_utf8_bytes >= execution.output.stdout.len() as u64);
@@ -133,4 +142,5 @@ async fn disabling_the_filter_makes_both_forms_raw() {
     };
     assert!(execution.model_text.contains("Entering directory"));
     assert!(execution.output.stdout.contains("Entering directory"));
+    assert_eq!(execution.filter, None);
 }

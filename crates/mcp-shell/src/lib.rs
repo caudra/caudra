@@ -27,6 +27,6 @@ pub use permission::{
 pub use progress::ShellProgressSink;
 pub use types::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellCommandScope,
-    ShellExecution, ShellInput, ShellOutput, ShellProgressChunk, ShellStream,
+    ShellExecution, ShellFilterInfo, ShellInput, ShellOutput, ShellProgressChunk, ShellStream,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

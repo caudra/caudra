@@ -16,6 +16,21 @@ which were copied verbatim from the RTK project.
 The files in `rules/` are unmodified. The filter engine in `src/` is an
 independent implementation and is not derived from RTK source code.
 
+Only RTK's declarative filter corpus is vendored. RTK also implements per-command
+filtering in Rust under `src/cmds/`, where a module both executes the command and
+shapes its output, and in one case substitutes a different command line than the
+caller wrote. None of that is vendored or ported. This crate is a pure output
+transformation: it never spawns a process and never rewrites a command, because
+execution and authorization belong to the shell tool group.
+
+One vendored rule refers to that absent layer. The description in
+`rules/spring-boot.toml` states that `mvn spring-boot:run` is routed to a
+dedicated Maven filter and never reaches the Spring Boot rule. Upstream that
+filter is a Rust module, so the statement does not hold here and the command does
+reach the Spring Boot rule. That is the better fit for application logs, so
+`rules-workcell/maven.toml` matches Maven goals explicitly rather than the `mvn`
+program in order to preserve the routing.
+
 The rules in `rules-workcell/` are original to this project and are not derived
 from RTK. They are kept in a separate directory so that refreshing the vendored
 corpus stays a clean copy of `rules/`, and so that provenance is visible without

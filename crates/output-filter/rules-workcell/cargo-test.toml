@@ -1,5 +1,5 @@
 [filters.cargo-test]
-description = "Compact cargo test output, dropping empty test-binary sections"
+description = "Compact cargo test output, dropping passing test rows and empty test-binary sections"
 match_command = "^cargo\\s+(test|nextest)\\b"
 filter_stderr = true
 strip_lines_matching = [
@@ -12,14 +12,16 @@ strip_lines_matching = [
   "^\\s*Finished ",
   "^\\s*Running ",
   "^\\s*Doc-tests ",
-  "^running 0 tests$",
+  "^running [0-9]+ tests?$",
+  "^\\s*test .+ \\.\\.\\. (ok|ignored)$",
+  "^\\s*PASS\\s+\\[[^]]+\\]\\s+.+$",
   "^test result: ok\\. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
   "^\\s*$",
 ]
 on_empty = "cargo test: ok"
 
 [[tests.cargo-test]]
-name = "collapses empty test binaries and keeps real results"
+name = "collapses passing test rows and empty test binaries"
 input = """
    Compiling rustdemo v0.1.0 (/work/rustdemo)
     Finished test [unoptimized + debuginfo] target(s) in 0.43s
@@ -44,9 +46,6 @@ running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 """
 expected = """
-running 2 tests
-test tests::adds ... ok
-test tests::also_adds ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 """
 
@@ -64,10 +63,24 @@ assertion `left == right` failed
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 """
 expected = """
-running 1 test
 test tests::adds ... FAILED
 failures:
 ---- tests::adds stdout ----
 assertion `left == right` failed
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+"""
+
+[[tests.cargo-test]]
+name = "nextest passing rows collapse to the summary"
+input = """
+    PASS [   0.012s] caudra sdk_mode::tests::wire_init_serializes_correctly
+    PASS [   0.013s] caudra sdk_mode::tests::wire_result_serializes_correctly
+    FAIL [   0.014s] caudra sdk_mode::tests::broken
+────────────
+     Summary [   0.020s] 3 tests run: 2 passed, 1 failed
+"""
+expected = """
+    FAIL [   0.014s] caudra sdk_mode::tests::broken
+────────────
+     Summary [   0.020s] 3 tests run: 2 passed, 1 failed
 """

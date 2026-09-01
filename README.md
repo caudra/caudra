@@ -459,8 +459,10 @@ policy, then commit with the matching `execute_*` method.
 
 A shell execution returns both renderings on one value. `ShellExecution::model_text` is the filtered,
 model-facing form and `ShellExecution::output` is the unfiltered capture with the complete byte
-accounting, so a host that keeps a transcript or builds its own presentation never has to disable
-filtering to obtain the real bytes. Live output is independent of both: chunks delivered to a
+accounting. `ShellExecution::filter` identifies the applied rule and the unfiltered and filtered
+rendering sizes when filtering reduced the result, so hosts do not need to parse presentation text.
+A host that keeps a transcript or builds its own presentation never has to disable filtering to
+obtain the real bytes. Live output is independent of both: chunks delivered to a
 `ShellProgressSink` are published while the process runs, before an exit code exists, and are never
 filtered. Filtering therefore changes only what a model reads, never what a host can observe.
 

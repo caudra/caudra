@@ -57,3 +57,23 @@ fn rules_match_normalized_scopes_rather_than_raw_command_strings() {
     // A different program with a matching prefix must not be captured.
     assert!(corpus.find("dfu-util --list").is_none());
 }
+
+#[test]
+fn cargo_test_reduces_large_passing_suites_to_their_summary() {
+    const TEST_COUNT: usize = 86;
+    let mut stdout = format!("running {TEST_COUNT} tests\n");
+    for test in 0..TEST_COUNT {
+        stdout.push_str(&format!("test sdk_mode::tests::case_{test} ... ok\n"));
+    }
+    stdout.push_str(
+        "test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s\n",
+    );
+    let rule = builtin().rule("cargo-test").expect("cargo-test rule");
+
+    let filtered = rule.apply(&stdout, "warning: future incompatibility\n", Some(0));
+
+    assert!(!filtered.text.contains("case_42"));
+    assert!(filtered.text.contains("test result: ok. 86 passed"));
+    assert!(filtered.text.contains("warning: future incompatibility"));
+    assert!(filtered.text.len() < stdout.len() / 4);
+}
