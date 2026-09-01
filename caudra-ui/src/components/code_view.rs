@@ -520,6 +520,7 @@ pub(crate) fn render_instructions(
 pub struct SectionFlags {
     pub script: bool,
     pub output: bool,
+    pub shell_raw: bool,
 }
 
 impl SectionFlags {

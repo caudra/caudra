@@ -69,8 +69,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Legacy compatibility flag. Caudra no longer rewrites commands through RTK.
-    #[arg(long, hide = true)]
+    /// Disable model-facing shell output filtering.
+    #[arg(long)]
     pub no_rtk: bool,
 
     /// Skip user `init.lua` files (global and project) but keep the Lua

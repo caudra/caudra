@@ -620,6 +620,25 @@ pub fn truncate_output(text: &str, max: usize) -> TruncatedOutput<'_> {
     }
 }
 
+pub fn truncate_output_tail(text: &str, max: usize) -> TruncatedOutput<'_> {
+    let line_count = text.lines().count();
+    let skipped = line_count.saturating_sub(max);
+    if !should_truncate(skipped) {
+        return truncate_output(text, usize::MAX);
+    }
+    let start = if skipped == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(skipped - 1)
+            .map_or(text.len(), |(index, _)| index + 1)
+    };
+    TruncatedOutput {
+        kept: render::truncate_long_lines(&text[start..]),
+        skipped,
+    }
+}
+
 /// Keeps the head. Tools that want tail truncation do it in Lua instead
 /// (ToolView `keep = "tail"`).
 pub fn truncate_lines(s: &str, max: usize) -> Truncated<'_> {
@@ -795,6 +814,19 @@ mod tests {
     #[test_case("a\nb\nc\nd", 2, "a\nb", 2     ; "over_limit_keeps_head")]
     fn truncate_lines_cases(input: &str, max: usize, expected_kept: &str, expected_skipped: usize) {
         let tr = truncate_lines(input, max);
+        assert_eq!(tr.kept, expected_kept);
+        assert_eq!(tr.skipped, expected_skipped);
+    }
+
+    #[test_case("a\nb\nc", 5, "a\nb\nc", 0     ; "under_limit")]
+    #[test_case("a\nb\nc\nd", 2, "c\nd", 2     ; "over_limit_keeps_tail")]
+    fn truncate_output_tail_cases(
+        input: &str,
+        max: usize,
+        expected_kept: &str,
+        expected_skipped: usize,
+    ) {
+        let tr = truncate_output_tail(input, max);
         assert_eq!(tr.kept, expected_kept);
         assert_eq!(tr.skipped, expected_skipped);
     }

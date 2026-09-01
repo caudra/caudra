@@ -152,6 +152,49 @@ pub struct TextOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellFilterInfo {
+    pub rule: String,
+    pub unfiltered_utf8_bytes: usize,
+    pub filtered_utf8_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOutput {
+    pub model_text: String,
+    pub relative_workdir: String,
+    pub timeout_ms: u64,
+    pub duration_ms: u64,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub output_limit_exceeded: bool,
+    pub final_sequence: u64,
+    pub stdout_utf8_bytes: u64,
+    pub stderr_utf8_bytes: u64,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_capture_truncated: bool,
+    pub stderr_capture_truncated: bool,
+    pub stdout_preview_truncated: bool,
+    pub stderr_preview_truncated: bool,
+    pub filter: Option<ShellFilterInfo>,
+}
+
+impl ShellOutput {
+    pub fn raw_text(&self) -> String {
+        match (self.stdout.is_empty(), self.stderr.is_empty()) {
+            (false, true) => self.stdout.clone(),
+            (true, false) => self.stderr.clone(),
+            (false, false) => format!(
+                "stdout tail:\n{}\nstderr tail:\n{}",
+                self.stdout, self.stderr
+            ),
+            (true, true) => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LuaToolProvenance {
     pub plugin: String,
     pub contract: String,
@@ -313,6 +356,7 @@ pub enum ToolOutput {
         entries: Vec<GrepFileEntry>,
     },
     Index(IndexOutput),
+    Shell(ShellOutput),
     /// Only here so legacy sessions still deserialize. Batch is a Lua
     /// plugin now and stores plain text plus a `state` payload, so the old
     /// per-child `entries` are dropped on load: nothing can render them.
@@ -372,6 +416,17 @@ impl ToolOutput {
                 format!("at least {total_count} entries")
             } else {
                 format!("{total_count} entries")
+            }),
+            Self::Shell(output) => Some(if output.timed_out {
+                "timed out".into()
+            } else if output.output_limit_exceeded {
+                "output limit exceeded".into()
+            } else if let Some(exit_code) = output.exit_code {
+                format!("exit {exit_code}")
+            } else if let Some(signal) = output.signal {
+                format!("signal {signal}")
+            } else {
+                "exit unknown".into()
             }),
             Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
                 let n = text.text.lines().count();
@@ -446,6 +501,7 @@ impl ToolOutput {
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::Index(_)
+            | Self::Shell(_)
             | Self::TodoList(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -456,6 +512,7 @@ impl ToolOutput {
             Self::GrepResult { entries } => entries.is_empty(),
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.is_empty(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.is_empty(),
+            Self::Shell(output) => output.stdout.is_empty() && output.stderr.is_empty(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
             _ => false,
         }
@@ -465,6 +522,7 @@ impl ToolOutput {
         match self {
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
+            Self::Shell(output) => output.model_text.clone(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -496,6 +554,7 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
+            Self::Shell(output) => output.raw_text(),
             Self::ReadCode {
                 start_line,
                 lines,
@@ -1190,6 +1249,48 @@ mod tests {
     use caudra_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    fn shell_output() -> ShellOutput {
+        ShellOutput {
+            model_text: "filtered summary\n\n[shell status: exit code 0]".into(),
+            relative_workdir: ".".into(),
+            timeout_ms: 120_000,
+            duration_ms: 10,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 2,
+            stdout_utf8_bytes: 14,
+            stderr_utf8_bytes: 10,
+            stdout: "raw stdout".into(),
+            stderr: "raw stderr".into(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+            filter: Some(ShellFilterInfo {
+                rule: "cargo".into(),
+                unfiltered_utf8_bytes: 100,
+                filtered_utf8_bytes: 20,
+            }),
+        }
+    }
+
+    #[test]
+    fn shell_output_separates_model_and_raw_projections() {
+        let output = ToolOutput::Shell(shell_output());
+
+        assert_eq!(
+            output.as_text(),
+            "filtered summary\n\n[shell status: exit code 0]"
+        );
+        assert_eq!(
+            output.as_display_text(),
+            "stdout tail:\nraw stdout\nstderr tail:\nraw stderr"
+        );
+        assert_eq!(output.annotation().as_deref(), Some("exit 0"));
+    }
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]

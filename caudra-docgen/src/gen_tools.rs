@@ -169,6 +169,14 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
         .unwrap();
         writeln!(out).unwrap();
     }
+    if name == "shell" {
+        writeln!(
+            out,
+            "Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it."
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+    }
     write_param_table(out, &params);
 }
 

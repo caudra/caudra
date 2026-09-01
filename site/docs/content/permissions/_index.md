@@ -141,7 +141,7 @@ Bash scopes include the normalized initial working directory. Tree-sitter walks 
 
 Command substitution, process substitution, subshells, arithmetic expansion, unresolved redirect targets, and parse failures force exact review.
 
-Caudra executes the reviewed command text. It does not replace an approved command through RTK or another post-approval rewriter.
+Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 
 The initial working directory is context, not confinement. An approved shell command can still access files, the network, and inherited environment variables.
 

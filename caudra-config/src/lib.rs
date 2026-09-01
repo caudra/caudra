@@ -606,6 +606,7 @@ pub struct AgentFileConfig {
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
+    pub shell_output_filter: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -620,7 +621,8 @@ impl AgentFileConfig {
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
-            stale_read_check
+            stale_read_check,
+            shell_output_filter
         );
     }
 }
@@ -1180,7 +1182,7 @@ impl ToolOutputLines {
 
     pub fn get(&self, name: &str) -> usize {
         match name {
-            "bash" => self.bash,
+            "bash" | "shell" => self.bash,
             "code_execution" => self.code_execution,
             "task" => self.task,
             "index" => self.index,
@@ -1243,6 +1245,12 @@ pub struct AgentConfig {
     )]
     pub stale_read_check: bool,
 
+    #[config(
+        default = true,
+        desc = "Filter completed model-facing shell output with built-in rules"
+    )]
+    pub shell_output_filter: bool,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1280,6 +1288,7 @@ impl AgentConfig {
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
+            shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -2707,10 +2716,29 @@ mod tests {
         };
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.ui.tool_output_lines.bash, 20);
+        assert_eq!(config.ui.tool_output_lines.get("shell"), 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
             config.ui.tool_output_lines.index,
             ToolOutputLines::DEFAULT.index
+        );
+    }
+
+    #[test_case(false, None,        true  ; "enabled_by_default")]
+    #[test_case(false, Some(false), false ; "disabled_in_config")]
+    #[test_case(true,  Some(true),  false ; "cli_flag_forces_disabled")]
+    fn shell_output_filter_config(no_rtk: bool, configured: Option<bool>, expected: bool) {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                shell_output_filter: configured,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            raw.into_config(no_rtk).unwrap().agent.shell_output_filter,
+            expected
         );
     }
 

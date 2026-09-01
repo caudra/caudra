@@ -22,6 +22,7 @@ use crate::animation::spinner_str;
 use crate::components::keybindings::key;
 use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
+    truncate_output_tail,
 };
 use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
@@ -54,6 +55,7 @@ use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
+const SHELL_LIVE_OUTPUT_LINES: usize = 12;
 
 #[derive(Debug, PartialEq, Eq)]
 enum HoverTarget {
@@ -131,6 +133,7 @@ pub struct MessagesPanel {
     /// carries a restore fallback, so we never track the runtime's
     /// warm cache.
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    retained_shell_outputs: VecDeque<String>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
@@ -182,6 +185,7 @@ impl MessagesPanel {
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
+            retained_shell_outputs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
             restore_event_tx: None,
@@ -240,6 +244,7 @@ impl MessagesPanel {
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
+        self.retained_shell_outputs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
         self.thinking_collapsed = !self.show_thinking;
@@ -328,7 +333,16 @@ impl MessagesPanel {
         };
         let tool_name = msg.role.tool_name().unwrap_or("");
         truncate_to_header(&mut msg.text);
-        let truncated = truncate_output(content, self.tool_output_lines.get(tool_name));
+        let output_lines = if tool_name == "shell" {
+            SHELL_LIVE_OUTPUT_LINES
+        } else {
+            self.tool_output_lines.get(tool_name)
+        };
+        let truncated = if tool_name == "shell" {
+            truncate_output_tail(content, output_lines)
+        } else {
+            truncate_output(content, output_lines)
+        };
         msg.truncated_lines = truncated.skipped;
         msg.text.push('\n');
         msg.text.push_str(&truncated.kept);
@@ -337,6 +351,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
         let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
@@ -388,8 +403,27 @@ impl MessagesPanel {
             _ => {}
         }
         msg.tool_output = Some(Arc::new(event.output));
-        msg.live_output = None;
+        let retained_live_output = retain_live_output && msg.live_output.is_some();
+        if !retain_live_output {
+            msg.live_output = None;
+        }
+        let evicted = if retained_live_output {
+            self.retained_shell_outputs.push_back(event.id.clone());
+            (self.retained_shell_outputs.len() > WARM_TOOL_CAP)
+                .then(|| self.retained_shell_outputs.pop_front())
+                .flatten()
+        } else {
+            None
+        };
         self.rebuild_tool_segment(&event.id);
+        if let Some(evicted) = evicted {
+            if let Some(message) = self.messages.iter_mut().rfind(
+                |message| matches!(&message.role, DisplayRole::Tool(tool) if tool.id == evicted),
+            ) {
+                message.live_output = None;
+            }
+            self.rebuild_tool_segment(&evicted);
+        }
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -841,15 +875,21 @@ impl MessagesPanel {
             .unwrap_or_default();
         let native_toggle =
             !self.has_snapshot(tool_id) && (segment.truncation.any() || expanded.any());
-        if !native_toggle && !known_task_target {
+        let shell_toggle = segment
+            .shell_toggle_line
+            .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
+        if !native_toggle && !shell_toggle && !known_task_target {
             return None;
         }
-        let feedback = if native_toggle
+        let feedback = if shell_toggle {
+            HoverFeedback::Chrome
+        } else if native_toggle
             && segment.lines().iter().any(|line| {
                 line.spans
                     .iter()
                     .any(|span| span.content.contains(EXPAND_AFFORDANCE))
-            }) {
+            })
+        {
             HoverFeedback::Affordance
         } else {
             HoverFeedback::Chrome
@@ -1107,6 +1147,16 @@ impl MessagesPanel {
             .get(tool_id)
             .copied()
             .unwrap_or_default();
+        let shell_toggle = seg
+            .shell_toggle_line
+            .is_some_and(|line| seg.source_line_at(rel, width) == Some(line));
+        if shell_toggle {
+            let tool_id = tool_id.to_owned();
+            let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
+            entry.shell_raw = !entry.shell_raw;
+            self.rebuild_expanded_tool(&tool_id);
+            return true;
+        }
         if !seg.truncation.any() && !exp.any() {
             return false;
         }

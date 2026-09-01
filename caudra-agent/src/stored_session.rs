@@ -104,7 +104,7 @@ mod tests {
     use super::*;
     use crate::{
         History, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic,
-        IndexOutput, IndexSourceRange,
+        IndexOutput, IndexSourceRange, ShellFilterInfo, ShellOutput,
     };
     use caudra_providers::{ContentBlock, Role, active_history_items, resolve_history_head};
 
@@ -227,5 +227,46 @@ mod tests {
 
         assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
         assert!(matches!(actual.as_ref(), ToolOutput::Index(_)));
+    }
+
+    #[test]
+    fn native_shell_output_survives_persisted_session_roundtrip() {
+        let output = ToolOutput::Shell(ShellOutput {
+            model_text: "filtered\n\n[shell status: exit code 0]".into(),
+            relative_workdir: ".".into(),
+            timeout_ms: 120_000,
+            duration_ms: 10,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 1,
+            stdout_utf8_bytes: 3,
+            stderr_utf8_bytes: 0,
+            stdout: "raw".into(),
+            stderr: String::new(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+            filter: Some(ShellFilterInfo {
+                rule: "cargo".into(),
+                unfiltered_utf8_bytes: 100,
+                filtered_utf8_bytes: 20,
+            }),
+        });
+        let expected = serde_json::to_value(&output).unwrap();
+        let mut session = StoredSession::new(MODEL, CWD);
+        let id = session.id;
+        session.insert_tool_output("shell-call".into(), output);
+
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        session.save(&storage).unwrap();
+        let loaded = load_stored_session(id, &storage).unwrap();
+        let actual = loaded.tool_outputs().get("shell-call").unwrap();
+
+        assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
+        assert_eq!(actual.as_text(), "filtered\n\n[shell status: exit code 0]");
     }
 }

@@ -74,6 +74,7 @@ pub(super) struct Segment {
     highlight_key: HighlightKey,
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
+    pub shell_toggle_line: Option<usize>,
     pub content_indent: &'static str,
     /// Lines were laid out at a width or theme that is no longer current.
     /// Cleared by `set_lines` (whole vector replaced) and up front by
@@ -297,6 +298,7 @@ impl Segment {
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
         self.snapshot_base = tl.snapshot_base;
+        self.shell_toggle_line = tl.shell_toggle_line;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
         let links = std::mem::take(&mut tl.links);
@@ -330,6 +332,7 @@ impl Segment {
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
             self.snapshot_base = tl.snapshot_base;
+            self.shell_toggle_line = tl.shell_toggle_line;
             self.content_indent = tl.content_indent;
         } else {
             self.apply_highlight(tl, worker);
@@ -385,6 +388,9 @@ impl Segment {
         }
         if let Some(base) = &mut self.snapshot_base {
             shift(base);
+        }
+        if let Some(line) = &mut self.shell_toggle_line {
+            shift(line);
         }
     }
 }

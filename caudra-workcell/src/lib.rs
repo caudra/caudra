@@ -20,7 +20,8 @@ use caudra_agent::{
     IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
-    IndexSourceRange as AgentIndexSourceRange, SnapshotLine, TextOutput, ToolInput, ToolOutput,
+    IndexSourceRange as AgentIndexSourceRange, ShellFilterInfo as AgentShellFilterInfo,
+    ShellOutput as AgentShellOutput, SnapshotLine, TextOutput, ToolInput, ToolOutput,
 };
 use futures_lite::future;
 use serde::{Serialize, de::DeserializeOwned};
@@ -42,8 +43,8 @@ use workcell::files::{
     IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
 };
 use workcell::shell::{
-    PreparedShell, ShellExecution, ShellInput, ShellProgressChunk, ShellProgressSink,
-    ShellToolGroup,
+    PreparedShell, ShellExecution, ShellFilterInfo as WorkcellShellFilterInfo, ShellInput,
+    ShellOutput as WorkcellShellOutput, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, WebExecution, WebToolGroup, WebfetchInput, WebfetchOutput,
@@ -797,12 +798,14 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let input = input.clone();
+                let output_filter = ctx.config.shell_output_filter;
                 let (group, shell) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
-                        let prepared = groups.shell.prepare(input).await?;
-                        Ok::<_, String>((groups.shell, prepared))
+                        let group = groups.shell.with_output_filter(output_filter);
+                        let prepared = group.prepare(input).await?;
+                        Ok::<_, String>((group, prepared))
                     })
                     .await??;
                 shell_prepared(group, shell)
@@ -1712,12 +1715,62 @@ fn webfetch_result(execution: WebExecution<WebfetchOutput>) -> ToolExecResult {
 }
 
 fn shell_result(execution: ShellExecution) -> ToolExecResult {
-    text_result(
-        &execution.output,
-        execution.model_text.clone(),
-        false,
-        execution.model_text,
-    )
+    shell_result_parts(execution.output, execution.model_text, execution.filter)
+}
+
+fn shell_result_parts(
+    output: WorkcellShellOutput,
+    mut model_text: String,
+    filter: Option<WorkcellShellFilterInfo>,
+) -> ToolExecResult {
+    let is_error = output.exit_code != Some(0) || output.timed_out || output.output_limit_exceeded;
+    model_text.push_str("\n\n");
+    model_text.push_str(&shell_status(&output));
+    let output = AgentShellOutput {
+        model_text: model_text.clone(),
+        relative_workdir: output.relative_workdir,
+        timeout_ms: output.timeout_ms,
+        duration_ms: output.duration_ms,
+        exit_code: output.exit_code,
+        signal: output.signal,
+        timed_out: output.timed_out,
+        output_limit_exceeded: output.output_limit_exceeded,
+        final_sequence: output.final_sequence,
+        stdout_utf8_bytes: output.stdout_utf8_bytes,
+        stderr_utf8_bytes: output.stderr_utf8_bytes,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        stdout_capture_truncated: output.stdout_capture_truncated,
+        stderr_capture_truncated: output.stderr_capture_truncated,
+        stdout_preview_truncated: output.stdout_preview_truncated,
+        stderr_preview_truncated: output.stderr_preview_truncated,
+        filter: filter.map(|filter| AgentShellFilterInfo {
+            rule: filter.rule,
+            unfiltered_utf8_bytes: filter.unfiltered_utf8_bytes,
+            filtered_utf8_bytes: filter.filtered_utf8_bytes,
+        }),
+    };
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::Shell(output)))
+        .with_model_output(Some(model_text))
+        .with_error(is_error)
+}
+
+fn shell_status(output: &WorkcellShellOutput) -> String {
+    let mut statuses = Vec::new();
+    if output.timed_out {
+        statuses.push("timed out".into());
+    }
+    if output.output_limit_exceeded {
+        statuses.push("output limit exceeded".into());
+    }
+    if let Some(exit_code) = output.exit_code {
+        statuses.push(format!("exit code {exit_code}"));
+    } else if let Some(signal) = output.signal {
+        statuses.push(format!("signal {signal}"));
+    } else if statuses.is_empty() {
+        statuses.push("exit unknown".into());
+    }
+    format!("[shell status: {}]", statuses.join("; "))
 }
 
 fn code_result(execution: CodeExecution) -> ToolExecResult {
@@ -1814,6 +1867,7 @@ mod tests {
     use tempfile::TempDir;
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+    const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
 
     fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
         context_with_mode(
@@ -1868,6 +1922,103 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         host.register(&registry).expect("Workcell registration");
         (host, registry)
+    }
+
+    fn shell_output(exit_code: i32) -> WorkcellShellOutput {
+        WorkcellShellOutput {
+            version: 1,
+            kind: "shell",
+            relative_workdir: ".".into(),
+            timeout_ms: 120_000,
+            duration_ms: 10,
+            exit_code: Some(exit_code),
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 1,
+            stdout_utf8_bytes: 3,
+            stderr_utf8_bytes: 0,
+            stdout: "raw".into(),
+            stderr: String::new(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+        }
+    }
+
+    #[test]
+    fn shell_result_keeps_raw_output_and_surfaces_exit_status_to_the_model() {
+        let success = shell_result_parts(
+            shell_output(0),
+            "filtered\n[filtered: cargo]".into(),
+            Some(WorkcellShellFilterInfo {
+                rule: "cargo".into(),
+                unfiltered_utf8_bytes: 100,
+                filtered_utf8_bytes: 20,
+            }),
+        );
+        assert!(!success.is_error);
+        assert_eq!(
+            success.model_output.as_deref(),
+            Some("filtered\n[filtered: cargo]\n\n[shell status: exit code 0]")
+        );
+        let ToolOutput::Shell(output) = success.output.unwrap() else {
+            panic!("expected typed shell output");
+        };
+        assert_eq!(output.stdout, "raw");
+        assert_eq!(
+            output.model_text,
+            "filtered\n[filtered: cargo]\n\n[shell status: exit code 0]"
+        );
+        assert_eq!(output.filter.unwrap().rule, "cargo");
+
+        let failure = shell_result_parts(shell_output(101), "filtered".into(), None);
+        assert!(failure.is_error);
+        assert_eq!(
+            failure.model_output.as_deref(),
+            Some("filtered\n\n[shell status: exit code 101]")
+        );
+        assert!(matches!(
+            failure.output.as_ref().unwrap(),
+            ToolOutput::Shell(output) if output.filter.is_none()
+        ));
+    }
+
+    #[test]
+    fn no_rtk_disables_native_shell_output_filtering() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(root.path().join("Makefile"), FILTERABLE_MAKEFILE).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+
+        for (no_rtk, filtered) in [(false, true), (true, false)] {
+            let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+            ctx.config = caudra_config::RawConfig::default()
+                .into_config(no_rtk)
+                .unwrap()
+                .agent;
+            let entry = registry.get("shell").expect("registered shell");
+            let invocation = entry
+                .tool
+                .parse(&json!({"command": "make all"}))
+                .expect("valid shell input");
+            smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+            let result = smol::block_on(invocation.execute(&ctx));
+            let ToolOutput::Shell(output) = result.output.unwrap() else {
+                panic!("expected typed shell output");
+            };
+
+            assert_eq!(output.filter.is_some(), filtered);
+            assert_eq!(output.model_text.contains("Entering directory"), !filtered);
+            assert!(output.stdout.contains("Entering directory"));
+        }
     }
 
     #[test]

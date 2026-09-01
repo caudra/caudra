@@ -126,6 +126,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
 
 ### `provider`
 

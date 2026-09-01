@@ -18,10 +18,11 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{
-    LinkMap, should_truncate, text_to_painted, truncate_output, truncation_notice,
+    LinkMap, should_truncate, text_to_painted, truncate_output, truncate_output_tail,
+    truncation_notice,
 };
 use caudra_agent::{
-    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -110,6 +111,7 @@ pub struct ToolLines {
     /// Index of the first live-buffer snapshot line, recorded in the same
     /// pass that lays out `lines`, so click rows can never drift from them.
     pub snapshot_base: Option<usize>,
+    pub shell_toggle_line: Option<usize>,
     pub content_indent: &'static str,
     pub truncation: SectionFlags,
 }
@@ -142,6 +144,7 @@ impl HighlightRequest {
             | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
+            | ToolOutput::Shell(_)
             | ToolOutput::Batch { .. }
             | ToolOutput::Image { .. } => None,
         });
@@ -238,12 +241,21 @@ fn resolve_output<'a>(
     live_output: Option<&'a str>,
     pre_truncated: usize,
     limits: RenderLimits,
+    shell_raw: bool,
 ) -> ResolvedOutput<'a> {
     let full_text: Option<Cow<'a, str>> = match output {
         Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
             Some(Cow::Borrowed(t.text.as_str()))
         }
         Some(ToolOutput::Batch { text }) => Some(Cow::Borrowed(text.as_str())),
+        Some(ToolOutput::Shell(output)) => Some(if output.filter.is_some() && !shell_raw {
+            Cow::Borrowed(output.model_text.as_str())
+        } else {
+            match live_output {
+                Some(live) => Cow::Borrowed(live),
+                None => Cow::Owned(output.raw_text()),
+            }
+        }),
         _ => None,
     };
 
@@ -281,9 +293,14 @@ fn resolve_output<'a>(
         }
     };
 
+    let keep_tail = matches!(output, Some(ToolOutput::Shell(_)));
     let (text, skipped) = match raw_text {
         Some(t) if !t.is_empty() => {
-            let tr = truncate_output(&t, limits.output);
+            let tr = if keep_tail {
+                truncate_output_tail(&t, limits.output)
+            } else {
+                truncate_output(&t, limits.output)
+            };
             let s = if tr.skipped > 0 {
                 tr.skipped
             } else {
@@ -307,6 +324,7 @@ struct ToolLineBuilder {
     search_text: String,
     spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
+    shell_toggle_line: Option<usize>,
     content_range: (usize, usize),
     width: u16,
     truncation: SectionFlags,
@@ -329,6 +347,7 @@ impl ToolLineBuilder {
             search_text: String::new(),
             spinner_lines: Vec::new(),
             snapshot_base: None,
+            shell_toggle_line: None,
             content_range: (0, 0),
             width,
             truncation: SectionFlags::default(),
@@ -464,6 +483,32 @@ impl ToolLineBuilder {
         }
     }
 
+    fn push_shell_view_toggle(&mut self, output: &ShellOutput, shell_raw: bool) {
+        let Some(filter) = &output.filter else {
+            return;
+        };
+        let saved = filter
+            .unfiltered_utf8_bytes
+            .saturating_sub(filter.filtered_utf8_bytes);
+        let reduction = saved
+            .saturating_mul(100)
+            .checked_div(filter.unfiltered_utf8_bytes)
+            .unwrap_or(0);
+        let label = if shell_raw {
+            "raw output · click for filtered".to_owned()
+        } else {
+            format!(
+                "filtered · {} · {reduction}% smaller · click for raw",
+                filter.rule
+            )
+        };
+        self.shell_toggle_line = Some(self.lines.len());
+        self.lines.push(Line::from(Span::styled(
+            format!("  {label}"),
+            theme::current().tool_dim,
+        )));
+    }
+
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
         let indent = TOOL_BODY_INDENT.len() as u16;
@@ -533,6 +578,7 @@ impl ToolLineBuilder {
             highlight,
             spinner_lines: self.spinner_lines,
             snapshot_base: self.snapshot_base,
+            shell_toggle_line: self.shell_toggle_line,
             content_indent,
             truncation: self.truncation,
         }
@@ -725,8 +771,12 @@ pub fn build_tool_lines(
             msg.live_output.as_deref(),
             msg.truncated_lines,
             b.limits,
+            expanded.shell_raw,
         );
         b.push_resolved_output(&resolved);
+    }
+    if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
+        b.push_shell_view_toggle(output, expanded.shell_raw);
     }
     b.finish(
         msg.tool_input.clone(),
@@ -762,6 +812,7 @@ pub fn build_instructions_lines(
     let exp = SectionFlags {
         script: false,
         output: expanded,
+        shell_raw: false,
     };
     let mut b = ToolLineBuilder::new(
         width,
@@ -803,7 +854,9 @@ mod tests {
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
     use caudra_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
-    use caudra_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
+    use caudra_agent::{
+        ShellFilterInfo, SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput,
+    };
     use test_case::test_case;
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
@@ -818,6 +871,7 @@ mod tests {
         SectionFlags {
             script: both,
             output: both,
+            shell_raw: false,
         }
     }
 
@@ -840,6 +894,39 @@ mod tests {
 
     fn plain_output() -> Option<ToolOutput> {
         Some(ToolOutput::Plain("ok".into()))
+    }
+
+    fn shell_output(filtered: bool) -> ToolOutput {
+        ToolOutput::Shell(ShellOutput {
+            model_text: (1..=8)
+                .map(|line| format!("model_{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            relative_workdir: ".".into(),
+            timeout_ms: 120_000,
+            duration_ms: 10,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 8,
+            stdout_utf8_bytes: 47,
+            stderr_utf8_bytes: 0,
+            stdout: (1..=8)
+                .map(|line| format!("raw_{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            stderr: String::new(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+            filter: filtered.then(|| ShellFilterInfo {
+                rule: "cargo".into(),
+                unfiltered_utf8_bytes: 200,
+                filtered_utf8_bytes: 40,
+            }),
+        })
     }
 
     fn bash_msg(
@@ -907,6 +994,86 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn filtered_shell_output_defaults_to_model_view_and_can_switch_to_raw() {
+        let msg = bash_msg(
+            "cargo test",
+            ToolStatus::Success,
+            None,
+            Some(shell_output(true)),
+        );
+        let collapsed = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let filtered_expanded = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags {
+                output: true,
+                ..SectionFlags::default()
+            },
+        );
+        let raw_collapsed = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags {
+                shell_raw: true,
+                ..SectionFlags::default()
+            },
+        );
+        let raw_expanded = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags {
+                output: true,
+                shell_raw: true,
+                ..SectionFlags::default()
+            },
+        );
+        let collapsed_text = lines_text(&collapsed);
+
+        assert!(collapsed_text.contains("model_8"));
+        assert!(!collapsed_text.contains("model_1"));
+        assert!(!collapsed_text.contains("raw_8"));
+        assert!(collapsed_text.contains("filtered · cargo · 80% smaller · click for raw"));
+        assert!(collapsed.truncation.output);
+        assert!(collapsed.shell_toggle_line.is_some());
+        assert!(lines_text(&filtered_expanded).contains("model_1"));
+        assert!(lines_text(&raw_collapsed).contains("raw_8"));
+        assert!(!lines_text(&raw_collapsed).contains("raw_1"));
+        assert!(lines_text(&raw_collapsed).contains("raw output · click for filtered"));
+        assert!(lines_text(&raw_expanded).contains("raw_1"));
+        assert!(!lines_text(&raw_expanded).contains("model_1"));
+    }
+
+    #[test]
+    fn unfiltered_shell_output_omits_the_view_toggle() {
+        let msg = bash_msg(
+            "printf raw",
+            ToolStatus::Success,
+            None,
+            Some(shell_output(false)),
+        );
+        let lines = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&lines);
+
+        assert!(text.contains("raw_8"));
+        assert!(!text.contains("click for"));
+        assert!(!text.contains("model_8"));
+        assert!(lines.shell_toggle_line.is_none());
     }
 
     #[test_case(ToolStatus::InProgress, None           ; "live_streaming_shows_body")]
@@ -1196,6 +1363,7 @@ mod tests {
             SectionFlags {
                 script: false,
                 output: true,
+                shell_raw: false,
             },
         );
 
@@ -1488,14 +1656,14 @@ mod tests {
         expect_text: bool,
     ) {
         let limits = RenderLimits::new(SectionFlags::default(), TOL.get(tool));
-        let resolved = resolve_output(output.as_ref(), body, None, 0, limits);
+        let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
     }
 
     #[test]
     fn resolve_output_pre_truncated_forwarded() {
         let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
-        let resolved = resolve_output(None, Some("short"), None, 42, limits);
+        let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
     }
 
@@ -1503,7 +1671,7 @@ mod tests {
     fn resolve_output_truncation_overrides_pre_truncated() {
         let long = n_lines(200);
         let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
-        let resolved = resolve_output(None, Some(&long), None, 5, limits);
+        let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);
     }
 

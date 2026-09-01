@@ -127,6 +127,8 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 Execute a Bash command on the MCP server host.
 
+Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `command` | string | yes | Bash command to execute on the MCP server host. |

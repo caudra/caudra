@@ -58,9 +58,9 @@ pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
     GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine,
     IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, LuaToolProvenance,
-    NO_FILES_FOUND, QueueConsumedItem, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits,
-    ToolStartEvent, TurnCompleteEvent,
+    NO_FILES_FOUND, QueueConsumedItem, SharedBuf, ShellFilterInfo, ShellOutput, SnapshotLine,
+    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

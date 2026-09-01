@@ -6,7 +6,8 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use caudra_agent::{
-    GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    GrepFileEntry, GrepMatchGroup, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan,
+    SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -93,6 +94,53 @@ fn done(id: &str) -> ToolDoneEvent {
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    }
+}
+
+fn shell_done(id: &str, filtered: bool) -> ToolDoneEvent {
+    let output = ToolOutput::Shell(ShellOutput {
+        model_text: (1..=8)
+            .map(|line| format!("model_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        relative_workdir: ".".into(),
+        timeout_ms: 120_000,
+        duration_ms: 10,
+        exit_code: Some(0),
+        signal: None,
+        timed_out: false,
+        output_limit_exceeded: false,
+        final_sequence: 8,
+        stdout_utf8_bytes: 47,
+        stderr_utf8_bytes: 0,
+        stdout: (1..=8)
+            .map(|line| format!("raw_{line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        stderr: String::new(),
+        stdout_capture_truncated: false,
+        stderr_capture_truncated: false,
+        stdout_preview_truncated: false,
+        stderr_preview_truncated: false,
+        filter: filtered.then(|| ShellFilterInfo {
+            rule: "cargo".into(),
+            unfiltered_utf8_bytes: 200,
+            filtered_utf8_bytes: 40,
+        }),
+    });
+    ToolDoneEvent {
+        id: id.into(),
+        tool: "shell".into(),
+        output,
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1306,6 +1354,51 @@ fn toggle_expand_collapse_truncated_tool() {
     assert!(panel.toggle_expansion_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
+}
+
+#[test]
+fn completed_shell_output_toggles_between_filtered_and_raw_views() {
+    let mut panel = panel_with_tools(&[("t1", "shell")]);
+    panel.tool_done(shell_done("t1", true));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some("t1"))
+        .unwrap();
+    let toggle_line = segment.shell_toggle_line.unwrap() as u16;
+    let toggle_row = segment.chrome(80).content_start() + toggle_line;
+
+    assert!(seg_text(&panel, "t1").contains("model_8"));
+    assert!(!seg_text(&panel, "t1").contains("raw_8"));
+    assert!(panel.toggle_expansion_at(toggle_row, area));
+    render(&mut panel, 80, 24);
+    let text = seg_text(&panel, "t1");
+
+    assert!(text.contains("raw_8"));
+    assert!(!text.contains("model_8"));
+    assert!(text.contains("raw output · click for filtered"));
+}
+
+#[test]
+fn shell_live_output_uses_the_larger_running_budget_and_survives_completion() {
+    let mut panel = panel_with_tools(&[("t1", "shell")]);
+    let live = (0..20)
+        .map(|line| format!("entry_{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    panel.tool_output("t1", &live);
+    assert!(panel.messages[0].text.contains("entry_10"));
+    assert!(!panel.messages[0].text.contains("entry_7\n"));
+
+    panel.tool_done(shell_done("t1", false));
+    assert_eq!(
+        panel.messages[0].live_output.as_deref(),
+        Some(live.as_str())
+    );
 }
 
 #[test]
