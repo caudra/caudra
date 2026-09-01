@@ -332,6 +332,14 @@ impl StreamSynth {
         events
     }
 
+    fn thinking_boundary(&mut self) -> Vec<Value> {
+        if self.current_block == Some(BlockKind::Thinking) {
+            self.close_block().into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn tool_use(&mut self, model: &str, id: &str, name: &str, input_json: &str) -> Vec<Value> {
         let mut events = self.ensure_started(model);
         events.extend(self.close_block());
@@ -1627,6 +1635,12 @@ impl EventPump {
                     self.emit_stream(events)?;
                 }
             }
+            AgentEvent::ThinkingBoundary => {
+                if self.include_partial_messages {
+                    let events = self.synth.thinking_boundary();
+                    self.emit_stream(events)?;
+                }
+            }
             AgentEvent::ToolStart(ts) => {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
@@ -2328,6 +2342,23 @@ mod tests {
         assert_eq!(events[0]["index"], 0);
         assert_eq!(events[1]["index"], 1);
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+    }
+
+    #[test]
+    fn thinking_boundary_closes_the_block_before_the_next_summary() {
+        let mut synth = StreamSynth::new();
+        synth.thinking_delta(MODEL, "first");
+
+        let boundary = synth.thinking_boundary();
+        let second = synth.thinking_delta(MODEL, "second");
+
+        assert_eq!(types(&boundary), ["content_block_stop"]);
+        assert_eq!(
+            types(&second),
+            ["content_block_start", "content_block_delta"]
+        );
+        assert_eq!(second[0]["index"], 1);
+        assert_eq!(second[0]["content_block"]["type"], "thinking");
     }
 
     #[test]

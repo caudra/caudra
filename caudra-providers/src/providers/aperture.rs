@@ -484,6 +484,23 @@ impl Provider for Aperture {
         }
         apply_adjustments(model, &self.overrides);
     }
+
+    fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
+        let Some((provider_id, model_id)) = model.id.split_once('/') else {
+            return crate::ReasoningTransport::Other;
+        };
+        let ov = merged_override(&self.overrides, provider_id, model_id);
+        let Some(kind) = routed_kind(provider_id, &ov) else {
+            return crate::ReasoningTransport::Other;
+        };
+        let provider = build_routed_provider(
+            kind,
+            routed_auth(&self.auth, &path_prefix(Some(kind), &ov)),
+            self.timeouts,
+            self.system_prefix.clone(),
+        );
+        provider.reasoning_transport(&native_route_model(model, kind, model_id))
+    }
 }
 
 #[cfg(test)]

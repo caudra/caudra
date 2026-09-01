@@ -10,11 +10,12 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::providers::ResolvedAuth;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 const RESPONSES_PATH: &str = "/responses";
+pub(crate) const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 
 pub(crate) fn build_body(
     model: &Model,
@@ -29,6 +30,7 @@ pub(crate) fn build_body(
         "model": model.id,
         "instructions": system,
         "input": input,
+        "include": [ENCRYPTED_REASONING],
         "stream": true,
         "store": false,
     });
@@ -43,8 +45,9 @@ pub(crate) fn apply_responses_reasoning(
     thinking: &ThinkingConfig,
     model: &Model,
 ) {
+    body["reasoning"] = json!({ "summary": "auto" });
     if let Some(effort) = thinking.effort_str(model) {
-        body["reasoning"] = json!({ "effort": effort });
+        body["reasoning"]["effort"] = json!(effort);
     }
 }
 
@@ -90,10 +93,40 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
             Role::Assistant => {
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
+                let mut reasoning_items: Vec<(String, String, Vec<&str>)> = Vec::new();
 
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                        ContentBlock::Thinking {
+                            thinking,
+                            responses:
+                                Some(ResponsesReasoning {
+                                    item_id,
+                                    encrypted_content: Some(encrypted_content),
+                                }),
+                            ..
+                        } if !encrypted_content.is_empty() => {
+                            if let Some((_, stored_encrypted, summaries)) = reasoning_items
+                                .iter_mut()
+                                .find(|(stored_id, _, _)| stored_id == item_id)
+                            {
+                                encrypted_content.clone_into(stored_encrypted);
+                                if !thinking.is_empty() {
+                                    summaries.push(thinking);
+                                }
+                            } else {
+                                reasoning_items.push((
+                                    item_id.clone(),
+                                    encrypted_content.clone(),
+                                    if thinking.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![thinking]
+                                    },
+                                ));
+                            }
+                        }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
@@ -104,6 +137,18 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. } => {}
                     }
+                }
+
+                for (id, encrypted_content, summaries) in reasoning_items {
+                    input.push(json!({
+                        "type": "reasoning",
+                        "id": id,
+                        "summary": summaries
+                            .into_iter()
+                            .map(|text| json!({"type": "summary_text", "text": text}))
+                            .collect::<Vec<_>>(),
+                        "encrypted_content": encrypted_content,
+                    }));
                 }
 
                 if !text_parts.is_empty() {
@@ -202,6 +247,33 @@ struct ToolAccumulator {
     arguments: String,
 }
 
+struct ReasoningAccumulator {
+    item_id: Option<String>,
+    summary_index: u64,
+    text: String,
+    encrypted_content: Option<String>,
+}
+
+fn reasoning_accumulator<'a>(
+    reasoning: &'a mut Vec<ReasoningAccumulator>,
+    item_id: Option<&str>,
+    summary_index: u64,
+) -> &'a mut ReasoningAccumulator {
+    if let Some(position) = reasoning
+        .iter()
+        .position(|part| part.item_id.as_deref() == item_id && part.summary_index == summary_index)
+    {
+        return &mut reasoning[position];
+    }
+    reasoning.push(ReasoningAccumulator {
+        item_id: item_id.map(ToOwned::to_owned),
+        summary_index,
+        text: String::new(),
+        encrypted_content: None,
+    });
+    reasoning.last_mut().unwrap()
+}
+
 pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
@@ -210,7 +282,7 @@ pub(crate) async fn parse_sse(
     let mut lines = reader.lines();
 
     let mut text = String::new();
-    let mut reasoning_text = String::new();
+    let mut reasoning: Vec<ReasoningAccumulator> = Vec::new();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
@@ -289,7 +361,21 @@ pub(crate) async fn parse_sse(
                 let output_index = parsed["output_index"]
                     .as_u64()
                     .unwrap_or(tool_accumulators.len() as u64);
-                if item["type"].as_str() == Some("function_call") {
+                if item["type"].as_str() == Some("reasoning") {
+                    let item_id = item["id"].as_str();
+                    if reasoning.iter().any(|part| !part.text.is_empty())
+                        && !reasoning.iter().any(|part| {
+                            part.item_id.as_deref() == item_id && part.summary_index == 0
+                        })
+                    {
+                        event_tx.send_async(ProviderEvent::ThinkingBoundary).await?;
+                    }
+                    let part = reasoning_accumulator(&mut reasoning, item_id, 0);
+                    part.encrypted_content = item["encrypted_content"]
+                        .as_str()
+                        .filter(|content| !content.is_empty())
+                        .map(ToOwned::to_owned);
+                } else if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
                     if !name.is_empty() {
@@ -358,7 +444,49 @@ pub(crate) async fn parse_sse(
                     Err(_) => continue,
                 };
                 let item = &parsed["item"];
-                if item["type"].as_str() == Some("function_call") {
+                if item["type"].as_str() == Some("reasoning") {
+                    let item_id = item["id"].as_str();
+                    let encrypted_content = item["encrypted_content"]
+                        .as_str()
+                        .filter(|content| !content.is_empty())
+                        .map(ToOwned::to_owned);
+                    let summaries: Vec<_> = item["summary"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|summary| summary["text"].as_str())
+                        .collect();
+                    if summaries.is_empty() {
+                        let part = reasoning_accumulator(&mut reasoning, item_id, 0);
+                        if encrypted_content.is_some() {
+                            part.encrypted_content.clone_from(&encrypted_content);
+                        }
+                    } else {
+                        for (summary_index, summary) in summaries.into_iter().enumerate() {
+                            let part = reasoning_accumulator(
+                                &mut reasoning,
+                                item_id,
+                                summary_index as u64,
+                            );
+                            if part.text.is_empty() {
+                                part.text.push_str(summary);
+                            }
+                            if encrypted_content.is_some() {
+                                part.encrypted_content.clone_from(&encrypted_content);
+                            }
+                        }
+                    }
+                    if let Some(item_id) = item_id {
+                        for part in reasoning
+                            .iter_mut()
+                            .filter(|part| part.item_id.as_deref() == Some(item_id))
+                        {
+                            if encrypted_content.is_some() {
+                                part.encrypted_content.clone_from(&encrypted_content);
+                            }
+                        }
+                    }
+                } else if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
                     let arguments = if let Some(s) = item["arguments"].as_str() {
@@ -421,7 +549,19 @@ pub(crate) async fn parse_sse(
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
-                    reasoning_text.push_str(delta);
+                    let item_id = parsed["item_id"]
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .or_else(|| reasoning.last().and_then(|part| part.item_id.clone()));
+                    let summary_index = parsed["summary_index"].as_u64().unwrap_or_else(|| {
+                        reasoning
+                            .iter()
+                            .rposition(|part| part.item_id.as_deref() == item_id.as_deref())
+                            .map_or(0, |position| reasoning[position].summary_index)
+                    });
+                    reasoning_accumulator(&mut reasoning, item_id.as_deref(), summary_index)
+                        .text
+                        .push_str(delta);
                     event_tx
                         .send_async(ProviderEvent::ThinkingDelta {
                             text: delta.to_string(),
@@ -430,8 +570,28 @@ pub(crate) async fn parse_sse(
                 }
             }
 
-            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
-                reasoning_text.push_str("\n\n");
+            "response.reasoning_summary_part.added" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let item_id = parsed["item_id"].as_str();
+                let summary_index = parsed["summary_index"].as_u64().unwrap_or_else(|| {
+                    reasoning
+                        .iter()
+                        .filter(|part| part.item_id.as_deref() == item_id)
+                        .map(|part| part.summary_index)
+                        .max()
+                        .map_or(0, |index| index + 1)
+                });
+                if reasoning.iter().any(|part| !part.text.is_empty())
+                    && !reasoning.iter().any(|part| {
+                        part.item_id.as_deref() == item_id && part.summary_index == summary_index
+                    })
+                {
+                    event_tx.send_async(ProviderEvent::ThinkingBoundary).await?;
+                }
+                reasoning_accumulator(&mut reasoning, item_id, summary_index);
             }
 
             "response.completed" => {
@@ -497,8 +657,20 @@ pub(crate) async fn parse_sse(
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-    if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::thinking(reasoning_text, None));
+    for part in reasoning {
+        if part.text.is_empty() && part.encrypted_content.is_none() {
+            continue;
+        }
+        content_blocks.push(ContentBlock::Thinking {
+            thinking: part.text,
+            signature: None,
+            duration_ms: None,
+            interrupted: false,
+            responses: part.item_id.map(|item_id| ResponsesReasoning {
+                item_id,
+                encrypted_content: part.encrypted_content,
+            }),
+        });
     }
 
     if !text.is_empty() {
@@ -743,6 +915,32 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[3]["call_id"], "tc_1");
         assert_eq!(items[3]["output"], "file.txt");
+    }
+
+    #[test]
+    fn convert_input_replays_encrypted_reasoning_and_folds_summary_parts() {
+        let reasoning = |text: &str| ContentBlock::Thinking {
+            thinking: text.into(),
+            signature: None,
+            duration_ms: None,
+            interrupted: false,
+            responses: Some(ResponsesReasoning {
+                item_id: "rs_1".into(),
+                encrypted_content: Some("ciphertext".into()),
+            }),
+        };
+        let input = convert_input(&[Message {
+            role: Role::Assistant,
+            content: vec![reasoning("First"), reasoning("Second")],
+            ..Default::default()
+        }]);
+
+        assert_eq!(input.as_array().unwrap().len(), 1);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "ciphertext");
+        assert_eq!(input[0]["summary"][0]["text"], "First");
+        assert_eq!(input[0]["summary"][1]["text"], "Second");
     }
 
     #[test]
@@ -1059,12 +1257,86 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
+            let (resp, events) = run_sse(sse).await;
             let resp = resp.unwrap();
 
-            assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+            assert!(matches!(
+                &resp.message.content[0],
+                ContentBlock::Thinking { thinking, .. } if thinking == "First part"
+            ));
+            assert!(matches!(
+                &resp.message.content[1],
+                ContentBlock::Thinking { thinking, .. } if thinking == "Second part"
+            ));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, ProviderEvent::ThinkingBoundary))
+                    .count(),
+                1
             );
+        })
+    }
+
+    #[test]
+    fn parse_sse_preserves_encrypted_reasoning_without_exposing_it_as_text() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":null}}\n\
+\n\
+event: response.reasoning_summary_part.added\n\
+data: {\"item_id\":\"rs_1\",\"summary_index\":0}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"**Checking safety**\"}\n\
+\n\
+event: response.output_item.done\n\
+data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"**Checking safety**\"}],\"encrypted_content\":\"ciphertext\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+            let ContentBlock::Thinking {
+                thinking,
+                responses: Some(responses),
+                ..
+            } = &resp.message.content[0]
+            else {
+                panic!("expected reasoning block");
+            };
+            assert_eq!(thinking, "**Checking safety**");
+            assert_eq!(responses.item_id, "rs_1");
+            assert_eq!(responses.encrypted_content.as_deref(), Some("ciphertext"));
+            let public = serde_json::to_string(&resp.message).unwrap();
+            assert!(!public.contains("ciphertext"));
+        })
+    }
+
+    #[test]
+    fn parse_sse_treats_empty_encrypted_reasoning_as_unavailable() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.done\n\
+data: {\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Summary\"}],\"encrypted_content\":\"\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+            let (response, _) = run_sse(sse).await;
+            let response = response.unwrap();
+            let ContentBlock::Thinking {
+                responses: Some(responses),
+                ..
+            } = &response.message.content[0]
+            else {
+                panic!("expected reasoning block");
+            };
+            assert!(responses.encrypted_content.is_none());
         })
     }
 

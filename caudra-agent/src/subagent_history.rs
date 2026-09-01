@@ -570,6 +570,7 @@ mod tests {
                     |task_id| serde_json::json!({ "task_id": task_id }),
                 ),
                 thought_signature: None,
+                source: None,
             },
         };
         let versions = active_task_history_versions(&[
@@ -591,6 +592,7 @@ mod tests {
                 name: "batch".into(),
                 input: serde_json::json!({}),
                 thought_signature: None,
+                source: None,
             },
         };
         let state = serde_json::json!([{

@@ -24,7 +24,7 @@ use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
     truncate_output_tail,
 };
-use crate::provenance::Provenance;
+use crate::provenance::{LineProvenance, Provenance};
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
@@ -53,10 +53,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
-const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const THOUGHT_PREFIX: &str = "Thought";
 const THOUGHT_TITLE_FENCE: &str = "**";
-const THOUGHT_SUMMARY_CHARS: usize = 72;
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
@@ -175,7 +173,7 @@ impl MessagesPanel {
         Self {
             messages: Vec::new(),
             streaming_thinking: StreamingContent::new(
-                thinking.prefix,
+                "",
                 thinking.text_style,
                 thinking.prefix_style,
                 ms,
@@ -347,6 +345,11 @@ impl MessagesPanel {
         self.clear_hover();
         self.thinking_started.get_or_insert_with(Instant::now);
         self.streaming_thinking.push(text);
+    }
+
+    pub fn thinking_boundary(&mut self) {
+        self.clear_hover();
+        self.flush_thinking();
     }
 
     pub fn text_delta(&mut self, text: &str) {
@@ -975,7 +978,7 @@ impl MessagesPanel {
             Some(HoverTarget::CachedThinking(msg_index))
                 if segment.msg_index == Some(*msg_index) && segment.tool_id.is_none() =>
             {
-                Some(HoverFeedback::Affordance)
+                Some(HoverFeedback::Chrome)
             }
             Some(HoverTarget::Tool { id, feedback })
                 if segment.tool_id.as_deref() == Some(id.as_str()) =>
@@ -1011,6 +1014,18 @@ impl MessagesPanel {
             }
             let chrome = SegmentChrome::for_kind(kind, width, 0);
             let content_width = chrome.content_width(width);
+            if kind == SegmentKind::Thinking && !collapsed {
+                let (lines, links) = self.build_streaming_expanded_lines();
+                let height = wrapped_line_count(&lines, content_width) as u32;
+                if (block_start..block_start + height).contains(&doc_row) {
+                    let row = u16::try_from(doc_row - block_start).ok()?;
+                    let col = col.checked_sub(chrome.left)?;
+                    return links.target_at(&lines, content_width, row, col);
+                }
+                block_start = block_start.saturating_add(height);
+                has_previous = true;
+                continue;
+            }
             let lines = if collapsed {
                 None
             } else {
@@ -1320,6 +1335,7 @@ impl MessagesPanel {
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(!self.streaming_thinking.is_empty(), Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
@@ -1369,11 +1385,8 @@ impl MessagesPanel {
             self.cache.mark_all_width_stale();
             let thinking = thinking_style();
             let assistant = assistant_style();
-            self.streaming_thinking.set_style(
-                thinking.prefix,
-                thinking.text_style,
-                thinking.prefix_style,
-            );
+            self.streaming_thinking
+                .set_style("", thinking.text_style, thinking.prefix_style);
             self.streaming_text.set_style(
                 assistant.prefix,
                 assistant.text_style,
@@ -1398,6 +1411,7 @@ impl MessagesPanel {
         } else {
             Vec::new()
         };
+        let mut expanded_thinking = None;
 
         if thinking_collapsed {
             if cached_count > 0 || !streaming_heights.is_empty() {
@@ -1409,10 +1423,17 @@ impl MessagesPanel {
         } else if !self.streaming_thinking.is_empty() {
             let content_width =
                 SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
-            if self.streaming_thinking.update_render(content_width) {
+            self.streaming_thinking.tick();
+            let visible = self.streaming_thinking.visible().to_owned();
+            let body = reasoning_summary(&visible).body.to_owned();
+            if self
+                .streaming_thinking
+                .update_render_from(body, content_width)
+            {
                 self.clear_hover();
             }
-            let lines = self.streaming_thinking.cached_lines();
+            expanded_thinking = Some(self.build_streaming_expanded_lines());
+            let lines = &expanded_thinking.as_ref().unwrap().0;
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
@@ -1502,7 +1523,7 @@ impl MessagesPanel {
                 height_idx += 1;
                 if collapsed {
                     let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
-                        .then_some((HoverFeedback::Affordance, accent));
+                        .then_some((HoverFeedback::Chrome, accent));
                     cursor.render(
                         (&collapsed_thinking_lines, None),
                         h,
@@ -1515,14 +1536,26 @@ impl MessagesPanel {
                         frame,
                     );
                 } else {
-                    cursor.render(
-                        (sc.cached_lines(), Some(sc.links())),
-                        h,
-                        SegmentChrome::for_kind(kind, width, 0),
-                        (None, None),
-                        RenderFeedback::default(),
-                        frame,
-                    );
+                    if kind == SegmentKind::Thinking {
+                        let (lines, links) = expanded_thinking.as_ref().unwrap();
+                        cursor.render(
+                            (lines, Some(links)),
+                            h,
+                            SegmentChrome::for_kind(kind, width, 0),
+                            (None, None),
+                            RenderFeedback::default(),
+                            frame,
+                        );
+                    } else {
+                        cursor.render(
+                            (sc.cached_lines(), Some(sc.links())),
+                            h,
+                            SegmentChrome::for_kind(kind, width, 0),
+                            (None, None),
+                            RenderFeedback::default(),
+                            frame,
+                        );
+                    }
                 }
             }
         }
@@ -1864,13 +1897,29 @@ impl MessagesPanel {
     }
 
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        if self.compact {
-            return thought_line(
-                self.streaming_thinking.buffer(),
-                self.thinking_started.map(|started| started.elapsed()),
-            );
+        thought_line(
+            self.streaming_thinking.buffer(),
+            self.thinking_started.map(|started| started.elapsed()),
+            false,
+        )
+    }
+
+    fn build_streaming_expanded_lines(&self) -> (Vec<Line<'static>>, LinkMap) {
+        let mut lines = thought_line(
+            self.streaming_thinking.visible(),
+            self.thinking_started.map(|started| started.elapsed()),
+            false,
+        );
+        let mut links = LinkMap::none_for(&lines);
+        if !self.streaming_thinking.cached_lines().is_empty() {
+            lines.push(Line::from(""));
+            links.rows.push(Vec::new());
+            lines.extend_from_slice(self.streaming_thinking.cached_lines());
+            links
+                .rows
+                .extend(self.streaming_thinking.links().rows.iter().cloned());
         }
-        thinking_indicator(self.streaming_thinking.line_count())
+        (lines, links)
     }
 
     fn build_cached_thinking_indicator(
@@ -1878,10 +1927,7 @@ impl MessagesPanel {
         text: &str,
         duration: Option<Duration>,
     ) -> Vec<Line<'static>> {
-        if self.compact {
-            return thought_line(text, duration);
-        }
-        thinking_indicator(logical_line_count(text))
+        thought_line(text, duration, true)
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
@@ -1923,33 +1969,30 @@ impl MessagesPanel {
     }
 
     fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
-        let Some((text, collapsed, duration)) = self
-            .messages
-            .get(msg_idx)
-            .map(|m| (m.text.clone(), m.thinking_collapsed, m.thinking_duration))
-        else {
+        let Some(message) = self.messages.get(msg_idx).cloned() else {
             return;
         };
-        let (lines, links) = if collapsed {
-            let lines = self.build_cached_thinking_indicator(&text, duration);
+        let (lines, links, provenance, diagrams, search_text) = if message.thinking_collapsed {
+            let lines =
+                self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
             let links = LinkMap::none_for(&lines);
-            (lines, links)
-        } else {
-            let style = thinking_style();
-            let content_width =
-                SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
-            let (painted, _) = text_to_painted(
-                &text,
-                style.prefix,
-                style.text_style,
-                style.prefix_style,
-                content_width,
+            (
+                lines,
+                links,
                 None,
                 Vec::new(),
-            );
-            (painted.lines, painted.links)
+                format!("thinking> {}", message.text),
+            )
+        } else {
+            let built = build_message_lines(&message, width, self.pans_for(msg_idx));
+            (
+                built.lines,
+                built.links,
+                built.provenance,
+                built.diagrams,
+                built.search_text,
+            )
         };
-        let search_text = format!("thinking> {text}");
         let seg_idx = self
             .cache
             .segments()
@@ -1959,6 +2002,8 @@ impl MessagesPanel {
         if let Some(seg) = self.cache.get_mut(seg_idx) {
             seg.set_lines(lines);
             seg.set_links(links);
+            seg.set_provenance(provenance);
+            seg.set_diagrams(diagrams);
             seg.search_text = search_text;
         }
     }
@@ -2247,57 +2292,105 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
     }
 }
 
-/// Two-line thinking indicator: a header (`thinking> ...`) followed by a
-/// `(N lines) (click to expand)` footer. Shared by the streaming and cached
-/// views when `show_thinking` is off.
-fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
+fn thought_line(text: &str, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
     let theme = theme::current();
-    vec![
-        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
-        Line::from(vec![
-            Span::styled(format!("({line_count} lines) "), theme.tool_dim),
-            Span::styled("(click to expand)", theme.thinking),
-        ]),
-    ]
-}
-
-/// The compact form: `Thought: <summary> · 9.7s`, or `Thinking` while the
-/// block is still arriving and has no summary to show yet.
-fn thought_line(text: &str, duration: Option<Duration>) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    let mut spans = vec![Span::styled(THOUGHT_PREFIX, theme.thinking)];
-    if let Some(summary) = reasoning_summary(text) {
-        spans.push(Span::styled(format!(": {summary}"), theme.thinking));
+    let summary = reasoning_summary(text);
+    let label = if done { THOUGHT_PREFIX } else { "Thinking" };
+    let header_style = if done {
+        theme.thinking
+    } else {
+        theme.todo_in_progress
+    };
+    let mut spans = Vec::new();
+    if !done && let Some(duration) = duration {
+        spans.push(Span::styled(
+            spinner_str(duration.as_millis()),
+            theme.spinner,
+        ));
+    }
+    spans.push(Span::styled(label, header_style));
+    if let Some(title) = summary.title {
+        spans.push(Span::styled(format!(": {title}"), header_style));
     }
     if let Some(duration) = duration {
         spans.push(Span::styled(
-            format!(" · {}", format_thought_duration(duration)),
+            format!(
+                " · {}",
+                if done {
+                    format_thought_duration(duration)
+                } else {
+                    format_live_thinking_duration(duration)
+                }
+            ),
             theme.tool_dim,
         ));
     }
     vec![Line::from(spans)]
 }
 
-/// Reasoning summaries from the OpenAI Responses API open with a bolded
-/// title (`**Weighing options**\n\n…`); everything else gets its first
-/// non-empty line. Either way the result is one clause, not a paragraph.
-fn reasoning_summary(text: &str) -> Option<String> {
-    let first = text
-        .trim_start()
-        .lines()
-        .find(|line| !line.trim().is_empty())?;
-    let summary = first
-        .trim()
-        .trim_start_matches(THOUGHT_TITLE_FENCE)
-        .trim_end_matches(THOUGHT_TITLE_FENCE)
-        .trim();
-    if summary.is_empty() {
-        return None;
+fn format_live_thinking_duration(duration: Duration) -> String {
+    let tenths = duration.as_millis() / 100;
+    let seconds = tenths / 10;
+    if seconds < u128::from(SECONDS_PER_MINUTE) {
+        format!("{}.{}s", seconds, tenths % 10)
+    } else {
+        format!(
+            "{}m {}.{}s",
+            seconds / u128::from(SECONDS_PER_MINUTE),
+            seconds % u128::from(SECONDS_PER_MINUTE),
+            tenths % 10
+        )
     }
-    Some(match summary.char_indices().nth(THOUGHT_SUMMARY_CHARS) {
-        Some((cut, _)) => format!("{}…", &summary[..cut]),
-        None => summary.to_owned(),
-    })
+}
+
+struct ReasoningSummary<'a> {
+    title: Option<&'a str>,
+    body: &'a str,
+}
+
+fn reasoning_summary(text: &str) -> ReasoningSummary<'_> {
+    let content = text.trim();
+    let Some(after_open) = content.strip_prefix(THOUGHT_TITLE_FENCE) else {
+        return ReasoningSummary {
+            title: None,
+            body: content,
+        };
+    };
+    let Some(close) = after_open.find(THOUGHT_TITLE_FENCE) else {
+        return ReasoningSummary {
+            title: None,
+            body: content,
+        };
+    };
+    let title = &after_open[..close];
+    let title = title.trim();
+    if title.is_empty()
+        || title
+            .chars()
+            .any(|character| matches!(character, '*' | '\n' | '\r'))
+    {
+        return ReasoningSummary {
+            title: None,
+            body: content,
+        };
+    }
+    let suffix = &after_open[close + THOUGHT_TITLE_FENCE.len()..];
+    let body = if suffix.is_empty() {
+        ""
+    } else if let Some(body) = suffix.strip_prefix("\r\n\r\n") {
+        body.trim_end()
+    } else if let Some(body) = suffix.strip_prefix("\n\n") {
+        body.trim_end()
+    } else {
+        return ReasoningSummary {
+            title: None,
+            body: content,
+        };
+    };
+    ReasoningSummary {
+        title: Some(title),
+        body,
+    }
 }
 
 fn format_thought_duration(duration: Duration) -> String {
@@ -2314,14 +2407,6 @@ fn format_thought_duration(duration: Duration) -> String {
         duration.as_secs() / SECONDS_PER_MINUTE,
         duration.as_secs() % SECONDS_PER_MINUTE
     )
-}
-
-fn logical_line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.bytes().filter(|&b| b == b'\n').count() + 1
-    }
 }
 
 fn segment_kind(role: &DisplayRole) -> SegmentKind {
@@ -2359,6 +2444,9 @@ fn segment_styles(kind: SegmentKind, accent: Color) -> (Option<Style>, Option<St
 /// messages) so both paths produce identical segments.
 fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
     let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
+    if matches!(msg.role, DisplayRole::Thinking) {
+        return build_thinking_lines(msg, width, diagram_pans);
+    }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
@@ -2454,6 +2542,50 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         provenance,
         diagrams,
         links,
+    }
+}
+
+fn build_thinking_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
+    let summary = reasoning_summary(&msg.text);
+    let mut lines = thought_line(&msg.text, msg.thinking_duration, true);
+    let mut links = LinkMap::none_for(&lines);
+    let mut provenance = None;
+    let mut diagrams = Vec::new();
+    if !summary.body.is_empty() {
+        let style = thinking_style();
+        let (painted, parsed) = text_to_painted(
+            summary.body,
+            "",
+            style.text_style,
+            style.prefix_style,
+            width,
+            style.max_line_bytes,
+            diagram_pans,
+        );
+        lines.push(Line::from(""));
+        links.rows.push(Vec::new());
+        lines.extend(painted.lines);
+        links.rows.extend(painted.links.rows);
+        diagrams = painted
+            .diagrams
+            .into_iter()
+            .map(|mut diagram| {
+                diagram.rows = diagram.rows.start + 2..diagram.rows.end + 2;
+                diagram
+            })
+            .collect();
+        let mut painted_provenance = Vec::with_capacity(painted.provenance.len() + 2);
+        painted_provenance.push(LineProvenance::chrome(lines[0].spans.len()));
+        painted_provenance.push(LineProvenance::chrome(0));
+        painted_provenance.extend(painted.provenance);
+        provenance = Some(Provenance::new(parsed, painted_provenance));
+    }
+    BuiltMessage {
+        lines,
+        links,
+        provenance,
+        diagrams,
+        search_text: format!("thinking> {}", msg.text),
     }
 }
 

@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use caudra_providers::{ContentBlock, Message, Role};
+use caudra_providers::{
+    ContentBlock, Message, Model, ReasoningTransport, ResponsesReasoning, Role,
+};
 use serde_json::Value;
 
 use crate::tools::{TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME};
@@ -106,6 +108,111 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
     Cow::Owned(projected)
 }
 
+pub fn project_for_target<'a>(
+    messages: &'a [Message],
+    tools: &Value,
+    model: &Model,
+    transport: ReasoningTransport,
+) -> Cow<'a, [Message]> {
+    let projected = project(messages, tools);
+    if !projected
+        .iter()
+        .any(|message| reasoning_requires_lowering(message, model, transport))
+    {
+        return projected;
+    }
+
+    let mut lowered = projected.into_owned();
+    for message in &mut lowered {
+        if reasoning_requires_lowering(message, model, transport) {
+            lower_reasoning(message);
+        }
+    }
+    Cow::Owned(lowered)
+}
+
+fn reasoning_requires_lowering(
+    message: &Message,
+    model: &Model,
+    transport: ReasoningTransport,
+) -> bool {
+    if !matches!(message.role, Role::Assistant)
+        || !message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            ) || matches!(
+                block,
+                ContentBlock::ToolUse {
+                    thought_signature: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        return false;
+    }
+    message.content.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Thinking {
+                interrupted: true,
+                ..
+            }
+        ) || matches!(
+            block,
+            ContentBlock::Thinking {
+                responses: Some(ResponsesReasoning {
+                    encrypted_content,
+                    ..
+                }),
+                ..
+            } if encrypted_content.as_deref().is_none_or(str::is_empty)
+        ) || (transport == ReasoningTransport::OpenAiResponses
+            && matches!(
+                block,
+                ContentBlock::Thinking {
+                    responses: None,
+                    ..
+                }
+            ))
+    }) || !message
+        .reasoning_source
+        .as_ref()
+        .is_some_and(|source| source.matches(model, transport))
+}
+
+fn lower_reasoning(message: &mut Message) {
+    let mut content = Vec::with_capacity(message.content.len());
+    for block in message.content.drain(..) {
+        match block {
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                content.push(ContentBlock::Text { text: thinking });
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature: _,
+            } => content.push(ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature: None,
+            }),
+            block => content.push(block),
+        }
+    }
+    if content.is_empty() {
+        content.push(ContentBlock::Text {
+            text: caudra_providers::EMPTY_RESPONSE_MARKER.into(),
+        });
+    }
+    message.content = content;
+    message.reasoning_source = None;
+}
+
 fn has_tool(tools: &Value, name: &str) -> bool {
     tools.as_array().is_some_and(|definitions| {
         definitions
@@ -144,6 +251,10 @@ mod tests {
     use caudra_storage::tool_outputs::ToolOutputRef;
 
     use super::*;
+
+    fn anthropic_model() -> Model {
+        Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+    }
 
     fn tools(include_read: bool) -> Value {
         if include_read {
@@ -216,6 +327,160 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn exact_target_preserves_native_reasoning() {
+        let model = anthropic_model();
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::thinking(
+                "private chain".into(),
+                Some("signature".into()),
+            )],
+            ..Default::default()
+        };
+        message.reasoning_source = Some(caudra_providers::ReasoningSource::new(
+            &model,
+            ReasoningTransport::AnthropicMessages,
+        ));
+
+        let messages = [message];
+        let projected = project_for_target(
+            &messages,
+            &tools(false),
+            &model,
+            ReasoningTransport::AnthropicMessages,
+        );
+        assert!(matches!(
+            &projected[0].content[0],
+            ContentBlock::Thinking {
+                signature: Some(signature),
+                ..
+            } if signature == "signature"
+        ));
+    }
+
+    #[test]
+    fn different_target_lowers_visible_reasoning_and_drops_private_fields() {
+        let source_model = anthropic_model();
+        let target_model = Model::from_spec("openai/gpt-5.5").unwrap();
+        let mut thinking = ContentBlock::thinking("visible summary".into(), Some("secret".into()));
+        let ContentBlock::Thinking { responses, .. } = &mut thinking else {
+            unreachable!();
+        };
+        *responses = Some(caudra_providers::ResponsesReasoning {
+            item_id: "rs_1".into(),
+            encrypted_content: Some("ciphertext".into()),
+        });
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                thinking,
+                ContentBlock::RedactedThinking {
+                    data: "opaque".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: Some("tool-secret".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        message.reasoning_source = Some(caudra_providers::ReasoningSource::new(
+            &source_model,
+            ReasoningTransport::AnthropicMessages,
+        ));
+
+        let messages = [message];
+        let projected = project_for_target(
+            &messages,
+            &tools(false),
+            &target_model,
+            ReasoningTransport::OpenAiResponses,
+        );
+        assert!(matches!(
+            &projected[0].content[..],
+            [
+                ContentBlock::Text { text },
+                ContentBlock::ToolUse {
+                    thought_signature: None,
+                    ..
+                }
+            ] if text == "visible summary"
+        ));
+        assert!(projected[0].reasoning_source.is_none());
+    }
+
+    #[test]
+    fn interrupted_reasoning_is_lowered_even_for_the_same_target() {
+        let model = anthropic_model();
+        let mut thinking = ContentBlock::thinking("partial".into(), Some("signature".into()));
+        let ContentBlock::Thinking { interrupted, .. } = &mut thinking else {
+            unreachable!();
+        };
+        *interrupted = true;
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![thinking],
+            ..Default::default()
+        };
+        message.reasoning_source = Some(caudra_providers::ReasoningSource::new(
+            &model,
+            ReasoningTransport::AnthropicMessages,
+        ));
+
+        let messages = [message];
+        let projected = project_for_target(
+            &messages,
+            &tools(false),
+            &model,
+            ReasoningTransport::AnthropicMessages,
+        );
+        assert!(matches!(
+            &projected[0].content[..],
+            [ContentBlock::Text { text }] if text == "partial"
+        ));
+    }
+
+    #[test]
+    fn responses_reasoning_without_usable_ciphertext_is_lowered() {
+        let model = Model::from_spec("openai/gpt-5.4").unwrap();
+        for encrypted_content in [None, Some(String::new())] {
+            let mut message = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "visible summary".into(),
+                    signature: None,
+                    duration_ms: None,
+                    interrupted: false,
+                    responses: Some(ResponsesReasoning {
+                        item_id: "rs_1".into(),
+                        encrypted_content,
+                    }),
+                }],
+                ..Default::default()
+            };
+            message.reasoning_source = Some(caudra_providers::ReasoningSource::new(
+                &model,
+                ReasoningTransport::OpenAiResponses,
+            ));
+
+            let messages = [message];
+            let projected = project_for_target(
+                &messages,
+                &tools(false),
+                &model,
+                ReasoningTransport::OpenAiResponses,
+            );
+
+            assert!(matches!(
+                &projected[0].content[..],
+                [ContentBlock::Text { text }] if text == "visible summary"
+            ));
+        }
     }
 
     #[test]

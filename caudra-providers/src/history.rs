@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::types::{ContentBlock, EMPTY_RESPONSE_MARKER, ImageSource, Message, MessageKind, Role};
+use crate::types::{
+    ContentBlock, EMPTY_RESPONSE_MARKER, ImageSource, Message, MessageKind, ReasoningSource,
+    ResponsesReasoning, Role,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryItem {
@@ -66,9 +69,13 @@ pub enum HistoryItemKind {
         signature: Option<String>,
         redacted: bool,
         interrupted: bool,
-        /// Dropped by `project_group`, so it never reaches a provider.
+        /// Host-only on `ContentBlock`, so provider serializers cannot emit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ReasoningSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        responses: Option<ResponsesReasoning>,
     },
     ToolCall {
         call_id: String,
@@ -76,6 +83,8 @@ pub enum HistoryItemKind {
         input: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ReasoningSource>,
     },
     ToolResult {
         call_id: String,
@@ -418,7 +427,7 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
                 last_tool_result = Some(kinds.len() - 1);
                 result_indexes.push((tool_use_id.clone(), kinds.len() - 1));
             }
-            other => kinds.push(assistant_kind(other, false)),
+            other => kinds.push(assistant_kind(other, false, None)),
         }
     }
     if !pending_images.is_empty() {
@@ -448,7 +457,7 @@ fn expand_user_content(message: &Message, origin: UserOrigin) -> Vec<HistoryItem
                         origin,
                     ));
                 }
-                kinds.push(assistant_kind(other, false));
+                kinds.push(assistant_kind(other, false, None));
             }
         }
     }
@@ -473,11 +482,7 @@ fn user_kind(
 }
 
 fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
-    let padding = message.display_text.is_none()
-        && matches!(
-            message.content.as_slice(),
-            [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER
-        );
+    let padding = message.is_empty_padding();
     if message.content.is_empty() {
         return vec![HistoryItemKind::AssistantText {
             text: String::new(),
@@ -490,7 +495,7 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
     let mut kinds: Vec<_> = message
         .content
         .iter()
-        .map(|block| assistant_kind(block, padding))
+        .map(|block| assistant_kind(block, padding, message.reasoning_source.as_ref()))
         .collect();
     if let Some(HistoryItemKind::AssistantText {
         retained_output_refs,
@@ -508,7 +513,11 @@ fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
     kinds
 }
 
-fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
+fn assistant_kind(
+    block: &ContentBlock,
+    padding: bool,
+    source: Option<&ReasoningSource>,
+) -> HistoryItemKind {
     match block {
         ContentBlock::Text { text } => HistoryItemKind::AssistantText {
             text: text.clone(),
@@ -525,12 +534,16 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
             thinking,
             signature,
             duration_ms,
+            interrupted,
+            responses,
         } => HistoryItemKind::Reasoning {
             text: thinking.clone(),
             signature: signature.clone(),
             redacted: false,
-            interrupted: false,
+            interrupted: *interrupted,
             duration_ms: *duration_ms,
+            source: source.cloned(),
+            responses: responses.clone(),
         },
         ContentBlock::RedactedThinking { data } => HistoryItemKind::Reasoning {
             text: data.clone(),
@@ -538,6 +551,8 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
             redacted: true,
             interrupted: false,
             duration_ms: None,
+            source: source.cloned(),
+            responses: None,
         },
         ContentBlock::ToolUse {
             id,
@@ -549,6 +564,7 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
             name: name.clone(),
             input: input.clone(),
             thought_signature: thought_signature.clone(),
+            source: thought_signature.as_ref().and(source).cloned(),
         },
         ContentBlock::ToolResult {
             tool_use_id,
@@ -768,16 +784,26 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 text,
                 signature,
                 redacted,
-                ..
+                interrupted,
+                duration_ms,
+                source,
+                responses,
             } => {
+                if source.is_some() {
+                    message.reasoning_source = source.clone();
+                }
                 if *redacted {
                     message
                         .content
                         .push(ContentBlock::RedactedThinking { data: text.clone() });
                 } else {
-                    message
-                        .content
-                        .push(ContentBlock::thinking(text.clone(), signature.clone()));
+                    message.content.push(ContentBlock::Thinking {
+                        thinking: text.clone(),
+                        signature: signature.clone(),
+                        duration_ms: *duration_ms,
+                        interrupted: *interrupted,
+                        responses: responses.clone(),
+                    });
                 }
             }
             HistoryItemKind::ToolCall {
@@ -785,12 +811,18 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 name,
                 input,
                 thought_signature,
-            } => message.content.push(ContentBlock::ToolUse {
-                id: call_id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-                thought_signature: thought_signature.clone(),
-            }),
+                source,
+            } => {
+                if source.is_some() {
+                    message.reasoning_source = source.clone();
+                }
+                message.content.push(ContentBlock::ToolUse {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    thought_signature: thought_signature.clone(),
+                });
+            }
             HistoryItemKind::ToolResult {
                 call_id,
                 content,
@@ -886,6 +918,8 @@ mod tests {
                     thinking: "inspect".into(),
                     signature: Some("reasoning-signature".into()),
                     duration_ms: Some(REASONING_DURATION_MS),
+                    interrupted: false,
+                    responses: None,
                 },
                 ContentBlock::Text {
                     text: "calling tool".into(),
@@ -1003,6 +1037,8 @@ mod tests {
                 thinking: "weighing options".into(),
                 signature: None,
                 duration_ms: Some(REASONING_DURATION_MS),
+                interrupted: false,
+                responses: None,
             }],
             ..Default::default()
         };
@@ -1022,10 +1058,61 @@ mod tests {
         assert!(matches!(
             &projected[0].content[0],
             ContentBlock::Thinking {
-                duration_ms: None,
+                duration_ms: Some(REASONING_DURATION_MS),
                 ..
             }
         ));
+        assert!(
+            serde_json::to_value(&projected[0]).unwrap()["content"][0]
+                .get("duration_ms")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reasoning_source_and_responses_state_round_trip_only_through_history() {
+        let source = ReasoningSource {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            transport: crate::ReasoningTransport::OpenAiResponses,
+        };
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "**Checking safety**".into(),
+                signature: None,
+                duration_ms: Some(REASONING_DURATION_MS),
+                interrupted: false,
+                responses: Some(ResponsesReasoning {
+                    item_id: "rs_1".into(),
+                    encrypted_content: Some("ciphertext".into()),
+                }),
+            }],
+            reasoning_source: Some(source.clone()),
+            ..Default::default()
+        };
+
+        let persisted = serde_json::to_value(expand_message(&message, None)).unwrap();
+        assert_eq!(persisted[0]["source"]["transport"], "open_ai_responses");
+        assert_eq!(persisted[0]["responses"]["encrypted_content"], "ciphertext");
+
+        let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
+        let projected = project_messages(&items).unwrap();
+        assert_eq!(projected[0].reasoning_source.as_ref(), Some(&source));
+        assert!(matches!(
+            &projected[0].content[0],
+            ContentBlock::Thinking {
+                responses: Some(ResponsesReasoning {
+                    item_id,
+                    encrypted_content: Some(encrypted_content),
+                }),
+                ..
+            } if item_id == "rs_1" && encrypted_content == "ciphertext"
+        ));
+
+        let public = serde_json::to_string(&projected[0]).unwrap();
+        assert!(!public.contains("ciphertext"));
+        assert!(!public.contains("reasoning_source"));
     }
 
     #[test]
@@ -1244,6 +1331,8 @@ mod tests {
                 redacted: false,
                 interrupted: true,
                 duration_ms: None,
+                source: None,
+                responses: None,
             },
             assistant_group,
             None,
@@ -1254,6 +1343,7 @@ mod tests {
                 name: TOOL_NAME.into(),
                 input: json!({}),
                 thought_signature: None,
+                source: None,
             },
             assistant_group,
             Some(reasoning.id),
@@ -1264,6 +1354,7 @@ mod tests {
                 name: TOOL_NAME.into(),
                 input: json!({}),
                 thought_signature: None,
+                source: None,
             },
             assistant_group,
             Some(first_call.id),

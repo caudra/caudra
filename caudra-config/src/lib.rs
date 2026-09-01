@@ -1044,8 +1044,8 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
-        default = true,
-        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+        default = false,
+        desc = "Show full model reasoning live and persisted. By default, reasoning is collapsed behind a Thinking or Thought header that can be clicked to expand"
     )]
     pub show_thinking: bool,
 
@@ -1084,7 +1084,7 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
-            show_thinking: f.show_thinking.unwrap_or(true),
+            show_thinking: f.show_thinking.unwrap_or(false),
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(false),
             theme: f.theme,
@@ -3445,10 +3445,10 @@ mod tests {
     }
 
     #[test]
-    fn show_thinking_missing_defaults_true() {
+    fn show_thinking_missing_defaults_false() {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(false).unwrap();
-        assert!(config.ui.show_thinking);
+        assert!(!config.ui.show_thinking);
     }
 
     #[test_case(true; "enabled")]

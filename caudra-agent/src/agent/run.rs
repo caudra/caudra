@@ -8,7 +8,8 @@ use tracing::{error, info, warn};
 use caudra_providers::model_registry::CompactionTarget;
 use caudra_providers::provider::Provider;
 use caudra_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, RequestOptions, Role, StopReason,
+    StreamResponse, TokenUsage,
 };
 
 use super::compaction;
@@ -410,10 +411,14 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         let tools = self.request_tools();
-        let provider_history =
-            provider_projection::project(self.history.as_slice(), tools.as_ref());
+        let provider_history = provider_projection::project_for_target(
+            self.history.as_slice(),
+            tools.as_ref(),
+            &self.model,
+            self.provider.reasoning_transport(&self.model),
+        );
         let provider_history = repair_tool_pairs(provider_history);
-        let response = match stream_with_retry(
+        let mut response = match stream_with_retry(
             &*self.provider,
             &self.model,
             provider_history.as_ref(),
@@ -430,14 +435,38 @@ impl<'h> Agent<'h> {
                 self.reauth_attempts = 0;
                 r
             }
-            Err(StreamError::Cancelled { streamed }) => {
+            Err(StreamError::Cancelled {
+                streamed,
+                reasoning,
+            }) => {
                 let streamed = streamed.trim_end();
+                let mut content: Vec<_> =
+                    reasoning
+                        .into_iter()
+                        .filter(|run| !run.text.is_empty())
+                        .map(|run| ContentBlock::Thinking {
+                            thinking: run.text,
+                            signature: None,
+                            duration_ms: Some(
+                                run.duration.as_millis().min(u128::from(u64::MAX)) as u64
+                            ),
+                            interrupted: true,
+                            responses: None,
+                        })
+                        .collect();
                 if !streamed.is_empty() {
+                    content.push(ContentBlock::Text {
+                        text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                    });
+                }
+                if !content.is_empty() {
                     self.history.push(Message {
                         role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
-                        }],
+                        content,
+                        reasoning_source: Some(caudra_providers::ReasoningSource::new(
+                            &self.model,
+                            self.provider.reasoning_transport(&self.model),
+                        )),
                         ..Default::default()
                     });
                 }
@@ -483,9 +512,23 @@ impl<'h> Agent<'h> {
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
+            let has_reasoning = response.message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                )
+            });
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+            } else if has_reasoning {
+                response.message.content.push(ContentBlock::Text {
+                    text: EMPTY_RESPONSE_MARKER.into(),
+                });
+                self.history.push(response.message);
+                if stop_reason != Some(StopReason::MaxTokens) && self.recover_stalled_turn(false)? {
+                    return Ok(TurnOutcome::Continue);
+                }
+            } else if self.recover_stalled_turn(true)? {
                 return Ok(TurnOutcome::Continue);
             }
 
@@ -722,12 +765,15 @@ impl<'h> Agent<'h> {
         })
     }
 
-    /// The turn came back without text, so [`Message::empty_marker`] takes its
-    /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    /// Returns true when the model was nudged to try again. A wholly empty
+    /// response needs assistant padding; retained reasoning already occupies
+    /// that turn and must not be followed by another assistant message.
+    fn recover_stalled_turn(&mut self, pad_empty_response: bool) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
+        if pad_empty_response {
+            self.history.push(Message::empty_marker());
+        }
         if !nudge {
             return Ok(false);
         }
@@ -1029,6 +1075,7 @@ mod tests {
     #[derive(Default)]
     struct StubStreamProvider {
         delta: Option<&'static str>,
+        delta_is_thinking: bool,
         cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
         fail_status: Option<u16>,
     }
@@ -1046,8 +1093,12 @@ mod tests {
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
-                    ptx.send(ProviderEvent::TextDelta { text: text.into() })
-                        .unwrap();
+                    let event = if self.delta_is_thinking {
+                        ProviderEvent::ThinkingDelta { text: text.into() }
+                    } else {
+                        ProviderEvent::TextDelta { text: text.into() }
+                    };
+                    ptx.send(event).unwrap();
                 }
                 if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
                     trigger.cancel();
@@ -1896,6 +1947,73 @@ mod tests {
                 matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
                 "kept text must carry the truncation note so the model never resumes it"
             );
+        });
+    }
+
+    #[test]
+    fn cancel_mid_stream_keeps_partial_reasoning_as_interrupted() {
+        const PARTIAL: &str = "partial reasoning";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                delta_is_thinking: true,
+                cancel_after_delta: Mutex::new(Some(trigger)),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
+            let partial = &history.as_slice()[history.len() - 2];
+            assert!(matches!(
+                &partial.content[0],
+                ContentBlock::Thinking {
+                    thinking,
+                    interrupted: true,
+                    duration_ms: Some(_),
+                    ..
+                } if thinking == PARTIAL
+            ));
+            assert!(partial.reasoning_source.is_some());
+        });
+    }
+
+    #[test]
+    fn reasoning_only_max_tokens_response_is_retained_before_continuation() {
+        smol::block_on(async {
+            let reasoning = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::thinking("summary".into(), None)],
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::MaxTokens),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![reasoning, text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            assert!(history.as_slice().iter().any(|message| {
+                message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "summary"),
+                )
+            }));
         });
     }
 

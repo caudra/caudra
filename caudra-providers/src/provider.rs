@@ -32,7 +32,10 @@ use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
 use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
-use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, ReasoningTransport, RequestOptions,
+    StreamResponse,
+};
 
 const STATIC_FALLBACK_NOTE: &str = "using static fallback";
 const NO_FALLBACK_NOTE: &str = "no models listed";
@@ -288,6 +291,10 @@ pub trait Provider: Send + Sync {
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
+
+    fn reasoning_transport(&self, _model: &Model) -> ReasoningTransport {
+        ReasoningTransport::Other
+    }
 }
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

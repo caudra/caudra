@@ -321,6 +321,14 @@ impl Provider for CustomOpenAiProvider {
         let auth = self.auth.lock().unwrap().clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
     }
+
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        if self.protocol == Protocol::OpenaiResponses {
+            crate::ReasoningTransport::OpenAiResponses
+        } else {
+            crate::ReasoningTransport::Other
+        }
+    }
 }
 
 #[cfg(test)]

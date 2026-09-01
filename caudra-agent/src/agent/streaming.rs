@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
 use caudra_providers::{
-    ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse,
+    ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions, StreamResponse,
 };
 use caudra_storage::id::SessionRef;
 use serde_json::Value;
@@ -33,7 +33,13 @@ fn canonicalize_tool_names(message: &mut Message) {
 /// deltas, in emission order.
 struct ForwardedStream {
     streamed: String,
-    reasoning: Vec<Duration>,
+    reasoning: Vec<ForwardedReasoning>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ForwardedReasoning {
+    pub(crate) text: String,
+    pub(crate) duration: Duration,
 }
 
 /// Only Anthropic's SSE parser exposes reasoning block boundaries, so the
@@ -46,12 +52,17 @@ async fn forward_provider_events(
 ) -> ForwardedStream {
     let mut streamed = String::new();
     let mut reasoning = Vec::new();
+    let mut reasoning_text = String::new();
     let mut run_started: Option<Instant> = None;
     while let Ok(pe) = prx.recv_async().await {
-        if matches!(pe, ProviderEvent::ThinkingDelta { .. }) {
+        if let ProviderEvent::ThinkingDelta { text } = &pe {
             run_started.get_or_insert_with(Instant::now);
+            reasoning_text.push_str(text);
         } else if let Some(started) = run_started.take() {
-            reasoning.push(started.elapsed());
+            reasoning.push(ForwardedReasoning {
+                text: std::mem::take(&mut reasoning_text),
+                duration: started.elapsed(),
+            });
         }
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
@@ -59,6 +70,7 @@ async fn forward_provider_events(
                 AgentEvent::TextDelta { text }
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
+            ProviderEvent::ThinkingBoundary => AgentEvent::ThinkingBoundary,
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
                 id,
                 name: canonical_tool_name(&name).to_owned(),
@@ -78,7 +90,10 @@ async fn forward_provider_events(
         }
     }
     if let Some(started) = run_started {
-        reasoning.push(started.elapsed());
+        reasoning.push(ForwardedReasoning {
+            text: reasoning_text,
+            duration: started.elapsed(),
+        });
     }
     ForwardedStream {
         streamed,
@@ -86,15 +101,18 @@ async fn forward_provider_events(
     }
 }
 
-/// Providers append thinking blocks in the order their deltas arrive, so the
-/// n-th timed run belongs to the n-th thinking block. A mismatch leaves the
-/// extra blocks untimed rather than mispairing them.
+/// Providers append visible thinking blocks in the order their deltas arrive.
+/// Opaque blocks have no deltas, so they must not consume a timed run.
 fn attach_reasoning_durations(message: &mut Message, durations: &[Duration]) {
     let blocks = message
         .content
         .iter_mut()
         .filter_map(|block| match block {
-            ContentBlock::Thinking { duration_ms, .. } => Some(duration_ms),
+            ContentBlock::Thinking {
+                thinking,
+                duration_ms,
+                ..
+            } if !thinking.is_empty() => Some(duration_ms),
             _ => None,
         })
         .take(durations.len());
@@ -109,7 +127,10 @@ fn attach_reasoning_durations(message: &mut Message, durations: &[Duration]) {
 /// attempt's text (`stream_reset`), and history must agree with the view.
 #[derive(Debug)]
 pub(crate) enum StreamError {
-    Cancelled { streamed: String },
+    Cancelled {
+        streamed: String,
+        reasoning: Vec<ForwardedReasoning>,
+    },
     Other(AgentError),
 }
 
@@ -218,11 +239,21 @@ async fn stream_with_retry_inner(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
-                attach_reasoning_durations(&mut r.message, &reasoning);
+                let durations: Vec<_> = reasoning.iter().map(|run| run.duration).collect();
+                attach_reasoning_durations(&mut r.message, &durations);
+                r.message.reasoning_source = Some(ReasoningSource::new(
+                    model,
+                    provider.reasoning_transport(model),
+                ));
                 emit_api_request(model, &r, opts, started.elapsed());
                 return Ok(r);
             }
-            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
+            Err(AgentError::Cancelled) => {
+                return Err(StreamError::Cancelled {
+                    streamed,
+                    reasoning,
+                });
+            }
             Err(e) if e.is_retryable() => {
                 emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
                 if e.should_rotate_key()
@@ -253,6 +284,7 @@ async fn stream_with_retry_inner(
                 if cancel.is_cancelled() {
                     return Err(StreamError::Cancelled {
                         streamed: String::new(),
+                        reasoning: Vec::new(),
                     });
                 }
             }
@@ -350,7 +382,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: (0..blocks)
-                .map(|_| ContentBlock::thinking(String::new(), None))
+                .map(|index| ContentBlock::thinking(format!("reasoning {index}"), None))
                 .chain([ContentBlock::Text { text: "hi".into() }])
                 .collect(),
             ..Default::default()
@@ -385,6 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn opaque_thinking_does_not_consume_a_visible_duration() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::thinking(String::new(), None),
+                ContentBlock::thinking("visible".into(), None),
+            ],
+            ..Default::default()
+        };
+
+        attach_reasoning_durations(&mut message, &[Duration::from_millis(42)]);
+
+        assert_eq!(thinking_durations(&message), [None, Some(42)]);
+    }
+
+    #[test]
     fn thinking_runs_are_timed_separately_and_flushed_at_stream_end() {
         let (tx, rx) = flume::unbounded();
         for event in [
@@ -400,6 +448,30 @@ mod tests {
         let forwarded = smol::block_on(forward_provider_events(rx, None));
         assert_eq!(forwarded.streamed, "x");
         assert_eq!(forwarded.reasoning.len(), 2);
+        assert_eq!(forwarded.reasoning[0].text, "ab");
+        assert_eq!(forwarded.reasoning[1].text, "c");
+    }
+
+    #[test]
+    fn provider_reasoning_boundary_splits_streamed_blocks() {
+        let (tx, rx) = flume::unbounded();
+        for event in [
+            ProviderEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            ProviderEvent::ThinkingBoundary,
+            ProviderEvent::ThinkingDelta {
+                text: "second".into(),
+            },
+        ] {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+
+        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        assert_eq!(forwarded.reasoning.len(), 2);
+        assert_eq!(forwarded.reasoning[0].text, "first");
+        assert_eq!(forwarded.reasoning[1].text, "second");
     }
 
     #[test]

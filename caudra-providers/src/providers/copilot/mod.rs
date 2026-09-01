@@ -1175,6 +1175,21 @@ impl Provider for Copilot {
         })
     }
 
+    fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
+        let endpoint = self
+            .models
+            .lock()
+            .unwrap()
+            .get(&model.id)
+            .map(CopilotModel::endpoint)
+            .unwrap_or_else(|| guess_endpoint(&model.id));
+        match endpoint {
+            Endpoint::Messages => crate::ReasoningTransport::AnthropicMessages,
+            Endpoint::Responses => crate::ReasoningTransport::OpenAiResponses,
+            Endpoint::ChatCompletions => crate::ReasoningTransport::OpenAiChatCompletions,
+        }
+    }
+
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             *self.auth.lock().unwrap() = None;
@@ -1378,7 +1393,10 @@ mod tests {
         let model = Model::from_spec("copilot/gpt-5.4").unwrap();
         let mut body = json!({});
         responses::apply_responses_reasoning(&mut body, &thinking, &model);
-        assert_eq!(body, json!({"reasoning": {"effort": expected}}));
+        assert_eq!(
+            body,
+            json!({"reasoning": {"effort": expected, "summary": "auto"}})
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 

@@ -686,6 +686,10 @@ impl Provider for Bedrock {
         })
     }
 
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        crate::ReasoningTransport::AnthropicMessages
+    }
+
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let new_auth = resolve_bedrock_auth()?;

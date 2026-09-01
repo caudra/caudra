@@ -78,7 +78,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
 | `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
-| `show_thinking` | bool | `true` | - | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `show_thinking` | bool | `false` | - | - | Show full model reasoning live and persisted. By default, reasoning is collapsed behind a Thinking or Thought header that can be clicked to expand |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `update_check` | bool | `false` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Caudra makes no such request unless you turn this on |
 

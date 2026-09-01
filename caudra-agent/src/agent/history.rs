@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use caudra_providers::{
-    CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, HistoryItem, HistoryItemKind,
+    CaudraId, ContentBlock, HistoryItem, HistoryItemKind,
     HistoryProjectionError, Message, Role, expand_message, project_messages,
 };
 use caudra_storage::sessions::next_epoch;
@@ -464,9 +464,7 @@ fn is_system_padding(m: &Message) -> bool {
 /// text verbatim writes a real message, and it has to break the nudge streak
 /// like any other.
 fn is_empty_marker(m: &Message) -> bool {
-    matches!(m.role, Role::Assistant)
-        && m.display_text.is_none()
-        && matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
+    m.is_empty_padding()
 }
 
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
@@ -1092,7 +1090,7 @@ mod tests {
         vec![
             Message::empty_marker(),
             Message::synthetic("nudge".into()),
-            Message::user(EMPTY_RESPONSE_MARKER.into()),
+            Message::user(caudra_providers::EMPTY_RESPONSE_MARKER.into()),
         ],
         0
         ; "user_typing_the_marker_text_resets_streak"

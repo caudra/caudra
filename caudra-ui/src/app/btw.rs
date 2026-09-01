@@ -60,10 +60,12 @@ impl App {
 
         // Mirrors what the live request puts on the wire, so the provider can reuse the cached
         // prefix instead of re-reading the whole history as fresh input tokens.
-        let mut messages = match caudra_agent::project_for_provider(&messages, &prompt.tools) {
-            Cow::Borrowed(_) => messages,
-            Cow::Owned(projected) => projected,
-        };
+        let transport = provider.reasoning_transport(&model);
+        let mut messages =
+            match caudra_agent::project_for_target(&messages, &prompt.tools, &model, transport) {
+                Cow::Borrowed(_) => messages,
+                Cow::Owned(projected) => projected,
+            };
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
         caudra_agent::close_dangling_tool_calls(&mut messages, caudra_agent::UNAVAILABLE_RESULT);

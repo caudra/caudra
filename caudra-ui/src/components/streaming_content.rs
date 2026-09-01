@@ -184,10 +184,6 @@ impl StreamingContent {
         self.typewriter.buffer()
     }
 
-    pub fn line_count(&self) -> usize {
-        self.typewriter.buffer_line_count()
-    }
-
     pub fn is_animating(&self) -> bool {
         self.typewriter.is_animating()
     }
@@ -206,9 +202,21 @@ impl StreamingContent {
 
     pub fn update_render(&mut self, width: u16) -> bool {
         self.typewriter.tick();
+        self.update_render_from(self.typewriter.visible().to_owned(), width)
+    }
+
+    pub fn tick(&mut self) {
+        self.typewriter.tick();
+    }
+
+    pub fn visible(&self) -> &str {
+        self.typewriter.visible()
+    }
+
+    pub fn update_render_from(&mut self, visible: String, width: u16) -> bool {
         self.cache.get_or_update_with_links(
             &mut self.renderer,
-            self.typewriter.visible(),
+            &visible,
             self.prefix,
             (self.text_style, self.prefix_style),
             width,

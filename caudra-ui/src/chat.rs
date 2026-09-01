@@ -209,6 +209,7 @@ impl Chat {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.thinking_delta(&text);
             }
+            AgentEvent::ThinkingBoundary => self.messages_panel.thinking_boundary(),
             AgentEvent::TextDelta { text } => {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.text_delta(&text);
@@ -684,8 +685,9 @@ fn history_to_display_with_project(
                 text,
                 redacted: false,
                 duration_ms,
+                responses,
                 ..
-            } if !text.is_empty() => {
+            } if !text.is_empty() || responses.is_some() => {
                 let mut message = DisplayMessage::new(DisplayRole::Thinking, text.clone());
                 message.source = Some(DisplaySource::Reasoning(item.id));
                 message.thinking_duration = duration_ms.map(Duration::from_millis);
@@ -1811,6 +1813,31 @@ mod tests {
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
         assert_eq!(display[1].role, DisplayRole::Assistant);
+    }
+
+    #[test]
+    fn history_to_display_keeps_opaque_reasoning_as_a_title_only_block() {
+        let mut reasoning = ContentBlock::thinking(String::new(), None);
+        let ContentBlock::Thinking { responses, .. } = &mut reasoning else {
+            unreachable!();
+        };
+        *responses = Some(caudra_providers::ResponsesReasoning {
+            item_id: "rs_1".into(),
+            encrypted_content: Some("ciphertext".into()),
+        });
+        let display = display_messages(
+            &[Message {
+                role: Role::Assistant,
+                content: vec![reasoning],
+                ..Default::default()
+            }],
+            &HashMap::new(),
+        )
+        .0;
+
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::Thinking);
+        assert!(display[0].text.is_empty());
     }
 
     const RESTORE_OUTPUT: &str = "rendered output";

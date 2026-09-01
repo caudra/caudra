@@ -24,8 +24,6 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "xAI",
 };
 
-const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
-
 pub struct Xai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -120,17 +118,21 @@ fn apply_grok_reasoning(body: &mut Value, opts: &RequestOptions, model: &Model) 
     if !model.supports_thinking() {
         return;
     }
+    body["reasoning"] = json!({ "summary": "auto" });
     if let Some(effort) = opts.thinking.effort_str(model) {
-        body["reasoning"] = json!({ "effort": effort });
+        body["reasoning"]["effort"] = json!(effort);
     }
     let include = body["include"].as_array_mut();
     match include {
         Some(arr) => {
-            if !arr.iter().any(|v| v.as_str() == Some(ENCRYPTED_REASONING)) {
-                arr.push(json!(ENCRYPTED_REASONING));
+            if !arr
+                .iter()
+                .any(|v| v.as_str() == Some(responses::ENCRYPTED_REASONING))
+            {
+                arr.push(json!(responses::ENCRYPTED_REASONING));
             }
         }
-        None => body["include"] = json!([ENCRYPTED_REASONING]),
+        None => body["include"] = json!([responses::ENCRYPTED_REASONING]),
     }
 }
 
@@ -204,6 +206,14 @@ impl Provider for Xai {
             })
             .await
         })
+    }
+
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        if self.is_oauth() {
+            crate::ReasoningTransport::OpenAiResponses
+        } else {
+            crate::ReasoningTransport::OpenAiChatCompletions
+        }
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -328,7 +338,20 @@ mod tests {
             &model,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
-        assert_eq!(body["include"][0], ENCRYPTED_REASONING);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["include"][0], responses::ENCRYPTED_REASONING);
+    }
+
+    #[test]
+    fn grok_reasoning_without_effort_still_requests_summary() {
+        let model = test_model(true);
+        let mut body = json!({"model": "grok-4.6"});
+
+        apply_grok_reasoning(&mut body, &RequestOptions::default(), &model);
+
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_eq!(body["include"][0], responses::ENCRYPTED_REASONING);
     }
 
     #[test]

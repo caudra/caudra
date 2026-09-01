@@ -182,6 +182,14 @@ impl Provider for LocalEndpoint {
         })
     }
 
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
+            crate::ReasoningTransport::OpenAiResponses
+        } else {
+            crate::ReasoningTransport::Other
+        }
+    }
+
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
             Ok(self.key_pool.as_ref().is_some_and(|p| {

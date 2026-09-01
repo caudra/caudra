@@ -825,6 +825,7 @@ pub enum AgentEvent {
     ThinkingDelta {
         text: String,
     },
+    ThinkingBoundary,
     ToolPending {
         id: String,
         name: String,

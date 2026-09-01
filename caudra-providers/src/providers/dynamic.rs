@@ -815,6 +815,10 @@ impl Provider for DynamicProvider {
         })
     }
 
+    fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
+        self.inner.reasoning_transport(model)
+    }
+
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(self.refresh_gate.refresh(self.script_path, &self.auth))
     }

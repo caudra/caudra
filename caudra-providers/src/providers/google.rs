@@ -315,6 +315,10 @@ impl Provider for Google {
             }))
         })
     }
+
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        crate::ReasoningTransport::GeminiGenerateContent
+    }
 }
 
 fn convert_messages(messages: &[Message]) -> Vec<Value> {

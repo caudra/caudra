@@ -157,6 +157,10 @@ pub enum ContentBlock {
         /// to, so anything not skipped here lands in the request body.
         #[serde(skip)]
         duration_ms: Option<u64>,
+        #[serde(skip)]
+        interrupted: bool,
+        #[serde(skip)]
+        responses: Option<ResponsesReasoning>,
     },
     RedactedThinking {
         data: String,
@@ -193,8 +197,51 @@ impl ContentBlock {
             thinking,
             signature,
             duration_ms: None,
+            interrupted: false,
+            responses: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningTransport {
+    AnthropicMessages,
+    GeminiGenerateContent,
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningSource {
+    pub provider: String,
+    pub model: String,
+    pub transport: ReasoningTransport,
+}
+
+impl ReasoningSource {
+    pub fn new(model: &Model, transport: ReasoningTransport) -> Self {
+        Self {
+            provider: model.provider.to_string(),
+            model: model.id.clone(),
+            transport,
+        }
+    }
+
+    pub fn matches(&self, model: &Model, transport: ReasoningTransport) -> bool {
+        self.provider == model.provider.as_ref()
+            && self.model == model.id
+            && self.transport == transport
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponsesReasoning {
+    pub item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
 }
 
 /// Who a message came from, which `role` cannot say. Providers only
@@ -240,6 +287,9 @@ pub struct Message {
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+    /// Host-only producer identity used to gate provider-private replay.
+    #[serde(skip)]
+    pub reasoning_source: Option<ReasoningSource>,
     /// One call ID per trailing tool-result image, in image order. This is
     /// runtime projection metadata and must never reach provider wires or
     /// legacy persisted messages.
@@ -257,9 +307,8 @@ pub struct Message {
 }
 
 impl Message {
-    /// Stands in for an assistant turn with no text, thinking alone or empty,
-    /// which providers reject as the trailing message. Never a real response:
-    /// readers mining history for model text must skip it.
+    /// Stands in for an assistant turn with no visible text. Never a real
+    /// response: readers mining history for model text must skip it.
     pub fn empty_marker() -> Self {
         Self {
             role: Role::Assistant,
@@ -268,6 +317,21 @@ impl Message {
             }],
             ..Default::default()
         }
+    }
+
+    pub fn is_empty_padding(&self) -> bool {
+        let Some((last, reasoning)) = self.content.split_last() else {
+            return false;
+        };
+        matches!(self.role, Role::Assistant)
+            && self.display_text.is_none()
+            && matches!(last, ContentBlock::Text { text } if text == EMPTY_RESPONSE_MARKER)
+            && reasoning.iter().all(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                )
+            })
     }
 
     /// Something the host saw, reported to the model without pretending
@@ -384,6 +448,7 @@ pub enum ProviderEvent {
     ThinkingDelta {
         text: String,
     },
+    ThinkingBoundary,
     ToolUseStart {
         id: String,
         name: String,
@@ -438,11 +503,12 @@ impl StopReason {
 
 pub const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<effort level>|<token budget>]";
 
-/// First Claude version that speaks adaptive thinking. Opus got there a
-/// generation early, at 4.7; the other families joined at 5.
-const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
-const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+/// Claude 4.6 introduced adaptive thinking for Opus and Sonnet; every family
+/// uses it from 4.7 onward.
+const ADAPTIVE_SINCE: (u32, u32) = (4, 7);
+const EARLY_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
 const OPUS: &str = "opus";
+const SONNET: &str = "sonnet";
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
 /// Copilot writes the version with a dot, hence the two separators. Legacy ids
@@ -676,7 +742,7 @@ impl ThinkingConfig {
                     .rsplit('/')
                     .next()
                     .is_some_and(|id| id.starts_with("claude-"))
-                    && !Self::requires_adaptive(&model.id) =>
+                    && !Self::supports_adaptive(&model.id) =>
             {
                 Err(ThinkingCompatibilityError::AdaptiveUnsupported)
             }
@@ -700,14 +766,16 @@ impl ThinkingConfig {
     /// budget, and the ones that take both get both.
     pub fn apply_to_body(&self, body: &mut Value, model: &Model) {
         let resolved = self.resolve(model);
-        if Self::requires_adaptive(&model.id) {
+        if Self::supports_adaptive(&model.id) && !matches!(resolved, ResolvedThinking::Budget(_)) {
             if !resolved.is_enabled() {
                 return;
             }
-            // These models default `display` to "omitted", so thinking arrives
-            // empty and tool calls pop up out of nowhere in the UI. Asking for
-            // the summary back costs nothing: thinking tokens bill the same.
-            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+            body["thinking"] = json!({"type": "adaptive"});
+            // Claude 4.6 defaults to summaries. Newer models default to
+            // omitted, so ask for the same summary explicitly.
+            if Self::omits_adaptive_thinking(&model.id) {
+                body["thinking"]["display"] = json!("summarized");
+            }
             if let ResolvedThinking::Effort(level) = resolved {
                 body["output_config"]["effort"] = json!(level);
             }
@@ -730,18 +798,15 @@ impl ThinkingConfig {
         }
     }
 
-    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
-    /// version check, not an allowlist, so future releases and new families
-    /// work automatically.
-    fn requires_adaptive(model_id: &str) -> bool {
+    fn supports_adaptive(model_id: &str) -> bool {
         claude_version(model_id).is_some_and(|(family, version)| {
-            version
-                >= if family == OPUS {
-                    ADAPTIVE_SINCE_OPUS
-                } else {
-                    ADAPTIVE_SINCE
-                }
+            version >= ADAPTIVE_SINCE
+                || (version >= EARLY_ADAPTIVE_VERSION && matches!(family, OPUS | SONNET))
         })
+    }
+
+    fn omits_adaptive_thinking(model_id: &str) -> bool {
+        claude_version(model_id).is_some_and(|(_, version)| version >= ADAPTIVE_SINCE)
     }
 
     /// The level to send, or `None` when this model has none to name and its
@@ -1137,6 +1202,9 @@ mod tests {
     #[test_case(ThinkingConfig::Off, "claude-opus-4-5", json!({}) ; "off")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-5", json!({"thinking": {"type": "adaptive"}}) ; "adaptive")]
     #[test_case(ThinkingConfig::Budget(2048), "claude-opus-4-5", json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}) ; "budget_legacy_in_range")]
+    #[test_case(ThinkingConfig::Adaptive, "claude-sonnet-4-6", json!({"thinking": {"type": "adaptive"}}) ; "sonnet_4_6_uses_summarized_adaptive_default")]
+    #[test_case(effort("high"), "claude-opus-4-6", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "opus_4_6_uses_summarized_adaptive_default")]
+    #[test_case(ThinkingConfig::Budget(2048), "claude-sonnet-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}) ; "sonnet_4_6_explicit_budget_stays_budgeted")]
     #[test_case(ThinkingConfig::Off, "claude-opus-4-7", json!({}) ; "off_adaptive_model")]
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
     #[test_case(effort("low"), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
@@ -1251,6 +1319,8 @@ mod tests {
     fn thinking_resolve_exact_requires_native_adaptive_support_for_claude() {
         let old_claude = thinking_model("claude-haiku-4-5");
         let legacy_claude = thinking_model("claude-3-7-sonnet-20250219");
+        let early_adaptive_claude = thinking_model("claude-sonnet-4-6");
+        let unsupported_early_family = thinking_model("claude-haiku-4-6");
         let adaptive_claude = thinking_model("claude-opus-4-7");
 
         assert_eq!(
@@ -1260,6 +1330,14 @@ mod tests {
         assert_eq!(
             ThinkingConfig::Adaptive.resolve_exact(&legacy_claude),
             Err(ThinkingCompatibilityError::AdaptiveUnsupported)
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&unsupported_early_family),
+            Err(ThinkingCompatibilityError::AdaptiveUnsupported)
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.resolve_exact(&early_adaptive_claude),
+            Ok(ResolvedThinking::On)
         );
         assert_eq!(
             ThinkingConfig::Adaptive.resolve_exact(&adaptive_claude),

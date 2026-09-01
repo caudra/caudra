@@ -829,6 +829,7 @@ data: [DONE]\n";
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
                     ProviderEvent::PromptProgress { .. } => {}
+                    ProviderEvent::ThinkingBoundary => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);

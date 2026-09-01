@@ -266,7 +266,7 @@ pub fn run(
                     result_text.push_str(text);
                 }
             }
-            AgentEvent::ThinkingDelta { .. } => {}
+            AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBoundary => {}
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }

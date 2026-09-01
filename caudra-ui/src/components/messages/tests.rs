@@ -15,6 +15,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 use test_case::test_case;
 
+const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
         spans: vec![SnapshotSpan {
@@ -598,11 +600,11 @@ const THINKING_TEXT: &str = "a long chain of reasoning";
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
 const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Only `view` advances a typewriter, and collapsed thinking is never drawn,
-/// so its reveal can never finish. Believing it would hold the loop at full
-/// frame rate for as long as the model reasons.
+/// Only `view` advances a typewriter, and collapsed thinking does not draw its
+/// body. Its lifecycle header still needs the lower spinner cadence for the
+/// glyph and elapsed timer.
 #[test_case(true  => Cadence::SMOOTH ; "expanded_thinking_reveals")]
-#[test_case(false => Cadence::IDLE   ; "collapsed_thinking_reveals_nothing")]
+#[test_case(false => Cadence::SPINNER ; "collapsed_thinking_spins")]
 fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence {
     let config = UiConfig {
         show_thinking,
@@ -1195,6 +1197,29 @@ fn select_all_omits_the_role_prefix() {
     let area = Rect::new(0, 0, 80, 24);
     let sel = make_sel(area, (0, 0), (0, 79));
     assert_eq!(panel.extract_selection_text(&sel, area), "plain text");
+}
+
+#[test]
+fn expanded_reasoning_selection_uses_body_markdown_provenance() {
+    const BODY: &str = "# Review\n\nUse **care**.";
+    const WIDTH: u16 = 80;
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        format!("**Inspecting**\n\n{BODY}"),
+    ));
+    render(&mut panel, WIDTH, 20);
+    let area = Rect::new(0, 0, WIDTH, 20);
+    let total = panel.segment_heights().iter().sum::<u16>();
+    let sel = make_sel(area, (0, 0), (u32::from(total), WIDTH - 1));
+
+    assert_eq!(panel.extract_selection_text(&sel, area), BODY);
 }
 
 /// Partial selections stay literal for verbatim spans, so dragging over part
@@ -2402,20 +2427,12 @@ fn hide_collapses_streaming_thinking() {
     );
     panel
         .streaming_thinking
-        .set_buffer("line one\nline two\nline three");
+        .set_buffer("**Reviewing changes**\n\nline one\nline two\nline three");
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("thinking> ..."),
-        "collapsed view should show hint; got: {text}"
-    );
-    assert!(
-        text.contains("3 lines"),
-        "should show live line counter; got: {text}"
-    );
-    assert!(
-        text.contains("click to expand"),
-        "should hint click-to-expand; got: {text}"
+        text.contains("Thinking: Reviewing changes"),
+        "collapsed view should show the active reasoning header; got: {text}"
     );
     assert!(
         !text.contains("line one"),
@@ -2470,16 +2487,8 @@ fn hide_keeps_cached_thinking_as_indicator() {
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("thinking> ..."),
-        "cached thinking should persist as an indicator, not hide; got: {text}"
-    );
-    assert!(
-        text.contains("(1 lines)"),
-        "footer always shows the line count; got: {text}"
-    );
-    assert!(
-        text.contains("click to expand"),
-        "footer should hint click-to-expand; got: {text}"
+        text.contains("Thought"),
+        "cached thinking should persist as a lifecycle header; got: {text}"
     );
     assert!(
         !text.contains("reasoning here"),
@@ -2488,7 +2497,7 @@ fn hide_keeps_cached_thinking_as_indicator() {
 }
 
 #[test]
-fn cached_collapsed_thinking_hover_reverses_only_its_affordance() {
+fn cached_collapsed_thinking_header_responds_to_hover() {
     let mut panel = MessagesPanel::new(
         UiConfig {
             show_thinking: false,
@@ -2505,20 +2514,11 @@ fn cached_collapsed_thinking_hover_reverses_only_its_affordance() {
     let terminal = render(&mut panel, area.width, area.height);
 
     assert!(matches!(panel.hover, Some(HoverTarget::CachedThinking(0))));
-    assert!(
-        style_of(&terminal, EXPAND_AFFORDANCE)
-            .add_modifier
-            .contains(Modifier::REVERSED)
-    );
-    assert!(
-        !style_of(&terminal, THINKING_HIDDEN_HEADER)
-            .add_modifier
-            .contains(Modifier::REVERSED)
-    );
+    assert!(buffer_text(&terminal).contains("Thought"));
 }
 
 #[test]
-fn streaming_collapsed_thinking_hover_reverses_its_affordance() {
+fn streaming_collapsed_thinking_header_responds_to_hover() {
     let mut panel = MessagesPanel::new(
         UiConfig {
             show_thinking: false,
@@ -2536,11 +2536,7 @@ fn streaming_collapsed_thinking_hover_reverses_its_affordance() {
     let terminal = render(&mut panel, area.width, area.height);
 
     assert!(matches!(panel.hover, Some(HoverTarget::StreamingThinking)));
-    assert!(
-        style_of(&terminal, EXPAND_AFFORDANCE)
-            .add_modifier
-            .contains(Modifier::REVERSED)
-    );
+    assert!(buffer_text(&terminal).contains("Thinking"));
 }
 
 #[test]
@@ -2563,15 +2559,48 @@ fn transcript_hover_clears_explicitly_and_on_scroll_or_layout_change() {
 }
 
 #[test]
-fn full_default_renders_streaming_thinking() {
+fn default_collapses_streaming_thinking() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_thinking.set_buffer("visible reasoning");
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("visible reasoning"),
-        "default config renders reasoning; got: {text}"
+        text.contains("Thinking") && !text.contains("visible reasoning"),
+        "default config should collapse reasoning; got: {text}"
     );
+}
+
+#[test]
+fn expanded_streaming_reasoning_has_an_active_header_and_separate_body() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel
+        .streaming_thinking
+        .set_buffer("**Reviewing**\n\nBody details");
+    let text = buffer_text(&render(&mut panel, 80, 10));
+
+    assert!(text.contains("Thinking: Reviewing"));
+    assert!(text.contains("Body details"));
+    assert_eq!(text.matches("Reviewing").count(), 1);
+    assert!(!text.contains("thinking>"));
+}
+
+#[test]
+fn streaming_reasoning_shows_a_spinner_and_tenths_timer() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.thinking_delta("working");
+    panel.thinking_started = Some(Instant::now() - Duration::from_millis(1_201));
+
+    let text = buffer_text(&render(&mut panel, 80, 5));
+
+    assert!(SPINNER_GLYPHS.chars().any(|glyph| text.contains(glyph)));
+    assert!(text.contains("Thinking · 1.2s"));
+    assert_eq!(panel.cadence(), Cadence::SPINNER);
 }
 
 #[test]
@@ -2593,13 +2622,8 @@ fn hide_cached_thinking_persists_as_indicator() {
     let terminal = render(&mut panel, 80, 12);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("thinking> ..."),
-        "cached thinking should persist as an indicator, not hide; got: {text}"
-    );
-    assert!(text.contains("(7 lines)"), "footer line count; got: {text}");
-    assert!(
-        text.contains("click to expand"),
-        "footer should hint click-to-expand; got: {text}"
+        text.contains("Thought"),
+        "cached thinking should persist as a lifecycle header; got: {text}"
     );
     assert!(
         !text.contains("cached line 7"),
@@ -2666,7 +2690,7 @@ fn stream_reset_clears_thinking_expand_state() {
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("thinking> ..."),
+        text.contains("Thinking"),
         "new stream after reset should collapse again; got: {text}"
     );
     assert!(
@@ -2801,23 +2825,26 @@ fn msg_seg_text(panel: &MessagesPanel, msg_idx: usize) -> String {
 fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.show_thinking = false;
-    let mut m = DisplayMessage::new(DisplayRole::Thinking, "one\ntwo".to_string());
+    let mut m = DisplayMessage::new(
+        DisplayRole::Thinking,
+        "**First title**\n\none\ntwo".to_string(),
+    );
     m.thinking_collapsed = true;
     panel.push(m);
     render(&mut panel, 80, 10);
     assert!(
-        msg_seg_text(&panel, 0).contains("(2 lines)"),
-        "indicator should report the initial line count"
+        msg_seg_text(&panel, 0).contains("Thought: First title"),
+        "indicator should report the initial title"
     );
 
     // Change what the indicator renders, then mark it stale the way a theme
     // change does. Clearing the flag without rebuilding keeps the old spans.
-    panel.messages[0].text = "one\ntwo\nthree\nfour".to_string();
+    panel.messages[0].text = "**Second title**\n\none\ntwo\nthree\nfour".to_string();
     panel.cache.mark_all_width_stale();
     render(&mut panel, 80, 10);
 
     assert!(
-        msg_seg_text(&panel, 0).contains("(4 lines)"),
+        msg_seg_text(&panel, 0).contains("Thought: Second title"),
         "stale collapsed-thinking segment must be rebuilt, not just stamped; got: {}",
         msg_seg_text(&panel, 0)
     );
@@ -3146,6 +3173,18 @@ fn replace_past_the_end_is_a_noop() {
 }
 
 const WIDE_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write to store]\n```";
+
+#[test]
+fn expanded_reasoning_diagram_rows_follow_the_header() {
+    let message = DisplayMessage::new(
+        DisplayRole::Thinking,
+        format!("**Mapping**\n\n{WIDE_CHART}"),
+    );
+    let built = build_thinking_lines(&message, 40, Vec::new());
+
+    assert!(!built.diagrams.is_empty());
+    assert!(built.diagrams[0].rows.start >= 2);
+}
 const PAN_WIDTH: u16 = 40;
 const PAN_HEIGHT: u16 = 20;
 
@@ -3754,6 +3793,64 @@ fn compact_reasoning_reports_its_summary_and_duration() {
     );
 }
 
+#[test_case(
+    "**Continuing Quality Review**\n\nDetails.\n\n**Next section**\n\nMore.",
+    Some("Continuing Quality Review"),
+    "Details.\n\n**Next section**\n\nMore."
+    ; "leading_title_block"
+)]
+#[test_case("**Continuing Quality Review**", Some("Continuing Quality Review"), "" ; "title_only")]
+#[test_case("**Important:** keep this in the body.", None, "**Important:** keep this in the body." ; "inline_bold_is_body")]
+#[test_case("Details only.", None, "Details only." ; "plain_body")]
+fn reasoning_titles_require_a_leading_standalone_bold_block(
+    text: &str,
+    expected_title: Option<&str>,
+    expected_body: &str,
+) {
+    let summary = reasoning_summary(text);
+    assert_eq!(summary.title, expected_title);
+    assert_eq!(summary.body, expected_body);
+}
+
+#[test]
+fn active_and_completed_reasoning_have_distinct_headers() {
+    let line_text = |line: &Line<'_>| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    };
+    assert_eq!(
+        line_text(&thought_line("**Reviewing**", None, false)[0]),
+        "Thinking: Reviewing"
+    );
+    assert_eq!(
+        line_text(&thought_line("plain body", Some(Duration::from_secs(2)), true)[0]),
+        "Thought · 2.0s"
+    );
+}
+
+#[test]
+fn expanded_reasoning_keeps_the_title_out_of_the_body() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "**Reviewing**\n\nBody details".into(),
+    ));
+    rebuild(&mut panel);
+
+    let text = msg_seg_text(&panel, 0);
+    assert!(text.contains("Thought: Reviewing"));
+    assert!(text.contains("Body details"));
+    assert_eq!(text.matches("Reviewing").count(), 1);
+}
+
 #[test]
 fn untimed_reasoning_drops_the_duration_suffix() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -3763,12 +3860,18 @@ fn untimed_reasoning_drops_the_duration_suffix() {
     panel.push(msg);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "Thought: just a thought");
+    assert_eq!(first_line_text(&panel, 0), "Thought");
 }
 
 #[test]
 fn switching_to_compact_collapses_reasoning_that_show_thinking_had_open() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(
         DisplayRole::Thinking,
         "reasoning".into(),
@@ -3786,7 +3889,13 @@ fn switching_to_compact_collapses_reasoning_that_show_thinking_had_open() {
 
 #[test]
 fn a_compact_thought_reopens_on_click_even_when_show_thinking_is_on() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(
         DisplayRole::Thinking,
         THINKING_TEXT.into(),
@@ -3808,17 +3917,37 @@ fn a_live_reasoning_block_records_how_long_it_ran() {
     assert!(panel.thinking_started.is_none());
 }
 
+#[test]
+fn reasoning_boundary_completes_one_block_and_starts_another() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.thinking_delta("**First**\n\nbody");
+    panel.thinking_boundary();
+    panel.thinking_delta("**Second**\n\nbody");
+
+    assert_eq!(panel.messages.len(), 1);
+    assert_eq!(panel.messages[0].text, "**First**\n\nbody");
+    assert!(panel.messages[0].thinking_duration.is_some());
+    assert_eq!(panel.streaming_thinking.buffer(), "**Second**\n\nbody");
+}
+
 #[test_case(Duration::from_millis(420), "Thought: t · 420ms" ; "sub_second_stays_in_millis")]
 #[test_case(Duration::from_millis(9_700), "Thought: t · 9.7s" ; "seconds_keep_one_decimal")]
 #[test_case(Duration::from_secs(125), "Thought: t · 2m 5s" ; "minutes_split_from_seconds")]
 fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &str) {
-    let line = &thought_line("t", Some(duration))[0];
+    let line = &thought_line("**t**", Some(duration), true)[0];
     let text: String = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect();
     assert_eq!(text, expected);
+}
+
+#[test_case(Duration::from_millis(420), "0.4s" ; "sub_second")]
+#[test_case(Duration::from_millis(9_700), "9.7s" ; "under_a_minute")]
+#[test_case(Duration::from_millis(125_340), "2m 5.3s" ; "over_a_minute")]
+fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str) {
+    assert_eq!(format_live_thinking_duration(duration), expected);
 }
 
 #[test]

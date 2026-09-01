@@ -320,6 +320,14 @@ impl Provider for OpenAi {
         })
     }
 
+    fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
+        if is_codex_model(&model.id) {
+            crate::ReasoningTransport::OpenAiResponses
+        } else {
+            crate::ReasoningTransport::OpenAiChatCompletions
+        }
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
@@ -442,8 +450,9 @@ mod tests {
         responses::apply_responses_reasoning(&mut body, &thinking, &model);
         match expected {
             Some(level) => assert_eq!(body["reasoning"]["effort"], level),
-            None => assert!(body.get("reasoning").is_none()),
+            None => assert!(body["reasoning"].get("effort").is_none()),
         }
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body.get("reasoning_effort").is_none());
     }
 

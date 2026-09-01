@@ -861,6 +861,10 @@ impl Provider for Anthropic {
             model.pricing.cache_read = 0.0;
         }
     }
+
+    fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
+        crate::ReasoningTransport::AnthropicMessages
+    }
 }
 
 #[derive(Deserialize)]
