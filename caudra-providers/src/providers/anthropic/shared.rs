@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use flume::Sender;
 use serde::{Deserialize, Serialize};
@@ -574,6 +574,7 @@ impl EventParser {
             },
             usage: self.usage,
             stop_reason: self.stop_reason,
+            tool_name_aliases: self.oauth_tool_names.map(Arc::new),
         }
     }
 }

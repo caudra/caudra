@@ -523,6 +523,13 @@ impl UserData for LuaCtx {
             Ok((Some(audience.name().unwrap_or("main").to_string()), None))
         });
 
+        methods.add_method("canonical_tool_name", |_, this, name: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("canonical_tool_name"));
+            };
+            Ok((Some(agent.resolve_tool_name_alias(&name).to_owned()), None))
+        });
+
         // The session that called this tool, which under concurrent
         // sessions is not always the focused one `caudra.session.current()`
         // reports. Nil without an error when the run has no session, as in

@@ -399,6 +399,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            ..Default::default()
         }
     }
 
@@ -450,6 +451,7 @@ mod tests {
                 },
                 usage: TokenUsage::default(),
                 stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
             })]);
             const KEPT: &str = "first";
             let mut history = History::new(vec![Message::user(KEPT.into())]);

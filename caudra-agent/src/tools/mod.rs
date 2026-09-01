@@ -415,6 +415,7 @@ pub struct ToolContext {
     pub audience: ToolAudience,
     pub tool_filter: ToolFilter,
     pub local_tools: LocalTools,
+    pub tool_name_aliases: Option<caudra_providers::ToolNameAliases>,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`caudra.agent.call_tool` with `on_live_buf`/`on_annotation`).
     /// Never inherited: `to_tool_context` clears it, and each caller sets
@@ -424,6 +425,13 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn resolve_tool_name_alias<'a>(&'a self, name: &'a str) -> &'a str {
+        self.tool_name_aliases
+            .as_ref()
+            .and_then(|aliases| aliases.get(name))
+            .map_or(name, String::as_str)
+    }
+
     pub fn policy(&self) -> ToolPolicy {
         if self.mode.is_read_only() || self.audience == ToolAudience::RESEARCH_SUB {
             ToolPolicy::ReadOnly
@@ -661,6 +669,7 @@ pub fn interpreter_ctx(
         audience: ToolAudience::MAIN,
         tool_filter: ToolFilter::All,
         local_tools: LocalTools::default(),
+        tool_name_aliases: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
     }

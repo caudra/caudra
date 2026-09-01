@@ -1,6 +1,7 @@
 //! Tests the batch plugin's policy end-to-end: real plugin source, real
 //! `caudra.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -284,6 +285,37 @@ fn all_success_exact_llm_output() {
         summary_all_ok(2)
     );
     assert_eq!(out, expected);
+}
+
+#[test]
+fn oauth_wire_names_dispatch_and_preserve_nested_guard() {
+    let (reg, _host) = load_batch_host();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.tool_name_aliases = Some(Arc::new(HashMap::from([
+        ("mcp_Ok".into(), "ok".into()),
+        ("mcp_Batch".into(), BATCH_TOOL.into()),
+    ])));
+
+    let out = exec_with_ctx(
+        &reg,
+        BATCH_TOOL,
+        batch_input(json!([
+            { "tool": "mcp_Ok", "parameters": { "tag": "aliased" } },
+            { "tool": "mcp_Batch", "parameters": { "tool_calls": [] } },
+        ])),
+        &ctx,
+    )
+    .map(output_text)
+    .expect("batch failed");
+
+    let expected = format!(
+        "{}{}{}",
+        section("ok", "ok:aliased"),
+        section(BATCH_TOOL, &format!("{ERROR_PREFIX}{NESTED_ERROR}")),
+        summary_mixed(1, 2, 1)
+    );
+    assert_eq!(out, expected);
+    assert_eq!(recorded_calls(&reg).len(), 1);
 }
 
 #[test]

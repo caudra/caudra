@@ -91,7 +91,7 @@ pub async fn run(
     emit: Emit,
 ) -> ToolDoneEvent {
     let telemetry = caudra_otel::enabled();
-    let canonical = telemetry.then(|| super::streaming::canonical_tool_name(name));
+    let canonical = telemetry.then(|| canonical_tool_name(name, ctx));
     let source = canonical.map(|name| tool_source(registry, ctx, name));
     let started = Instant::now();
     let mut done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
@@ -115,7 +115,7 @@ async fn run_inner(
 ) -> ToolDoneEvent {
     // Covers names re-entering from model JSON (batch children, `call_tool`,
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
-    let name = super::streaming::canonical_tool_name(name);
+    let name = canonical_tool_name(name, ctx);
     let local = ctx.local_tools.get(name);
     let entry = registry.get(name);
     // LLM providers send tool names in wire format (server__tool) but our
@@ -339,6 +339,11 @@ async fn run_inner(
         warn!(tool = %mcp_lookup, "unknown tool");
         done_error(msg)
     }
+}
+
+fn canonical_tool_name<'a>(name: &'a str, ctx: &'a ToolContext) -> &'a str {
+    let name = super::streaming::canonical_tool_name(name);
+    ctx.resolve_tool_name_alias(name)
 }
 
 fn set_lua_provenance(
@@ -830,6 +835,7 @@ async fn dispatch_mcp(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -922,6 +928,40 @@ mod tests {
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
         });
+    }
+
+    #[test]
+    fn oauth_aliases_resolve_losslessly_before_dispatch() {
+        const WIRE_NAME: &str = "mcp_File_grep_3e49f5027c6a";
+
+        smol::block_on(async {
+            let mut ctx = local_ctx("file_grep", |_| Ok("matched".into()));
+            ctx.tool_name_aliases = Some(Arc::new(HashMap::from([(
+                WIRE_NAME.into(),
+                "file_grep".into(),
+            )])));
+
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "alias".into(),
+                WIRE_NAME,
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), "matched");
+            assert_eq!(done.tool.as_ref(), "file_grep");
+        });
+    }
+
+    #[test]
+    fn canonical_tool_name_preserves_unmapped_mcp_prefix() {
+        let ctx = local_ctx("mcp_fetch", |_| Ok("matched".into()));
+        assert_eq!(canonical_tool_name("mcp_fetch", &ctx), "mcp_fetch");
     }
 
     #[test]

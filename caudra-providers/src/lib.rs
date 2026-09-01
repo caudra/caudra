@@ -36,5 +36,6 @@ pub use types::{
     ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, ImageMediaType,
     ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent, ProviderUsage,
     ReasoningOption, ReasoningOptions, RequestOptions, ResolvedThinking, Role, StopReason,
-    StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
+    StreamResponse, THINKING_USAGE, ThinkingConfig, ToolNameAliases, UsageLimit,
+    adapt_images_for_model,
 };

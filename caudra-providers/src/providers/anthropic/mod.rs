@@ -1113,7 +1113,12 @@ mod tests {
         assert_eq!(body["tools"][1]["name"], "mcp_Mcp_fetch");
         assert_eq!(tool_names["mcp_Mcp_fetch"], "mcp_fetch");
         assert_ne!(body["tools"][2]["name"], body["tools"][0]["name"]);
-        assert!(body["tools"][3]["name"].as_str().unwrap().len() <= 64);
+        let long_wire_name = body["tools"][3]["name"].as_str().unwrap();
+        assert!(long_wire_name.len() <= 64);
+        assert_eq!(
+            tool_names[long_wire_name],
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl"
+        );
         assert_eq!(body["messages"][1]["content"][0]["name"], "mcp_Bash");
     }
 
@@ -1361,6 +1366,10 @@ data: {\"type\":\"content_block_stop\"}\n";
             .await
             .unwrap();
             assert_eq!(response.message.tool_uses().next().unwrap().1, "bash");
+            assert_eq!(
+                response.tool_name_aliases.as_ref().unwrap()["mcp_Bash"],
+                "bash"
+            );
             assert!(matches!(
                 rx.recv().unwrap(),
                 ProviderEvent::ToolUseStart { name, .. } if name == "bash"

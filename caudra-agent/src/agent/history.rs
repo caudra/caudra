@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -357,6 +358,96 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
     }
 
     changed
+}
+
+pub(super) fn repair_tool_pairs(mut messages: Cow<'_, [Message]>) -> Cow<'_, [Message]> {
+    if !tool_pairs_need_repair(&messages) {
+        return messages;
+    }
+
+    let repaired = messages.to_mut();
+    remove_orphaned_tool_results(repaired);
+    synthesize_missing_tool_results(repaired);
+    messages
+}
+
+fn tool_pairs_need_repair(messages: &[Message]) -> bool {
+    messages.iter().enumerate().any(|(index, message)| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::ToolUse { id, .. } => !messages
+                .get(index + 1)
+                .is_some_and(|next| has_tool_result(next, id)),
+            ContentBlock::ToolResult { tool_use_id, .. } => index
+                .checked_sub(1)
+                .and_then(|previous| messages.get(previous))
+                .is_none_or(|previous| !has_tool_use(previous, tool_use_id)),
+            _ => false,
+        })
+    })
+}
+
+fn has_tool_use(message: &Message, id: &str) -> bool {
+    matches!(message.role, Role::Assistant)
+        && message
+            .tool_uses()
+            .any(|(tool_use_id, _, _)| tool_use_id == id)
+}
+
+fn has_tool_result(message: &Message, id: &str) -> bool {
+    matches!(message.role, Role::User)
+        && message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+        })
+}
+
+fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
+    let mut index = 0;
+    while index < messages.len() {
+        if !matches!(messages[index].role, Role::Assistant) {
+            index += 1;
+            continue;
+        }
+
+        let missing: Vec<String> = messages[index]
+            .tool_uses()
+            .filter(|(id, _, _)| {
+                !messages
+                    .get(index + 1)
+                    .is_some_and(|next| has_tool_result(next, id))
+            })
+            .map(|(id, _, _)| id.to_owned())
+            .collect();
+        if missing.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let results = missing
+            .into_iter()
+            .map(|tool_use_id| ContentBlock::ToolResult {
+                tool_use_id,
+                content: UNAVAILABLE_RESULT.into(),
+                is_error: true,
+                output_ref: None,
+            });
+        if messages
+            .get(index + 1)
+            .is_some_and(|next| matches!(next.role, Role::User))
+        {
+            messages[index + 1].content.splice(0..0, results);
+        } else {
+            messages.insert(
+                index + 1,
+                Message {
+                    role: Role::User,
+                    content: results.collect(),
+                    display_text: Some(String::new()),
+                    ..Default::default()
+                },
+            );
+        }
+        index += 2;
+    }
 }
 
 /// Empty markers and synthetic prompts (empty `display_text`) are
@@ -818,6 +909,59 @@ mod tests {
             [ContentBlock::Text { text }] if text == "keep me"
         ));
         assert!(!remove_orphaned_tool_results(&mut messages));
+    }
+
+    #[test]
+    fn repair_tool_pairs_borrows_well_formed_history() {
+        let messages = vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["t1"]),
+        ];
+
+        assert!(matches!(
+            repair_tool_pairs(Cow::Borrowed(&messages)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn repair_tool_pairs_preserves_thinking_and_closes_mid_history_call() {
+        let mut assistant = make_tool_use_msg(&["t1"]);
+        assistant.content.insert(
+            0,
+            ContentBlock::Thinking {
+                thinking: "signed reasoning".into(),
+                signature: Some("signature".into()),
+            },
+        );
+        let assistant_before = serde_json::to_value(&assistant).unwrap();
+        let messages = vec![
+            Message::user("go".into()),
+            assistant,
+            Message::user("later".into()),
+        ];
+
+        let repaired = repair_tool_pairs(Cow::Borrowed(&messages));
+
+        assert!(matches!(repaired, Cow::Owned(_)));
+        assert_eq!(
+            serde_json::to_value(&repaired[1]).unwrap(),
+            assistant_before
+        );
+        assert!(matches!(
+            &repaired[2].content[0],
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+                ..
+            } if tool_use_id == "t1" && content == UNAVAILABLE_RESULT
+        ));
+        assert!(matches!(
+            &repaired[2].content[1],
+            ContentBlock::Text { text } if text == "later"
+        ));
     }
 
     #[test]

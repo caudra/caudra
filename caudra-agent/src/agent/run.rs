@@ -16,7 +16,7 @@ use super::goal::{
     Evaluator, GOAL_BLOCK_CAP, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator,
     continuation_message, is_unrecoverable, resolve_evaluator,
 };
-use super::history::{History, sanitize_cancelled_history};
+use super::history::{History, repair_tool_pairs, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::provider_projection;
 use super::streaming::{StreamError, stream_with_retry};
@@ -412,6 +412,7 @@ impl<'h> Agent<'h> {
         let tools = self.request_tools();
         let provider_history =
             provider_projection::project(self.history.as_slice(), tools.as_ref());
+        let provider_history = repair_tool_pairs(provider_history);
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
@@ -741,7 +742,10 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        let ctx = self.tool_context();
+        let ctx = ToolContext {
+            tool_name_aliases: response.tool_name_aliases.clone(),
+            ..self.tool_context()
+        };
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -784,6 +788,7 @@ impl<'h> Agent<'h> {
             audience: self.audience,
             tool_filter: self.tool_filter.clone(),
             local_tools: Arc::clone(&self.local_tools),
+            tool_name_aliases: None,
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
         }
@@ -1079,6 +1084,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            ..Default::default()
         }
     }
 
@@ -1102,6 +1108,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
         }
     }
 
@@ -1631,6 +1638,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
         }
     }
 
@@ -1643,6 +1651,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
         }
     }
 

@@ -89,7 +89,7 @@ local examples = {
 -- Models send entries in two shapes, { tool, parameters } and flat
 -- { tool, ...params }, so accept either, or even both merged, as long
 -- as no key appears twice.
-local function normalize_entry(entry)
+local function normalize_entry(entry, ctx)
   if type(entry) ~= "table" then
     return nil, "batch entry must be an object"
   end
@@ -100,6 +100,13 @@ local function normalize_entry(entry)
   -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
   -- `functions.` prefix so headers and the nested-batch guard match.
   tool = tool:match("^functions%.(.+)") or tool
+  if ctx then
+    local canonical, err = ctx:canonical_tool_name(tool)
+    if err then
+      return nil, err
+    end
+    tool = canonical
+  end
   local rest = {}
   local has_rest = false
   for k, v in pairs(entry) do
@@ -188,13 +195,13 @@ end
 -- batches are born terminal (error), so they render but never run. Only
 -- a malformed entry fails the batch as a whole, and that happens before
 -- anything runs.
-local function prepare_children(tool_calls)
+local function prepare_children(tool_calls, ctx)
   if type(tool_calls) ~= "table" then
     return nil, "tool_calls must be an array"
   end
   local children = {}
   for i, entry in ipairs(tool_calls) do
-    local c, err = normalize_entry(entry)
+    local c, err = normalize_entry(entry, ctx)
     if not c then
       return nil, err
     end
@@ -558,7 +565,7 @@ end
 --- Tool entry points --------------------------------------------------------
 
 local function handler(input, ctx)
-  local children, err = prepare_children(input.tool_calls)
+  local children, err = prepare_children(input.tool_calls, ctx)
   if not children then
     return { llm_output = err, is_error = true }
   end
@@ -604,6 +611,7 @@ local function restore(input, output, _is_error, rctx)
     -- Non-terminal statuses are treated as errors (corrupt data).
     for i, sc in ipairs(kids) do
       local c = children[i]
+      c.tool = sc.tool or c.tool
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
       c.usage = sc.usage

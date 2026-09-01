@@ -709,6 +709,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 

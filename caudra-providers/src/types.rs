@@ -7,7 +7,7 @@
 //! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use caudra_storage::sessions::TitleSource;
@@ -865,11 +865,14 @@ impl RequestOptions {
     }
 }
 
-#[derive(Debug)]
+pub type ToolNameAliases = Arc<HashMap<String, String>>;
+
+#[derive(Debug, Default)]
 pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    pub tool_name_aliases: Option<ToolNameAliases>,
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
