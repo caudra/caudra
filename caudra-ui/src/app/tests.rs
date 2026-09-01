@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::ParsedCommand;
+use crate::components::command::{BUILTIN_COMMANDS, ParsedCommand};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
@@ -3908,6 +3908,49 @@ fn help_toggles_modal() {
 }
 
 #[test]
+fn view_toggle_flips_density_for_every_chat() {
+    let mut app = test_app();
+    assert!(!app.compact);
+
+    app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
+    assert!(app.compact);
+
+    app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
+    assert!(!app.compact);
+}
+
+#[test]
+fn view_command_flips_density_like_the_keybinding() {
+    let mut app = test_app();
+
+    app.execute_command(cmd("/view"), 0);
+    assert!(app.compact);
+
+    app.execute_command(cmd("/view"), 0);
+    assert!(!app.compact);
+}
+
+/// `/compact` rewrites history and `/view` only changes rendering, so the
+/// palette must not offer the destructive one first when the view is meant.
+#[test]
+fn view_command_does_not_shadow_compact() {
+    let names: Vec<&str> = BUILTIN_COMMANDS.iter().map(|cmd| cmd.name).collect();
+    assert!(names.contains(&"/view"));
+    assert!(
+        !names.iter().any(|name| *name != "/compact"
+            && (name.starts_with("/compact") || "/compact".starts_with(name))),
+        "no command may prefix-collide with /compact: {names:?}"
+    );
+}
+
+#[test]
+fn view_toggle_is_reachable_from_lua() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ViewToggle);
+    assert!(app.compact);
+}
+
+#[test]
 fn help_modal_consumes_keys_and_esc_closes() {
     let mut app = test_app();
     app.update(Msg::Key(kb::HELP.to_key_event()));
@@ -5593,10 +5636,7 @@ fn fork_targets_every_display_source_with_user_before_and_other_items_inclusive(
         Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Thinking {
-                    thinking: "reason".into(),
-                    signature: None,
-                },
+                ContentBlock::thinking("reason".into(), None),
                 ContentBlock::Text {
                     text: "answer".into(),
                 },
@@ -8461,10 +8501,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
             ContentBlock::Text {
                 text: "  first\n\tsecond ".into(),
             },
-            ContentBlock::Thinking {
-                thinking: "ignored".into(),
-                signature: None,
-            },
+            ContentBlock::thinking("ignored".into(), None),
             ContentBlock::Text { text: long },
         ],
         ..Default::default()

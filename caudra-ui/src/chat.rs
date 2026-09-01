@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
@@ -376,6 +377,10 @@ impl Chat {
         self.messages_panel.set_accent(color);
     }
 
+    pub fn set_compact(&mut self, compact: bool) {
+        self.messages_panel.set_compact(compact);
+    }
+
     pub fn tick(&mut self) -> Dirty {
         self.messages_panel.tick()
     }
@@ -678,10 +683,12 @@ fn history_to_display_with_project(
             HistoryItemKind::Reasoning {
                 text,
                 redacted: false,
+                duration_ms,
                 ..
             } if !text.is_empty() => {
                 let mut message = DisplayMessage::new(DisplayRole::Thinking, text.clone());
                 message.source = Some(DisplaySource::Reasoning(item.id));
+                message.thinking_duration = duration_ms.map(Duration::from_millis);
                 display.push(message);
             }
             HistoryItemKind::ToolCall {
@@ -777,6 +784,7 @@ fn history_to_display_with_project(
                     render_header: None,
                     snapshot_theme_gen: 0,
                     thinking_collapsed: false,
+                    thinking_duration: None,
                 });
             }
             HistoryItemKind::AssistantText { .. }
@@ -1303,10 +1311,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "inspect".into(),
-                        signature: None,
-                    },
+                    ContentBlock::thinking("inspect".into(), None),
                     ContentBlock::Text {
                         text: "running".into(),
                     },
@@ -1793,10 +1798,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Thinking {
-                    thinking: "reasoning".into(),
-                    signature: None,
-                },
+                ContentBlock::thinking("reasoning".into(), None),
                 ContentBlock::Text {
                     text: "answer".into(),
                 },

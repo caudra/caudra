@@ -112,6 +112,8 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const COMPACT_VIEW_MSG: &str = "View: compact";
+const EXPANDED_VIEW_MSG: &str = "View: expanded";
 const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
 const REVIEW_READY_MSG: &str = "Review notes added to the prompt";
 const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
@@ -299,6 +301,8 @@ pub struct App {
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     unsent_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
+    /// Transcript density, shared by every chat and pushed at render time.
+    pub(crate) compact: bool,
 }
 
 struct PendingSteer {
@@ -438,6 +442,7 @@ impl App {
             pending_subagent_steers: HashMap::new(),
             unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
+            compact: false,
         };
         app.model_picker.set_recents(
             caudra_storage::model::read_recents(&app.storage)
@@ -821,6 +826,9 @@ impl App {
         }
         if key::POP_QUEUE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::PopQueue));
+        }
+        if key::VIEW_TOGGLE.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::ViewToggle));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -1366,6 +1374,17 @@ impl App {
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
+            }
+            BuiltinAction::ViewToggle => {
+                self.compact = !self.compact;
+                for chat in &mut self.chats {
+                    chat.set_compact(self.compact);
+                }
+                self.flash(if self.compact {
+                    COMPACT_VIEW_MSG.into()
+                } else {
+                    EXPANDED_VIEW_MSG.into()
+                });
             }
         }
         vec![]
@@ -2440,6 +2459,7 @@ impl App {
                 vec![]
             }
             "/review" => self.run_builtin(BuiltinAction::Review),
+            "/view" => self.run_builtin(BuiltinAction::ViewToggle),
             "/theme" => {
                 self.theme_picker.open();
                 vec![]

@@ -196,6 +196,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+X",
     };
+    pub const VIEW_TOGGLE: Bind = Bind {
+        code: KeyCode::Char('v'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+V",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -398,6 +403,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::PLAN_TOGGLE.label),
         description: "Toggle plan panel",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::VIEW_TOGGLE.label),
+        description: "Toggle compact / expanded transcript",
         context: KeybindContext::General,
         platform: Platform::All,
     },

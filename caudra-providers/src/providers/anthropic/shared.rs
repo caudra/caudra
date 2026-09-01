@@ -449,10 +449,8 @@ impl EventParser {
                             });
                         }
                         SseContentBlock::Thinking => {
-                            self.content_blocks.push(ContentBlock::Thinking {
-                                thinking: String::new(),
-                                signature: None,
-                            });
+                            self.content_blocks
+                                .push(ContentBlock::thinking(String::new(), None));
                         }
                         SseContentBlock::RedactedThinking { data } => {
                             self.content_blocks

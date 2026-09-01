@@ -852,12 +852,21 @@ impl WorkcellInvocation {
     }
 }
 
+/// A bare pattern says nothing about where it ran, and the search root is the
+/// difference between a repo-wide sweep and one directory.
+fn search_header(pattern: &str, path: Option<&str>) -> String {
+    match path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => format!("{pattern} in {path}"),
+        None => pattern.to_owned(),
+    }
+}
+
 impl ToolInvocation for WorkcellInvocation {
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(match &self.input {
             Input::FileRead(input) => input.file_path.clone(),
-            Input::FileGlob(input) => input.pattern.clone(),
-            Input::FileGrep(input) => input.pattern.clone(),
+            Input::FileGlob(input) => search_header(&input.pattern, input.path.as_deref()),
+            Input::FileGrep(input) => search_header(&input.pattern, input.path.as_deref()),
             Input::FileWrite(input) => input.file_path.clone(),
             Input::FileEdit(input) => input.file_path.clone(),
             Input::FileApplyPatch(_) => "file patch".into(),
@@ -1865,6 +1874,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
@@ -2754,6 +2764,22 @@ mod tests {
         )
         .expect("structured model output");
         assert_eq!(model_output["applied"], true);
+    }
+
+    #[test_case(json!({"pattern": "needle"}), "needle" ; "a_rootless_search_shows_only_its_pattern")]
+    #[test_case(json!({"pattern": "needle", "path": "site/docs"}), "needle in site/docs" ; "a_search_root_joins_the_pattern")]
+    #[test_case(json!({"pattern": "needle", "path": "  "}), "needle" ; "a_blank_root_is_not_a_root")]
+    fn grep_headers_report_where_the_search_ran(input: serde_json::Value, expected: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let invocation = registry
+            .get("file_grep")
+            .expect("registered file_grep")
+            .tool
+            .parse(&input)
+            .expect("valid file_grep input");
+
+        assert_eq!(invocation.start_header().into_ready().text(), expected);
     }
 
     #[test]

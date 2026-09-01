@@ -450,10 +450,7 @@ mod tests {
         let messages = vec![
             Message::user("hello".into()),
             assistant(vec![
-                MsgBlock::Thinking {
-                    thinking: "hmm".into(),
-                    signature: None,
-                },
+                MsgBlock::thinking("hmm".into(), None),
                 MsgBlock::Text {
                     text: "let me check".into(),
                 },

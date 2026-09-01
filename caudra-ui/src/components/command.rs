@@ -70,6 +70,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/view",
+        description: "Toggle compact / expanded transcript",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/mcp",
         description: "Configure MCP servers",
         max_args: 0,

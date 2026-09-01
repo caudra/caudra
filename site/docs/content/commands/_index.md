@@ -22,6 +22,7 @@ Type `/` in the input box to open the command palette.
 | `/system-prompt` | Switch system prompt profile |
 | `/review` | Review the last reply passage by passage |
 | `/theme` | Switch color theme |
+| `/view` | Toggle compact / expanded transcript |
 | `/mcp` | Configure MCP servers |
 | `/permissions` | Inspect active conversation permission rules |
 | `/login` | Authenticate with an LLM provider |

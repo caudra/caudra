@@ -33,6 +33,7 @@ pub struct RenderCtx<'a> {
     pub started_at: Instant,
     pub width: u16,
     pub tool_output_lines: &'a ToolOutputLines,
+    pub compact: bool,
 }
 
 pub const TOOL_INDICATOR: &str = "● ";
@@ -41,6 +42,118 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+pub const RAW_AFFORDANCE: &str = "click for raw";
+pub const FILTERED_AFFORDANCE: &str = "click for filtered";
+const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
+const COMPACT_FALLBACK_SIGIL: char = '⚙';
+const COMPACT_ARG_LIMIT: usize = 3;
+const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
+
+/// How a tool names itself on a compact row. The `name> ` prefix is gone
+/// there, so `label` is what identifies the call, and `header_keys` are the
+/// inputs already folded into the header text so the `[k=v]` suffix can skip
+/// them. Tools missing from the table fall back to their registered name.
+struct CompactTool {
+    sigil: char,
+    label: &'static str,
+    header_keys: &'static [&'static str],
+}
+
+/// Header keys are matched ignoring case and underscores, so one spelling
+/// covers Workcell's camelCase wire names and the snake_case the legacy tools
+/// still carry in restored sessions.
+const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
+    tool_row("file_read", '→', "Read", &["file_path"]),
+    tool_row("file_glob", '✱', "Glob", &["pattern", "path"]),
+    tool_row("file_grep", '✱', "Grep", &["pattern", "path"]),
+    tool_row("file_write", '←', "Write", &["file_path", "content"]),
+    tool_row("file_edit", '←', "Edit", EDIT_KEYS),
+    tool_row("file_apply_patch", '%', "Patch", &["patch_text"]),
+    tool_row("index", '→', "Index", &["path"]),
+    tool_row("websearch", '◈', "Search", &["query"]),
+    tool_row("webfetch", '%', "Fetch", &["url"]),
+    tool_row("shell", '$', "Shell", &["command"]),
+    tool_row("code_execution", '$', "Code", &["code"]),
+    tool_row("execution_environment", '⚙', "Env", &[]),
+    tool_row("task", '#', "Task", &["prompt", "description"]),
+    tool_row("batch", '#', "Batch", &["invocations"]),
+    tool_row("todo_write", '⚙', "Todo", &["todos"]),
+    tool_row("skill", '→', "Skill", &["name"]),
+    tool_row("question", '→', "Ask", &["questions"]),
+    tool_row("memory", '⚙', "Memory", &[]),
+    tool_row("sessions", '⚙', "Sessions", &[]),
+    tool_row("view_image", '→', "Image", &["path"]),
+    // Legacy spellings, still the names in sessions written before the
+    // Workcell tools took over.
+    tool_row("read", '→', "Read", &["file_path"]),
+    tool_row("glob", '✱', "Glob", &["pattern", "path"]),
+    tool_row("grep", '✱', "Grep", &["pattern", "path"]),
+    tool_row("write", '←', "Write", &["file_path", "content"]),
+    tool_row("edit", '←', "Edit", EDIT_KEYS),
+    tool_row("multiedit", '←', "Edit", &["file_path", "edits"]),
+    tool_row("bash", '$', "Shell", &["command"]),
+];
+
+const fn tool_row(
+    tool: &'static str,
+    sigil: char,
+    label: &'static str,
+    header_keys: &'static [&'static str],
+) -> (&'static str, CompactTool) {
+    (
+        tool,
+        CompactTool {
+            sigil,
+            label,
+            header_keys,
+        },
+    )
+}
+
+fn compact_tool(name: &str) -> Option<&'static CompactTool> {
+    COMPACT_TOOLS
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .map(|(_, entry)| entry)
+}
+
+fn same_key(left: &str, right: &str) -> bool {
+    let normalize = |key: &str| {
+        key.chars()
+            .filter(|c| *c != '_')
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    normalize(left) == normalize(right)
+}
+
+/// The primitive inputs a compact header does not already show, rendered the
+/// way opencode does: `[offset=1, limit=260]`.
+fn compact_args(raw_input: Option<&serde_json::Value>, header_keys: &[&str]) -> Option<String> {
+    let fields = raw_input?.as_object()?;
+    let mut rendered = String::new();
+    let mut shown = 0;
+    for (key, value) in fields
+        .iter()
+        .filter(|(key, _)| !header_keys.iter().any(|folded| same_key(folded, key)))
+    {
+        let scalar = match value {
+            serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
+            serde_json::Value::Number(number) => Cow::Owned(number.to_string()),
+            serde_json::Value::Bool(flag) => Cow::Owned(flag.to_string()),
+            _ => continue,
+        };
+        if shown > 0 {
+            rendered.push_str(", ");
+        }
+        write!(rendered, "{key}={scalar}").unwrap();
+        shown += 1;
+        if shown == COMPACT_ARG_LIMIT {
+            break;
+        }
+    }
+    (!rendered.is_empty()).then(|| format!(" [{rendered}]"))
+}
 
 pub struct RoleStyle {
     pub prefix: &'static str,
@@ -409,6 +522,61 @@ impl ToolLineBuilder {
         self.search_text = copy;
     }
 
+    /// The one-line form: a sigil in place of the status dot, a short label
+    /// in place of `name> `, and the inputs the header omits.
+    fn push_compact_header(
+        &mut self,
+        tool_name: &str,
+        header: &str,
+        annotation: Option<&str>,
+        raw_input: Option<&serde_json::Value>,
+    ) {
+        let entry = compact_tool(tool_name);
+        let label = entry.map_or(tool_name, |entry| entry.label);
+
+        let mut copy = format!("{label} {header}");
+        let mut spans = vec![
+            Span::styled(format!("{label} "), theme::current().tool_prefix),
+            Span::styled(header.to_owned(), theme::current().tool),
+        ];
+        if let Some(args) = compact_args(raw_input, entry.map_or(&[], |entry| entry.header_keys)) {
+            copy.push_str(&args);
+            spans.push(Span::styled(args, theme::current().tool_dim));
+        }
+        if let Some(ann) = annotation {
+            spans.push(Span::styled(
+                format!(" ({ann})"),
+                theme::current().tool_annotation,
+            ));
+            write!(copy, " ({ann})").unwrap();
+        }
+        self.lines.push(Line::from(spans));
+        self.search_text = copy;
+    }
+
+    /// Compact rows carry the sigil where an expanded row carries `● `, so a
+    /// finished call still reports success or failure by color.
+    fn prepend_compact_sigil(&mut self, tool_name: &str, started_at: Instant) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let (text, style) = match self.indicator {
+            Indicator::InProgress => (
+                format!("{} ", spinner_frame(started_at.elapsed().as_millis())),
+                theme::current().spinner,
+            ),
+            finished => {
+                let sigil =
+                    compact_tool(tool_name).map_or(COMPACT_FALLBACK_SIGIL, |entry| entry.sigil);
+                (format!("{sigil} "), finished_style(finished))
+            }
+        };
+        if matches!(self.indicator, Indicator::InProgress) {
+            self.spinner_lines.push((0, 0));
+        }
+        self.lines[0].spans.insert(0, Span::styled(text, style));
+    }
+
     fn push_search_text(&mut self, text: &str) {
         if !self.search_text.is_empty() {
             self.search_text.push('\n');
@@ -495,10 +663,10 @@ impl ToolLineBuilder {
             .checked_div(filter.unfiltered_utf8_bytes)
             .unwrap_or(0);
         let label = if shell_raw {
-            "raw output · click for filtered".to_owned()
+            format!("raw output · {FILTERED_AFFORDANCE}")
         } else {
             format!(
-                "filtered · {} · {reduction}% smaller · click for raw",
+                "filtered · {} · {reduction}% smaller · {RAW_AFFORDANCE}",
                 filter.rule
             )
         };
@@ -696,17 +864,20 @@ pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
     }
 }
 
+/// `expansion` is `None` on a compact row the reader has not opened, which is
+/// the only state that draws a header with no body.
 pub fn build_tool_lines(
     msg: &DisplayMessage,
     status: ToolStatus,
     rctx: &RenderCtx,
-    expanded: SectionFlags,
+    expansion: Option<SectionFlags>,
 ) -> ToolLines {
     let tool_name = msg.role.tool_name().unwrap_or("?");
     let (header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
+    let expanded = expansion.unwrap_or_default();
 
     let mut b = ToolLineBuilder::new(
         rctx.width,
@@ -715,14 +886,37 @@ pub fn build_tool_lines(
         status.into(),
     );
     b.apply_output_format(msg.tool_output.as_deref());
-    b.push_header(
-        tool_name,
-        header,
-        msg.annotation.as_deref(),
-        msg.render_header.as_ref(),
-        msg.tool_output.as_deref(),
-    );
-    b.prepend_indicator(rctx.started_at);
+    if rctx.compact {
+        b.push_compact_header(
+            tool_name,
+            header,
+            msg.annotation.as_deref(),
+            msg.tool_raw_input.as_deref(),
+        );
+        b.prepend_compact_sigil(tool_name, rctx.started_at);
+    } else {
+        b.push_header(
+            tool_name,
+            header,
+            msg.annotation.as_deref(),
+            msg.render_header.as_ref(),
+            msg.tool_output.as_deref(),
+        );
+        b.prepend_indicator(rctx.started_at);
+    }
+    if expansion.is_none() {
+        // Nothing is drawn below the header, but the reader still needs a
+        // click target whenever there is something to reveal.
+        b.truncation.output = msg.render_snapshot.is_some()
+            || msg.tool_input.is_some()
+            || msg.tool_output.is_some()
+            || body.is_some_and(|body| !body.trim().is_empty());
+        return b.finish(
+            msg.tool_input.clone(),
+            msg.tool_output.clone(),
+            TOOL_BODY_INDENT,
+        );
+    }
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -797,11 +991,17 @@ pub(crate) fn append_annotation(ann: &mut Option<String>, suffix: &str) {
     }
 }
 
+/// `expanded` is `None` on an unopened compact row, which lists the loaded
+/// paths instead of their contents.
 pub fn build_instructions_lines(
     blocks: &[InstructionBlock],
     width: u16,
-    expanded: bool,
+    expanded: Option<bool>,
 ) -> ToolLines {
+    if expanded.is_none() {
+        return compact_instruction_lines(blocks);
+    }
+    let expanded = expanded.unwrap_or_default();
     let header = blocks.first().map_or("", |b| b.path.as_str());
     let annotation = if blocks.len() > 1 {
         Some(format!("+{}", blocks.len() - 1))
@@ -846,6 +1046,38 @@ pub fn build_instructions_lines(
     b.finish(None, Some(output), TOOL_BODY_INDENT)
 }
 
+fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
+    let style = theme::current().tool_dim;
+    let path_style = theme::current().tool_path;
+    let mut lines = Vec::with_capacity(blocks.len());
+    let mut search_text = String::new();
+    for block in blocks {
+        lines.push(Line::from(vec![
+            Span::styled(COMPACT_LOAD_PREFIX, style),
+            Span::styled(block.path.clone(), path_style),
+        ]));
+        if !search_text.is_empty() {
+            search_text.push('\n');
+        }
+        write!(search_text, "{COMPACT_LOAD_PREFIX}{}", block.path).unwrap();
+    }
+    ToolLines {
+        links: LinkMap::none_for(&lines),
+        lines,
+        search_text,
+        highlight: None,
+        spinner_lines: Vec::new(),
+        snapshot_base: None,
+        shell_toggle_line: None,
+        content_indent: TOOL_BODY_INDENT,
+        truncation: SectionFlags {
+            script: false,
+            output: true,
+            shell_raw: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +1096,14 @@ mod tests {
             started_at: Instant::now(),
             width,
             tool_output_lines: &TOL,
+            compact: false,
+        }
+    }
+
+    fn compact_rctx(width: u16) -> RenderCtx<'static> {
+        RenderCtx {
+            compact: true,
+            ..test_rctx(width)
         }
     }
 
@@ -956,6 +1196,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -973,7 +1214,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert_eq!(tl.highlight.is_some(), expect_highlight);
         if let Some(hl) = &tl.highlight {
@@ -1008,35 +1249,35 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let filtered_expanded = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags {
+            Some(SectionFlags {
                 output: true,
                 ..SectionFlags::default()
-            },
+            }),
         );
         let raw_collapsed = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags {
+            Some(SectionFlags {
                 shell_raw: true,
                 ..SectionFlags::default()
-            },
+            }),
         );
         let raw_expanded = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags {
+            Some(SectionFlags {
                 output: true,
                 shell_raw: true,
                 ..SectionFlags::default()
-            },
+            }),
         );
         let collapsed_text = lines_text(&collapsed);
 
@@ -1066,7 +1307,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&lines);
 
@@ -1080,7 +1321,7 @@ mod tests {
     #[test_case(ToolStatus::Success,    plain_output() ; "done_with_plain_output_shows_body")]
     fn bash_body_visible(status: ToolStatus, output: Option<ToolOutput>) {
         let msg = bash_msg("echo hi\nline1\nline2", status, code_input(), output);
-        let tl = build_tool_lines(&msg, status, &test_rctx(80), SectionFlags::default());
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(SectionFlags::default()));
         let text = lines_text(&tl);
         assert!(text.contains("line1"));
         assert!(text.contains("line2"));
@@ -1112,7 +1353,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let span_count_before = tl.lines[0].spans.len();
         append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
@@ -1133,7 +1374,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
@@ -1146,7 +1387,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("bold"));
@@ -1160,7 +1401,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let (row, line) = tl
             .lines
@@ -1205,6 +1446,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -1231,7 +1473,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         )
     }
 
@@ -1274,7 +1516,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(width),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert_hr_fits(&tl, width);
     }
@@ -1301,6 +1543,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -1312,7 +1555,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line_0"));
@@ -1354,17 +1597,17 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let expanded = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags {
+            Some(SectionFlags {
                 script: false,
                 output: true,
                 shell_raw: false,
-            },
+            }),
         );
 
         assert!(collapsed.truncation.output);
@@ -1400,6 +1643,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -1424,7 +1668,7 @@ mod tests {
             &snapshot_msg(snapshot),
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert!(
             tl.search_text.contains("import asyncio"),
@@ -1449,7 +1693,7 @@ mod tests {
             &snapshot_msg(snapshot),
             ToolStatus::InProgress,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let base = tl.snapshot_base.expect("snapshot must record its base");
         let line_text = |i: usize| {
@@ -1473,7 +1717,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert_eq!(tl.snapshot_base, None);
     }
@@ -1499,7 +1743,7 @@ mod tests {
             &msg,
             ToolStatus::InProgress,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         // indicator + `tool> ` prefix + "3 tools " sit before the header spinner.
         assert_eq!(tl.spinner_lines, vec![(0, 3), (0, 0)]);
@@ -1554,7 +1798,7 @@ mod tests {
             &msg,
             ToolStatus::Error,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         let tail = output.lines().next_back().unwrap();
@@ -1591,7 +1835,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let t = theme::current();
         assert!(line_has_styled(&tl, "pub", t.index_keyword));
@@ -1609,7 +1853,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("from_snapshot"));
@@ -1714,14 +1958,25 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
     #[test]
     fn bash_expanded_live_output() {
         let msg = bash_output_msg(200, true);
-        let collapsed = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), exp(false));
-        let expanded = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), exp(true));
+        let collapsed = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(exp(false)),
+        );
+        let expanded = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(exp(true)),
+        );
         let collapsed_text = lines_text(&collapsed);
         let expanded_text = lines_text(&expanded);
         assert!(collapsed.truncation.any());
@@ -1742,7 +1997,12 @@ mod tests {
         expect_expand_notice: bool,
     ) {
         let msg = bash_output_msg(line_count, false);
-        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), exp(expanded));
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(exp(expanded)),
+        );
         let text = lines_text(&tl);
         assert_eq!(tl.truncation.any(), expect_truncation);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
@@ -1762,7 +2022,12 @@ mod tests {
         expect_expand_notice: bool,
     ) {
         let msg = read_output_msg(line_count);
-        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), exp(expanded));
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(exp(expanded)),
+        );
         assert_eq!(tl.truncation.any(), expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
@@ -1816,6 +2081,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -1825,7 +2091,7 @@ mod tests {
         let msg = read_msg_with_instructions(3, 30);
         let output = msg.tool_output.as_deref().unwrap();
         let blocks = output.instructions().unwrap();
-        let tl = build_instructions_lines(blocks, 80, expanded);
+        let tl = build_instructions_lines(blocks, 80, Some(expanded));
         assert_eq!(tl.truncation.any(), expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("inst 29"), expect_all_visible);
@@ -1838,7 +2104,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(
@@ -1853,10 +2119,71 @@ mod tests {
             path: "agents.md".into(),
             content: "follow style guide".into(),
         }];
-        let tl = build_instructions_lines(&blocks, 80, false);
+        let tl = build_instructions_lines(&blocks, 80, Some(false));
         assert!(tl.highlight.is_some());
         let text = lines_text(&tl);
         assert!(text.contains("follow style guide"));
+    }
+
+    #[test]
+    fn a_snapshot_tool_stays_one_line_until_a_compact_row_is_opened() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "rendered by lua".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = snapshot_msg(snapshot);
+
+        let collapsed = build_tool_lines(&msg, ToolStatus::Success, &compact_rctx(80), None);
+        assert_eq!(collapsed.lines.len(), 1);
+        assert!(
+            collapsed.truncation.output,
+            "a hidden snapshot has to leave a click target behind"
+        );
+        assert!(!lines_text(&collapsed).contains("rendered by lua"));
+
+        let opened = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &compact_rctx(80),
+            Some(SectionFlags::default()),
+        );
+        assert!(lines_text(&opened).contains("rendered by lua"));
+    }
+
+    #[test]
+    fn a_bodyless_compact_row_reports_nothing_to_open() {
+        let msg = bash_msg("ls", ToolStatus::Success, None, None);
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &compact_rctx(80), None);
+
+        assert_eq!(tl.lines.len(), 1);
+        assert!(!tl.truncation.any());
+    }
+
+    #[test]
+    fn compact_instructions_list_paths_instead_of_contents() {
+        let blocks = vec![InstructionBlock {
+            path: "site/docs/AGENTS.md".into(),
+            content: "never hand-edit generated docs".into(),
+        }];
+
+        let tl = build_instructions_lines(&blocks, 80, None);
+
+        assert_eq!(tl.lines.len(), 1);
+        let text = lines_text(&tl);
+        assert!(text.contains("↳ Loaded site/docs/AGENTS.md"), "{text}");
+        assert!(!text.contains("never hand-edit"), "{text}");
+    }
+
+    #[test_case("filePath", "file_path" ; "camel_matches_snake")]
+    #[test_case("patch_text", "patchText" ; "snake_matches_camel")]
+    #[test_case("path", "path" ; "identical_keys_match")]
+    fn header_keys_match_across_spellings(shown: &str, sent: &str) {
+        assert!(same_key(shown, sent));
+    }
+
+    #[test]
+    fn a_distinct_key_is_not_folded_into_the_header() {
+        assert!(!same_key("path", "file_path"));
     }
 
     #[test]
@@ -1867,7 +2194,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert!(
             !lines_text(&tl).contains("plain fallback"),
@@ -1892,7 +2219,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("row_0"));
@@ -1927,12 +2254,13 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         };
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert!(
             tl.search_text.contains("llm_output_here"),
@@ -1967,12 +2295,13 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         };
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert!(
             tl.search_text.contains("body_fallback"),
@@ -2089,7 +2418,7 @@ mod tests {
             &snapshot_msg(snapshot),
             status,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let body = tl.lines.get(1).expect("snapshot body line");
@@ -2118,7 +2447,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            SectionFlags::default(),
+            Some(SectionFlags::default()),
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let header_line = tl.lines.first().expect("header line");

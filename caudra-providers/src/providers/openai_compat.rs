@@ -665,10 +665,7 @@ pub async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
+        content_blocks.push(ContentBlock::thinking(reasoning_text, None));
     }
 
     if !text.is_empty() {
@@ -1142,10 +1139,7 @@ data: [DONE]\n";
         let messages = vec![Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Thinking {
-                    thinking: "Let me think...".into(),
-                    signature: None,
-                },
+                ContentBlock::thinking("Let me think...".into(), None),
                 ContentBlock::Text {
                     text: "Hello".into(),
                 },
@@ -1163,10 +1157,7 @@ data: [DONE]\n";
     fn convert_messages_assistant_reasoning_only() {
         let messages = vec![Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::Thinking {
-                thinking: "Just thinking...".into(),
-                signature: None,
-            }],
+            content: vec![ContentBlock::thinking("Just thinking...".into(), None)],
             ..Default::default()
         }];
         let wire = convert_messages(&messages, "");

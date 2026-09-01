@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
+use crate::components::tool_display::{FILTERED_AFFORDANCE, RAW_AFFORDANCE};
 use crate::markdown::{LinkMap, TerminalLink};
 
 use super::layout::SegmentChrome;
@@ -13,7 +14,20 @@ pub(super) const EXPAND_AFFORDANCE: &str = "click to expand";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HoverFeedback {
     Affordance,
+    /// Only the raw/filtered switch, so hovering it does not also light up an
+    /// expand affordance elsewhere on the same card.
+    ShellToggle,
     Chrome,
+}
+
+impl HoverFeedback {
+    fn needles(self) -> &'static [&'static str] {
+        match self {
+            Self::Affordance => &[EXPAND_AFFORDANCE],
+            Self::ShellToggle => &[RAW_AFFORDANCE, FILTERED_AFFORDANCE],
+            Self::Chrome => &[],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,11 +157,11 @@ fn hover_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = lines.to_vec();
     match hover {
-        Some((HoverFeedback::Affordance, _)) => {
+        Some((feedback @ (HoverFeedback::Affordance | HoverFeedback::ShellToggle), _)) => {
             for line in &mut lines {
                 let mut spans = Vec::with_capacity(line.spans.len());
                 for span in line.spans.drain(..) {
-                    spans.extend(reverse_affordance(span));
+                    spans.extend(reverse_affordance(span, feedback.needles()));
                 }
                 line.spans = spans;
             }
@@ -165,13 +179,16 @@ fn hover_lines(
     lines
 }
 
-fn reverse_affordance(span: Span<'static>) -> Vec<Span<'static>> {
+fn reverse_affordance(span: Span<'static>, needles: &[&str]) -> Vec<Span<'static>> {
     let style = span.style;
     let text = span.content.into_owned();
-    let Some(start) = text.find(EXPAND_AFFORDANCE) else {
+    let Some((start, needle)) = needles
+        .iter()
+        .find_map(|needle| Some((text.find(needle)?, *needle)))
+    else {
         return vec![Span::styled(text, style)];
     };
-    let end = start + EXPAND_AFFORDANCE.len();
+    let end = start + needle.len();
     let mut spans = Vec::with_capacity(3);
     if start > 0 {
         spans.push(Span::styled(text[..start].to_owned(), style));

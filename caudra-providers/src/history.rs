@@ -66,6 +66,9 @@ pub enum HistoryItemKind {
         signature: Option<String>,
         redacted: bool,
         interrupted: bool,
+        /// Dropped by `project_group`, so it never reaches a provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     ToolCall {
         call_id: String,
@@ -521,17 +524,20 @@ fn assistant_kind(block: &ContentBlock, padding: bool) -> HistoryItemKind {
         ContentBlock::Thinking {
             thinking,
             signature,
+            duration_ms,
         } => HistoryItemKind::Reasoning {
             text: thinking.clone(),
             signature: signature.clone(),
             redacted: false,
             interrupted: false,
+            duration_ms: *duration_ms,
         },
         ContentBlock::RedactedThinking { data } => HistoryItemKind::Reasoning {
             text: data.clone(),
             signature: None,
             redacted: true,
             interrupted: false,
+            duration_ms: None,
         },
         ContentBlock::ToolUse {
             id,
@@ -769,10 +775,9 @@ fn project_group(items: &[HistoryItem]) -> Message {
                         .content
                         .push(ContentBlock::RedactedThinking { data: text.clone() });
                 } else {
-                    message.content.push(ContentBlock::Thinking {
-                        thinking: text.clone(),
-                        signature: signature.clone(),
-                    });
+                    message
+                        .content
+                        .push(ContentBlock::thinking(text.clone(), signature.clone()));
                 }
             }
             HistoryItemKind::ToolCall {
@@ -830,6 +835,7 @@ mod tests {
     const CALL_TWO: &str = "call-two";
     const STORED_OUTPUT: &str = "first\nsecond";
     const TOOL_NAME: &str = "read";
+    const REASONING_DURATION_MS: u64 = 9_700;
 
     fn image(data: &str) -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(data))
@@ -879,6 +885,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "inspect".into(),
                     signature: Some("reasoning-signature".into()),
+                    duration_ms: Some(REASONING_DURATION_MS),
                 },
                 ContentBlock::Text {
                     text: "calling tool".into(),
@@ -986,6 +993,59 @@ mod tests {
                 .get("output_ref")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reasoning_duration_persists_but_never_reaches_the_provider() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "weighing options".into(),
+                signature: None,
+                duration_ms: Some(REASONING_DURATION_MS),
+            }],
+            ..Default::default()
+        };
+
+        let persisted = serde_json::to_value(expand_message(&message, None)).unwrap();
+        assert_eq!(persisted[0]["duration_ms"], REASONING_DURATION_MS);
+        let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
+        assert!(matches!(
+            &items[0].kind,
+            HistoryItemKind::Reasoning {
+                duration_ms: Some(REASONING_DURATION_MS),
+                ..
+            }
+        ));
+
+        let projected = project_messages(&items).unwrap();
+        assert!(matches!(
+            &projected[0].content[0],
+            ContentBlock::Thinking {
+                duration_ms: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reasoning_without_duration_omits_the_key() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::thinking("untimed".into(), None)],
+            ..Default::default()
+        };
+
+        let persisted = serde_json::to_value(expand_message(&message, None)).unwrap();
+        assert!(persisted[0].get("duration_ms").is_none());
+        let items: Vec<HistoryItem> = serde_json::from_value(persisted).unwrap();
+        assert!(matches!(
+            &items[0].kind,
+            HistoryItemKind::Reasoning {
+                duration_ms: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1183,6 +1243,7 @@ mod tests {
                 signature: Some("signature".into()),
                 redacted: false,
                 interrupted: true,
+                duration_ms: None,
             },
             assistant_group,
             None,
@@ -1240,7 +1301,7 @@ mod tests {
         let messages = project_messages(&items).unwrap();
         assert!(matches!(
             &messages[0].content[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "partial" && signature.as_deref() == Some("signature")
         ));
         assert!(matches!(

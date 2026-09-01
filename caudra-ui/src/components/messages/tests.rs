@@ -4,7 +4,7 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
-use caudra_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
+use caudra_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME};
 use caudra_agent::{
     GrepFileEntry, GrepMatchGroup, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan,
     SpanStyle, ToolInput, ToolOutput,
@@ -1380,6 +1380,72 @@ fn completed_shell_output_toggles_between_filtered_and_raw_views() {
     assert!(text.contains("raw_8"));
     assert!(!text.contains("model_8"));
     assert!(text.contains("raw output · click for filtered"));
+}
+
+fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some("t1"))
+        .unwrap();
+    segment.chrome(80).content_start() + segment.shell_toggle_line.unwrap() as u16
+}
+
+/// The raw/filtered switch is a choice about the body, so re-opening a card
+/// has to return to the view the reader last picked.
+#[test_case(true; "raw survives")]
+#[test_case(false; "filtered survives")]
+fn collapsing_a_shell_card_remembers_its_raw_or_filtered_view(raw: bool) {
+    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
+    panel.tool_done(shell_done("t1", true));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    render(&mut panel, 80, 24);
+    if raw {
+        assert!(panel.toggle_expansion_at(shell_toggle_row(&panel), area));
+        render(&mut panel, 80, 24);
+    }
+    let chosen = seg_text(&panel, "t1").contains("raw_8");
+    assert_eq!(chosen, raw, "the test must set up the view it checks");
+
+    while !panel.expanded_tools.is_empty() {
+        assert!(panel.handle_click(0, area), "{COMPACT_REHIDE_MSG}");
+        render(&mut panel, 80, 24);
+    }
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    render(&mut panel, 80, 24);
+
+    assert_eq!(
+        seg_text(&panel, "t1").contains("raw_8"),
+        raw,
+        "{SHELL_VIEW_STICKY_MSG}"
+    );
+}
+
+#[test]
+fn hovering_the_raw_switch_reverses_it_instead_of_the_card_header() {
+    let mut panel = panel_with_tools(&[("t1", "shell")]);
+    panel.tool_done(shell_done("t1", true));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let row = shell_toggle_row(&panel);
+
+    panel.update_hover(row, area.x, area, false);
+
+    assert_eq!(
+        panel.hover_feedback_for_segment(
+            panel
+                .cache
+                .segments()
+                .iter()
+                .find(|s| s.tool_id.as_deref() == Some("t1"))
+                .unwrap()
+        ),
+        Some(HoverFeedback::ShellToggle),
+        "{SHELL_HOVER_MSG}"
+    );
 }
 
 #[test]
@@ -3420,4 +3486,347 @@ fn a_chart_that_fits_leaves_the_arrow_keys_alone() {
     assert!(panel.most_visible_diagram().is_none());
     assert!(!panel.pan_visible_diagram(PAN_STEP_TEST));
     assert!(!panel.pan_visible_diagram(-PAN_STEP_TEST));
+}
+
+const COMPACT_ROW_MSG: &str = "a compact tool call must occupy exactly one row";
+const COMPACT_GAPLESS_MSG: &str = "consecutive compact rows must stack without a blank line";
+const COMPACT_CLICK_MSG: &str = "a compact row must open on click";
+const COMPACT_RESET_MSG: &str = "flipping density must drop every per-item override";
+const COMPACT_REHIDE_MSG: &str = "clicking through a compact row must end back at its header";
+const COMPACT_HOVER_MSG: &str = "a compact row must highlight exactly when a click would act";
+const SHELL_VIEW_STICKY_MSG: &str =
+    "re-opening a shell card must restore the last raw/filtered view";
+const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
+const MAX_COMPACT_CLICK_CYCLE: usize = 4;
+
+fn compact_panel(ids: &[(&str, &'static str)]) -> MessagesPanel {
+    let mut panel = panel_with_tools(ids);
+    panel.set_compact(true);
+    panel
+}
+
+fn finished(panel: &mut MessagesPanel, ids: &[&str]) {
+    for id in ids {
+        panel.tool_done(done(id));
+    }
+}
+
+fn first_line_text(panel: &MessagesPanel, seg: usize) -> String {
+    panel.cache.get(seg).unwrap().lines()[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+#[test]
+fn a_compact_tool_call_collapses_to_one_row() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    assert_eq!(panel.segment_heights(), vec![1], "{COMPACT_ROW_MSG}");
+}
+
+#[test]
+fn compact_rows_stack_without_separator_lines() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME), ("t2", READ_TOOL_NAME)]);
+    finished(&mut panel, &["t1", "t2"]);
+    rebuild(&mut panel);
+
+    assert_eq!(panel.segment_heights(), vec![1, 1], "{COMPACT_GAPLESS_MSG}");
+}
+
+#[test]
+fn reasoning_and_wrapped_rows_join_the_compact_list() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_compact(true);
+    let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
+    thought.thinking_collapsed = true;
+    panel.push(thought);
+    let mut long = start("t1", READ_TOOL_NAME);
+    long.summary = "a/very/deeply/nested/path/that/has/to/wrap/at/this/width.md".into();
+    panel.tool_start(long);
+    panel.tool_done(done("t1"));
+    panel.tool_start(start("t2", GREP_TOOL_NAME));
+    panel.tool_done(done("t2"));
+    render(&mut panel, 40, 24);
+
+    assert!(
+        panel.segment_heights()[1] > 1,
+        "the long row must wrap: {:?}",
+        panel.segment_heights()
+    );
+    let margins: Vec<u16> = (0..panel.cache.len())
+        .map(|i| panel.cache.get(i).unwrap().chrome(40).margin_top)
+        .collect();
+    assert_eq!(margins, vec![0, 0, 0], "{COMPACT_GAPLESS_MSG}");
+}
+
+#[test]
+fn a_user_message_still_separates_from_the_compact_list() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "next question".into(),
+    ));
+    rebuild(&mut panel);
+
+    assert!(
+        panel.segment_heights()[1] > 1,
+        "a user bubble keeps its card padding"
+    );
+}
+
+#[test]
+fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    assert_eq!(first_line_text(&panel, 0), "✱ Grep t1 (1 lines)");
+}
+
+#[test]
+fn an_unknown_tool_falls_back_to_its_registered_name() {
+    let mut panel = compact_panel(&[("t1", "mystery_tool")]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    assert_eq!(first_line_text(&panel, 0), "⚙ mystery_tool t1 (1 lines)");
+}
+
+#[test]
+fn a_compact_row_lists_the_inputs_its_header_omits() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_compact(true);
+    let mut event = start("t1", READ_TOOL_NAME);
+    event.summary = "src/main.rs".into();
+    event.raw_input = Some(serde_json::json!({
+        "filePath": "src/main.rs",
+        "offset": 1,
+        "limit": 260,
+    }));
+    panel.tool_start(event);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    // Key order follows serde_json's map, which the workspace flips to
+    // insertion order via `preserve_order`; only membership is stable.
+    let line = first_line_text(&panel, 0);
+    assert!(line.contains("offset=1"), "{line}");
+    assert!(line.contains("limit=260"), "{line}");
+    assert!(
+        !line.contains("filePath"),
+        "the header already shows the path: {line}"
+    );
+}
+
+#[test]
+fn a_click_opens_one_compact_row_and_leaves_its_neighbour_alone() {
+    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME), ("t2", BASH_TOOL_NAME)]);
+    finished(&mut panel, &["t1", "t2"]);
+    rebuild(&mut panel);
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    rebuild(&mut panel);
+
+    assert!(
+        panel.segment_heights()[0] > 1,
+        "{COMPACT_CLICK_MSG}: {:?}",
+        panel.segment_heights()
+    );
+    assert_eq!(
+        panel.cache.get(1).unwrap().lines().len(),
+        1,
+        "{COMPACT_ROW_MSG}"
+    );
+}
+
+#[test]
+fn flipping_density_clears_opened_rows() {
+    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+    panel.handle_click(0, Rect::new(0, 0, 80, 24));
+    assert!(!panel.expanded_tools.is_empty());
+
+    panel.set_compact(false);
+
+    assert!(panel.expanded_tools.is_empty(), "{COMPACT_RESET_MSG}");
+}
+
+/// Hover feedback promises the click will do something, so the two must agree
+/// at every step of the compact cycle, not just on the closed header.
+#[test_case(GREP_TOOL_NAME; "short row")]
+#[test_case(BASH_TOOL_NAME; "truncated row")]
+fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str) {
+    let mut panel = compact_panel(&[("t1", tool)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+
+    for _ in 0..MAX_COMPACT_CLICK_CYCLE {
+        panel.update_hover(area.y, area.x, area, false);
+        let hovered = panel.hover.is_some();
+        assert_eq!(
+            hovered,
+            panel.handle_click(0, area),
+            "{COMPACT_HOVER_MSG} (expanded={:?})",
+            panel.expanded_tools.get("t1")
+        );
+        rebuild(&mut panel);
+    }
+}
+
+/// A short row opens on the first click and has nothing further to give, so
+/// the next click has to take it back to its header rather than do nothing.
+#[test]
+fn clicking_an_opened_compact_row_returns_it_to_its_header() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+    let header = panel.segment_heights()[0];
+
+    assert!(panel.handle_click(0, area));
+    assert!(panel.segment_heights()[0] > header, "the row should open");
+
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.segment_heights()[0], header, "{COMPACT_REHIDE_MSG}");
+    assert!(panel.expanded_tools.is_empty(), "{COMPACT_REHIDE_MSG}");
+}
+
+/// A row with a truncated body has a middle state, and the cycle still has to
+/// end back at the header instead of stalling on the fully expanded body.
+#[test]
+fn a_truncated_compact_row_cycles_back_to_its_header() {
+    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+    let header = panel.segment_heights()[0];
+
+    for _ in 0..MAX_COMPACT_CLICK_CYCLE {
+        assert!(panel.handle_click(0, area));
+        if panel.expanded_tools.is_empty() {
+            assert_eq!(panel.segment_heights()[0], header, "{COMPACT_REHIDE_MSG}");
+            return;
+        }
+    }
+    panic!("{COMPACT_REHIDE_MSG}");
+}
+
+#[test]
+fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    panel.set_compact(false);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    assert!(!panel.handle_click(0, Rect::new(0, 0, 80, 24)));
+}
+
+#[test]
+fn a_compact_row_with_nothing_to_show_ignores_clicks() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    rebuild(&mut panel);
+
+    assert!(!panel.handle_click(0, Rect::new(0, 0, 80, 24)));
+}
+
+#[test]
+fn compact_reasoning_reports_its_summary_and_duration() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_compact(true);
+    let mut msg = DisplayMessage::new(DisplayRole::Thinking, "**Weighing options**\n\nbody".into());
+    msg.thinking_collapsed = true;
+    msg.thinking_duration = Some(Duration::from_millis(9_700));
+    panel.push(msg);
+    rebuild(&mut panel);
+
+    assert_eq!(panel.segment_heights(), vec![1]);
+    assert_eq!(
+        first_line_text(&panel, 0),
+        "Thought: Weighing options · 9.7s"
+    );
+}
+
+#[test]
+fn untimed_reasoning_drops_the_duration_suffix() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_compact(true);
+    let mut msg = DisplayMessage::new(DisplayRole::Thinking, "just a thought".into());
+    msg.thinking_collapsed = true;
+    panel.push(msg);
+    rebuild(&mut panel);
+
+    assert_eq!(first_line_text(&panel, 0), "Thought: just a thought");
+}
+
+#[test]
+fn switching_to_compact_collapses_reasoning_that_show_thinking_had_open() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "reasoning".into(),
+    ));
+    rebuild(&mut panel);
+    assert!(!panel.messages[0].thinking_collapsed);
+
+    panel.set_compact(true);
+    rebuild(&mut panel);
+    assert!(panel.messages[0].thinking_collapsed);
+
+    panel.set_compact(false);
+    assert!(!panel.messages[0].thinking_collapsed, "{COMPACT_RESET_MSG}");
+}
+
+#[test]
+fn a_compact_thought_reopens_on_click_even_when_show_thinking_is_on() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        THINKING_TEXT.into(),
+    ));
+    panel.set_compact(true);
+    rebuild(&mut panel);
+
+    assert!(panel.handle_click(0, Rect::new(0, 0, 80, 24)));
+    assert!(!panel.messages[0].thinking_collapsed);
+}
+
+#[test]
+fn a_live_reasoning_block_records_how_long_it_ran() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.thinking_delta("reasoning");
+    panel.text_delta("answer");
+
+    assert!(panel.messages[0].thinking_duration.is_some());
+    assert!(panel.thinking_started.is_none());
+}
+
+#[test_case(Duration::from_millis(420), "Thought: t · 420ms" ; "sub_second_stays_in_millis")]
+#[test_case(Duration::from_millis(9_700), "Thought: t · 9.7s" ; "seconds_keep_one_decimal")]
+#[test_case(Duration::from_secs(125), "Thought: t · 2m 5s" ; "minutes_split_from_seconds")]
+fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &str) {
+    let line = &thought_line("t", Some(duration))[0];
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn expanded_density_keeps_the_status_dot_and_the_card() {
+    let mut panel = panel_with_tools(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    assert!(first_line_text(&panel, 0).starts_with("● grep> "));
+    assert!(panel.segment_heights()[0] > 1);
 }

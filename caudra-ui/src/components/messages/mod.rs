@@ -35,7 +35,7 @@ use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
@@ -54,6 +54,11 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+const THOUGHT_PREFIX: &str = "Thought";
+const THOUGHT_TITLE_FENCE: &str = "**";
+const THOUGHT_SUMMARY_CHARS: usize = 72;
+const MILLIS_PER_SECOND: u128 = 1_000;
+const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 const SHELL_LIVE_OUTPUT_LINES: usize = 12;
 
@@ -122,6 +127,10 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
+    /// Which shell cards the reader put into raw view. Kept apart from
+    /// `expanded_tools` because it is a choice about the body rather than an
+    /// expansion of it, so collapsing the card must not forget it.
+    shell_raw: HashSet<String>,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
     diagram_pans: HashMap<DiagramKey, u16>,
@@ -139,6 +148,16 @@ pub struct MessagesPanel {
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
     thinking_collapsed: bool,
+    /// Live-turn stand-in for the persisted reasoning duration: the agent only
+    /// stamps history once the turn lands, and the header wants a number while
+    /// the reply is still streaming.
+    thinking_started: Option<Instant>,
+    /// One line per tool call and per reasoning block. Absence from
+    /// `expanded_tools` means header-only, so a click still opens one item.
+    compact: bool,
+    /// Set when a density switch drops the cache under a scrolled-up reader,
+    /// and applied once the next rebuild gives the segment a height again.
+    pending_scroll_segment: Option<usize>,
     clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
@@ -181,6 +200,7 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
+            shell_raw: HashSet::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
@@ -191,6 +211,9 @@ impl MessagesPanel {
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
+            thinking_started: None,
+            compact: false,
+            pending_scroll_segment: None,
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
@@ -201,6 +224,58 @@ impl MessagesPanel {
 
     pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
+    }
+
+    /// Switching density drops every per-item override, so the shortcut that
+    /// flips the mode really does move the whole transcript.
+    pub fn set_compact(&mut self, compact: bool) {
+        if self.compact == compact {
+            return;
+        }
+        self.compact = compact;
+        self.clear_hover();
+        self.expanded_tools.clear();
+        for msg in &mut self.messages {
+            if matches!(msg.role, DisplayRole::Thinking) {
+                msg.thinking_collapsed = compact || !self.show_thinking;
+            }
+        }
+        self.thinking_collapsed = compact || !self.show_thinking;
+        // Anchor before the cache goes: the two densities have wildly
+        // different heights, so a raw line offset would land anywhere.
+        let anchor = self
+            .cache
+            .anchor_at(self.scroll_top as u32, self.viewport_width);
+        self.cache.clear();
+        if let Some((seg_idx, _)) = anchor.filter(|_| !self.auto_scroll) {
+            self.pending_scroll_segment = Some(seg_idx);
+        }
+    }
+
+    /// `None` means header-only, which only compact rows can be. The flags
+    /// inside say how much of the body an opened row shows.
+    fn tool_expansion(&self, tool_id: &str) -> Option<SectionFlags> {
+        let flags = self.expanded_tools.get(tool_id).copied();
+        let mut flags = if self.compact {
+            flags?
+        } else {
+            flags.unwrap_or_default()
+        };
+        flags.shell_raw = self.shell_raw.contains(tool_id);
+        Some(flags)
+    }
+
+    fn compact_collapsed(&self, tool_id: &str) -> bool {
+        self.compact && !self.expanded_tools.contains_key(tool_id)
+    }
+
+    /// Whether a click on the row would change anything. Hover feedback and
+    /// the click share this, or a row highlights and then ignores the press.
+    fn tool_click_acts(&self, tool_id: &str, truncation: SectionFlags) -> bool {
+        // An opened compact row always has its header left to collapse to.
+        (self.compact && self.expanded_tools.contains_key(tool_id))
+            || truncation.any()
+            || self.tool_expansion(tool_id).is_some_and(SectionFlags::any)
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -270,6 +345,7 @@ impl MessagesPanel {
 
     pub fn thinking_delta(&mut self, text: &str) {
         self.clear_hover();
+        self.thinking_started.get_or_insert_with(Instant::now);
         self.streaming_thinking.push(text);
     }
 
@@ -480,26 +556,22 @@ impl MessagesPanel {
             return;
         }
         let inst_id = segment::instruction_id(parent_id);
-        let exp = self
-            .expanded_tools
-            .get(&inst_id)
-            .copied()
-            .unwrap_or_default();
+        let exp = self.tool_expansion(&inst_id).map(|flags| flags.output);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
-        let tl = build_instructions_lines(blocks, width, exp.output);
+        let tl = build_instructions_lines(blocks, width, exp);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let seg = self.cache.get_mut(seg_idx).unwrap();
             seg.search_text = tl.search_text.clone();
-            seg.update_with_reuse(tl, &self.hl_worker);
+            seg.update_with_reuse(tl, &self.hl_worker, self.compact);
         } else {
             let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction);
             seg.search_text = tl.search_text.clone();
-            seg.apply_highlight(tl, &self.hl_worker);
+            seg.apply_highlight(tl, &self.hl_worker, self.compact);
             self.cache.insert(parent_idx + 1, seg);
         }
-        self.cache.update_margins(self.viewport_width);
+        self.cache.update_margins(self.viewport_width, self.compact);
     }
 
     fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
@@ -514,6 +586,7 @@ impl MessagesPanel {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.thinking_collapsed = !self.show_thinking;
+        self.thinking_started = None;
         self.cancel_in_progress();
     }
 
@@ -868,13 +941,10 @@ impl MessagesPanel {
                 .then_some(HoverTarget::CachedThinking(msg_index));
         };
 
-        let expanded = self
-            .expanded_tools
-            .get(tool_id)
-            .copied()
-            .unwrap_or_default();
-        let native_toggle =
-            !self.has_snapshot(tool_id) && (segment.truncation.any() || expanded.any());
+        // A compact snapshot tool has not reached Lua yet, so the first click
+        // is served locally and the row has to advertise itself.
+        let native_toggle = (!self.has_snapshot(tool_id) || self.compact_collapsed(tool_id))
+            && self.tool_click_acts(tool_id, segment.truncation);
         let shell_toggle = segment
             .shell_toggle_line
             .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
@@ -882,7 +952,7 @@ impl MessagesPanel {
             return None;
         }
         let feedback = if shell_toggle {
-            HoverFeedback::Chrome
+            HoverFeedback::ShellToggle
         } else if native_toggle
             && segment.lines().iter().any(|line| {
                 line.spans
@@ -1059,7 +1129,7 @@ impl MessagesPanel {
             _ => self.diagram_pans.insert(key, next),
         };
         self.reflow_text_segment(seg_idx, width);
-        self.cache.update_margins(width);
+        self.cache.update_margins(width, self.compact);
         true
     }
 
@@ -1106,6 +1176,21 @@ impl MessagesPanel {
             return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
+        // The first click on a compact row only reveals the body, which is
+        // what an expanded row shows unopened. Lua-rendered tools included:
+        // their snapshot is already here, so the runtime stays out of it
+        // until the reader asks for more.
+        if self.compact_collapsed(tool_id) {
+            if !seg.truncation.any() {
+                return false;
+            }
+            let tool_id = tool_id.to_owned();
+            self.expanded_tools
+                .insert(tool_id.clone(), SectionFlags::default());
+            self.rebuild_expanded_tool(&tool_id);
+            return true;
+        }
+
         if self.has_snapshot(tool_id) {
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
@@ -1142,26 +1227,26 @@ impl MessagesPanel {
             return true;
         }
 
-        let exp = self
-            .expanded_tools
-            .get(tool_id)
-            .copied()
-            .unwrap_or_default();
+        let exp = self.tool_expansion(tool_id).unwrap_or_default();
         let shell_toggle = seg
             .shell_toggle_line
             .is_some_and(|line| seg.source_line_at(rel, width) == Some(line));
         if shell_toggle {
             let tool_id = tool_id.to_owned();
-            let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
-            entry.shell_raw = !entry.shell_raw;
+            if !self.shell_raw.remove(&tool_id) {
+                self.shell_raw.insert(tool_id.clone());
+            }
             self.rebuild_expanded_tool(&tool_id);
             return true;
         }
-        if !seg.truncation.any() && !exp.any() {
-            return false;
-        }
+        let nothing_to_open = !seg.truncation.any() && !exp.any();
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
+        if nothing_to_open {
+            // An expanded row is already at rest, but a compact one still has
+            // its header to fall back to.
+            return self.compact && self.collapse_to_compact_header(&tool_id);
+        }
 
         let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
         if truncation.output || entry.output {
@@ -1169,7 +1254,20 @@ impl MessagesPanel {
         } else if truncation.script || entry.script {
             entry.script = !entry.script;
         }
+        if self.compact && !entry.any() {
+            return self.collapse_to_compact_header(&tool_id);
+        }
         self.rebuild_expanded_tool(&tool_id);
+        true
+    }
+
+    /// Closing the last open section drops the override entirely, which is
+    /// what returns a compact row to the single line it started as.
+    fn collapse_to_compact_header(&mut self, tool_id: &str) -> bool {
+        if self.expanded_tools.remove(tool_id).is_none() {
+            return false;
+        }
+        self.rebuild_expanded_tool(tool_id);
         true
     }
 
@@ -1283,6 +1381,9 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
+        if let Some(seg_idx) = self.pending_scroll_segment.take() {
+            self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
+        }
         if self.in_progress_count() > 0 {
             self.update_spinners();
         }
@@ -1335,10 +1436,10 @@ impl MessagesPanel {
         // The reflow window is picked from `scroll_top` and the bottom pin,
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
-        self.cache.update_margins(width);
+        self.cache.update_margins(width, self.compact);
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
-        self.cache.update_margins(width);
+        self.cache.update_margins(width, self.compact);
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
         if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
             self.clear_hover();
@@ -1690,11 +1791,17 @@ impl MessagesPanel {
     }
 
     fn rctx(&self) -> RenderCtx<'_> {
+        let kind = if self.compact {
+            SegmentKind::ToolInline
+        } else {
+            SegmentKind::ToolBlock
+        };
         RenderCtx {
             started_at: self.started_at,
-            width: SegmentChrome::for_kind(SegmentKind::ToolBlock, self.viewport_width, 0)
+            width: SegmentChrome::for_kind(kind, self.viewport_width, 0)
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
+            compact: self.compact,
         }
     }
 
@@ -1723,10 +1830,13 @@ impl MessagesPanel {
         msg: &DisplayMessage,
         status: ToolStatus,
         rctx: &RenderCtx,
-        exp: SectionFlags,
+        exp: Option<SectionFlags>,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
+        // A compact row is meant to be scannable, and a right-aligned clock
+        // on every line is the opposite of that.
         if let Some(ts) = &msg.timestamp
+            && !rctx.compact
             && !tl.lines.is_empty()
         {
             append_right_info(
@@ -1741,21 +1851,36 @@ impl MessagesPanel {
     }
 
     fn flush_thinking(&mut self) {
+        let started = self.thinking_started.take();
         if self.streaming_thinking.is_empty() {
             return;
         }
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
         msg.thinking_collapsed = self.thinking_collapsed;
+        msg.thinking_duration = started.map(|started| started.elapsed());
         self.thinking_collapsed = !self.show_thinking;
         self.messages.push(msg);
     }
 
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
+        if self.compact {
+            return thought_line(
+                self.streaming_thinking.buffer(),
+                self.thinking_started.map(|started| started.elapsed()),
+            );
+        }
         thinking_indicator(self.streaming_thinking.line_count())
     }
 
-    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
+    fn build_cached_thinking_indicator(
+        &self,
+        text: &str,
+        duration: Option<Duration>,
+    ) -> Vec<Line<'static>> {
+        if self.compact {
+            return thought_line(text, duration);
+        }
         thinking_indicator(logical_line_count(text))
     }
 
@@ -1782,7 +1907,7 @@ impl MessagesPanel {
     }
 
     fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking {
+        if self.show_thinking && !self.compact {
             return false;
         }
         let Some(idx) = msg_idx else { return false };
@@ -1798,15 +1923,15 @@ impl MessagesPanel {
     }
 
     fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
-        let Some((text, collapsed)) = self
+        let Some((text, collapsed, duration)) = self
             .messages
             .get(msg_idx)
-            .map(|m| (m.text.clone(), m.thinking_collapsed))
+            .map(|m| (m.text.clone(), m.thinking_collapsed, m.thinking_duration))
         else {
             return;
         };
         let (lines, links) = if collapsed {
-            let lines = self.build_cached_thinking_indicator(&text);
+            let lines = self.build_cached_thinking_indicator(&text, duration);
             let links = LinkMap::none_for(&lines);
             (lines, links)
         } else {
@@ -1881,11 +2006,7 @@ impl MessagesPanel {
             return;
         };
 
-        let exp = self
-            .expanded_tools
-            .get(tool_id)
-            .copied()
-            .unwrap_or_default();
+        let exp = self.tool_expansion(tool_id);
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
@@ -1896,12 +2017,12 @@ impl MessagesPanel {
 
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
-        seg.update_with_reuse(tl, &self.hl_worker);
+        seg.update_with_reuse(tl, &self.hl_worker, self.compact);
 
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
-        self.cache.update_margins(self.viewport_width);
+        self.cache.update_margins(self.viewport_width, self.compact);
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -1912,14 +2033,14 @@ impl MessagesPanel {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
+                let exp = self.tool_expansion(&t.id);
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
                 let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock);
                 seg.search_text = search_text;
-                seg.apply_highlight(tl, &self.hl_worker);
+                seg.apply_highlight(tl, &self.hl_worker, self.compact);
                 self.cache.push(seg);
 
                 let blocks = msg
@@ -1932,8 +2053,8 @@ impl MessagesPanel {
                 }
             } else {
                 if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
-                    let text = msg.text.clone();
-                    let lines = self.build_cached_thinking_indicator(&text);
+                    let (text, duration) = (msg.text.clone(), msg.thinking_duration);
+                    let lines = self.build_cached_thinking_indicator(&text, duration);
                     let search_text = format!("thinking> {text}");
                     let mut segment = Segment::with_lines(lines, search_text, Some(i));
                     segment.set_links(LinkMap::none_for(segment.lines()));
@@ -1950,7 +2071,7 @@ impl MessagesPanel {
                 self.cache.push(segment);
             }
         }
-        self.cache.update_margins(self.viewport_width);
+        self.cache.update_margins(self.viewport_width, self.compact);
         self.cache.mark_built(self.messages.len());
     }
 
@@ -2138,6 +2259,61 @@ fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
             Span::styled("(click to expand)", theme.thinking),
         ]),
     ]
+}
+
+/// The compact form: `Thought: <summary> · 9.7s`, or `Thinking` while the
+/// block is still arriving and has no summary to show yet.
+fn thought_line(text: &str, duration: Option<Duration>) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut spans = vec![Span::styled(THOUGHT_PREFIX, theme.thinking)];
+    if let Some(summary) = reasoning_summary(text) {
+        spans.push(Span::styled(format!(": {summary}"), theme.thinking));
+    }
+    if let Some(duration) = duration {
+        spans.push(Span::styled(
+            format!(" · {}", format_thought_duration(duration)),
+            theme.tool_dim,
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
+/// Reasoning summaries from the OpenAI Responses API open with a bolded
+/// title (`**Weighing options**\n\n…`); everything else gets its first
+/// non-empty line. Either way the result is one clause, not a paragraph.
+fn reasoning_summary(text: &str) -> Option<String> {
+    let first = text
+        .trim_start()
+        .lines()
+        .find(|line| !line.trim().is_empty())?;
+    let summary = first
+        .trim()
+        .trim_start_matches(THOUGHT_TITLE_FENCE)
+        .trim_end_matches(THOUGHT_TITLE_FENCE)
+        .trim();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(match summary.char_indices().nth(THOUGHT_SUMMARY_CHARS) {
+        Some((cut, _)) => format!("{}…", &summary[..cut]),
+        None => summary.to_owned(),
+    })
+}
+
+fn format_thought_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < MILLIS_PER_SECOND {
+        return format!("{millis}ms");
+    }
+    let seconds = duration.as_secs_f64();
+    if duration.as_secs() < SECONDS_PER_MINUTE {
+        return format!("{seconds:.1}s");
+    }
+    format!(
+        "{}m {}s",
+        duration.as_secs() / SECONDS_PER_MINUTE,
+        duration.as_secs() % SECONDS_PER_MINUTE
+    )
 }
 
 fn logical_line_count(text: &str) -> usize {

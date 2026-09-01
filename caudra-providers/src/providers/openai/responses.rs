@@ -498,10 +498,7 @@ pub(crate) async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
+        content_blocks.push(ContentBlock::thinking(reasoning_text, None));
     }
 
     if !text.is_empty() {

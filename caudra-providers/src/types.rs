@@ -152,6 +152,11 @@ pub enum ContentBlock {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// Wall time the model spent producing this block. Host-only: the
+        /// derived `Serialize` is what Anthropic's wire encoder falls back
+        /// to, so anything not skipped here lands in the request body.
+        #[serde(skip)]
+        duration_ms: Option<u64>,
     },
     RedactedThinking {
         data: String,
@@ -179,6 +184,16 @@ pub enum ContentBlock {
 impl ContentBlock {
     pub fn is_thinking(&self) -> bool {
         matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+    }
+
+    /// Untimed thinking. Only the streaming path knows how long a block took,
+    /// so every other producer goes through here.
+    pub fn thinking(thinking: String, signature: Option<String>) -> Self {
+        Self::Thinking {
+            thinking,
+            signature,
+            duration_ms: None,
+        }
     }
 }
 
@@ -1447,10 +1462,7 @@ mod tests {
 
     #[test]
     fn thinking_serde_no_signature_omits_field() {
-        let block = ContentBlock::Thinking {
-            thinking: "x".into(),
-            signature: None,
-        };
+        let block = ContentBlock::thinking("x".into(), None);
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
     }

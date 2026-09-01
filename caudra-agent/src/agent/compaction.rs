@@ -638,10 +638,7 @@ mod tests {
         let mut messages = vec![Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Thinking {
-                    thinking: "hmm".into(),
-                    signature: Some("sig".into()),
-                },
+                ContentBlock::thinking("hmm".into(), Some("sig".into())),
                 ContentBlock::Text {
                     text: "hello".into(),
                 },

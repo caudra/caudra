@@ -360,6 +360,9 @@ pub struct DisplayMessage {
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
     pub thinking_collapsed: bool,
+    /// Wall time the model spent on a `Thinking` block. Absent for sessions
+    /// written before reasoning was timed.
+    pub thinking_duration: Option<Duration>,
 }
 
 impl DisplayMessage {
@@ -381,6 +384,7 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 
@@ -402,6 +406,7 @@ impl DisplayMessage {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            thinking_duration: None,
         }
     }
 

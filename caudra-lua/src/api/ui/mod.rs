@@ -280,7 +280,8 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`.
+/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"copy_message"`,
+/// `"review"`, `"view_toggle"`.
 ///
 /// For slash commands rather than keybound actions, see
 /// `caudra.api.run_command`.

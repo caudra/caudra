@@ -289,10 +289,8 @@ impl Segment {
         Some(self.lines[s..e].to_vec())
     }
 
-    pub fn apply_highlight(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
-        if self.kind != SegmentKind::Instruction {
-            self.set_kind(tool_kind(&tl));
-        }
+    pub fn apply_highlight(&mut self, mut tl: ToolLines, worker: &RenderWorker, compact: bool) {
+        self.set_kind(tool_kind(self.kind, &tl, compact));
         self.pending_highlight = tl.send_highlight(worker);
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
@@ -306,10 +304,8 @@ impl Segment {
         self.set_links(links);
     }
 
-    pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker) {
-        if self.kind != SegmentKind::Instruction {
-            self.set_kind(tool_kind(&tl));
-        }
+    pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker, compact: bool) {
+        self.set_kind(tool_kind(self.kind, &tl, compact));
         let key = HighlightKey::from_request(tl.highlight.as_ref());
         let reused = tl.highlight.as_ref().and_then(|req| {
             let hl_lines = self.reuse_highlight(&key, req.range)?;
@@ -335,7 +331,7 @@ impl Segment {
             self.shell_toggle_line = tl.shell_toggle_line;
             self.content_indent = tl.content_indent;
         } else {
-            self.apply_highlight(tl, worker);
+            self.apply_highlight(tl, worker, compact);
         }
     }
 
@@ -395,7 +391,15 @@ impl Segment {
     }
 }
 
-fn tool_kind(lines: &ToolLines) -> SegmentKind {
+/// Compact rows are always inline: the kind is what strips the card rail and
+/// the padding that would otherwise separate every call by a blank line.
+fn tool_kind(current: SegmentKind, lines: &ToolLines, compact: bool) -> SegmentKind {
+    if compact {
+        return SegmentKind::ToolInline;
+    }
+    if current == SegmentKind::Instruction {
+        return current;
+    }
     if lines.lines.len() == 1
         && lines.highlight.is_none()
         && lines.snapshot_base.is_none()
@@ -405,6 +409,15 @@ fn tool_kind(lines: &ToolLines) -> SegmentKind {
     } else {
         SegmentKind::ToolBlock
     }
+}
+
+/// Single-line tool rows read as a list, so they sit flush against each other.
+/// Compact folds reasoning into that list and drops the height condition:
+/// every row there is one entry, and a wrapped one is still one entry.
+fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16), compact: bool) -> bool {
+    let dense =
+        |kind| kind == SegmentKind::ToolInline || (compact && kind == SegmentKind::Thinking);
+    dense(previous.0) && dense(current.0) && (compact || (previous.1 <= 1 && current.1 <= 1))
 }
 
 pub(super) struct SegmentCache {
@@ -507,20 +520,15 @@ impl SegmentCache {
         self.segments.len()
     }
 
-    pub fn update_margins(&mut self, width: u16) {
+    pub fn update_margins(&mut self, width: u16, compact: bool) {
         let mut previous = None;
         for segment in &mut self.segments {
-            let segment_height = segment.content_height(width);
-            let margin = previous.map_or(0, |(kind, previous_height)| {
-                u16::from(
-                    segment.kind() != SegmentKind::ToolInline
-                        || kind != SegmentKind::ToolInline
-                        || previous_height > 1
-                        || segment_height > 1,
-                )
+            let current = (segment.kind(), segment.content_height(width));
+            let margin = previous.map_or(0, |previous| {
+                u16::from(!stacks_flush(previous, current, compact))
             });
             segment.set_margin_top(margin);
-            previous = Some((segment.kind(), segment_height));
+            previous = Some(current);
         }
     }
 
@@ -576,7 +584,7 @@ mod tests {
         cache.push(inline_tool("first".into()));
         cache.push(inline_tool("second".into()));
 
-        cache.update_margins(80);
+        cache.update_margins(80, false);
 
         assert_eq!(cache.segments[0].margin_top, 0);
         assert_eq!(cache.segments[1].margin_top, 0);
@@ -588,7 +596,7 @@ mod tests {
         cache.push(inline_tool("x".repeat(80)));
         cache.push(inline_tool("next".into()));
 
-        cache.update_margins(40);
+        cache.update_margins(40, false);
 
         assert_eq!(cache.segments[1].margin_top, 1);
     }
@@ -599,7 +607,7 @@ mod tests {
         cache.push(inline_tool("first".into()));
         cache.push(inline_tool("x".repeat(80)));
 
-        cache.update_margins(40);
+        cache.update_margins(40, false);
 
         assert_eq!(cache.segments[1].margin_top, 1);
     }

@@ -1382,10 +1382,7 @@ data: {\"type\":\"content_block_stop\"}\n";
     }
 
     fn thinking_block(thinking: &str) -> ContentBlock {
-        ContentBlock::Thinking {
-            thinking: thinking.into(),
-            signature: None,
-        }
+        ContentBlock::thinking(thinking.into(), None)
     }
 
     fn output_ref() -> ToolOutputRef {
@@ -1709,7 +1706,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 .unwrap();
 
             assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature, .. }
                     if thinking == "Let me think" && *signature == Some("sig123".to_string()))
             );
             assert!(

@@ -29,12 +29,30 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
+/// Streamed assistant text plus one duration per contiguous run of thinking
+/// deltas, in emission order.
+struct ForwardedStream {
+    streamed: String,
+    reasoning: Vec<Duration>,
+}
+
+/// Only Anthropic's SSE parser exposes reasoning block boundaries, so the
+/// durations are timed here instead, where every provider looks the same: a
+/// run starts on the first thinking delta and ends when anything else
+/// arrives or the stream closes.
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: Option<&EventSender>,
-) -> String {
+) -> ForwardedStream {
     let mut streamed = String::new();
+    let mut reasoning = Vec::new();
+    let mut run_started: Option<Instant> = None;
     while let Ok(pe) = prx.recv_async().await {
+        if matches!(pe, ProviderEvent::ThinkingDelta { .. }) {
+            run_started.get_or_insert_with(Instant::now);
+        } else if let Some(started) = run_started.take() {
+            reasoning.push(started.elapsed());
+        }
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
@@ -59,7 +77,30 @@ async fn forward_provider_events(
             break;
         }
     }
-    streamed
+    if let Some(started) = run_started {
+        reasoning.push(started.elapsed());
+    }
+    ForwardedStream {
+        streamed,
+        reasoning,
+    }
+}
+
+/// Providers append thinking blocks in the order their deltas arrive, so the
+/// n-th timed run belongs to the n-th thinking block. A mismatch leaves the
+/// extra blocks untimed rather than mispairing them.
+fn attach_reasoning_durations(message: &mut Message, durations: &[Duration]) {
+    let blocks = message
+        .content
+        .iter_mut()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { duration_ms, .. } => Some(duration_ms),
+            _ => None,
+        })
+        .take(durations.len());
+    for (slot, duration) in blocks.zip(durations) {
+        *slot = Some(duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    }
 }
 
 /// Cancelling mid-stream carries the text the user still sees on screen,
@@ -170,10 +211,14 @@ async fn stream_with_retry_inner(
         )
         .await;
         drop(ptx);
-        let streamed = forwarder.await;
+        let ForwardedStream {
+            streamed,
+            reasoning,
+        } = forwarder.await;
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
+                attach_reasoning_durations(&mut r.message, &reasoning);
                 emit_api_request(model, &r, opts, started.elapsed());
                 return Ok(r);
             }
@@ -288,6 +333,84 @@ mod tests {
         canonicalize_tool_names(&mut message);
         let names: Vec<&str> = message.tool_uses().map(|(_, name, _)| name).collect();
         assert_eq!(names, ["bash", "read", "my_functions.x"]);
+    }
+
+    fn thinking_durations(message: &Message) -> Vec<Option<u64>> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn thinking_message(blocks: usize) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: (0..blocks)
+                .map(|_| ContentBlock::thinking(String::new(), None))
+                .chain([ContentBlock::Text { text: "hi".into() }])
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_durations_pair_with_thinking_blocks_in_order() {
+        let mut message = thinking_message(2);
+        attach_reasoning_durations(
+            &mut message,
+            &[Duration::from_millis(9_700), Duration::from_millis(1_800)],
+        );
+        assert_eq!(thinking_durations(&message), [Some(9_700), Some(1_800)]);
+    }
+
+    #[test]
+    fn surplus_thinking_blocks_stay_untimed() {
+        let mut message = thinking_message(3);
+        attach_reasoning_durations(&mut message, &[Duration::from_millis(42)]);
+        assert_eq!(thinking_durations(&message), [Some(42), None, None]);
+    }
+
+    #[test]
+    fn surplus_durations_are_dropped() {
+        let mut message = thinking_message(1);
+        attach_reasoning_durations(
+            &mut message,
+            &[Duration::from_millis(42), Duration::from_millis(7)],
+        );
+        assert_eq!(thinking_durations(&message), [Some(42)]);
+    }
+
+    #[test]
+    fn thinking_runs_are_timed_separately_and_flushed_at_stream_end() {
+        let (tx, rx) = flume::unbounded();
+        for event in [
+            ProviderEvent::ThinkingDelta { text: "a".into() },
+            ProviderEvent::ThinkingDelta { text: "b".into() },
+            ProviderEvent::TextDelta { text: "x".into() },
+            ProviderEvent::ThinkingDelta { text: "c".into() },
+        ] {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+
+        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        assert_eq!(forwarded.streamed, "x");
+        assert_eq!(forwarded.reasoning.len(), 2);
+    }
+
+    #[test]
+    fn a_stream_without_reasoning_reports_no_durations() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(ProviderEvent::TextDelta { text: "x".into() })
+            .unwrap();
+        drop(tx);
+
+        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        assert!(forwarded.reasoning.is_empty());
     }
 
     #[test]

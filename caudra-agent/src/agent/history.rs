@@ -930,10 +930,7 @@ mod tests {
         let mut assistant = make_tool_use_msg(&["t1"]);
         assistant.content.insert(
             0,
-            ContentBlock::Thinking {
-                thinking: "signed reasoning".into(),
-                signature: Some("signature".into()),
-            },
+            ContentBlock::thinking("signed reasoning".into(), Some("signature".into())),
         );
         let assistant_before = serde_json::to_value(&assistant).unwrap();
         let messages = vec![

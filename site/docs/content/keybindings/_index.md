@@ -22,6 +22,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
+| `Alt+V` | Toggle compact / expanded transcript |
 | `Ctrl+M` / `Alt+M` | Model picker |
 
 ## Editing

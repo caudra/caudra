@@ -1093,10 +1093,7 @@ mod tests {
     }
 
     fn thinking_response() -> StreamResponse {
-        assistant_response(vec![ContentBlock::Thinking {
-            thinking: "stalled".into(),
-            signature: None,
-        }])
+        assistant_response(vec![ContentBlock::thinking("stalled".into(), None)])
     }
 
     fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {

@@ -473,6 +473,7 @@ pub enum BuiltinAction {
     ModelPicker,
     CopyMessage,
     Review,
+    ViewToggle,
 }
 
 pub enum UiAction {
