@@ -881,6 +881,10 @@ impl App {
                     .permissions
                     .answer(&decision.request_id, decision.answer)
                     || transient
+                    || self
+                        .permissions
+                        .pending_request(&decision.request_id)
+                        .is_none()
                 {
                     self.permission_prompt.resolve(&decision.request_id);
                 } else {
@@ -2220,6 +2224,11 @@ impl App {
             return vec![];
         }
 
+        if let ChatEventResult::PermissionRequestResolved { request_id } = result {
+            self.permission_prompt.resolve_pending(&request_id);
+            return vec![];
+        }
+
         if let ChatEventResult::AuthRequired = result {
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
@@ -2275,6 +2284,7 @@ impl App {
                 }
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest(_)
+                | ChatEventResult::PermissionRequestResolved { .. }
                 | ChatEventResult::QueueItemConsumed { .. }
                 | ChatEventResult::QueueBatchConsumed { .. } => unreachable!(),
                 ChatEventResult::Continue => {}

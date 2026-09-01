@@ -118,6 +118,9 @@ pub enum ChatEventResult {
     },
     Error(String),
     PermissionRequest(Box<PermissionRequest>),
+    PermissionRequestResolved {
+        request_id: String,
+    },
     AuthRequired,
 }
 
@@ -278,6 +281,9 @@ impl Chat {
             }
             AgentEvent::PermissionRequest(request) => {
                 return ChatEventResult::PermissionRequest(request);
+            }
+            AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                return ChatEventResult::PermissionRequestResolved { request_id };
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;

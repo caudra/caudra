@@ -843,6 +843,10 @@ pub enum AgentEvent {
         message: String,
     },
     PermissionRequest(Box<PermissionRequest>),
+    PermissionRequestResolved {
+        request_id: String,
+        source_request_id: String,
+    },
     AuthRequired,
     Nudge,
     SubagentHistory {

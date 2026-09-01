@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use caudra_config::{
@@ -34,6 +34,7 @@ pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const BASH_WORKDIR_SCOPE_MARKER: &str = " # caudra-workdir[";
 const BASH_WORKDIR_FRAME_MARKER: &str = " # caudra-frame[";
+static NEXT_PERMISSION_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 const PROJECT_READ_TOOLS: &[&str] = &[
     "file_glob",
     "file_grep",
@@ -286,11 +287,12 @@ impl PluginRuleStore {
 }
 
 pub struct PermissionManager {
+    id: u64,
     session_rules: Mutex<Vec<PermissionRule>>,
     inactive_session_allows: Mutex<Vec<PermissionRule>>,
     structured_conversation_rules: Mutex<Vec<PermissionRuleRecord>>,
     conversation_policy_error: Mutex<Option<String>>,
-    pending: Mutex<HashMap<String, PendingPermission>>,
+    broker: Arc<PermissionBroker>,
     config_rules: Vec<PermissionRule>,
     review_candidates: Vec<PermissionReviewCandidate>,
     yolo: AtomicBool,
@@ -303,7 +305,7 @@ pub struct PermissionManager {
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     project: Mutex<ProjectContext>,
-    policy: Option<Arc<Mutex<SharedPolicy>>>,
+    policy: Option<Arc<SharedPermissionState>>,
     plugin_rules: Arc<PluginRuleStore>,
 }
 
@@ -320,9 +322,24 @@ struct SharedPolicy {
     error: Option<String>,
 }
 
+#[derive(Default)]
+struct PermissionBroker(Mutex<HashMap<u64, HashMap<String, PendingPermission>>>);
+
+struct SharedPermissionState {
+    policy: Mutex<SharedPolicy>,
+    broker: Arc<PermissionBroker>,
+}
+
 struct PendingPermission {
     request: PermissionRequest,
-    sender: flume::Sender<PermissionAnswer>,
+    project: Option<PathBuf>,
+    event_tx: EventSender,
+    sender: flume::Sender<PendingDecision>,
+}
+
+enum PendingDecision {
+    Explicit(PermissionAnswer),
+    MatchedRule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,14 +360,14 @@ pub struct EffectivePermissionRule {
 #[error("structured permission policy unavailable: {0}")]
 pub struct PermissionPolicyError(String);
 
-type SharedPolicies = HashMap<PathBuf, Weak<Mutex<SharedPolicy>>>;
+type SharedPolicies = HashMap<PathBuf, Weak<SharedPermissionState>>;
 
 fn shared_policies() -> &'static Mutex<SharedPolicies> {
     static POLICIES: OnceLock<Mutex<SharedPolicies>> = OnceLock::new();
     POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn shared_policy(state_dir: StateDir) -> Arc<Mutex<SharedPolicy>> {
+fn shared_policy(state_dir: StateDir) -> Arc<SharedPermissionState> {
     let key = caudra_storage::paths::normalize_path(&state_dir.path().join(PERMISSION_STATE_FILE));
     let mut policies = shared_policies().lock().unwrap_or_else(|error| {
         warn!("permission policy registry mutex was poisoned, recovering");
@@ -360,16 +377,19 @@ fn shared_policy(state_dir: StateDir) -> Arc<Mutex<SharedPolicy>> {
         return policy;
     }
     policies.retain(|_, policy| policy.strong_count() > 0);
-    let policy = Arc::new(Mutex::new(match PermissionState::open(&state_dir) {
-        Ok(state) => SharedPolicy {
-            state: Some(state),
-            error: None,
-        },
-        Err(error) => SharedPolicy {
-            state: None,
-            error: Some(error.to_string()),
-        },
-    }));
+    let policy = Arc::new(SharedPermissionState {
+        policy: Mutex::new(match PermissionState::open(&state_dir) {
+            Ok(state) => SharedPolicy {
+                state: Some(state),
+                error: None,
+            },
+            Err(error) => SharedPolicy {
+                state: None,
+                error: Some(error.to_string()),
+            },
+        }),
+        broker: Arc::default(),
+    });
     policies.insert(key, Arc::downgrade(&policy));
     policy
 }
@@ -392,6 +412,36 @@ impl SharedPolicy {
         self.state
             .as_mut()
             .ok_or_else(|| PermissionPolicyError("state was not initialized".into()))
+    }
+}
+
+fn remove_pending(
+    pending: &mut HashMap<u64, HashMap<String, PendingPermission>>,
+    manager_id: u64,
+    request_id: &str,
+) -> Option<PendingPermission> {
+    let requests = pending.get_mut(&manager_id)?;
+    let removed = requests.remove(request_id);
+    if requests.is_empty() {
+        pending.remove(&manager_id);
+    }
+    removed
+}
+
+fn reusable_rule_scope_matches(
+    lifetime: &PermissionLifetime,
+    source_manager_id: u64,
+    source_project: Option<&Path>,
+    candidate_manager_id: u64,
+    candidate_project: Option<&Path>,
+) -> bool {
+    match lifetime {
+        PermissionLifetime::Once => false,
+        PermissionLifetime::Conversation => source_manager_id == candidate_manager_id,
+        PermissionLifetime::Project => {
+            source_project.is_some() && source_project == candidate_project
+        }
+        PermissionLifetime::Global => true,
     }
 }
 
@@ -461,7 +511,7 @@ impl PermissionManager {
         config: PermissionsConfig,
         cwd: PathBuf,
         plugin_rules: Arc<PluginRuleStore>,
-        policy: Option<Arc<Mutex<SharedPolicy>>>,
+        policy: Option<Arc<SharedPermissionState>>,
         policy_context_error: Option<String>,
     ) -> Self {
         let config_rules = config.rules;
@@ -492,11 +542,15 @@ impl PermissionManager {
         }
 
         Self {
+            id: NEXT_PERMISSION_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
             session_rules: Mutex::new(Vec::new()),
             inactive_session_allows: Mutex::new(Vec::new()),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            broker: policy
+                .as_ref()
+                .map(|state| Arc::clone(&state.broker))
+                .unwrap_or_default(),
             config_rules,
             review_candidates,
             yolo: AtomicBool::new(config.yolo),
@@ -560,11 +614,12 @@ impl PermissionManager {
     pub fn fork(&self) -> Self {
         let project = self.project().clone();
         Self {
+            id: NEXT_PERMISSION_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
             session_rules: Mutex::new(Vec::new()),
             inactive_session_allows: Mutex::new(Vec::new()),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            broker: Arc::clone(&self.broker),
             config_rules: self.config_rules.clone(),
             review_candidates: self.review_candidates.clone(),
             yolo: AtomicBool::new(self.is_yolo()),
@@ -596,8 +651,10 @@ impl PermissionManager {
             })
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingPermission>> {
-        self.pending.lock().unwrap_or_else(|error| {
+    fn pending(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u64, HashMap<String, PendingPermission>>> {
+        self.broker.0.lock().unwrap_or_else(|error| {
             warn!("permission request mutex was poisoned, recovering");
             error.into_inner()
         })
@@ -605,30 +662,87 @@ impl PermissionManager {
 
     pub fn answer(&self, request_id: &str, answer: PermissionAnswer) -> bool {
         let mut pending = self.pending();
-        let Some(request) = pending.get(request_id) else {
+        let Some((request, project)) = pending
+            .get(&self.id)
+            .and_then(|requests| requests.get(request_id))
+            .map(|pending| (pending.request.clone(), pending.project.clone()))
+        else {
             return false;
         };
-        if let Err(error) = self.commit_structured_decision(&request.request, &answer) {
-            warn!(%error, request_id, "permission decision was not committed");
+        let reusable_rule =
+            match self.commit_structured_decision(&request, &answer, project.as_deref()) {
+                Ok(rule) => rule,
+                Err(error) => {
+                    warn!(%error, request_id, "permission decision was not committed");
+                    return false;
+                }
+            };
+        let Some(answered) = remove_pending(&mut pending, self.id, request_id) else {
             return false;
+        };
+        let mut covered = Vec::new();
+        if let Some(rule) = reusable_rule {
+            let mut matches = Vec::new();
+            for (&manager_id, requests) in pending.iter() {
+                for (candidate_id, candidate) in requests {
+                    if reusable_rule_scope_matches(
+                        &rule.lifetime,
+                        self.id,
+                        project.as_deref(),
+                        manager_id,
+                        candidate.project.as_deref(),
+                    ) && permission_rule_covers_request(&rule, &candidate.request)
+                    {
+                        matches.push((manager_id, candidate_id.clone()));
+                    }
+                }
+            }
+            for (manager_id, candidate_id) in matches {
+                if let Some(candidate) = remove_pending(&mut pending, manager_id, &candidate_id) {
+                    covered.push(candidate);
+                }
+            }
         }
-        let answered = pending
-            .remove(request_id)
-            .expect("pending permission exists while its lock is held");
-        if answered.sender.try_send(answer).is_err() {
+        drop(pending);
+
+        for candidate in covered {
+            candidate
+                .event_tx
+                .try_send(AgentEvent::PermissionRequestResolved {
+                    request_id: candidate.request.id.clone(),
+                    source_request_id: request_id.to_owned(),
+                });
+            if candidate
+                .sender
+                .try_send(PendingDecision::MatchedRule)
+                .is_err()
+            {
+                warn!(request_id = %candidate.request.id, "permission requester already closed");
+            }
+        }
+        if answered
+            .sender
+            .try_send(PendingDecision::Explicit(answer))
+            .is_err()
+        {
             warn!(request_id, "permission requester already closed");
         }
         true
     }
 
     pub fn pending_count(&self) -> usize {
-        self.pending().len()
+        self.pending().get(&self.id).map_or(0, HashMap::len)
     }
 
     pub fn pending_request(&self, request_id: &str) -> Option<PermissionRequest> {
         self.pending()
-            .get(request_id)
+            .get(&self.id)
+            .and_then(|requests| requests.get(request_id))
             .map(|pending| pending.request.clone())
+    }
+
+    fn remove_pending(&self, request_id: &str) {
+        remove_pending(&mut self.pending(), self.id, request_id);
     }
 
     fn check_inner(
@@ -1009,7 +1123,7 @@ impl PermissionManager {
             .policy
             .as_ref()
             .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
-        let mut policy = policy.lock().unwrap_or_else(|error| {
+        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
             warn!("permission policy mutex was poisoned, recovering");
             error.into_inner()
         });
@@ -1061,7 +1175,7 @@ impl PermissionManager {
             )
         })?;
         drop(project_context);
-        let mut policy = policy.lock().unwrap_or_else(|error| {
+        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
             warn!("permission policy mutex was poisoned, recovering");
             error.into_inner()
         });
@@ -1085,7 +1199,8 @@ impl PermissionManager {
         &self,
         request: &PermissionRequest,
         answer: &PermissionAnswer,
-    ) -> Result<(), PermissionPolicyError> {
+        approved_project: Option<&Path>,
+    ) -> Result<Option<StructuredPermissionRule>, PermissionPolicyError> {
         let (option_id, lifetime) = match answer {
             PermissionAnswer::AllowOnce => ("allow_exact", PermissionLifetime::Once),
             PermissionAnswer::AllowSession => ("allow_exact", PermissionLifetime::Conversation),
@@ -1097,7 +1212,7 @@ impl PermissionManager {
             } => (option_id.as_str(), lifetime.clone()),
             PermissionAnswer::DenyAlwaysLocal => ("deny_exact", PermissionLifetime::Project),
             PermissionAnswer::DenyAlwaysGlobal => ("deny_exact", PermissionLifetime::Global),
-            PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => return Ok(()),
+            PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => return Ok(None),
         };
         let option = request
             .options
@@ -1123,28 +1238,24 @@ impl PermissionManager {
             )));
         }
         if rule.lifetime == PermissionLifetime::Once {
-            return Ok(());
+            return Ok(None);
         }
+        let reusable_allow =
+            (rule.effect == StructuredPermissionEffect::Allow).then(|| rule.clone());
         let review = Some(redacted_review_shape(&request.input));
         if rule.lifetime == PermissionLifetime::Conversation {
             let record = PermissionRuleRecord::conversation_with_review(rule, review)
                 .map_err(|error| PermissionPolicyError(error.to_string()))?;
             self.structured_conversation_rules().push(record);
-            return Ok(());
+            return Ok(reusable_allow);
         }
 
         let project = match rule.lifetime {
-            PermissionLifetime::Project => Some({
-                let project = self.project();
-                project.canonical_project.clone().ok_or_else(|| {
-                    PermissionPolicyError(
-                        project
-                            .policy_context_error
-                            .clone()
-                            .unwrap_or_else(|| "canonical project is unavailable".into()),
-                    )
-                })?
-            }),
+            PermissionLifetime::Project => {
+                Some(approved_project.map(Path::to_path_buf).ok_or_else(|| {
+                    PermissionPolicyError("canonical project is unavailable".into())
+                })?)
+            }
             PermissionLifetime::Global => None,
             PermissionLifetime::Once | PermissionLifetime::Conversation => {
                 return Err(PermissionPolicyError(
@@ -1156,7 +1267,7 @@ impl PermissionManager {
             .policy
             .as_ref()
             .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
-        let mut policy = policy.lock().unwrap_or_else(|error| {
+        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
             warn!("permission policy mutex was poisoned, recovering");
             error.into_inner()
         });
@@ -1164,7 +1275,7 @@ impl PermissionManager {
             .state()?
             .insert_with_review(project, rule, review)
             .map_err(|error| PermissionPolicyError(error.to_string()))?;
-        Ok(())
+        Ok(reusable_allow)
     }
 
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
@@ -1334,7 +1445,10 @@ impl PermissionManager {
         intent: Option<&crate::tools::PermissionIntent>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
-        let cwd = self.project().cwd.clone();
+        let (cwd, canonical_project) = {
+            let project = self.project();
+            (project.cwd.clone(), project.canonical_project.clone())
+        };
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
@@ -1489,30 +1603,44 @@ impl PermissionManager {
         let (answer_tx, answer_rx) = flume::bounded(1);
         {
             let mut pending = self.pending();
-            if pending.contains_key(request_id) {
+            let current_rules = self.applicable_structured_rules().map_err(|error| {
+                warn!(%error, "structured permission policy failed closed");
+                deny(DECISION_SOURCE_RULE, Some(error.to_string()))
+            })?;
+            match evaluate_structured_permission_rules(&current_rules, &request) {
+                StructuredPermissionDecision::Deny => {
+                    return Err(deny(DECISION_SOURCE_RULE, None));
+                }
+                StructuredPermissionDecision::Allow => return allowed(DECISION_SOURCE_RULE),
+                StructuredPermissionDecision::NoMatch => {}
+            }
+            let requests = pending.entry(self.id).or_default();
+            if requests.contains_key(request_id) {
                 warn!(request_id, "duplicate permission request id");
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             }
-            pending.insert(
+            requests.insert(
                 request_id.to_owned(),
                 PendingPermission {
                     request: request.clone(),
+                    project: canonical_project,
+                    event_tx: event_tx.clone(),
                     sender: answer_tx,
                 },
             );
-        }
-        if event_tx
-            .send(AgentEvent::PermissionRequest(Box::new(request.clone())))
-            .is_err()
-        {
-            self.pending().remove(request_id);
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            if event_tx
+                .send(AgentEvent::PermissionRequest(Box::new(request.clone())))
+                .is_err()
+            {
+                remove_pending(&mut pending, self.id, request_id);
+                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            }
         }
         let response = cancel.race(answer_rx.recv_async()).await;
-        self.pending().remove(request_id);
+        self.remove_pending(request_id);
 
-        let answer = match response {
-            Ok(Ok(answer)) => answer,
+        let decision = match response {
+            Ok(Ok(decision)) => decision,
             Ok(Err(_)) => {
                 warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
@@ -1520,7 +1648,11 @@ impl PermissionManager {
             Err(_) => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
         };
 
-        if answer.is_allow() {
+        let allow = match &decision {
+            PendingDecision::Explicit(answer) => answer.is_allow(),
+            PendingDecision::MatchedRule => true,
+        };
+        if allow {
             let current_rules = self.applicable_structured_rules().map_err(|error| {
                 warn!(%error, "structured permission policy failed closed");
                 deny(DECISION_SOURCE_RULE, Some(error.to_string()))
@@ -1532,11 +1664,18 @@ impl PermissionManager {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
         }
-        let source = answer.decision_source();
-        if answer.is_allow() {
+        let source = match &decision {
+            PendingDecision::Explicit(answer) => answer.decision_source(),
+            PendingDecision::MatchedRule => DECISION_SOURCE_RULE,
+        };
+        if allow {
             allowed(source)
         } else {
-            Err(deny(source, answer.guidance().map(String::from)))
+            let guidance = match decision {
+                PendingDecision::Explicit(answer) => answer.guidance().map(String::from),
+                PendingDecision::MatchedRule => None,
+            };
+            Err(deny(source, guidance))
         }
     }
 }
@@ -2371,6 +2510,228 @@ mod tests {
         });
     }
 
+    fn pending_tool_enforcement(
+        manager: Arc<PermissionManager>,
+        request_id: &str,
+        tool: &str,
+        scope: String,
+        input: serde_json::Value,
+    ) -> (
+        smol::Task<Result<(), PermissionError>>,
+        flume::Receiver<crate::Envelope>,
+    ) {
+        let (event_tx, event_rx) = flume::unbounded();
+        let event_tx = crate::EventSender::new(event_tx, 0);
+        let request_id = request_id.to_owned();
+        let tool = ToolKey::native(tool);
+        let task = smol::spawn(async move {
+            let (_legacy_tx, legacy_rx) = flume::unbounded();
+            let legacy_rx = async_lock::Mutex::new(legacy_rx);
+            manager
+                .enforce(
+                    &tool,
+                    &crate::tools::PermissionScopes::single(scope),
+                    &input,
+                    &event_tx,
+                    Some(&legacy_rx),
+                    &request_id,
+                    &crate::CancelToken::none(),
+                    None,
+                )
+                .await
+        });
+        (task, event_rx)
+    }
+
+    #[test]
+    fn reusable_exact_approval_resolves_covered_parallel_requests() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let input = serde_json::json!({"command": "cargo test"});
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                input.clone(),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                "cargo test".into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert_eq!(manager.pending_count(), 2);
+            assert!(manager.answer("first", PermissionAnswer::AllowSession));
+            assert!(first.await.is_ok());
+            assert!(second.await.is_ok());
+            assert_eq!(manager.pending_count(), 0);
+            assert!(matches!(
+                second_events.recv_async().await.unwrap().event,
+                AgentEvent::PermissionRequestResolved {
+                    request_id,
+                    source_request_id
+                } if request_id == "second" && source_request_id == "first"
+            ));
+        });
+    }
+
+    #[test]
+    fn allow_once_resolves_only_the_selected_parallel_request() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let input = serde_json::json!({"command": "cargo test"});
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                input.clone(),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                "cargo test".into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowOnce));
+            assert!(first.await.is_ok());
+            assert_eq!(manager.pending_count(), 1);
+            assert!(second_events.is_empty());
+            assert!(manager.answer("second", PermissionAnswer::Deny));
+            assert!(second.await.is_err());
+        });
+    }
+
+    #[test]
+    fn reusable_exact_approval_leaves_different_input_pending() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                "cargo check".into(),
+                serde_json::json!({"command": "cargo check"}),
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowSession));
+            assert!(first.await.is_ok());
+            assert_eq!(manager.pending_count(), 1);
+            assert!(second_events.is_empty());
+            assert!(manager.answer("second", PermissionAnswer::Deny));
+            assert!(second.await.is_err());
+        });
+    }
+
+    #[test]
+    fn conversation_approval_does_not_cross_manager_forks() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let other = Arc::new(manager.fork());
+            let input = serde_json::json!({"command": "cargo test"});
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                input.clone(),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&other),
+                "second",
+                "bash",
+                "cargo test".into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowSession));
+            assert!(first.await.is_ok());
+            assert_eq!(other.pending_count(), 1);
+            assert!(second_events.is_empty());
+            assert!(other.answer("second", PermissionAnswer::Deny));
+            assert!(second.await.is_err());
+        });
+    }
+
+    #[test]
+    fn filesystem_subtree_approval_resolves_descendant_reads_only() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let external = temp.path().join("external");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            let manager = Arc::new(mgr_with(PermissionsConfig::default(), project));
+            let first_path = external.join("first.txt").to_string_lossy().into_owned();
+            let second_path = external
+                .join("nested/second.txt")
+                .to_string_lossy()
+                .into_owned();
+            let outside_path = temp
+                .path()
+                .join("outside.txt")
+                .to_string_lossy()
+                .into_owned();
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "file_read",
+                first_path.clone(),
+                serde_json::json!({"path": first_path}),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "file_read",
+                second_path.clone(),
+                serde_json::json!({"path": second_path}),
+            );
+            let (outside, outside_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "outside",
+                "file_read",
+                outside_path.clone(),
+                serde_json::json!({"path": outside_path}),
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+            outside_events.recv_async().await.unwrap();
+
+            assert!(manager.answer(
+                "first",
+                PermissionAnswer::AllowOption {
+                    option_id: "allow_filesystem_subtree".into(),
+                    lifetime: PermissionLifetime::Conversation,
+                }
+            ));
+            assert!(first.await.is_ok());
+            assert!(second.await.is_ok());
+            assert_eq!(manager.pending_count(), 1);
+            assert!(manager.answer("outside", PermissionAnswer::Deny));
+            assert!(outside.await.is_err());
+        });
+    }
+
     #[test]
     fn deny_rule_with_none_scope_blocks_everything() {
         let mgr = mgr_with(
@@ -2769,6 +3130,102 @@ mod tests {
             Arc::default(),
             state_dir,
         ))
+    }
+
+    #[test]
+    fn project_approval_resolves_only_pending_requests_in_the_same_project() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let first_project = temp.path().join("first");
+            let second_project = temp.path().join("second");
+            std::fs::create_dir(&first_project).unwrap();
+            std::fs::create_dir(&second_project).unwrap();
+            let manager = persistent_manager(
+                StateDir::from_path(temp.path().join("state")),
+                &first_project,
+            );
+            let same_project = Arc::new(manager.fork());
+            let other_project = Arc::new(manager.fork());
+            other_project.set_project(&second_project);
+            let url = "https://example.com/docs";
+            let input = serde_json::json!({"url": url});
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "webfetch",
+                url.into(),
+                input.clone(),
+            );
+            let (same, same_events) = pending_tool_enforcement(
+                Arc::clone(&same_project),
+                "same",
+                "webfetch",
+                url.into(),
+                input.clone(),
+            );
+            let (other, other_events) = pending_tool_enforcement(
+                Arc::clone(&other_project),
+                "other",
+                "webfetch",
+                url.into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            same_events.recv_async().await.unwrap();
+            other_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowAlwaysLocal));
+            assert!(first.await.is_ok());
+            assert!(same.await.is_ok());
+            assert_eq!(other_project.pending_count(), 1);
+            assert!(other_events.is_empty());
+            assert!(other_project.answer("other", PermissionAnswer::Deny));
+            assert!(other.await.is_err());
+        });
+    }
+
+    #[test]
+    fn global_approval_resolves_pending_requests_in_other_projects() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let first_project = temp.path().join("first");
+            let second_project = temp.path().join("second");
+            std::fs::create_dir(&first_project).unwrap();
+            std::fs::create_dir(&second_project).unwrap();
+            let manager = persistent_manager(
+                StateDir::from_path(temp.path().join("state")),
+                &first_project,
+            );
+            let other_project = Arc::new(manager.fork());
+            other_project.set_project(&second_project);
+            let url = "https://example.com/docs";
+            let input = serde_json::json!({"url": url});
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "webfetch",
+                url.into(),
+                input.clone(),
+            );
+            let (other, other_events) = pending_tool_enforcement(
+                Arc::clone(&other_project),
+                "other",
+                "webfetch",
+                url.into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            other_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowAlwaysGlobal));
+            assert!(first.await.is_ok());
+            assert!(other.await.is_ok());
+            assert_eq!(other_project.pending_count(), 0);
+            assert!(matches!(
+                other_events.recv_async().await.unwrap().event,
+                AgentEvent::PermissionRequestResolved { request_id, .. } if request_id == "other"
+            ));
+        });
     }
 
     async fn answer_enforcement(
@@ -3204,12 +3661,24 @@ mod tests {
                 }
             });
             let _ = event_rx.recv_async().await.unwrap();
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second-failed-persist",
+                "bash",
+                "cargo test".into(),
+                serde_json::json!({"command": "cargo test"}),
+            );
+            second_events.recv_async().await.unwrap();
             std::fs::rename(&state_path, temp.path().join("old-state")).unwrap();
             std::fs::write(&state_path, b"blocks directory recreation").unwrap();
             assert!(!manager.answer("failed-persist", PermissionAnswer::AllowAlwaysGlobal));
+            assert_eq!(manager.pending_count(), 2);
+            assert!(second_events.is_empty());
             assert!(manager.answer("failed-persist", PermissionAnswer::Deny));
+            assert!(manager.answer("second-failed-persist", PermissionAnswer::Deny));
 
             assert!(task.await.is_err());
+            assert!(second.await.is_err());
             assert!(manager.structured_conversation_rules_snapshot().is_empty());
         });
     }

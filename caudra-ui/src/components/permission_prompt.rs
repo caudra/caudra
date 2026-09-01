@@ -276,6 +276,22 @@ impl PermissionPrompt {
         true
     }
 
+    pub fn resolve_pending(&mut self, request_id: &str) -> bool {
+        let Some(index) = self
+            .requests
+            .iter()
+            .position(|queued| queued.request.id == request_id)
+        else {
+            return false;
+        };
+        self.requests.remove(index);
+        self.request_ids.remove(request_id);
+        if index == 0 {
+            self.reset_view();
+        }
+        true
+    }
+
     pub fn handle_paste(&mut self, text: &str) -> bool {
         if (self.state != PromptState::DenyEditing && self.confirmation_phrase().is_none())
             || !self.is_open()
@@ -921,6 +937,21 @@ mod tests {
         assert_eq!(prompt.request_id(), Some("second"));
         let second = prompt.handle_key(key(KeyCode::Esc)).unwrap();
         assert_eq!(second.request_id, "second");
+    }
+
+    #[test]
+    fn resolving_a_covered_request_preserves_unmatched_fifo_order() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(request("first", json!({"n": 1})), None);
+        prompt.enqueue(request("covered", json!({"n": 2})), None);
+        prompt.enqueue(request("third", json!({"n": 3})), None);
+
+        assert!(prompt.resolve_pending("covered"));
+        assert_eq!(prompt.pending_count(), 2);
+        assert_eq!(prompt.request_id(), Some("first"));
+        assert!(prompt.resolve_pending("first"));
+        assert_eq!(prompt.request_id(), Some("third"));
+        assert!(!prompt.resolve_pending("missing"));
     }
 
     #[test]

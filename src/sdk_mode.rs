@@ -138,6 +138,7 @@ enum WireInner {
     StreamEvent(StreamEventPayload),
     ControlResponse(ControlResponsePayload),
     ControlRequest(ControlRequestPayload),
+    ControlCancelRequest(ControlCancelRequestPayload),
 }
 
 #[derive(Serialize)]
@@ -226,6 +227,11 @@ struct ControlRequestInner {
     input: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_use_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ControlCancelRequestPayload {
+    request_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -477,6 +483,7 @@ struct Shared {
     permission_mode: PermissionMode,
     turn_start: Instant,
     pending: HashMap<String, String>,
+    resolved_permission_requests: HashSet<String>,
 }
 
 pub fn run(params: SdkParams) -> Result<()> {
@@ -651,6 +658,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permission_mode,
         turn_start: Instant::now(),
         pending: HashMap::new(),
+        resolved_permission_requests: HashSet::new(),
     }));
 
     let pump = EventPump {
@@ -1496,14 +1504,25 @@ fn answer_pending_permission(
     sdk_request_id: &str,
     answer: PermissionAnswer,
 ) -> bool {
-    let Some(request_id) = shared.lock().unwrap().pending.remove(sdk_request_id) else {
+    let request_id = {
+        let mut shared = shared.lock().unwrap();
+        if let Some(request_id) = shared.pending.remove(sdk_request_id) {
+            Some(request_id)
+        } else if shared.resolved_permission_requests.remove(sdk_request_id) {
+            return true;
+        } else {
+            None
+        }
+    };
+    let Some(request_id) = request_id else {
         warn!(
             sdk_request_id,
             "response for unknown SDK permission request"
         );
         return false;
     };
-    if permissions.answer(&request_id, answer) {
+    if permissions.answer(&request_id, answer) || permissions.pending_request(&request_id).is_none()
+    {
         true
     } else {
         warn!(%request_id, "SDK permission response failed; denying request");
@@ -1726,11 +1745,41 @@ impl EventPump {
                     return Err(error);
                 }
             }
+            AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                let sdk_request_ids = {
+                    let mut shared = self.shared.lock().unwrap();
+                    let ids: Vec<_> = shared
+                        .pending
+                        .iter()
+                        .filter(|(_, pending_request_id)| pending_request_id.as_str() == request_id)
+                        .map(|(sdk_request_id, _)| sdk_request_id.clone())
+                        .collect();
+                    for sdk_request_id in &ids {
+                        shared.pending.remove(sdk_request_id);
+                        shared
+                            .resolved_permission_requests
+                            .insert(sdk_request_id.clone());
+                    }
+                    ids
+                };
+                for sdk_request_id in sdk_request_ids {
+                    self.writer.emit(WireInner::ControlCancelRequest(
+                        ControlCancelRequestPayload {
+                            request_id: sdk_request_id,
+                        },
+                    ))?;
+                }
+            }
             AgentEvent::Done {
                 usage,
                 num_turns,
                 reason,
             } => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .resolved_permission_requests
+                    .clear();
                 // An interrupted run leaves a partial answer, so it is not a success.
                 let is_error = *reason == DoneReason::Cancelled;
                 let result = mem::take(&mut self.result_text);
@@ -1794,6 +1843,7 @@ mod tests {
             permission_mode: PermissionMode::Default,
             turn_start: Instant::now(),
             pending,
+            resolved_permission_requests: HashSet::new(),
         }))
     }
 
@@ -2679,6 +2729,68 @@ mod tests {
             assert!(!first.await, "unknown response denies its request");
             assert!(second.await, "out-of-order allow reaches its request");
             assert!(shared.lock().unwrap().pending.is_empty());
+        });
+    }
+
+    #[test]
+    fn sdk_reusable_approval_cancels_a_covered_permission_callback() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let input = serde_json::json!({"command": "cargo test"});
+            let (first, first_events) = pending_permission(
+                Arc::clone(&manager),
+                CAUDRA_REQUEST_ID,
+                "cargo test",
+                input.clone(),
+            );
+            let (second, second_events) = pending_permission(
+                Arc::clone(&manager),
+                SECOND_CAUDRA_REQUEST_ID,
+                "cargo test",
+                input,
+            );
+            let first_request = first_events.recv_async().await.unwrap();
+            let second_request = second_events.recv_async().await.unwrap();
+            let (mut pump, out_rx, shared) =
+                permission_event_pump(Arc::clone(&manager), PermissionMode::Default);
+            pump.handle(first_request).unwrap();
+            pump.handle(second_request).unwrap();
+            let _: Value = serde_json::from_str(&out_rx.recv_async().await.unwrap()).unwrap();
+            let _: Value = serde_json::from_str(&out_rx.recv_async().await.unwrap()).unwrap();
+
+            answer_permission_response(
+                &shared,
+                &manager,
+                InboundControlResponseInner {
+                    subtype: "success".into(),
+                    request_id: "req_1".into(),
+                    response: serde_json::json!({
+                        "behavior": "allow",
+                        "updatedPermissions": [{
+                            "type": "addRules",
+                            "rules": [{"toolName": "Shell"}],
+                            "behavior": "allow",
+                            "destination": "session"
+                        }]
+                    }),
+                },
+            );
+            pump.handle(second_events.recv_async().await.unwrap())
+                .unwrap();
+
+            assert!(first.await);
+            assert!(second.await);
+            assert!(shared.lock().unwrap().pending.is_empty());
+            let cancelled: Value =
+                serde_json::from_str(&out_rx.recv_async().await.unwrap()).unwrap();
+            assert_eq!(cancelled["type"], "control_cancel_request");
+            assert_eq!(cancelled["request_id"], "req_2");
+            assert!(answer_pending_permission(
+                &shared,
+                &manager,
+                "req_2",
+                PermissionAnswer::Deny,
+            ));
         });
     }
 

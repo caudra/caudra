@@ -8115,6 +8115,33 @@ fn subagent_permission_requests_remain_in_fifo_order() {
 }
 
 #[test]
+fn covered_permission_event_removes_the_matching_queued_prompt() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.permission_prompt.open(
+        "first".into(),
+        caudra_config::ToolKey::native("bash"),
+        vec!["cargo test".into()],
+        None,
+    );
+    app.permission_prompt.open(
+        "covered".into(),
+        caudra_config::ToolKey::native("bash"),
+        vec!["cargo test".into()],
+        None,
+    );
+
+    app.update(agent_msg(AgentEvent::PermissionRequestResolved {
+        request_id: "covered".into(),
+        source_request_id: "first".into(),
+    }));
+
+    assert_eq!(app.permission_prompt.pending_count(), 1);
+    assert_eq!(app.permission_prompt.request_id(), Some("first"));
+}
+
+#[test]
 fn permission_decision_answers_manager_request_id_directly() {
     let mut app = test_app();
     app.status = Status::Streaming;

@@ -70,6 +70,7 @@ enum AskKind {
         request_id: String,
         exact_project_deny: bool,
     },
+    ResolvedPermission,
     Elicitation,
 }
 
@@ -836,7 +837,13 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
             exact_project_deny,
         } => {
             let answer = permission_answer(raw, exact_project_deny);
-            if !session.handle.permissions.answer(&request_id, answer) {
+            if !session.handle.permissions.answer(&request_id, answer)
+                && session
+                    .handle
+                    .permissions
+                    .pending_request(&request_id)
+                    .is_some()
+            {
                 warn!(%request_id, "permission response failed; denying request");
                 session
                     .handle
@@ -844,6 +851,7 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
                     .answer(&request_id, PermissionAnswer::Deny);
             }
         }
+        AskKind::ResolvedPermission => {}
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
         AskKind::Elicitation => {
@@ -898,6 +906,36 @@ fn request_permission(
         exact_project_deny: permissions::exact_project_deny_is_representable(&request),
     };
     ask_client(out_tx, pending, kind, client_request);
+}
+
+fn resolve_presented_permission(out_tx: &Sender<Value>, pending: &PendingState, request_id: &str) {
+    let ids = {
+        let mut pending = pending.lock().unwrap();
+        let ids: Vec<_> = pending
+            .asks
+            .iter()
+            .filter_map(|(&id, kind)| match kind {
+                AskKind::Permission {
+                    request_id: candidate,
+                    ..
+                } if candidate == request_id => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in &ids {
+            pending.asks.insert(*id, AskKind::ResolvedPermission);
+        }
+        ids
+    };
+    for id in ids {
+        send(
+            out_tx,
+            Notification {
+                method: Arc::from("$/cancel_request"),
+                params: Some(serde_json::json!({ "id": id })),
+            },
+        );
+    }
 }
 
 fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>) {
@@ -964,7 +1002,12 @@ fn start_event_pump(
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
             }
-            if subagent.is_some() && !matches!(&event, AgentEvent::PermissionRequest(_)) {
+            if subagent.is_some()
+                && !matches!(
+                    &event,
+                    AgentEvent::PermissionRequest(_) | AgentEvent::PermissionRequestResolved { .. }
+                )
+            {
                 continue;
             }
 
@@ -980,6 +1023,10 @@ fn start_event_pump(
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest(request) => {
                     request_permission(&out_tx, &pending, &sid, *request);
+                    continue;
+                }
+                AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                    resolve_presented_permission(&out_tx, &pending, &request_id);
                     continue;
                 }
                 AgentEvent::Done { reason, .. } => {
@@ -1284,6 +1331,56 @@ mod tests {
 
             assert!(!first.await);
             assert!(second.await);
+            assert!(answer_rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn reusable_approval_cancels_a_covered_permission_request() {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (first, first_events) =
+                pending_permission(Arc::clone(&manager), CAUDRA_REQUEST_ID, "cargo test");
+            let (second, second_events) =
+                pending_permission(Arc::clone(&manager), SECOND_CAUDRA_REQUEST_ID, "cargo test");
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+            let asks = HashMap::from([
+                (
+                    ANSWERED_ID,
+                    AskKind::Permission {
+                        request_id: CAUDRA_REQUEST_ID.into(),
+                        exact_project_deny: true,
+                    },
+                ),
+                (
+                    UNKNOWN_ID,
+                    AskKind::Permission {
+                        request_id: SECOND_CAUDRA_REQUEST_ID.into(),
+                        exact_project_deny: true,
+                    },
+                ),
+            ]);
+            let (srv, answer_rx, out_rx) = server_with_asks(Arc::clone(&manager), asks);
+
+            handle_incoming_response(&srv, &selected_permission(ANSWERED_ID, "allow_always"));
+            let resolution = second_events.recv_async().await.unwrap().event;
+            let AgentEvent::PermissionRequestResolved { request_id, .. } = resolution else {
+                panic!("expected permission resolution, got {resolution:?}");
+            };
+            resolve_presented_permission(
+                &srv.out_tx,
+                &srv.session.as_ref().unwrap().pending,
+                &request_id,
+            );
+
+            assert!(first.await);
+            assert!(second.await);
+            assert!(answer_rx.is_empty());
+            let cancelled = out_rx.recv_async().await.unwrap();
+            assert_eq!(cancelled["method"], "$/cancel_request");
+            assert_eq!(cancelled["params"]["id"], UNKNOWN_ID);
+            handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
             assert!(answer_rx.is_empty());
         });
     }
