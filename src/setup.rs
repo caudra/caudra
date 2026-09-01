@@ -42,10 +42,6 @@ pub fn load_session(id: CaudraId, storage: &StateDir) -> Result<StoredSession> {
     caudra_agent::load_stored_session(id, storage).context("load persisted session")
 }
 
-pub fn latest_session(cwd: &str, storage: &StateDir) -> Result<Option<StoredSession>> {
-    caudra_agent::latest_stored_session(cwd, storage).context("load latest persisted session")
-}
-
 pub fn resolve_model(
     explicit: Option<&str>,
     provider_config: &caudra_config::ProviderConfig,
@@ -288,6 +284,5 @@ mod tests {
                 .all(|pair| pair[1].parent_id == Some(pair[0].id))
         );
         assert!(StoredSession::load(id, &storage).is_ok());
-        assert_eq!(latest_session(CWD, &storage).unwrap().unwrap().id, id);
     }
 }
