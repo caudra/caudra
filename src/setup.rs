@@ -4,13 +4,13 @@ use std::sync::Mutex;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use maki_providers::manifest::ManifestRegistry;
-use maki_providers::model::{Model, ModelError, ModelTier};
-use maki_providers::{HistoryItem, active_history_items, resolve_history_head};
-use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use caudra_providers::manifest::ManifestRegistry;
+use caudra_providers::model::{Model, ModelError, ModelTier};
+use caudra_providers::{HistoryItem, active_history_items, resolve_history_head};
+use caudra_storage::StateDir;
+use caudra_storage::id::CaudraId;
+use caudra_storage::log::RotatingFileWriter;
+use caudra_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 
 const PROVIDER_PRIORITY: &[&str] = &[
@@ -23,9 +23,9 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "deepseek",
 ];
 
-pub type StoredSession = maki_agent::StoredSession;
+pub type StoredSession = caudra_agent::StoredSession;
 
-pub fn session_history_head(session: &StoredSession) -> Option<MakiId> {
+pub fn session_history_head(session: &StoredSession) -> Option<CaudraId> {
     resolve_history_head(
         session.messages(),
         session.meta.history_head,
@@ -38,17 +38,17 @@ pub fn active_session_history(session: &StoredSession) -> Result<Vec<HistoryItem
         .context("resolve active session history")
 }
 
-pub fn load_session(id: MakiId, storage: &StateDir) -> Result<StoredSession> {
-    maki_agent::load_stored_session(id, storage).context("load persisted session")
+pub fn load_session(id: CaudraId, storage: &StateDir) -> Result<StoredSession> {
+    caudra_agent::load_stored_session(id, storage).context("load persisted session")
 }
 
 pub fn latest_session(cwd: &str, storage: &StateDir) -> Result<Option<StoredSession>> {
-    maki_agent::latest_stored_session(cwd, storage).context("load latest persisted session")
+    caudra_agent::latest_stored_session(cwd, storage).context("load latest persisted session")
 }
 
 pub fn resolve_model(
     explicit: Option<&str>,
-    provider_config: &maki_config::ProviderConfig,
+    provider_config: &caudra_config::ProviderConfig,
     storage: &StateDir,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
@@ -86,7 +86,7 @@ pub fn resolve_model(
             ""
         };
         color_eyre::eyre::eyre!(
-            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model{policy_note}\n\nSee https://maki.sh/docs/providers/ for setup instructions"
+            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `caudra auth login`, or use -m to specify a model{policy_note}\n\nSee https://caudra.ai/docs/providers/ for setup instructions"
         )
     })
 }
@@ -97,17 +97,17 @@ pub fn resolve_model(
 fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
     match Model::from_spec(spec) {
         Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog();
+            caudra_providers::warm_catalog();
             Model::from_spec(spec)
         }
         result => result,
     }
 }
 
-fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
+fn auto_detect_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
     for tier in [ModelTier::Strong, ModelTier::Medium] {
         for &slug in PROVIDER_PRIORITY {
-            if maki_providers::provider::provider_available(slug)
+            if caudra_providers::provider::provider_available(slug)
                 && let Ok(model) = Model::from_tier(slug, tier)
                 && policy.allows(&model.spec())
             {
@@ -123,11 +123,11 @@ fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
 /// (#597). Call this after `init_logging`, otherwise the warning has no
 /// subscriber to reach.
 pub fn warn_ignored_provider_fields() {
-    for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
+    for (slug, def) in &caudra_config::providers::ProvidersConfig::load().providers {
         if ManifestRegistry::get(slug).is_none() {
             continue;
         }
-        let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
+        let ignored = caudra_config::providers::ignored_builtin_fields(slug, def);
         if ignored.is_empty() {
             continue;
         }
@@ -161,11 +161,11 @@ pub fn install_panic_log_hook() {
     }));
 }
 
-/// Telemetry is opt-in and must never stop maki from starting, so a bad
+/// Telemetry is opt-in and must never stop caudra from starting, so a bad
 /// setting is a warning in the log, not an error to the user. Call this after
 /// `init_logging` or the warning has nowhere to go.
-pub fn init_telemetry(config: &maki_config::TelemetryConfig) {
-    if let Err(error) = maki_otel::init(config) {
+pub fn init_telemetry(config: &caudra_config::TelemetryConfig) {
+    if let Err(error) = caudra_otel::init(config) {
         tracing::warn!(%error, "telemetry disabled");
     }
 }
@@ -174,10 +174,10 @@ pub fn init_telemetry(config: &maki_config::TelemetryConfig) {
 /// unattributed.
 pub fn report_session_start(start_type: &'static str, session_id: Option<impl Display>) {
     let id = session_id.map(|id| id.to_string());
-    maki_otel::emit::session_started(start_type, id.as_deref());
+    caudra_otel::emit::session_started(start_type, id.as_deref());
 }
 
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &caudra_config::StorageConfig) {
     let Ok(writer) =
         RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files)
     else {
@@ -195,9 +195,9 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{History, ToolOutput};
-    use maki_providers::{ContentBlock, Message, Role, TokenUsage, project_messages};
-    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionError};
+    use caudra_agent::{History, ToolOutput};
+    use caudra_providers::{ContentBlock, Message, Role, TokenUsage, project_messages};
+    use caudra_storage::sessions::{SESSIONS_DIR, Session, SessionError};
 
     const CWD: &str = "/repo";
     const MAIN_PROMPT: &str = "main prompt";

@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  BINARY_NAME: maki
+  BINARY_NAME: caudra
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
 
@@ -66,9 +66,11 @@ jobs:
                "$worker" --version | grep -q '0.0.21'
                WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
                WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
-                 --package maki-workcell production_host_executes_code_with_the_embedded_worker
-               smoke_output="$(XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-                 target/${{ matrix.target }}/release/maki prompt --tools --names 2>&1)"
+                 --package caudra-workcell production_host_executes_code_with_the_embedded_worker
+                smoke_output="$(OPENAI_API_KEY=release-smoke \
+                  XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+                  target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
+                  prompt --tools --names 2>&1)"
                printf '%s\n' "$smoke_output" | grep -qx code_execution
                ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
              '
@@ -79,7 +81,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE THIRD_PARTY_LICENSES/Monty.txt
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -124,14 +126,15 @@ jobs:
           "$worker" --version | grep -q '0.0.21'
           WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
           WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
-            --package maki-workcell production_host_executes_code_with_the_embedded_worker
+            --package caudra-workcell production_host_executes_code_with_the_embedded_worker
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            binary="target/${{ matrix.target }}/release/maki.exe"
+            binary="target/${{ matrix.target }}/release/caudra.exe"
           else
-            binary="target/${{ matrix.target }}/release/maki"
+            binary="target/${{ matrix.target }}/release/caudra"
           fi
-          smoke_output="$(XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-            "$binary" prompt --tools --names 2>&1)"
+          smoke_output="$(OPENAI_API_KEY=release-smoke \
+            XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+            "$binary" --model openai/gpt-5.1 prompt --tools --names 2>&1)"
           printf '%s\n' "$smoke_output" | grep -qx code_execution
           ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
 
@@ -141,7 +144,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE THIRD_PARTY_LICENSES/Monty.txt
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -151,7 +154,7 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE THIRD_PARTY_LICENSES/Monty.txt
+          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE NOTICE.md THIRD_PARTY_LICENSES/Monty.txt
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact

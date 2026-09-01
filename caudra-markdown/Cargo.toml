@@ -1,0 +1,18 @@
+[package]
+name = "caudra-markdown"
+description = "Theme-free Markdown parsing and width-aware terminal rendering for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-highlight = { workspace = true }
+thiserror = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+fastrand = { workspace = true }

@@ -8,16 +8,16 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::command::{self, CustomCommand};
-use maki_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
-use maki_agent::tools::ToolRegistry;
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_providers::model::Model;
-use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_storage::sessions::SessionLease;
-use maki_ui::{AppSession, RunOutcome, SessionTab};
+use caudra_agent::command::{self, CustomCommand};
+use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
+use caudra_agent::tools::ToolRegistry;
+use caudra_config::{Config, load_env_files, load_permissions};
+use caudra_lua::PluginHost;
+use caudra_providers::model::Model;
+use caudra_storage::StateDir;
+use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::SessionLease;
+use caudra_ui::{AppSession, RunOutcome, SessionTab};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -46,8 +46,8 @@ type StackFallback = (
 );
 
 impl Stack {
-    fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts {
+    fn timeouts(&self) -> caudra_providers::Timeouts {
+        caudra_providers::Timeouts {
             connect: self.config.provider.connect_timeout,
             low_speed: self.config.provider.low_speed_timeout,
             stream: self.config.provider.stream_timeout,
@@ -225,26 +225,26 @@ fn resolve_session(
     storage: &StateDir,
 ) -> Result<SessionTab> {
     if let Some(raw) = session_id {
-        let id: MakiId = raw
+        let id: CaudraId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let lease = Arc::new(SessionLease::acquire(storage, id)?);
         let session = setup::load_session(id, storage)?;
-        setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
+        setup::report_session_start(caudra_otel::emit::START_RESUME, Some(session.id));
         return Ok(SessionTab { session, lease });
     }
     if continue_session {
         if let Some(summary) = AppSession::list(cwd, storage)?.into_iter().next() {
             let lease = Arc::new(SessionLease::acquire(storage, summary.id)?);
             let session = setup::load_session(summary.id, storage)?;
-            setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
+            setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(session.id));
             return Ok(SessionTab { session, lease });
         }
         tracing::info!("no previous session found for this directory, starting new");
     }
     let session = AppSession::new(model, cwd);
     let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
-    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
+    setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
     Ok(SessionTab { session, lease })
 }
 
@@ -262,7 +262,7 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
 
 pub fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    caudra_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
@@ -283,7 +283,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             .config
             .always_thinking
             .clone()
-            .map(maki_providers::ThinkingConfig::from)
+            .map(caudra_providers::ThinkingConfig::from)
             .unwrap_or_default();
         let prompt_slots = stack
             .plugin_host
@@ -313,7 +313,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             .config
             .always_thinking
             .clone()
-            .map(maki_providers::ThinkingConfig::from)
+            .map(caudra_providers::ThinkingConfig::from)
             .unwrap_or_default();
         let timeouts = stack.timeouts();
         crate::print::run(
@@ -375,8 +375,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
         };
 
-        let outcome = maki_ui::run(
-            maki_ui::EventLoopParams {
+        let outcome = caudra_ui::run(
+            caudra_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
                 commands: std::mem::take(&mut stack.commands),
@@ -387,11 +387,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new_persistent(
-                    stack.config.permissions.clone(),
-                    cwd.clone(),
-                    stack.plugin_host.plugin_rules(),
-                )),
+                permissions: Arc::new(
+                    caudra_agent::permissions::PermissionManager::new_persistent(
+                        stack.config.permissions.clone(),
+                        cwd.clone(),
+                        stack.plugin_host.plugin_rules(),
+                    ),
+                ),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),
@@ -411,7 +413,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -s {session_id}");
+                    eprintln!("Resume session:\n\n  caudra -s {session_id}");
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -423,7 +425,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "plugin host and teardown joined"
                 );
                 if code != 0 {
-                    maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
+                    caudra_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
                 return Ok(());
@@ -453,7 +455,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
                     let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
-                    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
+                    setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
                     tabs.push(SessionTab { session, lease });
                 }
                 stack = new_stack;
@@ -471,14 +473,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
 fn warn_stale_config_toml(cwd: &std::path::Path) {
     let stale_paths = [
-        maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(cwd.join(".maki/config.toml")),
+        caudra_config::global_config_dir().map(|d| d.join("config.toml")),
+        Some(cwd.join(".caudra/config.toml")),
     ];
     for path in stale_paths.into_iter().flatten() {
         if path.is_file() {
             tracing::warn!(
                 path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
+                "config.toml found but no longer used. Migrate to init.lua. See https://caudra.ai/docs/configuration/"
             );
         }
     }
@@ -487,8 +489,8 @@ fn warn_stale_config_toml(cwd: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_config::RawConfig;
     use color_eyre::eyre::eyre;
-    use maki_config::RawConfig;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -625,20 +627,20 @@ mod tests {
     /// `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
+        use caudra_agent::tools::ToolRegistry;
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).expect("mkdir .maki");
+        let caudra_dir: PathBuf = dir.path().join(".caudra");
+        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
         fs::write(
-            maki_dir.join("init.lua"),
+            caudra_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
 
-        let cli = Cli::parse_from(["maki", "--no-plugins"]);
+        let cli = Cli::parse_from(["caudra", "--no-plugins"]);
         assert!(cli.no_plugins);
 
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
@@ -663,20 +665,20 @@ mod tests {
     /// cannot silently regress into a tautology.
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
+        use caudra_agent::tools::ToolRegistry;
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).expect("mkdir .maki");
+        let caudra_dir: PathBuf = dir.path().join(".caudra");
+        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
         fs::write(
-            maki_dir.join("init.lua"),
+            caudra_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
 
-        let cli = Cli::parse_from(["maki"]);
+        let cli = Cli::parse_from(["caudra"]);
         assert!(!cli.no_plugins);
 
         let mut plugin_host =

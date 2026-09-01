@@ -7,19 +7,19 @@ group = "Getting Started"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language as plugins.
+Settings go in `init.lua`, a Lua script that calls `caudra.setup()`. Same language as plugins.
 
 Two places, both optional:
 
-- **Global**: `~/.config/maki/init.lua`
-- **Project**: `.maki/init.lua` (relative to your working directory)
+- **Global**: `~/.config/caudra/init.lua`
+- **Project**: `.caudra/init.lua` (relative to your working directory)
 
 When both exist, project settings override global ones. Neither file is required.
 
 ## Example
 
 ```lua
-maki.setup({
+caudra.setup({
     ui = {
         splash_animation = true,
         mouse_scroll_lines = 5,
@@ -50,9 +50,9 @@ maki.setup({
 
 All fields are optional. Typos in field names cause an error right away.
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `maki models`.
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 
-`maki.setup()` can only be called once per init.lua.
+`caudra.setup()` can only be called once per init.lua.
 
 ## Full Reference
 
@@ -62,7 +62,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | Start every session with Anthropic fast mode (Opus only; ignored otherwise) |
-| `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
+| `always_workflow` | bool | `false` | Start every session with workflow context for custom Lua tools |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
 ### `ui`
@@ -80,23 +80,23 @@ All fields are optional. Typos in field names cause an error right away.
 | `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
-| `update_check` | bool | `false` | `MAKI_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Maki makes no such request unless you turn this on |
+| `update_check` | bool | `false` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Caudra makes no such request unless you turn this on |
 
 ### `ui.theme`
 
-Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Caudra keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
 
 Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
-You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
+You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Caudra config directory, for example `~/.config/caudra/themes/`. If it reuses a built-in name, yours wins.
 
-Themes use 24-bit colors, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
+Themes use 24-bit colors, but not every terminal can show them. Caudra checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `CAUDRA_TRUECOLOR=1` to force truecolor or `CAUDRA_TRUECOLOR=0` to force the fallback.
 
 ### `ui.update_check`
 
-When on, Maki asks the GitHub releases API for the latest version once at startup and shows it in the splash when yours is older. The request carries a `maki` user agent and nothing else: no session id, no machine id, not even your current version.
+When on, Caudra asks the GitHub releases API for the latest version once at startup and shows it in the splash when yours is older. The request carries a `caudra` user agent and nothing else: no session id, no machine id, not even your current version.
 
-It is off by default, so a normal run reaches only the model provider you configured. Set `MAKI_ENABLE_UPDATE_CHECK=1` to turn it on for a single run, or `MAKI_ENABLE_UPDATE_CHECK=0` to turn it off when your config has it on. The `maki update` command always checks, because that is what you asked it to do.
+It is off by default, so a normal run reaches only the model provider you configured. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it on for a single run, or `CAUDRA_ENABLE_UPDATE_CHECK=0` to turn it off when your config has it on. The `caudra update` command always checks, because that is what you asked it to do.
 
 ### `ui.tool_output_lines`
 
@@ -150,7 +150,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 
 | Field | Type | Default | Env | Description |
 |-------|------|---------|-----|-------------|
-| `enabled` | bool | `false` | `MAKI_ENABLE_TELEMETRY` | Master switch |
+| `enabled` | bool | `false` | `CAUDRA_ENABLE_TELEMETRY` | Master switch |
 | `metrics_exporter` | string | `none` | `OTEL_METRICS_EXPORTER` | Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix |
 | `logs_exporter` | string | `none` | `OTEL_LOGS_EXPORTER` | Where events go: `otlp`, `console`, `none`, or a comma-separated mix |
 | `protocol` | string | `-` | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp` |
@@ -173,13 +173,13 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `logs_max_export_batch_size` | integer | `512` | `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` | Maximum events per export request |
 | `logs_export_timeout_ms` | integer | `30000` | `OTEL_BLRP_EXPORT_TIMEOUT` | Deadline for one events export, retries included (ms) |
 | `metrics_temporality` | string | `delta` | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality: `delta` or `cumulative` |
-| `service_name` | string | `maki` | `OTEL_SERVICE_NAME` | `service.name` on the exported resource |
+| `service_name` | string | `caudra` | `OTEL_SERVICE_NAME` | `service.name` on the exported resource |
 | `resource_attributes` | table | `{}` | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, your place for team or environment labels |
 | `metrics_include_session_id` | bool | `true` | `OTEL_METRICS_INCLUDE_SESSION_ID` | Attach `session.id` to metrics. Turn off to keep metric cardinality low |
 | `metrics_include_version` | bool | `false` | `OTEL_METRICS_INCLUDE_VERSION` | Attach `app.version` to metrics |
-| `log_user_prompts` | bool | `false` | `OTEL_LOG_USER_PROMPTS` | Include prompt text in `maki.user_prompt` events. Off by default |
-| `log_tool_details` | bool | `false` | `OTEL_LOG_TOOL_DETAILS` | Include tool input in `maki.tool_result` events. Off by default |
-| `content_max_length` | integer | `10240` | `MAKI_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
+| `log_user_prompts` | bool | `false` | `OTEL_LOG_USER_PROMPTS` | Include prompt text in `caudra.user_prompt` events. Off by default |
+| `log_tool_details` | bool | `false` | `OTEL_LOG_TOOL_DETAILS` | Include tool input in `caudra.tool_result` events. Off by default |
+| `content_max_length` | integer | `10240` | `CAUDRA_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
 
 Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
 
@@ -189,12 +189,12 @@ The `plugins` table turns bundled features and plugins on or off and passes opti
 
 Each feature checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
-The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
+The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Caudra stops at startup and shows you the new form.
 
-This table is for bundled plugins only. Your own plugins go in `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).
+This table is for bundled plugins only. Your own plugins go in `~/.config/caudra/lua/`, see [Plugins](/docs/plugins/).
 
 ```lua
-maki.setup({
+caudra.setup({
     plugins = {
         bash = { timeout_secs = 180 },
         websearch = { enabled = false },
@@ -214,7 +214,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
+| `plugin_dev` | boolean | `true` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. |
 
 ### `plugins.task`
 
@@ -224,30 +224,30 @@ maki.setup({
 
 ## Validation
 
-If a value is below its minimum, Maki shows a `ConfigError` with the field name, value, and minimum.
+If a value is below its minimum, Caudra shows a `ConfigError` with the field name, value, and minimum.
 
 ## Directory layout
 
-Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
+Caudra follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
 
 | Purpose | Linux / macOS | Windows |
 |---------|---------------|---------|
-| Config | `~/.config/maki/` | `%APPDATA%\maki\` |
-| Data | `~/.local/share/maki/` | `%APPDATA%\maki\` |
-| State | `~/.local/state/maki/` | `%APPDATA%\maki\` |
-| Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
-| Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\maki\` |
+| Config | `~/.config/caudra/` | `%APPDATA%\caudra\` |
+| Data | `~/.local/share/caudra/` | `%APPDATA%\caudra\` |
+| State | `~/.local/state/caudra/` | `%APPDATA%\caudra\` |
+| Logs | `~/.local/logs/caudra/` | `%APPDATA%\caudra\` |
+| Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.caudra/` (or `%USERPROFILE%\.caudra\`) is checked as a legacy fallback. If that directory still exists, caudra uses it for everything until you migrate.
 
-Development builds compiled with debug assertions use `maki-debug` for every platform directory and `~/.maki-debug/` for the legacy fallback. This keeps global config, sessions, auth, logs, and caches separate from release builds. Per-project `.maki/` directories remain shared.
+Development builds compiled with debug assertions use `caudra-debug` for every platform directory and `~/.caudra-debug/` for the legacy fallback. This keeps global config, sessions, auth, logs, and caches separate from release builds. Per-project `.caudra/` directories remain shared.
 
-### Migrating from ~/.maki/
+### Migrating from ~/.caudra/
 
 ```
-maki migrate xdg
+caudra migrate xdg
 ```
 
 This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
@@ -256,10 +256,10 @@ Safe to run more than once.
 
 ## Personal Instructions
 
-On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
+On top of the project instruction files Caudra loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
-- `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `~/.config/caudra/AGENTS.md` for preferences that apply to all projects
 
 All of these are added to the system prompt at the start of every session.
 
@@ -267,8 +267,8 @@ All of these are added to the system prompt at the start of every session.
 
 The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
 
-`…/state/maki/projects/<project-id>/memories/`
+`…/state/caudra/projects/<project-id>/memories/`
 
-(Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\maki\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+(Linux/macOS: `~/.local/state/caudra/…`; Windows: `%APPDATA%\caudra\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
 Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

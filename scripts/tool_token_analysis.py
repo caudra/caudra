@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Analyze tool token usage from ~/.maki/sessions to identify optimization targets."""
+"""Analyze Caudra session tool token usage to identify optimization targets."""
 
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path.home() / ".maki" / "sessions"
+if os.name == "nt":
+    STATE_HOME = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
+else:
+    STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+SESSION_DIR = STATE_HOME / "caudra" / "sessions"
 CHARS_PER_TOKEN = 4  # rough estimate for token counting from char length
 
 
@@ -370,7 +375,7 @@ def print_session_summary(sessions, all_calls):
             agg_usage[k] += v
 
     print("\n" + "═" * 70)
-    print("  MAKI SESSION TOOL TOKEN ANALYSIS")
+    print("  CAUDRA SESSION TOOL TOKEN ANALYSIS")
     print("═" * 70)
     print(f"  Sessions analyzed:     {total_sessions}")
     print(f"  Sessions with tools:   {sessions_with_tools}")

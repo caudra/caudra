@@ -1,6 +1,6 @@
 local QuestionForm = require("question_form")
 local QuestionHelpers = require("question_helpers")
-local ToolView = require("maki.tool_view")
+local ToolView = require("caudra.tool_view")
 
 local DESCRIPTION = [[Use this tool when you need to ask the user questions during execution. This allows you to:
 - Gather user preferences or requirements
@@ -33,7 +33,7 @@ local function dense(questions, answers)
   return out
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "question",
   effect = "isolated",
   description = DESCRIPTION,

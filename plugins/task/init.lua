@@ -2,15 +2,15 @@
 -- tool whose handler validates and captures the result as closure upvalues.
 -- Invalid input is an inline tool error the model can fix in the same run.
 -- This plugin owns structured output and subagent concurrency; Rust exposes
--- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
--- `maki.async.semaphore`).
+-- primitives only (`caudra.agent.session`, `caudra.json.schema_validator`,
+-- `caudra.async.semaphore`).
 --
 -- It also owns the /tasks picker over the subagents spawned here: picker.lua
 -- registers the command and the keymap when this file is loaded, so the two
 -- cannot be enabled apart and left pointing at each other's absence.
 
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
+local ToolView = require("caudra.tool_view")
+local output_limits = require("caudra.output_limits")
 require("picker")
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
@@ -51,7 +51,7 @@ Notes:
 4. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
 
-local opts = maki.api.register_options({
+local opts = caudra.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
 })
 
@@ -59,7 +59,7 @@ local schema = {
   type = "object",
   required = { "description", "prompt" },
   additionalProperties = false,
-  ["x-maki-reject-unknown"] = true,
+  ["x-caudra-reject-unknown"] = true,
   properties = {
     description = {
       type = "string",
@@ -80,7 +80,7 @@ local schema = {
     },
     profile = {
       type = "string",
-      description = 'System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Maki\'s built-in prompt. Omitted continuations retain their stored profile.',
+      description = 'System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra\'s built-in prompt. Omitted continuations retain their stored profile.',
     },
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
@@ -96,7 +96,7 @@ local examples = {
 }
 
 -- Process-wide cap on concurrent subagents.
-local semaphore = maki.async.semaphore(opts.max_concurrent)
+local semaphore = caudra.async.semaphore(opts.max_concurrent)
 
 local function bounded_errors(errors)
   local out = {}
@@ -119,7 +119,7 @@ local function handler(input, ctx)
       return { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
     end
     local compile_err
-    validator, compile_err = maki.json.schema_validator(input.output_schema)
+    validator, compile_err = caudra.json.schema_validator(input.output_schema)
     if compile_err then
       return { llm_output = SCHEMA_COMPILE_ERROR .. ": " .. compile_err, is_error = true }
     end
@@ -152,7 +152,7 @@ local function handler(input, ctx)
   -- pcall so a raised error cannot leak the permit.
   local ok, out = pcall(function()
     local sess_err
-    sess, sess_err = maki.agent.session(ctx, {
+    sess, sess_err = caudra.agent.session(ctx, {
       task = true,
       task_id = input.task_id,
       profile = input.profile,
@@ -205,7 +205,7 @@ local function handler(input, ctx)
       return with_task_id(task_id, { llm_output = SUMMARY_MISSING_ERROR, is_error = true })
     end
     return with_task_id(task_id, {
-      llm_output = captured and maki.json.encode(captured) or result.text,
+      llm_output = captured and caudra.json.encode(captured) or result.text,
       format = "markdown",
     })
   end)
@@ -236,11 +236,11 @@ local function restore(_input, output, is_error, ctx)
     max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
+    width = math.max(caudra.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
   })
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "task",
   effect = "orchestrator",
   description = description,

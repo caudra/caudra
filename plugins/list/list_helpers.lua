@@ -1,4 +1,4 @@
-local dir_listing = require("maki.dir_listing")
+local dir_listing = require("caudra.dir_listing")
 
 local M = {}
 
@@ -9,8 +9,8 @@ function M.handler(input, ctx)
   if not raw then
     return { llm_output = "error: path is required", is_error = true }
   end
-  local path = maki.fs.normalize(raw)
-  local meta = maki.fs.metadata(path)
+  local path = caudra.fs.normalize(raw)
+  local meta = caudra.fs.metadata(path)
   if not meta then
     return { llm_output = "error: path not found: " .. path, is_error = true }
   end

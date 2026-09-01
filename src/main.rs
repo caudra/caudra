@@ -11,7 +11,7 @@ use clap::Parser;
 
 use cli::Cli;
 
-/// How long a final telemetry export may take before maki stops waiting.
+/// How long a final telemetry export may take before caudra stops waiting.
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
@@ -19,7 +19,7 @@ fn main() {
     let result = cmd::dispatch(Cli::parse());
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
-    maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
+    caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     if let Err(e) = result {
         print_error(&e);
         std::process::exit(1);

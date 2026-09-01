@@ -1,0 +1,2383 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use caudra_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
+use caudra_agent::tools::Tool;
+use caudra_agent::tools::registry::{RegisteredTool, ToolRegistry};
+use caudra_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
+use caudra_agent::tools::{
+    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    PermissionScopes, ToolAudience, ToolContext, ToolEffect, ToolExecResult, ToolFilter,
+    ToolInvocation, ToolSource, is_tool_enabled, timeout_annotation,
+};
+use caudra_agent::{
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
+    TextOutput, ToolOutput, ToolOutputLimits,
+};
+use caudra_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
+use caudra_lua_macro::{lua_fn, lua_table};
+use caudra_storage::tool_outputs::ToolOutputRef;
+use flume::Sender;
+use mlua::{
+    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Value as LuaValue,
+};
+use serde_json::{Value, json};
+
+use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
+use crate::api::ui::buf::{BufHandle, line_to_lua};
+use crate::api::util::command::{
+    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
+    ui_roundtrip,
+};
+use crate::api::util::convert::{json_to_lua, lua_to_json};
+use crate::api::util::ctx::{LuaCtx, ManagedToolOutputRef};
+use crate::api::util::pair::{Pair, try_pair};
+use crate::runtime::{
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+};
+
+const TOOL_NAME_MAX: usize = 64;
+const TOOL_HANDLER_RETURN_ERR: &str =
+    "tool handler must return string or {output=string, is_error?=bool}";
+const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
+const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
+const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
+const PLAIN_HEADER_STYLE: &str = "tool";
+
+type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
+
+thread_local! {
+    /// Lives on the Lua runtime thread only. Calling `Request::Describe` from
+    /// that same thread would self-deadlock, so we resolve in-thread instead.
+    static LOCAL_DESCRIBE: RefCell<Option<DescribeFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String> + 'static) {
+    LOCAL_DESCRIBE.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
+    LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
+}
+
+type ToolHandles = (Option<Function>, Option<Function>);
+type ToolHandlesFn = Box<dyn Fn(&str) -> Option<ToolHandles>>;
+
+thread_local! {
+    static LOCAL_TOOL_HANDLES: RefCell<Option<ToolHandlesFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + 'static) {
+    LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
+    LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
+}
+
+fn dctx_json(ctx: &DescriptionContext) -> Value {
+    let mut obj = json!({
+        "audience": ctx.audience.name().unwrap_or("main"),
+        "policy": if ctx.policy().is_read_only() { "read_only" } else { "standard" },
+        "workflow": ctx.workflow,
+    });
+    let mut filter = ctx.filter;
+    while let ToolFilter::ReadOnly(inner) = filter {
+        filter = inner;
+    }
+    match filter {
+        ToolFilter::All => {}
+        ToolFilter::Only(names) => obj["only"] = json!(names),
+        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+        ToolFilter::ReadOnly(_) => unreachable!(),
+    }
+    obj
+}
+
+#[derive(Clone)]
+pub(crate) enum StartAnnotation {
+    Count(Arc<str>),
+    Timeout(Arc<str>),
+}
+
+#[derive(Clone)]
+pub(crate) enum PermissionScopeKind {
+    Field(Arc<str>),
+    Callback,
+}
+
+pub(crate) enum PermissionScopeSpec {
+    Field(Arc<str>),
+    Callback(RegistryKey),
+}
+
+impl PermissionScopeSpec {
+    pub(crate) fn kind(&self) -> PermissionScopeKind {
+        match self {
+            Self::Field(f) => PermissionScopeKind::Field(Arc::clone(f)),
+            Self::Callback(_) => PermissionScopeKind::Callback,
+        }
+    }
+}
+
+pub(crate) struct PendingTool {
+    pub(crate) name: Arc<str>,
+    pub(crate) description: String,
+    pub(crate) schema: &'static ParamSchema,
+    pub(crate) audience: ToolAudience,
+    pub(crate) effect: ToolEffect,
+    pub(crate) kind: Option<Arc<str>>,
+    pub(crate) handler_key: RegistryKey,
+    pub(crate) header_key: Option<RegistryKey>,
+    pub(crate) restore_key: Option<RegistryKey>,
+    pub(crate) start_key: Option<RegistryKey>,
+    pub(crate) permission_scopes: Option<PermissionScopeSpec>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) describe_key: Option<RegistryKey>,
+}
+
+pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
+
+pub(crate) type PendingRules = Arc<Mutex<Vec<PermissionRule>>>;
+
+#[derive(Clone, Copy)]
+pub(crate) enum PermissionRulePolicy {
+    Trusted,
+    DenyOnly,
+}
+
+pub(crate) struct LuaTool {
+    pub(crate) name: Arc<str>,
+    pub(crate) description: String,
+    pub(crate) schema: &'static ParamSchema,
+    pub(crate) audience: ToolAudience,
+    pub(crate) kind: Option<Arc<str>>,
+    pub(crate) tx: Sender<Request>,
+    pub(crate) plugin: Arc<str>,
+    pub(crate) contract: Arc<str>,
+    pub(crate) bundled: bool,
+    pub(crate) has_header_fn: bool,
+    pub(crate) has_start_fn: bool,
+    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) has_describe_fn: bool,
+}
+
+impl Tool for LuaTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        if !self.has_describe_fn {
+            return Cow::Borrowed(&self.description);
+        }
+        let dctx = dctx_json(ctx);
+        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+            return match result {
+                Some(s) => Cow::Owned(s),
+                None => Cow::Borrowed(&self.description),
+            };
+        }
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let sent = self
+            .tx
+            .send(Request::Describe {
+                plugin: Arc::clone(&self.plugin),
+                tool: Arc::clone(&self.name),
+                dctx,
+                reply: reply_tx,
+            })
+            .is_ok();
+        if sent {
+            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
+                Ok(Some(s)) => return Cow::Owned(s),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    tool = %self.name,
+                    error = %e,
+                    "describe round trip failed; falling back to static description"
+                ),
+            }
+        }
+        Cow::Borrowed(&self.description)
+    }
+
+    fn schema(&self) -> Value {
+        to_json_schema(self.schema)
+    }
+
+    fn audience(&self) -> ToolAudience {
+        self.audience
+    }
+
+    fn tool_kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    fn examples(&self) -> Option<Value> {
+        self.examples.clone()
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        let validated = validate(self.schema, input.clone())?;
+        let permission_state = match &self.permission_scope_kind {
+            Some(PermissionScopeKind::Field(field)) => {
+                let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
+                PermissionState::Ready(Some(match scope {
+                    Some(s) => PermissionScopes::single(s.to_owned()),
+                    None => PermissionScopes::force_prompt(validated.to_string()),
+                }))
+            }
+            Some(PermissionScopeKind::Callback) => PermissionState::NeedsCompute,
+            None => PermissionState::Ready(None),
+        };
+        Ok(Box::new(LuaToolInvocation {
+            tool: Arc::clone(&self.name),
+            plugin: Arc::clone(&self.plugin),
+            contract: Arc::clone(&self.contract),
+            bundled: self.bundled,
+            has_header_fn: self.has_header_fn,
+            has_start_fn: self.has_start_fn,
+            input: validated,
+            tx: self.tx.clone(),
+            permission_state,
+            mutable_path_field: self.mutable_path_field.clone(),
+            timeout: self.timeout,
+            start_annotation: self.start_annotation.clone(),
+        }))
+    }
+}
+
+enum PermissionState {
+    Ready(Option<PermissionScopes>),
+    NeedsCompute,
+}
+
+struct LuaToolInvocation {
+    tool: Arc<str>,
+    plugin: Arc<str>,
+    contract: Arc<str>,
+    bundled: bool,
+    has_header_fn: bool,
+    has_start_fn: bool,
+    input: Value,
+    tx: Sender<Request>,
+    permission_state: PermissionState,
+    mutable_path_field: Option<Arc<str>>,
+    timeout: Option<Duration>,
+    start_annotation: Option<StartAnnotation>,
+}
+
+impl ToolInvocation for LuaToolInvocation {
+    fn permission_input(&self) -> Option<&Value> {
+        Some(&self.input)
+    }
+
+    fn start_header(&self) -> HeaderFuture {
+        if !self.has_header_fn {
+            return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
+        }
+        let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
+        let tool = Arc::clone(&self.tool);
+        let plugin = Arc::clone(&self.plugin);
+        let contract = Arc::clone(&self.contract);
+        let input = self.input.clone();
+        let tx = self.tx.clone();
+        let fallback = tool.to_string();
+        HeaderFuture::Pending {
+            fallback: fallback.clone(),
+            fut: Box::pin(async move {
+                let sent = tx
+                    .send_async(Request::ComputeHeader {
+                        plugin: Arc::clone(&plugin),
+                        tool: Arc::clone(&tool),
+                        contract,
+                        input,
+                        reply: reply_tx,
+                    })
+                    .await;
+                if sent.is_err() {
+                    return HeaderResult::plain(fallback);
+                }
+                reply_rx
+                    .recv_async()
+                    .await
+                    .unwrap_or_else(|_| HeaderResult::plain(fallback))
+            }),
+        }
+    }
+
+    fn start_annotation(&self) -> Option<String> {
+        match self.start_annotation.as_ref()? {
+            StartAnnotation::Timeout(field) => {
+                let secs = self.input.get(field.as_ref())?.as_u64()?;
+                Some(timeout_annotation(secs))
+            }
+            StartAnnotation::Count(field) => {
+                let field = field.as_ref();
+                let n = self.input.get(field)?.as_array()?.len();
+                let (singular, plural) = if let Some(stem) = field.strip_suffix('s') {
+                    (stem, field)
+                } else {
+                    (field, &*format!("{field}s"))
+                };
+                let label = if n == 1 { singular } else { plural };
+                Some(format!("{n} {label}"))
+            }
+        }
+    }
+
+    fn start<'a>(&'a self, ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        let id = ctx.tool_use_id.as_ref().filter(|_| self.has_start_fn);
+        let Some(id) = id else {
+            return Box::pin(std::future::ready(()));
+        };
+        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let req = Request::StartTool {
+            plugin: Arc::clone(&self.plugin),
+            tool: Arc::clone(&self.tool),
+            contract: Arc::clone(&self.contract),
+            input: self.input.clone(),
+            live: LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id.clone(),
+            },
+            ctx: Box::new(LuaCtx::start(ctx)),
+            reply: reply_tx,
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            if tx.send_async(req).await.is_ok() {
+                let _ = reply_rx.recv_async().await;
+            }
+        })
+    }
+
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        match &self.permission_state {
+            PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
+            PermissionState::NeedsCompute => {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                let tx = self.tx.clone();
+                let plugin = Arc::clone(&self.plugin);
+                let tool = Arc::clone(&self.tool);
+                let contract = Arc::clone(&self.contract);
+                let input = self.input.clone();
+                let fallback = input.to_string();
+                Box::pin(async move {
+                    if tx
+                        .send_async(Request::ComputePermissionScopes {
+                            plugin,
+                            tool,
+                            contract,
+                            input,
+                            reply: reply_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Some(PermissionScopes::force_prompt(fallback));
+                    }
+                    match reply_rx.recv_async().await {
+                        Ok(Some(scopes)) => Some(scopes),
+                        _ => Some(PermissionScopes::force_prompt(fallback)),
+                    }
+                })
+            }
+        }
+    }
+
+    fn mutable_path(&self) -> Option<&Path> {
+        let field = self.mutable_path_field.as_deref()?;
+        let val = self.input.get(field)?.as_str()?;
+        Some(Path::new(val))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        let deadline = ctx.deadline;
+        let plugin = self.plugin;
+        let tool = self.tool;
+        let contract = self.contract;
+        let bundled = self.bundled;
+        let input = self.input;
+        let tx = self.tx;
+        let tool_timeout = self.timeout;
+
+        Box::pin(async move {
+            let effective_secs: Option<u64> = match tool_timeout {
+                Some(d) => match deadline.cap_timeout(d.as_secs()) {
+                    Ok(s) => Some(s),
+                    Err(e) => return Err(e).into(),
+                },
+                None => match deadline {
+                    Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
+                        Ok(s) => Some(s),
+                        Err(e) => return Err(e).into(),
+                    },
+                    Deadline::None => None,
+                },
+            };
+
+            let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
+            let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id,
+            });
+            let lua_ctx = LuaCtx::handler_for_tool(ctx, Arc::clone(&tool), bundled);
+
+            if tx
+                .send_async(Request::CallTool {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    contract,
+                    input,
+                    ctx: Box::new(lua_ctx),
+                    deadline: match deadline {
+                        Deadline::At(t) => Some(t),
+                        Deadline::None => None,
+                    },
+                    reply: reply_tx,
+                    live,
+                })
+                .await
+                .is_err()
+            {
+                return Err("lua thread disconnected".to_string()).into();
+            }
+
+            let recv = async { Some(reply_rx.recv_async().await) };
+            let result = match effective_secs {
+                Some(secs) => {
+                    futures_lite::future::race(recv, async move {
+                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        None
+                    })
+                    .await
+                }
+                None => recv.await,
+            };
+
+            match result {
+                None => Err(format!(
+                    "plugin {} tool {} exceeded timeout ({}s)",
+                    plugin,
+                    tool,
+                    effective_secs.unwrap_or(0)
+                ))
+                .into(),
+                Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
+                Some(Ok(reply)) => {
+                    if let Some(ref id) = ctx.tool_use_id {
+                        if let Some(live_buf) = reply.live_buf {
+                            crate::runtime::send_render_event(
+                                &ctx.event_tx,
+                                id,
+                                "live_buf",
+                                AgentEvent::LiveToolBuf {
+                                    id: id.clone(),
+                                    body: live_buf,
+                                },
+                            );
+                        }
+                        crate::runtime::RestoreReply {
+                            body: reply.snapshot,
+                            header: reply.header,
+                        }
+                        .emit(id, None, &ctx.event_tx);
+                    }
+                    let format = reply.format;
+                    let instructions = reply.instructions;
+                    let image = reply.image;
+                    let state = reply.state;
+                    let model_suffix = reply.model_suffix;
+                    let output_limits = reply.output_limits;
+                    let output_ref = reply.output_ref;
+                    let model_output_from_ref = reply.model_output_from_ref;
+                    let is_error = reply.result.is_err();
+                    ToolExecResult {
+                        output: reply.result.map(|s| {
+                            if let Some(source) = image {
+                                ToolOutput::Image { source, text: s }
+                            } else if let Some(diff) = reply.diff {
+                                ToolOutput::Diff {
+                                    summary: s,
+                                    path: diff.path,
+                                    before: diff.before,
+                                    after: diff.after,
+                                }
+                            } else {
+                                let inner = TextOutput {
+                                    text: s,
+                                    instructions: instructions.filter(|b| !b.is_empty()),
+                                    state,
+                                    lua_provenance: None,
+                                };
+                                match format {
+                                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
+                                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                                }
+                            }
+                        }),
+                        is_error,
+                        annotation: reply.annotation,
+                        written_path: reply.written_path,
+                        written_paths: Vec::new(),
+                        model_suffix,
+                        model_output: None,
+                        output_limits,
+                        output_ref,
+                        model_output_from_ref,
+                    }
+                }
+            }
+        })
+    }
+}
+
+fn parse_slot(spec: &Table) -> LuaResult<Slot> {
+    spec.get::<String>("slot")
+        .map_err(|_| mlua::Error::runtime("'slot' is required"))?
+        .parse()
+        .map_err(|_| {
+            mlua::Error::runtime(format!("unknown 'slot'. Valid: {}", Slot::valid_names()))
+        })
+}
+
+fn parse_prompt_field(spec: &Table) -> LuaResult<Option<Vec<PromptId>>> {
+    let parse_one = |s: &str| -> mlua::Result<PromptId> {
+        s.parse().map_err(|_| {
+            mlua::Error::runtime(format!(
+                "unknown 'prompt'. Valid: {}",
+                PromptId::valid_names()
+            ))
+        })
+    };
+    match spec.get::<LuaValue>("prompt") {
+        Ok(LuaValue::String(s)) => Ok(Some(vec![parse_one(&s.to_str()?)?])),
+        Ok(LuaValue::Table(t)) => {
+            let mut ids = Vec::new();
+            for pair in t.sequence_values::<mlua::String>() {
+                ids.push(parse_one(&pair?.to_str()?)?);
+            }
+            if ids.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "'prompt' table is empty or has no sequence entries; expected a list like {\"system\", \"general\"}",
+                ));
+            }
+            Ok(Some(ids))
+        }
+        Ok(LuaValue::Nil) | Err(_) => Ok(None),
+        Ok(_) => Err(mlua::Error::runtime(
+            "'prompt' must be a string or list of strings",
+        )),
+    }
+}
+
+fn validate_slot_prompt_compatibility(
+    slot: Slot,
+    prompts: &Option<Vec<PromptId>>,
+) -> LuaResult<()> {
+    if let Some(prompts) = prompts {
+        for &pid in prompts {
+            if !pid.has_slot(slot) {
+                return Err(mlua::Error::runtime(format!(
+                    "slot '{}' is not available for prompt '{}'",
+                    slot, pid
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
+    let has_content = spec.contains_key("content")?;
+    if !has_content {
+        return Err(mlua::Error::runtime("'content' is required"));
+    }
+
+    match spec.get("content")? {
+        LuaValue::String(s) => {
+            let text = s.to_string_lossy();
+            if text.is_empty() {
+                return Err(mlua::Error::runtime("'content' must not be empty"));
+            }
+            if text.len() > MAX_HINT_CONTENT_SIZE {
+                return Err(mlua::Error::runtime(format!(
+                    "content exceeds the {} byte limit",
+                    MAX_HINT_CONTENT_SIZE
+                )));
+            }
+            Ok(HintContent::Static(text))
+        }
+        LuaValue::Function(f) => Ok(HintContent::Callback(lua.create_registry_value(f)?)),
+        _ => Err(mlua::Error::runtime(
+            "'content' must be a string or function",
+        )),
+    }
+}
+
+/// Register a new tool the agent can call. This is the main way plugins add
+/// capabilities to the agent. The tool is queued during plugin load and
+/// committed to the registry once the plugin finishes loading.
+///
+/// Your {spec} table must include a name, a description (the model reads it
+/// to decide when to use the tool), a JSON Schema for the input, and a handler
+/// function. The handler receives `(input, ctx)` and returns either a plain
+/// string or a table with richer output fields. Normally return the complete
+/// `llm_output`: the host applies output limits and retains eligible full text
+/// for later retrieval. Truncate in the producer only when loss is intentional.
+///
+/// @param spec table Tool specification:
+///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
+///   description     (string)   Required. Non-empty description shown to the model.
+///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
+///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
+///                              Must return a string or a table with any of these fields:
+///                                llm_output  (string)  Text sent to the model.
+///                                is_error    (boolean) When true, the result is treated as an error.
+///                                content     (string)  Alias for llm_output (legacy).
+///                                body        (BufHandle) Rich rendered body shown in the UI.
+///                                header      (BufHandle) One-line header shown before the body.
+///                                format      (string)  "plain" (default) or "markdown".
+///                                annotation  (string)  Short label shown next to the tool call.
+///                                written_path (string) Path of a file written by the tool.
+///                                diff_path   (string)  Path for a diff output block.
+///                                diff_before (string)  Before text of the diff.
+///                                diff_after  (string)  After text of the diff.
+///                                image       (table)   { media_type: string, data: string } base64 image.
+///                                instructions (table)  Array of { path, content } blocks injected as context.
+///                                state       (any)     Serializable state forwarded to restore.
+///                                model_suffix (string) Extra parent-model context omitted from UI and direct tool calls.
+///                                output_limits (table) Host-enforced limits for this result.
+///                                                      `max_lines` and `max_bytes` are required positive
+///                                                      integers. Overrides the agent defaults.
+///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
+///   effect          (string)   Bundled-tool capability: "read_only", "isolated", "orchestrator", or "mutating". Unbundled claims are ignored.
+///   kind            (string)   Optional grouping label (e.g. "filesystem").
+///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
+///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
+///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
+///   start           (function) Optional. Called when the tool call starts, before the handler runs.
+///   describe        (function) Optional. Returns a custom description string for the current context.
+///   examples        (table)    Optional. Array of example input objects for documentation.
+///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
+///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes.
+///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+/// @return
+/// @example
+/// caudra.api.register_tool({
+///   name = "word_count",
+///   description = "Count words in a file.",
+///   kind = "read",
+///   schema = {
+///     properties = { path = { type = "string", description = "File path" } },
+///     required = { "path" },
+///   },
+///   handler = function(input)
+///     local f = io.open(input.path, "r")
+///     if not f then return { llm_output = "file not found", is_error = true } end
+///     local n = 0
+///     for _ in f:read("*a"):gmatch("%S+") do n = n + 1 end
+///     f:close()
+///     return tostring(n) .. " words"
+///   end,
+/// })
+#[lua_fn]
+fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaResult<()> {
+    register_tool_from_lua(lua, &spec, pending)
+}
+
+/// Declare an agent permission rule for a native tool. Use it to pre-allow
+/// (or pre-deny) tool calls on paths your plugin owns, like a storage
+/// directory outside the working dir, so the user is not prompted for them.
+///
+/// Rules live as long as the plugin is loaded: a reload replaces them, and a
+/// reload that registers none clears the old ones. User config and session
+/// deny rules always win over a plugin allow.
+///
+/// @param spec table Rule specification:
+///   tool   (string) Required. Native tool name (e.g. "edit", "write").
+///                   MCP tools and the "*" wildcard are not allowed.
+///   scope  (string) Required. Scope pattern the rule applies to, e.g.
+///                   "/abs/dir/**" for a directory subtree.
+///   effect (string) Optional. "allow" (default) or "deny".
+/// @return
+/// @example
+/// caudra.api.register_permission_rule({
+///   tool = "write",
+///   scope = notes_dir .. "/**",
+/// })
+#[lua_fn]
+fn register_permission_rule(
+    _lua: &Lua,
+    #[ctx] pending_rules: PendingRules,
+    #[ctx] rule_policy: PermissionRulePolicy,
+    spec: Table,
+) -> LuaResult<()> {
+    for entry in spec.pairs::<String, LuaValue>() {
+        let (key, _) = entry.map_err(|_| {
+            mlua::Error::runtime("register_permission_rule: spec keys must be strings")
+        })?;
+        if !PERMISSION_RULE_KEYS.contains(&key.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: unknown key '{key}' (valid: tool, scope, effect)"
+            )));
+        }
+    }
+
+    let tool: String = spec.get("tool").map_err(|_| {
+        mlua::Error::runtime("register_permission_rule: 'tool' must be a native tool name string")
+    })?;
+    let tool = match ToolKey::parse(&tool) {
+        Ok(key @ ToolKey::Native(_)) => key,
+        Ok(_) => {
+            return Err(mlua::Error::runtime(
+                "register_permission_rule: only native tools are allowed (no wildcard or MCP)",
+            ));
+        }
+        Err(e) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: {e}"
+            )));
+        }
+    };
+
+    let scope: String = spec
+        .get("scope")
+        .map_err(|_| mlua::Error::runtime("register_permission_rule: 'scope' must be a string"))?;
+    if scope.is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_permission_rule: 'scope' must be non-empty",
+        ));
+    }
+
+    let effect = spec
+        .get::<Option<String>>("effect")
+        .map_err(|_| mlua::Error::runtime("register_permission_rule: 'effect' must be a string"))?;
+    let effect = match effect.as_deref() {
+        None | Some("allow") => Effect::Allow,
+        Some("deny") => Effect::Deny,
+        Some(other) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: invalid effect '{other}' (expected \"allow\" or \"deny\")"
+            )));
+        }
+    };
+    if effect == Effect::Allow && matches!(rule_policy, PermissionRulePolicy::DenyOnly) {
+        return Err(mlua::Error::runtime(
+            "register_permission_rule: this plugin source may register deny rules only",
+        ));
+    }
+
+    pending_rules
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(PermissionRule {
+            tool,
+            scope: Some(scope),
+            effect,
+        });
+    Ok(())
+}
+
+/// Register a slash-command that appears in the user input bar.
+///
+/// Slash commands let the user trigger plugin actions by typing `/name` in the
+/// input. Use them for interactive workflows that do not need the model, like
+/// browsing memory files or toggling settings.
+///
+/// @param spec table Command specification:
+///   name        (string)   Required. The command name (e.g. "/hello"; a leading
+///                            slash is added when missing).
+///   description (string)   Optional. Short description shown in the command palette.
+///   nargs       (integer|string) Optional. How many arguments the command
+///                          takes, spelled like nvim's nargs: 0 (default),
+///                          1, "?" (zero or one), "*" (any number), or "+"
+///                          (one or more). An argument is a whitespace
+///                          separated word. Type more than allowed and the
+///                          command quietly stops matching: the input goes
+///                          to the model as a normal message. Only the upper
+///                          bound is checked, so with "+" you still need to
+///                          handle an empty `opts.args` yourself.
+///   handler     (function) Required. Called when the user runs the command,
+///                          with one opts table: `opts.args` is the raw
+///                          argument string (whitespace kept, may be empty)
+///                          and `opts.fargs` is the same split into words.
+/// @return
+/// @example
+/// caudra.api.register_command({
+///   name = "/hello",
+///   description = "Say hello",
+///   handler = function()
+///     caudra.ui.flash("Hello from my plugin!")
+///   end,
+/// })
+#[lua_fn]
+fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    register_command_from_lua(lua, &spec, plugin)
+}
+
+/// Runs a slash command by name, exactly as typing it in the input would.
+/// Works for built-ins, custom `/project:` and `/user:` commands, MCP
+/// prompts, and commands other plugins registered.
+///
+/// Use it to alias a command you like under a name you prefer, instead of
+/// reimplementing what it does. See `caudra.ui.action` for the same idea
+/// applied to keybound UI actions.
+///
+/// Pass the whole command line, arguments included: `"/cd ~/src"`. The
+/// leading slash is optional. Names match exactly apart from case, so a typo
+/// reports an error instead of running the closest command, and a cycle of
+/// aliases stops with one too.
+///
+/// This returns as soon as the command has been dispatched, not when it
+/// finishes, so aliasing something long-running like `/compact` does not
+/// block your handler.
+///
+/// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @example
+/// -- /resume as an alias for the built-in session picker:
+/// caudra.api.register_command({
+///   name = "/resume",
+///   description = "Alias for /sessions",
+///   handler = function()
+///     local ok, err = caudra.api.run_command("/sessions")
+///     if not ok then
+///       caudra.ui.flash("could not run /sessions: " .. err)
+///     end
+///   end,
+/// })
+#[lua_fn]
+async fn run_command(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    cmdline: String,
+) -> LuaResult<Pair<bool>> {
+    let depth = command_depth(&lua).saturating_add(1);
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
+            cmdline,
+            depth,
+            reply_tx,
+        })
+        .await
+    );
+    try_pair!(reply);
+    Ok((Some(true), None))
+}
+
+/// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
+/// contribute to the same slot, and all contributions are concatenated.
+///
+/// Good for things like tool usage guidelines or extra context that should
+/// appear alongside other plugins' hints. If you need to own the whole slot
+/// (e.g. identity or tone), use `set_prompt` instead.
+///
+/// Throws if you pass a singleton slot name.
+///
+/// @param spec table Hint specification:
+///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
+///   content (string|function) Required. Static text, or a `function(config)` that receives the effective agent config and returns a string or nil. Max 1 MiB.
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
+/// @return
+/// @example
+/// caudra.api.register_prompt_hint({
+///   slot = "tool_usage",
+///   content = "- Prefer **grep** over reading entire files.",
+/// })
+#[lua_fn]
+fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    let slot: Slot = parse_slot(&spec)?;
+    if slot.kind() == SlotKind::Singleton {
+        return Err(mlua::Error::runtime(format!(
+            "register_prompt_hint is for aggregate slots ({}); \
+             use set_prompt for singleton slots ({})",
+            Slot::names_for_kind(SlotKind::Aggregate),
+            Slot::names_for_kind(SlotKind::Singleton),
+        )));
+    }
+    let prompts = parse_prompt_field(&spec)?;
+    validate_slot_prompt_compatibility(slot, &prompts)?;
+    let content = parse_hint_content(lua, &spec)?;
+    let reg = PromptHintRegistration {
+        prompts,
+        slot,
+        content,
+    };
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    Ok(())
+}
+
+/// Set a singleton prompt slot. Only one plugin owns each singleton slot at a
+/// time, so calling this replaces any previous value from your plugin.
+///
+/// Use this for slots like "identity" or "tone" where a single coherent value
+/// makes more sense than combining fragments. For aggregate slots like
+/// "tool_usage", use `register_prompt_hint` instead.
+///
+/// Throws if you pass an aggregate slot name.
+///
+/// @param spec table Spec fields mirror `register_prompt_hint`:
+///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
+///   content (string|function) Required. Static text, or a `function(config)` that receives the effective agent config and returns a string or nil. Max 1 MiB.
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
+/// @return
+/// @example
+/// caudra.api.set_prompt({
+///   slot = "tone",
+///   content = "Be concise. No filler words.",
+/// })
+#[lua_fn]
+fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    let slot: Slot = parse_slot(&spec)?;
+    if slot.kind() == SlotKind::Aggregate {
+        return Err(mlua::Error::runtime(format!(
+            "set_prompt is for singleton slots ({}); \
+             use register_prompt_hint for aggregate slots ({})",
+            Slot::names_for_kind(SlotKind::Singleton),
+            Slot::names_for_kind(SlotKind::Aggregate),
+        )));
+    }
+    let prompts = parse_prompt_field(&spec)?;
+    validate_slot_prompt_compatibility(slot, &prompts)?;
+    let content = parse_hint_content(lua, &spec)?;
+    let reg = PromptHintRegistration {
+        prompts,
+        slot,
+        content,
+    };
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    Ok(())
+}
+
+/// Return a list of all registered tools. Useful for building UI that shows
+/// available tools or for checking which tools are enabled.
+///
+/// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
+/// Describe callbacks are not invoked (the static description is used).
+///
+/// @param opts table? Options:
+///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
+/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+/// @example
+/// local tools = caudra.api.get_tools()
+/// for _, t in ipairs(tools) do
+///   print(t.name, t.enabled)
+/// end
+#[lua_fn]
+fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tools: tool registry not available"))?;
+    let mut disabled: Vec<String> = Vec::new();
+    if let Some(o) = opts
+        && let Some(config) = o.get::<Option<Table>>("config")?
+    {
+        disabled = config
+            .get::<Option<Vec<String>>>("disabled_tools")?
+            .unwrap_or_default();
+    }
+
+    let out = lua.create_table()?;
+    for (i, entry) in registry.iter().iter().enumerate() {
+        let t = tool_entry_to_lua(lua, entry)?;
+        t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
+        out.set(i + 1, t)?;
+    }
+    Ok(out)
+}
+
+/// Look up a single tool by name. Returns its metadata table or nil if the
+/// tool does not exist. For Lua-registered tools the returned table also
+/// includes `header` and `restore` handle functions (wrapped so they never
+/// throw).
+///
+/// @param name string Exact tool name.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @example
+/// local t = caudra.api.get_tool("bash")
+/// if t then
+///   print("bash audiences:", table.concat(t.audiences, ", "))
+/// end
+#[lua_fn]
+fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
+    let Some(entry) = registry.get(&name) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = tool_entry_to_lua(lua, &entry)?;
+    if let ToolSource::Lua {
+        plugin, contract, ..
+    } = &entry.source
+    {
+        let provenance = lua.create_table()?;
+        provenance.set("plugin", plugin.as_ref())?;
+        provenance.set("contract", contract.as_ref())?;
+        t.set("lua_provenance", provenance)?;
+    }
+    if let Some((header, restore)) = local_tool_handles(&name) {
+        let safe_in_read_only = entry.is_safe_in_read_only();
+        if let Some(f) = header {
+            t.set(
+                "header",
+                wrap_header(lua, name.clone(), f, safe_in_read_only)?,
+            )?;
+        }
+        if let Some(f) = restore {
+            t.set("restore", wrap_restore(lua, name, f, safe_in_read_only)?)?;
+        }
+    }
+    Ok(LuaValue::Table(t))
+}
+
+lua_table! {
+    /// Plugin registration. This is where you tell caudra about your tools,
+    /// slash commands, and prompt contributions.
+    ///
+    /// Most plugins only need `register_tool` and maybe `register_prompt_hint`.
+    /// Call these at the top level of your plugin file (during load).
+    ///
+    /// ```lua
+    /// caudra.api.register_tool({ name = "greet", ... })
+    /// caudra.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
+    /// ```
+    extend "caudra.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, rule_policy: PermissionRulePolicy, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending), register_permission_rule(pending_rules, rule_policy), register_command(plugin),
+        register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
+        get_tools, get_tool,
+        manual run_command,
+    ]
+}
+
+pub(crate) fn create_api_table(
+    lua: &Lua,
+    pending: PendingTools,
+    pending_rules: PendingRules,
+    rule_policy: PermissionRulePolicy,
+    plugin: Arc<str>,
+    opts: PluginOpts,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    add_tool_fns(&t, lua, pending, pending_rules, rule_policy, plugin, opts)?;
+    run_command__register(&t, lua, ui_action_tx)?;
+    Ok(t)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
+    let audience = entry.tool.audience();
+    let audiences = lua.create_table()?;
+    for (flag, name) in caudra_agent::tools::registry::AUDIENCE_NAMES {
+        if audience.contains(*flag) {
+            audiences.push(*name)?;
+        }
+    }
+    let t = lua.create_table()?;
+    t.set("name", entry.name())?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("audiences", audiences)?;
+    if let Some(kind) = entry.tool.tool_kind() {
+        t.set("kind", kind)?;
+    }
+    Ok(t)
+}
+
+/// Async so wrapped fns can yield (e.g. bash restore highlights inline).
+fn wrap_nothrow(
+    lua: &Lua,
+    tool: String,
+    handle: &'static str,
+    f: Function,
+    norm: fn(&Lua, LuaValue) -> LuaResult<LuaValue>,
+    safe_in_read_only: bool,
+) -> LuaResult<Function> {
+    lua.create_async_function(move |lua, args: MultiValue| {
+        let (f, tool) = (f.clone(), tool.clone());
+        async move {
+            if !safe_in_read_only && crate::runtime::active_task_is_read_only(&lua) {
+                return Ok(LuaValue::Nil);
+            }
+            match f.call_async::<LuaValue>(args).await {
+                Ok(v) => norm(&lua, v),
+                Err(e) => {
+                    tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
+                    Ok(LuaValue::Nil)
+                }
+            }
+        }
+    })
+}
+
+/// Normalizes a header fn to one spans line or nil: a plain string gets
+/// the standalone header style, a buf return contributes its first line.
+fn wrap_header(
+    lua: &Lua,
+    tool: String,
+    f: Function,
+    safe_in_read_only: bool,
+) -> LuaResult<Function> {
+    wrap_nothrow(
+        lua,
+        tool,
+        "header",
+        f,
+        |lua, v| match v {
+            LuaValue::String(s) => {
+                let span = lua.create_table()?;
+                span.raw_set(1, s)?;
+                span.raw_set(2, PLAIN_HEADER_STYLE)?;
+                let line = lua.create_table()?;
+                line.raw_set(1, span)?;
+                Ok(LuaValue::Table(line))
+            }
+            LuaValue::UserData(ud) => {
+                let Ok(h) = ud.borrow::<BufHandle>() else {
+                    return Ok(LuaValue::Nil);
+                };
+                match h.buf.read().first() {
+                    Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
+                    None => Ok(LuaValue::Nil),
+                }
+            }
+            _ => Ok(LuaValue::Nil),
+        },
+        safe_in_read_only,
+    )
+}
+
+/// Normalizes a restore fn to its body buf or nil (whether it returned
+/// the buf directly or a `{ body = buf }` reply), so callers composing
+/// another tool's rendering need no pcall of their own. The ctx arg may be
+/// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
+/// batch drives child restores); either way the fn sees a restore `LuaCtx`.
+fn wrap_restore(
+    lua: &Lua,
+    tool: String,
+    f: Function,
+    safe_in_read_only: bool,
+) -> LuaResult<Function> {
+    let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
+        let f = f.clone();
+        async move {
+            let ctx = normalize_restore_ctx(&lua, args.get(3))?;
+            while args.len() < 4 {
+                args.push_back(LuaValue::Nil);
+            }
+            args[3] = ctx;
+            f.call_async::<MultiValue>(args).await
+        }
+    })?;
+    wrap_nothrow(
+        lua,
+        tool,
+        "restore",
+        prepped,
+        |_lua, v| {
+            Ok(match &v {
+                LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
+                LuaValue::Table(t) => t
+                    .get::<mlua::AnyUserData>("body")
+                    .ok()
+                    .filter(|ud| ud.is::<BufHandle>())
+                    .map(LuaValue::UserData)
+                    .unwrap_or(LuaValue::Nil),
+                _ => LuaValue::Nil,
+            })
+        },
+        safe_in_read_only,
+    )
+}
+
+fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue> {
+    if let Some(LuaValue::UserData(ud)) = v
+        && ud.is::<LuaCtx>()
+    {
+        return Ok(LuaValue::UserData(ud.clone()));
+    }
+    let (tol, state) = match v {
+        Some(LuaValue::Table(t)) => (
+            t.get::<LuaValue>("tool_output_lines")
+                .ok()
+                .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
+                .unwrap_or_default(),
+            t.get::<LuaValue>("state")
+                .ok()
+                .and_then(|v| lua_to_json(lua, &v).ok())
+                .filter(|v| !v.is_null()),
+        ),
+        _ => (ToolOutputLines::default(), None),
+    };
+    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    Ok(LuaValue::UserData(ud))
+}
+
+fn is_valid_tool_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > TOOL_NAME_MAX {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
+    let Some(arr) = audiences else {
+        return Ok(ToolAudience::default());
+    };
+    let mut flags = ToolAudience::empty();
+    let mut count = 0;
+    for item in arr.sequence_values::<String>() {
+        let s = item?;
+        count += 1;
+        flags |= match s.as_str() {
+            "all" => ToolAudience::all(),
+            other => ToolAudience::parse_name(other)
+                .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {other}")))?,
+        };
+    }
+    if count == 0 {
+        return Err(mlua::Error::runtime(
+            "register_tool: 'audiences' must be omitted or non-empty",
+        ));
+    }
+    Ok(flags)
+}
+
+fn parse_timeout(spec: &Table) -> LuaResult<Option<Duration>> {
+    let value: LuaValue = spec.get("timeout").unwrap_or(LuaValue::Nil);
+    match value {
+        LuaValue::Nil | LuaValue::Boolean(false) => Ok(None),
+        LuaValue::Integer(0) => Ok(None),
+        LuaValue::Integer(n) if n > 0 => Ok(Some(Duration::from_secs(n as u64))),
+        LuaValue::Number(n) if n > 0.0 && n.is_finite() => Ok(Some(Duration::from_secs(n as u64))),
+        LuaValue::Number(0.0) => Ok(None),
+        _ => Err(mlua::Error::runtime(TIMEOUT_PARSE_ERR)),
+    }
+}
+
+fn spec_opt<T: mlua::FromLua>(spec: &Table, key: &str, expected: &str) -> LuaResult<Option<T>> {
+    spec.get::<Option<T>>(key)
+        .map_err(|_| mlua::Error::runtime(format!("register_tool: '{key}' must be {expected}")))
+}
+
+fn check_schema_field(schema: &Value, key: &str, field: &str, expected: &str) -> LuaResult<()> {
+    let matches = schema
+        .get("properties")
+        .and_then(|p| p.get(field))
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == expected);
+    if matches {
+        Ok(())
+    } else {
+        Err(mlua::Error::runtime(format!(
+            "register_tool: {key} field '{field}' not in schema properties or not type '{expected}'"
+        )))
+    }
+}
+
+fn require_schema_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Option<Arc<str>>> {
+    let Some(field) = spec_opt::<String>(spec, key, "a string")? else {
+        return Ok(None);
+    };
+    check_schema_field(schema, key, &field, "string")?;
+    Ok(Some(Arc::from(field.as_str())))
+}
+
+fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<StartAnnotation>> {
+    match spec.get::<Option<LuaValue>>("start_annotation")? {
+        None => Ok(None),
+        Some(LuaValue::String(s)) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(schema, "start_annotation", &field, "array")?;
+            Ok(Some(StartAnnotation::Count(Arc::from(field.as_str()))))
+        }
+        Some(LuaValue::Table(t)) => {
+            let field: String = t.get("field").map_err(|_| {
+                mlua::Error::runtime("register_tool: start_annotation.field required")
+            })?;
+            if t.get::<Option<String>>("kind")?.as_deref() != Some("timeout") {
+                return Err(mlua::Error::runtime(
+                    "register_tool: start_annotation.kind must be 'timeout'",
+                ));
+            }
+            check_schema_field(schema, "start_annotation", &field, "integer")?;
+            Ok(Some(StartAnnotation::Timeout(Arc::from(field.as_str()))))
+        }
+        Some(_) => Err(mlua::Error::runtime(
+            "register_tool: 'start_annotation' must be a string field name or a table",
+        )),
+    }
+}
+
+fn parse_tool_effect(spec: &Table) -> LuaResult<ToolEffect> {
+    match spec.get::<Option<String>>("effect")?.as_deref() {
+        None | Some("unknown") => Ok(ToolEffect::Unknown),
+        Some("read_only") => Ok(ToolEffect::ReadOnly),
+        Some("isolated") => Ok(ToolEffect::Isolated),
+        Some("orchestrator") => Ok(ToolEffect::Orchestrator),
+        Some("mutating") => Ok(ToolEffect::Mutating),
+        Some(effect) => Err(mlua::Error::runtime(format!(
+            "register_tool: invalid effect '{effect}'"
+        ))),
+    }
+}
+
+fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
+    let name: String = spec
+        .get("name")
+        .map_err(|_| mlua::Error::runtime("register_tool: missing 'name'"))?;
+    if !is_valid_tool_name(&name) {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: invalid name '{name}'"
+        )));
+    }
+    let description: String = spec.get("description").unwrap_or_default();
+    if description.trim().is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_tool: description must be non-empty",
+        ));
+    }
+    let handler: Function = spec
+        .get("handler")
+        .map_err(|_| mlua::Error::runtime("register_tool: missing 'handler'"))?;
+    let schema_table: LuaValue = spec
+        .get("schema")
+        .map_err(|_| mlua::Error::runtime("register_tool: missing 'schema'"))?;
+    let audiences: Option<mlua::Table> = spec.get("audiences").ok();
+
+    let schema_val: Value = lua.from_value(schema_table)?;
+    let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
+
+    if !spec.get::<LuaValue>("permission_scope")?.is_nil() {
+        return Err(mlua::Error::runtime(
+            "register_tool: 'permission_scope' was removed; use permission_scopes = \"<field>\" or permission_scopes = function(input) ... end",
+        ));
+    }
+    let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+
+    let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
+        LuaValue::Nil => None,
+        LuaValue::String(s) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(&schema_val, "permission_scopes", &field, "string")?;
+            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
+        }
+        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'permission_scopes' must be a string field name or a function",
+            ));
+        }
+    };
+
+    let header_fn: Option<Function> = spec.get("header").ok();
+    let restore_fn: Option<Function> = spec.get("restore").ok();
+    let start_fn: Option<Function> = spec.get("start").ok();
+    let kind: Option<Arc<str>> = spec
+        .get::<String>("kind")
+        .ok()
+        .map(|s| Arc::from(s.as_str()));
+    let audience = parse_audience(audiences)?;
+    let effect = parse_tool_effect(spec)?;
+    let timeout = parse_timeout(spec)?;
+    let start_annotation = parse_start_annotation(spec, &schema_val)?;
+    let handler_key: RegistryKey = lua.create_registry_value(handler)?;
+    let header_key = header_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+    let restore_key = restore_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+    let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
+
+    let describe_fn: Option<Function> = spec.get("describe").ok();
+    let describe_key = describe_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+
+    let examples: Option<Value> =
+        spec_opt::<Table>(spec, "examples", "a table (array of example inputs)")?
+            .map(|t| lua.from_value(LuaValue::Table(t)))
+            .transpose()
+            .map_err(|e| mlua::Error::runtime(format!("register_tool: invalid examples: {e}")))?;
+
+    let name: Arc<str> = Arc::from(name.as_str());
+
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(PendingTool {
+            name,
+            description,
+            schema: param_schema,
+            audience,
+            effect,
+            kind,
+            handler_key,
+            header_key,
+            restore_key,
+            start_key,
+            permission_scopes,
+            mutable_path_field,
+            timeout,
+            start_annotation,
+            examples,
+            describe_key,
+        });
+
+    Ok(())
+}
+
+/// Matching only needs an upper bound, so "+" and "*" both become MAX;
+/// minimums ("+" vs "*") are left for handlers to enforce.
+fn parse_nargs(spec: &Table) -> LuaResult<usize> {
+    match spec.get::<LuaValue>("nargs")? {
+        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
+        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
+        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
+            "?" => Ok(1),
+            "*" | "+" => Ok(usize::MAX),
+            _ => Err(mlua::Error::runtime(NARGS_ERR)),
+        },
+        _ => Err(mlua::Error::runtime(NARGS_ERR)),
+    }
+}
+
+fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
+    let mut name: String = spec
+        .get("name")
+        .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
+    if name.is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_command: name must be non-empty",
+        ));
+    }
+    if !name.starts_with('/') {
+        name.insert(0, '/');
+    }
+    let description: String = spec.get("description").unwrap_or_default();
+    let max_args = parse_nargs(spec)?;
+    let handler: Function = spec
+        .get("handler")
+        .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
+
+    let handler_key = lua.create_registry_value(handler)?;
+    let name: Arc<str> = Arc::from(name.as_str());
+    let description: Arc<str> = Arc::from(description.as_str());
+
+    {
+        let mut map = lua
+            .app_data_mut::<CommandHandlerMap>()
+            .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+        map.entry(Arc::clone(&plugin)).or_default().insert(
+            Arc::clone(&name),
+            CommandEntry {
+                handler: handler_key,
+                description,
+                max_args,
+            },
+        );
+    }
+
+    let map = lua
+        .app_data_ref::<CommandHandlerMap>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    let writer = lua
+        .app_data_ref::<LuaCommandWriter>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    publish_command_snapshot(&map, &writer);
+
+    Ok(())
+}
+
+pub(crate) type ToolCallResult = Result<String, String>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LuaOutputFormat {
+    #[default]
+    Plain,
+    Markdown,
+}
+
+const LUA_FORMAT_MARKDOWN: &str = "markdown";
+const LUA_FORMAT_PLAIN: &str = "plain";
+
+pub(crate) struct DiffPayload {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+}
+
+pub(crate) struct ToolCallReply {
+    pub result: ToolCallResult,
+    pub snapshot: Option<BufferSnapshot>,
+    pub header: Option<BufferSnapshot>,
+    pub live_buf: Option<Arc<SharedBuf>>,
+    pub format: LuaOutputFormat,
+    pub annotation: Option<String>,
+    pub instructions: Option<Vec<InstructionBlock>>,
+    pub written_path: Option<String>,
+    pub diff: Option<DiffPayload>,
+    /// Set via `image = { media_type = "image/png", data = <base64> }` in the
+    /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
+    pub image: Option<ImageSource>,
+    pub state: Option<Value>,
+    pub model_suffix: Option<String>,
+    pub output_limits: Option<ToolOutputLimits>,
+    pub output_ref: Option<ToolOutputRef>,
+    pub model_output_from_ref: bool,
+}
+
+impl ToolCallReply {
+    pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
+        let mut result = coerce_tool_result(val);
+        let LuaValue::Table(t) = val else {
+            return Self::plain(result);
+        };
+        let (snapshot, live_buf) = Self::extract_body_handle(t);
+        let header = t
+            .get::<LuaValue>("header")
+            .ok()
+            .and_then(|v| Self::extract_snapshot(&v));
+        let format = extract_format(t);
+        let annotation = t.get::<String>("annotation").ok();
+        let model_suffix = t.get::<String>("model_suffix").ok();
+        let mut host_metadata_error = false;
+        let output_limits = match extract_output_limits(t) {
+            Ok(output_limits) => output_limits,
+            Err(e) => {
+                result = Err(e);
+                host_metadata_error = true;
+                None
+            }
+        };
+        let instructions = extract_instructions(t);
+        let written_path = t.get::<String>("written_path").ok();
+        let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
+            path,
+            before: t.get::<String>("diff_before").ok().unwrap_or_default(),
+            after: t.get::<String>("diff_after").ok().unwrap_or_default(),
+        });
+        // A malformed image fails the call; dropping it silently would leave
+        // a caption claiming pixels the model never receives.
+        let image = match extract_image(t) {
+            Ok(image) => image,
+            Err(e) => {
+                result = Err(e);
+                host_metadata_error = true;
+                None
+            }
+        };
+        let output_ref = (!host_metadata_error)
+            .then(|| extract_managed_output(t))
+            .flatten();
+        let model_output_from_ref = output_ref.is_some();
+        let state = match t.get::<LuaValue>("state") {
+            Ok(LuaValue::Nil) | Err(_) => None,
+            Ok(v) => crate::api::util::convert::lua_to_json(lua, &v)
+                .inspect_err(|e| tracing::warn!(error = %e, "tool state is not JSON-serializable, dropping it"))
+                .ok(),
+        };
+        Self {
+            result,
+            snapshot,
+            header,
+            live_buf,
+            format,
+            annotation,
+            instructions,
+            written_path,
+            diff,
+            image,
+            state,
+            model_suffix,
+            output_limits,
+            output_ref,
+            model_output_from_ref,
+        }
+    }
+
+    fn extract_body_handle(t: &mlua::Table) -> (Option<BufferSnapshot>, Option<Arc<SharedBuf>>) {
+        t.get::<LuaValue>("body")
+            .ok()
+            .and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some((Some(h.buf.take()), Some(Arc::clone(&h.buf))))
+            })
+            .unwrap_or((None, None))
+    }
+
+    fn extract_snapshot(val: &LuaValue) -> Option<BufferSnapshot> {
+        let ud = val.as_userdata()?;
+        let h = ud.borrow::<BufHandle>().ok()?;
+        Some(h.buf.take())
+    }
+
+    pub fn plain(result: ToolCallResult) -> Self {
+        Self {
+            result,
+            snapshot: None,
+            header: None,
+            live_buf: None,
+            format: LuaOutputFormat::default(),
+            annotation: None,
+            instructions: None,
+            written_path: None,
+            diff: None,
+            image: None,
+            state: None,
+            model_suffix: None,
+            output_limits: None,
+            output_ref: None,
+            model_output_from_ref: false,
+        }
+    }
+
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self::plain(Err(msg.into()))
+    }
+}
+
+fn extract_managed_output(t: &mlua::Table) -> Option<ToolOutputRef> {
+    let LuaValue::UserData(userdata) = t.get::<LuaValue>("managed_output").ok()? else {
+        return None;
+    };
+    let reference = userdata.borrow::<ManagedToolOutputRef>().ok()?;
+    Some(reference.reference().clone())
+}
+
+fn extract_output_limits(t: &mlua::Table) -> Result<Option<ToolOutputLimits>, String> {
+    let limits = match t.get::<LuaValue>("output_limits") {
+        Ok(LuaValue::Table(limits)) => limits,
+        Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(other) => {
+            return Err(format!(
+                "tool 'output_limits' field must be a table {{ max_lines, max_bytes }}, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let positive = |field| match limits.get::<LuaValue>(field) {
+        Ok(LuaValue::Integer(value)) if value > 0 => usize::try_from(value)
+            .map_err(|_| format!("tool output_limits '{field}' must fit in usize")),
+        _ => Err(format!(
+            "tool output_limits '{field}' must be a positive integer"
+        )),
+    };
+    Ok(Some(ToolOutputLimits {
+        max_lines: positive("max_lines")?,
+        max_bytes: positive("max_bytes")?,
+    }))
+}
+
+fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
+    let Ok(LuaValue::String(s)) = t.get::<LuaValue>("format") else {
+        return LuaOutputFormat::default();
+    };
+    let Ok(s) = s.to_str() else {
+        return LuaOutputFormat::default();
+    };
+    match &*s {
+        LUA_FORMAT_MARKDOWN => LuaOutputFormat::Markdown,
+        LUA_FORMAT_PLAIN => LuaOutputFormat::Plain,
+        _ => LuaOutputFormat::default(),
+    }
+}
+
+fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
+    let entry = match t.get::<LuaValue>("image") {
+        Ok(LuaValue::Table(entry)) => entry,
+        Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(other) => {
+            return Err(format!(
+                "tool 'image' field must be a table {{ media_type, data }}, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let media_type = entry
+        .get::<String>("media_type")
+        .map_err(|_| "tool image is missing 'media_type'".to_owned())?;
+    let media_type = ImageMediaType::from_mime(&media_type).ok_or_else(|| {
+        let supported: Vec<&str> = ImageMediaType::ALL.iter().map(|m| m.mime()).collect();
+        format!(
+            "unsupported tool image media_type '{media_type}' ({})",
+            supported.join(", ")
+        )
+    })?;
+    let data = entry
+        .get::<String>("data")
+        .map_err(|_| "tool image is missing base64 'data'".to_owned())?;
+    // Bad base64 would land in history and fail every later request;
+    // validate once at the boundary.
+    if data.is_empty() {
+        return Err("tool image 'data' is empty".to_owned());
+    }
+    BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
+    Ok(Some(ImageSource::new(media_type, Arc::from(data))))
+}
+
+fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
+    let Ok(LuaValue::Table(arr)) = t.get::<LuaValue>("instructions") else {
+        return None;
+    };
+    let mut blocks = Vec::new();
+    for pair in arr.sequence_values::<LuaValue>() {
+        let Ok(LuaValue::Table(entry)) = pair else {
+            continue;
+        };
+        let Ok(path) = entry.get::<String>("path") else {
+            continue;
+        };
+        let Ok(content) = entry.get::<String>("content") else {
+            continue;
+        };
+        blocks.push(InstructionBlock { path, content });
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
+    }
+}
+
+pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
+    match result {
+        LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
+        LuaValue::Table(t) => {
+            let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
+                if let LuaValue::String(s) = v {
+                    s.to_str().ok().map(|s| s.to_owned())
+                } else {
+                    None
+                }
+            });
+            match output {
+                Some(s) if matches!(t.get::<LuaValue>("is_error"), Ok(LuaValue::Boolean(true))) => {
+                    Err(s)
+                }
+                Some(s) => Ok(s),
+                None => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+            }
+        }
+        _ => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case::test_case("echo", true ; "simple_name")]
+    #[test_case::test_case("tool123", true ; "trailing_digits")]
+    #[test_case::test_case("_leading", true ; "leading_underscore")]
+    #[test_case::test_case("_", true ; "single_underscore")]
+    #[test_case::test_case("snake_case_123", true ; "snake_with_digits")]
+    #[test_case::test_case(&"a".repeat(TOOL_NAME_MAX), true ; "max_length_ok")]
+    #[test_case::test_case("", false ; "empty")]
+    #[test_case::test_case("../../bash", false ; "path_traversal")]
+    #[test_case::test_case("foo bar", false ; "space")]
+    #[test_case::test_case("1foo", false ; "leading_digit")]
+    #[test_case::test_case("foo-bar", false ; "hyphen")]
+    #[test_case::test_case("foo.bar", false ; "dot")]
+    #[test_case::test_case("foo@bar", false ; "at_sign")]
+    #[test_case::test_case("café", false ; "non_ascii")]
+    #[test_case::test_case(&"a".repeat(TOOL_NAME_MAX + 1), false ; "too_long")]
+    fn tool_name_validation(name: &str, expected: bool) {
+        assert_eq!(is_valid_tool_name(name), expected);
+    }
+
+    #[test_case::test_case(None, ToolEffect::Unknown ; "omitted")]
+    #[test_case::test_case(Some("read_only"), ToolEffect::ReadOnly ; "read_only")]
+    #[test_case::test_case(Some("isolated"), ToolEffect::Isolated ; "isolated")]
+    #[test_case::test_case(Some("orchestrator"), ToolEffect::Orchestrator ; "orchestrator")]
+    #[test_case::test_case(Some("mutating"), ToolEffect::Mutating ; "mutating")]
+    fn tool_effect_parsing(value: Option<&str>, expected: ToolEffect) {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        if let Some(value) = value {
+            spec.set("effect", value).unwrap();
+        }
+        assert_eq!(parse_tool_effect(&spec).unwrap(), expected);
+    }
+
+    #[test]
+    fn invalid_tool_effect_is_rejected() {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        spec.set("effect", "safe").unwrap();
+
+        assert!(
+            parse_tool_effect(&spec)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid effect")
+        );
+    }
+
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { data = "aGVsbG8=" } }"#,
+        "missing 'media_type'" ; "missing_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png" } }"#,
+        "missing base64 'data'" ; "missing_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "" } }"#,
+        "'data' is empty" ; "empty_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = "nope" }"#,
+        "must be a table" ; "image_not_a_table")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/bmp", data = "aGVsbG8=" } }"#,
+        "unsupported tool image media_type" ; "unsupported_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "!!!not base64!!!" } }"#,
+        "not valid base64" ; "data_not_base64")]
+    fn malformed_image_reply_fails_the_call(src: &str, expected: &str) {
+        let lua = Lua::new();
+        let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+        assert!(reply.image.is_none());
+        let err = reply.result.expect_err("malformed image must error");
+        assert!(err.contains(expected), "got: {err}");
+    }
+
+    #[test]
+    fn output_limits_are_parsed() {
+        let lua = Lua::new();
+        let val: LuaValue = lua
+            .load(r#"return { llm_output = "full", output_limits = { max_lines = 12, max_bytes = 345 } }"#)
+            .eval()
+            .unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+
+        assert_eq!(reply.result, Ok("full".into()));
+        assert_eq!(
+            reply.output_limits,
+            Some(ToolOutputLimits {
+                max_lines: 12,
+                max_bytes: 345,
+            })
+        );
+    }
+
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = "bad" }"#,
+        "must be a table" ; "not_a_table"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1 } }"#,
+        "'max_bytes' must be a positive integer" ; "missing_field"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 0, max_bytes = 1 } }"#,
+        "'max_lines' must be a positive integer" ; "zero"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1, max_bytes = -1 } }"#,
+        "'max_bytes' must be a positive integer" ; "negative"
+    )]
+    #[test_case::test_case(
+        r#"{ llm_output = "x", output_limits = { max_lines = 1.5, max_bytes = 1 } }"#,
+        "'max_lines' must be a positive integer" ; "non_integer"
+    )]
+    fn malformed_output_limits_fail_the_call(src: &str, expected: &str) {
+        let lua = Lua::new();
+        let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+
+        assert!(reply.output_limits.is_none());
+        let err = reply
+            .result
+            .expect_err("malformed output limits must error");
+        assert!(err.contains(expected), "got: {err}");
+    }
+
+    fn invocation(input: Value) -> LuaToolInvocation {
+        let (tx, _rx) = flume::unbounded();
+        LuaToolInvocation {
+            tool: Arc::from("test_tool"),
+            plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
+            bundled: false,
+            has_header_fn: false,
+            input,
+            tx,
+            permission_state: PermissionState::Ready(None),
+            mutable_path_field: None,
+            timeout: Some(Duration::from_secs(60)),
+            start_annotation: None,
+            has_start_fn: false,
+        }
+    }
+
+    #[test_case::test_case(serde_json::json!({"timeout": 90}), Some(timeout_annotation(90)) ; "present")]
+    #[test_case::test_case(serde_json::json!({}),              None                        ; "absent")]
+    fn start_annotation_timeout(input: Value, expected: Option<String>) {
+        let inv = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Timeout(Arc::from("timeout"))),
+            ..invocation(input)
+        };
+        assert_eq!(inv.start_annotation(), expected);
+    }
+
+    #[test]
+    fn describe_falls_back_to_static_description_when_runtime_unavailable() {
+        use caudra_agent::tools::ToolFilter;
+
+        let mut tool = make_lua_tool(None);
+        tool.has_describe_fn = true;
+        let ctx = DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        assert_eq!(tool.description(&ctx), "test");
+    }
+
+    fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
+        let schema = try_from_json(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string" },
+                "format": { "type": "string" },
+                "count": { "type": "integer" },
+            },
+            "required": ["url"],
+        }))
+        .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        LuaTool {
+            name: Arc::from("test_tool"),
+            description: "test".into(),
+            schema,
+            audience: ToolAudience::default(),
+            kind: None,
+            tx,
+            plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
+            bundled: false,
+            has_header_fn: false,
+            permission_scope_kind,
+            mutable_path_field: None,
+            timeout: Some(Duration::from_secs(60)),
+            start_annotation: None,
+            has_start_fn: false,
+            examples: None,
+            has_describe_fn: false,
+        }
+    }
+
+    #[test]
+    fn permission_scope_extracted_at_parse_time() {
+        let tool = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))));
+        let inv = tool
+            .parse(&serde_json::json!({"url": "https://example.com"}))
+            .unwrap();
+        let scopes = smol::block_on(inv.permission_scopes());
+        assert_eq!(
+            scopes.unwrap().scopes,
+            vec!["https://example.com".to_string()]
+        );
+    }
+
+    #[test_case::test_case("format" ; "absent_field")]
+    #[test_case::test_case("count" ; "non_string_field")]
+    fn permission_scope_field_invalid_forces_prompt(field: &str) {
+        let input = serde_json::json!({"url": "https://example.com", "count": 42});
+        let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
+            .parse(&input)
+            .unwrap();
+        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        assert!(scopes.force_prompt);
+        assert_eq!(scopes.scopes, vec![input.to_string()]);
+    }
+
+    #[test]
+    fn permission_scope_none_when_unconfigured() {
+        let unconfigured = make_lua_tool(None)
+            .parse(&serde_json::json!({"url": "https://example.com"}))
+            .unwrap();
+        assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
+    }
+
+    #[test]
+    fn coerce_string_returns_ok() {
+        let lua = Lua::new();
+        let val = LuaValue::String(lua.create_string("hello").unwrap());
+        assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
+    }
+
+    #[test]
+    fn coerce_table_with_is_error_true() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "boom").unwrap();
+        t.set("is_error", true).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Err("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn coerce_error_paths() {
+        let lua = Lua::new();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Nil),
+            Err(TOOL_HANDLER_RETURN_ERR.to_string())
+        );
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Boolean(true)),
+            Err(TOOL_HANDLER_RETURN_ERR.to_string())
+        );
+        assert!(coerce_tool_result(&LuaValue::Table(lua.create_table().unwrap())).is_err());
+    }
+
+    #[test_case::test_case(LUA_FORMAT_MARKDOWN, LuaOutputFormat::Markdown ; "markdown")]
+    #[test_case::test_case(LUA_FORMAT_PLAIN,    LuaOutputFormat::Plain    ; "plain")]
+    #[test_case::test_case("unknown",           LuaOutputFormat::Plain    ; "unknown_defaults_to_plain")]
+    fn extract_format_known_values(value: &str, expected: LuaOutputFormat) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("format", value).unwrap();
+        assert_eq!(extract_format(&t), expected);
+    }
+
+    #[test]
+    fn extract_format_missing_defaults_to_plain() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
+    }
+
+    #[test]
+    fn needs_compute_fallback_on_failure() {
+        // Closed channel → fallback to force_prompt
+        let (tx, rx) = flume::bounded(0);
+        drop(rx);
+        let inv = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
+            bundled: false,
+            has_header_fn: false,
+            input: serde_json::json!({"command": "ls"}),
+            tx,
+            permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
+            timeout: None,
+            start_annotation: None,
+            has_start_fn: false,
+        };
+        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
+        assert!(scopes.force_prompt);
+        assert!(!scopes.scopes.is_empty());
+
+        // Callback returns None → fallback to force_prompt
+        let (tx2, rx2) = flume::bounded(1);
+        let inv2 = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
+            bundled: false,
+            has_header_fn: false,
+            input: serde_json::json!({"command": "echo hi"}),
+            tx: tx2,
+            permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
+            timeout: None,
+            start_annotation: None,
+            has_start_fn: false,
+        };
+        std::thread::spawn(move || {
+            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+                let _ = reply.send(None);
+            }
+        });
+        let scopes2 = smol::block_on(inv2.permission_scopes()).expect("should fallback");
+        assert!(scopes2.force_prompt);
+    }
+
+    #[test]
+    fn needs_compute_returns_callback_result() {
+        let (tx, rx) = flume::bounded(1);
+        let inv = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            contract: Arc::from("test-contract"),
+            bundled: false,
+            has_header_fn: false,
+            input: serde_json::json!({"command": "cargo test"}),
+            tx,
+            permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
+            timeout: None,
+            start_annotation: None,
+            has_start_fn: false,
+        };
+        std::thread::spawn(move || {
+            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+                let _ = reply.send(Some(PermissionScopes {
+                    scopes: vec!["cargo".into(), "test".into()],
+                    force_prompt: false,
+                }));
+            }
+        });
+        let result = smol::block_on(inv.permission_scopes());
+        let scopes = result.unwrap();
+        assert_eq!(scopes.scopes, vec!["cargo", "test"]);
+        assert!(!scopes.force_prompt);
+    }
+
+    fn timeout_spec(lua: &Lua, value: LuaValue) -> Table {
+        let t = lua.create_table().unwrap();
+        if !matches!(value, LuaValue::Nil) {
+            t.set("timeout", value).unwrap();
+        }
+        t
+    }
+
+    fn timeout_ok(lua: &Lua, value: LuaValue) -> Option<Duration> {
+        parse_timeout(&timeout_spec(lua, value)).unwrap()
+    }
+
+    fn timeout_err(lua: &Lua, value: LuaValue) {
+        let err = parse_timeout(&timeout_spec(lua, value)).unwrap_err();
+        assert!(err.to_string().contains(TIMEOUT_PARSE_ERR));
+    }
+
+    #[test]
+    fn timeout_parsing_none_means_infinite() {
+        let lua = Lua::new();
+        assert_eq!(timeout_ok(&lua, LuaValue::Nil), None);
+        assert_eq!(timeout_ok(&lua, LuaValue::Boolean(false)), None);
+        assert_eq!(timeout_ok(&lua, LuaValue::Integer(0)), None);
+        assert_eq!(timeout_ok(&lua, LuaValue::Number(0.0)), None);
+    }
+
+    #[test]
+    fn timeout_parsing_valid_values() {
+        let lua = Lua::new();
+        assert_eq!(
+            timeout_ok(&lua, LuaValue::Integer(30)),
+            Some(Duration::from_secs(30))
+        );
+        let big: f64 = 1e10;
+        assert_eq!(
+            timeout_ok(&lua, LuaValue::Number(big)),
+            Some(Duration::from_secs(big as u64))
+        );
+        assert_eq!(
+            timeout_ok(&lua, LuaValue::Number(0.5)),
+            Some(Duration::from_secs(0))
+        );
+    }
+
+    #[test]
+    fn timeout_parsing_invalid_rejected() {
+        let lua = Lua::new();
+        timeout_err(&lua, LuaValue::Integer(-1));
+        timeout_err(&lua, LuaValue::Number(-1.5));
+        timeout_err(&lua, LuaValue::Boolean(true));
+        timeout_err(&lua, LuaValue::Number(f64::INFINITY));
+        timeout_err(&lua, LuaValue::Number(f64::NEG_INFINITY));
+        timeout_err(&lua, LuaValue::Number(f64::NAN));
+        let s = lua.create_string("forever").unwrap();
+        timeout_err(&lua, LuaValue::String(s));
+    }
+
+    fn reply_table(lua: &Lua, output: &str, format: Option<&str>, is_error: bool) -> LuaValue {
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", output).unwrap();
+        if is_error {
+            t.set("is_error", true).unwrap();
+        }
+        if let Some(f) = format {
+            t.set("format", f).unwrap();
+        }
+        LuaValue::Table(t)
+    }
+
+    #[test]
+    fn from_lua_value_table_with_markdown_format_ok() {
+        let lua = Lua::new();
+        let val = reply_table(&lua, "hi", Some(LUA_FORMAT_MARKDOWN), false);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+        assert_eq!(reply.result, Ok("hi".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Markdown);
+    }
+
+    #[test]
+    fn from_lua_value_table_with_markdown_format_and_is_error_captures_format() {
+        // The format field is read on its own, separate from is_error, so a
+        // handler that fails can still ask for its error message to be rendered
+        // as markdown.
+        let lua = Lua::new();
+        let val = reply_table(&lua, "boom", Some(LUA_FORMAT_MARKDOWN), true);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+        assert_eq!(reply.result, Err("boom".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Markdown);
+    }
+
+    #[test_case::test_case(false ; "success")]
+    #[test_case::test_case(true ; "error")]
+    fn from_lua_value_extracts_model_suffix(is_error: bool) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "visible").unwrap();
+        t.set("model_suffix", "model context").unwrap();
+        t.set("is_error", is_error).unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
+
+        assert_eq!(reply.model_suffix.as_deref(), Some("model context"));
+        assert_eq!(reply.result.is_err(), is_error);
+    }
+
+    #[test]
+    fn from_lua_value_table_without_format_defaults_to_plain() {
+        let lua = Lua::new();
+        let val = reply_table(&lua, "hi", None, false);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+        assert_eq!(reply.result, Ok("hi".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Plain);
+    }
+
+    #[test]
+    fn from_lua_value_non_table_defaults_to_plain() {
+        let lua = Lua::new();
+        let string_val = LuaValue::String(lua.create_string("hello").unwrap());
+        let reply = ToolCallReply::from_lua_value(&lua, &string_val);
+        assert_eq!(reply.result, Ok("hello".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Plain);
+
+        let bool_reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Boolean(true));
+        assert_eq!(bool_reply.result, Err(TOOL_HANDLER_RETURN_ERR.to_string()));
+        assert_eq!(bool_reply.format, LuaOutputFormat::Plain);
+    }
+
+    #[test]
+    fn from_lua_value_extracts_instructions() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "file contents").unwrap();
+
+        let inst1 = lua.create_table().unwrap();
+        inst1.set("path", "AGENTS.md").unwrap();
+        inst1.set("content", "be nice").unwrap();
+
+        let instructions = lua.create_table().unwrap();
+        instructions.set(1, inst1).unwrap();
+        t.set("instructions", instructions).unwrap();
+
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Ok("file contents".to_string()));
+        let blocks = reply.instructions.expect("instructions should be Some");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].path, "AGENTS.md");
+        assert_eq!(blocks[0].content, "be nice");
+    }
+
+    #[test]
+    fn from_lua_value_extracts_diff_fields() {
+        let lua = Lua::new();
+
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "edited file.rs").unwrap();
+        t.set("diff_path", "/tmp/file.rs").unwrap();
+        t.set("diff_before", "old content").unwrap();
+        t.set("diff_after", "new content").unwrap();
+        let diff = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t))
+            .diff
+            .expect("diff should be Some");
+        assert_eq!(diff.path, "/tmp/file.rs");
+        assert_eq!(diff.before, "old content");
+        assert_eq!(diff.after, "new content");
+
+        let partial = lua.create_table().unwrap();
+        partial.set("llm_output", "patched").unwrap();
+        partial.set("diff_path", "/tmp/file.rs").unwrap();
+        let d = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(partial))
+            .diff
+            .unwrap();
+        assert_eq!(d.before, "");
+        assert_eq!(d.after, "");
+    }
+
+    #[test]
+    fn start_annotation_returns_none_for_non_array_or_missing() {
+        let no_field = invocation(serde_json::json!({"edits": [1, 2]}));
+        assert_eq!(no_field.start_annotation(), None);
+
+        let not_array = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Count(Arc::from("edit"))),
+            ..invocation(serde_json::json!({"edit": "not an array"}))
+        };
+        assert_eq!(not_array.start_annotation(), None);
+
+        let wrong_key = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Count(Arc::from("edit"))),
+            ..invocation(serde_json::json!({"other_field": [1, 2]}))
+        };
+        assert_eq!(wrong_key.start_annotation(), None);
+    }
+
+    #[test_case::test_case("edits", serde_json::json!({"edits": [1]}),      Some("1 edit")   ; "singular")]
+    #[test_case::test_case("edits", serde_json::json!({"edits": [1, 2, 3]}), Some("3 edits")  ; "plural")]
+    #[test_case::test_case("item",  serde_json::json!({"item": [1, 2]}),     Some("2 items")  ; "field_without_trailing_s")]
+    #[test_case::test_case("edits", serde_json::json!({"edits": []}),        Some("0 edits")  ; "empty_array")]
+    fn start_annotation_count(field: &str, input: Value, expected: Option<&str>) {
+        let inv = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Count(Arc::from(field))),
+            ..invocation(input)
+        };
+        assert_eq!(inv.start_annotation(), expected.map(String::from));
+    }
+
+    #[test]
+    fn start_without_tool_use_id_is_noop() {
+        let inv = LuaToolInvocation {
+            has_start_fn: true,
+            ..invocation(serde_json::json!({"code": "x"}))
+        };
+        let ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
+        smol::block_on(inv.start(&ctx));
+    }
+}

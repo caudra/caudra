@@ -2,11 +2,11 @@
 -- The tool in init.lua spawns them, this file only shows them.
 --
 -- The host keeps the transcripts, so there is no task state here. Every
--- refresh rebuilds the rows from maki.task.list(), and previewing is just
--- maki.task.focus() with a restore on cancel.
+-- refresh rebuilds the rows from caudra.task.list(), and previewing is just
+-- caudra.task.focus() with a restore on cancel.
 
-local TextInput = require("maki.text_input")
-local ListPicker = require("maki.list_picker")
+local TextInput = require("caudra.text_input")
+local ListPicker = require("caudra.list_picker")
 local Rows = require("picker_rows")
 
 local TITLE = " Tasks "
@@ -39,21 +39,21 @@ end
 
 -- Opening a subagent puts its transcript where the main chat was. The status
 -- bar links back to Main, while this hint advertises the picker for jumping
--- between every task. maki.task.list() suspends and autocmd callbacks cannot,
+-- between every task. caudra.task.list() suspends and autocmd callbacks cannot,
 -- so the round-trip runs off to the side.
 local function refresh_hint()
-  maki.async.run(function()
+  caudra.async.run(function()
     local n = 0
-    for _, task in ipairs(maki.task.list() or {}) do
+    for _, task in ipairs(caudra.task.list() or {}) do
       -- The main chat is listed too, and it is the one entry without a status.
       if task.status then
         n = n + 1
       end
     end
     if n == 0 then
-      maki.ui.set_status_hint(nil)
+      caudra.ui.set_status_hint(nil)
     else
-      maki.ui.set_status_hint({
+      caudra.ui.set_status_hint({
         { string.format(" %d %s ", n, n == 1 and "task" or "tasks"), "foreground" },
         { HINT_KEY, "keybind_key" },
         { " ", "" },
@@ -143,12 +143,12 @@ end
 -- close while it waits, so bail out unless this board is still the current one.
 local function refresh()
   local this_board = board
-  local tasks, err = maki.task.list()
+  local tasks, err = caudra.task.list()
   if board ~= this_board then
     return
   end
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
     return
   end
   board.tasks = tasks
@@ -165,7 +165,7 @@ local function finish(commit)
   end
   board = nil
   if not commit and closing.origin_id then
-    maki.task.focus(closing.origin_id)
+    caudra.task.focus(closing.origin_id)
   end
   closing.win:close()
 end
@@ -187,9 +187,9 @@ local function move_sel(delta, wrap)
   end
   board.sel_id = board.rows[idx].task.id
   render()
-  local _, err = maki.task.focus(board.sel_id)
+  local _, err = caudra.task.focus(board.sel_id)
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
   end
 end
 
@@ -201,9 +201,9 @@ local function open_selected()
   if not board.sel_id then
     return
   end
-  local _, err = maki.task.focus(board.sel_id)
+  local _, err = caudra.task.focus(board.sel_id)
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
     return
   end
   finish(true)
@@ -240,8 +240,8 @@ local function open()
   if board then
     return
   end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = caudra.ui.buf()
+  local win = caudra.ui.open_win(buf, {
     title = TITLE,
     width = "70%",
     height = "70%",
@@ -301,7 +301,7 @@ end
 
 -- Autocmds run synchronously while a refresh needs an async round-trip, so both
 -- handlers only raise a flag and let the recv tick do the work.
-maki.api.create_autocmd({ "TaskStatusChanged", "SessionStatusChanged" }, {
+caudra.api.create_autocmd({ "TaskStatusChanged", "SessionStatusChanged" }, {
   callback = function()
     if board then
       board.dirty = true
@@ -311,7 +311,7 @@ maki.api.create_autocmd({ "TaskStatusChanged", "SessionStatusChanged" }, {
 
 -- The picker only ever shows the focused session, so a session switch closes it
 -- instead of leaving ids from elsewhere on screen.
-maki.api.create_autocmd("SessionFocusChanged", {
+caudra.api.create_autocmd("SessionFocusChanged", {
   callback = function()
     if board then
       board.expired = true
@@ -320,14 +320,14 @@ maki.api.create_autocmd("SessionFocusChanged", {
 })
 
 -- Every way the subagent count of the focused session can change.
-maki.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionReset" }, {
+caudra.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionReset" }, {
   callback = refresh_hint,
 })
 
-maki.api.register_command({
+caudra.api.register_command({
   name = "/tasks",
   description = "Browse tasks and steer running subagents",
   handler = open,
 })
 
-maki.keymap.set("n", "<C-x>", open, { desc = "Open tasks" })
+caudra.keymap.set("n", "<C-x>", open, { desc = "Open tasks" })

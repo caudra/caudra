@@ -1,6 +1,6 @@
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local output_limits = require("maki.output_limits")
+local ToolView = require("caudra.tool_view")
+local shorten_path = require("caudra.shorten_path")
+local output_limits = require("caudra.output_limits")
 local helpers = require("read_helpers")
 
 local truncate_bytes = helpers.truncate_bytes
@@ -22,7 +22,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
-local opts = maki.api.register_options({
+local opts = caudra.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
@@ -34,7 +34,7 @@ end
 
 local function apply_highlights(view, lines, ext, prefix)
   local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
+  local highlighted = caudra.ui.highlight(table.concat(lines, "\n"), ext, opts)
   if not highlighted then
     return
   end
@@ -49,7 +49,7 @@ local function apply_highlights(view, lines, ext, prefix)
 end
 
 local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = ToolView.line_nr_fmt(start_line + #lines - 1) .. " "
 
@@ -74,7 +74,7 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
   view:finish()
 
   local ext = path:match("%.([^%.]+)$") or ""
-  maki.async.run(function()
+  caudra.async.run(function()
     apply_highlights(view, lines, ext, prefix)
   end)
 
@@ -85,7 +85,7 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
 end
 
 local function read_file(path, offset, limit, ctx)
-  local content, err = maki.fs.read(path)
+  local content, err = caudra.fs.read(path)
   if not content then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
@@ -131,7 +131,7 @@ local function read_file(path, offset, limit, ctx)
 
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
-    local parent = maki.fs.dirname(path)
+    local parent = caudra.fs.dirname(path)
     if parent then
       local instructions = ctx:find_instructions(parent)
       if #instructions > 0 then
@@ -152,19 +152,19 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - When using the **read** tool, only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
 })
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "read",
   kind = "read",
   description = DESCRIPTION,
   permission_scopes = function(input)
-    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+    return { scopes = { caudra.fs.normalize(input.path) }, force_prompt = false }
   end,
 
   schema = {
@@ -190,7 +190,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     local s = shorten_path(input.path or "")
     local start = input.offset or 1
     if input.limit and input.limit > 0 then
@@ -204,7 +204,7 @@ maki.api.register_tool({
 
   restore = function(input, output, _is_error, ctx)
     local lines, start_line, total_lines = {}, nil, nil
-    for _, raw in ipairs(maki.split(output, "\n")) do
+    for _, raw in ipairs(caudra.split(output, "\n")) do
       local nr, text = raw:match("^%s*(%d+): (.*)$")
       if nr then
         start_line = start_line or tonumber(nr)
@@ -229,8 +229,8 @@ maki.api.register_tool({
     if not raw then
       return { llm_output = "error: path is required", is_error = true }
     end
-    local path = maki.fs.normalize(raw)
-    local meta = maki.fs.metadata(path)
+    local path = caudra.fs.normalize(raw)
+    local meta = caudra.fs.metadata(path)
     if not meta then
       return { llm_output = "error: path not found: " .. path, is_error = true }
     end

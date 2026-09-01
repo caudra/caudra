@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-OpenAI OAuth dynamic provider for maki (device code flow).
+OpenAI OAuth dynamic provider for caudra (device code flow).
 
-Install: cp scripts/providers/openai-oauth ~/.maki/providers/openai-oauth && chmod +x ~/.maki/providers/openai-oauth
-Usage:   maki auth login openai-oauth
-         maki -m openai-oauth/gpt-4.1
+Install: mkdir -p ~/.config/caudra/providers && cp scripts/providers/openai-oauth ~/.config/caudra/providers/openai-oauth && chmod +x ~/.config/caudra/providers/openai-oauth
+Usage:   caudra auth login openai-oauth
+         caudra -m openai-oauth/gpt-4.1
 
 Requires Python 3.8+ with no external dependencies.
-Stores tokens at ~/.maki/auth/openai.json
+Stores tokens under Caudra's platform state directory.
 """
 
 import json
@@ -26,7 +26,11 @@ REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 REFRESH_BUFFER_SECS = 60
 POLL_TIMEOUT = 300
 
-TOKEN_FILE = os.path.expanduser("~/.maki/auth/openai.json")
+if os.name == "nt":
+    STATE_HOME = os.environ.get("APPDATA", os.path.expanduser("~/AppData/Roaming"))
+else:
+    STATE_HOME = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+TOKEN_FILE = os.path.join(STATE_HOME, "caudra", "auth", "openai.json")
 
 
 def load_tokens():
@@ -112,7 +116,7 @@ def cmd_info():
 def cmd_resolve():
     tokens = load_tokens()
     if not tokens:
-        print("not authenticated, run: maki auth login openai-oauth", file=sys.stderr)
+        print("not authenticated, run: caudra auth login openai-oauth", file=sys.stderr)
         sys.exit(1)
     if is_expired(tokens):
         try:

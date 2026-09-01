@@ -1,24 +1,24 @@
-local dir_listing = require("maki.dir_listing")
+local dir_listing = require("caudra.dir_listing")
 local list_helpers = require("list_helpers")
-local shorten_path = require("maki.shorten_path")
+local shorten_path = require("caudra.shorten_path")
 
 local DESCRIPTION =
   [[List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 
 - Filters out instruction files (AGENTS.md, CLAUDE.md, COPILOT.md).]]
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - Use the **list** tool to see what a directory contains.]],
 })
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "list",
   kind = "read",
   description = DESCRIPTION,
   permission_scopes = function(input)
-    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+    return { scopes = { caudra.fs.normalize(input.path) }, force_prompt = false }
   end,
 
   schema = {
@@ -33,7 +33,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     buf:line({ { shorten_path(input.path or ""), "path" } })
     return buf
   end,

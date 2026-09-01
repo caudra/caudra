@@ -18,7 +18,7 @@ end
 
 local function make_sse(text)
   return "data: "
-    .. maki.json.encode({
+    .. caudra.json.encode({
       jsonrpc = "2.0",
       result = {
         content = { { type = "text", text = text } },
@@ -27,7 +27,7 @@ local function make_sse(text)
 end
 
 local function sse_line(obj)
-  return "data: " .. maki.json.encode(obj)
+  return "data: " .. caudra.json.encode(obj)
 end
 
 -- ── parse_sse_response ──

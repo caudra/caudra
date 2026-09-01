@@ -9,7 +9,7 @@ Audience: competent devs. Every line earns its place. No hand-holding, no fluff.
 - Plain words over clever idioms: "sends data only to the endpoint you configure", not "never phones home".
 - State facts and why they matter; never perform emphasis.
 - Vary sentence length; uniform 18-24 word cadence reads machine-made.
-- ASCII diagrams in ``` blocks where they beat prose.
+- Use Mermaid when a diagram communicates structure more clearly than prose.
 
 ## Banned AI mannerisms
 
@@ -28,4 +28,20 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 
 - [Diátaxis](https://diataxis.fr/): guides for goals, reference for lookup, concepts for understanding.
 - One canonical home per topic; link instead of duplicating.
-- Generated pages (tools, providers, configuration, lua-api, plugins, keybindings, commands) come from `maki-docgen`: edit the source, run `just gen-docs`, never edit output by hand.
+- Generated pages (tools, providers, configuration, lua-api, plugins, keybindings, commands) come from `caudra-docgen`: edit the source, run `just gen-docs`, never edit output by hand.
+
+## Product identity
+
+- Position Caudra as a terminal coding agent that turns context into effective action.
+- State that Caudra is an independent fork when project provenance is relevant.
+- Use `Caudra` for the product and `caudra` for commands, paths, packages, APIs, and the lowercase wordmark.
+- Use only `https://caudra.ai` for the site, docs, and installer origin.
+- Use `github.com/caudra/caudra` for source and `github.com/caudra/config` for the example config.
+- Telemetry names use the `caudra.*` namespace.
+
+## Visual identity
+
+- Use the lowercase wordmark and decision-aperture mark. Its midnight shell forms a C around one coral route.
+- Base surfaces are midnight navy and warm mineral white. Vermilion marks a selected route or active state.
+- Use precise curves, high contrast, and functional decoration.
+- Do not use mascots, food imagery, literal brains, neural networks, gradients, glass effects, or rounded marketing cards.

@@ -1,6 +1,6 @@
-local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
-local fuzzy_replace = require("maki.fuzzy_replace")
+local shorten_path = require("caudra.shorten_path")
+local ToolView = require("caudra.tool_view")
+local fuzzy_replace = require("caudra.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
 
@@ -34,17 +34,17 @@ Prefer this over edit when making multiple changes to the same file.
 ]]
 
 local function path_permission_scopes(input)
-  return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+  return { scopes = { caudra.fs.normalize(input.path) }, force_prompt = false }
 end
 
 local function edit_header(input)
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   buf:line({ { shorten_path(input.path or ""), "path" } })
   return buf
 end
 
 local function split_lines(text)
-  local lines = maki.split(text, "\n")
+  local lines = caudra.split(text, "\n")
   if lines[#lines] == "" then
     lines[#lines] = nil
   end
@@ -76,7 +76,7 @@ local function resolve_block_nrs(blocks, path)
   local content
   for _, b in ipairs(blocks) do
     if not b.nr and (b.new or "") ~= "" then
-      content = content or maki.fs.read(maki.fs.normalize(path))
+      content = content or caudra.fs.read(caudra.fs.normalize(path))
       if not content then
         return
       end
@@ -131,10 +131,10 @@ end
 -- Re-renders the block's lines with syntax colors on the diff backgrounds,
 -- keeping the gutter and prefix the plain render put there.
 local function apply_highlights(view, fmt, jobs, ext)
-  maki.async.run(function()
+  caudra.async.run(function()
     for _, job in ipairs(jobs) do
-      local bg = maki.ui.theme_color(job.style)
-      local highlighted = bg and maki.ui.highlight(job.text, ext)
+      local bg = caudra.ui.theme_color(job.style)
+      local highlighted = bg and caudra.ui.highlight(job.text, ext)
       for i, hl_line in ipairs(highlighted or {}) do
         local idx = job.first + i - 1
         if not view.all_lines[idx] then
@@ -161,7 +161,7 @@ end
 -- on removed lines, blank gutter + `+` on added lines, and no truncation
 -- ever, a diff is exactly the change and hiding part of it lies.
 local function diff_view(blocks, path)
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local view = ToolView.new(buf, { max_lines = math.huge, keep = "head" })
   resolve_block_nrs(blocks, path)
   local w = gutter_width(blocks)
@@ -196,14 +196,14 @@ local function diff_restore(blocks_from)
 end
 
 local function apply_edit(path, ctx, transform)
-  path = maki.fs.normalize(path)
+  path = caudra.fs.normalize(path)
 
   local ok, err = ctx:check_before_edit(path)
   if not ok then
     return nil, err
   end
 
-  local before, read_err = maki.fs.read(path)
+  local before, read_err = caudra.fs.read(path)
   if read_err then
     return nil, "read error: " .. tostring(read_err)
   end
@@ -213,7 +213,7 @@ local function apply_edit(path, ctx, transform)
     return nil, transform_err
   end
 
-  local _, write_err = maki.fs.write(path, after)
+  local _, write_err = caudra.fs.write(path, after)
   if write_err then
     return nil, "write error: " .. tostring(write_err)
   end
@@ -237,7 +237,7 @@ local function diff_result(edit_result, summary)
   }
 end
 
-local opts = maki.api.register_options({
+local opts = caudra.api.register_options({
   multiedit = { default = true, desc = "Provide the `multiedit` tool." },
   edit_lines = { default = true, desc = "Provide the `edit_lines` tool." },
   insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
@@ -245,11 +245,11 @@ local opts = maki.api.register_options({
 
 local function register_tool_if(enabled, tool)
   if enabled then
-    maki.api.register_tool(tool)
+    caudra.api.register_tool(tool)
   end
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",

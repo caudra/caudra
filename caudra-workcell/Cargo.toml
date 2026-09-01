@@ -1,0 +1,28 @@
+[package]
+name = "caudra-workcell"
+description = "Native Workcell tool adapter for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-agent = { workspace = true }
+caudra-storage = { workspace = true }
+async-trait = { workspace = true }
+futures-lite = { workspace = true }
+flume = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+workcell = { workspace = true }
+
+[dev-dependencies]
+caudra-config = { workspace = true }
+smol = { workspace = true }
+tempfile = { workspace = true }

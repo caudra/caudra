@@ -1,4 +1,4 @@
-//! Non-interactive (headless) mode: `maki "prompt" --print`.
+//! Non-interactive (headless) mode: `caudra "prompt" --print`.
 //!
 //! Wire format intentionally matches Claude Code so existing scripts work
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
@@ -12,21 +12,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::ValueEnum;
-use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{HeadlessHandle, HeadlessParams};
-use maki_agent::permissions::PluginRuleStore;
-use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{
+use caudra_agent::headless::{HeadlessHandle, HeadlessParams};
+use caudra_agent::permissions::PluginRuleStore;
+use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
     PermissionsConfig,
 };
-use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
-use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
-use maki_storage::id::SessionRef;
+use caudra_config::ModelPolicy;
+use caudra_lua::EventHandle;
+use caudra_providers::model::Model;
+use caudra_providers::{TokenUsage, add_cost};
+use caudra_storage::id::SessionRef;
+use clap::ValueEnum;
+use color_eyre::Result;
+use color_eyre::eyre::{Context, eyre};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -38,9 +38,9 @@ fn load_images(paths: &[PathBuf]) -> Result<Vec<ImageSource>> {
     paths
         .iter()
         .map(|path| {
-            let media_type = maki_ui::image::media_type_for(path)
+            let media_type = caudra_ui::image::media_type_for(path)
                 .ok_or_else(|| eyre!("unsupported image type: {}", path.display()))?;
-            maki_ui::image::load_file_image(path, media_type)
+            caudra_ui::image::load_file_image(path, media_type)
                 .map_err(|e| eyre!("failed to load image: {e}"))
         })
         .collect()
@@ -148,13 +148,13 @@ pub fn run(
     verbose: bool,
     config: AgentConfig,
     permissions_config: PermissionsConfig,
-    timeouts: maki_providers::Timeouts,
+    timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
-    thinking: maki_providers::ThinkingConfig,
-    system_prompt_profile: Option<Arc<maki_agent::prompt::profile::SystemPromptProfile>>,
-    prompt_profiles: Arc<maki_agent::prompt::profile::PromptProfileCatalog>,
+    thinking: caudra_providers::ThinkingConfig,
+    system_prompt_profile: Option<Arc<caudra_agent::prompt::profile::SystemPromptProfile>>,
+    prompt_profiles: Arc<caudra_agent::prompt::profile::PromptProfileCatalog>,
     model_policy: Arc<ModelPolicy>,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<()> {
@@ -173,7 +173,7 @@ pub fn run(
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(caudra_agent::mcp::start_connected(&cwd));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -183,18 +183,18 @@ pub fn run(
             .load()
             .infos
             .iter()
-            .filter(|info| info.status == maki_agent::McpServerStatus::AwaitingTrust)
+            .filter(|info| info.status == caudra_agent::McpServerStatus::AwaitingTrust)
             .map(|info| info.name.clone())
             .collect();
         if !awaiting.is_empty() {
             return Err(eyre!(
-                "project MCP servers require startup trust: {}. Run `maki`, review them with `/mcp`, then retry",
+                "project MCP servers require startup trust: {}. Run `caudra`, review them with `/mcp`, then retry",
                 awaiting.join(", ")
             ));
         }
     }
 
-    let handle = maki_agent::headless::spawn(HeadlessParams {
+    let handle = caudra_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
         permissions_config,
@@ -223,7 +223,7 @@ pub fn run(
         goal,
         task,
     } = handle;
-    crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
+    crate::setup::report_session_start(caudra_otel::emit::START_FRESH, Some(&session_id));
     let start = Instant::now();
 
     let mut verbose_out = match format {
@@ -454,13 +454,13 @@ fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {
     }
     let goal = GoalHandle::default();
     goal.set(condition)?;
-    Ok((maki_agent::goal_kickoff_message(condition), goal))
+    Ok((caudra_agent::goal_kickoff_message(condition), goal))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_providers::TokenUsage;
+    use caudra_providers::TokenUsage;
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",

@@ -7,15 +7,15 @@ group = "Guides"
 
 # Sessions, forks, and revert
 
-Maki stores conversation history as parent-linked items. User prompts, assistant text, reasoning, tool calls, and tool results are separate items. A session head selects the active path through those items. Moving the head keeps the abandoned path available for unrevert and later forks.
+Caudra stores conversation history as parent-linked items. User prompts, assistant text, reasoning, tool calls, and tool results are separate items. A session head selects the active path through those items. Moving the head keeps the abandoned path available for unrevert and later forks.
 
 ## Active sessions
 
-One Maki runtime can own a session ID at a time. Opening that session from
-another Maki process fails before the agent starts or executes tools. Sessions
+One Caudra runtime can own a session ID at a time. Opening that session from
+another Caudra process fails before the agent starts or executes tools. Sessions
 with different IDs can run together, including background tabs in one TUI.
 
-Maki releases ownership on normal exit, process termination, or a crash. A
+Caudra releases ownership on normal exit, process termination, or a crash. A
 running process that has stopped responding still owns its session. Forking an
 active session remains available because the child receives a new ID.
 
@@ -51,7 +51,7 @@ Forking does not restore files. The child uses the same working directory and se
 
 ## Managed tool outputs
 
-Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Maki state directory. An output ID can be read or searched only from its owning session. Live sessions have no age-based expiry for these results.
+Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Caudra state directory. An output ID can be read or searched only from its owning session. Live sessions have no age-based expiry for these results.
 
 Each retained output is capped at 100 MiB. Deleting a session deletes its retained outputs. A fork copies the outputs referenced by its selected ancestor path and reachable subagent histories into the child session, preserving their opaque IDs there.
 
@@ -67,18 +67,18 @@ Sending a prompt after revert creates a new branch from that point. The abandone
 
 ## File snapshots
 
-Maki creates a session-start snapshot before the first top-level run. It snapshots the current history head before each later run and the resulting head after completion or cancellation. Reusing a head refreshes its pre-run snapshot, so edits made while idle are included. A file restore selects the nearest available snapshot at or before the chosen item. Several parallel tool calls therefore share one safe run checkpoint.
+Caudra creates a session-start snapshot before the first top-level run. It snapshots the current history head before each later run and the resulting head after completion or cancellation. Reusing a head refreshes its pre-run snapshot, so edits made while idle are included. A file restore selects the nearest available snapshot at or before the chosen item. Several parallel tool calls therefore share one safe run checkpoint.
 
-Snapshots are content-addressed with SHA-256 and stored under the Maki state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
+Snapshots are content-addressed with SHA-256 and stored under the Caudra state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
 
 Each session workspace has a 512 MiB retention target. Old checkpoint manifests are removed first. The session-start anchor and data needed by an active revert remain available, so protected data can exceed the target.
 
-In a Git worktree, snapshot walks follow Git ignore rules. Outside Git, Maki walks all regular files below the session directory. `.git`, symlinks, special files, and paths outside the session directory are not captured. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.
+In a Git worktree, snapshot walks follow Git ignore rules. Outside Git, Caudra walks all regular files below the session directory. `.git`, symlinks, special files, and paths outside the session directory are not captured. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.
 
-Restore compares the current file hash and mode with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Maki does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
+Restore compares the current file hash and mode with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Caudra does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
 
 Only paths that differ between the source and target manifests are touched. Files created after the target are deleted, deleted files are recreated, and unrelated files remain in place. Each file replacement is atomic. A restore spanning several files completes through the journal.
 
-Before applying changes, Maki captures the current state of every affected path. Unrevert restores this state before moving the conversation head back. A restore journal records prepare, apply, and verification phases so a later restore can finish an interrupted transaction.
+Before applying changes, Caudra captures the current state of every affected path. Unrevert restores this state before moving the conversation head back. A restore journal records prepare, apply, and verification phases so a later restore can finish an interrupted transaction.
 
 Snapshots cover regular files. They cannot reverse running processes, databases, network calls, Git branches or index state, nested repository state, or commands that changed files outside the session directory. Changes from manual shell commands can appear as conflicts. `/cd` changes the process workspace for every live session and is blocked while any session is busy or has a pending revert.

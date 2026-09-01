@@ -7,29 +7,29 @@ group = "Reference"
 
 # Providers
 
-Maki talks to LLM providers over their HTTP APIs. Models are split into three capability tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). Compaction is a separate workload role, not a capability tier.
+Caudra talks to LLM providers over their HTTP APIs. Models are split into three capability tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). Compaction is a separate workload role, not a capability tier.
 
 Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose; uppercase `R` resets the displayed purpose.
 
-Fast, Balanced, and Best are global exact-model presets saved to `~/.local/state/maki/model-tiers`. Goal and Compact are workload roles saved to `~/.local/state/maki/model-roles`. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model; Default Compact uses the chat model.
+Fast, Balanced, and Best are global exact-model presets saved to `~/.local/state/caudra/model-tiers`. Goal and Compact are workload roles saved to `~/.local/state/caudra/model-roles`. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model; Default Compact uses the chat model.
 
 ## Auth Reloading
 
-Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
+Caudra re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `caudra auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
 You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors.
 
 ## Base URL Overrides
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
+Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Caudra appends the API paths itself:
 
 ```sh
-ANTHROPIC_BASE_URL=https://my-proxy.internal maki
+ANTHROPIC_BASE_URL=https://my-proxy.internal caudra
 ```
 
 It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Three exceptions apply. `ANTHROPIC_BASE_URL` never receives Claude subscription tokens. `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
-You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+You can also set `base_url` for a built-in provider in `~/.config/caudra/providers.toml`. It overrides the built-in default and loses to the env var above:
 
 ```toml
 [openai]
@@ -42,7 +42,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ### Anthropic
 
-- **Env var**: `ANTHROPIC_API_KEY` (also supports subscription OAuth via `maki auth login anthropic`)
+- **Env var**: `ANTHROPIC_API_KEY` (also supports subscription OAuth via `caudra auth login anthropic`)
 - **API**: `https://api.anthropic.com/v1/messages`
 - **Features**: Prompt caching, thinking mode (adaptive/budgeted), advanced tool use
 
@@ -63,7 +63,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
 
-Run `maki auth login anthropic` to sign in to a Claude subscription through browser OAuth. Maki stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
+Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
 This experimental flow uses Claude Code's public client registration. Anthropic limits Pro and Max subscription tokens to official clients in its terms. The flow may stop working when Anthropic changes its OAuth or request protocol.
 
@@ -71,7 +71,7 @@ Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token 
 
 #### Amazon Bedrock
 
-If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
+If you already use Claude through AWS Bedrock, you can point Caudra at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Caudra will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
 
 You will need `AWS_REGION` and one of the following for auth:
 
@@ -128,7 +128,7 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 
 ### Copilot
 
-- **Env var**: `GH_COPILOT_TOKEN` (or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)
+- **Env var**: `GH_COPILOT_TOKEN` (or run `caudra auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)
 - **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
 - **Features**: Native Copilot Chat HTTP API with model endpoint discovery
 
@@ -262,7 +262,7 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
-By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+By default Caudra hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/caudra/providers.toml`:
 
 ```toml
 [opencode]
@@ -273,7 +273,7 @@ The default is `false`.
 
 ### xAI
 
-- **Env var**: `XAI_API_KEY` (also supports OAuth via `maki auth login xai`)
+- **Env var**: `XAI_API_KEY` (also supports OAuth via `caudra auth login xai`)
 - **API endpoints**:
   - `https://api.x.ai/v1`
   - `https://cli-chat-proxy.grok.com/v1`
@@ -287,7 +287,7 @@ The default is `false`.
 
 Defaults: grok-4.6 (strong), grok-4.3 (medium)
 
-OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Maki fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
+OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file.
 
@@ -323,7 +323,7 @@ If the model name is unique across providers, the prefix can be omitted.
 
 ## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+`providers.toml` lives in the config directory (`~/.config/caudra/providers.toml` on Linux/macOS, `%APPDATA%\caudra\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
@@ -365,10 +365,10 @@ supports_vision = false
 |-------|------|-------|
 | `display_name` | string | Shown in pickers and auth status |
 | `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `base_url` | string | Origin of the API. Maki appends the protocol paths |
+| `base_url` | string | Origin of the API. Caudra appends the protocol paths |
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
-| `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
+| `api_key` | string | Inline key (prefer the env var or `caudra auth login`) |
 | `default_model` | string | Used after login when no model is saved yet |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
@@ -393,7 +393,7 @@ supports_vision = false
 
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
 
-You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+You can also create a custom provider interactively with `caudra auth login` and choosing the custom option. That writes a starter entry to this file.
 
 ### Aperture overrides
 
@@ -412,11 +412,11 @@ supports_vision = true
 
 Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
 
-Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
 ### Plans
 
-Some built-ins ship multiple plans (different base URLs or default models). `maki auth login <provider>` asks which plan to use when more than one exists. You can also set it in TOML:
+Some built-ins ship multiple plans (different base URLs or default models). `caudra auth login <provider>` asks which plan to use when more than one exists. You can also set it in TOML:
 
 ```toml
 [mistral]
@@ -439,7 +439,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
 
 ## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/caudra/providers/` on Linux/macOS, `%APPDATA%\caudra\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|
@@ -462,7 +462,7 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 
 Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
 
-A `llama-cpp` model can replace Maki's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
+A `llama-cpp` model can replace Caudra's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
 
 ```json
 [{

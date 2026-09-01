@@ -7,12 +7,12 @@ group = "Reference"
 
 # Markdown
 
-Maki renders model replies as markdown: headings, emphasis, lists, tables,
+Caudra renders model replies as markdown: headings, emphasis, lists, tables,
 code blocks with syntax highlighting, maths, and mermaid flowcharts.
 
 ## Maths
 
-Models write maths as LaTeX. Maki recognises four delimiters:
+Models write maths as LaTeX. Caudra recognises four delimiters:
 
 | Delimiter | Kind |
 | --- | --- |
@@ -21,7 +21,7 @@ Models write maths as LaTeX. Maki recognises four delimiters:
 | `$$ ... $$` | display |
 | `\[ ... \]` | display |
 
-Terminals cannot typeset maths, so Maki approximates it with Unicode on a
+Terminals cannot typeset maths, so Caudra approximates it with Unicode on a
 single line.
 
 | LaTeX | Renders as |
@@ -40,7 +40,7 @@ and super- and subscripts map to their Unicode equivalents. Font commands
 such as `\mathbf` and `\boldsymbol` pass their content through, since a
 terminal cannot restyle text inside an equation.
 
-Where no Unicode equivalent exists, Maki falls back to readable ASCII rather
+Where no Unicode equivalent exists, Caudra falls back to readable ASCII rather
 than dropping the term. A subscript of `x \to \infty` has no subscript glyphs,
 so it renders as `lim_(x → ∞)`. A single symbol needs no grouping, so
 `x^\infty` gives `x^∞`, while `x^{AB}` keeps its parentheses as `x^(AB)`.
@@ -62,7 +62,7 @@ math = "raw"
 
 ### When a dollar sign is money
 
-`It costs $5 and $10 total` stays plain text. Maki treats `$...$` as maths
+`It costs $5 and $10 total` stays plain text. Caudra treats `$...$` as maths
 only when the content does not start with a digit, or when it contains a
 LaTeX signal such as `\`, `^`, `_`, or `{`. So `$2^n$` is maths and `$5 and $`
 is not.
@@ -122,7 +122,7 @@ through the middle, so the two never join.
 Anything outside that table leaves the block as a highlighted code fence.
 Sequence diagrams, class diagrams, pie charts, nested subgraphs, and self
 loops all fall back this way. A half-drawn diagram would be worse than the
-source, so Maki draws only what it fully understands, and it waits for the
+source, so Caudra draws only what it fully understands, and it waits for the
 closing fence before laying anything out.
 
 Wide diagrams clip at the edges and mark each cut with `‹` or `›`. Hover one
@@ -138,12 +138,18 @@ Set `ui.mermaid = "off"` to leave every mermaid block as code.
 mermaid = "off"
 ```
 
+## Links
+
+Explicit Markdown links, HTTP(S) autolinks, and bare HTTP(S) URLs are underlined. Hover a link to show its target. Supporting terminals receive OSC 8 hyperlink metadata, and a click can use an available local desktop or WSL opener.
+
+Interactive targets must use HTTP or HTTPS, include a host, and contain no control characters. Other schemes remain visible text without an interactive target.
+
 ## Copying
 
-Selecting text and pressing `Alt+C` copies the markdown source, not the
-glyphs on screen. A copied table has its pipes, a heading has its `#`, and an
-equation has its `$` delimiters and LaTeX. Pasting into a file or a chat gives
-back what the model wrote.
+Releasing a mouse drag copies the selected Markdown source, not the glyphs on
+screen. `Alt+C` copies the latest assistant reply as Markdown. A copied table
+has its pipes, a heading has its `#`, and an equation has its `$` delimiters
+and LaTeX. Pasting into a file or a chat gives back what the model wrote.
 
 Rendering is lossy in both directions, so some constructs copy whole. Select
 part of an equation, a table row, or a list marker and you get the entire

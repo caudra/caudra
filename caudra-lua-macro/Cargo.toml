@@ -1,0 +1,14 @@
+[package]
+name = "caudra-lua-macro"
+description = "Procedural macros for Caudra Lua APIs."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

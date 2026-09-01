@@ -3,8 +3,8 @@
 -- while the picker is open so rows never jump around under the cursor
 -- while background agents keep working.
 
-local TextInput = require("maki.text_input")
-local ListPicker = require("maki.list_picker")
+local TextInput = require("caudra.text_input")
+local ListPicker = require("caudra.list_picker")
 
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
@@ -208,12 +208,12 @@ end
 -- board is still current.
 local function refresh()
   local this_board = board
-  local live, live_err = maki.session.live()
+  local live, live_err = caudra.session.live()
   if board ~= this_board then
     return
   end
   if live_err then
-    maki.ui.flash(live_err)
+    caudra.ui.flash(live_err)
     render()
     return
   end
@@ -302,9 +302,9 @@ local function open_selected()
     return
   end
   if not s.focused then
-    local _, err = maki.session.focus(s.id)
+    local _, err = caudra.session.focus(s.id)
     if err then
-      maki.ui.flash(err)
+      caudra.ui.flash(err)
       return
     end
   end
@@ -312,9 +312,9 @@ local function open_selected()
 end
 
 local function open_blank()
-  local _, err = maki.session.new({ focus = true })
+  local _, err = caudra.session.new({ focus = true })
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
     return
   end
   close()
@@ -326,7 +326,7 @@ local function delete_selected()
     return
   end
   if s.focused then
-    maki.ui.flash(DELETE_FOCUSED_HINT)
+    caudra.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -335,9 +335,9 @@ local function delete_selected()
     return
   end
   board.confirm = nil
-  local _, err = maki.session.delete(s.id)
+  local _, err = caudra.session.delete(s.id)
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
     return
   end
   board.deleted[s.id] = true
@@ -374,9 +374,9 @@ local function commit_rename()
   if title == "" then
     return
   end
-  local _, err = maki.session.set_title({ id = id, title = title })
+  local _, err = caudra.session.set_title({ id = id, title = title })
   if err then
-    maki.ui.flash(err)
+    caudra.ui.flash(err)
   else
     local si = find_stored(id)
     if si then
@@ -447,8 +447,8 @@ local function open()
   if board then
     return
   end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = caudra.ui.buf()
+  local win = caudra.ui.open_win(buf, {
     title = " Sessions ",
     width = "70%",
     height = "70%",
@@ -478,13 +478,13 @@ local function open()
   -- in once it lands.
   refresh()
   local this_board = board
-  maki.async.run(function()
-    local stored, err = maki.session.list()
+  caudra.async.run(function()
+    local stored, err = caudra.session.list()
     if board ~= this_board then
       return
     end
     if err then
-      maki.ui.flash(err)
+      caudra.ui.flash(err)
       stored = {}
     end
     -- A delete may have landed while the scan was in flight; never let the
@@ -535,16 +535,16 @@ end
 -- synchronously while refresh needs an async roundtrip, so the dirty flag
 -- defers it to the next tick of the recv loop.
 local last_status = {}
-maki.api.create_autocmd("SessionStatusChanged", {
+caudra.api.create_autocmd("SessionStatusChanged", {
   callback = function(ev)
     local d = ev.data or {}
     local prev = last_status[d.session_id]
     last_status[d.session_id] = d.status
     if not d.focused then
       if d.status == "needs_input" then
-        maki.ui.flash("◆ " .. d.title .. " needs input · /sessions")
+        caudra.ui.flash("◆ " .. d.title .. " needs input · /sessions")
       elseif d.status == "idle" and prev == "working" then
-        maki.ui.flash("✓ " .. d.title .. " finished · /sessions")
+        caudra.ui.flash("✓ " .. d.title .. " finished · /sessions")
       end
     end
     if board then
@@ -553,30 +553,30 @@ maki.api.create_autocmd("SessionStatusChanged", {
   end,
 })
 
-maki.api.register_command({
+caudra.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
   handler = open,
 })
 
-maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
+caudra.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
-maki.api.register_command({
+caudra.api.register_command({
   name = "/rename",
   description = "Rename the current session",
   nargs = "+",
   handler = function(opts)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then
-      maki.ui.flash(RENAME_USAGE)
+      caudra.ui.flash(RENAME_USAGE)
       return
     end
-    local id, err = maki.session.current()
+    local id, err = caudra.session.current()
     if err then
-      maki.ui.flash(err)
+      caudra.ui.flash(err)
       return
     end
-    local _, set_err = maki.session.set_title({ id = id, title = title })
-    maki.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
+    local _, set_err = caudra.session.set_title({ id = id, title = title })
+    caudra.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
   end,
 })

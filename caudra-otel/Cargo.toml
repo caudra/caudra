@@ -1,0 +1,22 @@
+[package]
+name = "caudra-otel"
+description = "OpenTelemetry export and instrumentation for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caudra-config = { workspace = true }
+isahc = { workspace = true }
+serde_json = { workspace = true }
+smol = { workspace = true }
+flume = { workspace = true }
+futures-lite = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }
+jiff = { workspace = true }
+fastrand = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

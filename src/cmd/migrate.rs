@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use caudra_storage::input_history::MAX_ENTRIES;
+use caudra_storage::paths;
+use caudra_storage::sessions::{SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionDatabase};
+use caudra_storage::{StateDir, lock_session_artifacts};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
-use maki_storage::input_history::MAX_ENTRIES;
-use maki_storage::paths;
-use maki_storage::sessions::{SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionDatabase};
-use maki_storage::{StateDir, lock_session_artifacts};
 use tempfile::NamedTempFile;
 
 #[cfg(unix)]
@@ -39,7 +39,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", tilde(parent)))?;
     }
-    match maki_storage::durable_rename(src, dst) {
+    match caudra_storage::durable_rename(src, dst) {
         Ok(()) => {
             sync_parent(dst)?;
             sync_parent(src)?;
@@ -79,7 +79,7 @@ fn remove_file_durable(path: &Path) -> Result<()> {
 }
 
 fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
-    maki_storage::atomic_write(path, data)?;
+    caudra_storage::atomic_write(path, data)?;
     Ok(())
 }
 
@@ -279,7 +279,7 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> Result<()> {
     {
         let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
         drop(file);
-        if let Err(error) = maki_storage::durable_rename_noreplace(&temporary_path, destination) {
+        if let Err(error) = caudra_storage::durable_rename_noreplace(&temporary_path, destination) {
             let _ = fs::remove_file(temporary_path);
             return Err(error.into());
         }
@@ -413,7 +413,7 @@ fn move_logs(legacy: &Path, logs_dir: &Path) -> Result<()> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.starts_with("maki.") && name.ends_with(".log")
+            name.starts_with("caudra.") && name.ends_with(".log")
         })
         .collect();
 
@@ -545,7 +545,7 @@ pub fn xdg() -> Result<()> {
 
     move_logs(&legacy, &xdg.logs)?;
 
-    let lock_file = legacy.join("maki.log.lock");
+    let lock_file = legacy.join("caudra.log.lock");
     if lock_file.exists() {
         fs::remove_file(&lock_file).ok();
     }
@@ -587,7 +587,7 @@ pub fn xdg() -> Result<()> {
          \x20 State    {}\n\
          \x20          sessions, auth, plans, memories, input history, preferences\n\n\
          \x20 Logs     {}\n\n\
-         Per-project settings (.maki/ in your repos) are not affected.\n\n\
+         Per-project settings (.caudra/ in your repos) are not affected.\n\n\
          {} {}.",
         tilde(&xdg.config),
         tilde(&xdg.state),
@@ -624,8 +624,8 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    #[test_case(".maki", ".maki.bak"; "release")]
-    #[test_case(".maki-debug", ".maki-debug.bak"; "debug")]
+    #[test_case(".caudra", ".caudra.bak"; "release")]
+    #[test_case(".caudra-debug", ".caudra-debug.bak"; "debug")]
     fn legacy_backup_preserves_directory_name(legacy_name: &str, expected_name: &str) {
         let legacy = Path::new("/home/test").join(legacy_name);
 

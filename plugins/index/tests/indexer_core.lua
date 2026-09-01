@@ -1,4 +1,4 @@
-local th = require("maki.test_helpers")
+local th = require("caudra.test_helpers")
 local helpers = require("tests.helpers")
 local case = th.case
 local idx_with_meta = helpers.idx_with_meta

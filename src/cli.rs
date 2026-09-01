@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use caudra_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
@@ -24,7 +24,11 @@ pub enum InputFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "maki", version, about = "AI coding agent for the terminal")]
+#[command(
+    name = "caudra",
+    version,
+    about = "Terminal coding agent that turns context into effective action"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -61,11 +65,11 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = InputFormat::Text)]
     pub input_format: InputFormat,
 
-    /// Skip loading custom commands from .maki/commands, .claude/commands, etc.
+    /// Skip loading custom commands from .caudra/commands, .claude/commands, etc.
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Legacy compatibility flag. Maki no longer rewrites commands through RTK.
+    /// Legacy compatibility flag. Caudra no longer rewrites commands through RTK.
     #[arg(long, hide = true)]
     pub no_rtk: bool,
 
@@ -221,7 +225,7 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Update maki to the latest version
+    /// Update caudra to the latest version
     Update {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
@@ -379,11 +383,11 @@ mod tests {
 
     #[test]
     fn system_prompt_profile_parses_and_conflicts_with_raw_override() {
-        let cli = Cli::try_parse_from(["maki", "--system-prompt-profile", "review"]).unwrap();
+        let cli = Cli::try_parse_from(["caudra", "--system-prompt-profile", "review"]).unwrap();
         assert_eq!(cli.system_prompt_profile.as_deref(), Some("review"));
         assert!(
             Cli::try_parse_from([
-                "maki",
+                "caudra",
                 "--system-prompt-profile",
                 "review",
                 "--system-prompt",

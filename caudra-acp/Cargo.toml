@@ -1,0 +1,24 @@
+[package]
+name = "caudra-acp"
+description = "Agent Client Protocol server for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caudra-agent = { workspace = true }
+caudra-config = { workspace = true }
+caudra-otel = { workspace = true }
+caudra-providers = { workspace = true }
+caudra-storage = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
+smol = { workspace = true }
+flume = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+color-eyre = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }

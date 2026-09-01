@@ -1,5 +1,5 @@
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
+local ToolView = require("caudra.tool_view")
+local output_limits = require("caudra.output_limits")
 
 local SMALL_OUTPUT_MAX_BYTES = 8 * 1024
 local FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
@@ -11,7 +11,7 @@ local NO_PARTIAL_OUTPUT = "no output before the cut"
 local OUTPUT_LIMIT_MARKER = "[stopped: output limit exceeded]"
 local STREAM_FAILURE_MARKER = "[stopped: stream failure]"
 local PERSISTENCE_FAILURE_MARKER = "[stopped: output persistence failure]"
-local WORKDIR_SCOPE_FMT = "%s # maki-workdir[%d]=%s # maki-frame[%d]"
+local WORKDIR_SCOPE_FMT = "%s # caudra-workdir[%d]=%s # caudra-frame[%d]"
 local SEPARATOR = "──────"
 
 local function unquote(s)
@@ -38,7 +38,7 @@ end
 
 local function execution(input)
   local command, workdir = parse_cd_hint(input)
-  return command, maki.fs.normalize(workdir or maki.uv.cwd() or ".")
+  return command, caudra.fs.normalize(workdir or caudra.uv.cwd() or ".")
 end
 
 local function normalize_sep(s)
@@ -47,7 +47,7 @@ end
 
 local function relative_path(p)
   local np = normalize_sep(p)
-  local cwd = maki.uv.cwd()
+  local cwd = caudra.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if np:sub(1, #cwd + 1) == cwd .. "/" then
@@ -58,7 +58,7 @@ local function relative_path(p)
       return "."
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = caudra.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if np:sub(1, #home + 1) == home .. "/" then
@@ -71,7 +71,7 @@ end
 
 local function build_header_lines(command)
   local header = {}
-  local highlighted = maki.ui.highlight(command, "bash")
+  local highlighted = caudra.ui.highlight(command, "bash")
   if highlighted then
     for _, line in ipairs(highlighted) do
       header[#header + 1] = line
@@ -85,7 +85,7 @@ end
 
 local function create_bash_view(command, ctx)
   local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.bash) or 5,
     keep = "tail",
@@ -126,12 +126,12 @@ local function redirect_path(raw, workdir)
     path = path:gsub("\\(.)", "%1")
   end
   if not quoted and (path == "~" or path:sub(1, 2) == "~/") then
-    return maki.fs.normalize(path)
+    return caudra.fs.normalize(path)
   end
   if path:sub(1, 1) == "/" then
-    return maki.fs.normalize(path)
+    return caudra.fs.normalize(path)
   end
-  return maki.fs.normalize(maki.fs.joinpath(workdir, path))
+  return caudra.fs.normalize(caudra.fs.joinpath(workdir, path))
 end
 
 local function collect_effects(node, source, workdir, out, seen)
@@ -140,7 +140,7 @@ local function collect_effects(node, source, workdir, out, seen)
     out.force_prompt = true
   end
   if COMMAND_TYPES[kind] then
-    local command = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+    local command = caudra.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
     if command ~= "" then
       local scope = with_workdir(command, workdir)
       if not seen[scope] then
@@ -150,9 +150,9 @@ local function collect_effects(node, source, workdir, out, seen)
     end
   elseif kind == "file_redirect" then
     local destinations = node:field("destination")
-    local raw = destinations[1] and maki.treesitter.get_node_text(destinations[1], source) or nil
+    local raw = destinations[1] and caudra.treesitter.get_node_text(destinations[1], source) or nil
     if raw then
-      local redirect = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+      local redirect = caudra.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
       local descriptor_only = redirect:find("[<>]&") and (raw == "-" or raw:match("^%d+$"))
       if not descriptor_only then
         local target = redirect_path(raw, workdir)
@@ -182,7 +182,7 @@ local function permission_scopes(input)
   end
 
   local fallback = with_workdir(command, workdir)
-  local parser = maki.treesitter.get_parser(command, "bash")
+  local parser = caudra.treesitter.get_parser(command, "bash")
   if not parser then
     return { scopes = { fallback }, force_prompt = true }
   end
@@ -211,12 +211,12 @@ Commands run in the current working directory by default.
 - Output truncated beyond 2000 lines or 50KB.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
 })
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = caudra.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 120,
     min = 5,
@@ -224,7 +224,7 @@ local opts = maki.api.register_options(output_limits.extend({
   },
 }))
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "bash",
   kind = "execute",
   description = description,
@@ -242,15 +242,15 @@ maki.api.register_tool({
   header = function(input)
     local command, workdir = parse_cd_hint(input)
     if workdir then
-      workdir = maki.fs.normalize(workdir)
+      workdir = caudra.fs.normalize(workdir)
     end
     local s = input.description or command
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
     if input.timeout then
-      local buf = maki.ui.buf()
-      buf:line({ { s }, { " (" .. maki.ui.humantime(input.timeout) .. " timeout)", "dim" } })
+      local buf = caudra.ui.buf()
+      buf:line({ { s }, { " (" .. caudra.ui.humantime(input.timeout) .. " timeout)", "dim" } })
       return buf
     end
     return s
@@ -406,7 +406,7 @@ maki.api.register_tool({
       if finished then
         return
       end
-      maki.fn.jobstop(id)
+      caudra.fn.jobstop(id)
 
       local is_limit = err:find("exceeding the", 1, true) ~= nil
       local message = is_limit and "Bash output limit exceeded; command stopped: " .. err
@@ -501,7 +501,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    job_id = maki.fn.jobstart(command, {
+    job_id = caudra.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       raw_chunks = true,
@@ -545,7 +545,7 @@ maki.api.register_tool({
 
     -- Esc or deadline: hand back the lines streamed so far, so the model
     -- keeps what the user just watched instead of a bare error.
-    maki.async.on_cancel(function(reason)
+    caudra.async.on_cancel(function(reason)
       if finished then
         return
       end
@@ -559,7 +559,7 @@ maki.api.register_tool({
         return
       end
       finished = true
-      maki.fn.jobstop(job_id)
+      caudra.fn.jobstop(job_id)
       flush_view_pending(false)
       if command_output_empty then
         view:clear()

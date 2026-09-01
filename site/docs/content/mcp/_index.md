@@ -7,7 +7,7 @@ group = "Reference"
 
 # MCP (Model Context Protocol)
 
-Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** transports are supported.
+Caudra connects to external tool servers over MCP. Both **stdio** and **HTTP** transports are supported.
 
 An external stdio server is an unsandboxed local process. Per-tool permissions control MCP calls after startup. They cannot confine the server process itself.
 
@@ -15,8 +15,8 @@ An external stdio server is an unsandboxed local process. Per-tool permissions c
 
 Add servers under `[mcp.*]` in your MCP config:
 
-- **Global**: `~/.config/maki/mcp.toml`
-- **Project**: `.maki/mcp.toml` (project config wins when both set a value)
+- **Global**: `~/.config/caudra/mcp.toml`
+- **Project**: `.caudra/mcp.toml` (project config wins when both set a value)
 
 ### Stdio
 
@@ -39,7 +39,7 @@ url = "https://mcp.example.com/mcp"
 headers = { Authorization = "Bearer tok123" }
 ```
 
-Some HTTP servers need OAuth but have no dynamic client registration. For those, give Maki a static client:
+Some HTTP servers need OAuth but have no dynamic client registration. For those, give Caudra a static client:
 
 ```toml
 [mcp.acme]
@@ -72,7 +72,7 @@ One option lives at the top level of `mcp.toml`, outside any server:
 
 Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
 
-So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+So Caudra, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
 
 ```
 server ships 117 tool definitions
@@ -130,9 +130,9 @@ Generic MCP approvals are exact-input by default. The permission review shows th
 
 ## Project server trust
 
-Maki separates server startup trust from tool-call permissions.
+Caudra separates server startup trust from tool-call permissions.
 
-Project stdio servers do not start until you review them. Project HTTP servers also wait for plaintext HTTP, URL credentials, failed DNS resolution, or any resolved private or reserved address. A trust decision cannot start or persist until DNS succeeds. Public HTTPS addresses connect normally. Maki pins the reviewed DNS result for the process, so a later DNS answer cannot redirect that connection into a private network. Global user configuration and ACP-provided runtime servers are trusted for startup.
+Project stdio servers do not start until you review them. Project HTTP servers also wait for plaintext HTTP, URL credentials, failed DNS resolution, or any resolved private or reserved address. A trust decision cannot start or persist until DNS succeeds. Public HTTPS addresses connect normally. Caudra pins the reviewed DNS result for the process, so a later DNS answer cannot redirect that connection into a private network. Global user configuration and ACP-provided runtime servers are trusted for startup.
 
 Open `/mcp` to review a parked server. The picker shows the command or URL, config source, and environment or header names. Values remain hidden.
 
@@ -167,11 +167,11 @@ If one server fails, the rest still work.
 
 ## OAuth
 
-Some HTTP servers need auth. When that happens, Maki opens your browser to log in. Other servers keep working while you authenticate. Tokens refresh on their own. If you change the server URL, you log in again.
+Some HTTP servers need auth. When that happens, Caudra opens your browser to log in. Other servers keep working while you authenticate. Tokens refresh on their own. If you change the server URL, you log in again.
 
 ```bash
-maki mcp auth <server-name>     # manually trigger auth
-maki mcp logout <server-name>   # remove stored tokens
+caudra mcp auth <server-name>     # manually trigger auth
+caudra mcp logout <server-name>   # remove stored tokens
 ```
 
 Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
@@ -184,15 +184,15 @@ Servers without dynamic client registration need a client you registered yoursel
 | `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
 | `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
 
-Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
+Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Caudra falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
 
 ### Headless machines
 
-On a machine without a browser (say, a dev server over SSH), run `maki mcp auth <server-name>`. Maki prints the login URL. Open it on your laptop and log in. The browser lands on a `http://127.0.0.1:19876/...` page that fails to load. Copy that full URL from the address bar and paste it into the terminal to finish the login.
+On a machine without a browser (say, a dev server over SSH), run `caudra mcp auth <server-name>`. Caudra prints the login URL. Open it on your laptop and log in. The browser lands on a `http://127.0.0.1:19876/...` page that fails to load. Copy that full URL from the address bar and paste it into the terminal to finish the login.
 
 ## Prompts
 
-MCP servers can expose prompts (reusable message templates). Maki shows them as slash commands in the command palette: `/server:prompt-name`. Type `/` to filter.
+MCP servers can expose prompts (reusable message templates). Caudra shows them as slash commands in the command palette: `/server:prompt-name`. Type `/` to filter.
 
 ```
 /github:create-pr           # no arguments
@@ -200,4 +200,4 @@ MCP servers can expose prompts (reusable message templates). Maki shows them as 
 /review:code src tests      # multiple, positional
 ```
 
-Skip a required argument and Maki shows a usage hint. Prompts are fetched at startup and on reconnect, so new ones need a restart. Only text content is supported.
+Skip a required argument and Caudra shows a usage hint. Prompts are fetched at startup and on reconnect, so new ones need a restart. Only text content is supported.

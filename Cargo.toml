@@ -1,31 +1,33 @@
 [package]
-name = "maki"
+name = "caudra"
 version.workspace = true
 edition = "2024"
-authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
-description = "AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory."
+authors = [
+  "Thorsten Born <tensorninja@caudra.ai>",
+]
+description = "Terminal coding agent that turns context into effective action."
 license = "MIT"
-repository = "https://github.com/tontinton/maki"
-homepage = "https://maki.sh"
+repository = "https://github.com/caudra/caudra"
+homepage = "https://caudra.ai"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.98"
 
 [[bin]]
-name = "maki"
+name = "caudra"
 path = "src/main.rs"
 
 [dependencies]
-maki-ui = { workspace = true }
-maki-agent = { workspace = true }
-maki-acp = { workspace = true }
-maki-config = { workspace = true }
-maki-providers = { workspace = true }
-maki-storage = { workspace = true }
-maki-lua = { workspace = true }
-maki-otel = { workspace = true }
-maki-workcell = { workspace = true }
+caudra-ui = { workspace = true }
+caudra-agent = { workspace = true }
+caudra-acp = { workspace = true }
+caudra-config = { workspace = true }
+caudra-providers = { workspace = true }
+caudra-storage = { workspace = true }
+caudra-lua = { workspace = true }
+caudra-otel = { workspace = true }
+caudra-workcell = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
@@ -47,50 +49,50 @@ test-case = { workspace = true }
 
 [workspace]
 members = [
-  "maki-acp",
-  "maki-agent",
-  "maki-config",
-  "maki-docgen",
-  "maki-highlight",
-  "maki-interpreter",
-  "maki-lua",
-  "maki-markdown",
-  "maki-otel",
-  "maki-providers",
-  "maki-storage",
-  "maki-config-macro",
-  "maki-lua-macro",
-  "maki-ui",
-  "maki-workcell",
+  "caudra-acp",
+  "caudra-agent",
+  "caudra-config",
+  "caudra-docgen",
+  "caudra-highlight",
+  "caudra-interpreter",
+  "caudra-lua",
+  "caudra-markdown",
+  "caudra-otel",
+  "caudra-providers",
+  "caudra-storage",
+  "caudra-config-macro",
+  "caudra-lua-macro",
+  "caudra-ui",
+  "caudra-workcell",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.12"
+version = "0.1.0"
 edition = "2024"
-authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
+authors = [
+  "Thorsten Born <tensorninja@caudra.ai>",
+]
 license = "MIT"
-repository = "https://github.com/tontinton/maki"
+repository = "https://github.com/caudra/caudra"
 rust-version = "1.98"
 
 [workspace.dependencies]
-maki-agent = { path = "maki-agent" }
-maki-acp = { path = "maki-acp" }
-maki-config = { path = "maki-config" }
-maki-interpreter = { path = "maki-interpreter" }
-maki-providers = { path = "maki-providers" }
-maki-storage = { path = "maki-storage" }
-maki-ui = { path = "maki-ui" }
-maki-lua = { path = "maki-lua" }
-maki-config-macro = { path = "maki-config-macro" }
-maki-lua-macro = { path = "maki-lua-macro" }
-maki-highlight = { path = "maki-highlight" }
-maki-markdown = { path = "maki-markdown" }
-maki-otel = { path = "maki-otel" }
-maki-workcell = { path = "maki-workcell" }
-# Temporary cross-repository development dependency. Replace `path` with a
-# pinned git `rev` once the Workcell API changes are published.
-workcell = { path = "../workcell-mcp/crates/workcell", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "environment"] }
+caudra-agent = { path = "caudra-agent" }
+caudra-acp = { path = "caudra-acp" }
+caudra-config = { path = "caudra-config" }
+caudra-interpreter = { path = "caudra-interpreter" }
+caudra-providers = { path = "caudra-providers" }
+caudra-storage = { path = "caudra-storage" }
+caudra-ui = { path = "caudra-ui" }
+caudra-lua = { path = "caudra-lua" }
+caudra-config-macro = { path = "caudra-config-macro" }
+caudra-lua-macro = { path = "caudra-lua-macro" }
+caudra-highlight = { path = "caudra-highlight" }
+caudra-markdown = { path = "caudra-markdown" }
+caudra-otel = { path = "caudra-otel" }
+caudra-workcell = { path = "caudra-workcell" }
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "d87388175b3e9ba776939b7b695569cbde713648", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "environment"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }

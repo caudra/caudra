@@ -21,11 +21,10 @@ mkdir -p "$OUT"
 
 # 1. Copy static landing page files
 cp index.html "$OUT/"
-cp asciinema-player.css "$OUT/"
-cp asciinema-player.min.js "$OUT/"
-cp demo.cast "$OUT/"
-cp doom.mp4 "$OUT/"
-cp doom-av1.mp4 "$OUT/"
+cp caudra-mark.svg "$OUT/"
+cp caudra-wordmark.svg "$OUT/"
+cp caudra-hero-v1.png "$OUT/"
+cp social-card.png "$OUT/"
 cp ../install.sh "$OUT/"
 cp ../install.ps1 "$OUT/"
 cp favicon.ico "$OUT/"
@@ -42,7 +41,7 @@ zola build -o "../_build/docs"
 cd ..
 
 # 3. Markdown mirrors + llms.txt / llms-full.txt for LLM consumption
-BASE_URL="https://maki.sh"
+BASE_URL="https://caudra.ai"
 
 body() {
   awk '/^\+\+\+$/{c++; next} c>=2' "$1"
@@ -68,7 +67,7 @@ body docs/content/_index.md > "$OUT/docs/index.md"
 summary=$(first_paragraph docs/content/_index.md)
 
 {
-  echo "# Maki"
+  echo "# Caudra"
   echo
   echo "> $summary"
   echo
@@ -76,7 +75,7 @@ summary=$(first_paragraph docs/content/_index.md)
   echo
   echo "## Docs"
   echo
-  echo "- [Maki Docs]($BASE_URL/docs/index.md): overview and map of the documentation"
+  echo "- [Caudra Docs]($BASE_URL/docs/index.md): overview and map of the documentation"
   for f in $pages; do
     slug=$(basename "$(dirname "$f")")
     title=$(sed -n 's/^title = "\(.*\)"$/\1/p' "$f")

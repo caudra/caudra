@@ -7,31 +7,31 @@ group = "Guides"
 
 # ACP (Agent Client Protocol)
 
-Run Maki inside your editor. `maki acp` starts an [ACP](https://agentclientprotocol.com/) server over stdio, so any ACP-capable editor (like [Zed](https://zed.dev/)) can drive Maki as its coding agent.
+Run Caudra inside your editor. `caudra acp` starts an [ACP](https://agentclientprotocol.com/) server over stdio, so any ACP-capable editor (like [Zed](https://zed.dev/)) can drive Caudra as its coding agent.
 
 ```bash
-maki acp
+caudra acp
 ```
 
 ## Zed setup
 
-Add Maki as a custom agent in Zed's `settings.json`:
+Add Caudra as a custom agent in Zed's `settings.json`:
 
 ```json
 "agent_servers": {
-  "Maki": {
+  "Caudra": {
     "default_config_options": {
       "model": "deepseek/deepseek-v4-flash"
     },
     "type": "custom",
-    "command": "maki",
+    "command": "caudra",
     "args": ["acp"],
     "env": {}
   }
 }
 ```
 
-The `model` value is a `provider/model-id` spec, same format as `maki --model`.
+The `model` value is a `provider/model-id` spec, same format as `caudra --model`.
 
 ## What works
 
@@ -43,17 +43,17 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 - **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
 - **Images and context.** Prompts can include images and editor-attached files.
 
-Authentication, providers, and permissions come from your normal Maki config. Set up [providers](/docs/providers/) first and ACP sessions just work.
+Authentication, providers, and permissions come from your normal Caudra config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 
 Project MCP startup trust must already be approved through `/mcp` in the TUI. ACP returns an actionable session error instead of silently omitting a parked server.
 
 ```bash
-maki acp
-maki acp -m anthropic/claude-sonnet-4-6
-maki acp --yolo
-maki --no-jit acp
+caudra acp
+caudra acp -m anthropic/claude-sonnet-4-6
+caudra acp --yolo
+caudra --no-jit acp
 ```
 
-`maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`).
+`caudra acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`caudra --no-jit acp`, not `caudra acp --no-jit`).
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.

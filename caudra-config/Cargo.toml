@@ -1,0 +1,23 @@
+[package]
+name = "caudra-config"
+description = "Configuration loading and policy types for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caudra-config-macro = { workspace = true }
+caudra-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tracing = { workspace = true }
+dotenvy = { workspace = true }
+inventory = { workspace = true }
+globset = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }

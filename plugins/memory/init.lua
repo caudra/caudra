@@ -1,22 +1,22 @@
-local ToolView = require("maki.tool_view")
+local ToolView = require("caudra.tool_view")
 local helpers = require("memory_helpers")
-local ListPicker = require("maki.list_picker")
+local ListPicker = require("caudra.list_picker")
 
 local MEMORY_POLICY_TOOLS = { "memory", "file_write", "file_edit", "file_apply_patch" }
 
 local function memories_path_suffix()
-  local cwd = maki.uv.cwd()
-  local root = maki.fs.root(cwd, ".git") or cwd
+  local cwd = caudra.uv.cwd()
+  local root = caudra.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
 local function legacy_dir_if_exists(suffix)
-  local legacy = maki.env.legacy_dir()
+  local legacy = caudra.env.legacy_dir()
   if not legacy then
     return nil
   end
-  local dir = maki.fs.joinpath(legacy, suffix)
-  local meta = maki.fs.metadata(dir)
+  local dir = caudra.fs.joinpath(legacy, suffix)
+  local meta = caudra.fs.metadata(dir)
   if meta and meta.is_dir then
     return dir
   end
@@ -27,14 +27,14 @@ end
 local function register_memory_rules()
   local suffix = memories_path_suffix()
   local dirs = { legacy_dir_if_exists(suffix) }
-  local state = maki.env.state_dir()
+  local state = caudra.env.state_dir()
   if state then
-    dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
+    dirs[#dirs + 1] = caudra.fs.joinpath(state, suffix)
   end
   for _, dir in ipairs(dirs) do
-    dir = maki.fs.normalize(dir)
+    dir = caudra.fs.normalize(dir)
     for _, tool in ipairs(MEMORY_POLICY_TOOLS) do
-      maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
+      caudra.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
     end
   end
 end
@@ -48,14 +48,14 @@ local function resolve_dir(check_legacy)
       return dir
     end
   end
-  local state = maki.env.state_dir()
+  local state = caudra.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
-  return maki.fs.joinpath(state, suffix)
+  return caudra.fs.joinpath(state, suffix)
 end
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
   content = function()
@@ -71,14 +71,14 @@ maki.api.register_prompt_hint({
   end,
 })
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   prompt = { "system", "general" },
   slot = "tool_usage",
   content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
 })
 
 local function render_content(content, path, ctx)
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local tol = ctx:tool_output_lines()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.other) or 20,
@@ -101,7 +101,7 @@ local function cmd_read(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local content, err = maki.fs.read(file_path)
+  local content, err = caudra.fs.read(file_path)
   if not content then
     return nil, "read error: " .. err
   end
@@ -128,8 +128,8 @@ local function cmd_write(path, content, tags, dir, ctx)
     return nil, tag_err
   end
   local full = helpers.encode_frontmatter(normalized) .. content
-  maki.fs.mkdir(dir, { parents = true })
-  local ok, write_err = maki.fs.write(file_path, full)
+  caudra.fs.mkdir(dir, { parents = true })
+  local ok, write_err = caudra.fs.write(file_path, full)
   if not ok then
     return nil, "write error: " .. tostring(write_err)
   end
@@ -149,10 +149,10 @@ local function cmd_delete(path, dir)
   if not file_path then
     return nil, err
   end
-  if not maki.fs.metadata(file_path) then
+  if not caudra.fs.metadata(file_path) then
     return nil, "'" .. path .. "' does not exist"
   end
-  local ok, rm_err = maki.fs.rm(file_path)
+  local ok, rm_err = caudra.fs.rm(file_path)
   if not ok then
     return nil, "delete error: " .. tostring(rm_err)
   end
@@ -174,7 +174,7 @@ local function memory_permission_scopes(input)
   if not dir then
     return nil
   end
-  local scope = maki.fs.normalize(dir)
+  local scope = caudra.fs.normalize(dir)
   if input.path then
     scope = helpers.safe_resolve(scope, input.path) or scope
   else
@@ -183,7 +183,7 @@ local function memory_permission_scopes(input)
   return { scopes = { scope }, force_prompt = false }
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "memory",
   effect = "mutating",
   permission_scopes = memory_permission_scopes,
@@ -287,23 +287,23 @@ local function popup_build_items(dir)
   return items, warnings
 end
 
-maki.api.register_command({
+caudra.api.register_command({
   name = "/memory",
   description = "View, edit, and delete memory files",
   handler = function()
     local dir = resolve_dir(true)
     if not dir then
-      maki.ui.flash("Cannot resolve memory directory")
+      caudra.ui.flash("Cannot resolve memory directory")
       return
     end
 
     local items, warnings = popup_build_items(dir)
     if #items == 0 then
-      maki.ui.flash("No memories yet")
+      caudra.ui.flash("No memories yet")
       return
     end
     if #warnings > 0 then
-      maki.ui.flash(#warnings .. " unreadable memory file(s)")
+      caudra.ui.flash(#warnings .. " unreadable memory file(s)")
     end
     local last_cursor = 1
     while true do
@@ -329,23 +329,23 @@ maki.api.register_command({
       if event.type == "choice" then
         local item = items[event.index]
         if item then
-          local path = maki.fs.joinpath(dir, item.label)
-          local code = maki.ui.open_editor(path)
+          local path = caudra.fs.joinpath(dir, item.label)
+          local code = caudra.ui.open_editor(path)
           if code == 0 then
             items = popup_build_items(dir)
           end
         end
       elseif event.type == "delete" then
         local item = items[event.index]
-        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item.label))
+        local ok, err = caudra.fs.rm(caudra.fs.joinpath(dir, item.label))
         if ok then
-          maki.ui.flash("Deleted " .. item.label)
+          caudra.ui.flash("Deleted " .. item.label)
           items = popup_build_items(dir)
           if #items == 0 then
             break
           end
         else
-          maki.ui.flash("Delete failed: " .. tostring(err))
+          caudra.ui.flash("Delete failed: " .. tostring(err))
         end
       else
         break

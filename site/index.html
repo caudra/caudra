@@ -1,2043 +1,376 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>maki</title>
-  <meta name="description" content="An efficient AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox interpreter. Anthropic, OpenAI, Google, Z.AI, OpenRouter, Synthetic, or any OpenAI / Anthropic compatible API.">
-  <meta name="theme-color" content="#f0ede2">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>caudra | context into effective action</title>
+  <meta name="description" content="Caudra is a terminal coding agent that turns context into effective action by coordinating models, tools, plugins, and subagents under your control.">
+  <meta name="theme-color" content="#09254d">
+  <link rel="canonical" href="https://caudra.ai/">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://maki.sh/">
-  <meta property="og:title" content="maki - the efficient coder">
-  <meta property="og:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
-  <meta property="og:image" content="https://maki.sh/android-chrome-512x512.png">
-  <meta property="og:site_name" content="maki">
-  <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="maki - the efficient coder">
-  <meta name="twitter:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
-  <meta name="twitter:image" content="https://maki.sh/android-chrome-512x512.png">
-  <link rel="icon" type="image/x-icon" href="/favicon.ico">
-  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <meta property="og:url" content="https://caudra.ai/">
+  <meta property="og:title" content="caudra | context into effective action">
+  <meta property="og:description" content="A terminal coding agent that coordinates context, capabilities, and outcomes under your control.">
+  <meta property="og:image" content="https://caudra.ai/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Caudra turns context into effective action">
+  <meta property="og:site_name" content="Caudra">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="caudra | context into effective action">
+  <meta name="twitter:description" content="A terminal coding agent that coordinates context, capabilities, and outcomes under your control.">
+  <meta name="twitter:image" content="https://caudra.ai/social-card.png">
+  <link rel="icon" href="/caudra-mark.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="dns-prefetch" href="https://api.github.com">
-  <link rel="preload" href="demo.cast" as="fetch" crossorigin fetchpriority="high">
-  <link rel="preload" href="asciinema-player.min.js" as="script" fetchpriority="high">
-  <link rel="preload" href="asciinema-player.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&display=swap" media="print" onload="this.media='all'">
-  <noscript>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&display=swap">
-    <link rel="stylesheet" href="asciinema-player.css">
-  </noscript>
   <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    html {
-      scroll-padding-top: 5rem;
-      scroll-behavior: smooth;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
-    }
-    code, pre { font-family: 'JetBrains Mono', monospace; }
-
     :root {
-      --lavender: oklch(85% 0.06 280);
-      --periwinkle: oklch(78% 0.08 275);
-      --soft-pink: oklch(82% 0.06 350);
-      --salmon: oklch(75% 0.12 40);
-      --cream: oklch(96% 0.02 90);
-      --deep-navy: oklch(25% 0.04 270);
-      --navy-light: oklch(35% 0.04 270);
-      --text-secondary: oklch(50% 0.03 270);
-      --muted: oklch(65% 0.03 270);
-      --surface-glow: oklch(90% 0.05 280);
-      --sky-start: oklch(92% 0.04 275);
-      --sky-end: oklch(88% 0.06 280);
+      color-scheme: light;
+      --ink: #09254d;
+      --paper: #f2ebdd;
+      --paper-2: #e8ddcb;
+      --muted: #6f6a61;
+      --line: #c9bba7;
+      --signal: #f0442f;
+      --signal-ink: #fff8ec;
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --max: 1180px;
     }
 
-    body {
-      font-family: 'Nunito', sans-serif;
-      color: var(--deep-navy);
-      background: var(--cream);
-      line-height: 1.6;
-      overflow-x: hidden;
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); line-height: 1.55; }
+    a { color: inherit; }
+    button, code { font: inherit; }
+    ::selection { background: var(--signal); color: var(--signal-ink); }
+
+    .shell { width: min(calc(100% - 2rem), var(--max)); margin: 0 auto; }
+    .site-nav { position: sticky; top: 0; z-index: 10; background: rgb(242 235 221 / 94%); border-bottom: 1px solid var(--ink); backdrop-filter: blur(10px); }
+    .nav-inner { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; }
+    .brand { display: inline-flex; align-items: center; gap: .7rem; font: 700 1.05rem/1 var(--mono); text-decoration: none; letter-spacing: -.04em; }
+    .brand img { width: 34px; height: 34px; }
+    .nav-meta { display: flex; align-items: center; gap: 1.5rem; font: 700 .73rem/1 var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+    .nav-meta a { text-decoration-thickness: 1px; text-underline-offset: 4px; }
+    .version { color: var(--muted); }
+
+    .hero { border-bottom: 1px solid var(--ink); }
+    .hero-grid { min-height: calc(100svh - 65px); display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(380px, .92fr); }
+    .hero-copy { padding: clamp(4.5rem, 10vw, 8rem) clamp(1rem, 6vw, 5rem) 4.5rem 0; display: flex; flex-direction: column; justify-content: center; }
+    .eyebrow { margin: 0 0 1.6rem; color: var(--muted); font: 700 .72rem/1.4 var(--mono); text-transform: uppercase; letter-spacing: .14em; }
+    h1 { max-width: 760px; margin: 0; font: 750 clamp(3.6rem, 8vw, 7rem)/.9 var(--sans); letter-spacing: -.075em; text-wrap: balance; }
+    .hero-lede { max-width: 630px; margin: 2rem 0 0; font-size: clamp(1.05rem, 2vw, 1.28rem); color: #34445e; }
+    .hero-actions { display: flex; gap: .7rem; flex-wrap: wrap; margin-top: 2.1rem; }
+    .button { display: inline-flex; align-items: center; justify-content: center; min-height: 47px; padding: .7rem 1rem; border: 1px solid var(--ink); font: 700 .78rem/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; text-decoration: none; transition: background .15s, color .15s; }
+    .button-primary { background: var(--ink); color: var(--paper); }
+    .button:hover { background: var(--signal); color: var(--signal-ink); }
+    .install { width: min(100%, 615px); margin-top: 2.2rem; display: flex; border: 1px solid var(--ink); background: var(--paper-2); }
+    .install code { min-width: 0; flex: 1; padding: .85rem 1rem; overflow-x: auto; white-space: nowrap; font: .78rem/1.4 var(--mono); }
+    .copy { border: 0; border-left: 1px solid var(--ink); padding: 0 1rem; background: var(--signal); color: var(--signal-ink); cursor: pointer; font: 700 .7rem/1 var(--mono); text-transform: uppercase; }
+
+    .hero-system { position: relative; overflow: hidden; min-height: 620px; border-left: 1px solid var(--ink); background: var(--paper); color: var(--ink); }
+    .hero-system::after { content: ""; position: absolute; z-index: 1; inset: 0; box-shadow: inset 0 0 0 1px rgb(9 37 77 / 8%); pointer-events: none; }
+    .hero-art { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+    .hero-legend { position: absolute; z-index: 2; right: 1.5rem; bottom: 1.5rem; left: 1.5rem; display: grid; grid-template-columns: repeat(3, 1fr); padding: .85rem 1rem; border: 1px solid rgb(9 37 77 / 42%); background: rgb(242 235 221 / 88%); color: #485872; font: 700 .62rem/1.4 var(--mono); letter-spacing: .1em; text-transform: uppercase; backdrop-filter: blur(8px); }
+    .hero-legend span:nth-child(2) { text-align: center; }
+    .hero-legend span:last-child { color: var(--signal); text-align: right; }
+
+    .signal-strip { border-bottom: 1px solid var(--ink); }
+    .signal-grid { display: grid; grid-template-columns: repeat(4, 1fr); }
+    .signal-item { min-height: 92px; padding: 1.25rem; border-right: 1px solid var(--ink); }
+    .signal-item:first-child { border-left: 1px solid var(--ink); }
+    .signal-key { display: block; margin-bottom: .45rem; color: var(--muted); font: 700 .64rem/1 var(--mono); text-transform: uppercase; letter-spacing: .12em; }
+    .signal-value { font: 700 .92rem/1.3 var(--mono); }
+
+    .section { padding: clamp(5rem, 10vw, 8rem) 0; border-bottom: 1px solid var(--ink); }
+    .section-head { display: grid; grid-template-columns: 220px 1fr; gap: 2rem; margin-bottom: 3rem; }
+    .section-index { color: var(--muted); font: 700 .72rem/1.4 var(--mono); letter-spacing: .12em; }
+    h2 { max-width: 850px; margin: 0; font: 740 clamp(2.25rem, 5vw, 4.6rem)/.98 var(--sans); letter-spacing: -.055em; text-wrap: balance; }
+    .section-intro { max-width: 720px; margin: 1.4rem 0 0; color: #44443f; font-size: 1.05rem; }
+
+    .capability-grid { display: grid; grid-template-columns: repeat(2, 1fr); border-top: 1px solid var(--ink); border-left: 1px solid var(--ink); }
+    .capability { min-height: 270px; padding: 1.7rem; border-right: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+    .capability-top { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 3.5rem; }
+    .capability-num { color: var(--muted); font: .7rem/1 var(--mono); }
+    .capability-route { width: 64px; height: 12px; position: relative; border-top: 1px solid var(--ink); }
+    .capability-route::after { content: ""; position: absolute; right: 0; top: -4px; width: 7px; height: 7px; background: var(--signal); border: 1px solid var(--ink); }
+    h3 { margin: 0 0 .7rem; font: 700 1.15rem/1.2 var(--mono); letter-spacing: -.03em; }
+    .capability p { max-width: 55ch; margin: 0; color: #4d4c46; }
+
+    .flow { background: var(--ink); color: var(--paper); }
+    .flow .section-index, .flow .eyebrow { color: #99988f; }
+    .flow .section-intro { color: #b8b7ae; }
+    .flow-grid { display: grid; grid-template-columns: repeat(5, 1fr); border: 1px solid #6c6b64; }
+    .flow-step { position: relative; min-height: 230px; padding: 1.3rem; border-right: 1px solid #6c6b64; }
+    .flow-step:last-child { border-right: 0; background: var(--signal); color: var(--signal-ink); }
+    .flow-step:not(:last-child)::after { content: "→"; position: absolute; right: -.65rem; top: 50%; z-index: 1; width: 1.3rem; background: var(--ink); color: var(--signal); text-align: center; font-family: var(--mono); }
+    .flow-step b { display: block; margin-bottom: 5rem; font: 700 .68rem/1 var(--mono); color: #99988f; }
+    .flow-step:last-child b { color: #ffe8df; }
+    .flow-step strong { display: block; margin-bottom: .5rem; font: 700 .96rem/1.2 var(--mono); }
+    .flow-step span { font-size: .85rem; color: #b8b7ae; }
+    .flow-step:last-child span { color: #fff8ec; }
+
+    .control-grid { display: grid; grid-template-columns: .8fr 1.2fr; gap: 4rem; align-items: start; }
+    .control-list { border-top: 1px solid var(--ink); }
+    .control-row { display: grid; grid-template-columns: 2rem 1fr; gap: 1rem; padding: 1.2rem 0; border-bottom: 1px solid var(--line); }
+    .control-row span { font: 700 .68rem/1.5 var(--mono); color: var(--muted); }
+    .control-row p { margin: 0; }
+    .terminal { border: 1px solid var(--ink); background: var(--ink); color: #d4d2c9; font: .78rem/1.7 var(--mono); }
+    .terminal-head { display: flex; justify-content: space-between; padding: .65rem .9rem; border-bottom: 1px solid #4a4a44; color: #8f8e86; }
+    .terminal pre { margin: 0; padding: 1.2rem; overflow-x: auto; }
+    .terminal .prompt, .terminal .ok { color: var(--signal); }
+    .terminal .dim { color: #77766f; }
+
+    .provider-grid { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--ink); border-left: 1px solid var(--ink); }
+    .provider-grid span { padding: .9rem 1rem; border-right: 1px solid var(--ink); border-bottom: 1px solid var(--ink); font: 700 .77rem/1.2 var(--mono); }
+
+    .fork { background: var(--signal); color: var(--signal-ink); }
+    .fork-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4rem; align-items: end; }
+    .fork p { max-width: 650px; margin: 1.5rem 0 0; font-size: 1.08rem; }
+    .fork-links { display: grid; border-top: 1px solid var(--signal-ink); }
+    .fork-links a { display: flex; justify-content: space-between; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid var(--signal-ink); font: 700 .78rem/1 var(--mono); text-decoration: none; text-transform: uppercase; }
+
+    footer { background: var(--ink); color: var(--paper); }
+    .footer-inner { min-height: 170px; display: flex; justify-content: space-between; align-items: center; gap: 2rem; }
+    .footer-mark { display: flex; align-items: center; gap: .9rem; font: 700 1.15rem/1 var(--mono); }
+    .footer-mark img { width: 42px; height: 42px; }
+    .footer-meta { color: #96958d; font: .7rem/1.7 var(--mono); text-align: right; }
+
+    @media (max-width: 850px) {
+      .hero-grid { grid-template-columns: 1fr; }
+      .hero-copy { min-height: 76svh; padding-right: 0; }
+      .hero-system { min-height: 70svh; border-left: 0; border-top: 1px solid var(--ink); }
+      .signal-grid, .provider-grid { grid-template-columns: repeat(2, 1fr); }
+      .section-head, .control-grid, .fork-grid { grid-template-columns: 1fr; }
+      .flow-grid { grid-template-columns: 1fr; }
+      .flow-step { min-height: auto; border-right: 0; border-bottom: 1px solid #6c6b64; }
+      .flow-step b { margin-bottom: 2.5rem; }
+      .flow-step:not(:last-child)::after { right: auto; left: 1.2rem; top: auto; bottom: -.65rem; content: "↓"; }
     }
 
-    /* ── NAV ── */
-    nav {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      z-index: 100;
-      padding: 0.35rem 1rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: oklch(96% 0.02 90 / 0.85);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-bottom: 1px solid oklch(85% 0.04 280 / 0.3);
-      transition: box-shadow 0.3s ease;
-    }
-    nav.scrolled { box-shadow: 0 4px 30px oklch(70% 0.06 280 / 0.1); }
-    .nav-logo {
-      font-weight: 800;
-      font-size: 1.4rem;
-      color: var(--deep-navy);
-      text-decoration: none;
-      letter-spacing: -0.02em;
-    }
-    .nav-right { display: flex; gap: 1.5rem; align-items: center; }
-    .nav-right a {
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: var(--text-secondary);
-      text-decoration: none;
-      transition: color 0.2s;
-    }
-    .nav-right a:hover { color: var(--deep-navy); }
-    .nav-cta {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      background: var(--deep-navy) !important;
-      color: var(--cream) !important;
-      padding: 0.45rem 1.1rem;
-      border-radius: 8px;
-      transition: opacity 0.2s !important;
-    }
-    .nav-cta:hover { opacity: 0.85; }
-
-    /* ── STAR BADGE ── */
-    .star-badge {
-      display: none;
-      align-items: center;
-      gap: 0.25rem;
-      font-size: 0.78rem;
-      font-weight: 700;
-      font-family: 'JetBrains Mono', monospace;
-      letter-spacing: 0.01em;
-      opacity: 0;
-      transform: scale(0.8) translateY(2px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-      pointer-events: none;
-    }
-    .star-badge.loaded {
-      display: inline-flex;
-      opacity: 1;
-      transform: scale(1) translateY(0);
-    }
-    .star-badge svg {
-      flex-shrink: 0;
-    }
-    .nav-cta .star-badge.loaded,
-    .btn-primary .star-badge.loaded {
-      margin-left: 0.15rem;
-      padding-left: 0.5rem;
-      border-left: 1px solid oklch(80% 0.02 90 / 0.25);
-    }
-    .nav-cta .star-badge svg,
-    .btn-primary .star-badge svg { fill: oklch(80% 0.10 85); }
-
-    /* ── HERO ── */
-    .hero {
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 6rem clamp(2rem, 4vw, 4rem) 3rem;
-      position: relative;
-      background: linear-gradient(180deg, var(--sky-start) 0%, var(--sky-end) 40%, var(--lavender) 70%, var(--soft-pink) 100%);
-      overflow: hidden;
-    }
-    .hero-grid {
-      display: grid;
-      grid-template-columns: 30% 1fr;
-      align-items: center;
-      gap: 2.5rem;
-      width: 100%;
-      max-width: 1280px;
-      position: relative;
-      z-index: 2;
-    }
-    .hero-intro {
-      position: relative;
+    @media (max-width: 560px) {
+      .shell { width: min(calc(100% - 1.25rem), var(--max)); }
+      .nav-meta .version { display: none; }
+      .nav-meta { gap: .8rem; font-size: .66rem; }
+      h1 { font-size: clamp(3rem, 17vw, 4.5rem); }
+      .hero-copy { padding-top: 4rem; }
+      .hero-system { min-height: 520px; }
+      .hero-legend { right: 1rem; bottom: 1rem; left: 1rem; }
+      .signal-grid, .capability-grid, .provider-grid { grid-template-columns: 1fr; }
+      .signal-item { border-left: 1px solid var(--ink); }
+      .capability { min-height: 230px; }
+      .section { padding: 4.5rem 0; }
+      .install { display: grid; }
+      .copy { min-height: 40px; border-left: 0; border-top: 1px solid var(--ink); }
+      .footer-inner { padding: 2.5rem 0; align-items: flex-start; flex-direction: column; }
+      .footer-meta { text-align: left; }
     }
 
-    .hero-clouds {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-    }
-
-    .cloud-svg {
-      position: absolute;
-      pointer-events: none;
-    }
-
-    .cloud-bank {
-      position: absolute;
-      pointer-events: none;
-      will-change: transform;
-    }
-    .cloud-bank-1 { bottom: -2%; left: -8%; animation: drift-slow 18s ease-in-out infinite; }
-    .cloud-bank-2 { bottom: 6%; right: -6%; animation: drift-slow 14s ease-in-out infinite reverse; }
-    .cloud-bank-5 { bottom: 18%; left: 30%; animation: drift-slow 16s ease-in-out infinite; transform: scale(0.45); opacity: 0.5; }
-    .cloud-bank-7 { bottom: -4%; left: 20%; animation: drift-slow 21s ease-in-out infinite; transform: scale(0.9); }
-    .cloud-bank-8 { bottom: -6%; right: 15%; animation: drift-slow 18s ease-in-out infinite reverse; transform: scale(0.75); opacity: 0.85; }
-
-    .cloud-floor {
-      position: absolute;
-      bottom: -30px;
-      left: -5%;
-      right: -5%;
-      height: 120px;
-      background: linear-gradient(180deg, transparent 0%, oklch(95% 0.02 280 / 0.4) 40%, oklch(96% 0.02 90 / 0.8) 100%);
-    }
-
-    @keyframes drift-slow {
-      0%, 100% { transform: translateX(0); }
-      50% { transform: translateX(30px); }
-    }
-    @keyframes drift-med {
-      0%, 100% { transform: translateX(0) translateY(0); }
-      33% { transform: translateX(20px) translateY(-5px); }
-      66% { transform: translateX(-10px) translateY(3px); }
-    }
-
-    .stars { position: absolute; inset: 0; pointer-events: none; }
-    .star {
-      position: absolute;
-      background: oklch(98% 0.02 90);
-      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-      animation: twinkle 3s ease-in-out infinite;
-    }
-    .star-diamond {
-      position: absolute;
-      background: oklch(98% 0.03 85);
-      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
-      animation: twinkle-bright 4s ease-in-out infinite;
-    }
-    .star:nth-child(1) { top: 15%; left: 20%; width: 8px; height: 8px; }
-    .star:nth-child(2) { top: 25%; right: 25%; width: 6px; height: 6px; animation-delay: 1s; }
-    .star:nth-child(3) { top: 10%; right: 35%; width: 5px; height: 5px; animation-delay: 0.5s; }
-    .star:nth-child(4) { top: 30%; left: 35%; width: 4px; height: 4px; animation-delay: 2s; }
-    .star:nth-child(5) { top: 18%; left: 55%; width: 7px; height: 7px; animation-delay: 1.5s; }
-    .star:nth-child(6) { top: 8%; right: 15%; width: 5px; height: 5px; animation-delay: 0.8s; }
-    .star:nth-child(7) { top: 6%; left: 40%; width: 4px; height: 4px; animation-delay: 2.3s; }
-    .star:nth-child(8) { top: 22%; left: 70%; width: 5px; height: 5px; animation-delay: 0.3s; }
-    .star:nth-child(9) { top: 12%; left: 82%; width: 3px; height: 3px; animation-delay: 1.8s; }
-    .star:nth-child(10) { top: 35%; right: 40%; width: 4px; height: 4px; animation-delay: 2.6s; }
-    .star-diamond:nth-child(11) { top: 12%; left: 30%; width: 14px; height: 14px; animation-delay: 0.7s; }
-    .star-diamond:nth-child(12) { top: 20%; right: 18%; width: 11px; height: 11px; animation-delay: 1.4s; }
-    .star-diamond:nth-child(13) { top: 7%; left: 60%; width: 10px; height: 10px; animation-delay: 2.1s; }
-    .star-diamond:nth-child(14) { top: 32%; left: 48%; width: 8px; height: 8px; animation-delay: 0.2s; }
-    .star-diamond:nth-child(15) { top: 16%; right: 38%; width: 9px; height: 9px; animation-delay: 1.9s; }
-
-    @keyframes twinkle {
-      0%, 100% { opacity: 0.3; transform: scale(1); }
-      50% { opacity: 1; transform: scale(1.3); }
-    }
-    @keyframes twinkle-bright {
-      0%, 100% { opacity: 0.15; transform: scale(0.8) rotate(0deg); }
-      50% { opacity: 0.9; transform: scale(1.2) rotate(15deg); }
-    }
-
-    .moon-group {
-      position: absolute;
-      top: 10%;
-      right: 10%;
-      pointer-events: none;
-    }
-    .moon {
-      position: relative;
-      width: 42px;
-      height: 42px;
-      border-radius: 50%;
-      background: oklch(95% 0.03 85);
-      box-shadow:
-        0 0 20px oklch(92% 0.04 85 / 0.5),
-        0 0 60px oklch(92% 0.04 85 / 0.2),
-        0 0 100px oklch(92% 0.04 85 / 0.1);
-    }
-    .moon::after {
-      content: '';
-      position: absolute;
-      width: 34px;
-      height: 34px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, var(--sky-start), var(--sky-end));
-      top: -4px;
-      left: 7px;
-    }
-
-    .hero h1 {
-      font-weight: 800;
-      font-size: clamp(2.5rem, 5vw, 3.5rem);
-      letter-spacing: -0.03em;
-      line-height: 1.05;
-      margin-bottom: 0.3rem;
-    }
-    .hero-tagline {
-      font-size: clamp(1.05rem, 2.2vw, 1.3rem);
-      font-weight: 700;
-      color: var(--navy-light);
-      margin-bottom: 1.25rem;
-    }
-    .hero-sub {
-      font-size: 1rem;
-      color: var(--navy-light);
-      max-width: 42ch;
-      margin-bottom: 1.5rem;
-    }
-    .hero-actions {
-      display: flex;
-      gap: 0.75rem;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    .hero-preview {
-      position: relative;
-      z-index: 2;
-      align-self: center;
-      min-width: 0;
-    }
-
-    /* ── DIVIDER ── */
-    .divider {
-      height: 1px;
-      background: linear-gradient(90deg, transparent, oklch(80% 0.06 280 / 0.4), transparent);
-      margin-bottom: clamp(3rem, 6vw, 5rem);
-    }
-    .divider.visible { transform: scaleX(1); }
-    .btn-primary {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.75rem 1.75rem;
-      background: var(--deep-navy);
-      color: var(--cream);
-      font-family: 'Nunito', sans-serif;
-      font-weight: 700;
-      font-size: 1rem;
-      border: none;
-      border-radius: 10px;
-      cursor: pointer;
-      text-decoration: none;
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
-    }
-    .btn-primary:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 24px oklch(25% 0.04 270 / 0.3);
-    }
-    .btn-ghost {
-      padding: 0.75rem 1.75rem;
-      background: none;
-      color: var(--deep-navy);
-      font-family: 'Nunito', sans-serif;
-      font-weight: 700;
-      font-size: 1rem;
-      border: 2px solid oklch(30% 0.04 270 / 0.25);
-      border-radius: 10px;
-      cursor: pointer;
-      text-decoration: none;
-      transition: transform 0.2s ease, border-color 0.2s;
-    }
-    .btn-ghost:hover { transform: translateY(-2px); border-color: oklch(30% 0.04 270 / 0.5); }
-
-    .install-line code {
-      display: inline-block;
-      padding: 0.35rem 0.9rem;
-      background: #1e1e2e;
-      color: #cdd6f4;
-      border: 1px solid #313244;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.92rem;
-      border-radius: 8px;
-      letter-spacing: 0.02em;
-      user-select: none;
-    }
-    .install-line .sh-cmd { color: #89b4fa; }
-    .install-line .sh-flag { color: #a6adc8; }
-    .install-line .sh-url { color: #a6e3a1; }
-    .install-line .sh-pipe { color: #f38ba8; font-weight: 700; }
-
-    /* ── MAIN CONTENT ── */
-    .content {
-      max-width: 1060px;
-      margin: 0 auto;
-      padding: clamp(4rem, 8vw, 6rem) clamp(1.5rem, 5vw, 3rem) 0rem;
-      content-visibility: auto;
-      contain-intrinsic-size: auto 800px;
-    }
-
-    .pitch {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3rem;
-      margin-bottom: clamp(3rem, 6vw, 5rem);
-    }
-    .pitch-col h2 {
-      font-weight: 800;
-      font-size: clamp(1.35rem, 2.5vw, 1.7rem);
-      letter-spacing: -0.02em;
-      line-height: 1.2;
-      margin-bottom: 1.25rem;
-    }
-    .pitch-col h2 span {
-      display: block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.14em;
-      color: var(--muted);
-      margin-bottom: 0.4rem;
-    }
-
-    .pitch-item:last-child { margin-bottom: 0; }
-
-    .pip {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      margin-top: 0.55rem;
-      justify-self: center;
-    }
-    .pip-lavender { background: var(--periwinkle); }
-    .pip-salmon { background: var(--salmon); }
-    .pip-pink { background: var(--soft-pink); }
-    .pip-gold { background: oklch(78% 0.12 85); }
-
-    .pitch-item strong {
-      font-weight: 800;
-      font-size: 1rem;
-    }
-    .pitch-item strong a {
-      color: inherit;
-      text-decoration: underline;
-      text-decoration-color: var(--lavender);
-      text-underline-offset: 2px;
-      text-decoration-thickness: 2px;
-      transition: text-decoration-color 0.2s;
-    }
-    .pitch-item strong a:hover {
-      text-decoration-color: var(--salmon);
-    }
-    .pitch-item p {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
-      line-height: 1.55;
-      margin-top: 0.2rem;
-    }
-    .pitch-item code {
-      font-size: 0.88rem;
-      background: oklch(90% 0.03 270 / 0.5);
-      padding: 0.1rem 0.35rem;
-      border-radius: 4px;
-    }
-    .pitch-badge {
-      display: inline-block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: oklch(50% 0.1 280);
-      background: oklch(92% 0.06 280 / 0.5);
-      padding: 0.2rem 0.6rem;
-      border-radius: 20px;
-      margin-left: 0.4rem;
-      vertical-align: middle;
-    }
-
-    /* faithful TUI recreation */
-    .tui {
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 24px 80px oklch(20% 0.04 270 / 0.3), 0 0 0 1px oklch(30% 0.02 270 / 0.3);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      line-height: 1.5;
-      background: #282a36;
-      color: oklch(78% 0.02 270);
-      display: inline-block;
-      transform-origin: top left;
-    }
-    .tui-titlebar {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      padding: 8px 16px;
-      background: oklch(16% 0.015 270);
-    }
-    .tui-dot { width: 11px; height: 11px; border-radius: 50%; }
-    .tui-dot-r { background: oklch(62% 0.2 25); }
-    .tui-dot-y { background: oklch(78% 0.15 85); }
-    .tui-dot-g { background: oklch(68% 0.15 150); }
-    .tui-titlebar-text {
-      margin-left: 0.5rem;
-      font-size: 0.72rem;
-      color: oklch(55% 0.02 270);
-    }
-
-    .tui-body {
-      display: flex;
-      flex-direction: column;
-      background: #282a36;
-      position: relative;
-      min-height: 330px;
-      min-width: 774px;
-    }
-    @media (hover: hover) {
-      .tui-body:hover .player-controls {
-        opacity: 1;
-        transform: translateY(0);
-        pointer-events: auto;
-      }
-    }
-    .tui-body .player-controls:focus-within,
-    .tui-body .player-controls.force-visible {
-      opacity: 1;
-      transform: translateY(0);
-      pointer-events: auto;
-    }
-    .tui-loader {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #282a36;
-      z-index: 5;
-      transition: opacity 0.3s ease;
-    }
-    .tui-loader.hidden {
-      opacity: 0;
-      pointer-events: none;
-    }
-    .tui-spinner {
-      width: 24px;
-      height: 24px;
-      border: 2px solid oklch(50% 0.02 270);
-      border-top-color: oklch(80% 0.06 280);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
-    /* asciinema player overrides */
-    .tui-body .ap-wrapper {
-      background: #282a36 !important;
-      border-radius: 0 !important;
-      box-shadow: none !important;
-      padding: 0 !important;
-      margin: 0 !important;
-      justify-content: start !important;
-    }
-    .tui-body .ap-player {
-      background: #282a36 !important;
-      padding: 0 !important;
-      border-radius: 0 !important;
-      margin: 0 !important;
-    }
-    .tui-body pre.ap-terminal {
-      padding: 0 !important;
-      margin: 0 !important;
-      border-width: 0 !important;
-      box-sizing: border-box !important;
-    }
-    .tui-body .ap-control-bar {
-      display: none !important;
-    }
-    .tui-body .ap-overlay-start {
-      display: none !important;
-    }
-
-    /* ── PLAYER CONTROLS ── */
-    .player-controls {
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.5rem 0.75rem;
-      background: #000;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
-      opacity: 0;
-      transform: translateY(6px);
-      pointer-events: none;
-      transition: opacity 0.2s ease, transform 0.2s ease;
-      z-index: 6;
-    }
-    .player-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 28px;
-      height: 28px;
-      padding: 0;
-      background: transparent;
-      border: 1px solid oklch(30% 0.02 270);
-      border-radius: 6px;
-      color: oklch(70% 0.02 270);
-      cursor: pointer;
-      transition: all 0.15s ease;
-      flex-shrink: 0;
-    }
-    .player-btn:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(90% 0.02 270);
-      border-color: oklch(40% 0.03 270);
-    }
-    .player-btn:active {
-      transform: scale(0.95);
-    }
-    .player-btn svg {
-      width: 14px;
-      height: 14px;
-      fill: currentColor;
-    }
-    .player-progress {
-      flex: 1;
-      height: 6px;
-      background: oklch(25% 0.02 270);
-      border-radius: 3px;
-      cursor: pointer;
-      position: relative;
-    }
-    .player-progress::before {
-      content: '';
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: -10px;
-      bottom: -10px;
-    }
-    .player-progress-bar {
-      height: 100%;
-      background: oklch(60% 0.08 280);
-      border-radius: 3px;
-      width: 0%;
-      transition: width 0.1s linear;
-    }
-    .player-time {
-      color: oklch(98% 0 0);
-      font-size: 0.82rem;
-      font-weight: 700;
-      min-width: 85px;
-      text-align: right;
-      flex-shrink: 0;
-    }
-    .player-speed {
-      position: relative;
-      margin-left: 0.25rem;
-    }
-    .speed-toggle {
-      padding: 0.2rem 0.55rem;
-      background: transparent;
-      border: 1px solid oklch(40% 0.02 270);
-      border-radius: 4px;
-      color: oklch(98% 0 0);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
-      font-weight: 700;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      min-width: 36px;
-    }
-    .speed-toggle:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(90% 0.02 270);
-      border-color: oklch(40% 0.03 270);
-    }
-    .speed-menu {
-      position: absolute;
-      bottom: calc(100% + 6px);
-      right: 0;
-      background: oklch(18% 0.02 270);
-      border: 1px solid oklch(30% 0.02 270);
-      border-radius: 6px;
-      padding: 0.25rem 0;
-      min-width: 72px;
-      box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
-      opacity: 0;
-      transform: translateY(4px);
-      pointer-events: none;
-      transition: opacity 0.15s ease, transform 0.15s ease;
-      z-index: 10;
-    }
-    .speed-menu.open {
-      opacity: 1;
-      transform: translateY(0);
-      pointer-events: auto;
-    }
-    .speed-option {
-      display: block;
-      width: 100%;
-      padding: 0.35rem 0.9rem 0.35rem 1.6rem;
-      background: transparent;
-      border: none;
-      color: oklch(95% 0.01 270);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-align: left;
-      cursor: pointer;
-      position: relative;
-      transition: background 0.12s ease, color 0.12s ease;
-    }
-    .speed-option:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(95% 0.02 270);
-    }
-    .speed-option.active {
-      color: oklch(75% 0.1 280);
-    }
-    .speed-option.active::before {
-      content: '✓';
-      position: absolute;
-      left: 0.55rem;
-      color: oklch(75% 0.1 280);
-    }
-    .player-hint {
-      margin-top: 0.6rem;
-      text-align: center;
-      font-size: 0.85rem;
-      color: var(--text-secondary);
-    }
-    .player-hint button {
-      background: none;
-      border: none;
-      padding: 0;
-      font: inherit;
-      font-weight: 700;
-      color: var(--navy-light);
-      text-decoration: underline;
-      text-underline-offset: 3px;
-      cursor: pointer;
-    }
-    .player-hint button:hover {
-      color: var(--deep-navy);
-    }
-
-    /* ── DOOM DEMO ── */
-    .doom-demo {
-      max-width: 820px;
-      margin: 3rem auto 0;
-    }
-    .doom-line {
-      text-align: center;
-      font-size: 1.15rem;
-      font-weight: 800;
-      color: var(--deep-navy);
-      margin-bottom: 1rem;
-    }
-    .doom-demo .tui { display: block; }
-    .doom-demo .tui-body { min-width: 0; min-height: 0; }
-    .doom-video {
-      display: block;
-      width: 100%;
-      height: auto;
-      aspect-ratio: 1920 / 970;
-      background: #000;
-      cursor: pointer;
-    }
-
-
-    /* ── PROVIDERS ── */
-    .providers-section {
-      text-align: center;
-      margin-bottom: 0;
-      position: relative;
-      z-index: 2;
-      max-width: 1060px;
-      margin: 0 auto;
-    }
-    .providers-section h2 {
-      font-weight: 800;
-      font-size: clamp(1.65rem, 3.2vw, 2.2rem);
-      letter-spacing: -0.02em;
-      margin-bottom: 0.5rem;
-    }
-    .providers-section > p {
-      font-size: 1rem;
-      color: var(--text-secondary);
-      max-width: 50ch;
-      margin: 0 auto 2rem;
-    }
-    .provider-grid {
-      display: flex;
-      justify-content: center;
-      gap: 1.25rem;
-      flex-wrap: wrap;
-      margin-bottom: 1.25rem;
-    }
-    .provider-chip {
-      display: inline-block;
-      padding: 0.8rem 1.6rem;
-      background: linear-gradient(135deg, oklch(96% 0.02 280 / 0.6), oklch(94% 0.03 280 / 0.3));
-      border: 1px solid oklch(88% 0.04 280 / 0.4);
-      border-radius: 12px;
-      font-weight: 700;
-      font-size: 1.05rem;
-      color: var(--deep-navy);
-      text-decoration: none;
-    }
-    .provider-chip:hover {
-      transform: translateY(-3px) scale(1.04);
-      box-shadow: 0 8px 24px oklch(70% 0.06 280 / 0.15);
-      background: linear-gradient(135deg, oklch(94% 0.04 280 / 0.7), oklch(90% 0.06 280 / 0.4));
-      border-color: oklch(78% 0.08 280 / 0.5);
-    }
-    .provider-plus {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
-    }
-    .provider-plus a {
-      color: oklch(48% 0.1 280);
-      text-decoration: underline;
-      text-underline-offset: 3px;
-    }
-
-
-    /* ── TOOL SHOWCASES ── */
-    .showcase {
-      margin-bottom: clamp(4rem, 8vw, 6rem);
-    }
-    .showcase-header {
-      margin-bottom: 2rem;
-    }
-    .showcase-header span {
-      display: block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.14em;
-      color: var(--muted);
-      margin-bottom: 0.4rem;
-    }
-    .showcase-header h2 {
-      font-weight: 800;
-      font-size: clamp(1.35rem, 2.5vw, 1.7rem);
-      letter-spacing: -0.02em;
-      line-height: 1.2;
-      margin-bottom: 0.5rem;
-    }
-    .showcase-header p {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
-      max-width: 55ch;
-      line-height: 1.55;
-    }
-    .showcase-header code {
-      font-size: 0.88rem;
-      background: oklch(90% 0.03 270 / 0.5);
-      padding: 0.1rem 0.35rem;
-      border-radius: 4px;
-    }
-
-    /* index tool split view */
-    .index-split {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      gap: 0;
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px oklch(20% 0.04 270 / 0.15), 0 0 0 1px oklch(30% 0.02 270 / 0.2);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      line-height: 1.6;
-      background: #1e1e2e;
-    }
-    .index-pane {
-      overflow: hidden;
-      position: relative;
-    }
-    .index-pane-label {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.3rem 1rem;
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: oklch(55% 0.02 270);
-      background: oklch(18% 0.02 270);
-    }
-    .index-pane pre {
-      margin: 0;
-      padding: 0.8rem 1rem;
-      overflow-x: auto;
-      color: #cdd6f4;
-    }
-    .index-divider {
-      width: 1px;
-      background: oklch(32% 0.04 270);
-    }
-    .index-pane .ln  { color: oklch(40% 0.015 270); user-select: none; }
-    .index-pane .kw  { color: #cba6f7; }
-    .index-pane .ty  { color: #f9e2af; }
-    .index-pane .fn  { color: #89b4fa; }
-    .index-pane .st  { color: #a6e3a1; }
-    .index-pane .cm  { color: oklch(50% 0.02 270); font-style: italic; }
-    .index-pane .at  { color: #f38ba8; }
-    .index-pane .op  { color: #89dceb; }
-    .index-pane .sec { color: #f9e2af; font-weight: 700; }
-    .index-pane .dim { color: oklch(50% 0.015 270); }
-    .index-pane .rng { color: oklch(55% 0.06 280); }
-
-    .showcase-stat {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-wrap: wrap;
-      gap: 0.4rem 0.6rem;
-      margin-top: 1.5rem;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.88rem;
-      color: var(--text-secondary);
-    }
-    .stat-num {
-      font-weight: 800;
-      color: var(--deep-navy);
-    }
-    .stat-arrow {
-      color: oklch(45% 0.03 270);
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .stat-result {
-      padding: 0.3rem 0.75rem;
-      border-radius: 20px;
-      font-size: 0.82rem;
-      font-weight: 800;
-      background: oklch(92% 0.06 150 / 0.5);
-      color: oklch(38% 0.12 150);
-    }
-
-    /* code_execution showcase */
-    .exec-demo {
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px oklch(20% 0.04 270 / 0.15), 0 0 0 1px oklch(30% 0.02 270 / 0.2);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      line-height: 1.6;
-      background: #1e1e2e;
-    }
-    .exec-body {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-    }
-    .exec-pane {
-      overflow: hidden;
-    }
-    .exec-pane-label {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.3rem 1rem;
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: oklch(55% 0.02 270);
-      background: oklch(18% 0.02 270);
-    }
-    .exec-pane pre {
-      margin: 0;
-      padding: 0.8rem 1rem;
-      overflow-x: auto;
-      color: #cdd6f4;
-    }
-    .exec-divider {
-      width: 1px;
-      background: oklch(32% 0.04 270);
-    }
-    .exec-duo {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5rem;
-    }
-    .exec-duo .exec-demo {
-      display: flex;
-      flex-direction: column;
-    }
-    .exec-duo .exec-pane {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    .exec-duo .exec-pane pre { flex: 1; }
-    .exec-pane .kw  { color: #cba6f7; }
-    .exec-pane .fn  { color: #89b4fa; }
-    .exec-pane .st  { color: #a6e3a1; }
-    .exec-pane .cm  { color: oklch(50% 0.02 270); font-style: italic; }
-    .exec-pane .op  { color: #89dceb; }
-    .exec-pane .nb  { color: #fab387; }
-    .exec-pane .dim { color: oklch(50% 0.015 270); }
-    .exec-pane .out { color: oklch(70% 0.08 150); }
-    .exec-pane .err { color: #f38ba8; }
-
-
-
-    @media (max-width: 768px) {
-      .index-split { grid-template-columns: 1fr; }
-      .index-divider { width: auto; height: 1px; }
-      .exec-body { grid-template-columns: 1fr; }
-      .exec-divider { width: auto; height: 1px; }
-      .exec-duo { grid-template-columns: 1fr; }
-    }
-
-    /* ── BOTTOM SKY ── */
-    .bottom-sky {
-      position: relative;
-      overflow: hidden;
-      margin-top: -1px;
-      content-visibility: auto;
-      contain-intrinsic-size: auto 500px;
-    }
-    .bottom-sky-bg {
-      min-height: clamp(18rem, 28vw, 28rem);
-      background: linear-gradient(180deg, var(--cream) 0%, var(--sky-start) 15%, var(--sky-end) 35%, var(--lavender) 60%, var(--soft-pink) 100%);
-      position: relative;
-      padding: clamp(3rem, 6vw, 5rem) clamp(1.5rem, 5vw, 3rem) clamp(10rem, 14vw, 16rem);
-    }
-    .bottom-stars {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-    }
-    .bottom-star {
-      position: absolute;
-      background: oklch(98% 0.02 90);
-      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-      animation: twinkle 3s ease-in-out infinite;
-    }
-    .bottom-star:nth-child(1) { bottom: 45%; left: 12%; width: 5px; height: 5px; animation-delay: 0.5s; }
-    .bottom-star:nth-child(2) { bottom: 55%; left: 30%; width: 4px; height: 4px; animation-delay: 1.2s; }
-    .bottom-star:nth-child(3) { bottom: 60%; right: 22%; width: 5px; height: 5px; animation-delay: 0.8s; }
-    .bottom-star:nth-child(4) { bottom: 50%; right: 38%; width: 3px; height: 3px; animation-delay: 2s; }
-    .bottom-star:nth-child(5) { bottom: 65%; left: 52%; width: 4px; height: 4px; animation-delay: 1.5s; }
-    .bottom-star:nth-child(6) { bottom: 48%; right: 10%; width: 4px; height: 4px; animation-delay: 0.3s; }
-    .bottom-star-diamond {
-      position: absolute;
-      background: oklch(98% 0.03 85);
-      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
-      animation: twinkle-bright 4s ease-in-out infinite;
-    }
-    .bottom-star-diamond:nth-child(7) { bottom: 52%; left: 22%; width: 10px; height: 10px; animation-delay: 1.8s; }
-    .bottom-star-diamond:nth-child(8) { bottom: 58%; right: 28%; width: 8px; height: 8px; animation-delay: 0.6s; }
-
-    .bottom-cloud-layer {
-      position: absolute;
-      bottom: 0;
-      left: -5%;
-      right: -5%;
-      pointer-events: none;
-    }
-    .bottom-cloud-row {
-      position: absolute;
-      left: 0;
-      right: 0;
-    }
-    .bottom-cloud-row .cloud-svg {
-    }
-    .bottom-cloud-back {
-      bottom: 60px;
-      height: 90px;
-    }
-    .bottom-cloud-back .cloud-svg { fill: oklch(90% 0.05 300 / 0.5); }
-    .bottom-cloud-mid {
-      bottom: 25px;
-      height: 80px;
-    }
-    .bottom-cloud-mid .cloud-svg { fill: oklch(88% 0.04 290 / 0.6); }
-    .bottom-cloud-front {
-      bottom: -8px;
-      height: 70px;
-    }
-    .bottom-cloud-front .cloud-svg { fill: oklch(92% 0.03 280 / 0.8); }
-
-    .bottom-moon {
-      position: absolute;
-      top: 18%;
-      right: 10%;
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: oklch(95% 0.03 85);
-      box-shadow:
-        0 0 16px oklch(92% 0.04 85 / 0.4),
-        0 0 50px oklch(92% 0.04 85 / 0.15);
-    }
-    .bottom-moon::after {
-      content: '';
-      position: absolute;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, oklch(90% 0.05 280), oklch(85% 0.06 290));
-      top: -3px;
-      left: 5px;
-    }
-
-    /* ── ANIMATIONS ── */
-    .reveal {
-      opacity: 0;
-      transform: translateY(20px);
-      transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .reveal.visible { opacity: 1; transform: translateY(0); }
-    .reveal-d1 { transition-delay: 0.1s; }
-    .reveal-d2 { transition-delay: 0.2s; }
-    .reveal-d3 { transition-delay: 0.3s; }
-    .reveal-d4 { transition-delay: 0.4s; }
-    .reveal-d5 { transition-delay: 0.5s; }
-    .reveal-d6 { transition-delay: 0.6s; }
-    .reveal-d7 { transition-delay: 0.7s; }
-
-    /* hero entrance choreography — .hero-anim added by JS */
-    .hero-anim .hero-intro > * {
-      opacity: 0;
-      transform: translateY(18px);
-      transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1), transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .hero-anim .hero-intro.entered > * { opacity: 1; transform: translateY(0); }
-    .hero-anim .hero-intro > :nth-child(1) { transition-delay: 0.05s; }
-    .hero-anim .hero-intro > :nth-child(2) { transition-delay: 0.12s; }
-    .hero-anim .hero-intro > :nth-child(3) { transition-delay: 0.19s; }
-    .hero-anim .hero-intro > :nth-child(4) { transition-delay: 0.26s; }
-    .hero-anim .hero-intro > :nth-child(5) { transition-delay: 0.33s; }
-    .hero-anim .hero-intro > :nth-child(6) { transition-delay: 0.40s; }
-
-    /* hero preview (TUI) entrance */
-    .hero-anim .hero-preview {
-      opacity: 0;
-      transform: translateX(40px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s, transform 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s;
-    }
-    .hero-anim .hero-preview.entered {
-      opacity: 1;
-      transform: translateX(0);
-    }
-
-    /* pitch item stagger — each item animates individually */
-    .pitch-item {
-      display: grid;
-      grid-template-columns: 24px 1fr;
-      gap: 0.75rem;
-      align-items: baseline;
-      margin-bottom: 1.1rem;
-      opacity: 0;
-      transform: translateY(16px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .pitch-item.visible { opacity: 1; transform: translateY(0); }
-
-    /* provider chip stagger */
-    .provider-chip {
-      opacity: 0;
-      transform: translateY(14px);
-      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), background 0.25s ease, border-color 0.25s ease;
-    }
-    .provider-chip.visible {
-      opacity: 1;
-      transform: translateY(0);
-    }
-
-    /* install line copy feedback */
-    .install-line {
-      margin-top: 1.25rem;
-      position: relative;
-      display: inline-flex;
-      align-items: center;
-    }
-    .install-line code {
-      cursor: pointer;
-      transition: background 0.2s ease, transform 0.15s ease;
-    }
-    .install-line code:hover {
-      background: #313244;
-    }
-    .install-line code:active {
-      transform: scale(0.97);
-    }
-    .copy-toast {
-      position: absolute;
-      top: 50%;
-      left: calc(100% + 0.35rem);
-      transform: translateY(-50%) translateX(-4px);
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: oklch(50% 0.12 145);
-      opacity: 0;
-      transition: opacity 0.25s ease, transform 0.25s ease;
-      pointer-events: none;
-      white-space: nowrap;
-    }
-    .copy-toast.show {
-      opacity: 1;
-      transform: translateY(-50%) translateX(0);
-    }
-
-    /* nav logo hover */
-    .nav-logo {
-      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .nav-logo:hover {
-      transform: scale(1.05);
-    }
-
-    /* button press feedback */
-    .btn-primary:active {
-      transform: translateY(0) scale(0.97);
-      transition-duration: 0.08s;
-    }
-    .btn-ghost:active {
-      transform: translateY(0) scale(0.97);
-      transition-duration: 0.08s;
-    }
-
-    /* provider chip active */
-    .provider-chip:active {
-      transform: translateY(0) scale(0.97) !important;
-    }
-
-    /* ── REDUCED MOTION ── */
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-        scroll-behavior: auto !important;
-      }
-      .hero-anim .hero-intro > * { opacity: 1; transform: none; }
-      .hero-anim .hero-preview { opacity: 1; transform: none; }
-      .reveal { opacity: 1; transform: none; }
-      .pitch-item { opacity: 1; transform: none; }
-      .provider-chip { opacity: 1; transform: none; }
-      .star-badge { opacity: 1; transform: none; }
-    }
-
-    /* ── RESPONSIVE ── */
-    @media (max-width: 768px) {
-      .nav-right a:not(.nav-cta):not([href="/docs/"]) { display: none; }
-      .hero { padding-inline: 1rem; }
-      .hero-grid { grid-template-columns: 1fr; text-align: center; }
-      .hero-intro { display: flex; flex-direction: column; align-items: center; }
-      .hero-actions { justify-content: center; }
-      .hero-preview { text-align: left; width: 100%; }
-      .pitch { grid-template-columns: 1fr; }
-
-      .provider-grid { gap: 0.75rem; }
-      .provider-chip { padding: 0.65rem 1.25rem; font-size: 0.88rem; }
-
-      /* always show player controls below the player on mobile */
-      .tui-body { min-width: 0; }
-      .tui-body .player-controls {
-        position: static;
-        opacity: 1;
-        transform: none;
-        pointer-events: auto;
-        background: oklch(16% 0.015 270);
-        border-top: 1px solid oklch(22% 0.02 270);
-      }
-    }
-    @media (max-width: 480px) {
-      .hero-actions { flex-direction: column; align-items: center; }
-    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
   </style>
 </head>
 <body>
-
-<nav id="nav">
-  <a href="#" class="nav-logo">maki</a>
-  <div class="nav-right">
-    <a href="/docs/">Docs</a>
-    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="nav-cta"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>GitHub<span class="star-badge" data-stars><svg width="10" height="10" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span></a>
-  </div>
-</nav>
-
-<section class="hero">
-  <div class="hero-clouds">
-    <div class="cloud-bank cloud-bank-1">
-      <svg class="cloud-svg" style="width:380px;bottom:0;left:0" viewBox="0 0 380 120" fill="oklch(96% 0.02 280 / 0.6)"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-2">
-      <svg class="cloud-svg" style="width:300px;bottom:0;right:0" viewBox="0 0 300 110" fill="oklch(96% 0.02 280 / 0.55)"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-5">
-      <svg class="cloud-svg" style="width:160px;bottom:0;left:0" viewBox="0 0 160 65" fill="oklch(96% 0.02 280 / 0.4)"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-7">
-      <svg class="cloud-svg" style="width:400px;bottom:0;left:0" viewBox="0 0 400 130" fill="oklch(97% 0.02 280 / 0.65)"><path d="M8 130 Q5 100 30 92 Q15 60 55 48 Q62 18 105 15 Q140 -5 175 12 Q205 0 235 18 Q265 5 295 22 Q325 8 355 30 Q380 18 385 55 Q405 72 385 92 Q395 125 375 130Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-8">
-      <svg class="cloud-svg" style="width:320px;bottom:0;left:0" viewBox="0 0 320 115" fill="oklch(97% 0.02 280 / 0.6)"><path d="M8 115 Q3 88 28 80 Q15 55 48 42 Q55 15 92 12 Q122 -4 155 10 Q182 0 208 16 Q235 5 258 22 Q282 12 300 35 Q318 22 312 55 Q330 68 312 85 Q320 110 302 115Z"/></svg>
-    </div>
-    <div class="cloud-floor"></div>
-  </div>
-  <div class="stars">
-    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
-    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
-    <div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div>
-  </div>
-  <div class="moon-group">
-    <div class="moon"></div>
-  </div>
-
-  <div class="hero-grid">
-  <div class="hero-intro">
-    <h1>maki</h1>
-    <p class="hero-tagline">the efficient coder</p>
-    <p class="hero-sub">I got frustrated with existing coding agents and hitting hourly/weekly token limits.<br>So I built Maki, a lightweight Rust TUI with some novel context token reduction techniques.<br>In benchmarks, it reduces cost by 2x and finishes them 2x faster too.</p>
-    <div class="hero-actions">
-      <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="btn-primary">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
-        GitHub<span class="star-badge" data-stars><svg width="11" height="11" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span>
+  <header class="site-nav">
+    <nav class="shell nav-inner" aria-label="Primary">
+      <a class="brand" href="/" aria-label="Caudra home">
+        <img src="/caudra-mark.svg" alt="">
+        caudra
       </a>
-      <a href="#features" class="btn-ghost">Features</a>
-    </div>
-    <div class="install-line">
-      <code onclick="navigator.clipboard.writeText('curl -fsSL https://maki.sh/install.sh | sh');showCopyToast(this)"><span class="sh-cmd">curl</span> <span class="sh-flag">-fsSL</span> <span class="sh-url">https://maki.sh/install.sh</span> <span class="sh-pipe">|</span> <span class="sh-cmd">sh</span></code>
-      <span class="copy-toast">copied!</span>
-    </div>
-  </div>
-
-  <div class="hero-preview">
-    <div class="tui-scale-wrap">
-    <div class="tui">
-      <div class="tui-titlebar">
-        <div class="tui-dot tui-dot-r"></div>
-        <div class="tui-dot tui-dot-y"></div>
-        <div class="tui-dot tui-dot-g"></div>
+      <div class="nav-meta">
+        <span class="version">v0.1.0</span>
+        <a href="/docs/">docs</a>
+        <a href="https://github.com/caudra/caudra">github</a>
       </div>
+    </nav>
+  </header>
 
-      <div class="tui-body">
-        <div class="tui-loader" id="demo-loader"><div class="tui-spinner"></div></div>
-        <div id="demo-player"></div>
-        <div class="player-controls">
-          <button class="player-btn" id="play-btn" aria-label="Play/Pause">
-            <svg viewBox="0 0 24 24" id="play-icon"><path d="M8 5v14l11-7z"/></svg>
-            <svg viewBox="0 0 24 24" id="pause-icon" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-          </button>
-          <div class="player-progress" id="progress-bar">
-            <div class="player-progress-bar" id="progress-fill"></div>
+  <main>
+    <section class="hero">
+      <div class="shell hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">terminal coding agent / independent fork</p>
+          <h1>Context into effective action.</h1>
+          <p class="hero-lede">Caudra coordinates models, native tools, plugins, and subagents to carry software work through to completion. Every action stays visible and under your control.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/caudra/caudra">View source</a>
+            <a class="button" href="/docs/quick-start/">Read quick start</a>
           </div>
-          <span class="player-time" id="time-display">0:00 / 0:00</span>
-          <div class="player-speed">
-            <button class="speed-toggle" id="speed-toggle" aria-haspopup="true" aria-expanded="false">2.0x</button>
-            <div class="speed-menu" id="speed-menu" role="menu">
-              <button class="speed-option" data-speed="0.5" role="menuitem">0.5x</button>
-              <button class="speed-option" data-speed="1" role="menuitem">1.0x</button>
-              <button class="speed-option" data-speed="1.5" role="menuitem">1.5x</button>
-              <button class="speed-option active" data-speed="2" role="menuitem">2.0x</button>
-              <button class="speed-option" data-speed="3" role="menuitem">3.0x</button>
-            </div>
+          <div class="install">
+            <code id="install-command">curl -fsSL https://caudra.ai/install.sh | sh</code>
+            <button class="copy" id="copy-install" type="button">copy</button>
           </div>
         </div>
+        <div class="hero-system">
+          <img class="hero-art" src="/caudra-hero-v1.png" alt="Three context paths converging through a decision aperture into one selected action">
+          <div class="hero-legend" aria-hidden="true"><span>context</span><span>selection</span><span>effective action</span></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="signal-strip">
+      <div class="shell signal-grid">
+        <div class="signal-item"><span class="signal-key">runtime</span><span class="signal-value">native Rust TUI</span></div>
+        <div class="signal-item"><span class="signal-key">execution</span><span class="signal-value">tools + subagents</span></div>
+        <div class="signal-item"><span class="signal-key">models</span><span class="signal-value">provider agnostic</span></div>
+        <div class="signal-item"><span class="signal-key">authority</span><span class="signal-value">user controlled</span></div>
       </div>
     </div>
-    </div>
-    <p class="player-hint"><button type="button" id="skip-hint-btn">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
-  </div>
-  </div>
-</section>
 
-<div class="content" id="features">
+    <section class="section" id="capabilities">
+      <div class="shell">
+        <div class="section-head">
+          <span class="section-index">01 / CAUDRA</span>
+          <div>
+            <h2>What Caudra adds.</h2>
+            <p class="section-intro">Compared with its Maki foundation, Caudra focuses on durable work, safe intervention, and evidence-backed completion. <a href="/docs/changes-from-maki/">Read the full comparison and rationale.</a></p>
+          </div>
+        </div>
+        <div class="capability-grid">
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.1</span><span class="capability-route"></span></div>
+            <h3>Evidence-gated completion</h3>
+            <p>Set a completion condition with <code>/goal</code>. A private evaluator checks the recorded evidence and continues the run when the condition is unmet.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.2</span><span class="capability-route"></span></div>
+            <h3>Durable task agents</h3>
+            <p>Task agents keep stable IDs, separate transcripts, queued guidance, and histories that continue across turns and restored sessions.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.3</span><span class="capability-route"></span></div>
+            <h3>Guide, queue, or replace</h3>
+            <p>Redirect active work at a safe boundary, schedule the next run, or replace a run without losing the rest of the queue.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.4</span><span class="capability-route"></span></div>
+            <h3>Branchable sessions</h3>
+            <p>Fork from a message and restore conversation state, workspace files, or both while preserving the abandoned path.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.5</span><span class="capability-route"></span></div>
+            <h3>Bound permission authority</h3>
+            <p>Reusable approvals bind to validated input, typed resources, implementation identity, authority, and an explicit lifetime.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.6</span><span class="capability-route"></span></div>
+            <h3>Decoupled Workcell tools</h3>
+            <p>Workcell owns protocol-neutral contracts, validation, execution bounds, atomicity, network policy, and process cleanup. Caudra binds permissions, retained output, and presentation.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.7</span><span class="capability-route"></span></div>
+            <h3>Source-faithful Markdown</h3>
+            <p>Read Unicode maths and Mermaid diagrams, pan wide charts, follow validated links, and copy the original Markdown behind rendered cells.</p>
+          </article>
+          <article class="capability">
+            <div class="capability-top"><span class="capability-num">01.8</span><span class="capability-route"></span></div>
+            <h3>Mouse across native controls</h3>
+            <p>Use pickers, queues, footer controls, task cards, links, and message actions with matched press-and-release behavior that preserves drag selection.</p>
+          </article>
+        </div>
+      </div>
+    </section>
 
-  <div class="pitch reveal">
-    <div class="pitch-col">
-      <h2><span>Context efficiency</span>Where tokens go</h2>
+    <section class="section flow">
+      <div class="shell">
+        <div class="section-head">
+          <span class="section-index">02 / LOOP</span>
+          <div>
+            <h2>Outcomes route the next step.</h2>
+            <p class="section-intro">The loop stays grounded in current evidence instead of treating the first plan as fixed.</p>
+          </div>
+        </div>
+        <div class="flow-grid">
+          <div class="flow-step"><b>01</b><strong>Observe</strong><span>Read repository state and session context.</span></div>
+          <div class="flow-step"><b>02</b><strong>Select</strong><span>Choose the smallest useful action.</span></div>
+          <div class="flow-step"><b>03</b><strong>Execute</strong><span>Call a tool, plugin, or subagent.</span></div>
+          <div class="flow-step"><b>04</b><strong>Verify</strong><span>Inspect output, tests, and side effects.</span></div>
+          <div class="flow-step"><b>05</b><strong>Adapt</strong><span>Continue, revise, or return control.</span></div>
+        </div>
+      </div>
+    </section>
 
-      <div class="pitch-item">
-        <div class="pip pip-lavender"></div>
+    <section class="section">
+      <div class="shell control-grid">
         <div>
-          <strong><a href="#index">index</a></strong>
-          <p>Parses 15 languages into skeletons: imports, type defs, function signatures with their line ranges. Adds 59 tok/turn but saves 224 tok/turn on reads, netting 165 tok/turn saved. My usage indicated reads are ~65% of all tokens, so this optimization is big.</p>
+          <span class="section-index">03 / CONTROL</span>
+          <h2 style="margin-top:1.6rem">Authority stays explicit.</h2>
+          <p class="section-intro">Caudra separates capability from permission. You can inspect what runs, scope repeated approvals, steer current work, and stop execution.</p>
         </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
         <div>
-          <strong><a href="#exec">code_execution</a></strong>
-          <p>A sandboxed Python interpreter with memory and time limits. All tools are exposed as <code>async</code> functions, so the model can <code>asyncio.gather()</code> a bunch of reads, grep the results, and only return what matters. Intermediate data never reaches your context.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-pink"></div>
-        <div>
-          <strong>task</strong>
-          <p>Subagents run in a strict read-only plan mode or a build mode. System prompt profiles can select their model and thinking mode.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-gold"></div>
-        <div>
-          <strong>Lean system prompt</strong>
-          <p>The system prompt, tool descriptions, and examples are short. When context gets too long, maki compacts history automatically: strips images, thinking blocks, and summarizes older turns.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong><a href="/docs/mcp/#tool-search" target="_blank" rel="noopener">MCP tool_search</a></strong>
-          <p>Datadog's MCP server exposes over 100 tools with all toolsets on, and each definition sits in your context on every request, used or not. Maki hides them behind a single <code>tool_search</code> tool, so the model looks up what it needs and the rest never loads.</p>
-        </div>
-      </div>
-    </div>
+          <div class="control-list">
+            <div class="control-row"><span>01</span><p>Tree-sitter parses compound shell commands into the permissions they actually need.</p></div>
+            <div class="control-row"><span>02</span><p>Plan mode restricts writes while you review the proposed path.</p></div>
+            <div class="control-row"><span>03</span><p>Sessions, queues, rewind, and task transcripts keep execution inspectable.</p></div>
+          </div>
+          <div class="terminal" style="margin-top:2rem">
+            <div class="terminal-head"><span>permission review</span><span>caudra / build</span></div>
+            <pre><span class="prompt">action</span>  shell
+<span class="prompt">input</span>   git diff &amp;&amp; cargo test
+<span class="prompt">scope</span>   git *
+        cargo test
 
-    <div class="pitch-col">
-      <h2><span>User experience</span>What you get</h2>
-
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong>Rust TUI, 60 FPS</strong>
-          <p>Native binary. No javascript runtime, no react. Even the splash screen animation uses SIMD. Syntax highlighting runs on a background thread pool so it never blocks your input. Fits well on small laptop screens.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-lavender"></div>
-        <div>
-          <strong>Full visibility</strong>
-          <p>Philosophy: don't hide anything. Token count, cost, and model are always in the status bar. Each subagent gets its own chat window you can flip through with <code>/tasks</code> (Ctrl-X). Ctrl-F for fuzzy search. <code>/btw</code> runs a side query without touching the current session. <code>!</code> runs shell commands, <code>!!</code> runs them silently.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-gold"></div>
-        <div>
-          <strong>Sensible permissions</strong>
-          <p>Bash commands are parsed with tree-sitter so maki knows what's actually being run. <code>git diff && rm -rf /</code> correctly flags both <code>git</code> and <code>rm</code>. Most agents only see <code>git</code>. Handles subshells, command substitution, pipes. Per-tool allow/deny rules, or <code>--yolo</code> to skip it all. SSRF protection on webfetch.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-pink"></div>
-        <div>
-          <strong>Sessions, memory, MCP, ACP</strong>
-          <p>Sessions run in parallel: switch away and the agent keeps working, <code>/sessions</code> to jump back when it flashes done. Long-term memory that persists across sessions. Tell maki to remember something, sometimes it picks things up on its own. Double-Escape to rewind. Plan mode restricts the agent to read-only. MCP servers over stdio or HTTP. Skills. Opt-in <a href="/docs/telemetry/">OpenTelemetry</a> export. 26 themes. Paste images. <code>--print</code> for headless (output is Claude Code-compatible). <code>maki acp</code> runs an <a href="/docs/acp/">ACP</a> server for editors like <a href="https://zed.dev" target="_blank" rel="noopener">Zed</a>.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong><a href="#lua">Lua plugins</a></strong>
-          <p>Extend maki in Lua with a Neovim-style plugin API. Every built-in tool is a Lua plugin, so anything maki does out of the box, your plugins can do too: add tools, slash commands, keymaps, and UI.</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="divider reveal"></div>
-
-  <!-- INDEX TOOL SHOWCASE -->
-  <div class="showcase reveal" id="index">
-    <div class="showcase-header">
-      <span>See it in action</span>
-      <h2>index: read less, know more</h2>
-      <p>Instead of reading full files, <code>index</code> parses with tree-sitter and returns a compact skeleton. The model sees the structure, then reads only the lines it needs.</p>
-    </div>
-
-    <div class="index-split">
-      <div class="index-pane">
-        <div class="index-pane-label">main.rs</div>
-        <pre><span class="kw">use</span> std::fs;
-<span class="kw">use</span> clap::<span class="ty">Parser</span>;
-<span class="kw">use</span> color_eyre::<span class="ty">Result</span>;
-
-<span class="at">#[derive(Parser)]</span>
-<span class="kw">struct</span> <span class="ty">Args</span> {
-    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;,
-    <span class="at">#[arg(short, long)]</span>
-    lines: <span class="kw">bool</span>,
-}
-
-<span class="kw">fn</span> <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {
-    text.<span class="fn">split_whitespace</span>().<span class="fn">count</span>()
-}
-
-<span class="kw">fn</span> <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {
-    text.<span class="fn">lines</span>().<span class="fn">count</span>()
-}
-
-<span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; {
-    <span class="kw">let</span> args = <span class="ty">Args</span>::<span class="fn">parse</span>();
-    <span class="kw">for</span> path <span class="kw">in</span> &amp;args.paths {
-        <span class="kw">let</span> text = fs::<span class="fn">read_to_string</span>(path)?;
-        <span class="kw">let</span> n = <span class="kw">if</span> args.lines {
-            <span class="fn">count_lines</span>(&amp;text)
-        } <span class="kw">else</span> {
-            <span class="fn">count_words</span>(&amp;text)
-        };
-        <span class="fn">println!</span>(<span class="st">"{}: {n}"</span>, path.<span class="fn">display</span>());
-    }
-    <span class="ty">Ok</span>(())
-}</pre>
-      </div>
-      <div class="index-divider"></div>
-      <div class="index-pane">
-        <div class="index-pane-label">maki index main.rs</div>
-        <pre><span class="sec">imports:</span> <span class="rng">[1-3]</span>
-  clap::<span class="ty">Parser</span>, color_eyre::<span class="ty">Result</span>, std::fs
-
-<span class="sec">types:</span>
-  <span class="at">#[derive(Parser)]</span>
-  <span class="kw">struct</span> <span class="ty">Args</span> <span class="rng">[5-9]</span>
-    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;
-    lines: <span class="kw">bool</span>
-
-<span class="sec">fns:</span>
-  <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> <span class="rng">[11-13]</span>
-  <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> <span class="rng">[15-17]</span>
-  <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; <span class="rng">[19-29]</span></pre>
-      </div>
-    </div>
-
-    <div class="showcase-stat">
-      <span><span class="stat-num">29</span> lines</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">13</span> lines</span>
-      <span class="stat-result">55% smaller</span>
-    </div>
-  </div>
-
-  <div class="divider reveal"></div>
-
-  <!-- CODE_EXECUTION SHOWCASE -->
-  <div class="showcase reveal" id="exec">
-    <div class="showcase-header">
-      <span>See it in action</span>
-      <h2>code_execution: think inside the sandbox</h2>
-      <p>Tools are exposed as <code>async</code> Python functions. The model writes a script, runs it sandboxed, and only the <code>print()</code> output enters your context.</p>
-    </div>
-
-    <div class="exec-demo">
-      <div class="exec-body">
-        <div class="exec-pane">
-          <div class="exec-pane-label">script</div>
-          <pre><span class="cm"># find dead exports in a TS repo</span>
-files = <span class="kw">await</span> <span class="fn">glob</span>(pattern=<span class="st">'src/**/*.ts'</span>)
-srcs = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(
-    *[<span class="fn">read</span>(path=f) <span class="kw">for</span> f <span class="kw">in</span> files]
-)
-
-exports = {}
-imports = <span class="fn">set</span>()
-<span class="kw">for</span> f, src <span class="kw">in</span> <span class="fn">zip</span>(files, srcs):
-    <span class="kw">for</span> m <span class="kw">in</span> re.<span class="fn">finditer</span>(<span class="st">r'^export \w+ (\w+)'</span>, src, re.M):
-        exports[m.<span class="fn">group</span>(1)] = f
-    <span class="kw">for</span> m <span class="kw">in</span> re.<span class="fn">finditer</span>(<span class="st">r'import\s*\{([^}]+)\}'</span>, src):
-        imports.<span class="fn">update</span>(n.<span class="fn">strip</span>() <span class="kw">for</span> n <span class="kw">in</span> m.<span class="fn">group</span>(1).<span class="fn">split</span>(<span class="st">','</span>))
-
-<span class="kw">for</span> name, f <span class="kw">in</span> exports.<span class="fn">items</span>():
-    <span class="kw">if</span> name <span class="kw">not in</span> imports:
-        <span class="fn">print</span>(<span class="st">f'{f}  {name}'</span>)</pre>
-        </div>
-        <div class="exec-divider"></div>
-        <div class="exec-pane">
-          <div class="exec-pane-label">output</div>
-          <pre><span class="out">src/lib/csv.ts       parseCsvLegacy</span>
-<span class="out">src/auth/jwt.ts      signV1</span>
-<span class="out">src/utils/phone.ts   formatE164</span></pre>
-        </div>
-      </div>
-    </div>
-
-    <div class="showcase-stat">
-      <span><span class="stat-num">~40k</span> tokens</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">~30</span> tokens</span>
-      <span class="stat-result">1300x reduction</span>
-    </div>
-  </div>
-
-  <div class="divider reveal"></div>
-
-  <!-- LUA PLUGINS SHOWCASE -->
-  <div class="showcase reveal" id="lua">
-    <div class="showcase-header">
-      <span>See it in action</span>
-      <h2>Lua plugins: hackable all the way down</h2>
-      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/maki/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
-    </div>
-
-    <div class="exec-duo">
-      <div class="exec-demo">
-        <div class="exec-pane">
-          <div class="exec-pane-label">add a ci_status tool: the model checks CI itself</div>
-          <pre><span class="fn">maki.api.register_tool</span>({
-  name = <span class="st">"ci_status"</span>,
-  description = <span class="st">"Latest CI run for this branch"</span>,
-  schema = { type = <span class="st">"object"</span>, properties = {} },
-  handler = <span class="kw">function</span>()
-    <span class="kw">local</span> res, err = <span class="fn">maki.net.request</span>(
-      <span class="st">"https://ci.internal/runs/json?branch=main"</span>)
-    <span class="kw">if</span> err <span class="kw">then</span>
-      <span class="kw">return</span> { llm_output = err, is_error = <span class="kw">true</span> }
-    <span class="kw">end</span>
-    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
-    <span class="fn">buf:lines</span>(<span class="fn">maki.ui.highlight</span>(res.body, <span class="st">"json"</span>))
-    <span class="kw">return</span> { llm_output = res.body, body = buf }
-  <span class="kw">end</span>,
-})</pre>
-        </div>
-      </div>
-      <div class="exec-demo">
-        <div class="exec-pane">
-          <div class="exec-pane-label">add /standup: show yesterday's commits</div>
-          <pre><span class="fn">maki.api.register_command</span>({
-  name = <span class="st">"/standup"</span>,
-  description = <span class="st">"Yesterday's commits"</span>,
-  handler = <span class="kw">function</span>()
-    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
-    <span class="kw">local</span> win = <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
-    <span class="fn">maki.fn.jobstart</span>(
-      <span class="st">"git log --since=yesterday --oneline"</span>, {
-        on_stdout = <span class="kw">function</span>(_, line) <span class="fn">buf:line</span>(line) <span class="kw">end</span>,
-      })
-    <span class="kw">repeat</span>
-      <span class="kw">local</span> ev = <span class="fn">win:recv</span>()
-    <span class="kw">until</span> <span class="kw">not</span> ev <span class="kw">or</span> ev.key == <span class="st">"esc"</span>
-    <span class="fn">win:close</span>()
-  <span class="kw">end</span>,
-})</pre>
-        </div>
-      </div>
-    </div>
-
-    <div class="doom-demo reveal">
-      <p class="doom-line">And yes... it can even run DOOM!</p>
-      <div class="tui">
-        <div class="tui-titlebar">
-          <div class="tui-dot tui-dot-r"></div>
-          <div class="tui-dot tui-dot-y"></div>
-          <div class="tui-dot tui-dot-g"></div>
-        </div>
-        <div class="tui-body">
-          <video class="doom-video" width="1920" height="970" muted loop playsinline preload="none" aria-label="maki running DOOM through a Lua plugin">
-            <source src="doom-av1.mp4" type="video/mp4; codecs=av01.0.04M.08">
-            <source src="doom.mp4" type="video/mp4">
-          </video>
-          <div class="player-controls">
-            <button class="player-btn doom-play-btn" aria-label="Play/Pause">
-              <svg viewBox="0 0 24 24" class="doom-play-icon"><path d="M8 5v14l11-7z"/></svg>
-              <svg viewBox="0 0 24 24" class="doom-pause-icon" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-            </button>
-            <div class="player-progress doom-progress">
-              <div class="player-progress-bar doom-progress-fill"></div>
-            </div>
-            <span class="player-time doom-time">0:00 / 0:00</span>
+<span class="dim">[y] once  [s] conversation  [a] project</span>
+<span class="ok">selected → once</span></pre>
           </div>
         </div>
       </div>
-    </div>
-  </div>
+    </section>
 
-  <div class="divider reveal"></div>
-
-</div>
-
-<div class="bottom-sky">
-  <div class="bottom-sky-bg">
-    <div class="bottom-stars">
-      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
-      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
-      <div class="bottom-star-diamond"></div><div class="bottom-star-diamond"></div>
-    </div>
-    <div class="bottom-moon"></div>
-
-    <div class="providers-section">
-      <h2 class="reveal">Providers</h2>
-      <p class="reveal reveal-d1">Set an API key env var, or use <code>maki auth login openai</code> for OAuth.</p>
-      <div class="provider-grid">
-        <a href="/docs/providers/#anthropic" class="provider-chip">Anthropic</a>
-        <a href="/docs/providers/#openai" class="provider-chip">OpenAI</a>
-        <a href="/docs/providers/#xai" class="provider-chip">xAI</a>
-        <a href="/docs/providers/#google" class="provider-chip">Google</a>
-        <a href="/docs/providers/#copilot" class="provider-chip">Copilot</a>
-        <a href="/docs/providers/#ollama" class="provider-chip">Ollama</a>
-        <a href="/docs/providers/#llamacpp" class="provider-chip">llama.cpp</a>
-        <a href="/docs/providers/#mistral" class="provider-chip">Mistral</a>
-        <a href="/docs/providers/#z-ai" class="provider-chip">Z.AI</a>
-        <a href="/docs/providers/#deepseek" class="provider-chip">DeepSeek</a>
-        <a href="/docs/providers/#openrouter" class="provider-chip">OpenRouter</a>
-        <a href="/docs/providers/#synthetic" class="provider-chip">Synthetic</a>
-        <a href="/docs/providers/#tensorx" class="provider-chip">TensorX</a>
-        <a href="/docs/providers/#opencode-zen" class="provider-chip">OpenCode Zen</a>
-        <a href="/docs/providers/#opencode-go" class="provider-chip">OpenCode Go</a>
-        <a href="/docs/providers/#aperture" class="provider-chip">Aperture</a>
+    <section class="section">
+      <div class="shell">
+        <div class="section-head">
+          <span class="section-index">04 / PROVIDERS</span>
+          <div>
+            <h2>Use the model that fits the work.</h2>
+            <p class="section-intro">Built-in providers, compatible APIs, local models, and executable provider adapters share one interface.</p>
+          </div>
+        </div>
+        <div class="provider-grid" aria-label="Supported providers">
+          <span>Anthropic</span><span>OpenAI</span><span>xAI</span><span>Google</span>
+          <span>Copilot</span><span>Ollama</span><span>llama.cpp</span><span>Mistral</span>
+          <span>Z.AI</span><span>DeepSeek</span><span>OpenRouter</span><span>Synthetic</span>
+          <span>TensorX</span><span>OpenCode</span><span>Aperture</span><span>Custom API</span>
+        </div>
       </div>
-      <p class="provider-plus reveal reveal-d3">Anything that speaks the OpenAI or Anthropic API works too. Write a short <a href="https://github.com/tontinton/maki/tree/main/scripts/providers" target="_blank" rel="noopener">provider script</a>. OpenAI oauth example included.</p>
+    </section>
+
+    <section class="section fork">
+      <div class="shell fork-grid">
+        <div>
+          <span class="section-index">05 / PROJECT</span>
+          <h2 style="margin-top:1.6rem">An independent release line.</h2>
+          <p>Caudra is an independent fork of <a href="https://github.com/tontinton/maki">Maki</a>, originally developed by <a href="https://github.com/tontinton">Tony Solomonik</a>. Caudra modifications are maintained by <a href="https://thorstenborn.com">Thorsten Born</a>.</p>
+        </div>
+        <div class="fork-links">
+          <a href="https://github.com/caudra/caudra"><span>source repository</span><span>↗</span></a>
+          <a href="https://github.com/caudra/config"><span>example config</span><span>↗</span></a>
+          <a href="/docs/changes-from-maki/"><span>changes from Maki</span><span>→</span></a>
+          <a href="/docs/"><span>documentation</span><span>→</span></a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell footer-inner">
+      <div class="footer-mark"><img src="/caudra-mark.svg" alt="">caudra</div>
+      <div class="footer-meta">context → effective action<br>brought to you by <a href="https://thorstenborn.com">Thorsten Born</a><br>github.com/caudra/caudra / v0.1.0</div>
     </div>
+  </footer>
 
-    <div class="bottom-cloud-layer">
-      <div class="bottom-cloud-row bottom-cloud-back">
-        <svg class="cloud-svg" style="width:360px;bottom:0;left:2%" viewBox="0 0 360 100"><path d="M8 100 Q5 78 28 70 Q15 48 48 38 Q55 12 92 10 Q125 -5 158 10 Q185 0 212 15 Q238 5 262 22 Q288 12 310 32 Q335 20 340 52 Q358 65 340 82 Q350 98 330 100Z"/></svg>
-        <svg class="cloud-svg" style="width:300px;bottom:0;left:30%" viewBox="0 0 300 90"><path d="M5 90 Q0 70 22 62 Q12 42 42 34 Q48 10 80 8 Q108 -4 135 8 Q158 0 180 14 Q205 4 225 20 Q248 10 262 30 Q282 18 285 48 Q302 58 285 72 Q295 88 278 90Z"/></svg>
-        <svg class="cloud-svg" style="width:340px;bottom:0;right:2%" viewBox="0 0 340 95"><path d="M8 95 Q2 75 25 66 Q14 45 45 36 Q52 10 88 8 Q118 -4 150 8 Q178 -2 205 14 Q232 4 255 22 Q280 10 300 30 Q322 18 325 50 Q342 62 325 78 Q335 93 315 95Z"/></svg>
-      </div>
-      <div class="bottom-cloud-row bottom-cloud-mid">
-        <svg class="cloud-svg" style="width:400px;bottom:0;left:-1%" viewBox="0 0 400 95"><path d="M5 95 Q0 72 28 64 Q14 42 50 32 Q58 8 98 6 Q132 -6 168 8 Q198 -2 228 14 Q258 2 288 20 Q318 8 345 28 Q372 16 378 50 Q398 62 378 78 Q390 93 368 95Z"/></svg>
-        <svg class="cloud-svg" style="width:380px;bottom:0;left:25%" viewBox="0 0 380 90"><path d="M5 90 Q0 68 25 60 Q12 40 45 30 Q52 6 90 5 Q122 -5 155 8 Q182 -2 210 12 Q238 2 265 18 Q292 6 318 25 Q345 14 352 46 Q370 58 352 72 Q362 88 342 90Z"/></svg>
-        <svg class="cloud-svg" style="width:360px;bottom:0;right:-1%" viewBox="0 0 360 92"><path d="M5 92 Q0 70 24 62 Q12 42 44 32 Q50 8 85 6 Q115 -4 148 8 Q175 -2 202 14 Q230 2 255 20 Q282 8 305 28 Q330 16 335 48 Q355 60 335 76 Q345 90 325 92Z"/></svg>
-      </div>
-      <div class="bottom-cloud-row bottom-cloud-front">
-        <svg class="cloud-svg" style="width:440px;bottom:0;left:-2%" viewBox="0 0 440 100"><path d="M5 100 Q0 76 30 68 Q15 45 55 35 Q62 8 105 5 Q142 -8 180 8 Q212 -4 245 14 Q278 2 312 20 Q345 6 378 28 Q408 14 415 50 Q435 65 415 82 Q428 98 405 100Z"/></svg>
-        <svg class="cloud-svg" style="width:420px;bottom:0;left:22%" viewBox="0 0 420 95"><path d="M5 95 Q0 72 28 64 Q14 42 52 32 Q58 6 98 4 Q135 -6 170 8 Q200 -2 232 14 Q262 2 295 18 Q325 6 355 26 Q385 14 392 48 Q412 60 392 76 Q405 93 385 95Z"/></svg>
-        <svg class="cloud-svg" style="width:400px;bottom:0;right:-2%" viewBox="0 0 400 98"><path d="M5 98 Q0 75 26 66 Q14 44 48 34 Q55 8 92 5 Q128 -6 162 8 Q192 -2 222 14 Q252 2 282 20 Q312 8 342 28 Q370 16 375 50 Q395 62 375 78 Q388 96 365 98Z"/></svg>
-      </div>
-    </div>
-
-    <footer style="position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);font-size:0.75rem;color:var(--text-secondary);">
-      Created by <a href="https://tontinton.com" target="_blank" rel="noopener" style="color:var(--deep-navy);text-decoration:underline;text-underline-offset:2px;">tontinton</a>.
-    </footer>
-  </div>
-</div>
-
-<script>
-  const nav = document.getElementById('nav');
-  let navScrolled = false;
-  let navScrollRaf = 0;
-  window.addEventListener('scroll', () => {
-    if (navScrollRaf) return;
-    navScrollRaf = requestAnimationFrame(() => {
-      navScrollRaf = 0;
-      const shouldScroll = window.scrollY > 40;
-      if (shouldScroll !== navScrolled) {
-        navScrolled = shouldScroll;
-        nav.classList.toggle('scrolled', shouldScroll);
+  <script>
+    const copyButton = document.getElementById('copy-install');
+    copyButton.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(document.getElementById('install-command').textContent);
+        copyButton.textContent = 'copied';
+      } catch {
+        copyButton.textContent = 'select';
       }
+      setTimeout(() => { copyButton.textContent = 'copy'; }, 1400);
     });
-  }, { passive: true });
-
-  // hero entrance — add hidden state via JS, then animate in
-  // this prevents flicker on Firefox refresh (content visible by default in CSS)
-  const hero = document.querySelector('.hero');
-  hero.classList.add('hero-anim');
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      document.querySelector('.hero-intro').classList.add('entered');
-      document.querySelector('.hero-preview').classList.add('entered');
-    });
-  });
-
-  // scroll reveal for .reveal elements
-  const revealObs = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-        revealObs.unobserve(entry.target);
-      }
-    });
-  }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
-  document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
-
-  // pitch items stagger on scroll
-  const pitchObs = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const col = entry.target;
-        col.querySelectorAll('.pitch-item').forEach((item, i) => {
-          setTimeout(() => item.classList.add('visible'), i * 120);
-        });
-        pitchObs.unobserve(col);
-      }
-    });
-  }, { threshold: 0.15, rootMargin: '0px 0px -60px 0px' });
-  document.querySelectorAll('.pitch-col').forEach(col => pitchObs.observe(col));
-
-  // provider chips stagger
-  const chipObs = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.querySelectorAll('.provider-chip').forEach((chip, i) => {
-          setTimeout(() => chip.classList.add('visible'), i * 100);
-        });
-        chipObs.unobserve(entry.target);
-      }
-    });
-  }, { threshold: 0.2 });
-  document.querySelectorAll('.provider-grid').forEach(g => chipObs.observe(g));
-
-  // copy toast
-  function showCopyToast(el) {
-    const toast = el.parentElement.querySelector('.copy-toast');
-    toast.classList.add('show');
-    setTimeout(() => toast.classList.remove('show'), 1200);
-  }
-
-  // fetch github stars
-  fetch('https://api.github.com/repos/tontinton/maki', { headers: { Accept: 'application/vnd.github.v3+json' } })
-    .then(r => r.json())
-    .then(data => {
-      if (!data.stargazers_count) return;
-      const count = data.stargazers_count >= 1000
-        ? (data.stargazers_count / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
-        : String(data.stargazers_count);
-      document.querySelectorAll('[data-star-count]').forEach(el => el.textContent = count);
-      const badges = document.querySelectorAll('[data-stars]');
-      badges.forEach(el => el.style.display = 'inline-flex');
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          badges.forEach(el => el.classList.add('loaded'));
-        });
-      });
-    })
-    .catch(() => {});
-</script>
-<script src="asciinema-player.min.js"></script>
-<script>
-  let player = AsciinemaPlayer.create('demo.cast', document.getElementById('demo-player'), {
-    autoPlay: true,
-    preload: true,
-    loop: true,
-    speed: 2.0,
-    idleTimeLimit: 2,
-    fit: false,
-    terminalFontSize: 'medium',
-    controls: false,
-    terminalFontFamily: "'JetBrains Mono', monospace",
-    theme: 'dracula',
-  });
-  let scaleTuiRaf = 0;
-  function scaleTui() {
-    if (scaleTuiRaf) return;
-    scaleTuiRaf = requestAnimationFrame(() => {
-      scaleTuiRaf = 0;
-      const tui = document.querySelector('.hero-preview .tui');
-      if (!tui) return;
-      const container = tui.parentElement;
-      const prevTransform = tui.style.transform;
-      tui.style.transform = 'none';
-      const naturalWidth = tui.offsetWidth;
-      const naturalHeight = tui.offsetHeight;
-      tui.style.transform = prevTransform;
-      const available = container.clientWidth;
-      if (naturalWidth > available) {
-        const s = available / naturalWidth;
-        tui.style.transform = `scale(${s})`;
-        container.style.height = (naturalHeight * s) + 'px';
-      } else {
-        tui.style.transform = '';
-        container.style.height = '';
-      }
-    });
-  }
-  window.addEventListener('resize', scaleTui, { passive: true });
-  new ResizeObserver(scaleTui).observe(document.querySelector('.hero-preview'));
-
-  player.addEventListener('play', () => {
-    const loader = document.getElementById('demo-loader');
-    if (loader) {
-      loader.classList.add('hidden');
-      setTimeout(() => loader.remove(), 300);
-    }
-    scaleTui();
-  });
-
-  // Player controls
-  const playBtn = document.getElementById('play-btn');
-  const playIcon = document.getElementById('play-icon');
-  const pauseIcon = document.getElementById('pause-icon');
-  const progressBar = document.getElementById('progress-bar');
-  const progressFill = document.getElementById('progress-fill');
-  const timeDisplay = document.getElementById('time-display');
-  let isPlaying = true;
-  let progressRaf = null;
-  let currentSpeed = 2.0;
-  let playerContainer = document.getElementById('demo-player');
-
-  function createPlayer(speed, autoPlay = true, startTime = 0) {
-    const container = playerContainer;
-    container.innerHTML = '';
-    const newPlayer = AsciinemaPlayer.create('demo.cast', container, {
-      autoPlay: autoPlay,
-      preload: true,
-      loop: true,
-      speed: speed,
-      idleTimeLimit: 2,
-      fit: false,
-      terminalFontSize: 'medium',
-      controls: false,
-      terminalFontFamily: "'JetBrains Mono', monospace",
-      theme: 'dracula',
-    });
-    if (startTime > 0) {
-      newPlayer.seek(startTime);
-    }
-    return newPlayer;
-  }
-
-  function formatTime(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-  }
-
-  function updateProgress() {
-    if (!player) return;
-    const current = player.getCurrentTime();
-    const duration = player.getDuration();
-    if (duration > 0) {
-      const pct = (current / duration) * 100;
-      progressFill.style.width = pct + '%';
-      timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
-    }
-    if (isPlaying) {
-      progressRaf = requestAnimationFrame(updateProgress);
-    }
-  }
-
-  playBtn.addEventListener('click', () => {
-    if (isPlaying) {
-      player.pause();
-    } else {
-      player.play();
-    }
-  });
-
-  player.addEventListener('play', () => {
-    isPlaying = true;
-    playIcon.style.display = 'none';
-    pauseIcon.style.display = 'block';
-    progressRaf = requestAnimationFrame(updateProgress);
-  });
-
-  player.addEventListener('pause', () => {
-    isPlaying = false;
-    playIcon.style.display = 'block';
-    pauseIcon.style.display = 'none';
-    if (progressRaf) cancelAnimationFrame(progressRaf);
-  });
-
-  progressBar.addEventListener('click', (e) => {
-    const rect = progressBar.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const duration = player.getDuration();
-    player.seek(duration * pct);
-  });
-
-  // Speed controls (YouTube-style popup)
-  const speedToggle = document.getElementById('speed-toggle');
-  const speedMenu = document.getElementById('speed-menu');
-  const speedOptions = document.querySelectorAll('.speed-option');
-
-  function closeSpeedMenu() {
-    speedMenu.classList.remove('open');
-    speedToggle.setAttribute('aria-expanded', 'false');
-  }
-
-  speedToggle.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const open = speedMenu.classList.toggle('open');
-    speedToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-  });
-
-  document.addEventListener('click', (e) => {
-    if (!speedMenu.contains(e.target) && e.target !== speedToggle) {
-      closeSpeedMenu();
-    }
-  });
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeSpeedMenu();
-  });
-
-  speedOptions.forEach(opt => {
-    opt.addEventListener('click', () => {
-      const speed = parseFloat(opt.dataset.speed);
-      const currentTime = player.getCurrentTime();
-      player.dispose();
-      currentSpeed = speed;
-      player = createPlayer(speed, true, currentTime);
-      speedOptions.forEach(o => o.classList.remove('active'));
-      opt.classList.add('active');
-      speedToggle.textContent = opt.textContent;
-      closeSpeedMenu();
-      player.addEventListener('play', () => {
-        isPlaying = true;
-        playIcon.style.display = 'none';
-        pauseIcon.style.display = 'block';
-        progressRaf = requestAnimationFrame(updateProgress);
-      });
-      player.addEventListener('pause', () => {
-        isPlaying = false;
-        playIcon.style.display = 'block';
-        pauseIcon.style.display = 'none';
-        if (progressRaf) cancelAnimationFrame(progressRaf);
-      });
-    });
-  });
-
-  document.getElementById('skip-hint-btn').addEventListener('click', () => {
-    player.seek(67);
-    player.play();
-  });
-
-  // Start progress updates
-  progressRaf = requestAnimationFrame(updateProgress);
-
-  // DOOM demo player
-  (() => {
-    const demo = document.querySelector('.doom-demo');
-    if (!demo) return;
-    const video = demo.querySelector('.doom-video');
-    const dPlayIcon = demo.querySelector('.doom-play-icon');
-    const dPauseIcon = demo.querySelector('.doom-pause-icon');
-    const dProgress = demo.querySelector('.doom-progress');
-    const dFill = demo.querySelector('.doom-progress-fill');
-    const dTime = demo.querySelector('.doom-time');
-    let userPaused = false;
-
-    function render() {
-      const d = video.duration || 0;
-      dFill.style.width = d ? (video.currentTime / d * 100) + '%' : '0%';
-      dTime.textContent = `${formatTime(video.currentTime)} / ${formatTime(d)}`;
-    }
-    video.addEventListener('timeupdate', render);
-    video.addEventListener('loadedmetadata', render);
-    video.addEventListener('play', () => {
-      dPlayIcon.style.display = 'none';
-      dPauseIcon.style.display = 'block';
-    });
-    video.addEventListener('pause', () => {
-      dPlayIcon.style.display = 'block';
-      dPauseIcon.style.display = 'none';
-    });
-
-    function toggle() {
-      if (video.paused) {
-        userPaused = false;
-        video.play();
-      } else {
-        userPaused = true;
-        video.pause();
-      }
-    }
-    demo.querySelector('.doom-play-btn').addEventListener('click', toggle);
-    video.addEventListener('click', toggle);
-
-    dProgress.addEventListener('click', (e) => {
-      const rect = dProgress.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
-      video.currentTime = pct * (video.duration || 0);
-      render();
-    });
-
-    new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting) {
-        if (!userPaused) video.play().catch(() => {});
-      } else if (!video.paused) {
-        video.pause();
-      }
-    }, { threshold: 0.35 }).observe(video);
-
-    window.addEventListener('load', () => {
-      if (video.readyState === 0 && video.paused) {
-        video.preload = 'auto';
-        video.load();
-      }
-    }, { once: true });
-  })();
-</script>
-
+  </script>
 </body>
 </html>

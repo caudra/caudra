@@ -1,6 +1,6 @@
-local truncate = require("maki.truncate")
-local ToolView = require("maki.tool_view")
-local th = require("maki.test_helpers")
+local truncate = require("caudra.truncate")
+local ToolView = require("caudra.tool_view")
+local th = require("caudra.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -318,17 +318,17 @@ end
 -- the text that reached the buf and how many times the renderer ran.
 local function restore_markdown(output, is_error, markdown)
   local buf = mock_buf()
-  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local original = { buf = caudra.ui.buf, markdown = caudra.ui.markdown }
   local calls = 0
-  maki.ui.buf = function()
+  caudra.ui.buf = function()
     return buf
   end
-  maki.ui.markdown = function(...)
+  caudra.ui.markdown = function(...)
     calls = calls + 1
     return markdown(...)
   end
   local ok, err = pcall(ToolView.restore_markdown, output, is_error, RESTORE_OPTS)
-  maki.ui.buf, maki.ui.markdown = original.buf, original.markdown
+  caudra.ui.buf, caudra.ui.markdown = original.buf, original.markdown
   assert(ok, tostring(err))
   return all_text(buf.lines), calls
 end
@@ -356,7 +356,7 @@ case("tool_view_restore_markdown_falls_back_when_rendering_fails", function()
   eq(text, RESTORE_OUTPUT, "a failing renderer must not swallow the output")
 end)
 
-local TextInput = require("maki.text_input")
+local TextInput = require("caudra.text_input")
 
 case("text_input_insert_and_value", function()
   local input = TextInput.new()
@@ -1141,7 +1141,7 @@ case("text_input_trace_cases", function()
   end
 end)
 
-local ListPicker = require("maki.list_picker")
+local ListPicker = require("caudra.list_picker")
 
 case("set_highlight_number_width_scales", function()
   local buf = mock_buf()
@@ -1448,7 +1448,7 @@ end
 -- single line a picker would guess. Whatever it draws is what the window pins,
 -- or the query scrolls out from under itself.
 case("render_header_pins_the_height_it_actually_drew", function()
-  local TextInput = require("maki.text_input")
+  local TextInput = require("caudra.text_input")
   local win = mock_win()
   local input = TextInput.new()
   local lines = {}

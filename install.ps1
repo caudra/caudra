@@ -3,12 +3,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Repo = "tontinton/maki"
-$Binary = "maki"
-$InstallDir = if ($env:MAKI_INSTALL_DIR) {
-    $env:MAKI_INSTALL_DIR
+$Repo = "caudra/caudra"
+$Binary = "caudra"
+$InstallDir = if ($env:CAUDRA_INSTALL_DIR) {
+    $env:CAUDRA_INSTALL_DIR
 } else {
-    Join-Path $env:LOCALAPPDATA "maki"
+    Join-Path $env:LOCALAPPDATA "caudra"
 }
 
 function Write-Err([string]$Message) {
@@ -18,7 +18,7 @@ function Write-Err([string]$Message) {
 
 function Get-GitHubHeaders {
     $headers = @{
-        "User-Agent" = "maki-install"
+        "User-Agent" = "caudra-install"
         "Accept"     = "application/vnd.github+json"
     }
     $token = $env:GITHUB_TOKEN
@@ -57,7 +57,7 @@ function Get-LatestTag {
     return $tag
 }
 
-function Install-Maki([string]$Tag) {
+function Install-Caudra([string]$Tag) {
     $target = Get-Target
     if (-not $Tag) {
         $Tag = Get-LatestTag
@@ -65,7 +65,7 @@ function Install-Maki([string]$Tag) {
 
     $archiveName = "$Binary-$Tag-$target.zip"
     $url = "https://github.com/$Repo/releases/download/$Tag/$archiveName"
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("maki-install-" + [guid]::NewGuid().ToString("N"))
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("caudra-install-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tmp | Out-Null
 
     try {
@@ -89,7 +89,7 @@ function Install-Maki([string]$Tag) {
         try {
             Move-Item -LiteralPath $src -Destination $dest -Force
         } catch {
-            Write-Err "failed to install to $dest (try running as Administrator or set MAKI_INSTALL_DIR): $_"
+            Write-Err "failed to install to $dest (try running as Administrator or set CAUDRA_INSTALL_DIR): $_"
         }
 
         Write-Host "$Binary $Tag installed to $dest"
@@ -114,8 +114,8 @@ function Add-ToUserPath([string]$Dir) {
     $newPath = if ($userPath.Trim()) { "$userPath$sep$Dir" } else { $Dir }
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     $env:Path = "$env:Path$sep$Dir"
-    Write-Host "added $Dir to user PATH (restart terminal if maki is not found)"
+    Write-Host "added $Dir to user PATH (restart terminal if caudra is not found)"
 }
 
 $tag = if ($args.Count -ge 1) { $args[0] } else { $null }
-Install-Maki -Tag $tag
+Install-Caudra -Tag $tag

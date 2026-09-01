@@ -38,7 +38,7 @@ end
 local function format_read(output_id, result, limit)
   local lines = {}
   if result.returned_lines > 0 then
-    lines = maki.split(result.text, "\n")
+    lines = caudra.split(result.text, "\n")
     while #lines > result.returned_lines do
       table.remove(lines)
     end
@@ -124,7 +124,7 @@ local function error_result(err)
   return { llm_output = "error: " .. tostring(err), is_error = true }
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "tool_output_read",
   effect = "read_only",
   kind = "read",
@@ -154,7 +154,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "tool_output_grep",
   effect = "read_only",
   kind = "search",

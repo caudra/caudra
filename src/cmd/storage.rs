@@ -1,7 +1,7 @@
+use caudra_storage::StateDir;
+use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
-use maki_storage::StateDir;
-use maki_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase};
 
 use crate::cli::StorageAction;
 

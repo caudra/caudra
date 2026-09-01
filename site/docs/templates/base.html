@@ -4,9 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ config.title }}{% endblock %}</title>
-  <meta name="description" content="Documentation for maki, an efficient AI coding agent built in Rust.">
-  <meta name="theme-color" content="#f2eee1" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#141624" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="{{ config.description }}">
+  <meta name="theme-color" content="#f2ebdd" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#09254d" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="{{ config.title }}">
+  <meta property="og:description" content="{{ config.description }}">
+  <meta property="og:image" content="https://caudra.ai/social-card.png">
+  <meta property="og:site_name" content="Caudra">
+  <link rel="icon" href="https://caudra.ai/caudra-mark.svg" type="image/svg+xml">
+  <link rel="icon" href="https://caudra.ai/favicon.ico" sizes="any">
   <script>
     (function() {
       var t = localStorage.getItem('theme');
@@ -14,11 +20,11 @@
       if (dark) {
         document.documentElement.setAttribute('data-theme', 'dark');
         document.documentElement.style.colorScheme = 'dark';
-        document.documentElement.style.background = 'oklch(19% 0.03 277)';
+        document.documentElement.style.background = '#09254d';
       } else {
         document.documentElement.setAttribute('data-theme', 'light');
         document.documentElement.style.colorScheme = 'light';
-        document.documentElement.style.background = 'oklch(95.5% 0.018 95)';
+        document.documentElement.style.background = '#f2ebdd';
       }
     })();
   </script>
@@ -47,23 +53,23 @@
       color-scheme: light;
       --font-body: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
       --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
-      --salmon: oklch(58% 0.12 40);
-      --cream: oklch(95.5% 0.018 95);
-      --deep-navy: oklch(30% 0.045 277);
-      --text-primary: oklch(32% 0.04 277);
-      --text-secondary: oklch(42% 0.035 277);
-      --text-muted: oklch(51% 0.025 277);
-      --sidebar-bg: oklch(93.5% 0.018 95 / 0.6);
-      --border-subtle: oklch(85% 0.022 90);
-      --accent: oklch(48% 0.115 45);
-      --accent-soft: oklch(91% 0.035 60);
-      --accent-hover: oklch(41% 0.13 45);
-      --code-bg: oklch(91.5% 0.02 92);
-      --code-block-bg: #1E1E2E;
-      --code-block-fg: oklch(89% 0.015 270);
-      --surface-card: oklch(97% 0.012 95 / 0.75);
-      --card-border: oklch(86% 0.02 90);
-      --quote-border: oklch(78% 0.025 85);
+      --signal: #b52f20;
+      --cream: #f2ebdd;
+      --deep-navy: #09254d;
+      --text-primary: #242420;
+      --text-secondary: #484741;
+      --text-muted: #696861;
+      --sidebar-bg: rgb(232 221 203 / 62%);
+      --border-subtle: #cbc8bc;
+      --accent: #b52f20;
+      --accent-soft: #f4c5bb;
+      --accent-hover: #7d2117;
+      --code-bg: #e5e3d9;
+      --code-block-bg: #09254d;
+      --code-block-fg: #e5e3d9;
+      --surface-card: rgb(250 248 239 / 72%);
+      --card-border: #c7c4b8;
+      --quote-border: #9d9b92;
       --sidebar-w: 240px;
       --toc-w: 250px;
       --content-max: 680px;
@@ -71,105 +77,105 @@
       --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
       --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
 
-      --topnav-bg: oklch(95.5% 0.018 95 / 0.97);
-      --topnav-border: oklch(85% 0.022 90 / 0.5);
-      --topnav-scrolled-border: oklch(80% 0.025 88);
-      --sidebar-sep: oklch(80% 0.02 90 / 0.5);
-      --sidebar-border: oklch(85% 0.02 90 / 0.5);
-      --sidebar-label-color: oklch(56% 0.025 85);
-      --sidebar-hover-bg: oklch(91% 0.02 92 / 0.6);
-      --sidebar-active-bg: oklch(90.5% 0.03 75 / 0.5);
-      --inline-code-color: oklch(36% 0.045 277);
-      --inline-code-border: oklch(87% 0.02 90);
-      --code-block-border: oklch(30% 0.03 277);
-      --table-head-bg: oklch(92.5% 0.018 93);
-      --table-border: oklch(81% 0.025 90);
-      --table-row-border: oklch(87% 0.018 92);
-      --table-th-color: oklch(40% 0.035 277);
-      --table-hover-bg: oklch(93.5% 0.015 94);
-      --blockquote-bg: oklch(92.5% 0.018 94 / 0.5);
+      --topnav-bg: rgb(242 235 221 / 96%);
+      --topnav-border: rgb(9 37 77 / 24%);
+      --topnav-scrolled-border: #09254d;
+      --sidebar-sep: rgb(9 37 77 / 34%);
+      --sidebar-border: rgb(9 37 77 / 22%);
+      --sidebar-label-color: #696861;
+      --sidebar-hover-bg: rgb(9 37 77 / 5%);
+      --sidebar-active-bg: #f4c5bb;
+      --inline-code-color: #242420;
+      --inline-code-border: #cac7bb;
+      --code-block-border: #09254d;
+      --table-head-bg: #e2e0d6;
+      --table-border: #aaa79d;
+      --table-row-border: #d2cfc4;
+      --table-th-color: #363631;
+      --table-hover-bg: #ebe9df;
+      --blockquote-bg: rgb(226 224 214 / 62%);
       --tip-accent: oklch(56% 0.10 155);
       --tip-bg: oklch(92% 0.025 155 / 0.4);
       --warn-accent: oklch(58% 0.11 70);
       --warn-bg: oklch(93% 0.03 80 / 0.5);
-      --marker-color: oklch(65% 0.025 88);
-      --hr-color: oklch(86% 0.02 90);
-      --link-underline: oklch(48% 0.115 45 / 0.3);
-      --h2-rule: oklch(86% 0.02 90 / 0.8);
-      --h3-code-border: oklch(87% 0.02 90);
-      --search-input-border: oklch(84% 0.022 90);
-      --search-input-bg: oklch(97% 0.01 95 / 0.7);
-      --search-placeholder: oklch(60% 0.02 90);
-      --search-hint-color: oklch(58% 0.02 90);
-      --search-hint-bg: oklch(92% 0.018 93);
-      --search-hint-border: oklch(85% 0.022 90);
-      --search-results-bg: oklch(96.5% 0.012 95);
-      --search-results-border: oklch(84% 0.022 90);
-      --search-results-shadow: oklch(40% 0.03 90 / 0.18);
-      --search-result-border: oklch(90% 0.015 92);
-      --search-result-hover: oklch(92.5% 0.02 90);
-      --overlay-bg: oklch(25% 0.02 277 / 0.35);
-      --mobile-sidebar-shadow: oklch(25% 0.02 277 / 0.12);
-      --kbd-shadow: oklch(82% 0.02 90);
+      --marker-color: #8c8b84;
+      --hr-color: #c7c4b8;
+      --link-underline: rgb(181 47 32 / 35%);
+      --h2-rule: rgb(9 37 77 / 18%);
+      --h3-code-border: #c7c4b8;
+      --search-input-border: #b8b5aa;
+      --search-input-bg: rgb(250 248 239 / 72%);
+      --search-placeholder: #77766f;
+      --search-hint-color: #696861;
+      --search-hint-bg: #e2e0d6;
+      --search-hint-border: #c7c4b8;
+      --search-results-bg: #f2ebdd;
+      --search-results-border: #a6a39a;
+      --search-results-shadow: rgb(9 37 77 / 20%);
+      --search-result-border: #d2cfc4;
+      --search-result-hover: #f4c5bb;
+      --overlay-bg: rgb(9 37 77 / 42%);
+      --mobile-sidebar-shadow: rgb(9 37 77 / 18%);
+      --kbd-shadow: #aaa79d;
     }
 
     [data-theme="dark"] {
       color-scheme: dark;
-      --salmon: oklch(72% 0.12 40);
-      --cream: oklch(19% 0.03 277);
-      --deep-navy: oklch(87% 0.015 277);
-      --text-primary: oklch(85% 0.015 277);
-      --text-secondary: oklch(71% 0.02 277);
-      --text-muted: oklch(57% 0.02 277);
-      --sidebar-bg: oklch(21% 0.028 277 / 0.55);
-      --border-subtle: oklch(29% 0.025 277);
-      --accent: oklch(73% 0.105 45);
-      --accent-soft: oklch(28% 0.045 45);
-      --accent-hover: oklch(80% 0.11 50);
-      --surface-card: oklch(22% 0.025 277 / 0.7);
-      --card-border: oklch(28% 0.025 277);
-      --quote-border: oklch(40% 0.03 277);
-      --topnav-bg: oklch(19.5% 0.03 277 / 0.97);
-      --topnav-border: oklch(28% 0.025 277 / 0.6);
-      --topnav-scrolled-border: oklch(33% 0.03 277);
-      --sidebar-sep: oklch(38% 0.025 277 / 0.5);
-      --sidebar-border: oklch(27% 0.025 277 / 0.6);
-      --sidebar-label-color: oklch(52% 0.02 277);
-      --sidebar-hover-bg: oklch(25% 0.025 277 / 0.6);
-      --sidebar-active-bg: oklch(27% 0.035 50 / 0.35);
-      --code-bg: oklch(27% 0.028 277);
-      --inline-code-color: oklch(83% 0.02 277);
-      --inline-code-border: oklch(35% 0.028 277);
-      --code-block-border: oklch(27% 0.025 277);
-      --table-head-bg: oklch(25% 0.028 277);
-      --table-border: oklch(33% 0.03 277);
-      --table-row-border: oklch(28.5% 0.025 277);
-      --table-th-color: oklch(76% 0.02 277);
-      --table-hover-bg: oklch(24% 0.025 277);
-      --blockquote-bg: oklch(22% 0.025 277 / 0.5);
+      --signal: #ff7662;
+      --cream: #09254d;
+      --deep-navy: #f2ebdd;
+      --text-primary: #f2ebdd;
+      --text-secondary: #c8ced8;
+      --text-muted: #969fad;
+      --sidebar-bg: rgb(12 44 87 / 62%);
+      --border-subtle: #315078;
+      --accent: #ff7662;
+      --accent-soft: #5a282f;
+      --accent-hover: #ffc1b6;
+      --surface-card: rgb(16 47 90 / 74%);
+      --card-border: #35557d;
+      --quote-border: #647897;
+      --topnav-bg: rgb(9 37 77 / 96%);
+      --topnav-border: rgb(242 235 221 / 18%);
+      --topnav-scrolled-border: #969fad;
+      --sidebar-sep: rgb(242 235 221 / 24%);
+      --sidebar-border: rgb(242 235 221 / 16%);
+      --sidebar-label-color: #969fad;
+      --sidebar-hover-bg: rgb(242 235 221 / 6%);
+      --sidebar-active-bg: #5a282f;
+      --code-bg: #102f5a;
+      --inline-code-color: #f2ebdd;
+      --inline-code-border: #406087;
+      --code-block-border: #406087;
+      --table-head-bg: #102f5a;
+      --table-border: #526d92;
+      --table-row-border: #29476f;
+      --table-th-color: #d8d6cd;
+      --table-hover-bg: #0d2a55;
+      --blockquote-bg: rgb(16 47 90 / 65%);
       --tip-accent: oklch(70% 0.10 155);
       --tip-bg: oklch(24% 0.03 160 / 0.4);
       --warn-accent: oklch(75% 0.10 75);
       --warn-bg: oklch(25% 0.03 70 / 0.45);
-      --marker-color: oklch(48% 0.02 277);
-      --hr-color: oklch(28% 0.025 277);
-      --link-underline: oklch(73% 0.10 45 / 0.35);
-      --h2-rule: oklch(28% 0.025 277 / 0.9);
-      --h3-code-border: oklch(31% 0.025 277);
-      --search-input-border: oklch(31% 0.025 277);
-      --search-input-bg: oklch(22% 0.02 277 / 0.7);
-      --search-placeholder: oklch(48% 0.02 277);
-      --search-hint-color: oklch(50% 0.02 277);
-      --search-hint-bg: oklch(23% 0.022 277);
-      --search-hint-border: oklch(31% 0.025 277);
-      --search-results-bg: oklch(21.5% 0.022 277);
-      --search-results-border: oklch(31% 0.025 277);
-      --search-results-shadow: oklch(5% 0.02 270 / 0.5);
-      --search-result-border: oklch(25% 0.02 277);
-      --search-result-hover: oklch(26% 0.025 277);
-      --overlay-bg: oklch(5% 0.01 270 / 0.55);
-      --mobile-sidebar-shadow: oklch(5% 0.02 270 / 0.35);
-      --kbd-shadow: oklch(30% 0.025 277);
+      --marker-color: #8995a7;
+      --hr-color: #29476f;
+      --link-underline: rgb(255 118 98 / 35%);
+      --h2-rule: rgb(242 235 221 / 16%);
+      --h3-code-border: #35557d;
+      --search-input-border: #406087;
+      --search-input-bg: rgb(16 47 90 / 74%);
+      --search-placeholder: #8995a7;
+      --search-hint-color: #969fad;
+      --search-hint-bg: #102f5a;
+      --search-hint-border: #35557d;
+      --search-results-bg: #0c2c57;
+      --search-results-border: #406087;
+      --search-results-shadow: rgb(0 0 0 / 56%);
+      --search-result-border: #234268;
+      --search-result-hover: #5a282f;
+      --overlay-bg: rgb(0 0 0 / 60%);
+      --mobile-sidebar-shadow: rgb(0 0 0 / 40%);
+      --kbd-shadow: #406087;
     }
 
     ::selection { background: var(--accent-soft); color: var(--deep-navy); }
@@ -210,6 +216,9 @@
     .topnav.scrolled { border-color: var(--topnav-scrolled-border); }
     .topnav-left { display: flex; align-items: center; gap: 1.25rem; }
     .topnav-logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
       font-family: var(--font-mono);
       font-weight: 700;
       font-size: 1.05rem;
@@ -219,6 +228,7 @@
       transition: opacity 0.15s;
     }
     .topnav-logo:hover { opacity: 0.7; }
+    .topnav-logo svg { width: 23px; height: 23px; flex: none; }
     .topnav-sep { width: 1px; height: 18px; background: var(--sidebar-sep); }
     .topnav-section {
       font-family: var(--font-mono);
@@ -432,7 +442,7 @@
       padding: 0.08rem 0.5rem;
       margin-left: 0.4rem;
     }
-    .badge-optin { color: var(--salmon); border-color: currentcolor; }
+    .badge-optin { color: var(--signal); border-color: currentcolor; }
 
     .h-anchor {
       margin-left: 0.4rem;
@@ -891,13 +901,16 @@
     <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
     </button>
-    <a href="https://maki.sh" class="topnav-logo">maki</a>
+    <a href="https://caudra.ai" class="topnav-logo">
+      <svg viewBox="0 0 96 96" aria-hidden="true"><g transform="rotate(180 48 48)"><path d="M7 12h24c14 0 19 9 28 19 4 5 8 7 12 9l-6 9c-5-4-9-5-14-8-11-7-13-17-22-17H7Z" fill="currentColor"/><path d="M7 84h24c14 0 19-9 28-19 4-5 8-7 12-9l-6-9c-5 4-9 5-14 8-11 7-13 17-22 17H7Z" fill="currentColor"/></g><path d="M7 40h11c5 0 8 3 8 8s-3 8-8 8H7Z" fill="var(--accent)"/><path d="M34 39h55v18H34c-5 0-8-4-8-9s3-9 8-9Z" fill="var(--accent)"/><circle cx="27" cy="48" r="6" fill="var(--cream)"/></svg>
+      caudra
+    </a>
     <div class="topnav-sep"></div>
     <a href="{{ config.base_url }}" class="topnav-section">docs</a>
   </div>
   <div class="topnav-right">
-    <a href="https://maki.sh">Home</a>
-    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="topnav-github">
+    <a href="https://caudra.ai">Home</a>
+    <a href="https://github.com/caudra/caudra" target="_blank" rel="noopener" class="topnav-github">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.92 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
       GitHub
     </a>
@@ -965,7 +978,7 @@
     }
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
     document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
-    document.documentElement.style.background = dark ? 'oklch(19% 0.03 277)' : 'oklch(95.5% 0.018 95)';
+    document.documentElement.style.background = dark ? '#09254d' : '#f2ebdd';
     localStorage.setItem('theme', dark ? 'dark' : 'light');
   }
   themeToggle.addEventListener('click', () => {

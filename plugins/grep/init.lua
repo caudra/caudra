@@ -1,13 +1,13 @@
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local color = require("maki.color")
-local output_limits = require("maki.output_limits")
+local ToolView = require("caudra.tool_view")
+local shorten_path = require("caudra.shorten_path")
+local color = require("caudra.color")
+local output_limits = require("caudra.output_limits")
 
 local NO_MATCHES = "No files found"
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = caudra.api.register_options(output_limits.extend({
   search_result_limit = {
     default = 100,
     min = 10,
@@ -17,7 +17,7 @@ local opts = maki.api.register_options(output_limits.extend({
 }))
 
 local function search_path(input)
-  return maki.fs.normalize(input.path or ".")
+  return caudra.fs.normalize(input.path or ".")
 end
 
 local function search_scope(input)
@@ -95,7 +95,7 @@ local function apply_grep_highlights(hl_tasks, view)
       texts[#texts + 1] = fl.text
     end
 
-    local highlighted = maki.ui.highlight(table.concat(texts, "\n"), task.ext, { independent = true })
+    local highlighted = caudra.ui.highlight(table.concat(texts, "\n"), task.ext, { independent = true })
     if highlighted then
       for i, fl in ipairs(task.lines) do
         local hl_spans = highlighted[i]
@@ -110,7 +110,7 @@ local function apply_grep_highlights(hl_tasks, view)
 end
 
 local function build_grep_view(entries, ctx)
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local view = ToolView.new(buf, grep_view_opts(ctx))
 
   local max_nr = 0
@@ -169,7 +169,7 @@ end
 local function parse_llm_output(text)
   local entries = {}
   local current
-  for _, line in ipairs(maki.split(text, "\n")) do
+  for _, line in ipairs(caudra.split(text, "\n")) do
     local path = line:match("^(%S.+):$")
     if path then
       current = { path = path, groups = { { lines = {} } } }
@@ -196,12 +196,12 @@ local function parse_llm_output(text)
   return entries
 end
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use the **grep** tool when searching for specific content across files.",
 })
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "grep",
   kind = "search",
   description = [[Search file contents using regex.
@@ -232,7 +232,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     local pattern = (input.pattern or ""):gsub('"$', "")
     local spans = { { pattern, "tool" } }
     if input.include then
@@ -267,7 +267,7 @@ maki.api.register_tool({
 
     local max_line_bytes = opts.max_line_bytes
 
-    local entries, err = maki.fs.grep(pattern, {
+    local entries, err = caudra.fs.grep(pattern, {
       path = search_path(input),
       include = input.include,
       context_before = input.context_before or 0,

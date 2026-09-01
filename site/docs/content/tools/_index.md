@@ -7,7 +7,9 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (21 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 21 built-in tools in this reference (21 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+
+First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
 ## File Operations
 
@@ -169,7 +171,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Maki's built-in prompt. Omitted continuations retain their stored profile. |
+| `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |

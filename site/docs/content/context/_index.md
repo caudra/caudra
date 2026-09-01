@@ -7,7 +7,7 @@ group = "Concepts"
 
 # Context
 
-Everything the model knows about your project passes through one context window, and every token in it costs money and attention. This page covers what Maki puts there, when, and where you should put things so they land well.
+Everything the model knows about your project passes through one context window, and every token in it costs money and attention. This page covers what Caudra puts there, when, and where you should put things so they land well.
 
 ## What loads when
 
@@ -21,11 +21,11 @@ memory tag names                     subdir rules    first file_read there
 skill names + descriptions           MCP tool defs   tool_search
 ```
 
-The left column is the fixed overhead of every single request, so Maki keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memories one list of tags, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
+The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memories one list of tags, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
 
 ## Instruction files
 
-At session start Maki walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:
+At session start Caudra walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:
 
 | Order | File |
 |------|------|
@@ -40,17 +40,17 @@ At session start Maki walks from the project git root down to the working direct
 | 9 | `GEMINI.md` |
 | 10 | `CODING_AGENT.md` |
 
-After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.config/maki/AGENTS.md` for preferences that follow you across projects.
+After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.config/caudra/AGENTS.md` for preferences that follow you across projects.
 
 ```
 ~/repo/AGENTS.md           loaded (root)
 ~/repo/AGENTS.local.md     loaded (yours, gitignored)
 ~/repo/api/CLAUDE.md       loaded when cwd is ~/repo/api, wins over root
 ~/repo/web/AGENTS.md       not loaded yet...
-~/.config/maki/AGENTS.md   loaded (global)
+~/.config/caudra/AGENTS.md   loaded (global)
 ```
 
-That `web/AGENTS.md` is not dead weight. The first time `file_read` opens a file under a subdirectory whose instruction file was never loaded, Maki pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
+That `web/AGENTS.md` is not dead weight. The first time `file_read` opens a file under a subdirectory whose instruction file was never loaded, Caudra pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
 
@@ -69,25 +69,25 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 ## Provider request projection
 
-Maki can replace old successful tool-result text with output-ID markers before sending a request to the provider. Only results retained for later retrieval are eligible. This reduces repeated context while keeping the result available through `tool_output_read` and `tool_output_grep`.
+Caudra can replace old successful tool-result text with output-ID markers before sending a request to the provider. Only results retained for later retrieval are eligible. This reduces repeated context while keeping the result available through `tool_output_read` and `tool_output_grep`.
 
 The replacement exists only in the provider request. Canonical session history stays intact. Compaction is separate and can rewrite the live log as described below.
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.
+Long sessions eventually approach the model's context limit. Caudra reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
+Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Caudra parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
 
-An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Maki you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
+An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Caudra you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
 
 ```sh
-cd ~/.local/state/maki/sessions
+cd ~/.local/state/caudra/sessions
 mv <session-id>.jsonl <session-id>.jsonl.bak
 cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-maki -s <session-id>
+caudra -s <session-id>
 ```
 
-`MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
+`CAUDRA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.

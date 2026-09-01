@@ -4,11 +4,11 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::prompt::profile::PromptProfileCatalog;
-use maki_agent::tools::ToolRegistry;
-use maki_config::{load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_storage::StateDir;
+use caudra_agent::prompt::profile::PromptProfileCatalog;
+use caudra_agent::tools::ToolRegistry;
+use caudra_config::{load_env_files, load_permissions};
+use caudra_lua::PluginHost;
+use caudra_storage::StateDir;
 
 use crate::setup;
 
@@ -20,7 +20,7 @@ pub fn run(
     profile_arg: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    caudra_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
@@ -48,7 +48,7 @@ pub fn run(
         .load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let timeouts = maki_providers::Timeouts {
+    let timeouts = caudra_providers::Timeouts {
         connect: config.provider.connect_timeout,
         low_speed: config.provider.low_speed_timeout,
         stream: config.provider.stream_timeout,
@@ -68,10 +68,10 @@ pub fn run(
     let thinking = config
         .always_thinking
         .clone()
-        .map(maki_providers::ThinkingConfig::from)
+        .map(caudra_providers::ThinkingConfig::from)
         .unwrap_or_default();
 
-    maki_acp::run(maki_acp::AcpParams {
+    caudra_acp::run(caudra_acp::AcpParams {
         model,
         config: config.agent,
         permissions_config: config.permissions,

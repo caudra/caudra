@@ -3,7 +3,7 @@
 -- host calls and no globals. Every refresh throws the old rows away and builds
 -- them again, so nothing here can drift from the host list.
 
-local ListPicker = require("maki.list_picker")
+local ListPicker = require("caudra.list_picker")
 
 local RUNNING_SECTION = "Running"
 local FINISHED_SECTION = "Finished"

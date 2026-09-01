@@ -7,28 +7,28 @@ group = "Reference"
 
 # Lua API
 
-Maki plugins are plain Lua files. Everything a plugin can touch lives under
-one global table: `maki`. This reference documents every module, function,
-and method. It is generated straight from the source code by `maki-docgen`.
+Caudra plugins are plain Lua files. Everything a plugin can touch lives under
+one global table: `caudra`. This reference documents every module, function,
+and method. It is generated straight from the source code by `caudra-docgen`.
 For where plugin files live and how to load them, read the
 [Plugins guide](/docs/plugins/) first.
 
-The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
-`maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
+The API tries to mirror Neovim as much as possible (`caudra.fs`, `caudra.uv`,
+`caudra.treesitter`, `caudra.keymap`, `caudra.base64`), signatures are kept identical
 so code can be copy-pasted between the two without too many modifications.
 
 Plugins run compiled to native code (Luau JIT). If you are debugging a
-plugin and want full backtraces, start maki with `--no-jit`: it runs your
+plugin and want full backtraces, start caudra with `--no-jit`: it runs your
 Lua on the interpreter with complete debug info instead.
 
 A small plugin looks like this:
 
 ```lua
-maki.api.register_command({
+caudra.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
   handler = function()
-    maki.ui.flash("hello from a plugin!")
+    caudra.ui.flash("hello from a plugin!")
   end,
 })
 ```
@@ -42,9 +42,9 @@ One convention to remember: fallible runtime operations return a
 `(value, err)` pair instead of throwing. Check `err` before using `value`:
 
 ```lua
-local text, err = maki.fs.read("config.json")
+local text, err = caudra.fs.read("config.json")
 if err then
-  maki.log.error("read failed: " .. err)
+  caudra.log.error("read failed: " .. err)
   return
 end
 ```
@@ -60,7 +60,7 @@ A gated call without its permission raises
 `permission denied: '<name>' not granted for this plugin`.
 
 Grants come from a `plugin.toml` next to the Lua file (for
-`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+`~/.config/caudra/init.lua` that is `~/.config/caudra/plugin.toml`):
 
 ```toml
 [permissions]
@@ -73,7 +73,7 @@ env = true
 
 The rules:
 
-- No `plugin.toml` at all: every permission is denied, and maki logs a
+- No `plugin.toml` at all: every permission is denied, and caudra logs a
   warning at load time.
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
@@ -83,52 +83,52 @@ The rules:
 
 | Module | What it is for |
 | --- | --- |
-| [`maki`](#maki) | The global entry point. |
-| [`maki.api`](#maki-api) | Plugin registration. |
-| [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
-| [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
-| [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
-| [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
-| [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
-| [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
-| [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
-| [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
-| [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
-| [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
-| [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
-| [`maki.json`](#maki-json) | JSON encoding, decoding, and schema validation. |
-| [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
-| [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
-| [`maki.log`](#maki-log) | Structured logging for plugins. |
-| [`maki.model`](#maki-model) | The model behind the focused session. |
-| [`maki.net`](#maki-net) | HTTP client for fetching web content. |
-| [`maki.session`](#maki-session) | Host session primitives. |
-| [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
-| [`maki.text`](#maki-text) | Text transformation utilities. |
-| [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
-| [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
-| [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
-| [`maki.treesitter.Query`](#maki-treesitter-Query) | A compiled tree-sitter query. |
-| [`maki.treesitter.Tree`](#maki-treesitter-Tree) | A parsed syntax tree. |
-| [`maki.treesitter.Node`](#maki-treesitter-Node) | A single node in a parsed syntax tree. |
-| [`maki.treesitter.LanguageTree`](#maki-treesitter-LanguageTree) | Manages parsing of a source string for a single language. |
-| [`maki.ui`](#maki-ui) | Functions for building interactive UI. |
-| [`maki.ui.Win`](#maki-ui-Win) | Handle to a floating or split window. |
-| [`maki.ui.Buf`](#maki-ui-Buf) | A content buffer that holds styled lines of text. |
-| [`maki.uv`](#maki-uv) | System and environment utilities, modelled after `vim.uv`. |
-| [`maki.yaml`](#maki-yaml) | YAML encoding and decoding. |
+| [`caudra`](#caudra) | The global entry point. |
+| [`caudra.api`](#caudra-api) | Plugin registration. |
+| [`caudra.agent`](#caudra-agent) | Subagent primitives for plugins that need to talk to an LLM. |
+| [`caudra.agent.Session`](#caudra-agent-Session) | A subagent session with its own conversation history. |
+| [`caudra.async`](#caudra-async) | Tools for running things concurrently in Lua plugins. |
+| [`caudra.async.Semaphore`](#caudra-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
+| [`caudra.async.Permit`](#caudra-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
+| [`caudra.base64`](#caudra-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
+| [`caudra.env`](#caudra-env) | Paths to caudra's own directories (config, state, logs, legacy). |
+| [`caudra.fn`](#caudra-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
+| [`caudra.fs`](#caudra-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`caudra.image`](#caudra-image) | Small building blocks for working with images: probe metadata, decode |
+| [`caudra.image.Image`](#caudra-image-Image) | A decoded image you can inspect, resize, and re-encode. |
+| [`caudra.interpreter`](#caudra-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
+| [`caudra.json`](#caudra-json) | JSON encoding, decoding, and schema validation. |
+| [`caudra.json.SchemaValidator`](#caudra-json-SchemaValidator) | A compiled JSON Schema validator. |
+| [`caudra.keymap`](#caudra-keymap) | Key mappings, modeled after `vim.keymap`. |
+| [`caudra.log`](#caudra-log) | Structured logging for plugins. |
+| [`caudra.model`](#caudra-model) | The model behind the focused session. |
+| [`caudra.net`](#caudra-net) | HTTP client for fetching web content. |
+| [`caudra.session`](#caudra-session) | Host session primitives. |
+| [`caudra.task`](#caudra-task) | The subagents of the focused session and their transcripts. |
+| [`caudra.text`](#caudra-text) | Text transformation utilities. |
+| [`caudra.treesitter`](#caudra-treesitter) | Tree-sitter parsing and query API. |
+| [`caudra.treesitter.language`](#caudra-treesitter-language) | Language registry for tree-sitter grammars. |
+| [`caudra.treesitter.query`](#caudra-treesitter-query) | Query compilation and lookup. |
+| [`caudra.treesitter.Query`](#caudra-treesitter-Query) | A compiled tree-sitter query. |
+| [`caudra.treesitter.Tree`](#caudra-treesitter-Tree) | A parsed syntax tree. |
+| [`caudra.treesitter.Node`](#caudra-treesitter-Node) | A single node in a parsed syntax tree. |
+| [`caudra.treesitter.LanguageTree`](#caudra-treesitter-LanguageTree) | Manages parsing of a source string for a single language. |
+| [`caudra.ui`](#caudra-ui) | Functions for building interactive UI. |
+| [`caudra.ui.Win`](#caudra-ui-Win) | Handle to a floating or split window. |
+| [`caudra.ui.Buf`](#caudra-ui-Buf) | A content buffer that holds styled lines of text. |
+| [`caudra.uv`](#caudra-uv) | System and environment utilities, modelled after `vim.uv`. |
+| [`caudra.yaml`](#caudra-yaml) | YAML encoding and decoding. |
 
-## maki {#maki}
+## caudra {#caudra}
 
 The global entry point. Every API lives under this table.
 
 ---
 
-### `maki.setup()` {#maki-setup}
+### `caudra.setup()` {#caudra-setup}
 
 ```lua
-maki.setup({config})
+caudra.setup({config})
 ```
 
 Apply your personal configuration. This is only available inside `init.lua` (not in plugins) and can be called at most once. The table accepts the same keys as the Configuration reference.
@@ -140,7 +140,7 @@ Apply your personal configuration. This is only available inside `init.lua` (not
 **Example:**
 
 ```lua
-maki.setup({
+caudra.setup({
 model = "opus",
 keymaps = false,
 })
@@ -148,15 +148,15 @@ keymaps = false,
 
 ---
 
-### `maki.split()` {#maki-split}
+### `caudra.split()` {#caudra-split}
 
 ```lua
-maki.split({s}, {sep}, {opts?})
+caudra.split({s}, {sep}, {opts?})
 ```
 
 Split {s} at each occurrence of {sep} and return the pieces as a
 list. Mirrors Neovim's `vim.split`, so code using it can be copied
-between Neovim and maki. {sep} is a Lua pattern unless `plain` is
+between Neovim and caudra. {sep} is a Lua pattern unless `plain` is
 set; an empty {sep} splits into single characters.
 
 **Parameters:**
@@ -172,31 +172,31 @@ set; an empty {sep} splits into single characters.
 **Example:**
 
 ```lua
-maki.split("a,b,c", ",")                   -- { "a", "b", "c" }
-maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
-maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+caudra.split("a,b,c", ",")                   -- { "a", "b", "c" }
+caudra.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
+caudra.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
 ```
 
 
-## maki.api {#maki-api}
+## caudra.api {#caudra-api}
 
-Plugin registration. This is where you tell maki about your tools,
+Plugin registration. This is where you tell caudra about your tools,
 slash commands, and prompt contributions.
 
 Most plugins only need `register_tool` and maybe `register_prompt_hint`.
 Call these at the top level of your plugin file (during load).
 
 ```lua
-maki.api.register_tool({ name = "greet", ... })
-maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
+caudra.api.register_tool({ name = "greet", ... })
+caudra.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
 ```
 
 ---
 
-### `maki.api.register_tool()` {#maki-api-register_tool}
+### `caudra.api.register_tool()` {#caudra-api-register_tool}
 
 ```lua
-maki.api.register_tool({spec})
+caudra.api.register_tool({spec})
 ```
 
 Register a new tool the agent can call. This is the main way plugins add
@@ -252,7 +252,7 @@ for later retrieval. Truncate in the producer only when loss is intentional.
 **Example:**
 
 ```lua
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "word_count",
   description = "Count words in a file.",
   kind = "read",
@@ -273,10 +273,10 @@ maki.api.register_tool({
 
 ---
 
-### `maki.api.register_permission_rule()` {#maki-api-register_permission_rule}
+### `caudra.api.register_permission_rule()` {#caudra-api-register_permission_rule}
 
 ```lua
-maki.api.register_permission_rule({spec})
+caudra.api.register_permission_rule({spec})
 ```
 
 Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -299,7 +299,7 @@ deny rules always win over a plugin allow.
 **Example:**
 
 ```lua
-maki.api.register_permission_rule({
+caudra.api.register_permission_rule({
   tool = "write",
   scope = notes_dir .. "/**",
 })
@@ -307,10 +307,10 @@ maki.api.register_permission_rule({
 
 ---
 
-### `maki.api.register_command()` {#maki-api-register_command}
+### `caudra.api.register_command()` {#caudra-api-register_command}
 
 ```lua
-maki.api.register_command({spec})
+caudra.api.register_command({spec})
 ```
 
 Register a slash-command that appears in the user input bar.
@@ -342,21 +342,21 @@ browsing memory files or toggling settings.
 **Example:**
 
 ```lua
-maki.api.register_command({
+caudra.api.register_command({
   name = "/hello",
   description = "Say hello",
   handler = function()
-    maki.ui.flash("Hello from my plugin!")
+    caudra.ui.flash("Hello from my plugin!")
   end,
 })
 ```
 
 ---
 
-### `maki.api.register_prompt_hint()` {#maki-api-register_prompt_hint}
+### `caudra.api.register_prompt_hint()` {#caudra-api-register_prompt_hint}
 
 ```lua
-maki.api.register_prompt_hint({spec})
+caudra.api.register_prompt_hint({spec})
 ```
 
 Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -378,7 +378,7 @@ Throws if you pass a singleton slot name.
 **Example:**
 
 ```lua
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Prefer **grep** over reading entire files.",
 })
@@ -386,14 +386,14 @@ maki.api.register_prompt_hint({
 
 ---
 
-### `maki.api.register_options()` {#maki-api-register_options}
+### `caudra.api.register_options()` {#caudra-api-register_options}
 
 ```lua
-maki.api.register_options({spec})
+caudra.api.register_options({spec})
 ```
 
 Declare the options your plugin accepts under `plugins.<name>` in
-`maki.setup`, and get back what the user set merged with your defaults.
+`caudra.setup`, and get back what the user set merged with your defaults.
 Call it once, at the top level of your plugin file.
 
 An unknown key, a wrong type, or a value below `min` fails the plugin
@@ -413,7 +413,7 @@ fail the load too. The specs also feed the generated configuration docs.
 **Example:**
 
 ```lua
-local opts = maki.api.register_options({
+local opts = caudra.api.register_options({
   timeout_secs = { default = 120, min = 5, desc = "Kill the command after this many seconds." },
   max_output_lines = { type = "integer", desc = "Override agent.max_output_lines for this tool." },
 })
@@ -421,10 +421,10 @@ local opts = maki.api.register_options({
 
 ---
 
-### `maki.api.set_prompt()` {#maki-api-set_prompt}
+### `caudra.api.set_prompt()` {#caudra-api-set_prompt}
 
 ```lua
-maki.api.set_prompt({spec})
+caudra.api.set_prompt({spec})
 ```
 
 Set a singleton prompt slot. Only one plugin owns each singleton slot at a
@@ -446,7 +446,7 @@ Throws if you pass an aggregate slot name.
 **Example:**
 
 ```lua
-maki.api.set_prompt({
+caudra.api.set_prompt({
   slot = "tone",
   content = "Be concise. No filler words.",
 })
@@ -454,10 +454,10 @@ maki.api.set_prompt({
 
 ---
 
-### `maki.api.get_tools()` {#maki-api-get_tools}
+### `caudra.api.get_tools()` {#caudra-api-get_tools}
 
 ```lua
-maki.api.get_tools({opts?})
+caudra.api.get_tools({opts?})
 ```
 
 Return a list of all registered tools. Useful for building UI that shows
@@ -476,7 +476,7 @@ Describe callbacks are not invoked (the static description is used).
 **Example:**
 
 ```lua
-local tools = maki.api.get_tools()
+local tools = caudra.api.get_tools()
 for _, t in ipairs(tools) do
   print(t.name, t.enabled)
 end
@@ -484,10 +484,10 @@ end
 
 ---
 
-### `maki.api.get_tool()` {#maki-api-get_tool}
+### `caudra.api.get_tool()` {#caudra-api-get_tool}
 
 ```lua
-maki.api.get_tool({name})
+caudra.api.get_tool({name})
 ```
 
 Look up a single tool by name. Returns its metadata table or nil if the
@@ -504,7 +504,7 @@ throw).
 **Example:**
 
 ```lua
-local t = maki.api.get_tool("bash")
+local t = caudra.api.get_tool("bash")
 if t then
   print("bash audiences:", table.concat(t.audiences, ", "))
 end
@@ -512,10 +512,10 @@ end
 
 ---
 
-### `maki.api.run_command()` {#maki-api-run_command}
+### `caudra.api.run_command()` {#caudra-api-run_command}
 
 ```lua
-maki.api.run_command({cmdline})
+caudra.api.run_command({cmdline})
 ```
 
 Runs a slash command by name, exactly as typing it in the input would.
@@ -523,7 +523,7 @@ Works for built-ins, custom `/project:` and `/user:` commands, MCP
 prompts, and commands other plugins registered.
 
 Use it to alias a command you like under a name you prefer, instead of
-reimplementing what it does. See `maki.ui.action` for the same idea
+reimplementing what it does. See `caudra.ui.action` for the same idea
 applied to keybound UI actions.
 
 Pass the whole command line, arguments included: `"/cd ~/src"`. The
@@ -545,13 +545,13 @@ block your handler.
 
 ```lua
 -- /resume as an alias for the built-in session picker:
-maki.api.register_command({
+caudra.api.register_command({
   name = "/resume",
   description = "Alias for /sessions",
   handler = function()
-    local ok, err = maki.api.run_command("/sessions")
+    local ok, err = caudra.api.run_command("/sessions")
     if not ok then
-      maki.ui.flash("could not run /sessions: " .. err)
+      caudra.ui.flash("could not run /sessions: " .. err)
     end
   end,
 })
@@ -559,10 +559,10 @@ maki.api.register_command({
 
 ---
 
-### `maki.api.create_autocmd()` {#maki-api-create_autocmd}
+### `caudra.api.create_autocmd()` {#caudra-api-create_autocmd}
 
 ```lua
-maki.api.create_autocmd({event}, {opts})
+caudra.api.create_autocmd({event}, {opts})
 ```
 
 Listen for one or more events. Returns an id you can pass to
@@ -600,7 +600,7 @@ old tasks.
 **Example:**
 
 ```lua
-local id = maki.api.create_autocmd("TurnEnd", {
+local id = caudra.api.create_autocmd("TurnEnd", {
   callback = function(ev)
     print("turn ended: " .. ev.event)
   end,
@@ -609,10 +609,10 @@ local id = maki.api.create_autocmd("TurnEnd", {
 
 ---
 
-### `maki.api.del_autocmd()` {#maki-api-del_autocmd}
+### `caudra.api.del_autocmd()` {#caudra-api-del_autocmd}
 
 ```lua
-maki.api.del_autocmd({id})
+caudra.api.del_autocmd({id})
 ```
 
 Remove a previously registered autocmd. Does nothing if the {id}
@@ -625,15 +625,15 @@ does not exist.
 **Example:**
 
 ```lua
-maki.api.del_autocmd(id)
+caudra.api.del_autocmd(id)
 ```
 
 ---
 
-### `maki.api.exec_autocmds()` {#maki-api-exec_autocmds}
+### `caudra.api.exec_autocmds()` {#caudra-api-exec_autocmds}
 
 ```lua
-maki.api.exec_autocmds({event}, {opts?})
+caudra.api.exec_autocmds({event}, {opts?})
 ```
 
 Fire one or more events manually. Every matching autocmd callback
@@ -649,7 +649,7 @@ runs synchronously before this function returns.
 **Example:**
 
 ```lua
-maki.api.exec_autocmds("MyEvent", {
+caudra.api.exec_autocmds("MyEvent", {
   pattern = "init",
   data = { msg = "hello" },
 })
@@ -657,10 +657,10 @@ maki.api.exec_autocmds("MyEvent", {
 
 ---
 
-### `maki.api.declare_slot()` {#maki-api-declare_slot}
+### `caudra.api.declare_slot()` {#caudra-api-declare_slot}
 
 ```lua
-maki.api.declare_slot({name}, {default})
+caudra.api.declare_slot({name}, {default})
 ```
 
 Create a named extension point owned by your plugin. You provide a
@@ -680,7 +680,7 @@ Throws if another plugin already owns a slot with the same {name}.
 **Example:**
 
 ```lua
-local render = maki.api.declare_slot("myplugin.render", function(text)
+local render = caudra.api.declare_slot("myplugin.render", function(text)
   return text:upper()
 end)
 print(render("hello")) -- HELLO
@@ -688,10 +688,10 @@ print(render("hello")) -- HELLO
 
 ---
 
-### `maki.api.set_slot()` {#maki-api-set_slot}
+### `caudra.api.set_slot()` {#caudra-api-set_slot}
 
 ```lua
-maki.api.set_slot({name}, {wrapper})
+caudra.api.set_slot({name}, {wrapper})
 ```
 
 Add a layer around an existing (or future) slot. Layers wrap the
@@ -710,17 +710,17 @@ is queued and attached when the slot is declared.
 **Example:**
 
 ```lua
-maki.api.set_slot("myplugin.render", function(prev, text)
+caudra.api.set_slot("myplugin.render", function(prev, text)
   return prev("[" .. text .. "]")
 end)
 ```
 
 ---
 
-### `maki.api.get_slots()` {#maki-api-get_slots}
+### `caudra.api.get_slots()` {#caudra-api-get_slots}
 
 ```lua
-maki.api.get_slots()
+caudra.api.get_slots()
 ```
 
 List all known slots and their current state. Useful for debugging
@@ -731,13 +731,13 @@ which plugins own or wrap each slot.
 **Example:**
 
 ```lua
-for name, info in pairs(maki.api.get_slots()) do
+for name, info in pairs(caudra.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
 ```
 
 
-## maki.agent {#maki-agent}
+## caudra.agent {#caudra-agent}
 
 Subagent primitives for plugins that need to talk to an LLM.
 
@@ -749,8 +749,8 @@ Policy like retries, validation, and concurrency lives in the calling
 plugin, not here.
 
 ```lua
-local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-local sess = maki.agent.session(ctx, {
+local tools = caudra.agent.tools(ctx, { audience = "general_sub" })
+local sess = caudra.agent.session(ctx, {
   system = "You are a helpful assistant.",
   tools = tools,
 })
@@ -761,10 +761,10 @@ sess:close()
 
 ---
 
-### `maki.agent.resolve_model()` {#maki-agent-resolve_model}
+### `caudra.agent.resolve_model()` {#caudra-agent-resolve_model}
 
 ```lua
-maki.agent.resolve_model({ctx}, {opts?})
+caudra.agent.resolve_model({ctx}, {opts?})
 ```
 
 Look up the model that the current agent is using, or pick a cheaper one.
@@ -788,17 +788,17 @@ The returned table has fields: `id` (string), `tier` (string),
 **Example:**
 
 ```lua
-local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+local model, err = caudra.agent.resolve_model(ctx, { tier = "weak" })
 if err then error(err) end
 print(model.spec, model.tier)
 ```
 
 ---
 
-### `maki.agent.system_prompt()` {#maki-agent-system_prompt}
+### `caudra.agent.system_prompt()` {#caudra-agent-system_prompt}
 
 ```lua
-maki.agent.system_prompt({ctx}, {opts})
+caudra.agent.system_prompt({ctx}, {opts})
 ```
 
 Build a system prompt from a built-in template. Environment variables like
@@ -814,7 +814,7 @@ prompt for a subagent session.
   Optional fields:
 
   - `instructions` (`string|boolean?`) extra text appended to the prompt.
-    `true` loads instructions from the project `.maki/instructions` file.
+    `true` loads instructions from the project `.caudra/instructions` file.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
@@ -822,7 +822,7 @@ prompt for a subagent session.
 **Example:**
 
 ```lua
-local prompt, err = maki.agent.system_prompt(ctx, {
+local prompt, err = caudra.agent.system_prompt(ctx, {
   prompt_id = "research",
   instructions = true,
 })
@@ -831,14 +831,14 @@ if err then error(err) end
 
 ---
 
-### `maki.agent.tools()` {#maki-agent-tools}
+### `caudra.agent.tools()` {#caudra-agent-tools}
 
 ```lua
-maki.agent.tools({ctx}, {opts})
+caudra.agent.tools({ctx}, {opts})
 ```
 
 Get the list of tool definitions for a given audience. Pass the result
-straight into `maki.agent.session()` or use it to inspect what tools are
+straight into `caudra.agent.session()` or use it to inspect what tools are
 available.
 
 **Parameters:**
@@ -860,7 +860,7 @@ available.
 **Example:**
 
 ```lua
-local defs, err = maki.agent.tools(ctx, {
+local defs, err = caudra.agent.tools(ctx, {
   audience = "general_sub",
   except = { "bash", "write" },
 })
@@ -870,10 +870,10 @@ print(#defs .. " tools available")
 
 ---
 
-### `maki.agent.call_tool()` {#maki-agent-call_tool}
+### `caudra.agent.call_tool()` {#caudra-agent-call_tool}
 
 ```lua
-maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
+caudra.agent.call_tool({ctx}, {name}, {input}, {opts?})
 ```
 
 Run a tool by name and wait for the result. This is how you call built-in
@@ -901,7 +901,7 @@ through optional callbacks while the tool runs.
 **Example:**
 
 ```lua
-local out, err = maki.agent.call_tool(ctx, "bash", {
+local out, err = caudra.agent.call_tool(ctx, "bash", {
   command = "ls -la",
   timeout = 10,
 })
@@ -911,10 +911,10 @@ print(out)
 
 ---
 
-### `maki.agent.session()` {#maki-agent-session}
+### `caudra.agent.session()` {#caudra-agent-session}
 
 ```lua
-maki.agent.session({ctx}, {opts})
+caudra.agent.session({ctx}, {opts})
 ```
 
 Create a new subagent session. The session inherits the parent model and
@@ -930,7 +930,7 @@ and tool set.
 - `{opts}` (`table`) Optional fields:
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
   - `system` (`string?`) system prompt. Defaults to empty.
-  - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
+  - `tools` (`table?`) tool definitions array (from `caudra.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
     `handler` (function). Optional `effect` is `read_only`, `isolated`,
@@ -961,13 +961,13 @@ and tool set.
   corresponding generic session options.
 
 
-**Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
+**Returns:** ([`Session?`](#caudra-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
 **Example:**
 
 ```lua
-local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-local sess, err = maki.agent.session(ctx, {
+local tools = caudra.agent.tools(ctx, { audience = "general_sub" })
+local sess, err = caudra.agent.session(ctx, {
   system = "You are a research assistant.",
   tools = tools,
   name = "researcher",
@@ -978,11 +978,11 @@ sess:close()
 ```
 
 
-## maki.agent.Session {#maki-agent-Session}
+## caudra.agent.Session {#caudra-agent-Session}
 
 A subagent session with its own conversation history.
 
-Create one with `maki.agent.session()`, then send messages with
+Create one with `caudra.agent.session()`, then send messages with
 `:prompt()`. The session remembers previous turns, so you can have
 a multi-step conversation. Call `:close()` when you are done, or let
 garbage collection handle it.
@@ -1046,7 +1046,7 @@ call this multiple times safely. If you forget, it runs automatically when
 the session is garbage collected.
 
 
-## maki.async {#maki-async}
+## caudra.async {#caudra-async}
 
 Tools for running things concurrently in Lua plugins.
 
@@ -1056,7 +1056,7 @@ The `await` and `wrap` helpers bridge callback-based APIs into
 coroutine-friendly calls.
 
 ```lua
-local results = maki.async.gather({
+local results = caudra.async.gather({
   function() return fetch("a.txt") end,
   function() return fetch("b.txt") end,
 })
@@ -1064,10 +1064,10 @@ local results = maki.async.gather({
 
 ---
 
-### `maki.async.run()` {#maki-async-run}
+### `caudra.async.run()` {#caudra-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+caudra.async.run({fn}, {on_finish?})
 ```
 
 Fire off a function as a new async task. It runs in the background and
@@ -1082,7 +1082,7 @@ callback.
 **Example:**
 
 ```lua
-maki.async.run(function()
+caudra.async.run(function()
   local data = expensive_fetch()
   process(data)
 end)
@@ -1090,10 +1090,10 @@ end)
 
 ---
 
-### `maki.async.await()` {#maki-async-await}
+### `caudra.async.await()` {#caudra-async-await}
 
 ```lua
-maki.async.await({argc}, {fn}, {...})
+caudra.async.await({argc}, {fn}, {...})
 ```
 
 Turn a callback-based function into a normal call you can use in a coroutine. It calls `fn(..., callback)`, inserting the callback at position {argc}, then suspends your coroutine until the callback fires. You get back whatever the callback was called with.
@@ -1109,22 +1109,22 @@ Turn a callback-based function into a normal call you can use in a coroutine. It
 **Example:**
 
 ```lua
-local result = maki.async.await(2, http.get, url)
+local result = caudra.async.await(2, http.get, url)
 ```
 
 ---
 
-### `maki.async.wrap()` {#maki-async-wrap}
+### `caudra.async.wrap()` {#caudra-async-wrap}
 
 ```lua
-maki.async.wrap({argc}, {fn})
+caudra.async.wrap({argc}, {fn})
 ```
 
-Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `maki.async.await` for you, so you can use the result like a normal function call.
+Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `caudra.async.await` for you, so you can use the result like a normal function call.
 
 **Parameters:**
 
-- `{argc}` (`integer`) Callback position, forwarded to `maki.async.await`.
+- `{argc}` (`integer`) Callback position, forwarded to `caudra.async.await`.
 - `{fn}` (`function`) Callback-based function to wrap.
 
 **Returns:** (`function`) Wrapped function you can call like a normal function.
@@ -1132,16 +1132,16 @@ Create a coroutine-friendly wrapper around a callback-based function. The wrappe
 **Example:**
 
 ```lua
-local get = maki.async.wrap(2, http.get)
+local get = caudra.async.wrap(2, http.get)
 local body = get(url)
 ```
 
 ---
 
-### `maki.async.join()` {#maki-async-join}
+### `caudra.async.join()` {#caudra-async-join}
 
 ```lua
-maki.async.join({max_jobs}, {fns})
+caudra.async.join({max_jobs}, {fns})
 ```
 
 Run all functions in {fns} with at most {max_jobs} going at once. Waits until every function has finished. Unlike `gather`, this does not return individual results.
@@ -1154,7 +1154,7 @@ Run all functions in {fns} with at most {max_jobs} going at once. Waits until ev
 **Example:**
 
 ```lua
-maki.async.join(4, {
+caudra.async.join(4, {
   function() process(files[1]) end,
   function() process(files[2]) end,
   function() process(files[3]) end,
@@ -1163,10 +1163,10 @@ maki.async.join(4, {
 
 ---
 
-### `maki.async.gather()` {#maki-async-gather}
+### `caudra.async.gather()` {#caudra-async-gather}
 
 ```lua
-maki.async.gather({fns})
+caudra.async.gather({fns})
 ```
 
 Run all functions in {fns} at the same time and collect their results.
@@ -1185,7 +1185,7 @@ Each entry in the result array has `ok` (boolean), and either `value`
 **Example:**
 
 ```lua
-local results = maki.async.gather({
+local results = caudra.async.gather({
   function() return fetch("a.txt") end,
   function() return fetch("b.txt") end,
 })
@@ -1196,10 +1196,10 @@ end
 
 ---
 
-### `maki.async.semaphore()` {#maki-async-semaphore}
+### `caudra.async.semaphore()` {#caudra-async-semaphore}
 
 ```lua
-maki.async.semaphore({n})
+caudra.async.semaphore({n})
 ```
 
 Create a counting semaphore that allows at most {n} concurrent permits.
@@ -1209,12 +1209,12 @@ Use this to limit how many tasks hit a resource at the same time.
 
 - `{n}` (`integer`) Maximum number of concurrent permits. Values below 1 are clamped to 1.
 
-**Returns:** ([`maki.async.Semaphore`](#maki-async-Semaphore)) A new semaphore.
+**Returns:** ([`caudra.async.Semaphore`](#caudra-async-Semaphore)) A new semaphore.
 
 **Example:**
 
 ```lua
-local sem = maki.async.semaphore(5)
+local sem = caudra.async.semaphore(5)
 -- each task acquires a permit before doing work
 local permit = sem:acquire()
 do_work()
@@ -1223,10 +1223,10 @@ permit:release()
 
 ---
 
-### `maki.async.on_cancel()` {#maki-async-on_cancel}
+### `caudra.async.on_cancel()` {#caudra-async-on_cancel}
 
 ```lua
-maki.async.on_cancel({fn})
+caudra.async.on_cancel({fn})
 ```
 
 Register {fn} to run as soon as the current task is cancelled or hits
@@ -1252,19 +1252,19 @@ other hooks still run.
 **Example:**
 
 ```lua
-maki.async.on_cancel(function(reason)
+caudra.async.on_cancel(function(reason)
   view:append({ { reason, "tool_error" } })
   ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 end)
-maki.async.gather(children)
+caudra.async.gather(children)
 ```
 
 
-## maki.async.Semaphore {#maki-async-Semaphore}
+## caudra.async.Semaphore {#caudra-async-Semaphore}
 
 A counting semaphore for limiting how many tasks run at once.
 
-Create one with `maki.async.semaphore(n)`, then call `:acquire()` to
+Create one with `caudra.async.semaphore(n)`, then call `:acquire()` to
 get a permit before doing work. If the task is cancelled, the acquire
 is cancelled too.
 
@@ -1279,19 +1279,19 @@ Semaphore:acquire()
 Wait for a permit from the semaphore. Your coroutine suspends until a slot
 opens up. If the owning task is cancelled, the acquire is cancelled too.
 
-**Returns:** ([`maki.async.Permit`](#maki-async-Permit)) A permit handle. Call `:release()` when done, or let it be garbage collected.
+**Returns:** ([`caudra.async.Permit`](#caudra-async-Permit)) A permit handle. Call `:release()` when done, or let it be garbage collected.
 
 **Example:**
 
 ```lua
-local sem = maki.async.semaphore(3)
+local sem = caudra.async.semaphore(3)
 local permit = sem:acquire()
 -- do work that needs the slot
 permit:release()
 ```
 
 
-## maki.async.Permit {#maki-async-Permit}
+## caudra.async.Permit {#caudra-async-Permit}
 
 One slot in a semaphore, obtained from `Semaphore:acquire()`.
 
@@ -1310,24 +1310,24 @@ Give the permit back to the semaphore so another task can acquire it.
 Throws if you already released this permit.
 
 
-## maki.base64 {#maki-base64}
+## caudra.base64 {#caudra-base64}
 
 Base64 encoding and decoding, modelled after `vim.base64`.
 
 Both functions accept strings and Luau buffers, so you can round-trip
-binary data read with `maki.fs.read_bytes`.
+binary data read with `caudra.fs.read_bytes`.
 
 ```lua
-local encoded = maki.base64.encode("hello")
-local decoded = maki.base64.decode(encoded)
+local encoded = caudra.base64.encode("hello")
+local decoded = caudra.base64.decode(encoded)
 ```
 
 ---
 
-### `maki.base64.encode()` {#maki-base64-encode}
+### `caudra.base64.encode()` {#caudra-base64-encode}
 
 ```lua
-maki.base64.encode({data})
+caudra.base64.encode({data})
 ```
 
 Encode {data} to standard Base64. Like `vim.base64.encode`.
@@ -1342,15 +1342,15 @@ Accepts both strings and Luau buffers.
 **Example:**
 
 ```lua
-maki.base64.encode("hello") -- "aGVsbG8="
+caudra.base64.encode("hello") -- "aGVsbG8="
 ```
 
 ---
 
-### `maki.base64.decode()` {#maki-base64-decode}
+### `caudra.base64.decode()` {#caudra-base64-decode}
 
 ```lua
-maki.base64.decode({str})
+caudra.base64.decode({str})
 ```
 
 Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
@@ -1365,30 +1365,30 @@ Throws if {str} is not valid Base64.
 **Example:**
 
 ```lua
-maki.base64.decode("aGVsbG8=") -- "hello"
+caudra.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
-## maki.env {#maki-env}
+## caudra.env {#caudra-env}
 
-Paths to maki's own directories (config, state, logs, legacy).
+Paths to caudra's own directories (config, state, logs, legacy).
 
 Use these to locate config files or persistent state without hard-coding paths.
 
 ```lua
-local cfg = maki.env.config_dir()
+local cfg = caudra.env.config_dir()
 ```
 
 ---
 
-### `maki.env.state_dir()` {#maki-env-state_dir}
+### `caudra.env.state_dir()` {#caudra-env-state_dir}
 
 ```lua
-maki.env.state_dir()
+caudra.env.state_dir()
 ```
 
-Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
-Typically `~/.local/state/maki`, or `~/.local/state/maki-debug` in debug builds.
+Return the directory where caudra stores runtime state (sessions, auth tokens, etc.).
+Typically `~/.local/state/caudra`, or `~/.local/state/caudra-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1397,19 +1397,19 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.state_dir()
+local dir = caudra.env.state_dir()
 ```
 
 ---
 
-### `maki.env.config_dir()` {#maki-env-config_dir}
+### `caudra.env.config_dir()` {#caudra-env-config_dir}
 
 ```lua
-maki.env.config_dir()
+caudra.env.config_dir()
 ```
 
-Return the directory where maki looks for user configuration files.
-Typically `~/.config/maki`, or `~/.config/maki-debug` in debug builds.
+Return the directory where caudra looks for user configuration files.
+Typically `~/.config/caudra`, or `~/.config/caudra-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1418,19 +1418,19 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.config_dir()
+local dir = caudra.env.config_dir()
 ```
 
 ---
 
-### `maki.env.logs_dir()` {#maki-env-logs_dir}
+### `caudra.env.logs_dir()` {#caudra-env-logs_dir}
 
 ```lua
-maki.env.logs_dir()
+caudra.env.logs_dir()
 ```
 
-Return the directory where maki writes its log files (`maki.log`).
-Typically `~/.local/logs/maki`, or `~/.local/logs/maki-debug` in debug builds.
+Return the directory where caudra writes its log files (`caudra.log`).
+Typically `~/.local/logs/caudra`, or `~/.local/logs/caudra-debug` in debug builds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1439,19 +1439,19 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.logs_dir()
+local dir = caudra.env.logs_dir()
 ```
 
 ---
 
-### `maki.env.legacy_dir()` {#maki-env-legacy_dir}
+### `caudra.env.legacy_dir()` {#caudra-env-legacy_dir}
 
 ```lua
-maki.env.legacy_dir()
+caudra.env.legacy_dir()
 ```
 
 Return the active build's legacy config path, if it exists on disk.
-This is `~/.maki` in release builds and `~/.maki-debug` in debug builds.
+This is `~/.caudra` in release builds and `~/.caudra-debug` in debug builds.
 Useful for migration logic. Returns nil when there is no legacy directory.
 
 Requires the `env` [plugin permission](#plugin-permissions).
@@ -1459,24 +1459,24 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
 
-## maki.fn {#maki-fn}
+## caudra.fn {#caudra-fn}
 
 Process and environment helpers, modeled after Neovim's `vim.fn` job
 control. Use these to run shell commands, wait for output, and check
 whether programs are installed.
 
 ```lua
-local id = maki.fn.jobstart("git status", {
+local id = caudra.fn.jobstart("git status", {
   on_exit = function(code) print("done: " .. code) end,
 })
 ```
 
 ---
 
-### `maki.fn.jobstart()` {#maki-fn-jobstart}
+### `caudra.fn.jobstart()` {#caudra-fn-jobstart}
 
 ```lua
-maki.fn.jobstart({cmd}, {opts?})
+caudra.fn.jobstart({cmd}, {opts?})
 ```
 
 Run a shell command in the background. The command runs through
@@ -1506,7 +1506,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart("ls -la", {
+local id = caudra.fn.jobstart("ls -la", {
   cwd = "~/projects",
   on_stdout = function(_, line) print(line) end,
   on_exit = function(_, code) print("exit: " .. code) end,
@@ -1515,10 +1515,10 @@ local id = maki.fn.jobstart("ls -la", {
 
 ---
 
-### `maki.fn.jobstop()` {#maki-fn-jobstop}
+### `caudra.fn.jobstop()` {#caudra-fn-jobstop}
 
 ```lua
-maki.fn.jobstop({job_id})
+caudra.fn.jobstop({job_id})
 ```
 
 Kill a running job immediately (SIGKILL on Unix). Safe to call on
@@ -1533,15 +1533,15 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-maki.fn.jobstop(id)
+caudra.fn.jobstop(id)
 ```
 
 ---
 
-### `maki.fn.jobwait()` {#maki-fn-jobwait}
+### `caudra.fn.jobwait()` {#caudra-fn-jobwait}
 
 ```lua
-maki.fn.jobwait({job_id}, {timeout_ms?})
+caudra.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
@@ -1565,8 +1565,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart("echo hello")
-local result = maki.fn.jobwait(id, 5000)
+local id = caudra.fn.jobstart("echo hello")
+local result = caudra.fn.jobwait(id, 5000)
 if result then
   print(result.stdout)
 end
@@ -1574,10 +1574,10 @@ end
 
 ---
 
-### `maki.fn.executable()` {#maki-fn-executable}
+### `caudra.fn.executable()` {#caudra-fn-executable}
 
 ```lua
-maki.fn.executable({name})
+caudra.fn.executable({name})
 ```
 
 Check whether {name} can be found on `$PATH` or is an absolute path
@@ -1595,22 +1595,22 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-if maki.fn.executable("rg") == 1 then
+if caudra.fn.executable("rg") == 1 then
   -- use ripgrep
 end
 ```
 
 ---
 
-### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
+### `caudra.fn.winsaveview()` {#caudra-fn-winsaveview}
 
 ```lua
-maki.fn.winsaveview()
+caudra.fn.winsaveview()
 ```
 
 Read the viewport of the focused chat transcript, like Neovim's
 `vim.fn.winsaveview()`. The transcript is the only scrollable window
-maki has, so there is no window argument.
+caudra has, so there is no window argument.
 
 `topline` is the 1-based transcript line at the top of the viewport, so
 the last visible one is `math.min(topline + height - 1, line_count)`.
@@ -1622,16 +1622,16 @@ follows streaming output.
 **Example:**
 
 ```lua
-local view = maki.fn.winsaveview()
-maki.fn.winrestview({ topline = view.topline + 1 })
+local view = caudra.fn.winsaveview()
+caudra.fn.winrestview({ topline = view.topline + 1 })
 ```
 
 ---
 
-### `maki.fn.winrestview()` {#maki-fn-winrestview}
+### `caudra.fn.winrestview()` {#caudra-fn-winrestview}
 
 ```lua
-maki.fn.winrestview({view})
+caudra.fn.winrestview({view})
 ```
 
 Scroll the focused chat transcript so that the `topline` field of
@@ -1651,11 +1651,11 @@ the bottom re-pins it so streaming output keeps following.
 **Example:**
 
 ```lua
-maki.fn.winrestview({ topline = 1 })
+caudra.fn.winrestview({ topline = 1 })
 ```
 
 
-## maki.fs {#maki-fs}
+## caudra.fs {#caudra-fs}
 
 File-system utilities, modelled after `vim.fs` and `vim.uv`.
 
@@ -1663,16 +1663,16 @@ Fallible operations return `(value, err)` pairs and never throw.
 Paths support `~/` expansion. Relative paths resolve from the current working directory.
 
 ```lua
-local text, err = maki.fs.read("init.lua")
+local text, err = caudra.fs.read("init.lua")
 if err then return end
 ```
 
 ---
 
-### `maki.fs.read()` {#maki-fs-read}
+### `caudra.fs.read()` {#caudra-fs-read}
 
 ```lua
-maki.fs.read({path})
+caudra.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
@@ -1690,23 +1690,23 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local text, err = maki.fs.read("config.toml")
+local text, err = caudra.fs.read("config.toml")
 if err then
-  maki.log.warn("could not read config: " .. err)
+  caudra.log.warn("could not read config: " .. err)
   return
 end
 ```
 
 ---
 
-### `maki.fs.read_bytes()` {#maki-fs-read_bytes}
+### `caudra.fs.read_bytes()` {#caudra-fs-read_bytes}
 
 ```lua
-maki.fs.read_bytes({path})
+caudra.fs.read_bytes({path})
 ```
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
-Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+Useful for binary files or when you need to pass the data to `caudra.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -1719,17 +1719,17 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local buf, err = maki.fs.read_bytes("image.png")
+local buf, err = caudra.fs.read_bytes("image.png")
 if err then return end
-local encoded = maki.base64.encode(buf)
+local encoded = caudra.base64.encode(buf)
 ```
 
 ---
 
-### `maki.fs.metadata()` {#maki-fs-metadata}
+### `caudra.fs.metadata()` {#caudra-fs-metadata}
 
 ```lua
-maki.fs.metadata({path})
+caudra.fs.metadata({path})
 ```
 
 Get metadata for the file or directory at {path}.
@@ -1749,7 +1749,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local meta = maki.fs.metadata("src/main.rs")
+local meta = caudra.fs.metadata("src/main.rs")
 if meta and meta.is_file then
   print("size: " .. meta.size)
 end
@@ -1757,10 +1757,10 @@ end
 
 ---
 
-### `maki.fs.dirname()` {#maki-fs-dirname}
+### `caudra.fs.dirname()` {#caudra-fs-dirname}
 
 ```lua
-maki.fs.dirname({path})
+caudra.fs.dirname({path})
 ```
 
 Return the parent directory of {path}. Like `vim.fs.dirname`.
@@ -1774,15 +1774,15 @@ Return the parent directory of {path}. Like `vim.fs.dirname`.
 **Example:**
 
 ```lua
-maki.fs.dirname("/home/user/init.lua") -- "/home/user"
+caudra.fs.dirname("/home/user/init.lua") -- "/home/user"
 ```
 
 ---
 
-### `maki.fs.basename()` {#maki-fs-basename}
+### `caudra.fs.basename()` {#caudra-fs-basename}
 
 ```lua
-maki.fs.basename({path})
+caudra.fs.basename({path})
 ```
 
 Return the final component (the file name) of {path}. Like `vim.fs.basename`.
@@ -1796,15 +1796,15 @@ Return the final component (the file name) of {path}. Like `vim.fs.basename`.
 **Example:**
 
 ```lua
-maki.fs.basename("/home/user/init.lua") -- "init.lua"
+caudra.fs.basename("/home/user/init.lua") -- "init.lua"
 ```
 
 ---
 
-### `maki.fs.joinpath()` {#maki-fs-joinpath}
+### `caudra.fs.joinpath()` {#caudra-fs-joinpath}
 
 ```lua
-maki.fs.joinpath({...})
+caudra.fs.joinpath({...})
 ```
 
 Join one or more path segments into a single path. Like `vim.fs.joinpath`.
@@ -1818,15 +1818,15 @@ Join one or more path segments into a single path. Like `vim.fs.joinpath`.
 **Example:**
 
 ```lua
-maki.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
+caudra.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
 ```
 
 ---
 
-### `maki.fs.normalize()` {#maki-fs-normalize}
+### `caudra.fs.normalize()` {#caudra-fs-normalize}
 
 ```lua
-maki.fs.normalize({path})
+caudra.fs.normalize({path})
 ```
 
 Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
@@ -1841,15 +1841,15 @@ This is purely string-based and does not touch the filesystem.
 **Example:**
 
 ```lua
-maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
+caudra.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
 ```
 
 ---
 
-### `maki.fs.abspath()` {#maki-fs-abspath}
+### `caudra.fs.abspath()` {#caudra-fs-abspath}
 
 ```lua
-maki.fs.abspath({path})
+caudra.fs.abspath({path})
 ```
 
 Make {path} absolute by prepending the current working directory when needed.
@@ -1864,15 +1864,15 @@ Unlike `normalize`, this does not resolve `.` or `..` segments.
 **Example:**
 
 ```lua
-maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
+caudra.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 ```
 
 ---
 
-### `maki.fs.parents()` {#maki-fs-parents}
+### `caudra.fs.parents()` {#caudra-fs-parents}
 
 ```lua
-maki.fs.parents({path})
+caudra.fs.parents({path})
 ```
 
 Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -1887,16 +1887,16 @@ Handy for walking up a directory tree.
 **Example:**
 
 ```lua
-local dirs = maki.fs.parents("/home/user/project/src")
+local dirs = caudra.fs.parents("/home/user/project/src")
 -- { "/home/user/project", "/home/user", "/home", "/" }
 ```
 
 ---
 
-### `maki.fs.root()` {#maki-fs-root}
+### `caudra.fs.root()` {#caudra-fs-root}
 
 ```lua
-maki.fs.root({source}, {marker})
+caudra.fs.root({source}, {marker})
 ```
 
 Walk upward from {source} looking for a directory that contains one of the
@@ -1915,16 +1915,16 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
+local root = caudra.fs.root("src/main.rs", { ".git", "Cargo.toml" })
 if root then print("project root: " .. root) end
 ```
 
 ---
 
-### `maki.fs.relpath()` {#maki-fs-relpath}
+### `caudra.fs.relpath()` {#caudra-fs-relpath}
 
 ```lua
-maki.fs.relpath({base}, {target})
+caudra.fs.relpath({base}, {target})
 ```
 
 Compute a relative path from {base} to {target}.
@@ -1939,15 +1939,15 @@ Compute a relative path from {base} to {target}.
 **Example:**
 
 ```lua
-maki.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
+caudra.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
 ```
 
 ---
 
-### `maki.fs.ext()` {#maki-fs-ext}
+### `caudra.fs.ext()` {#caudra-fs-ext}
 
 ```lua
-maki.fs.ext({path})
+caudra.fs.ext({path})
 ```
 
 Return the file extension of {path}, without the leading dot.
@@ -1961,16 +1961,16 @@ Return the file extension of {path}, without the leading dot.
 **Example:**
 
 ```lua
-maki.fs.ext("main.rs")   -- "rs"
-maki.fs.ext("Makefile")  -- nil
+caudra.fs.ext("main.rs")   -- "rs"
+caudra.fs.ext("Makefile")  -- nil
 ```
 
 ---
 
-### `maki.fs.dir()` {#maki-fs-dir}
+### `caudra.fs.dir()` {#caudra-fs-dir}
 
 ```lua
-maki.fs.dir({path}, {opts?})
+caudra.fs.dir({path}, {opts?})
 ```
 
 List the contents of the directory at {path}.
@@ -1989,7 +1989,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local entries, err = maki.fs.dir("src", { depth = 2 })
+local entries, err = caudra.fs.dir("src", { depth = 2 })
 if err then return end
 for _, e in ipairs(entries) do
   print(e[1], e[2]) -- "main.rs"  "file"
@@ -1998,10 +1998,10 @@ end
 
 ---
 
-### `maki.fs.write()` {#maki-fs-write}
+### `caudra.fs.write()` {#caudra-fs-write}
 
 ```lua
-maki.fs.write({path}, {content})
+caudra.fs.write({path}, {content})
 ```
 
 Write {content} to the file at {path}, creating it if it does not exist
@@ -2019,16 +2019,16 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.write("out.txt", "hello world")
+local ok, err = caudra.fs.write("out.txt", "hello world")
 if err then print("write failed: " .. err) end
 ```
 
 ---
 
-### `maki.fs.atomic_write()` {#maki-fs-atomic_write}
+### `caudra.fs.atomic_write()` {#caudra-fs-atomic_write}
 
 ```lua
-maki.fs.atomic_write({path}, {content})
+caudra.fs.atomic_write({path}, {content})
 ```
 
 Atomically replace {path} with {content}. The parent directory must exist.
@@ -2047,16 +2047,16 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.atomic_write("state.json", encoded)
+local ok, err = caudra.fs.atomic_write("state.json", encoded)
 if err then print("atomic write failed: " .. err) end
 ```
 
 ---
 
-### `maki.fs.rm()` {#maki-fs-rm}
+### `caudra.fs.rm()` {#caudra-fs-rm}
 
 ```lua
-maki.fs.rm({path}, {opts?})
+caudra.fs.rm({path}, {opts?})
 ```
 
 Delete the file, symlink, or directory at {path}.
@@ -2076,17 +2076,17 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.rm("temp.txt")
+local ok, err = caudra.fs.rm("temp.txt")
 if err then print("rm failed: " .. err) end
-maki.fs.rm("stale_dir", { recursive = true, force = true })
+caudra.fs.rm("stale_dir", { recursive = true, force = true })
 ```
 
 ---
 
-### `maki.fs.mkdir()` {#maki-fs-mkdir}
+### `caudra.fs.mkdir()` {#caudra-fs-mkdir}
 
 ```lua
-maki.fs.mkdir({path}, {opts?})
+caudra.fs.mkdir({path}, {opts?})
 ```
 
 Create the directory at {path}. Set `parents = true` to create
@@ -2104,15 +2104,15 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-maki.fs.mkdir("a/b/c", { parents = true })
+caudra.fs.mkdir("a/b/c", { parents = true })
 ```
 
 ---
 
-### `maki.fs.glob()` {#maki-fs-glob}
+### `caudra.fs.glob()` {#caudra-fs-glob}
 
 ```lua
-maki.fs.glob({pattern}, {opts?})
+caudra.fs.glob({pattern}, {opts?})
 ```
 
 Find files matching one or more glob patterns.
@@ -2131,17 +2131,17 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local files, err = maki.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
+local files, err = caudra.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
 if err then return end
 for _, f in ipairs(files) do print(f) end
 ```
 
 ---
 
-### `maki.fs.grep()` {#maki-fs-grep}
+### `caudra.fs.grep()` {#caudra-fs-grep}
 
 ```lua
-maki.fs.grep({pattern}, {opts?})
+caudra.fs.grep({pattern}, {opts?})
 ```
 
 Search file contents for a regex {pattern}. Returns structured matches
@@ -2162,7 +2162,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+local hits, err = caudra.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 if err then return end
 for _, file in ipairs(hits) do
   for _, g in ipairs(file.groups) do
@@ -2174,7 +2174,7 @@ end
 ```
 
 
-## maki.image {#maki-image}
+## caudra.image {#caudra-image}
 
 Small building blocks for working with images: probe metadata, decode
 pixels, resize, and encode back to bytes. Plugins compose these freely.
@@ -2182,17 +2182,17 @@ pixels, resize, and encode back to bytes. Plugins compose these freely.
 Decoding is guarded against pixel-bomb attacks (50 MP limit).
 
 ```lua
-local img = maki.image.decode(raw_bytes)
+local img = caudra.image.decode(raw_bytes)
 local small = img:resize(1024, 768)
 local png = small:encode("png")
 ```
 
 ---
 
-### `maki.image.probe()` {#maki-image-probe}
+### `caudra.image.probe()` {#caudra-image-probe}
 
 ```lua
-maki.image.probe({data})
+caudra.image.probe({data})
 ```
 
 Read image metadata (format, dimensions) from raw bytes without fully
@@ -2211,17 +2211,17 @@ Returns a table with `format` (string), `width` (integer), `height`
 **Example:**
 
 ```lua
-local info, err = maki.image.probe(raw_bytes)
+local info, err = caudra.image.probe(raw_bytes)
 if err then error(err) end
 print(info.format, info.width, info.height)
 ```
 
 ---
 
-### `maki.image.decode()` {#maki-image-decode}
+### `caudra.image.decode()` {#caudra-image-decode}
 
 ```lua
-maki.image.decode({data})
+caudra.image.decode({data})
 ```
 
 Decode raw image bytes into an Image handle you can resize and re-encode.
@@ -2231,22 +2231,22 @@ Images larger than 50 megapixels are rejected to prevent memory bombs.
 
 - `{data}` (`string|buffer`) Raw image bytes.
 
-**Returns:** ([`maki.image.Image?`](#maki-image-Image), `string?`) Decoded image, or `(nil, err)` on failure.
+**Returns:** ([`caudra.image.Image?`](#caudra-image-Image), `string?`) Decoded image, or `(nil, err)` on failure.
 
 **Example:**
 
 ```lua
-local img, err = maki.image.decode(raw_bytes)
+local img, err = caudra.image.decode(raw_bytes)
 if err then error(err) end
 print(img:width() .. "x" .. img:height())
 ```
 
 
-## maki.image.Image {#maki-image-Image}
+## caudra.image.Image {#caudra-image-Image}
 
 A decoded image you can inspect, resize, and re-encode.
 
-Get one from `maki.image.decode()`. The image data lives in memory
+Get one from `caudra.image.decode()`. The image data lives in memory
 until the handle is garbage collected.
 
 ---
@@ -2289,12 +2289,12 @@ ratio. If the image already fits, it is returned as-is. Never upscales.
 - `{max_w}` (`integer`) Maximum width in pixels. Must be positive.
 - `{max_h}` (`integer`) Maximum height in pixels. Must be positive.
 
-**Returns:** ([`maki.image.Image`](#maki-image-Image)) A new image handle (or the same one if no resize was needed).
+**Returns:** ([`caudra.image.Image`](#caudra-image-Image)) A new image handle (or the same one if no resize was needed).
 
 **Example:**
 
 ```lua
-local img = maki.image.decode(raw_bytes)
+local img = caudra.image.decode(raw_bytes)
 local small = img:resize(800, 600)
 local encoded = small:encode("jpeg")
 ```
@@ -2324,7 +2324,7 @@ local bytes = img:encode("png")
 ```
 
 
-## maki.interpreter {#maki-interpreter}
+## caudra.interpreter {#caudra-interpreter}
 
 Run Python code in a memory-safe, time-limited sandbox.
 
@@ -2332,7 +2332,7 @@ The sandbox uses the monty interpreter. Python code can call back into
 Lua-defined tools, and stdout is streamed line by line.
 
 ```lua
-local r, err = maki.interpreter.run("print('hello')", {
+local r, err = caudra.interpreter.run("print('hello')", {
   timeout = 10,
   max_memory_mb = 128,
   on_output = function(line) print(line) end,
@@ -2341,10 +2341,10 @@ local r, err = maki.interpreter.run("print('hello')", {
 
 ---
 
-### `maki.interpreter.run()` {#maki-interpreter-run}
+### `caudra.interpreter.run()` {#caudra-interpreter-run}
 
 ```lua
-maki.interpreter.run({code}, {opts})
+caudra.interpreter.run({code}, {opts})
 ```
 
 Run Python code in a sandboxed interpreter with memory and time limits.
@@ -2380,7 +2380,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local result, err = maki.interpreter.run("print(2 + 2)", {
+local result, err = caudra.interpreter.run("print(2 + 2)", {
   timeout = 30,
   max_memory_mb = 256,
   on_output = function(line) print("py: " .. line) end,
@@ -2390,23 +2390,23 @@ if result.stdout then print(result.stdout) end
 ```
 
 
-## maki.json {#maki-json}
+## caudra.json {#caudra-json}
 
 JSON encoding, decoding, and schema validation. Encode Lua
 tables to JSON strings, decode JSON back into tables, and
 optionally validate data against a JSON Schema.
 
 ```lua
-local s = maki.json.encode({ ok = true })
-local t = maki.json.decode(s)
+local s = caudra.json.encode({ ok = true })
+local t = caudra.json.decode(s)
 ```
 
 ---
 
-### `maki.json.encode()` {#maki-json-encode}
+### `caudra.json.encode()` {#caudra-json-encode}
 
 ```lua
-maki.json.encode({value})
+caudra.json.encode({value})
 ```
 
 Turn a Lua value into a JSON string. Tables, strings, numbers,
@@ -2422,16 +2422,16 @@ serialized.
 **Example:**
 
 ```lua
-local s, err = maki.json.encode({ name = "maki", version = 1 })
-print(s) -- {"name":"maki","version":1}
+local s, err = caudra.json.encode({ name = "caudra", version = 1 })
+print(s) -- {"name":"caudra","version":1}
 ```
 
 ---
 
-### `maki.json.decode()` {#maki-json-decode}
+### `caudra.json.decode()` {#caudra-json-decode}
 
 ```lua
-maki.json.decode({str})
+caudra.json.decode({str})
 ```
 
 Parse a JSON string into a Lua value. Objects become tables and
@@ -2446,16 +2446,16 @@ arrays become 1-indexed sequences.
 **Example:**
 
 ```lua
-local t, err = maki.json.decode('{"x": 42}')
+local t, err = caudra.json.decode('{"x": 42}')
 print(t.x) -- 42
 ```
 
 ---
 
-### `maki.json.schema_validator()` {#maki-json-schema_validator}
+### `caudra.json.schema_validator()` {#caudra-json-schema_validator}
 
 ```lua
-maki.json.schema_validator({schema})
+caudra.json.schema_validator({schema})
 ```
 
 Compile a JSON Schema into a reusable validator object. Supports
@@ -2466,24 +2466,24 @@ you catch mistakes before doing any real work.
 
 - `{schema}` (`table`) JSON Schema as a Lua table.
 
-**Returns:** ([`maki.json.SchemaValidator?`](#maki-json-SchemaValidator), `string?`) Validator, or nil plus an error.
+**Returns:** ([`caudra.json.SchemaValidator?`](#caudra-json-SchemaValidator), `string?`) Validator, or nil plus an error.
 
 **Example:**
 
 ```lua
-local v, err = maki.json.schema_validator({
+local v, err = caudra.json.schema_validator({
   type = "object",
   properties = { name = { type = "string" } },
   required = { "name" },
 })
-local errs = v:validate({ name = "maki" })
+local errs = v:validate({ name = "caudra" })
 assert(errs == nil)
 ```
 
 
-## maki.json.SchemaValidator {#maki-json-SchemaValidator}
+## caudra.json.SchemaValidator {#caudra-json-SchemaValidator}
 
-A compiled JSON Schema validator. Create one with `maki.json.schema_validator()` and reuse it to validate many values without recompiling the schema each time.
+A compiled JSON Schema validator. Create one with `caudra.json.schema_validator()` and reuse it to validate many values without recompiling the schema each time.
 
 ---
 
@@ -2511,23 +2511,23 @@ end
 ```
 
 
-## maki.keymap {#maki-keymap}
+## caudra.keymap {#caudra-keymap}
 
 Key mappings, modeled after `vim.keymap`. If you have written a
 Neovim keymap plugin before, this will feel familiar.
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+caudra.keymap.set("n", "<C-t>", function()
   print("hello")
 end, { desc = "Say hello" })
 ```
 
 ---
 
-### `maki.keymap.set()` {#maki-keymap-set}
+### `caudra.keymap.set()` {#caudra-keymap-set}
 
 ```lua
-maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
+caudra.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
 Bind a key to a Lua function, just like `vim.keymap.set`. Only
@@ -2545,17 +2545,17 @@ mapped, the old binding is replaced and a warning is logged.
 **Example:**
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+caudra.keymap.set("n", "<C-t>", function()
   print("toggle!")
 end, { desc = "Toggle panel" })
 ```
 
 ---
 
-### `maki.keymap.del()` {#maki-keymap-del}
+### `caudra.keymap.del()` {#caudra-keymap-del}
 
 ```lua
-maki.keymap.del({mode}, {lhs})
+caudra.keymap.del({mode}, {lhs})
 ```
 
 Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
@@ -2569,28 +2569,28 @@ exists for that key.
 **Example:**
 
 ```lua
-maki.keymap.del("n", "<C-t>")
+caudra.keymap.del("n", "<C-t>")
 ```
 
 
-## maki.log {#maki-log}
+## caudra.log {#caudra-log}
 
 Structured logging for plugins.
 
 Each call emits a tracing event tagged with the calling plugin's name.
-Messages show up in maki's log output, which you can view with `maki --log`.
+Messages show up in caudra's log output, which you can view with `caudra --log`.
 
 ```lua
-maki.log.info("ready")
-maki.log.warn("something looks off")
+caudra.log.info("ready")
+caudra.log.warn("something looks off")
 ```
 
 ---
 
-### `maki.log.debug()` {#maki-log-debug}
+### `caudra.log.debug()` {#caudra-log-debug}
 
 ```lua
-maki.log.debug({msg})
+caudra.log.debug({msg})
 ```
 
 Emit a DEBUG-level log message. Useful for development and troubleshooting.
@@ -2603,15 +2603,15 @@ The message is tagged with the plugin name automatically.
 **Example:**
 
 ```lua
-maki.log.debug("loaded " .. #items .. " items")
+caudra.log.debug("loaded " .. #items .. " items")
 ```
 
 ---
 
-### `maki.log.info()` {#maki-log-info}
+### `caudra.log.info()` {#caudra-log-info}
 
 ```lua
-maki.log.info({msg})
+caudra.log.info({msg})
 ```
 
 Emit an INFO-level log message. Good for normal operational events.
@@ -2623,15 +2623,15 @@ Emit an INFO-level log message. Good for normal operational events.
 **Example:**
 
 ```lua
-maki.log.info("plugin initialized")
+caudra.log.info("plugin initialized")
 ```
 
 ---
 
-### `maki.log.warn()` {#maki-log-warn}
+### `caudra.log.warn()` {#caudra-log-warn}
 
 ```lua
-maki.log.warn({msg})
+caudra.log.warn({msg})
 ```
 
 Emit a WARN-level log message. Use for recoverable problems.
@@ -2643,15 +2643,15 @@ Emit a WARN-level log message. Use for recoverable problems.
 **Example:**
 
 ```lua
-maki.log.warn("config file missing, using defaults")
+caudra.log.warn("config file missing, using defaults")
 ```
 
 ---
 
-### `maki.log.error()` {#maki-log-error}
+### `caudra.log.error()` {#caudra-log-error}
 
 ```lua
-maki.log.error({msg})
+caudra.log.error({msg})
 ```
 
 Emit an ERROR-level log message. Use for failures that need attention.
@@ -2663,11 +2663,11 @@ Emit an ERROR-level log message. Use for failures that need attention.
 **Example:**
 
 ```lua
-maki.log.error("failed to connect to API")
+caudra.log.error("failed to connect to API")
 ```
 
 
-## maki.model {#maki-model}
+## caudra.model {#caudra-model}
 
 The model behind the focused session. Good for a keybind that flips
 between your two go-to models, or lifts thinking for one hard question.
@@ -2676,10 +2676,10 @@ Without an interactive UI every function returns
 
 ---
 
-### `maki.model.get()` {#maki-model-get}
+### `caudra.model.get()` {#caudra-model-get}
 
 ```lua
-maki.model.get()
+caudra.model.get()
 ```
 
 Reads the focused session's model, thinking level, and fast mode.
@@ -2692,16 +2692,16 @@ can go straight back in.
 **Example:**
 
 ```lua
-local m = maki.model.get()
+local m = caudra.model.get()
 if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 ```
 
 ---
 
-### `maki.model.available()` {#maki-model-available}
+### `caudra.model.available()` {#caudra-model-available}
 
 ```lua
-maki.model.available()
+caudra.model.available()
 ```
 
 Lists the model specs you can switch to: what the providers you are logged
@@ -2713,15 +2713,15 @@ background at startup, so right after launch it can still be empty.
 **Example:**
 
 ```lua
-local specs = maki.model.available()
+local specs = caudra.model.available()
 ```
 
 ---
 
-### `maki.model.set()` {#maki-model-set}
+### `caudra.model.set()` {#caudra-model-set}
 
 ```lua
-maki.model.set({opts})
+caudra.model.set({opts})
 ```
 
 Switches the focused session's model, thinking level, or fast mode. Fields
@@ -2743,13 +2743,13 @@ Answers with the new state, in the same shape `get` returns.
 **Example:**
 
 ```lua
-maki.model.set("anthropic/claude-opus-4-6")
-maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+caudra.model.set("anthropic/claude-opus-4-6")
+caudra.model.set({ spec = "zai/glm-5", thinking = "high" })
+caudra.keymap.set("n", "<M-t>", function() caudra.model.set({ thinking = "" }) end)
 ```
 
 
-## maki.net {#maki-net}
+## caudra.net {#caudra-net}
 
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
@@ -2757,16 +2757,16 @@ blocked to prevent SSRF. Failed requests (5xx) are retried
 automatically.
 
 ```lua
-local res, err = maki.net.request("https://example.com")
+local res, err = caudra.net.request("https://example.com")
 if res then print(res.body) end
 ```
 
 ---
 
-### `maki.net.request()` {#maki-net-request}
+### `caudra.net.request()` {#caudra-net-request}
 
 ```lua
-maki.net.request({url}, {opts?})
+caudra.net.request({url}, {opts?})
 ```
 
 Make an HTTP request and return the response body. Plain `http://`
@@ -2796,7 +2796,7 @@ Requires the `net` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local res, err = maki.net.request("https://httpbin.org/get")
+local res, err = caudra.net.request("https://httpbin.org/get")
 if err then
   print("failed: " .. err)
 else
@@ -2805,7 +2805,7 @@ end
 ```
 
 
-## maki.session {#maki-session}
+## caudra.session {#caudra-session}
 
 Host session primitives. The interactive UI can run several sessions
 at once; these functions let plugins list, create, focus, rename, and
@@ -2815,10 +2815,10 @@ directly, so it also works under ACP and SDK frontends.
 
 ---
 
-### `maki.session.list()` {#maki-session-list}
+### `caudra.session.list()` {#caudra-session-list}
 
 ```lua
-maki.session.list()
+caudra.session.list()
 ```
 
 Lists sessions stored for the current project. Answered from a
@@ -2829,15 +2829,15 @@ background scan, so a slow disk never blocks the UI.
 **Example:**
 
 ```lua
-local stored, err = maki.session.list()
+local stored, err = caudra.session.list()
 ```
 
 ---
 
-### `maki.session.live()` {#maki-session-live}
+### `caudra.session.live()` {#caudra-session-live}
 
 ```lua
-maki.session.live()
+caudra.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
@@ -2849,15 +2849,15 @@ intermediate "idle" status.
 **Example:**
 
 ```lua
-local live, err = maki.session.live()
+local live, err = caudra.session.live()
 ```
 
 ---
 
-### `maki.session.current()` {#maki-session-current}
+### `caudra.session.current()` {#caudra-session-current}
 
 ```lua
-maki.session.current()
+caudra.session.current()
 ```
 
 Returns the id of the currently focused session.
@@ -2867,15 +2867,15 @@ Returns the id of the currently focused session.
 **Example:**
 
 ```lua
-local id = maki.session.current()
+local id = caudra.session.current()
 ```
 
 ---
 
-### `maki.session.focus()` {#maki-session-focus}
+### `caudra.session.focus()` {#caudra-session-focus}
 
 ```lua
-maki.session.focus({id})
+caudra.session.focus({id})
 ```
 
 Switches the UI to the session with {id}.
@@ -2889,15 +2889,15 @@ Switches the UI to the session with {id}.
 **Example:**
 
 ```lua
-local _, err = maki.session.focus(id)
+local _, err = caudra.session.focus(id)
 ```
 
 ---
 
-### `maki.session.delete()` {#maki-session-delete}
+### `caudra.session.delete()` {#caudra-session-delete}
 
 ```lua
-maki.session.delete({id})
+caudra.session.delete({id})
 ```
 
 Deletes a session and its stored history, cancelling it first if it
@@ -2912,15 +2912,15 @@ is running. The focused session cannot be deleted.
 **Example:**
 
 ```lua
-local _, err = maki.session.delete(id)
+local _, err = caudra.session.delete(id)
 ```
 
 ---
 
-### `maki.session.new()` {#maki-session-new}
+### `caudra.session.new()` {#caudra-session-new}
 
 ```lua
-maki.session.new({opts?})
+caudra.session.new({opts?})
 ```
 
 Starts a new session in the current project.
@@ -2937,15 +2937,15 @@ Starts a new session in the current project.
 **Example:**
 
 ```lua
-local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
+local id, err = caudra.session.new({ prompt = "fix the tests", focus = true })
 ```
 
 ---
 
-### `maki.session.prompt()` {#maki-session-prompt}
+### `caudra.session.prompt()` {#caudra-session-prompt}
 
 ```lua
-maki.session.prompt({text}, {opts?})
+caudra.session.prompt({text}, {opts?})
 ```
 
 Sends {text} as a regular user prompt to a live session. The text is
@@ -2970,15 +2970,15 @@ admission controls when the prompt is picked up.
 **Example:**
 
 ```lua
-local state, err = maki.session.prompt("run the tests", { session = id })
+local state, err = caudra.session.prompt("run the tests", { session = id })
 ```
 
 ---
 
-### `maki.session.notify()` {#maki-session-notify}
+### `caudra.session.notify()` {#caudra-session-notify}
 
 ```lua
-maki.session.notify({text}, {opts?})
+caudra.session.notify({text}, {opts?})
 ```
 
 Reports {text} to a live session without creating a user turn. The
@@ -2996,15 +2996,15 @@ observation waits for the session's next agent run.
 **Example:**
 
 ```lua
-maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+caudra.session.notify("[monitor] deploy failed", { session = id, wake = true })
 ```
 
 ---
 
-### `maki.session.set_title()` {#maki-session-set_title}
+### `caudra.session.set_title()` {#caudra-session-set_title}
 
 ```lua
-maki.session.set_title({opts})
+caudra.session.set_title({opts})
 ```
 
 Renames a session, live or stored.
@@ -3019,11 +3019,11 @@ Renames a session, live or stored.
 **Example:**
 
 ```lua
-local _, err = maki.session.set_title({ id = id, title = "refactor" })
+local _, err = caudra.session.set_title({ id = id, title = "refactor" })
 ```
 
 
-## maki.task {#maki-task}
+## caudra.task {#caudra-task}
 
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
@@ -3032,15 +3032,15 @@ Without an interactive UI every function returns
 
 ---
 
-### `maki.task.list()` {#maki-task-list}
+### `caudra.task.list()` {#caudra-task-list}
 
 ```lua
-maki.task.list()
+caudra.task.list()
 ```
 
 Lists the focused session's chats in chat order. Entry 1 is always the main
 chat, with id `"main"` and no `status`: its work is the session's own, and
-`maki.session.live()` already reports that. The rest are subagents, keyed by
+`caudra.session.live()` already reports that. The rest are subagents, keyed by
 the tool call that spawned them.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?}` where
@@ -3049,17 +3049,17 @@ the tool call that spawned them.
 **Example:**
 
 ```lua
-for _, t in ipairs(maki.task.list() or {}) do
+for _, t in ipairs(caudra.task.list() or {}) do
   print(t.name, t.status or "main")
 end
 ```
 
 ---
 
-### `maki.task.focus()` {#maki-task-focus}
+### `caudra.task.focus()` {#caudra-task-focus}
 
 ```lua
-maki.task.focus({id})
+caudra.task.focus({id})
 ```
 
 Shows a task's transcript, the way the chat cycling keys do. An id from
@@ -3074,30 +3074,30 @@ another session returns an error instead of landing on the wrong task.
 **Example:**
 
 ```lua
-local _, err = maki.task.focus("main")
+local _, err = caudra.task.focus("main")
 ```
 
 
-## maki.text {#maki-text}
+## caudra.text {#caudra-text}
 
 Text transformation utilities.
 
 Helper functions for converting between text formats.
 
 ```lua
-local md = maki.text.html_to_markdown(html)
+local md = caudra.text.html_to_markdown(html)
 ```
 
 ---
 
-### `maki.text.html_to_markdown()` {#maki-text-html_to_markdown}
+### `caudra.text.html_to_markdown()` {#caudra-text-html_to_markdown}
 
 ```lua
-maki.text.html_to_markdown({html})
+caudra.text.html_to_markdown({html})
 ```
 
 Convert an HTML string to Markdown.
-Useful for cleaning up web content fetched with `maki.webfetch`.
+Useful for cleaning up web content fetched with `caudra.webfetch`.
 
 **Parameters:**
 
@@ -3108,13 +3108,13 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 **Example:**
 
 ```lua
-local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
+local md, err = caudra.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
 ```
 
 
-## maki.treesitter {#maki-treesitter}
+## caudra.treesitter {#caudra-treesitter}
 
 Tree-sitter parsing and query API.
 
@@ -3123,17 +3123,17 @@ Start with `get_parser()` to parse source code, then use `get_node_text()` and
 the `query` sub-module to extract information from the syntax tree.
 
 ```lua
-local parser, err = maki.treesitter.get_parser(source, "lua")
+local parser, err = caudra.treesitter.get_parser(source, "lua")
 local trees = parser:parse()
 local root = trees[1]:root()
 ```
 
 ---
 
-### `maki.treesitter.get_parser()` {#maki-treesitter-get_parser}
+### `caudra.treesitter.get_parser()` {#caudra-treesitter-get_parser}
 
 ```lua
-maki.treesitter.get_parser({source}, {lang})
+caudra.treesitter.get_parser({source}, {lang})
 ```
 
 Creates a `LanguageTree` for {source} using the grammar named {lang}.
@@ -3145,21 +3145,21 @@ Signature matches `vim.treesitter.get_parser()`, so Neovim plugins can be copy-p
 - `{source}` (`string`) Source text to parse.
 - `{lang}` (`string`) Language name, e.g. `"rust"` or `"lua"`.
 
-**Returns:** ([`LanguageTree|nil`](#maki-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
+**Returns:** ([`LanguageTree|nil`](#caudra-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
 
 **Example:**
 
 ```lua
-local parser, err = maki.treesitter.get_parser(src, "lua")
+local parser, err = caudra.treesitter.get_parser(src, "lua")
 if err then print("error: " .. err) end
 ```
 
 ---
 
-### `maki.treesitter.get_string_parser()` {#maki-treesitter-get_string_parser}
+### `caudra.treesitter.get_string_parser()` {#caudra-treesitter-get_string_parser}
 
 ```lua
-maki.treesitter.get_string_parser({source}, {lang})
+caudra.treesitter.get_string_parser({source}, {lang})
 ```
 
 Alias for `get_parser`. Use whichever name you prefer.
@@ -3169,14 +3169,14 @@ Alias for `get_parser`. Use whichever name you prefer.
 - `{source}` (`string`) Source text to parse.
 - `{lang}` (`string`) Language name.
 
-**Returns:** ([`LanguageTree|nil`](#maki-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
+**Returns:** ([`LanguageTree|nil`](#caudra-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
 
 ---
 
-### `maki.treesitter.get_node_text()` {#maki-treesitter-get_node_text}
+### `caudra.treesitter.get_node_text()` {#caudra-treesitter-get_node_text}
 
 ```lua
-maki.treesitter.get_node_text({node}, {source})
+caudra.treesitter.get_node_text({node}, {source})
 ```
 
 Gets the text that {node} covers in {source}.
@@ -3184,7 +3184,7 @@ Useful when you have a captured node and need the actual source substring.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node whose text you want.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) The node whose text you want.
 - `{source}` (`string`) Original source text the tree was parsed from.
 
 **Returns:** (`string`) Substring covered by the node.
@@ -3192,38 +3192,38 @@ Useful when you have a captured node and need the actual source substring.
 **Example:**
 
 ```lua
-local text = maki.treesitter.get_node_text(node, source)
+local text = caudra.treesitter.get_node_text(node, source)
 print(text)
 ```
 
 ---
 
-### `maki.treesitter.get_node_range()` {#maki-treesitter-get_node_range}
+### `caudra.treesitter.get_node_range()` {#caudra-treesitter-get_node_range}
 
 ```lua
-maki.treesitter.get_node_range({node})
+caudra.treesitter.get_node_range({node})
 ```
 
 Returns the range of {node} as four 0-based integers: start_row, start_col, end_row, end_col.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node to query.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) The node to query.
 
 **Returns:** (`integer`, `integer`, `integer`, `integer`) start_row, start_col, end_row, end_col.
 
 **Example:**
 
 ```lua
-local sr, sc, er, ec = maki.treesitter.get_node_range(node)
+local sr, sc, er, ec = caudra.treesitter.get_node_range(node)
 ```
 
 ---
 
-### `maki.treesitter.get_range()` {#maki-treesitter-get_range}
+### `caudra.treesitter.get_range()` {#caudra-treesitter-get_range}
 
 ```lua
-maki.treesitter.get_range({node})
+caudra.treesitter.get_range({node})
 ```
 
 Returns a six-element table for {node}: `{start_row, start_col, start_byte, end_row, end_col, end_byte}`.
@@ -3231,23 +3231,23 @@ This gives you byte offsets in addition to row/column positions.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node to query.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) The node to query.
 
 **Returns:** (`table`) Six-element array: start_row, start_col, start_byte, end_row, end_col, end_byte.
 
 **Example:**
 
 ```lua
-local r = maki.treesitter.get_range(node)
+local r = caudra.treesitter.get_range(node)
 print("bytes: " .. r[3] .. "-" .. r[6])
 ```
 
 ---
 
-### `maki.treesitter.is_ancestor()` {#maki-treesitter-is_ancestor}
+### `caudra.treesitter.is_ancestor()` {#caudra-treesitter-is_ancestor}
 
 ```lua
-maki.treesitter.is_ancestor({dest}, {source})
+caudra.treesitter.is_ancestor({dest}, {source})
 ```
 
 Checks whether {dest} is an ancestor of {source} (or the same node).
@@ -3255,17 +3255,17 @@ Walks up from {source} toward the root looking for {dest}.
 
 **Parameters:**
 
-- `{dest}` ([`Node`](#maki-treesitter-Node)) Potential ancestor node.
-- `{source}` ([`Node`](#maki-treesitter-Node)) Node to check ancestry for.
+- `{dest}` ([`Node`](#caudra-treesitter-Node)) Potential ancestor node.
+- `{source}` ([`Node`](#caudra-treesitter-Node)) Node to check ancestry for.
 
 **Returns:** (`boolean`)
 
 ---
 
-### `maki.treesitter.is_in_node_range()` {#maki-treesitter-is_in_node_range}
+### `caudra.treesitter.is_in_node_range()` {#caudra-treesitter-is_in_node_range}
 
 ```lua
-maki.treesitter.is_in_node_range({node}, {line}, {col})
+caudra.treesitter.is_in_node_range({node}, {line}, {col})
 ```
 
 Checks whether the 0-based position ({line}, {col}) falls inside {node}.
@@ -3273,7 +3273,7 @@ Handy for cursor-position checks.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Node to test against.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) Node to test against.
 - `{line}` (`integer`) 0-based line number.
 - `{col}` (`integer`) 0-based column number.
 
@@ -3281,27 +3281,27 @@ Handy for cursor-position checks.
 
 ---
 
-### `maki.treesitter.node_contains()` {#maki-treesitter-node_contains}
+### `caudra.treesitter.node_contains()` {#caudra-treesitter-node_contains}
 
 ```lua
-maki.treesitter.node_contains({node}, {range})
+caudra.treesitter.node_contains({node}, {range})
 ```
 
 Checks whether {node} fully contains the given {range}.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Node to test.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) Node to test.
 - `{range}` (`table`) Four-element array `{start_row, start_col, end_row, end_col}`.
 
 **Returns:** (`boolean`)
 
 ---
 
-### `maki.treesitter.get_node()` {#maki-treesitter-get_node}
+### `caudra.treesitter.get_node()` {#caudra-treesitter-get_node}
 
 ```lua
-maki.treesitter.get_node({opts?})
+caudra.treesitter.get_node({opts?})
 ```
 
 Placeholder for cursor-based node lookup (not yet implemented, always returns nil).
@@ -3310,10 +3310,10 @@ Placeholder for cursor-based node lookup (not yet implemented, always returns ni
 
 - `{opts?}` (`table?`) Options (currently unused).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Always nil.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Always nil.
 
 
-## maki.treesitter.language {#maki-treesitter-language}
+## caudra.treesitter.language {#caudra-treesitter-language}
 
 Language registry for tree-sitter grammars.
 
@@ -3321,16 +3321,16 @@ Mirrors `vim.treesitter.language`. Use these functions to register grammars,
 map filetypes to languages, and inspect available node types.
 
 ```lua
-maki.treesitter.language.add("lua")
-maki.treesitter.language.register("lua", "luau")
+caudra.treesitter.language.add("lua")
+caudra.treesitter.language.register("lua", "luau")
 ```
 
 ---
 
-### `maki.treesitter.language.add()` {#maki-treesitter-language-add}
+### `caudra.treesitter.language.add()` {#caudra-treesitter-language-add}
 
 ```lua
-maki.treesitter.language.add({lang}, {opts?})
+caudra.treesitter.language.add({lang}, {opts?})
 ```
 
 Registers {lang} for use with tree-sitter.
@@ -3345,15 +3345,15 @@ Custom grammar paths are not yet supported.
 **Example:**
 
 ```lua
-maki.treesitter.language.add("lua")
+caudra.treesitter.language.add("lua")
 ```
 
 ---
 
-### `maki.treesitter.language.register()` {#maki-treesitter-language-register}
+### `caudra.treesitter.language.register()` {#caudra-treesitter-language-register}
 
 ```lua
-maki.treesitter.language.register({lang}, {filetype})
+caudra.treesitter.language.register({lang}, {filetype})
 ```
 
 Associates {lang} with one or more filetypes, so you can look up the right
@@ -3367,15 +3367,15 @@ parser language for a given filetype later with `get_lang()`.
 **Example:**
 
 ```lua
-maki.treesitter.language.register("typescript", { "ts", "tsx" })
+caudra.treesitter.language.register("typescript", { "ts", "tsx" })
 ```
 
 ---
 
-### `maki.treesitter.language.get_lang()` {#maki-treesitter-language-get_lang}
+### `caudra.treesitter.language.get_lang()` {#caudra-treesitter-language-get_lang}
 
 ```lua
-maki.treesitter.language.get_lang({filetype})
+caudra.treesitter.language.get_lang({filetype})
 ```
 
 Looks up the tree-sitter language name for {filetype}.
@@ -3391,16 +3391,16 @@ a grammar with that name exists. Returns nil when nothing matches.
 **Example:**
 
 ```lua
-local lang = maki.treesitter.language.get_lang("tsx")
+local lang = caudra.treesitter.language.get_lang("tsx")
 if lang then print(lang) end -- "typescript"
 ```
 
 ---
 
-### `maki.treesitter.language.get_filetypes()` {#maki-treesitter-language-get_filetypes}
+### `caudra.treesitter.language.get_filetypes()` {#caudra-treesitter-language-get_filetypes}
 
 ```lua
-maki.treesitter.language.get_filetypes({lang})
+caudra.treesitter.language.get_filetypes({lang})
 ```
 
 Returns all filetypes that have been registered for {lang}.
@@ -3414,16 +3414,16 @@ Returns all filetypes that have been registered for {lang}.
 **Example:**
 
 ```lua
-local fts = maki.treesitter.language.get_filetypes("typescript")
+local fts = caudra.treesitter.language.get_filetypes("typescript")
 -- { "ts", "tsx" }
 ```
 
 ---
 
-### `maki.treesitter.language.inspect()` {#maki-treesitter-language-inspect}
+### `caudra.treesitter.language.inspect()` {#caudra-treesitter-language-inspect}
 
 ```lua
-maki.treesitter.language.inspect({lang})
+caudra.treesitter.language.inspect({lang})
 ```
 
 Returns metadata about the grammar for {lang}.
@@ -3438,13 +3438,13 @@ Useful for debugging or discovering which node types and fields a grammar define
 **Example:**
 
 ```lua
-local info = maki.treesitter.language.inspect("lua")
+local info = caudra.treesitter.language.inspect("lua")
 print("ABI: " .. info.abi_version)
 for _, nt in ipairs(info.node_types) do print(nt) end
 ```
 
 
-## maki.treesitter.query {#maki-treesitter-query}
+## caudra.treesitter.query {#caudra-treesitter-query}
 
 Query compilation and lookup.
 
@@ -3452,15 +3452,15 @@ Mirrors `vim.treesitter.query`. Use `parse()` to compile a tree-sitter
 query string into a `Query` object you can run against parsed trees.
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(string) @str")
+local q = caudra.treesitter.query.parse("lua", "(string) @str")
 ```
 
 ---
 
-### `maki.treesitter.query.parse()` {#maki-treesitter-query-parse}
+### `caudra.treesitter.query.parse()` {#caudra-treesitter-query-parse}
 
 ```lua
-maki.treesitter.query.parse({lang}, {query})
+caudra.treesitter.query.parse({lang}, {query})
 ```
 
 Compiles a tree-sitter query string for {lang}.
@@ -3471,20 +3471,20 @@ Throws if the language is unknown or the query has a syntax error.
 - `{lang}` (`string`) Language name, e.g. `"lua"`.
 - `{query}` (`string`) Tree-sitter S-expression query.
 
-**Returns:** ([`Query`](#maki-treesitter-Query)) Compiled query object.
+**Returns:** ([`Query`](#caudra-treesitter-Query)) Compiled query object.
 
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = caudra.treesitter.query.parse("lua", "(identifier) @id")
 ```
 
 ---
 
-### `maki.treesitter.query.get()` {#maki-treesitter-query-get}
+### `caudra.treesitter.query.get()` {#caudra-treesitter-query-get}
 
 ```lua
-maki.treesitter.query.get({lang}, {name})
+caudra.treesitter.query.get({lang}, {name})
 ```
 
 Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
@@ -3494,18 +3494,18 @@ Looks up a named built-in query for {lang} (not yet implemented, always returns 
 - `{lang}` (`string`) Language name.
 - `{name}` (`string`) Query name, e.g. `"highlights"`.
 
-**Returns:** ([`Query|nil`](#maki-treesitter-Query)) Query object, or nil if not found.
+**Returns:** ([`Query|nil`](#caudra-treesitter-Query)) Query object, or nil if not found.
 
 
-## maki.treesitter.Query {#maki-treesitter-Query}
+## caudra.treesitter.Query {#caudra-treesitter-Query}
 
 A compiled tree-sitter query.
 
-Get one by calling `maki.treesitter.query.parse(lang, query_string)`.
+Get one by calling `caudra.treesitter.query.parse(lang, query_string)`.
 Then use `:iter_captures()` or `:iter_matches()` to run it against a syntax tree.
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = caudra.treesitter.query.parse("lua", "(identifier) @id")
 for idx, node, meta in q:iter_captures(root, source) do
   print(node:type())
 end
@@ -3523,7 +3523,7 @@ Iterates over every capture matched by this query. Each call to the returned ite
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Root node to search within.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) Root node to search within.
 - `{source}` (`string`) Source text the tree was parsed from.
 - `{start_row?}` (`integer`) Only match rows >= this value (0-based).
 - `{stop_row?}` (`integer`) Only match rows < this value (0-based).
@@ -3533,7 +3533,7 @@ Iterates over every capture matched by this query. Each call to the returned ite
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = caudra.treesitter.query.parse("lua", "(identifier) @id")
 for idx, node, meta in q:iter_captures(root, source) do
   print(idx, node:type())
 end
@@ -3551,7 +3551,7 @@ Iterates over every full pattern match in this query. Each call to the returned 
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Root node to search within.
+- `{node}` ([`Node`](#caudra-treesitter-Node)) Root node to search within.
 - `{source}` (`string`) Source text the tree was parsed from.
 - `{start_row?}` (`integer`) Only match rows >= this value (0-based).
 - `{stop_row?}` (`integer`) Only match rows < this value (0-based).
@@ -3561,7 +3561,7 @@ Iterates over every full pattern match in this query. Each call to the returned 
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(function_declaration name: (identifier) @name)"
+local q = caudra.treesitter.query.parse("lua", "(function_declaration name: (identifier) @name)"
 )
 for pat, captures, meta in q:iter_matches(root, source) do
   for cap_idx, nodes in pairs(captures) do
@@ -3571,7 +3571,7 @@ end
 ```
 
 
-## maki.treesitter.Tree {#maki-treesitter-Tree}
+## caudra.treesitter.Tree {#caudra-treesitter-Tree}
 
 A parsed syntax tree.
 
@@ -3594,7 +3594,7 @@ Tree:root()
 Returns the root node of this tree. This is where you start walking
 the syntax tree or running queries.
 
-**Returns:** ([`Node`](#maki-treesitter-Node)) Root node.
+**Returns:** ([`Node`](#caudra-treesitter-Node)) Root node.
 
 **Example:**
 
@@ -3614,10 +3614,10 @@ Tree:copy()
 Returns an independent copy of this tree.
 Edits to the copy will not affect the original.
 
-**Returns:** ([`Tree`](#maki-treesitter-Tree)) A new Tree with the same content.
+**Returns:** ([`Tree`](#caudra-treesitter-Tree)) A new Tree with the same content.
 
 
-## maki.treesitter.Node {#maki-treesitter-Node}
+## caudra.treesitter.Node {#caudra-treesitter-Node}
 
 A single node in a parsed syntax tree.
 
@@ -3746,7 +3746,7 @@ Returns nil if {index} is out of bounds.
 
 - `{index}` (`integer`) 0-based child index.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Child node, or nil.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Child node, or nil.
 
 ---
 
@@ -3763,7 +3763,7 @@ Returns nil if {index} is out of bounds.
 
 - `{index}` (`integer`) 0-based named child index.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Named child node, or nil.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Named child node, or nil.
 
 ---
 
@@ -3875,7 +3875,7 @@ Node:parent()
 
 Returns the parent of this node, or nil if this is the root.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Parent node.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Parent node.
 
 ---
 
@@ -3887,7 +3887,7 @@ Node:next_sibling()
 
 Returns the next sibling (named or anonymous), or nil if this is the last child.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Next sibling.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Next sibling.
 
 ---
 
@@ -3899,7 +3899,7 @@ Node:prev_sibling()
 
 Returns the previous sibling (named or anonymous), or nil if this is the first child.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Previous sibling.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Previous sibling.
 
 ---
 
@@ -3911,7 +3911,7 @@ Node:next_named_sibling()
 
 Returns the next named sibling, skipping anonymous nodes. Returns nil at the end.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Next named sibling.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Next named sibling.
 
 ---
 
@@ -3923,7 +3923,7 @@ Node:prev_named_sibling()
 
 Returns the previous named sibling, skipping anonymous nodes. Returns nil at the start.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Previous named sibling.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Previous named sibling.
 
 ---
 
@@ -3938,9 +3938,9 @@ Returns nil if {descendant} is not actually inside this node.
 
 **Parameters:**
 
-- `{descendant}` ([`Node`](#maki-treesitter-Node)) A node that may be a descendant.
+- `{descendant}` ([`Node`](#caudra-treesitter-Node)) A node that may be a descendant.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Direct child containing the descendant.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Direct child containing the descendant.
 
 ---
 
@@ -3960,7 +3960,7 @@ Includes both named and anonymous nodes.
 - `{end_row}` (`integer`) End row (0-based).
 - `{end_col}` (`integer`) End column (0-based).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Smallest node covering the range, or nil.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Smallest node covering the range, or nil.
 
 ---
 
@@ -3979,7 +3979,7 @@ Like `descendant_for_range`, but only considers named nodes.
 - `{end_row}` (`integer`) End row (0-based).
 - `{end_col}` (`integer`) End column (0-based).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Smallest named node covering the range, or nil.
+**Returns:** ([`Node|nil`](#caudra-treesitter-Node)) Smallest named node covering the range, or nil.
 
 ---
 
@@ -4053,7 +4053,7 @@ Returns true if this node and {other} are the same node in the tree.
 
 **Parameters:**
 
-- `{other}` ([`Node`](#maki-treesitter-Node)) Node to compare against.
+- `{other}` ([`Node`](#caudra-treesitter-Node)) Node to compare against.
 
 **Returns:** (`boolean`)
 
@@ -4086,18 +4086,18 @@ Node:tree()
 
 Returns the Tree that this node belongs to.
 
-**Returns:** ([`Tree`](#maki-treesitter-Tree)) The owning tree.
+**Returns:** ([`Tree`](#caudra-treesitter-Tree)) The owning tree.
 
 
-## maki.treesitter.LanguageTree {#maki-treesitter-LanguageTree}
+## caudra.treesitter.LanguageTree {#caudra-treesitter-LanguageTree}
 
 Manages parsing of a source string for a single language.
 
-Obtained from `maki.treesitter.get_parser()` or `maki.treesitter.get_string_parser()`.
+Obtained from `caudra.treesitter.get_parser()` or `caudra.treesitter.get_string_parser()`.
 Call `:parse()` to get the syntax tree, then use `:root()` on the tree to start walking nodes.
 
 ```lua
-local parser, err = maki.treesitter.get_parser(source, "lua")
+local parser, err = caudra.treesitter.get_parser(source, "lua")
 if not err then
   local trees = parser:parse()
   local root = trees[1]:root()
@@ -4261,24 +4261,24 @@ Drops the cached parse tree and frees its memory.
 After calling this, the next `parse()` will re-parse from scratch.
 
 
-## maki.ui {#maki-ui}
+## caudra.ui {#caudra-ui}
 
 Functions for building interactive UI. Create buffers to hold
 content, open floating or split windows to display them, highlight
 code, render markdown, and show status hints.
 
 ```lua
-local buf = maki.ui.buf()
+local buf = caudra.ui.buf()
 buf:line("hello from my plugin!")
-local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
+local win = caudra.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
 ```
 
 ---
 
-### `maki.ui.buf()` {#maki-ui-buf}
+### `caudra.ui.buf()` {#caudra-ui-buf}
 
 ```lua
-maki.ui.buf()
+caudra.ui.buf()
 ```
 
 Creates a new buffer for building UI content. The first buffer you
@@ -4286,21 +4286,21 @@ create in a task becomes the "live" buffer, streamed to the UI while
 your tool runs. Create more buffers for secondary content like
 floating windows.
 
-**Returns:** ([`Buf`](#maki-ui-Buf)) Buffer handle.
+**Returns:** ([`Buf`](#caudra-ui-Buf)) Buffer handle.
 
 **Example:**
 
 ```lua
-local buf = maki.ui.buf()
+local buf = caudra.ui.buf()
 buf:line("hello world")
 ```
 
 ---
 
-### `maki.ui.theme_color()` {#maki-ui-theme_color}
+### `caudra.ui.theme_color()` {#caudra-ui-theme_color}
 
 ```lua
-maki.ui.theme_color({name})
+caudra.ui.theme_color({name})
 ```
 
 Looks up a semantic color from the current theme. Use this to keep
@@ -4315,7 +4315,7 @@ your plugin's colors consistent with the rest of the UI.
 **Example:**
 
 ```lua
-local accent = maki.ui.theme_color("accent")
+local accent = caudra.ui.theme_color("accent")
 if accent then
   buf:line({ { "note", { fg = accent, bold = true } } })
 end
@@ -4323,10 +4323,10 @@ end
 
 ---
 
-### `maki.ui.highlight()` {#maki-ui-highlight}
+### `caudra.ui.highlight()` {#caudra-ui-highlight}
 
 ```lua
-maki.ui.highlight({code}, {lang}, {opts?})
+caudra.ui.highlight({code}, {lang}, {opts?})
 ```
 
 Syntax-highlights a chunk of source code. Returns a table of styled
@@ -4346,7 +4346,7 @@ lines that you can feed into a buffer. Each line is a list of
 **Example:**
 
 ```lua
-local lines = maki.ui.highlight("fn main() {}", "rust")
+local lines = caudra.ui.highlight("fn main() {}", "rust")
 for _, spans in ipairs(lines) do
   buf:line(spans)
 end
@@ -4354,10 +4354,10 @@ end
 
 ---
 
-### `maki.ui.markdown()` {#maki-ui-markdown}
+### `caudra.ui.markdown()` {#caudra-ui-markdown}
 
 ```lua
-maki.ui.markdown({text}, {width})
+caudra.ui.markdown({text}, {width})
 ```
 
 Renders Markdown into styled lines ready to display in a buffer.
@@ -4375,8 +4375,8 @@ for syntax-highlighted code blocks.
 **Example:**
 
 ```lua
-local size = maki.ui.terminal_size()
-local lines = maki.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
+local size = caudra.ui.terminal_size()
+local lines = caudra.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
 for _, spans in ipairs(lines) do
   buf:line(spans)
 end
@@ -4384,10 +4384,10 @@ end
 
 ---
 
-### `maki.ui.humantime()` {#maki-ui-humantime}
+### `caudra.ui.humantime()` {#caudra-ui-humantime}
 
 ```lua
-maki.ui.humantime({secs})
+caudra.ui.humantime({secs})
 ```
 
 Formats a number of seconds into a short, human-friendly string.
@@ -4402,16 +4402,16 @@ Useful for displaying elapsed time in status messages.
 **Example:**
 
 ```lua
-maki.ui.humantime(90)   -- "1m30s"
-maki.ui.humantime(3661) -- "1h1m1s"
+caudra.ui.humantime(90)   -- "1m30s"
+caudra.ui.humantime(3661) -- "1h1m1s"
 ```
 
 ---
 
-### `maki.ui.terminal_size()` {#maki-ui-terminal_size}
+### `caudra.ui.terminal_size()` {#caudra-ui-terminal_size}
 
 ```lua
-maki.ui.terminal_size()
+caudra.ui.terminal_size()
 ```
 
 Returns the current terminal size. Handy for sizing floating windows
@@ -4422,16 +4422,16 @@ or wrapping text to fit the screen.
 **Example:**
 
 ```lua
-local size = maki.ui.terminal_size()
+local size = caudra.ui.terminal_size()
 local half_width = math.floor(size.cols / 2)
 ```
 
 ---
 
-### `maki.ui.display_width()` {#maki-ui-display_width}
+### `caudra.ui.display_width()` {#caudra-ui-display_width}
 
 ```lua
-maki.ui.display_width({text})
+caudra.ui.display_width({text})
 ```
 
 Returns the display width of a string in terminal cells, matching
@@ -4446,15 +4446,15 @@ how `ratatui` measures text.
 **Example:**
 
 ```lua
-local w = maki.ui.display_width("hello")
+local w = caudra.ui.display_width("hello")
 ```
 
 ---
 
-### `maki.ui.truncate_text()` {#maki-ui-truncate_text}
+### `caudra.ui.truncate_text()` {#caudra-ui-truncate_text}
 
 ```lua
-maki.ui.truncate_text({text}, {max_width})
+caudra.ui.truncate_text({text}, {max_width})
 ```
 
 Splits a string at a display-cell boundary.
@@ -4469,16 +4469,16 @@ Splits a string at a display-cell boundary.
 **Example:**
 
 ```lua
-local t = maki.ui.truncate_text("hello world", 5)
+local t = caudra.ui.truncate_text("hello world", 5)
 -- t.head == "hello", t.tail == " world"
 ```
 
 ---
 
-### `maki.ui.flash()` {#maki-ui-flash}
+### `caudra.ui.flash()` {#caudra-ui-flash}
 
 ```lua
-maki.ui.flash({msg})
+caudra.ui.flash({msg})
 ```
 
 Shows a brief message in the status bar. The message disappears
@@ -4492,20 +4492,20 @@ or showing a transient warning.
 **Example:**
 
 ```lua
-maki.ui.flash("Copied to clipboard!")
+caudra.ui.flash("Copied to clipboard!")
 ```
 
 ---
 
-### `maki.ui.action()` {#maki-ui-action}
+### `caudra.ui.action()` {#caudra-ui-action}
 
 ```lua
-maki.ui.action({name})
+caudra.ui.action({name})
 ```
 
 Runs a built-in UI action by name, exactly as its default keybinding
-would. Handy when a default key never reaches maki because tmux or
-your terminal grabs it first: bind a new key with `maki.keymap.set`
+would. Handy when a default key never reaches caudra because tmux or
+your terminal grabs it first: bind a new key with `caudra.keymap.set`
 and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"help"`,
@@ -4513,7 +4513,7 @@ Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"prev_chat"`, `"next_chat"`.
 
 For slash commands rather than keybound actions, see
-`maki.api.run_command`.
+`caudra.api.run_command`.
 
 **Parameters:**
 
@@ -4525,17 +4525,17 @@ For slash commands rather than keybound actions, see
 
 ```lua
 -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-maki.keymap.set("n", "<C-q>", function()
-  maki.ui.action("file_picker")
+caudra.keymap.set("n", "<C-q>", function()
+  caudra.ui.action("file_picker")
 end)
 ```
 
 ---
 
-### `maki.ui.open_editor()` {#maki-ui-open_editor}
+### `caudra.ui.open_editor()` {#caudra-ui-open_editor}
 
 ```lua
-maki.ui.open_editor({path})
+caudra.ui.open_editor({path})
 ```
 
 Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
@@ -4551,18 +4551,18 @@ Returns the editor's exit code so you can check if the user saved.
 **Example:**
 
 ```lua
-local code = maki.ui.open_editor("/tmp/scratch.lua")
+local code = caudra.ui.open_editor("/tmp/scratch.lua")
 if code == 0 then
-  maki.ui.flash("File saved")
+  caudra.ui.flash("File saved")
 end
 ```
 
 ---
 
-### `maki.ui.open_win()` {#maki-ui-open_win}
+### `caudra.ui.open_win()` {#caudra-ui-open_win}
 
 ```lua
-maki.ui.open_win({buf}, {opts})
+caudra.ui.open_win({buf}, {opts})
 ```
 
 Opens a floating or split window that displays the contents of {buf}.
@@ -4571,7 +4571,7 @@ and close the window when you are done.
 
 **Parameters:**
 
-- `{buf}` ([`Buf`](#maki-ui-Buf)) Buffer to display.
+- `{buf}` ([`Buf`](#caudra-ui-Buf)) Buffer to display.
 - `{opts}` (`table`) Float configuration. Fields:
   - `width` (`integer|string`) window width. Integer for absolute columns; "N%" for percent of terminal width. Default "60%".
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
@@ -4592,14 +4592,14 @@ and close the window when you are done.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
 
-**Returns:** ([`Win`](#maki-ui-Win)) Window handle.
+**Returns:** ([`Win`](#caudra-ui-Win)) Window handle.
 
 **Example:**
 
 ```lua
-local buf = maki.ui.buf()
+local buf = caudra.ui.buf()
 buf:line("Pick an option:")
-local win = maki.ui.open_win(buf, {
+local win = caudra.ui.open_win(buf, {
   title = "Menu",
   width = "50%",
   height = 10,
@@ -4610,10 +4610,10 @@ local win = maki.ui.open_win(buf, {
 
 ---
 
-### `maki.ui.set_status_hint()` {#maki-ui-set_status_hint}
+### `caudra.ui.set_status_hint()` {#caudra-ui-set_status_hint}
 
 ```lua
-maki.ui.set_status_hint({spans})
+caudra.ui.set_status_hint({spans})
 ```
 
 Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.
@@ -4625,17 +4625,17 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 **Example:**
 
 ```lua
-maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
+caudra.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
-maki.ui.set_status_hint(nil)
+caudra.ui.set_status_hint(nil)
 ```
 
 ---
 
-### `maki.ui.set_window_title()` {#maki-ui-set_window_title}
+### `caudra.ui.set_window_title()` {#caudra-ui-set_window_title}
 
 ```lua
-maki.ui.set_window_title({title})
+caudra.ui.set_window_title({title})
 ```
 
 Sets the terminal emulator's window title. Pass an empty string to
@@ -4643,7 +4643,7 @@ clear it.
 
 The title passes through tmux, GNU screen, and zellij untouched, and
 control characters are stripped, so model text cannot inject escape
-sequences into the terminal. On exit maki hands the title back to the
+sequences into the terminal. On exit caudra hands the title back to the
 shell, on terminals that support the title stack.
 
 **Parameters:**
@@ -4653,23 +4653,23 @@ shell, on terminals that support the title stack.
 **Example:**
 
 ```lua
-maki.ui.set_window_title("maki: " .. session_name)
+caudra.ui.set_window_title("caudra: " .. session_name)
 -- Give the title back to the shell:
-maki.ui.set_window_title("")
+caudra.ui.set_window_title("")
 ```
 
 
-## maki.ui.Win {#maki-ui-Win}
+## caudra.ui.Win {#caudra-ui-Win}
 
 Handle to a floating or split window. You get one from
-`maki.ui.open_win()`. Use `recv()` in a loop to handle keyboard
+`caudra.ui.open_win()`. Use `recv()` in a loop to handle keyboard
 input, and call `close()` when done.
 
 Fields: `width`, `height` (initial content dimensions in columns/rows),
 `visible` (current visibility).
 
 ```lua
-local win = maki.ui.open_win(buf, { title = "Demo" })
+local win = caudra.ui.open_win(buf, { title = "Demo" })
 while true do
   local ev = win:recv()
   if not ev or ev.key == "q" then break end
@@ -4855,14 +4855,14 @@ Returns true if the window is both open and visible (not hidden).
 **Returns:** (`boolean`) true if visible.
 
 
-## maki.ui.Buf {#maki-ui-Buf}
+## caudra.ui.Buf {#caudra-ui-Buf}
 
 A content buffer that holds styled lines of text. Create one with
-`maki.ui.buf()` and pass it to `maki.ui.open_win()` to show it in
+`caudra.ui.buf()` and pass it to `caudra.ui.open_win()` to show it in
 a floating or split window.
 
 ```lua
-local buf = maki.ui.buf()
+local buf = caudra.ui.buf()
 buf:line("hello")
 buf:line({ { "world", "bold" } })
 ```
@@ -5008,7 +5008,7 @@ Calling `on()` again for the same event replaces the previous handler.
 
 ```lua
 buf:on("click", function(ev)
-  maki.ui.flash("Clicked row " .. ev.row)
+  caudra.ui.flash("Clicked row " .. ev.row)
 end)
 ```
 
@@ -5081,7 +5081,7 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 ```
 
 
-## maki.uv {#maki-uv}
+## caudra.uv {#caudra-uv}
 
 System and environment utilities, modelled after `vim.uv`.
 
@@ -5089,15 +5089,15 @@ Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
 ```lua
-local home = maki.uv.os_homedir()
+local home = caudra.uv.os_homedir()
 ```
 
 ---
 
-### `maki.uv.cwd()` {#maki-uv-cwd}
+### `caudra.uv.cwd()` {#caudra-uv-cwd}
 
 ```lua
-maki.uv.cwd()
+caudra.uv.cwd()
 ```
 
 Return the current working directory as an absolute path. Like `vim.uv.cwd`.
@@ -5109,16 +5109,16 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local cwd = maki.uv.cwd()
+local cwd = caudra.uv.cwd()
 if cwd then print("working in: " .. cwd) end
 ```
 
 ---
 
-### `maki.uv.os_homedir()` {#maki-uv-os_homedir}
+### `caudra.uv.os_homedir()` {#caudra-uv-os_homedir}
 
 ```lua
-maki.uv.os_homedir()
+caudra.uv.os_homedir()
 ```
 
 Return the current user's home directory. Like `vim.uv.os_homedir`.
@@ -5130,15 +5130,15 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local home = maki.uv.os_homedir() -- e.g. "/home/user"
+local home = caudra.uv.os_homedir() -- e.g. "/home/user"
 ```
 
 ---
 
-### `maki.uv.os_getenv()` {#maki-uv-os_getenv}
+### `caudra.uv.os_getenv()` {#caudra-uv-os_getenv}
 
 ```lua
-maki.uv.os_getenv({name})
+caudra.uv.os_getenv({name})
 ```
 
 Look up the environment variable {name}. Like `vim.uv.os_getenv`.
@@ -5155,26 +5155,26 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local editor = maki.uv.os_getenv("EDITOR") or "vi"
+local editor = caudra.uv.os_getenv("EDITOR") or "vi"
 ```
 
 
-## maki.yaml {#maki-yaml}
+## caudra.yaml {#caudra-yaml}
 
-YAML encoding and decoding. Works the same way as `maki.json`,
+YAML encoding and decoding. Works the same way as `caudra.json`,
 but for YAML formatted strings.
 
 ```lua
-local t = maki.yaml.decode("greeting: hello")
+local t = caudra.yaml.decode("greeting: hello")
 print(t.greeting)
 ```
 
 ---
 
-### `maki.yaml.encode()` {#maki-yaml-encode}
+### `caudra.yaml.encode()` {#caudra-yaml-encode}
 
 ```lua
-maki.yaml.encode({value})
+caudra.yaml.encode({value})
 ```
 
 Turn a Lua value into a YAML string. Most Lua types work, but
@@ -5189,16 +5189,16 @@ circular references will return an error.
 **Example:**
 
 ```lua
-local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
+local s, err = caudra.yaml.encode({ name = "caudra", tags = { "ai", "agent" } })
 print(s)
 ```
 
 ---
 
-### `maki.yaml.decode()` {#maki-yaml-decode}
+### `caudra.yaml.decode()` {#caudra-yaml-decode}
 
 ```lua
-maki.yaml.decode({str})
+caudra.yaml.decode({str})
 ```
 
 Parse a YAML string into a Lua value. Mappings become tables and
@@ -5213,17 +5213,17 @@ sequences become 1-indexed arrays.
 **Example:**
 
 ```lua
-local t, err = maki.yaml.decode("name: maki\nversion: 1")
-print(t.name) -- maki
+local t, err = caudra.yaml.decode("name: caudra\nversion: 1")
+print(t.name) -- caudra
 ```
 
 
 ## Shared helper modules
 
-These ship inside maki; `require` them from any plugin. Small modules are
+These ship inside caudra; `require` them from any plugin. Small modules are
 shown as full source, larger ones as their public interface.
 
-### `require("maki.color")`
+### `require("caudra.color")`
 
 ```lua
 local M = {}
@@ -5243,14 +5243,14 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background") or "#000000"
+  local bg = caudra.ui.theme_color("background") or "#000000"
   return M.lerp(color, bg, factor)
 end
 
 return M
 ```
 
-### `require("maki.dir_listing")`
+### `require("caudra.dir_listing")`
 
 ```lua
 -- Shared directory listing for index and list plugins.
@@ -5260,7 +5260,7 @@ function M.list(path, ctx)
 function M.view(text, ctx)
 ```
 
-### `require("maki.fuzzy_replace")`
+### `require("caudra.fuzzy_replace")`
 
 ```lua
 M.NO_MATCH = "old_string not found in file"
@@ -5273,7 +5273,7 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 function M.replace(content, old_string, new_string, replace_all)
 ```
 
-### `require("maki.list_picker")`
+### `require("caudra.list_picker")`
 
 ```lua
 -- Draws the filter query and its blank spacer into {lines}, pins that height on
@@ -5294,7 +5294,7 @@ ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ```
 
-### `require("maki.output_limits")`
+### `require("caudra.output_limits")`
 
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
@@ -5306,7 +5306,7 @@ function M.extend(spec)
 function M.resolve(opts, ctx)
 ```
 
-### `require("maki.partial")`
+### `require("caudra.partial")`
 
 ```lua
 -- When a tool is cut short, it still hands back what it printed. The marker
@@ -5320,23 +5320,23 @@ function M.resolve(opts, ctx)
 function M.cut(view, out, reason, timeout_secs)
 ```
 
-### `require("maki.scroll")`
+### `require("caudra.scroll")`
 
 ```lua
--- Relative scrolling on top of maki.fn.winsaveview / winrestview.
+-- Relative scrolling on top of caudra.fn.winsaveview / winrestview.
 -- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
 local function scroll(delta)
-  local view, err = maki.fn.winsaveview()
+  local view, err = caudra.fn.winsaveview()
   if not view then
     return nil, err
   end
-  return maki.fn.winrestview({ topline = view.topline + delta })
+  return caudra.fn.winrestview({ topline = view.topline + delta })
 end
 
 return scroll
 ```
 
-### `require("maki.shorten_path")`
+### `require("caudra.shorten_path")`
 
 ```lua
 local function normalize_sep(s)
@@ -5345,7 +5345,7 @@ end
 
 local function shorten_path(path)
   local p = normalize_sep(path)
-  local cwd = maki.uv.cwd()
+  local cwd = caudra.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if p:sub(1, #cwd + 1) == cwd .. "/" then
@@ -5353,7 +5353,7 @@ local function shorten_path(path)
       return rel == "" and "." or rel
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = caudra.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if p:sub(1, #home + 1) == home .. "/" then
@@ -5367,7 +5367,7 @@ end
 return shorten_path
 ```
 
-### `require("maki.test_helpers")`
+### `require("caudra.test_helpers")`
 
 ```lua
 -- Shared test helpers for Lua plugin specs.
@@ -5383,7 +5383,7 @@ function M.rmtree(dir)
 function M.report()
 ```
 
-### `require("maki.text_input")`
+### `require("caudra.text_input")`
 
 ```lua
 -- TextInput: multi-line editable buffer with a byte-offset cursor.
@@ -5441,7 +5441,7 @@ function TextInput:handle_key(key)
 function TextInput:render(prefix, prefix_width, width)
 ```
 
-### `require("maki.tool_view")`
+### `require("caudra.tool_view")`
 
 ```lua
 -- The shared truncate/expand body that tool plugins render through.
@@ -5452,7 +5452,7 @@ function TextInput:render(prefix, prefix_width, width)
 -- reaches the same toggle. Expansion is never stored: the UI records
 -- clicked rows and replays them through `restore` in order, so `toggle`
 -- stays a pure flag flip + re-render, deterministic across replays.
--- Async highlighting goes through `maki.async.run`; during restore the
+-- Async highlighting goes through `caudra.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
 
 -- Right aligned, so the content column stays put when a number gains a digit.
@@ -5495,7 +5495,7 @@ function ToolView.restore(output, opts)
 function ToolView.restore_markdown(output, is_error, opts)
 ```
 
-### `require("maki.truncate")`
+### `require("caudra.truncate")`
 
 ```lua
 -- Truncate before host-managed output. Use only when producer-level loss is intentional.

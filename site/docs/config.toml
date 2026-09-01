@@ -1,10 +1,11 @@
 base_url = "/docs"
-title = "Maki Docs"
+title = "Caudra Docs"
+description = "Documentation for Caudra, the terminal coding agent that turns context into effective action."
 compile_sass = true
 build_search_index = false
 
 [markdown.highlighting]
 enabled = true
 style = "inline"
-theme = "maki"
-extra_themes = ["extra/maki.json"]
+theme = "caudra"
+extra_themes = ["extra/caudra.json"]

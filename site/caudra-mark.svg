@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Caudra decision aperture</title>
+  <desc id="desc">Three context paths converge through one aperture and resolve into a selected path</desc>
+  <rect width="96" height="96" fill="#f2ebdd"/>
+  <g transform="rotate(180 48 48)">
+    <path d="M7 12h24c14 0 19 9 28 19 4 5 8 7 12 9l-6 9c-5-4-9-5-14-8-11-7-13-17-22-17H7Z" fill="#09254d"/>
+    <path d="M7 84h24c14 0 19-9 28-19 4-5 8-7 12-9l-6-9c-5 4-9 5-14 8-11 7-13 17-22 17H7Z" fill="#09254d"/>
+  </g>
+  <path d="M7 40h11c5 0 8 3 8 8s-3 8-8 8H7Z" fill="#f0442f"/>
+  <path d="M34 39h55v18H34c-5 0-8-4-8-9s3-9 8-9Z" fill="#f0442f"/>
+  <circle cx="27" cy="48" r="6" fill="#f2ebdd"/>
+</svg>

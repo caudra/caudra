@@ -1,144 +1,112 @@
-<img src="./banner.png">
+<p align="center">
+  <img src="./banner.png" alt="caudra: context into effective action" width="100%">
+</p>
 
-An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
+# Caudra
 
-## Features
+Caudra turns context into effective action. It is a terminal coding agent that coordinates models, tools, plugins, and subagents while keeping execution visible and under your control.
 
-### Context efficiency
+Caudra is an independent fork maintained at [github.com/caudra/caudra](https://github.com/caudra/caudra). The current release line starts at `0.1.0` and uses a hard-break product identity.
 
-* `index` tool - uses [tree-sitter](https://tree-sitter.github.io/tree-sitter) to parse supported programming languages to produce a high level skeleton of a file, with exact start-end lines of each item (e.g. a function's implementation is in lines 150-165). Encouraged to be used before reads. For my usage it adds 59 tok/turn but saves 224 tok/turn on read calls, saving 165 tok/turn.
-* `code_execution` tool - uses [monty](https://github.com/pydantic/monty) to run an interpreter that has all other tools available as async functions. Maki uses it to filter / summarize / transform / pipe data to other tools as input, without it ever reaching and polluting the context window. Sandbox limited by time & memory.
-* `task` tool - delegates isolated plan or build work to subagents. System prompt profiles can select a subagent model and thinking mode.
-* System prompt, tool descriptions, and tool examples are all concise, I've made sure not to bloat your context.
+Brought to you by [Thorsten Born](https://github.com/tensorninja) ([website](https://thorstenborn.com)).
 
-### User experience
+## Project lineage
 
-* SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
-* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
-* Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
-* UI fits everything well on my small screen laptop.
-* Full visibility and control of subagents - click a task to open its transcript, steer it while it runs, return through `[< Main]`, or browse every task with `/tasks` (Ctrl-X). Task history survives reloads and supports later continuation.
-* Sensible permission system - when the agent runs `git diff && rm -rf /`, what do you think will happen in your current coding agent? It will treat it as `git *`. Maki uses tree-sitter to parse the shell command and figure out the permissions requested are `git *` and `rm *`. Disable using `--yolo`.
-* SSRF protection on `webfetch` calls.
-* A `memory` tool to keep long term context, just tell maki to remember something (sometimes it uses it automatically). Managed via `/memory` (view / edit / delete memories).
-* Fuzzy search with Ctrl-F.
-* `/btw` to run a command with the chat history without interfering with the current session.
-* Rewind on Escape-Escape (no code rewind yet, only chat history).
-* Attach images in prompts.
-* 26 of the most popular themes.
-* Resume sessions.
-* Skills & MCPs.
-* Opt-in [OpenTelemetry](https://maki.sh/docs/telemetry/) export, same format as Claude Code's.
-* Plan mode.
-* Run bash commands using `!`, or `!!` if you want maki to not know about it.
-* `/cd` to change dir.
-* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions (although I wouldn't recommend that, maki is very new).
+Caudra is derived from [Maki](https://github.com/tontinton/maki), originally developed by [Tony Solomonik](https://github.com/tontinton), and includes work by Maki contributors. Maki is licensed under the MIT License, and its contributor history is preserved in this repository.
 
-## Supported providers
+Caudra modifications are maintained by [Thorsten Born](https://thorstenborn.com). Caudra is not affiliated with or endorsed by the original project.
 
-* Anthropic - `ANTHROPIC_API_KEY` or experimental Claude subscription OAuth via `maki auth login anthropic`. This uses Claude Code's public client registration and may conflict with Anthropic's subscription terms. Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
-* OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
-* xAI - `XAI_API_KEY` and OAuth via `maki auth login xai`.
-* Google - `GEMINI_API_KEY`.
-* Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
-* Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.
-* llama.cpp - `LLAMA_CPP_HOST` (e.g. `http://localhost:8080`), optionally `LLAMA_CPP_API_KEY`.
-* Mistral - `MISTRAL_API_KEY`.
-* Z.AI - `ZHIPU_API_KEY`.
-* DeepSeek - `DEEPSEEK_API_KEY`.
-* OpenRouter - `OPENROUTER_API_KEY`.
-* Synthetic - `SYNTHETIC_API_KEY`.
-* TensorX - `TENSORX_API_KEY`.
-* OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
-* OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
-* Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
+## Why Caudra
 
-**Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+### Effective action
 
-## Installation
+- `index` parses supported languages with [tree-sitter](https://tree-sitter.github.io/tree-sitter) and returns compact file structure with exact line ranges.
+- `code_execution` uses [Monty](https://github.com/pydantic/monty) to run bounded, isolated Python over values already in context. It cannot call tools or access host files, processes, or the network. The final expression and printed output return as one tool result.
+- `task` delegates isolated planning or implementation to subagents with selectable models and thinking modes.
+- Tool results feed back into the next decision, so Caudra can inspect failures, change course, and continue.
 
-### Linux / macOS
+### Control and visibility
+
+- Native Rust TUI with fast startup, 60 FPS rendering, and low memory use.
+- Tree-sitter shell parsing that reviews each command in a compound expression instead of approving by prefix.
+- Full task transcripts, live steering, session rewind, plan mode, and explicit permission scopes.
+- Headless and SDK modes, ACP support for editors, MCP servers, skills, persistent memory, and image input.
+- Opt-in [OpenTelemetry](https://caudra.ai/docs/telemetry/) export using `caudra.*` metrics and events.
+
+### Extensible by design
+
+Caudra has a Neovim-style Lua API. Built-in and user plugins can add tools, commands, keymaps, and UI. See the [built-in plugins](https://github.com/caudra/caudra/tree/main/plugins) and [Lua API reference](https://caudra.ai/docs/lua-api/).
+
+## Providers
+
+Caudra supports Anthropic, OpenAI, xAI, Google, Copilot, Ollama, llama.cpp, Mistral, Z.AI, DeepSeek, OpenRouter, Synthetic, TensorX, OpenCode, Aperture, and compatible OpenAI or Anthropic endpoints.
+
+Run `caudra auth login` for the interactive setup, or configure provider environment variables. Dynamic provider scripts live in `~/.config/caudra/providers/`. See the [provider reference](https://caudra.ai/docs/providers/).
+
+## Install
+
+### Linux and macOS
+
+Review the installer before running it:
 
 ```sh
-# Download and read the script first (don't blindly trust shell scripts).
-curl -fsSL https://maki.sh/install.sh -o install.sh
+curl -fsSL https://caudra.ai/install.sh -o install.sh
 cat install.sh
-
-# Then run.
 chmod +x install.sh && sh install.sh
 ```
 
-One-liner:
+Or run the one-liner:
 
 ```sh
-curl -fsSL https://maki.sh/install.sh | sh
+curl -fsSL https://caudra.ai/install.sh | sh
 ```
 
-Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
+The default install directory is `~/.local/bin`. Set `CAUDRA_INSTALL_DIR` to override it.
 
-### Windows (PowerShell)
+### Windows PowerShell
 
 ```powershell
-# Download and read the script first (don't blindly trust remote scripts).
-irm https://maki.sh/install.ps1 -OutFile install.ps1
+irm https://caudra.ai/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
-
-# Then run.
 .\install.ps1
 ```
 
-One-liner:
+Or run:
 
 ```powershell
-irm https://maki.sh/install.ps1 | iex
+irm https://caudra.ai/install.ps1 | iex
 ```
 
-### Windows (Git Bash)
+The Windows installer uses `%LOCALAPPDATA%\caudra` and adds it to the user `PATH`. Set `CAUDRA_INSTALL_DIR` to override it.
+
+### Other options
 
 ```sh
-curl -fsSL https://maki.sh/install.sh | sh
+# Main branch
+cargo install --locked --git https://github.com/caudra/caudra.git caudra
+
+# Nix
+nix run github:caudra/caudra
 ```
 
-Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
+Prebuilt binaries are available from [GitHub Releases](https://github.com/caudra/caudra/releases/latest).
 
-### Living on the edge (main branch)
+## Start
+
+From a repository:
 
 ```sh
-cargo install --locked --git https://github.com/tontinton/maki.git maki
+caudra
 ```
 
-### With Nix
-
-```sh
-nix run github:tontinton/maki
-```
-
-Or download a pre-built binary from [GitHub Releases](https://github.com/tontinton/maki/releases/latest).
-
-## ACP
-
-Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed](https://zed.dev/)'s `settings.json`:
-
-```json
-"agent_servers": {
-  "Maki": {
-    "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
-    },
-    "type": "custom",
-    "command": "maki",
-    "args": ["acp"],
-    "env": {}
-  }
-}
-```
+Run `caudra acp` to expose Caudra to an ACP client such as Zed. Use `caudra --print` for scripts and CI.
 
 ## Documentation
 
-More info at the [official docs](https://maki.sh/docs).
+- [Quick start](https://caudra.ai/docs/quick-start/)
+- [Tools](https://caudra.ai/docs/tools/)
+- [Configuration](https://caudra.ai/docs/configuration/)
+- [Permissions](https://caudra.ai/docs/permissions/)
+- [Example config](https://github.com/caudra/config)
 
-## Example config
-
-[tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
-
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactor if needed nowadays.
+The example config includes a [Semble](https://github.com/MinishLab/semble) semantic code-search tool and an [ast-grep](https://ast-grep.github.io) MCP server.

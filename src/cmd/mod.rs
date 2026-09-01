@@ -9,18 +9,18 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_storage::StateDir;
+use caudra_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
 
-fn register_workcell(cwd: &Path) -> Result<maki_workcell::WorkcellHost> {
+fn register_workcell(cwd: &Path) -> Result<caudra_workcell::WorkcellHost> {
     let worker = std::env::var_os(WORKCELL_CODE_WORKER_ENV).map(std::path::PathBuf::from);
-    let host = maki_workcell::WorkcellHost::new_production(cwd, worker.as_deref())
+    let host = caudra_workcell::WorkcellHost::new_production(cwd, worker.as_deref())
         .context("initialize native Workcell tools")?;
-    host.register(maki_agent::tools::ToolRegistry::global())
+    host.register(caudra_agent::tools::ToolRegistry::global())
         .context("register native Workcell tools")?;
     for warning in host.warnings() {
         eprintln!("warning: {warning}");

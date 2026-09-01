@@ -74,6 +74,6 @@ Once sent, the transcript draws the block as a review card rather than raw tags.
 
 ## Notes across messages
 
-Notes collect until you send them. Press `Esc` to leave the modal, open a different message, and keep adding. Maki reminds you how many are waiting.
+Notes collect until you send them. Press `Esc` to leave the modal, open a different message, and keep adding. Caudra reminds you how many are waiting.
 
 Starting a new session or loading another one drops pending notes, because the messages they point at are gone.

@@ -1,15 +1,15 @@
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local output_limits = require("maki.output_limits")
+local ToolView = require("caudra.tool_view")
+local shorten_path = require("caudra.shorten_path")
+local output_limits = require("caudra.output_limits")
 
 local NO_FILES_FOUND = "No files found"
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = caudra.api.register_options(output_limits.extend({
   search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
 }))
 
 local function search_path(input)
-  return maki.fs.normalize(input.path or ".")
+  return caudra.fs.normalize(input.path or ".")
 end
 
 local function search_scope(input)
@@ -22,7 +22,7 @@ local function glob_view_opts(ctx)
   return { max_lines = (tol and tol.other) or 3, keep = "head" }
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "glob",
   kind = "search",
   description = [[Find files by glob pattern.
@@ -43,7 +43,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     local spans = { { shorten_path(input.pattern or ""), "tool" } }
     if input.path then
       spans[#spans + 1] = { " in ", "dim" }
@@ -67,7 +67,7 @@ maki.api.register_tool({
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
     local limits = { max_lines = max_lines, max_bytes = max_bytes }
 
-    local files, err = maki.fs.glob(pattern, {
+    local files, err = caudra.fs.glob(pattern, {
       path = search_path(input),
       gitignore = true,
       sort = "mtime",
@@ -88,7 +88,7 @@ maki.api.register_tool({
     end
     local text = table.concat(lines, "\n")
 
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     local view = ToolView.new(buf, glob_view_opts(ctx))
     for _, line in ipairs(lines) do
       view:append(line)

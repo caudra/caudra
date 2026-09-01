@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-REPO="tontinton/maki"
-BINARY="maki"
+REPO="caudra/caudra"
+BINARY="caudra"
 
 github_curl() {
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
@@ -10,12 +10,12 @@ github_curl() {
         curl -fsSL \
             -H "Authorization: Bearer ${token}" \
             -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: maki-install" \
+            -H "User-Agent: caudra-install" \
             "$@"
     else
         curl -fsSL \
             -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: maki-install" \
+            -H "User-Agent: caudra-install" \
             "$@"
     fi
 }
@@ -37,7 +37,7 @@ latest_tag() {
 default_install_dir() {
     if is_windows; then
         if [ -n "${LOCALAPPDATA:-}" ]; then
-            printf '%s\n' "${LOCALAPPDATA}/maki"
+            printf '%s\n' "${LOCALAPPDATA}/caudra"
         else
             printf '%s\n' "${HOME}/.local/bin"
         fi
@@ -90,7 +90,7 @@ if (\$null -eq \$userPath) { \$userPath = '' }
 if (\$already) { exit 0 }
 \$newPath = if (\$userPath.Trim()) { \"\$userPath\$sep\$dir\" } else { \$dir }
 [Environment]::SetEnvironmentVariable('Path', \$newPath, 'User')
-Write-Host \"added \$dir to user PATH (restart terminal if maki is not found)\"
+Write-Host \"added \$dir to user PATH (restart terminal if caudra is not found)\"
 " || true
 }
 
@@ -121,7 +121,7 @@ main() {
         bin_name="${BINARY}"
     fi
 
-    INSTALL_DIR="${MAKI_INSTALL_DIR:-$(default_install_dir)}"
+    INSTALL_DIR="${CAUDRA_INSTALL_DIR:-$(default_install_dir)}"
 
     tag="${1:-$(latest_tag)}"
     [ -n "${tag}" ] || err "failed to determine latest release tag"
@@ -132,8 +132,8 @@ main() {
 
     echo "downloading ${BINARY} ${tag} for ${target}..."
     if [ "${archive_ext}" = "zip" ]; then
-        github_curl "${url}" -o "${tmp}/maki.zip"
-        unzip -qo "${tmp}/maki.zip" -d "${tmp}"
+        github_curl "${url}" -o "${tmp}/caudra.zip"
+        unzip -qo "${tmp}/caudra.zip" -d "${tmp}"
     else
         github_curl "${url}" | tar xz -C "${tmp}"
     fi
@@ -152,9 +152,9 @@ main() {
             mkdir -p "$1"
             mv "$2" "$3"
             chmod +x "$3"
-        ' maki-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
+        ' caudra-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
     else
-        err "cannot write to ${INSTALL_DIR} (set MAKI_INSTALL_DIR to a writable directory)"
+        err "cannot write to ${INSTALL_DIR} (set CAUDRA_INSTALL_DIR to a writable directory)"
     fi
 
     echo "${BINARY} ${tag} installed to ${dest}"

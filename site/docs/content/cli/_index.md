@@ -7,14 +7,14 @@ group = "Reference"
 
 # CLI
 
-`maki` without a subcommand starts the TUI. Subcommands cover auth, models, MCP OAuth, updates, and a few debug helpers. Many flags only apply to one of three run paths: **TUI**, one-shot **`--print`**, or **SDK** (`--print --input-format stream-json`).
+`caudra` without a subcommand starts the TUI. Subcommands cover auth, models, MCP OAuth, updates, and a few debug helpers. Many flags only apply to one of three run paths: **TUI**, one-shot **`--print`**, or **SDK** (`--print --input-format stream-json`).
 
 ```bash
-maki [OPTIONS] [PROMPT]
-maki <COMMAND>
+caudra [OPTIONS] [PROMPT]
+caudra <COMMAND>
 ```
 
-If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and that text is the first message. With `--print`, Maki runs non-interactively and exits when done.
+If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and that text is the first message. With `--print`, Caudra runs non-interactively and exits when done.
 
 ## Flags by run path
 
@@ -46,7 +46,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-s`, `--session` / `--resume <ID>` | Resume a specific session (TUI / SDK only) |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
-| `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
+| `--no-commands` | Skip custom commands from `.caudra/commands`, `.claude/commands`, etc. |
 | `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
@@ -64,7 +64,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept PascalCase (`FileRead,FileEdit,Shell`) or snake_case (`file_read,file_edit,shell`). Maki converts PascalCase to snake_case and checks the result against the built-in tool names. Unknown names fail with the complete list of valid names.
+`--allowed-tools` / `--disallowed-tools` accept PascalCase (`FileRead,FileEdit,Shell`) or snake_case (`file_read,file_edit,shell`). Caudra converts PascalCase to snake_case and checks the result against the built-in tool names. Unknown names fail with the complete list of valid names.
 
 ### Permission modes (SDK)
 
@@ -77,106 +77,98 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 If both `--yolo` and `--permission-mode` are set, the explicit mode wins. Unknown mode names warn and fall back to `default`.
 
-Several other Claude Code flags are accepted and ignored so existing scripts keep parsing. Maki prints a warning when you pass one of them.
+Several other Claude Code flags are accepted and ignored so existing scripts keep parsing. Caudra prints a warning when you pass one of them.
 
 ## Subcommands
 
-### `maki auth`
+### `caudra auth`
 
 ```bash
-maki auth login [provider]   # interactive picker if omitted
-maki auth logout <provider>
-maki auth status
+caudra auth login [provider]   # interactive picker if omitted
+caudra auth logout <provider>
+caudra auth status
 ```
 
 `login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). Anthropic, OpenAI, xAI, and Copilot have dedicated flows when named explicitly. Other providers prompt for a key and a plan when the provider has more than one. Custom providers can be created from the interactive picker.
 
-`maki auth login anthropic` starts experimental Claude subscription OAuth. The command explains the Anthropic terms limitation before opening the browser. Use the interactive picker or `ANTHROPIC_API_KEY` for API-key auth.
+`caudra auth login anthropic` starts experimental Claude subscription OAuth. The command explains the Anthropic terms limitation before opening the browser. Use the interactive picker or `ANTHROPIC_API_KEY` for API-key auth.
 
 `status` shows each provider as configured (key on disk), env-only, or missing.
 
-### `maki models`
+### `caudra models`
 
-Lists every model Maki currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
+Lists every model Caudra currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
 
-### `maki mcp`
+### `caudra mcp`
 
 ```bash
-maki mcp auth <server>     # OAuth for an HTTP MCP server
-maki mcp logout <server>   # drop stored tokens
+caudra mcp auth <server>     # OAuth for an HTTP MCP server
+caudra mcp logout <server>   # drop stored tokens
 ```
 
 Server names come from your [MCP config](/docs/mcp/). On a machine without a browser, `auth` prints a URL you open elsewhere and paste back.
 
-### `maki update` / `maki rollback`
+### `caudra update` / `caudra rollback`
 
 ```bash
-maki update            # install latest release
-maki update -y         # skip confirmation
-maki update --no-color
-maki rollback          # previous version
+caudra update            # install latest release
+caudra update -y         # skip confirmation
+caudra update --no-color
+caudra rollback          # previous version
 ```
 
 Uses the same install locations as the install scripts.
 
-### `maki acp`
+### `caudra acp`
 
 ```bash
-maki acp
-maki acp -m anthropic/claude-sonnet-4-6
-maki acp --yolo
-maki --no-jit acp
+caudra acp
+caudra acp -m anthropic/claude-sonnet-4-6
+caudra acp --yolo
+caudra --no-jit acp
 ```
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
 
-### `maki index`
+### `caudra index`
 
 ```bash
-maki index path/to/file.rs
+caudra index path/to/file.rs
 ```
 
 Runs the native `index` tool and prints its compact file skeleton or directory listing. It honors `plugins.index.enabled` and `plugins.index.max_file_size_mb`. `--no-plugins` skips user `init.lua`, so default index settings apply.
 
-### `maki prompt`
+### `caudra prompt`
 
 ```bash
-maki prompt                  # rendered system prompt (default: system variant)
-maki prompt research
-maki prompt general
-maki prompt --plan           # system prompt + plan-mode reminder (system only)
-maki prompt --tools          # tool definitions as JSON
-maki prompt --tools --names  # tool names only, one per line
+caudra prompt                  # rendered system prompt (default: system variant)
+caudra prompt research
+caudra prompt general
+caudra prompt --plan           # system prompt + plan-mode reminder (system only)
+caudra prompt --tools          # tool definitions as JSON
+caudra prompt --tools --names  # tool names only, one per line
 ```
 
 Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants.
-
-### `maki migrate`
-
-```bash
-maki migrate xdg
-```
-
-Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
 
 ## Everyday examples
 
 ```bash
 # TUI on a project
-cd ~/code/my-app && maki
+cd ~/code/my-app && caudra
 
 # One-shot with YOLO and a model pin
-maki -p --yolo -m anthropic/claude-sonnet-4-6 "summarize the architecture"
+caudra -p --yolo -m anthropic/claude-sonnet-4-6 "summarize the architecture"
 
 # Resume yesterday's session
-maki --continue
+caudra --continue
 
 # List models, then log in
-maki models
-maki auth login
+caudra models
+caudra auth login
 
 # Inspect tools without starting a session
-maki prompt --tools --names
+caudra prompt --tools --names
 ```
 
 For JSON / stream-json output, stdin prompts, and SDK wire mode, see [Headless Mode](/docs/headless/).

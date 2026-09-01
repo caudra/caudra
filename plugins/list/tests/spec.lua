@@ -1,5 +1,5 @@
 local list_helpers = require("list_helpers")
-local th = require("maki.test_helpers")
+local th = require("caudra.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -30,7 +30,7 @@ end)
 
 case("handler_errors_on_missing_path", function()
   local tmpdir = mktmpdir()
-  local missing = maki.fs.joinpath(tmpdir, "missing")
+  local missing = caudra.fs.joinpath(tmpdir, "missing")
   local result = list_helpers.handler({ path = missing }, mock_ctx())
   eq(result.is_error, true)
   eq(result.llm_output, "error: path not found: " .. missing)
@@ -39,8 +39,8 @@ end)
 
 case("handler_errors_on_file_path", function()
   local tmpdir = mktmpdir()
-  local file = maki.fs.joinpath(tmpdir, "file.txt")
-  maki.fs.write(file, "content")
+  local file = caudra.fs.joinpath(tmpdir, "file.txt")
+  caudra.fs.write(file, "content")
   local result = list_helpers.handler({ path = file }, mock_ctx())
   eq(result.is_error, true)
   eq(result.llm_output, "error: path is not a directory: " .. file)
@@ -49,11 +49,11 @@ end)
 
 case("handler_lists_sorted_and_filtered", function()
   local tmpdir = mktmpdir()
-  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
+  caudra.fs.write(caudra.fs.joinpath(tmpdir, "b.txt"), "")
+  caudra.fs.write(caudra.fs.joinpath(tmpdir, "a.txt"), "")
+  caudra.fs.write(caudra.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
+  caudra.fs.mkdir(caudra.fs.joinpath(tmpdir, "zdir"))
+  caudra.fs.mkdir(caudra.fs.joinpath(tmpdir, "adir"))
 
   local result = list_helpers.handler({ path = tmpdir }, mock_ctx())
   eq(result.is_error, nil)
@@ -65,8 +65,8 @@ end)
 
 case("handler_propagates_instructions", function()
   local tmpdir = mktmpdir()
-  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  local instructions = { maki.fs.joinpath(tmpdir, "AGENTS.md") }
+  caudra.fs.write(caudra.fs.joinpath(tmpdir, "a.txt"), "")
+  local instructions = { caudra.fs.joinpath(tmpdir, "AGENTS.md") }
   local result = list_helpers.handler({ path = tmpdir }, mock_ctx(instructions))
   eq(result.is_error, nil)
   eq(result.instructions, instructions)

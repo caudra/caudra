@@ -3,12 +3,12 @@ use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use maki_storage::version::{self, VersionError};
-use maki_storage::{StateDir, StorageError};
+use caudra_storage::version::{self, VersionError};
+use caudra_storage::{StateDir, StorageError};
 
-const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
-const BACKUP_FILENAME: &str = "maki_backup";
-const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
+const INSTALL_SCRIPT_URL: &str = "https://caudra.ai/install.sh";
+const BACKUP_FILENAME: &str = "caudra_backup";
+const INSTALL_DIR_ENV: &str = "CAUDRA_INSTALL_DIR";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -125,7 +125,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
         source: e,
     };
 
-    let tmp = exe_path.with_extension("maki_tmp");
+    let tmp = exe_path.with_extension("caudra_tmp");
     if needs_sudo(exe_path) {
         println!("Restoring to {} (requires sudo)...", exe_path.display());
         let status = std::process::Command::new("sudo")
@@ -133,7 +133,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
                 "sh",
                 "-c",
                 r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
-                "maki-restore",
+                "caudra-restore",
             ])
             .arg(backup_path)
             .arg(&tmp)
@@ -190,7 +190,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     if no_color {
         println!("{script}");
     } else {
-        println!("{}", maki_ui::highlight_ansi("bash", &script));
+        println!("{}", caudra_ui::highlight_ansi("bash", &script));
     }
 
     if !skip_confirm && !prompt_yes(&install_dir) {
@@ -205,7 +205,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     println!();
     println!("Updated successfully.");
     println!("Previous version saved to: {}", backup_path.display());
-    println!("To restore: maki rollback");
+    println!("To restore: caudra rollback");
 
     Ok(())
 }

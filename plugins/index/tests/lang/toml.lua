@@ -1,4 +1,4 @@
-local th = require("maki.test_helpers")
+local th = require("caudra.test_helpers")
 local helpers = require("tests.helpers")
 local case = th.case
 local idx = helpers.idx
@@ -23,7 +23,7 @@ end)
 case("toml_table_with_pairs", function()
   local src = [==[
     [package]
-    name = "maki"
+    name = "caudra"
     version = "0.3.27"
   ]==]
   local out = idx(src, "toml")
@@ -31,7 +31,7 @@ case("toml_table_with_pairs", function()
     "consts:",
     "[package]",
     "name",
-    "maki",
+    "caudra",
     "version",
     "0.3.27",
   })
@@ -40,14 +40,14 @@ end)
 case("toml_table_array_element", function()
   local src = [==[
     [[bin]]
-    name = "maki"
+    name = "caudra"
     path = "src/main.rs"
   ]==]
   local out = idx(src, "toml")
   has(out, {
     "[[bin]]",
     "name",
-    "maki",
+    "caudra",
     "path",
     "src/main.rs",
   })

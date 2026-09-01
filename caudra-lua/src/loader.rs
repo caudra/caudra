@@ -1,0 +1,1476 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use caudra_agent::permissions::{PluginRuleStore, canonical_json_sha256};
+use caudra_agent::tools::ToolRegistry;
+use caudra_config::{AgentConfig, PluginsConfig, RawConfig};
+use include_dir::{Dir, include_dir};
+
+use crate::api::keymap::KeymapReader;
+use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::tool::PermissionRulePolicy;
+use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
+use crate::error::PluginError;
+use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions_with_trust};
+use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
+use caudra_agent::prompt::ResolvedSlots;
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const ALWAYS_LOADED_BUILTINS: &[&str] = &["tool_output"];
+
+struct BundledPlugin {
+    name: &'static str,
+    dir: Dir<'static>,
+}
+
+fn bundled_implementation_digest() -> String {
+    fn collect(plugin: &str, directory: &Dir<'_>, files: &mut BTreeMap<String, String>) {
+        for file in directory.files() {
+            if file
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "lua")
+            {
+                files.insert(
+                    format!("{plugin}/{}", file.path().display()),
+                    canonical_json_sha256(&serde_json::Value::String(
+                        file.contents_utf8().unwrap_or_default().into(),
+                    )),
+                );
+            }
+        }
+        for child in directory.dirs() {
+            collect(plugin, child, files);
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    for plugin in BUNDLED_PLUGINS {
+        collect(plugin.name, &plugin.dir, &mut files);
+    }
+    canonical_json_sha256(&serde_json::json!(files))
+}
+
+/// `lib` is not a default builtin; it exists so plugins can
+/// `require()` shared modules across boundaries.
+static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "sessions",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
+        name: "index",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    },
+    BundledPlugin {
+        name: "webfetch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    },
+    BundledPlugin {
+        name: "websearch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    },
+    BundledPlugin {
+        name: "bash",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
+    },
+    BundledPlugin {
+        name: "batch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    },
+    BundledPlugin {
+        name: "grep",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
+    },
+    BundledPlugin {
+        name: "glob",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
+    },
+    BundledPlugin {
+        name: "skill",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
+    },
+    BundledPlugin {
+        name: "memory",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+    },
+    BundledPlugin {
+        name: "question",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
+    },
+    BundledPlugin {
+        name: "todo_write",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    },
+    BundledPlugin {
+        name: "tool_output",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_output"),
+    },
+    BundledPlugin {
+        name: "read",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
+    },
+    BundledPlugin {
+        name: "write",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
+    },
+    BundledPlugin {
+        name: "edit",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
+    },
+    BundledPlugin {
+        name: "task",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
+    },
+    BundledPlugin {
+        name: "code_execution",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
+        name: "view_image",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
+        name: "lib",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
+    },
+    BundledPlugin {
+        name: "list",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
+];
+
+pub(crate) fn lib_dir() -> &'static Dir<'static> {
+    &BUNDLED_PLUGINS
+        .iter()
+        .find(|p| p.name == "lib")
+        .expect("lib plugin bundled")
+        .dir
+}
+
+static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
+    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
+    Vec::leak(dirs)
+});
+
+pub struct PluginHost {
+    inner: LuaThread,
+    plugin_rules: Arc<PluginRuleStore>,
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        let Some(handle) = self.inner.join.take() else {
+            return;
+        };
+        // Start the shutdown first, or the join below waits for all
+        // queued bulk work to drain.
+        self.begin_shutdown();
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(handle.join().is_err());
+        });
+        match done_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(true) => tracing::warn!("lua thread panicked on shutdown"),
+            Err(_) => tracing::warn!("lua thread did not stop within timeout, detaching"),
+            Ok(false) => {}
+        }
+    }
+}
+
+impl PluginHost {
+    pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        Self::with_jit(registry, true)
+    }
+
+    /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
+    /// interpreter with full debug info. Applied at VM creation, so
+    /// every chunk gets it, init.lua files included.
+    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+        let plugin_rules = Arc::new(PluginRuleStore::default());
+        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
+        Ok(Self {
+            inner: lua,
+            plugin_rules,
+        })
+    }
+
+    /// The store that `caudra.api.register_permission_rule` writes into. Hand
+    /// it to every [`caudra_agent::permissions::PermissionManager`] so plugin
+    /// rules apply to all sessions.
+    pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
+        Arc::clone(&self.plugin_rules)
+    }
+
+    /// Stop the Lua thread from taking new work without joining it, so the
+    /// caller can rebuild shared state (like the tool registry) while the
+    /// old VM winds down on its own. The flag makes the watchdog abort
+    /// in-flight callbacks, `Shutdown` on the priority lane skips ahead of
+    /// queued bulk work, and swapping the senders for disconnected ones
+    /// makes every later host call fail right at the send; `&mut self`
+    /// rules out a call racing the swap. `Drop` still joins the thread.
+    pub fn begin_shutdown(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        let _ = self.inner.prio_tx.send(Request::Shutdown);
+        self.inner.tx = flume::unbounded().0;
+        self.inner.prio_tx = flume::unbounded().0;
+    }
+
+    /// Boots the runtime and loads every default bundled plugin into `registry`.
+    /// For callers like tests and docgen that want the full builtin set
+    /// without building a config.
+    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let mut host = Self::new(registry)?;
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
+        Ok(host)
+    }
+
+    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+        let mut merged: Option<RawConfig> = None;
+
+        for global_dir in caudra_config::global_config_dirs() {
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                "global/init.lua",
+                PermissionRulePolicy::Trusted,
+                &mut merged,
+            )?;
+            if merged.is_some() {
+                break;
+            }
+        }
+        self.run_init_file(
+            &cwd.join(".caudra/init.lua"),
+            "project/init.lua",
+            PermissionRulePolicy::DenyOnly,
+            &mut merged,
+        )?;
+
+        Ok(merged)
+    }
+
+    /// `--no-plugins` recovery path: skip every user `init.lua` while the
+    /// host and builtin plugins stay live. Centralized so every entry point
+    /// (TUI, index, acp, prompt) honors the flag identically.
+    pub fn load_init_files_or_skip(
+        &self,
+        no_plugins: bool,
+        cwd: &Path,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if no_plugins {
+            return Ok(None);
+        }
+        self.load_init_files(cwd)
+    }
+
+    fn run_init_file(
+        &self,
+        path: &Path,
+        label: &str,
+        rule_policy: PermissionRulePolicy,
+        merged: &mut Option<RawConfig>,
+    ) -> Result<(), PluginError> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        if let Some(raw) =
+            self.send_run_init_lua_with_policy(source, label.to_owned(), plugin_dir, rule_policy)?
+        {
+            match merged {
+                Some(existing) => existing.merge(raw),
+                None => *merged = Some(raw),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        let result = self.send_builtin_loads(config, None);
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    pub fn load_production_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        let result =
+            self.send_builtin_loads(config, Some(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS));
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    fn send_builtin_loads(
+        &self,
+        config: &PluginsConfig,
+        allowlist: Option<&[&str]>,
+    ) -> Result<(), PluginError> {
+        for (plugin, opts) in &config.opts {
+            if plugin == "index" {
+                continue;
+            }
+            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
+                return Err(PluginError::UnknownPluginOptions {
+                    plugin: plugin.clone(),
+                    keys: keys.join(", "),
+                });
+            }
+            if !config.names.contains(plugin) {
+                tracing::warn!(
+                    plugin = plugin.as_str(),
+                    keys = keys.join(", "),
+                    "plugin is disabled; its plugins.{} options are ignored until re-enabled",
+                    plugin
+                );
+            }
+        }
+        let mut builtins: Vec<String> = config
+            .names
+            .iter()
+            .filter(|name| allowlist.is_none_or(|active| active.contains(&name.as_str())))
+            .cloned()
+            .collect();
+        for builtin in ALWAYS_LOADED_BUILTINS {
+            if !builtins.iter().any(|name| name == builtin) {
+                builtins.push((*builtin).to_owned());
+            }
+        }
+        for builtin in &builtins {
+            let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
+                Some(p) => &p.dir,
+                None => {
+                    return Err(PluginError::UnknownPlugin {
+                        plugin: builtin.clone(),
+                    });
+                }
+            };
+            let init = dir
+                .get_file("init.lua")
+                .and_then(|f| f.contents_utf8())
+                .ok_or_else(|| PluginError::Lua {
+                    plugin: builtin.clone(),
+                    source: mlua::Error::runtime("bundled plugin missing init.lua"),
+                })?;
+            let name: Arc<str> = Arc::from(builtin.as_str());
+            let opts = config
+                .opts
+                .get(builtin.as_str())
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            let source = format!(
+                "{init}\n-- caudra bundled implementation {}",
+                bundled_implementation_digest()
+            );
+            self.send_load(
+                name,
+                source,
+                None,
+                true,
+                PluginPermissions::trusted(),
+                PermissionRulePolicy::Trusted,
+                opts,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_load(
+        &self,
+        name: Arc<str>,
+        source: String,
+        plugin_dir: Option<PathBuf>,
+        bundled: bool,
+        permissions: PluginPermissions,
+        rule_policy: PermissionRulePolicy,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::LoadSource {
+                name,
+                source,
+                plugin_dir,
+                bundled,
+                permissions,
+                rule_policy,
+                opts,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    /// Option specs declared by loaded plugins via `caudra.api.register_options`,
+    /// keyed by plugin name. Used by docgen.
+    pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectPluginOptions { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn send_run_init_lua(
+        &self,
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_run_init_lua_with_policy(
+            source,
+            source_name,
+            plugin_dir,
+            PermissionRulePolicy::DenyOnly,
+        )
+    }
+
+    fn send_run_init_lua_with_policy(
+        &self,
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+        rule_policy: PermissionRulePolicy,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::RunInitLua {
+                source,
+                source_name,
+                plugin_dir,
+                rule_policy,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::ClearPlugin {
+                plugin: Arc::from(plugin),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
+        Ok(())
+    }
+
+    pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
+        self.load_source_with_opts(name, source, serde_json::Map::new())
+    }
+
+    pub fn load_source_with_opts(
+        &self,
+        name: &str,
+        source: &str,
+        opts: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), PluginError> {
+        self.send_load(
+            Arc::from(name),
+            source.to_owned(),
+            None,
+            false,
+            PluginPermissions::trusted(),
+            PermissionRulePolicy::Trusted,
+            Arc::new(opts),
+        )
+    }
+
+    pub fn load_source_with_permissions(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+    ) -> Result<(), PluginError> {
+        self.send_load(
+            Arc::from(name),
+            source.to_owned(),
+            None,
+            false,
+            permissions,
+            PermissionRulePolicy::Trusted,
+            PluginOpts::default(),
+        )
+    }
+
+    pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        let (permissions, trusted) = load_plugin_permissions_with_trust(plugin_dir.as_deref());
+        // Test-only path today. Once user plugin dirs exist: derive a real
+        // plugin name, since the hardcoded "user" would collide across files,
+        // pass the `plugins.<name>` opts through, and teach the
+        // unknown-plugin guards about user plugin names.
+        self.send_load(
+            Arc::from("user"),
+            source,
+            plugin_dir,
+            false,
+            permissions,
+            if trusted {
+                PermissionRulePolicy::Trusted
+            } else {
+                PermissionRulePolicy::DenyOnly
+            },
+            PluginOpts::default(),
+        )
+    }
+
+    pub fn event_handle(&self) -> EventHandle {
+        EventHandle {
+            tx: self.inner.tx.clone(),
+            prio_tx: self.inner.prio_tx.clone(),
+        }
+    }
+
+    pub fn command_reader(&self) -> LuaCommandReader {
+        self.inner.command_reader.clone()
+    }
+
+    pub fn keymap_reader(&self) -> KeymapReader {
+        self.inner.keymap_reader.clone()
+    }
+
+    pub fn hint_reader(&self) -> HintReader {
+        self.inner.hint_reader.clone()
+    }
+
+    pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
+        self.inner.ui_action_rx.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct EventHandle {
+    tx: flume::Sender<Request>,
+    /// User-initiated requests bypass queued bulk work (session restores).
+    prio_tx: flume::Sender<Request>,
+}
+
+impl EventHandle {
+    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+        Self {
+            tx,
+            prio_tx: flume::unbounded().0,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn disconnected_for_test() -> Self {
+        Self::from_tx(flume::unbounded().0)
+    }
+
+    /// True when no runtime is draining requests. Production handles stay
+    /// connected for the host's lifetime; the disconnected-for-test handle
+    /// and a host whose thread has shut down both report true. Callers use
+    /// this to skip async side effects (e.g. a restore-complete flip) that
+    /// no live consumer would ever observe.
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_disconnected() && self.prio_tx.is_disconnected()
+    }
+
+    /// Test probe sibling of `from_tx`: collapses both senders onto one
+    /// channel so a `RequestProbe` sees every request, including the
+    /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
+    /// would route to a disconnected channel.
+    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+        Self {
+            tx: shared.clone(),
+            prio_tx: shared,
+        }
+    }
+
+    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
+        let _ = self.prio_tx.try_send(Request::RunCommand {
+            plugin,
+            command,
+            args,
+            depth,
+        });
+    }
+
+    pub fn collect_prompt_slots(&self, config: &AgentConfig) -> ResolvedSlots {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            config: config.clone(),
+            reply: tx,
+        });
+        rx.recv().unwrap_or_default()
+    }
+
+    pub async fn collect_prompt_slots_async(&self, config: &AgentConfig) -> ResolvedSlots {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            config: config.clone(),
+            reply: tx,
+        });
+        rx.recv_async().await.unwrap_or_default()
+    }
+
+    pub fn request_restore(&self, item: RestoreItem, event_tx: caudra_agent::EventSender) {
+        let _ = self.tx.send(Request::RestoreToolAsync {
+            item: Box::new(item),
+            event_tx,
+        });
+    }
+
+    /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
+    /// outside it (header line etc.).
+    pub fn request_click(&self, tool_use_id: String, row: usize) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: None,
+        });
+    }
+
+    /// Like [`Self::request_click`], but when the runtime no longer holds
+    /// a live or warm handle for the tool it restores from `item` (whose
+    /// `clicks` must already include `row`) and emits fresh snapshots on
+    /// `event_tx`. Callers need no knowledge of the runtime's warm cache.
+    pub fn request_click_with_fallback(
+        &self,
+        tool_use_id: String,
+        row: usize,
+        item: RestoreItem,
+        event_tx: caudra_agent::EventSender,
+    ) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: Some(Box::new(ClickFallback { item, event_tx })),
+        });
+    }
+
+    pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
+        let _ = self.tx.send(Request::RestoreComplete { flag });
+    }
+
+    /// Blocks until every restore item queued so far has finished; restores
+    /// run as spawned tasks, and the `RestoreComplete` flag flips only once
+    /// the whole batch has landed, making it the batch barrier.
+    #[doc(hidden)]
+    pub fn wait_restore_complete_for_test(&self) {
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let flag = Arc::new(AtomicBool::new(true));
+        self.send_restore_complete(Arc::clone(&flag));
+        let start = std::time::Instant::now();
+        while flag.load(Ordering::Relaxed) {
+            assert!(start.elapsed() < DEADLINE, "restore batch never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.to_owned(),
+            data,
+        });
+    }
+
+    pub fn run_keybind_callback(&self, id: u64) -> bool {
+        self.prio_tx
+            .try_send(Request::RunKeybindCallback { id })
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use caudra_agent::tools::ToolRegistry;
+    use std::time::Instant;
+    use test_case::test_case;
+
+    /// jit=true is exercised by the whole integration suite
+    /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
+    /// interpreter path needs its own coverage.
+    #[test]
+    fn with_jit_off_loads_builtins_and_registers_tools() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+        assert!(matches!(
+            reg.get("glob").unwrap().source,
+            caudra_agent::tools::ToolSource::Lua { bundled: true, .. }
+        ));
+    }
+
+    #[test]
+    fn production_builtins_leave_index_to_workcell() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+
+        assert!(reg.get("index").is_none());
+        assert!(!caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(&"index"));
+        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"index"));
+        assert!(reg.get("tool_output_read").is_some());
+        for name in [
+            "bash",
+            "code_execution",
+            "edit",
+            "glob",
+            "grep",
+            "list",
+            "read",
+            "webfetch",
+            "websearch",
+            "write",
+        ] {
+            assert!(reg.get(name).is_none(), "legacy tool {name} was registered");
+        }
+    }
+
+    #[test]
+    fn dynamically_loaded_tools_are_not_marked_as_bundled() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "replacement",
+            r#"
+            caudra.api.register_tool({
+                name = "task",
+                description = "replacement",
+                schema = { type = "object", properties = {} },
+                handler = function() return "ok" end,
+            })
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reg.get("task").unwrap().source,
+            caudra_agent::tools::ToolSource::Lua { bundled: false, .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_init_policy_requires_a_valid_plugin_manifest() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let directory = tempfile::TempDir::new().unwrap();
+        let result = host.send_run_init_lua_with_policy(
+            r#"caudra.api.register_permission_rule({ tool = "bash", scope = "*", effect = "allow" })"#
+                .into(),
+            "global/init.lua".into(),
+            Some(directory.path().to_path_buf()),
+            PermissionRulePolicy::Trusted,
+        );
+
+        assert!(result.is_err());
+        assert!(host.plugin_rules().snapshot().is_empty());
+    }
+
+    /// The second call sends `Shutdown` on a sender that is already
+    /// disconnected; it must swallow that error and keep rejecting work.
+    #[test]
+    fn begin_shutdown_rejects_later_loads_and_is_idempotent() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.begin_shutdown();
+        assert!(host.load_source("late", "return {}").is_err());
+        host.begin_shutdown();
+        assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
+    /// clone keeps queued requests alive after the Lua thread exits, and
+    /// dispatch prefers the priority lane, so a bulk request queued behind
+    /// `Shutdown` is never served. Without the drain its reply sender lives
+    /// forever and `collect_prompt_slots` blocks; with it, the call falls
+    /// back to defaults right away.
+    #[test]
+    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hinted",
+            r#"caudra.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+        host.begin_shutdown();
+
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert!(
+            contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
+            "dead host must yield defaults, not real slots"
+        );
+
+        drop(host);
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    /// Load `src` as one plugin, collect resolved slots.
+    /// Panics on failure; use `load_err` to inspect errors.
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(plugin, src).unwrap();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
+        (host, slots)
+    }
+
+    fn contents(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> Vec<&str> {
+        slots
+            .get(prompt, slot)
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn command_writer_reader_pair_works() {
+        let (writer, reader) = LuaCommandWriter::new();
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 0);
+
+        writer.publish(vec![LuaCommandInfo {
+            name: Arc::from("/test"),
+            description: Arc::from("desc"),
+            plugin: Arc::from("p"),
+            max_args: 0,
+        }]);
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 1);
+        assert!(snap.generation > 0);
+    }
+
+    #[test]
+    fn memory_builtin_registers_command() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+        let reader = host.command_reader();
+        let snap = reader.load();
+        let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
+        assert!(
+            found,
+            "Expected /memory command, found: {:?}",
+            snap.commands
+                .iter()
+                .map(|c| c.name.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_command_sends_correct_request() {
+        let (prio_tx, prio_rx) = flume::bounded(8);
+        let (tx, _rx) = flume::bounded(8);
+        let handle = EventHandle { tx, prio_tx };
+        handle.run_command(
+            Arc::from("myplugin"),
+            Arc::from("/greet"),
+            "world".into(),
+            2,
+        );
+        let req = prio_rx.try_recv().unwrap();
+        match req {
+            Request::RunCommand {
+                plugin,
+                command,
+                args,
+                depth,
+            } => {
+                assert_eq!(plugin.as_ref(), "myplugin");
+                assert_eq!(command.as_ref(), "/greet");
+                assert_eq!(args, "world");
+                assert_eq!(depth, 2);
+            }
+            _ => panic!("expected RunCommand"),
+        }
+    }
+
+    #[test]
+    fn multiple_plugins_register_independent_commands() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "plugin_a",
+            r#"
+            caudra.api.register_command({
+                name = "/alpha",
+                description = "from a",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+        host.load_source(
+            "plugin_b",
+            r#"
+            caudra.api.register_command({
+                name = "/beta",
+                description = "from b",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 2);
+        let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+        assert!(names.contains(&"/alpha"));
+        assert!(names.contains(&"/beta"));
+    }
+
+    #[test]
+    fn register_command_adds_missing_leading_slash() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "noslash",
+            r#"
+            caudra.api.register_command({
+                name = "hello",
+                description = "no slash",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 1);
+        assert_eq!(snap.commands[0].name.as_ref(), "/hello");
+    }
+
+    #[test]
+    fn command_reader_generation_increments_on_publish() {
+        let (writer, reader) = LuaCommandWriter::new();
+        assert_eq!(reader.load().generation, 0);
+        writer.publish(vec![]);
+        assert!(reader.load().generation > 0);
+    }
+
+    /// End-to-end: a plugin registers a keymap override, the override is published
+    /// to the snapshot, EventHandle::run_keybind_callback dispatches the request,
+    /// the runtime resolves the Function by id from the registry, and the callback
+    /// executes with an observable side effect. This is the load-bearing path the
+    /// dispatch reorder and the dead-host fallback rest on; unit tests only cover
+    /// the layers in isolation.
+    #[test]
+    fn keybind_callback_runs_end_to_end() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            r#"
+            caudra.keymap.set("n", "<C-g>", function()
+                caudra.api.register_command({
+                    name = "/fired",
+                    description = "callback ran",
+                    handler = function() end,
+                })
+            end, { desc = "test override" })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.keymap_reader().load();
+        assert_eq!(snap.entries.len(), 1, "override published to snapshot");
+        let entry = &snap.entries[0];
+        assert_eq!(entry.desc, "test override");
+        assert!(
+            host.command_reader().load().commands.is_empty(),
+            "callback has not fired yet"
+        );
+
+        let handle = host.event_handle();
+        handle.run_keybind_callback(entry.id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let cmds = &host.command_reader().load().commands;
+            if cmds.iter().any(|c| c.name.as_ref() == "/fired") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "keybind callback did not register /fired within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `load_init_files_or_skip` is the single seam every entry point
+    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
+    /// halves: the flag skips a broken init.lua, and absence runs it (so
+    /// the skip path is not a tautology that hides a regression in the
+    /// unconditional loader).
+    #[test]
+    fn load_init_files_or_skip_respects_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".caudra")).unwrap();
+        fs::write(
+            dir.path().join(".caudra/init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        let skipped = host
+            .load_init_files_or_skip(true, dir.path())
+            .expect("no-plugins skips broken init.lua");
+        assert!(
+            skipped.is_none(),
+            "--no-plugins must skip user init.lua entirely"
+        );
+
+        let ran = host.load_init_files_or_skip(false, dir.path());
+        assert!(
+            ran.is_err(),
+            "without --no-plugins the broken init.lua must surface as an error"
+        );
+    }
+
+    #[test]
+    fn callback_string_lands_in_targeted_prompt_only() {
+        let (_host, slots) = slots_from(
+            "cb",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = function() return "from_cb" end,
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["from_cb"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn callback_returning_nil_contributes_nothing() {
+        let (_host, slots) = slots_from(
+            "nil_cb",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function() return nil end,
+            })
+            "#,
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn callback_receives_effective_agent_config() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "config_cb",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(config)
+                    return config.no_rtk and "disabled" or "enabled"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let mut config = AgentConfig::default();
+        let slots = host.event_handle().collect_prompt_slots(&config);
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["enabled"]
+        );
+
+        config.no_rtk = true;
+        let slots = host.event_handle().collect_prompt_slots(&config);
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["disabled"]
+        );
+    }
+
+    /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.
+    #[test]
+    fn static_no_prompt_lands_on_all_prompts_with_slot() {
+        let (_host, slots) = slots_from(
+            "static_hint",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "efficient_tools",
+                content = "index",
+            })
+            "#,
+        );
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
+        }
+    }
+
+    /// `conventions` lives on system and general but not research, so a default
+    /// hint follows the slot and skips research.
+    #[test]
+    fn default_hint_skips_prompts_lacking_the_slot() {
+        let (_host, slots) = slots_from(
+            "conv",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "conventions",
+                content = "follow conventions",
+            })
+            "#,
+        );
+        for pid in [PromptId::System, PromptId::General] {
+            assert_eq!(
+                contents(&slots, pid, Slot::Conventions),
+                ["follow conventions"]
+            );
+        }
+        assert!(contents(&slots, PromptId::Research, Slot::Conventions).is_empty());
+    }
+
+    /// Targeting a prompt that does not have the slot quietly drops the hint.
+    #[test]
+    fn register_prompt_hint_rejects_incompatible_slot_prompt() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "drop",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "after_instructions",
+                prompt = "research",
+                content = "never lands",
+            })
+            "#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not available"));
+    }
+
+    #[test]
+    fn prompt_list_targets_each_listed_prompt() {
+        const CONTENT: &str = "shared";
+        let (_host, slots) = slots_from(
+            "list",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = { "system", "research" },
+                content = "shared",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::Research, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert!(contents(&slots, PromptId::General, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn multiple_plugins_sorted_by_plugin_name() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        for plugin in ["zzz", "aaa"] {
+            host.load_source(
+                plugin,
+                r#"
+                caudra.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
+                "#
+                .replace("PLUGIN", plugin)
+                .as_str(),
+            )
+            .unwrap();
+        }
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["from_aaa", "from_zzz"],
+            "entries must be ordered by plugin name"
+        );
+    }
+
+    /// One plugin can register several hints; unloading it clears all of them.
+    #[test]
+    fn unload_clears_all_hints_from_plugin() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "multi",
+            r#"
+            caudra.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
+            caudra.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["usage"]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Conventions),
+            ["conv"]
+        );
+
+        host.unload("multi").unwrap();
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
+    }
+
+    #[test_case(r#"{ slot = "nonexistent", content = "x" }"# ; "invalid_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = "nope" }"# ; "invalid_prompt")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = { "system", "bogus" } }"# ; "invalid_prompt_in_list")]
+    #[test_case(r#"{ slot = "tool_usage" }"# ; "missing_content")]
+    #[test_case(r#"{ content = "x" }"# ; "missing_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = 42 }"# ; "content_wrong_type")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = 42 }"# ; "prompt_wrong_type")]
+    fn invalid_hint_spec_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let src = format!("caudra.api.register_prompt_hint({spec})");
+        assert!(host.load_source("bad", &src).is_err());
+    }
+
+    #[test]
+    fn identity_slot_lands_on_system_only() {
+        let (_host, slots) = slots_from(
+            "id",
+            r#"
+            caudra.api.set_prompt({
+                slot = "identity",
+                content = "Custom identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Custom identity"]
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
+    }
+
+    #[test]
+    fn tone_slot_lands_on_system_only() {
+        let (_host, slots) = slots_from(
+            "tone",
+            r#"
+            caudra.api.set_prompt({
+                slot = "tone",
+                content = "Custom tone",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Tone),
+            ["Custom tone"]
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
+    }
+
+    #[test]
+    fn singleton_last_wins_across_plugins() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa",
+            r#"caudra.api.set_prompt({ slot = "identity", content = "AAA" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "zzz",
+            r#"caudra.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
+        )
+        .unwrap();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
+        let entries = slots.get(PromptId::System, Slot::Identity);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.last().unwrap().content, "ZZZ");
+    }
+
+    #[test]
+    fn content_required() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source("bad", r#"caudra.api.set_prompt({ slot = "identity" })"#);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("'content' is required"));
+    }
+
+    #[test]
+    fn set_prompt_sets_identity() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            caudra.api.set_prompt({
+                slot = "identity",
+                content = "New identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["New identity"]
+        );
+    }
+
+    #[test]
+    fn set_prompt_explicit_system_prompt() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            caudra.api.set_prompt({
+                slot = "identity",
+                prompt = "system",
+                content = "Explicit identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Explicit identity"]
+        );
+    }
+
+    #[test]
+    fn prompt_field_targets_specific_prompt() {
+        let (_host, slots) = slots_from(
+            "targeter",
+            r#"
+            caudra.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = "General hint",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["General hint"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn set_prompt_invalid_prompt_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"caudra.api.set_prompt({ slot = "identity", prompt = "nope", content = "x" })"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_prompt_and_register_prompt_hint_coexist() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hint",
+            r#"caudra.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "setter",
+            r#"caudra.api.set_prompt({ slot = "identity", content = "SET" })"#,
+        )
+        .unwrap();
+        let slots = host
+            .event_handle()
+            .collect_prompt_slots(&AgentConfig::default());
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["HINT"]
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["SET"]);
+    }
+
+    #[test]
+    fn set_prompt_rejects_aggregate_slot() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"caudra.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_prompt_rejects_incompatible_slot_prompt() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"caudra.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not available"));
+    }
+
+    #[test]
+    fn empty_prompt_table_is_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"caudra.api.set_prompt({ slot = "identity", prompt = {}, content = "x" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no sequence entries"));
+    }
+
+    #[test]
+    fn content_must_not_be_empty() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"caudra.api.set_prompt({ slot = "identity", content = "" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn set_prompt_with_callback() {
+        let (_host, slots) = slots_from(
+            "setter_cb",
+            r#"
+            caudra.api.set_prompt({
+                slot = "identity",
+                content = function() return "Dyn identity" end,
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Dyn identity"]
+        );
+    }
+}

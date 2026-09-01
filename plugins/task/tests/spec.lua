@@ -1,5 +1,5 @@
 local Rows = require("picker_rows")
-local th = require("maki.test_helpers")
+local th = require("caudra.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -12,16 +12,16 @@ local DEPLOY = { id = "toolu_04", name = "deploy", status = "working", focused =
 local AUDIT = { id = "toolu_05", name = "audit", status = "working", focused = false }
 local RESEARCH_DONE = { id = RESEARCH.id, name = RESEARCH.name, status = "done", focused = false }
 
-case("maki_agent_has_expected_functions", function()
-  assert(type(maki.agent) == "table", "maki.agent must be a table")
+case("caudra_agent_has_expected_functions", function()
+  assert(type(caudra.agent) == "table", "caudra.agent must be a table")
   local expected = { "resolve_model", "system_prompt", "tools", "call_tool", "session" }
   for _, fn_name in ipairs(expected) do
-    eq(type(maki.agent[fn_name]), "function", "maki.agent." .. fn_name .. " must be a function")
+    eq(type(caudra.agent[fn_name]), "function", "caudra.agent." .. fn_name .. " must be a function")
   end
 end)
 
 case("schema_validator_compiles_and_validates", function()
-  local validator, err = maki.json.schema_validator({
+  local validator, err = caudra.json.schema_validator({
     type = "object",
     properties = { answer = { type = "string" } },
     required = { "answer" },
@@ -33,7 +33,7 @@ case("schema_validator_compiles_and_validates", function()
 end)
 
 case("schema_validator_rejects_bad_schema", function()
-  local validator, err = maki.json.schema_validator({ type = 42 })
+  local validator, err = caudra.json.schema_validator({ type = 42 })
   eq(validator, nil, "bad schema must not compile")
   assert(err ~= nil, "bad schema must return an error")
 end)

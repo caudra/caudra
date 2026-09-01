@@ -33,7 +33,7 @@ Type `/` in the input box to open the command palette.
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) |
+| `/workflow` | Toggle workflow context for custom Lua tools |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
 | `/memory` | View, edit, and delete memory files |
@@ -43,7 +43,7 @@ Type `/` in the input box to open the command palette.
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
 
 ## Tasks
 
@@ -53,13 +53,13 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 ## Completion goals
 
-`/goal <condition>` asks Maki to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
+`/goal <condition>` asks Caudra to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
 Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Default tries the global Fast preset, then the active provider's weak model, and finally the current conversation model. Fast, Balanced, and Best use their global exact-model preset when assigned, otherwise the matching tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
 
-The evaluator choice is saved globally in `~/.local/state/maki/model-roles` and applies across sessions. The same Goal mode is available from `/model` with `Tab`; press uppercase `R` in that mode to restore Default.
+The evaluator choice is saved globally in `~/.local/state/caudra/model-roles` and applies across sessions. The same Goal mode is available from `/model` with `Tab`; press uppercase `R` in that mode to restore Default.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
 
@@ -67,14 +67,14 @@ Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `of
 
 Goal state belongs to the session. Active and completed status survive resume, while `/new` clears them. Normal permissions still apply, so unattended goals need rules or YOLO mode that already permit the required tools.
 
-Maki defers evaluation while tracked background agents are running and starts a hidden check-in after they finish. Worker compaction can still run, but evaluator calls never compact or alter history.
+Caudra defers evaluation while tracked background agents are running and starts a hidden check-in after they finish. Worker compaction can still run, but evaluator calls never compact or alter history.
 
-Eight automatic continuations are allowed in one query. When that safety cap or the configured turn limit is reached, Maki returns control with the goal still active. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
+Eight automatic continuations are allowed in one query. When that safety cap or the configured turn limit is reached, Caudra returns control with the goal still active. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
 
 One-shot headless mode accepts the same form:
 
 ```bash
-maki --print '/goal tests pass and cargo clippy is clean'
+caudra --print '/goal tests pass and cargo clippy is clean'
 ```
 
 Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result.
@@ -84,7 +84,7 @@ Headless mode waits for tracked background agents before evaluating. An impossib
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
-- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
+- **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `code_execution` remains isolated. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
@@ -98,9 +98,9 @@ You can define your own slash commands as Markdown files. Empty files are skippe
 
 Later sources override earlier ones when the command **name** matches (the stem of the file, or `name` in frontmatter):
 
-1. User config: `~/.config/maki/commands/` (and legacy `~/.maki/commands/` if present)
+1. User config: `~/.config/caudra/commands/` (and legacy `~/.caudra/commands/` if present)
 2. User third-party: `~/.claude/commands/`
-3. Project dirs, walking from the current working directory up to the nearest `.git` root. At each level: `.maki/commands/`, then `.claude/commands/`
+3. Project dirs, walking from the current working directory up to the nearest `.git` root. At each level: `.caudra/commands/`, then `.claude/commands/`
 
 Because the walk goes cwd → … → git root, a command at the **repository root overrides** the same name found only under a nested cwd. Project commands override user commands. Palette names are `/project:<name>` or `/user:<name>` depending on which scope won.
 
@@ -126,29 +126,29 @@ For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`.
 
 ## Aliasing commands
 
-Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+Prefer a different name for a command? `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
--- ~/.config/maki/init.lua
+-- ~/.config/caudra/init.lua
 local aliases = {
     { name = "/clear", target = "/new", description = "Alias for /new" },
     { name = "/resume", target = "/sessions", description = "Alias for /sessions" },
 }
 
 for _, alias in ipairs(aliases) do
-    maki.api.register_command({
+    caudra.api.register_command({
         name = alias.name,
         description = alias.description,
         handler = function()
-            local ok, err = maki.api.run_command(alias.target)
+            local ok, err = caudra.api.run_command(alias.target)
             if not ok then
-                maki.ui.flash("could not run " .. alias.target .. ": " .. err)
+                caudra.ui.flash("could not run " .. alias.target .. ": " .. err)
             end
         end,
     })
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`caudra.api.run_command`](/docs/lua-api/#caudra-api-run_command) for matching and error handling, or [`caudra.ui.action`](/docs/lua-api/#caudra-ui-action) to bind a key instead of a name.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

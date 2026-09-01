@@ -5,25 +5,25 @@ weight = 23
 group = "Guides"
 +++
 
-# Writing maki plugins
+# Writing caudra plugins
 
-Maki plugins are plain Lua files (Luau) that run inside maki. A plugin can
+Caudra plugins are plain Lua files (Luau) that run inside caudra. A plugin can
 register tools the LLM calls, slash commands, keymaps, prompt hints, and
-custom UI. Everything lives under the global `maki` table. The full API
+custom UI. Everything lives under the global `caudra` table. The full API
 reference is at the end of this document.
 
 ## Where plugin code goes
 
 Plugins live in one of two config directories with the same layout:
 
-- `maki.env.config_dir()` - global, every project
-- `<project>/.maki/` - this project only
+- `caudra.env.config_dir()` - global, every project
+- `<project>/.caudra/` - this project only
 
-Release builds normally return `~/.config/maki/`. Debug builds return
-`~/.config/maki-debug/`. An active legacy directory takes precedence.
+Release builds normally return `~/.config/caudra/`. Debug builds return
+`~/.config/caudra-debug/`. An active legacy directory takes precedence.
 
 ```
-init.lua        the only file maki runs; require()s plugins, calls maki.setup()
+init.lua        the only file caudra runs; require()s plugins, calls caudra.setup()
 lua/<name>.lua  plugin modules, loaded by require("<name>")
 plugin.toml     permission grants for every Lua file in the dir
 ```
@@ -36,12 +36,12 @@ that directory, you cannot reach files outside it.
 ## Creating a plugin
 
 1. Write the code in `<config>/lua/<name>.lua`, where `<config>` is the global
-   config directory above. The `maki` global is
+   config directory above. The `caudra` global is
    already there, nothing to import. For a project-only plugin use
-   `<project>/.maki/` here and in every step below.
+   `<project>/.caudra/` here and in every step below.
 
 ```lua
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "hello",
   description = "Say hello to a name.",
   parameters = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
@@ -69,7 +69,7 @@ run = true
 4. Run `/reload`, then read the log as described below, to see that it loaded
    and what it printed.
 
-Leave `maki.api.register_options` to bundled plugins: maki rejects a
+Leave `caudra.api.register_options` to bundled plugins: caudra rejects a
 `plugins.<name>` table for a plugin it does not ship, and startup fails. Keep
 settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
@@ -84,9 +84,9 @@ in [the reference](/docs/lua-api/#plugin-permissions).
 `/reload` rebuilds plugins and config in place, no restart needed. Until it
 runs, an edited plugin is still the old one.
 
-To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
-in the directory `maki.env.logs_dir()` returns. When
-a backtrace comes out useless, start maki with `--no-jit`: plugins then run on
+To debug, add `caudra.log.info|warn|error(...)` calls. They write to `caudra.log`
+in the directory `caudra.env.logs_dir()` returns. When
+a backtrace comes out useless, start caudra with `--no-jit`: plugins then run on
 the interpreter, with full debug info.
 
 ## Conventions
@@ -94,9 +94,9 @@ the interpreter, with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - Return complete `llm_output` from tool handlers. The host applies output limits and retains eligible full text for later retrieval.
-- Set `output_limits = { max_lines = ..., max_bytes = ... }` only to override the host limits for one result. Use `maki.truncate` only when producer-level loss is intentional.
+- Set `output_limits = { max_lines = ..., max_bytes = ... }` only to override the host limits for one result. Use `caudra.truncate` only when producer-level loss is intentional.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
-- Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
+- Reusable helpers ship with caudra; see "Shared helper modules" in the API reference.
 
 ## A complete real example
 
@@ -105,7 +105,7 @@ handling, host-managed output limits, collapsible UI view. It is a bundled plugi
 so it opens with `register_options`, which your own plugin skips:
 
 ```lua
-local shorten_path = require("maki.shorten_path")
+local shorten_path = require("caudra.shorten_path")
 
 local DESCRIPTION =
   [[View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `file_read` for images.
@@ -119,7 +119,7 @@ local MAX_RAW_BYTES = 3 * 1024 * 1024
 -- Anthropic downscales anything over 1568px on the long edge server-side
 -- anyway, so ship fewer bytes and do it here.
 local MAX_EDGE = 1568
--- Refuse absurdly large files up front; maki.image.decode also enforces a
+-- Refuse absurdly large files up front; caudra.image.decode also enforces a
 -- host-side pixel cap against decode bombs.
 local MAX_INPUT_BYTES = 50 * 1024 * 1024
 
@@ -148,7 +148,7 @@ local function fail(msg)
 end
 
 local function load_image(path)
-  local bytes, read_err = maki.fs.read_bytes(path)
+  local bytes, read_err = caudra.fs.read_bytes(path)
   if not bytes then
     return fail("cannot read " .. path .. ": " .. (read_err or "unknown error"))
   end
@@ -159,7 +159,7 @@ local function load_image(path)
     )
   end
 
-  local info, probe_err = maki.image.probe(bytes)
+  local info, probe_err = caudra.image.probe(bytes)
   if not info then
     return fail(path .. " is not an image (" .. (probe_err or "unrecognized format") .. ")")
   end
@@ -170,7 +170,7 @@ local function load_image(path)
 
   -- Decode fully even on the pass-through path: a corrupt file shipped
   -- undecoded poisons message history and fails every later request.
-  local img, decode_err = maki.image.decode(bytes)
+  local img, decode_err = caudra.image.decode(bytes)
   if not img then
     return fail("cannot decode " .. path .. ": " .. (decode_err or "unknown error"))
   end
@@ -178,7 +178,7 @@ local function load_image(path)
   if size <= MAX_RAW_BYTES and math.max(info.width, info.height) <= MAX_EDGE then
     return {
       llm_output = caption(path, size, info.width, info.height),
-      image = { media_type = media_type, data = maki.base64.encode(bytes) },
+      image = { media_type = media_type, data = caudra.base64.encode(bytes) },
     }
   end
 
@@ -217,17 +217,17 @@ local function load_image(path)
 
   return {
     llm_output = caption(path, #encoded, img:width(), img:height(), note),
-    image = { media_type = MEDIA_TYPES[out_format], data = maki.base64.encode(encoded) },
+    image = { media_type = MEDIA_TYPES[out_format], data = caudra.base64.encode(encoded) },
   }
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "view_image",
   effect = "read_only",
   kind = "read",
   description = DESCRIPTION,
   permission_scopes = function(input)
-    return { scopes = { maki.fs.normalize(input.path) }, force_prompt = false }
+    return { scopes = { caudra.fs.normalize(input.path) }, force_prompt = false }
   end,
   -- No interpreter audience: the code_execution bridge flattens tool output
   -- to text, so the pixels could never reach the model from there.
@@ -246,7 +246,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     buf:line({ { shorten_path(input.path or ""), "path" } })
     return buf
   end,
@@ -256,8 +256,8 @@ maki.api.register_tool({
     if not raw then
       return fail("error: path is required")
     end
-    local path = maki.fs.normalize(raw)
-    local meta = maki.fs.metadata(path)
+    local path = caudra.fs.normalize(raw)
+    local meta = caudra.fs.metadata(path)
     if not meta then
       return fail("error: path not found: " .. path)
     end
@@ -273,5 +273,5 @@ maki.api.register_tool({
 
 Every module, function, and method is in the [Lua API reference](/docs/lua-api/).
 The agent gets the same document on disk through the builtin
-`maki-plugin-dev` skill, so asking it to write a plugin for you works
+`caudra-plugin-dev` skill, so asking it to write a plugin for you works
 without pasting any of this.

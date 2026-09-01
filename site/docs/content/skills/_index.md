@@ -9,16 +9,16 @@ group = "Guides"
 
 A skill is a short Markdown how-to that the agent loads only when it needs it. The `skill` tool shows the agent what is available, and when it picks one, the file drops into the conversation and the agent follows it.
 
-Write one for anything you keep explaining: how you cut a release, how you write a maki plugin, how a PR should look in this repo. `AGENTS.md` is always in context and always costs tokens. A skill costs nothing until it is loaded, only its name and description sit in the tool list. So big skills are fine.
+Write one for anything you keep explaining: how you cut a release, how you write a caudra plugin, how a PR should look in this repo. `AGENTS.md` is always in context and always costs tokens. A skill costs nothing until it is loaded, only its name and description sit in the tool list. So big skills are fine.
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
+A skill is a directory with a `SKILL.md` inside. Caudra looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
 
-1. The builtin `maki-plugin-dev` (if enabled)
-2. `~/.config/maki/skills/` (Windows: `%APPDATA%\maki\skills\`)
+1. The builtin `caudra-plugin-dev` (if enabled)
+2. `~/.config/caudra/skills/` (Windows: `%APPDATA%\caudra\skills\`)
 3. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
-4. In your project, walking from the current directory up to the `.git` root, at each step: `.maki/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
+4. In your project, walking from the current directory up to the `.git` root, at each step: `.caudra/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
@@ -26,10 +26,10 @@ Only `SKILL.md` is read. If you want extra notes, put them in files next to it a
 
 ## Writing one
 
-Make a directory under `.maki/skills/` and put a `SKILL.md` in it:
+Make a directory under `.caudra/skills/` and put a `SKILL.md` in it:
 
 ```
-.maki/skills/git-release/SKILL.md
+.caudra/skills/git-release/SKILL.md
 ```
 
 ```markdown
@@ -53,13 +53,13 @@ The `skill` tool lists every skill it found, the agent calls it with a name and 
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
-## The builtin: maki-plugin-dev
+## The builtin: caudra-plugin-dev
 
-Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
+Caudra ships one skill, `caudra-plugin-dev`. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
--- ~/.config/maki/init.lua
-maki.setup({
+-- ~/.config/caudra/init.lua
+caudra.setup({
     plugins = {
         skill = { plugin_dev = false },
     },

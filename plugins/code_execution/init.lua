@@ -1,11 +1,11 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
 -- sees (via the `describe(dctx)` callback), and the preamble. The sandbox and
--- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
--- `maki.agent.call_tool`); orchestration policy is here.
+-- dispatch live in Rust, which exposes primitives only (`caudra.api.get_tools`,
+-- `caudra.agent.call_tool`); orchestration policy is here.
 
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
-local partial = require("maki.partial")
+local ToolView = require("caudra.tool_view")
+local output_limits = require("caudra.output_limits")
+local partial = require("caudra.partial")
 
 local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
@@ -50,7 +50,7 @@ local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = caudra.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 30,
     min = 5,
@@ -67,9 +67,9 @@ end
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
 local function build_body(ctx, code)
-  local lines = maki.split(code:gsub("\n+$", ""), "\n")
+  local lines = caudra.split(code:gsub("\n+$", ""), "\n")
   local hl
-  local buf = maki.ui.buf()
+  local buf = caudra.ui.buf()
   local view = new_view(ctx, buf)
 
   local function header()
@@ -98,7 +98,7 @@ local function build_body(ctx, code)
   end)
 
   local function highlight()
-    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), "py")
+    local highlighted = caudra.ui.highlight(table.concat(lines, "\n"), "py")
     if highlighted then
       hl = highlighted
       view:set_header(header())
@@ -221,7 +221,7 @@ end
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
   local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
+  for _, t in ipairs(interpreter_tools(caudra.api.get_tools(), dctx.audience, dctx.workflow)) do
     if matches_filter(t.name, dctx) then
       has_workflow_only = has_workflow_only or t.workflow_only
       parts[#parts + 1] = signature(t) .. "\n"
@@ -248,7 +248,7 @@ local function handler(input, ctx)
 
   local buf, view, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
-  maki.async.run(highlight)
+  caudra.async.run(highlight)
 
   view:append({ { "Waiting for output...", "dim" } })
 
@@ -277,20 +277,20 @@ local function handler(input, ctx)
 
   -- Only for a handler still parked when the host gives up on it: normally
   -- the interpreter sees the cancel and we return the partial reply below.
-  maki.async.on_cancel(function(reason)
+  caudra.async.on_cancel(function(reason)
     ctx:finish(cut(reason))
   end)
 
   local tools = {}
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
+  for _, t in ipairs(interpreter_tools(caudra.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
     local name = t.name
     local call_opts = t.workflow_only and {} or { timeout = timeout }
     tools[name] = function(tool_input)
-      return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+      return caudra.agent.call_tool(ctx, name, tool_input, call_opts)
     end
   end
 
-  local result, err = maki.interpreter.run(input.code, {
+  local result, err = caudra.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
     preamble = PREAMBLE,
@@ -351,7 +351,7 @@ local function restore(input, output, is_error, ctx)
   return buf
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "code_execution",
   description = description,
   describe = describe,
@@ -366,7 +366,7 @@ maki.api.register_tool({
   restore = restore,
 })
 
-maki.api.register_prompt_hint({
+caudra.api.register_prompt_hint({
   slot = "efficient_tools",
   content = "code_execution",
 })

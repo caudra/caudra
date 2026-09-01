@@ -2,8 +2,11 @@
 __pycache__/
 runs.csv
 /.direnv/
+/.bin/
 /site/_build/
 /site/.bin/
+/site/docs/public/
 /.playwright-mcp/
 /result
 .maki/
+.caudra/

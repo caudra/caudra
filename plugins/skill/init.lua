@@ -2,14 +2,14 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
-local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
+local shorten_path = require("caudra.shorten_path")
+local ToolView = require("caudra.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
+  ".caudra/skills",
   ".claude/skills",
   ".opencode/skills",
   ".agents/skills",
@@ -21,14 +21,14 @@ local GLOBAL_SKILL_DIRS = {
 }
 
 local function scan_skill_dir(dir, skills)
-  local entries = maki.fs.dir(dir)
+  local entries = caudra.fs.dir(dir)
   if not entries then
     return
   end
   for _, entry in ipairs(entries) do
     if entry[2] == "directory" then
-      local skill_path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
-      local content = maki.fs.read(skill_path)
+      local skill_path = caudra.fs.joinpath(dir, entry[1], SKILL_FILE)
+      local content = caudra.fs.read(skill_path)
       if content then
         local fm, body = parse_frontmatter(content)
         if body and #body > 0 then
@@ -46,17 +46,17 @@ local function scan_skill_dir(dir, skills)
 end
 
 local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
+  local cwd = caudra.uv.cwd()
   if not cwd then
     return {}
   end
   local dirs = { cwd }
-  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
+  if caudra.fs.metadata(caudra.fs.joinpath(cwd, ".git")) then
     return dirs
   end
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
+  for _, parent in ipairs(caudra.fs.parents(cwd)) do
     dirs[#dirs + 1] = parent
-    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
+    if caudra.fs.metadata(caudra.fs.joinpath(parent, ".git")) then
       break
     end
   end
@@ -67,28 +67,28 @@ local function configured_skill_dirs()
   local dirs = {}
   local seen = {}
   local function add(dir)
-    dir = maki.fs.normalize(dir)
+    dir = caudra.fs.normalize(dir)
     if not seen[dir] then
       seen[dir] = true
       dirs[#dirs + 1] = dir
     end
   end
 
-  local config = maki.env.config_dir()
+  local config = caudra.env.config_dir()
   if config then
-    add(maki.fs.joinpath(config, "skills"))
+    add(caudra.fs.joinpath(config, "skills"))
   end
 
-  local home = maki.uv.os_homedir()
+  local home = caudra.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      add(maki.fs.joinpath(home, rel))
+      add(caudra.fs.joinpath(home, rel))
     end
   end
 
   for _, ancestor in ipairs(find_project_ancestors()) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      add(maki.fs.joinpath(ancestor, rel))
+      add(caudra.fs.joinpath(ancestor, rel))
     end
   end
   return dirs
@@ -96,33 +96,33 @@ end
 
 local skill_dirs = configured_skill_dirs()
 
-local opts = maki.api.register_options({
-  plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
+local opts = caudra.api.register_options({
+  plugin_dev = { default = true, desc = "Offer the builtin caudra-plugin-dev skill for writing caudra plugins." },
 })
 
 local ok, builtin, reference = pcall(function()
   return require("plugin_dev"), require("plugin_dev_reference")
 end)
 if not ok then
-  maki.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
+  caudra.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
   builtin = nil
 end
 
 local function resolve_builtin_content()
-  local state = maki.env.state_dir()
+  local state = caudra.env.state_dir()
   if state then
-    local dir = maki.fs.joinpath(state, "docs")
-    local path = maki.fs.joinpath(dir, REFERENCE_FILE)
-    local _, err = maki.fs.mkdir(dir, { parents = true })
+    local dir = caudra.fs.joinpath(state, "docs")
+    local path = caudra.fs.joinpath(dir, REFERENCE_FILE)
+    local _, err = caudra.fs.mkdir(dir, { parents = true })
     if not err then
-      _, err = maki.fs.write(path, reference.content)
+      _, err = caudra.fs.write(path, reference.content)
     end
     if not err then
       return (builtin.content:gsub(builtin.reference_placeholder, function()
         return path
       end))
     end
-    maki.log.warn("failed to write lua api reference to " .. path .. ": " .. tostring(err))
+    caudra.log.warn("failed to write lua api reference to " .. path .. ": " .. tostring(err))
   end
   local content = builtin.content:gsub(builtin.reference_placeholder, REFERENCE_UNAVAILABLE)
   return content .. "\n---\n\n" .. reference.content
@@ -152,7 +152,7 @@ local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
-maki.api.register_permission_rule({ tool = "skill", scope = "*" })
+caudra.api.register_permission_rule({ tool = "skill", scope = "*" })
 
 local function skill_permission_scopes(input)
   local scopes = {}
@@ -160,9 +160,9 @@ local function skill_permission_scopes(input)
     scopes[#scopes + 1] = dir:sub(-1) == "/" and (dir .. "**") or (dir .. "/**")
   end
   if builtin and input.name == builtin.name then
-    local state = maki.env.state_dir()
+    local state = caudra.env.state_dir()
     if state then
-      scopes[#scopes + 1] = maki.fs.normalize(maki.fs.joinpath(state, "docs", REFERENCE_FILE))
+      scopes[#scopes + 1] = caudra.fs.normalize(caudra.fs.joinpath(state, "docs", REFERENCE_FILE))
     end
   end
   if #scopes == 0 then
@@ -171,7 +171,7 @@ local function skill_permission_scopes(input)
   return { scopes = scopes, force_prompt = false }
 end
 
-maki.api.register_tool({
+caudra.api.register_tool({
   name = "skill",
   effect = "mutating",
   kind = "read",
@@ -213,12 +213,12 @@ maki.api.register_tool({
     end
 
     local lines = {}
-    for i, line in ipairs(maki.split(skill.content, "\n")) do
+    for i, line in ipairs(caudra.split(skill.content, "\n")) do
       lines[#lines + 1] = string.format("%4d | %s", i, line)
     end
     local formatted = skill.location .. "\n" .. table.concat(lines, "\n")
 
-    local buf = maki.ui.buf()
+    local buf = caudra.ui.buf()
     local tol = ctx:tool_output_lines()
     local view = ToolView.new(buf, {
       max_lines = (tol and tol.other) or 20,
@@ -237,7 +237,7 @@ maki.api.register_tool({
     view:finish()
 
     local short = shorten_path(skill.location)
-    local header_buf = maki.ui.buf()
+    local header_buf = caudra.ui.buf()
     header_buf:line({ { short, "path" } })
 
     return {

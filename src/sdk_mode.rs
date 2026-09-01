@@ -1,11 +1,11 @@
-//! SDK streaming mode: `maki --print --input-format stream-json`.
+//! SDK streaming mode: `caudra --print --input-format stream-json`.
 //!
 //! Wire protocol matches Claude Code's SDK interface so tools like Conductor, Windsurf, and custom
 //! orchestrators work without adaptation.
 //!
 //! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
-//! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
-//! `MakiId` canonical form.
+//! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than caudra's base58
+//! `CaudraId` canonical form.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
@@ -14,32 +14,32 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
-use flume::{Receiver, Sender};
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
-use maki_agent::mcp;
-use maki_agent::permissions::{
+use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use caudra_agent::mcp;
+use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PluginRuleStore,
 };
-use maki_agent::prompt::ResolvedSlots;
-use maki_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
-use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{
+use caudra_agent::prompt::ResolvedSlots;
+use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
+use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
 };
-use maki_config::ModelPolicy;
-use maki_providers::model::Model;
-use maki_providers::{
+use caudra_config::ModelPolicy;
+use caudra_providers::model::Model;
+use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts, TokenUsage,
     add_cost,
 };
-use maki_storage::id::SessionRef;
-use maki_storage::permission_state::PermissionRuleRecord;
-use maki_storage::sessions::{SessionError, SessionLease, StoredRule};
-use maki_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
-use maki_storage::{StateDir, StorageError};
+use caudra_storage::id::SessionRef;
+use caudra_storage::permission_state::PermissionRuleRecord;
+use caudra_storage::sessions::{SessionError, SessionLease, StoredRule};
+use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
+use caudra_storage::{StateDir, StorageError};
+use color_eyre::Result;
+use color_eyre::eyre::{Context, eyre};
+use flume::{Receiver, Sender};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -410,7 +410,7 @@ impl StreamSynth {
     }
 }
 
-fn maki_to_claude_tool_name(name: &str) -> &str {
+fn caudra_to_claude_tool_name(name: &str) -> &str {
     TOOL_NAME_MAP
         .iter()
         .find(|(m, _)| *m == name)
@@ -522,9 +522,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     )?;
     crate::setup::report_session_start(
         if initial_history.is_empty() {
-            maki_otel::emit::START_FRESH
+            caudra_otel::emit::START_FRESH
         } else {
-            maki_otel::emit::START_RESUME
+            caudra_otel::emit::START_RESUME
         },
         Some(&session_id),
     );
@@ -539,12 +539,12 @@ pub fn run(params: SdkParams) -> Result<()> {
             .load()
             .infos
             .iter()
-            .filter(|info| info.status == maki_agent::McpServerStatus::AwaitingTrust)
+            .filter(|info| info.status == caudra_agent::McpServerStatus::AwaitingTrust)
             .map(|info| info.name.clone())
             .collect();
         if !awaiting.is_empty() {
             return Err(eyre!(
-                "project MCP servers require startup trust: {}. Run `maki`, review them with `/mcp`, then retry",
+                "project MCP servers require startup trust: {}. Run `caudra`, review them with `/mcp`, then retry",
                 awaiting.join(", ")
             ));
         }
@@ -559,12 +559,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                 .iter()
                 .map(|info| {
                     let status = match &info.status {
-                        maki_agent::McpServerStatus::Running => "connected",
-                        maki_agent::McpServerStatus::Connecting => "connecting",
-                        maki_agent::McpServerStatus::AwaitingTrust => "pending",
-                        maki_agent::McpServerStatus::Disabled => "disabled",
-                        maki_agent::McpServerStatus::Failed(_) => "failed",
-                        maki_agent::McpServerStatus::NeedsAuth { .. } => "needs-auth",
+                        caudra_agent::McpServerStatus::Running => "connected",
+                        caudra_agent::McpServerStatus::Connecting => "connecting",
+                        caudra_agent::McpServerStatus::AwaitingTrust => "pending",
+                        caudra_agent::McpServerStatus::Disabled => "disabled",
+                        caudra_agent::McpServerStatus::Failed(_) => "failed",
+                        caudra_agent::McpServerStatus::NeedsAuth { .. } => "needs-auth",
                     };
                     serde_json::json!({"name": info.name, "status": status})
                 })
@@ -630,7 +630,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let tools: Vec<&str> = handle
         .tool_names
         .iter()
-        .map(|t| maki_to_claude_tool_name(t))
+        .map(|t| caudra_to_claude_tool_name(t))
         .collect();
     writer.emit_system(
         "init",
@@ -835,7 +835,7 @@ fn resolve_session(
             ensure_fork_target_available(&storage, &target)?;
             let mut reachable = reachable_subagent_ids(&history, &session);
             let mut versions =
-                maki_agent::active_task_history_versions_with_batch_state(&history, |call_id| {
+                caudra_agent::active_task_history_versions_with_batch_state(&history, |call_id| {
                     session
                         .tool_outputs()
                         .get(call_id)
@@ -969,7 +969,7 @@ fn resolve_prompt_profile(
     raw_prompt_override: bool,
 ) -> Result<(
     Option<String>,
-    Option<Arc<maki_agent::prompt::profile::SystemPromptProfile>>,
+    Option<Arc<caudra_agent::prompt::profile::SystemPromptProfile>>,
 )> {
     if raw_prompt_override {
         return Ok((None, None));
@@ -1029,7 +1029,7 @@ fn copy_history_outputs<'a>(
 }
 
 fn ensure_fork_target_available(storage: &StateDir, target: &SessionRef) -> Result<()> {
-    match maki_agent::load_stored_session(target.id(), storage) {
+    match caudra_agent::load_stored_session(target.id(), storage) {
         Ok(_) => Err(eyre!("fork target session {target} already exists")),
         Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
         Err(error) => Err(eyre!(
@@ -1078,7 +1078,7 @@ fn save_sdk_fork(
 
 fn reachable_subagent_ids(history: &[HistoryItem], session: &StoredSession) -> HashSet<String> {
     let mut reachable = history_task_ids(history);
-    let mut active_calls = maki_agent::history_tool_call_ids(history);
+    let mut active_calls = caudra_agent::history_tool_call_ids(history);
     expand_reachable_subagents(&mut reachable, &mut active_calls, session);
     let legacy_fallback = reachable.is_empty()
         || history.iter().any(|item| {
@@ -1167,7 +1167,7 @@ fn expand_reachable_subagents(
         }
         if let Some(nested) = session.subagent_messages().get(&task_id) {
             reachable.extend(history_task_ids(nested));
-            active_calls.extend(maki_agent::history_tool_call_ids(nested));
+            active_calls.extend(caudra_agent::history_tool_call_ids(nested));
         }
     }
 }
@@ -1476,7 +1476,7 @@ fn answer_permission_response(
         .and_then(|request_id| permissions.pending_request(request_id));
     let pending_tool = pending_request.as_ref().map(|request| {
         let tool = request.tool.to_string();
-        maki_to_claude_tool_name(&tool).to_owned()
+        caudra_to_claude_tool_name(&tool).to_owned()
     });
     let answer = if response.subtype == "success" {
         decode_permission_response(
@@ -1617,7 +1617,7 @@ impl EventPump {
                     let events = self.synth.tool_use(
                         &model,
                         &ts.id,
-                        maki_to_claude_tool_name(&name),
+                        caudra_to_claude_tool_name(&name),
                         &serde_json::to_string(&input)?,
                     );
                     self.emit_stream(events)?;
@@ -1715,7 +1715,7 @@ impl EventPump {
                         request_id: req_id.clone(),
                         request: ControlRequestInner {
                             subtype: "can_use_tool",
-                            tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
+                            tool_name: Some(caudra_to_claude_tool_name(&tool_name).into()),
                             input: Some(request.input.clone()),
                             tool_use_id: Some(request.id.clone()),
                         },
@@ -1754,7 +1754,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
                         && let Some(name) = block.get("name").and_then(Value::as_str)
                     {
                         let mut b = block.clone();
-                        b["name"] = Value::String(maki_to_claude_tool_name(name).to_string());
+                        b["name"] = Value::String(caudra_to_claude_tool_name(name).to_string());
                         return b;
                     }
                     block.clone()
@@ -1769,16 +1769,16 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::permissions::PermissionRequest;
-    use maki_agent::tools::PermissionScopes;
-    use maki_providers::{ContentBlock, Message, Role};
-    use maki_storage::sessions::{StoredEffect, StoredRule};
+    use caudra_agent::permissions::PermissionRequest;
+    use caudra_agent::tools::PermissionScopes;
+    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::sessions::{StoredEffect, StoredRule};
     use tempfile::TempDir;
     use test_case::test_case;
 
     const SESSION_PERMISSION_SCOPE: &str = "cargo *";
-    const MAKI_REQUEST_ID: &str = "maki-permission-1";
-    const SECOND_MAKI_REQUEST_ID: &str = "maki-permission-2";
+    const CAUDRA_REQUEST_ID: &str = "caudra-permission-1";
+    const SECOND_CAUDRA_REQUEST_ID: &str = "caudra-permission-2";
 
     fn permission_manager() -> Arc<PermissionManager> {
         Arc::new(PermissionManager::new_nonpersistent(
@@ -1804,7 +1804,7 @@ mod tests {
         input: Value,
     ) -> (smol::Task<bool>, Receiver<Envelope>) {
         let (event_tx, event_rx) = flume::unbounded();
-        let event_tx = maki_agent::EventSender::new(event_tx, 0);
+        let event_tx = caudra_agent::EventSender::new(event_tx, 0);
         let request_id = request_id.to_owned();
         let scopes = PermissionScopes::single(scope.to_owned());
         let task = smol::spawn(async move {
@@ -1812,13 +1812,13 @@ mod tests {
             let legacy_rx = smol::lock::Mutex::new(legacy_rx);
             manager
                 .enforce(
-                    &maki_config::ToolKey::native("shell"),
+                    &caudra_config::ToolKey::native("shell"),
                     &scopes,
                     &input,
                     &event_tx,
                     Some(&legacy_rx),
                     &request_id,
-                    &maki_agent::CancelToken::none(),
+                    &caudra_agent::CancelToken::none(),
                     None,
                 )
                 .await
@@ -1831,13 +1831,13 @@ mod tests {
         let (event_tx, _) = flume::unbounded();
         manager
             .enforce(
-                &maki_config::ToolKey::native("shell"),
+                &caudra_config::ToolKey::native("shell"),
                 &PermissionScopes::single(scope.to_owned()),
                 &serde_json::json!({"command": scope}),
-                &maki_agent::EventSender::new(event_tx, 0),
+                &caudra_agent::EventSender::new(event_tx, 0),
                 None,
                 "follow-up",
-                &maki_agent::CancelToken::none(),
+                &caudra_agent::CancelToken::none(),
                 None,
             )
             .await
@@ -1900,7 +1900,7 @@ mod tests {
     fn stored_structured_rule() -> PermissionRuleRecord {
         let request = PermissionRequest::from_legacy(
             "stored-structured".into(),
-            maki_config::ToolKey::native("bash"),
+            caudra_config::ToolKey::native("bash"),
             vec!["cargo test".into()],
             serde_json::json!({"command": "cargo test"}),
             Path::new("/repo"),
@@ -1910,14 +1910,14 @@ mod tests {
             request
                 .option_rule(
                     "allow_exact",
-                    maki_agent::permissions::PermissionLifetime::Conversation,
+                    caudra_agent::permissions::PermissionLifetime::Conversation,
                 )
                 .unwrap(),
         )
         .unwrap()
     }
 
-    fn claude_to_maki_tool_name(name: &str) -> &str {
+    fn claude_to_caudra_tool_name(name: &str) -> &str {
         TOOL_NAME_MAP
             .iter()
             .find(|(_, c)| *c == name)
@@ -1941,21 +1941,21 @@ mod tests {
     #[test_case("index", "Index")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
-    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
+    fn caudra_to_claude_roundtrip(caudra: &str, claude: &str) {
+        assert_eq!(caudra_to_claude_tool_name(caudra), claude);
+        assert_eq!(claude_to_caudra_tool_name(claude), caudra);
     }
 
     #[test]
     fn unknown_tool_name_passthrough() {
-        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
-        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
+        assert_eq!(caudra_to_claude_tool_name("unknown_tool"), "unknown_tool");
+        assert_eq!(claude_to_caudra_tool_name("UnknownTool"), "UnknownTool");
     }
 
     #[test]
     fn public_user_message_json_omits_managed_output_ref() {
         let output_ref = ToolOutputRef {
-            id: maki_storage::id::MakiId::generate()
+            id: caudra_storage::id::CaudraId::generate()
                 .to_string()
                 .parse()
                 .unwrap(),
@@ -2096,7 +2096,7 @@ mod tests {
         let subagent = History::new(vec![Message::user("nested".into())]).into_items();
         source.insert_tool_output(
             "batch-call".into(),
-            maki_agent::ToolOutput::Plain(maki_agent::TextOutput {
+            caudra_agent::ToolOutput::Plain(caudra_agent::TextOutput {
                 text: "batch output".into(),
                 instructions: None,
                 state: Some(serde_json::json!([])),
@@ -2113,7 +2113,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = maki_agent::load_stored_session(target.id(), &storage).unwrap();
+        let loaded = caudra_agent::load_stored_session(target.id(), &storage).unwrap();
         assert_eq!(loaded.messages(), history);
         assert_eq!(loaded.subagent_messages()["task-1"].as_ref(), &subagent);
         assert!(loaded.tool_outputs().contains_key("batch-call"));
@@ -2151,17 +2151,17 @@ mod tests {
         session.set_subagent_history(
             "task-live".into(),
             live,
-            Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+            Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
         );
         session.set_subagent_history(
             "task-nested".into(),
             Vec::new(),
-            Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+            Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
         );
         session.set_subagent_history(
             "task-other-branch".into(),
             Vec::new(),
-            Some(maki_storage::sessions::StoredSubagentTaskSpec::default()),
+            Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
         );
 
         let reachable = reachable_subagent_ids(&main, &session);
@@ -2611,8 +2611,8 @@ mod tests {
             "nested": {"complete": true, "values": [1, 2, 3]}
         });
         let request = PermissionRequest::from_legacy(
-            MAKI_REQUEST_ID.into(),
-            maki_config::ToolKey::native("bash"),
+            CAUDRA_REQUEST_ID.into(),
+            caudra_config::ToolKey::native("bash"),
             vec!["cargo test".into()],
             input.clone(),
             Path::new("/project"),
@@ -2630,8 +2630,8 @@ mod tests {
         assert_eq!(message["type"], "control_request");
         assert_eq!(message["request"]["subtype"], "can_use_tool");
         assert_eq!(message["request"]["input"], input);
-        assert_eq!(message["request"]["tool_use_id"], MAKI_REQUEST_ID);
-        assert_eq!(shared.lock().unwrap().pending["req_1"], MAKI_REQUEST_ID);
+        assert_eq!(message["request"]["tool_use_id"], CAUDRA_REQUEST_ID);
+        assert_eq!(shared.lock().unwrap().pending["req_1"], CAUDRA_REQUEST_ID);
     }
 
     #[test]
@@ -2640,21 +2640,21 @@ mod tests {
             let manager = permission_manager();
             let (first, first_events) = pending_permission(
                 Arc::clone(&manager),
-                MAKI_REQUEST_ID,
+                CAUDRA_REQUEST_ID,
                 "cargo test",
                 serde_json::json!({"command": "cargo test"}),
             );
             let (second, second_events) = pending_permission(
                 Arc::clone(&manager),
-                SECOND_MAKI_REQUEST_ID,
+                SECOND_CAUDRA_REQUEST_ID,
                 "cargo check",
                 serde_json::json!({"command": "cargo check"}),
             );
             let _ = first_events.recv_async().await.unwrap();
             let _ = second_events.recv_async().await.unwrap();
             let shared = shared_with_pending(HashMap::from([
-                ("req_1".into(), MAKI_REQUEST_ID.into()),
-                ("req_2".into(), SECOND_MAKI_REQUEST_ID.into()),
+                ("req_1".into(), CAUDRA_REQUEST_ID.into()),
+                ("req_2".into(), SECOND_CAUDRA_REQUEST_ID.into()),
             ]));
 
             answer_permission_response(
@@ -2688,13 +2688,13 @@ mod tests {
             let manager = permission_manager();
             let (task, events) = pending_permission(
                 Arc::clone(&manager),
-                MAKI_REQUEST_ID,
+                CAUDRA_REQUEST_ID,
                 "cargo test",
                 serde_json::json!({"command": "cargo test"}),
             );
             let _ = events.recv_async().await.unwrap();
             let shared =
-                shared_with_pending(HashMap::from([("req_1".into(), MAKI_REQUEST_ID.into())]));
+                shared_with_pending(HashMap::from([("req_1".into(), CAUDRA_REQUEST_ID.into())]));
 
             answer_permission_response(
                 &shared,
@@ -2726,13 +2726,13 @@ mod tests {
             let manager = permission_manager();
             let (task, events) = pending_permission(
                 Arc::clone(&manager),
-                MAKI_REQUEST_ID,
+                CAUDRA_REQUEST_ID,
                 "cargo test",
                 serde_json::json!({"command": "cargo test"}),
             );
             let _ = events.recv_async().await.unwrap();
             let shared =
-                shared_with_pending(HashMap::from([("req_1".into(), MAKI_REQUEST_ID.into())]));
+                shared_with_pending(HashMap::from([("req_1".into(), CAUDRA_REQUEST_ID.into())]));
 
             assert!(answer_pending_permission(
                 &shared,
@@ -2751,7 +2751,7 @@ mod tests {
             let manager = permission_manager();
             let (task, events) = pending_permission(
                 Arc::clone(&manager),
-                MAKI_REQUEST_ID,
+                CAUDRA_REQUEST_ID,
                 "cargo test",
                 serde_json::json!({"command": "cargo test"}),
             );
@@ -2788,7 +2788,7 @@ mod tests {
         let result = resolve_set_model(
             Some(&Value::Null),
             &startup,
-            &maki_config::ModelPolicy::default(),
+            &caudra_config::ModelPolicy::default(),
         )
         .unwrap();
         assert_eq!(result.id, startup.id);
@@ -2797,7 +2797,7 @@ mod tests {
     #[test]
     fn resolve_set_model_rejects_disallowed_exact_spec() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+        let raw: caudra_config::RawConfig = serde_json::from_value(serde_json::json!({
             "provider": {"allowed_models": [startup.spec()]}
         }))
         .unwrap();

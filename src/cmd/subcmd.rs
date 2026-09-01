@@ -6,23 +6,23 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
-use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
-use maki_agent::tools::{RegisteredTool, ToolRegistry, is_tool_enabled};
-use maki_config::providers::{
+use caudra_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
+use caudra_agent::tools::{RegisteredTool, ToolRegistry, is_tool_enabled};
+use caudra_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_providers::provider::fetch_all_models;
-use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
-use maki_storage::StateDir;
-use maki_storage::auth::ProviderCredentials;
-use maki_storage::auth::{
+use caudra_config::{Config, load_env_files, load_permissions};
+use caudra_lua::PluginHost;
+use caudra_providers::provider::fetch_all_models;
+use caudra_providers::{ProviderData, catalog_providers};
+use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
+use caudra_storage::StateDir;
+use caudra_storage::auth::ProviderCredentials;
+use caudra_storage::auth::{
     delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
-use maki_storage::model::persist_model;
+use caudra_storage::model::persist_model;
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
@@ -35,7 +35,7 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
             if builtin_provider(&slug).is_none()
                 && dynamic::display_name(&slug).is_none()
                 && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+                && let Some(provider_data) = caudra_providers::catalog_provider(&slug)
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
@@ -124,11 +124,11 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         println!("  Default model: {}", model);
     }
     if has_key {
-        println!("  Credentials: ~/.local/state/maki/auth/{}.json", slug);
+        println!("  Credentials: ~/.local/state/caudra/auth/{}.json", slug);
     } else {
         let env_var = resolve_api_key_env(slug, config.get(slug));
         println!(
-            "  Set API key via: {} or run: maki auth login {}",
+            "  Set API key via: {} or run: caudra auth login {}",
             env_var, slug
         );
     }
@@ -240,7 +240,7 @@ fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result
     save_provider_credentials(storage, &provider.slug, &creds).context("save credentials")?;
     println!("  \x1b[32m✓\x1b[0m Saved credentials for {}", provider.slug);
     println!(
-        "  Credentials: ~/.local/state/maki/auth/{}.json",
+        "  Credentials: ~/.local/state/caudra/auth/{}.json",
         provider.slug
     );
     println!(
@@ -327,21 +327,21 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     println!("  \x1b[32m✓\x1b[0m Configured: {}", slug);
     println!("  Endpoint: {}", base_url);
     if has_key {
-        println!("  Credentials: ~/.local/state/maki/auth/{}.json", slug);
+        println!("  Credentials: ~/.local/state/caudra/auth/{}.json", slug);
     } else {
         println!(
-            "  Set API key via: {} or run: maki auth login {}",
+            "  Set API key via: {} or run: caudra auth login {}",
             api_key_env, slug
         );
     }
-    println!("  Use with: maki -m {}/<model>", slug);
+    println!("  Use with: caudra -m {}/<model>", slug);
 
     Ok(())
 }
 
 fn select_plan(
     slug: &str,
-    builtin: Option<&'static maki_config::providers::BuiltInProvider>,
+    builtin: Option<&'static caudra_config::providers::BuiltInProvider>,
     def: Option<&ProviderDef>,
 ) -> Result<Option<String>> {
     let plans = builtin.and_then(|b| b.plans);
@@ -472,7 +472,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
             println!("  \x1b[34m●\x1b[0m {:<14} {} (configured)", b.slug, display);
         } else {
             println!(
-                "  \x1b[31m✗\x1b[0m {:<14} {} (run: maki auth login {})",
+                "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
                 b.slug, display, b.slug
             );
         }
@@ -503,7 +503,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
                 );
             } else {
                 println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: maki auth login {})",
+                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
                     slug, display, slug
                 );
             }
@@ -528,7 +528,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
                 );
             } else {
                 println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: maki auth login {})",
+                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: caudra auth login {})",
                     entry.slug, entry.display_name, entry.slug
                 );
             }
@@ -600,7 +600,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_index_enabled(config: &maki_config::AgentConfig) -> Result<()> {
+fn ensure_index_enabled(config: &caudra_config::AgentConfig) -> Result<()> {
     if !is_tool_enabled(&config.disabled_tools, "index") {
         bail!("index is disabled by plugins.index.enabled = false");
     }
@@ -610,7 +610,7 @@ fn ensure_index_enabled(config: &maki_config::AgentConfig) -> Result<()> {
 fn execute_index(
     entry: RegisteredTool,
     path: &str,
-    config: maki_config::AgentConfig,
+    config: caudra_config::AgentConfig,
     project_cwd: &Path,
 ) -> Result<String> {
     let input = serde_json::json!({"path": path});
@@ -618,7 +618,7 @@ fn execute_index(
         .tool
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let mut ctx = maki_agent::tools::cli_tool_ctx(project_cwd);
+    let mut ctx = caudra_agent::tools::cli_tool_ctx(project_cwd);
     ctx.config = config;
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
@@ -658,7 +658,7 @@ pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
 }
 
 pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
-    let deleted = maki_storage::auth::delete_mcp_auth(storage, server)?;
+    let deleted = caudra_storage::auth::delete_mcp_auth(storage, server)?;
     if deleted {
         eprintln!("Removed OAuth credentials for MCP server '{server}'");
     } else {
@@ -680,12 +680,12 @@ pub fn prompt(
     profile_arg: Option<&str>,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text};
-    use maki_agent::prompt::{
+    use caudra_agent::agent::{build_system_prompt, load_instruction_text};
+    use caudra_agent::prompt::{
         PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task_with_filter,
     };
-    use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use caudra_agent::template;
+    use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
@@ -711,31 +711,31 @@ pub fn prompt(
     let cwd_str = cwd.to_string_lossy();
     let instructions = load_instruction_text(&cwd_str);
     let slots = host.event_handle().collect_prompt_slots(&config.agent);
-    let prompt_profiles = maki_agent::prompt::profile::PromptProfileCatalog::discover_user();
+    let prompt_profiles = caudra_agent::prompt::profile::PromptProfileCatalog::discover_user();
     let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
     let system_prompt_profile = prompt_profiles
         .resolve(profile_name)
         .context("resolve system prompt profile")?;
     let storage = StateDir::resolve().context("resolve data directory")?;
     let mut model = crate::setup::resolve_model(model_arg, &config.provider, &storage)?;
-    maki_providers::provider::adjust_model(&mut model, maki_providers::Timeouts::default())?;
+    caudra_providers::provider::adjust_model(&mut model, caudra_providers::Timeouts::default())?;
     let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 
     if tools {
         let thinking = config
             .always_thinking
             .clone()
-            .map(maki_providers::ThinkingConfig::from)
+            .map(caudra_providers::ThinkingConfig::from)
             .unwrap_or_default();
         let bindings = prompt_profiles.bind_for_tasks(
             &model,
             &thinking,
             &config.provider.model_policy,
-            maki_providers::Timeouts::default(),
+            caudra_providers::Timeouts::default(),
         );
         let vars = vars.set(
             "{task_system_prompt_profiles}",
-            bindings.task_tool_summary("Maki's built-in task prompt"),
+            bindings.task_tool_summary("Caudra's built-in task prompt"),
         );
         let ctx = DescriptionContext {
             filter: &filter,
@@ -761,9 +761,9 @@ pub fn prompt(
     let output = match variant {
         PromptVariant::System => {
             let mode = if plan {
-                maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
+                caudra_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
             } else {
-                maki_agent::AgentMode::Build
+                caudra_agent::AgentMode::Build
             };
             build_system_prompt(
                 &vars,
@@ -812,14 +812,14 @@ mod index_tests {
         std::fs::write(&source, "pub fn run() {}\n").unwrap();
         std::fs::create_dir(root.path().join("nested")).unwrap();
         let registry = Arc::new(ToolRegistry::new());
-        let host = maki_workcell::WorkcellHost::new(root.path(), None).unwrap();
+        let host = caudra_workcell::WorkcellHost::new(root.path(), None).unwrap();
         host.register(&registry).unwrap();
         let entry = registry.get("index").unwrap();
 
         let output = execute_index(
             entry.clone(),
             "source.rs",
-            maki_config::AgentConfig::default(),
+            caudra_config::AgentConfig::default(),
             root.path(),
         )
         .unwrap();
@@ -828,20 +828,20 @@ mod index_tests {
         let directory = execute_index(
             entry.clone(),
             ".",
-            maki_config::AgentConfig::default(),
+            caudra_config::AgentConfig::default(),
             root.path(),
         )
         .unwrap();
         assert_eq!(directory, "nested/\nsource.rs");
 
-        let disabled = maki_config::AgentConfig {
+        let disabled = caudra_config::AgentConfig {
             disabled_tools: vec!["index".into()],
             ..Default::default()
         };
         assert!(ensure_index_enabled(&disabled).is_err());
 
         std::fs::write(&source, vec![b' '; 1024 * 1024 + 1]).unwrap();
-        let limited = maki_config::AgentConfig {
+        let limited = caudra_config::AgentConfig {
             index_max_file_size_mb: 1,
             ..Default::default()
         };

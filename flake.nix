@@ -1,5 +1,5 @@
 {
-  description = "Maki - AI coding agent";
+  description = "Caudra - terminal coding agent that turns context into effective action";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -91,6 +91,8 @@
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=d87388175b3e9ba776939b7b695569cbde713648#d87388175b3e9ba776939b7b695569cbde713648" =
+          "sha256-ooBVCpgH8129NaZcNpwgjz6kMj68q8wBSKt2MzL4mJQ=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -122,7 +124,7 @@
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyWorker = craneLib.buildPackage {
-            pname = "maki-monty-worker";
+            pname = "caudra-monty-worker";
             version = "0.0.21";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
@@ -193,8 +195,11 @@
               doCheck = false;
               doInstallCheck = true;
               installCheckPhaseCommand = ''
-                XDG_CACHE_HOME="$TMPDIR/cache" $out/bin/maki prompt --tools --names \
-                  | grep -qx code_execution
+                smoke_output="$(OPENAI_API_KEY=release-smoke \
+                  XDG_CACHE_HOME="$TMPDIR/cache" \
+                  $out/bin/caudra --model openai/gpt-5.1 prompt --tools --names 2>&1)"
+                printf '%s\n' "$smoke_output" | grep -qx code_execution
+                ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
               '';
             }
           );

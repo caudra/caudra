@@ -1,0 +1,27 @@
+[package]
+name = "caudra-docgen"
+description = "Documentation generator for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "caudra-docgen"
+path = "src/main.rs"
+
+[dependencies]
+caudra-agent = { workspace = true }
+caudra-config = { workspace = true }
+caudra-lua = { workspace = true }
+caudra-providers = { workspace = true }
+caudra-ui = { workspace = true }
+caudra-workcell = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
