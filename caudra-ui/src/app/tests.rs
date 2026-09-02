@@ -40,7 +40,6 @@ use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -131,8 +130,22 @@ fn test_writer(dir: StateDir) -> StorageWriter {
     StorageWriter::new(dir, flume::unbounded().0)
 }
 
+thread_local! {
+    /// Retiring or checkpointing a session writes to `sessions.sqlite3` under
+    /// the state dir, so pointing every app at `env::temp_dir()` put the whole
+    /// suite on one database. Under load the write lock timed out and
+    /// `retire_current_session` failed, taking `/new` and session loading down
+    /// with it. Tests on one thread still share a dir, which is what a second
+    /// app in the same test wants; tests that run at the same time never can.
+    static TEST_STATE_DIR: TempDir = TempDir::new().expect("test state dir");
+}
+
+fn test_state_dir() -> StateDir {
+    TEST_STATE_DIR.with(|dir| StateDir::from_path(dir.path().to_path_buf()))
+}
+
 pub(crate) fn test_app() -> App {
-    let dir = StateDir::from_path(env::temp_dir());
+    let dir = test_state_dir();
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
@@ -1045,7 +1058,7 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
 }
 
 fn streaming_app_without_queue() -> App {
-    let dir = StateDir::from_path(env::temp_dir());
+    let dir = test_state_dir();
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
     app.status = Status::Streaming;
     app
@@ -4942,7 +4955,7 @@ const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the mod
 /// `nargs` command must still be routed to its plugin.
 #[test]
 fn typed_lua_command_with_args_executes() {
-    let dir = StateDir::from_path(env::temp_dir());
+    let dir = test_state_dir();
     let mut app = build_app_with_lua(
         dir.clone(),
         Arc::new(test_writer(dir)),
@@ -5032,7 +5045,7 @@ fn run_cmdline_rejects_past_max_depth() {
 /// registered, since only that spelling dispatches.
 #[test]
 fn run_cmdline_forwards_depth_to_lua_command() {
-    let dir = StateDir::from_path(env::temp_dir());
+    let dir = test_state_dir();
     let mut app = build_app_with_lua(
         dir.clone(),
         Arc::new(test_writer(dir)),
