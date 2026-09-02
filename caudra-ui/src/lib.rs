@@ -15,6 +15,8 @@ pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;
+mod herdr;
+pub use herdr::{HerdrReporter, HerdrReporterHandle};
 pub mod image;
 mod input_document;
 mod markdown;

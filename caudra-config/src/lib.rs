@@ -14,7 +14,13 @@ use tracing::warn;
 
 const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
-const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
+const PROCESS_ONLY_ENV_VARS: &[&str] = &[
+    "HERDR_ENV",
+    "HERDR_PANE_ID",
+    "HERDR_BIN_PATH",
+    "HERDR_SOCKET_PATH",
+    "WORKCELL_MCP_CODE_WORKER",
+];
 
 pub mod providers;
 
@@ -2194,6 +2200,10 @@ fn config_search_dirs(global: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
+fn env_file_var_is_allowed(key: &str) -> bool {
+    !PROCESS_ONLY_ENV_VARS.contains(&key)
+}
+
 fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
     let mut vars = HashMap::new();
     if let Some(path) = global {
@@ -2202,7 +2212,7 @@ fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
     collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
 
     for (key, value) in vars {
-        if !PROCESS_ONLY_ENV_VARS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
+        if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
             // SAFETY: single-threaded at startup, before any async runtime
             unsafe { std::env::set_var(&key, &value) };
         }
@@ -3374,19 +3384,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn project_env_cannot_select_an_executable_worker() {
-        const WORKER: &str = "WORKCELL_MCP_CODE_WORKER";
-
-        let dir = TempDir::new().unwrap();
-        let caudra_dir = dir.path().join(".caudra");
-        fs::create_dir_all(&caudra_dir).unwrap();
-        fs::write(caudra_dir.join(".env"), format!("{WORKER}=/tmp/untrusted")).unwrap();
-        unsafe { std::env::remove_var(WORKER) };
-
-        load_env_files_with_global(dir.path(), None);
-
-        assert!(std::env::var_os(WORKER).is_none());
+    #[test_case("HERDR_ENV", false ; "herdr_env_is_process_only")]
+    #[test_case("HERDR_PANE_ID", false ; "herdr_pane_id_is_process_only")]
+    #[test_case("HERDR_BIN_PATH", false ; "herdr_bin_path_is_process_only")]
+    #[test_case("HERDR_SOCKET_PATH", false ; "herdr_socket_path_is_process_only")]
+    #[test_case("WORKCELL_MCP_CODE_WORKER", false ; "workcell_worker_is_process_only")]
+    #[test_case("TEST_CAUDRA_ENV_FILE_VAR", true ; "ordinary_env_file_var_is_allowed")]
+    fn env_file_var_loading_policy(key: &str, expected: bool) {
+        assert_eq!(env_file_var_is_allowed(key), expected);
     }
 
     #[test]

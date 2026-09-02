@@ -17,7 +17,7 @@ use caudra_providers::model::Model;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionLease;
-use caudra_ui::{AppSession, RunOutcome, SessionTab};
+use caudra_ui::{AppSession, HerdrReporter, RunOutcome, SessionTab};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -350,6 +350,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut warnings: Vec<String> = Vec::new();
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
+    let mut herdr_reporter = HerdrReporter::from_env();
 
     loop {
         for tab in &mut tabs {
@@ -405,6 +406,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 prompt_profiles: Arc::clone(&stack.prompt_profiles),
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
+                herdr_reporter: herdr_reporter.as_ref().map(HerdrReporter::handle),
             },
             initial_prompt.take(),
         )
@@ -424,6 +426,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
                     "plugin host and teardown joined"
                 );
+                if let Some(reporter) = herdr_reporter.take() {
+                    reporter.shutdown();
+                }
                 if code != 0 {
                     caudra_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);

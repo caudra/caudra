@@ -16,6 +16,8 @@ caudra <COMMAND>
 
 If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and that text is the first message. With `--print`, Caudra runs non-interactively and exits when done.
 
+When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority.
+
 ## Flags by run path
 
 | Flag | TUI | `--print` | SDK (`stream-json`) |

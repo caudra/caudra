@@ -89,7 +89,6 @@ impl BtwModal {
         self.pending_usage.take()
     }
 
-    #[cfg(test)]
     pub fn is_streaming(&self) -> bool {
         self.rx.is_some()
     }

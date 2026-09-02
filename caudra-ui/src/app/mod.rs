@@ -123,6 +123,12 @@ const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
 const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
+const PERMISSION_BLOCKER: &str = "Permission requested";
+const AUTH_BLOCKER: &str = "Authentication required";
+const PLAN_BLOCKER: &str = "Plan ready";
+const QUESTION_BLOCKER: &str = "Question requested";
+const LOGIN_BLOCKER: &str = "Provider login required";
+const MCP_TRUST_BLOCKER: &str = "MCP trust required";
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
@@ -2833,6 +2839,42 @@ impl App {
         self.permission_prompt.is_open()
             || self.pending_input != PendingInput::None
             || self.float_mgr.needs_input()
+    }
+
+    pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
+        [
+            (self.permission_prompt.is_open(), PERMISSION_BLOCKER),
+            (
+                matches!(self.pending_input, PendingInput::AuthRetry { .. }),
+                AUTH_BLOCKER,
+            ),
+            (
+                self.status != Status::Streaming && self.plan_form_active(),
+                PLAN_BLOCKER,
+            ),
+            (self.float_mgr.needs_input(), QUESTION_BLOCKER),
+            (self.login_picker.is_open(), LOGIN_BLOCKER),
+            (
+                self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
+                MCP_TRUST_BLOCKER,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(blocked, message)| blocked.then_some(message))
+    }
+
+    pub(crate) fn has_lifecycle_work(&self) -> bool {
+        self.status == Status::Streaming
+            || self.retry_info.is_some()
+            || self.restoring.load(Ordering::Relaxed)
+            || self.btw_modal.is_streaming()
+            || self
+                .state
+                .session
+                .meta
+                .pending_revert
+                .as_ref()
+                .is_some_and(|pending| pending.restore_operation.is_some())
     }
 
     /// True while `recoverable_queue` holds user text captured at an agent

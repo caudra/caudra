@@ -53,6 +53,7 @@ use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
+use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
 use crate::input::InputReader;
 use crate::load_app_session;
 use crate::repaint::{Dirty, IDLE_POLL};
@@ -113,6 +114,7 @@ pub struct EventLoopParams {
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub prompt_profile_override: Option<String>,
+    pub herdr_reporter: Option<HerdrReporterHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -333,6 +335,39 @@ impl SessionRuntime {
                 .pending_revert
                 .as_ref()
                 .is_some_and(|pending| pending.restore_operation.is_some())
+    }
+
+    fn herdr_observation(&self) -> HerdrObservation {
+        runtime_observation(
+            self.app.lifecycle_blocker(),
+            self.app.has_lifecycle_work(),
+            self.handles.queue.is_empty(),
+            self.handles.queue.is_processing(),
+            self.handles.active_background_tasks(),
+            self.app.shell.active_ids().len(),
+        )
+    }
+}
+
+fn runtime_observation(
+    blocker: Option<&'static str>,
+    app_working: bool,
+    queue_empty: bool,
+    queue_processing: bool,
+    background_tasks: usize,
+    shell_commands: usize,
+) -> HerdrObservation {
+    if let Some(message) = blocker {
+        HerdrObservation::blocked(message)
+    } else if app_working
+        || !queue_empty
+        || queue_processing
+        || background_tasks > 0
+        || shell_commands > 0
+    {
+        HerdrObservation::working()
+    } else {
+        HerdrObservation::idle()
     }
 }
 
@@ -669,6 +704,7 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
+    herdr_reporter: Option<HerdrReporterHandle>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -786,6 +822,7 @@ impl<'t> EventLoop<'t> {
             prompt_profiles,
             default_prompt_profile,
             prompt_profile_override,
+            herdr_reporter,
         } = params;
 
         // Apply the config theme before the warmup thread spawns, or warmup
@@ -892,6 +929,7 @@ impl<'t> EventLoop<'t> {
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
+            herdr_reporter,
             _model_fetch_task: bg.task,
         })
     }
@@ -1126,6 +1164,11 @@ impl<'t> EventLoop<'t> {
         self.emit_status_changes();
         self.emit_task_changes();
         self.emit_notifications();
+        if let Some(reporter) = &self.herdr_reporter {
+            reporter.observe(aggregate_observations(
+                self.sessions.iter().map(SessionRuntime::herdr_observation),
+            ));
+        }
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
@@ -2423,6 +2466,7 @@ mod tests {
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+    const HERDR_BLOCKER: &str = "Permission requested";
 
     #[test]
     fn fork_draft_makes_empty_history_session_restorable() {
@@ -2586,6 +2630,47 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test_case(true, true, false, 0, 0 ; "app_work")]
+    #[test_case(false, false, false, 0, 0 ; "queued_prompt")]
+    #[test_case(false, true, true, 0, 0 ; "processing_queue")]
+    #[test_case(false, true, false, 1, 0 ; "background_subagent")]
+    #[test_case(false, true, false, 0, 1 ; "shell_command")]
+    fn active_work_reports_working(
+        app_working: bool,
+        queue_empty: bool,
+        queue_processing: bool,
+        background_tasks: usize,
+        shell_commands: usize,
+    ) {
+        assert_eq!(
+            runtime_observation(
+                None,
+                app_working,
+                queue_empty,
+                queue_processing,
+                background_tasks,
+                shell_commands,
+            ),
+            HerdrObservation::working()
+        );
+    }
+
+    #[test]
+    fn blocker_outranks_active_work() {
+        assert_eq!(
+            runtime_observation(Some(HERDR_BLOCKER), true, false, true, 1, 1),
+            HerdrObservation::blocked(HERDR_BLOCKER)
+        );
+    }
+
+    #[test]
+    fn quiescent_runtime_reports_idle() {
+        assert_eq!(
+            runtime_observation(None, false, true, false, 0, 0),
+            HerdrObservation::idle()
+        );
     }
 
     #[test]
