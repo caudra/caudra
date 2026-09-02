@@ -21,6 +21,9 @@ const ALIGN_PASSES: usize = 4;
 /// Blank columns kept either side of an edge label so two of them never read
 /// as one word.
 const LABEL_CLEARANCE: usize = 1;
+/// The two rank-facing sides of a node, in the order ports are bucketed into.
+const NEAR: usize = 0;
+const FAR: usize = 1;
 /// How far a label may be nudged across the flow before it is left where it
 /// started. Past this it is further from its own edge than from someone
 /// else's, which is worse than the overlap it is avoiding.
@@ -113,6 +116,30 @@ struct Gap {
     widest_label: usize,
 }
 
+/// The across interval a subgraph frame reserves at every rank it covers.
+#[derive(Clone, Copy, Debug)]
+struct Lane {
+    cluster: usize,
+    lo: usize,
+    need: usize,
+    first: usize,
+    last: usize,
+}
+
+impl Lane {
+    fn hi(&self) -> usize {
+        self.lo + self.need
+    }
+
+    fn covers(&self, rank: usize) -> bool {
+        self.first <= rank && rank <= self.last
+    }
+
+    fn blocks(&self, across: usize, size: usize) -> bool {
+        across < self.hi() + CLUSTER_PAD && self.lo.saturating_sub(CLUSTER_PAD) < across + size
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Band {
     start: usize,
@@ -122,10 +149,6 @@ struct Band {
 impl Band {
     fn gap_start(&self) -> usize {
         self.start + self.thickness
-    }
-
-    fn last(&self) -> usize {
-        self.start + self.thickness - 1
     }
 }
 
@@ -249,6 +272,25 @@ impl<'a> Builder<'a> {
                 from: previous,
                 to: edge.to,
             });
+        }
+
+        // A border cell can carry one edge. Without room for every edge on a
+        // side they clamp onto the same cell, and a node with four inbound
+        // edges shows one arrow instead of four.
+        let mut demand = vec![[0usize; 2]; vertices.len()];
+        for hop in &hops {
+            let descending = vertices[hop.to].rank > vertices[hop.from].rank;
+            let (leaves, arrives) = match descending {
+                true => (FAR, NEAR),
+                false => (NEAR, FAR),
+            };
+            demand[hop.from][leaves] += 1;
+            demand[hop.to][arrives] += 1;
+        }
+        for (vertex, sides) in vertices.iter_mut().zip(&demand) {
+            if matches!(vertex.kind, Kind::Real(_)) {
+                vertex.across_size = vertex.across_size.max(sides[NEAR].max(sides[FAR]) + BORDER);
+            }
         }
 
         let depth = vertices.iter().map(|v| v.rank).max().unwrap_or(0) + 1;
@@ -423,6 +465,8 @@ impl<'a> Builder<'a> {
             }
         }
 
+        self.reserve_cluster_lanes();
+
         // Normalise against the cluster borders too, so a subgraph flush with
         // the left edge still has room for its frame.
         let inset = self
@@ -437,6 +481,96 @@ impl<'a> Builder<'a> {
         for vertex in &mut self.vertices {
             vertex.across -= inset;
         }
+    }
+
+    /// A subgraph is one rectangle covering every rank it touches, so its
+    /// across interval has to be the same at all of them. Packing each rank
+    /// on its own lets a subgraph sit at one offset here and another there,
+    /// and the rectangle spanning both then swallows whatever was between.
+    fn reserve_cluster_lanes(&mut self) {
+        let mut lanes: Vec<Lane> = (0..self.graph.subgraphs.len())
+            .filter_map(|cluster| {
+                let (first, last) = self.cluster_ranks(cluster)?;
+                let lo = self
+                    .vertices
+                    .iter()
+                    .filter(|vertex| vertex.cluster == Some(cluster))
+                    .map(|vertex| vertex.across)
+                    .min()?;
+                let need = (first..=last)
+                    .map(|rank| self.packed_extent(rank, Some(cluster)))
+                    .max()
+                    .unwrap_or(0);
+                Some(Lane {
+                    cluster,
+                    lo,
+                    need,
+                    first,
+                    last,
+                })
+            })
+            .collect();
+        if lanes.is_empty() {
+            return;
+        }
+        lanes.sort_by_key(|lane| (lane.lo, lane.cluster));
+
+        // Only frames sharing a rank can collide. Two that never overlap
+        // along the flow are already apart, so they keep their packing.
+        for idx in 0..lanes.len() {
+            let floor = lanes[..idx]
+                .iter()
+                .filter(|other| other.first <= lanes[idx].last && lanes[idx].first <= other.last)
+                .map(|other| other.hi() + CLUSTER_PAD * 2)
+                .max()
+                .unwrap_or(0);
+            lanes[idx].lo = lanes[idx].lo.max(floor);
+        }
+
+        for rank in 0..self.order.len() {
+            let members = self.order[rank].clone();
+            for lane in lanes.iter().filter(|lane| lane.covers(rank)) {
+                let mut cursor = lane.lo;
+                for &vertex in &members {
+                    if self.vertices[vertex].cluster != Some(lane.cluster) {
+                        continue;
+                    }
+                    self.vertices[vertex].across = cursor;
+                    cursor += self.vertices[vertex].across_size + NODE_GAP;
+                }
+            }
+
+            // Outsiders keep the position alignment gave them unless a frame
+            // is in the way, so a rank with no subgraph on it is untouched.
+            let mut cursor = 0;
+            for &vertex in &members {
+                if self.vertices[vertex].cluster.is_some() {
+                    continue;
+                }
+                let size = self.vertices[vertex].across_size;
+                let mut across = self.vertices[vertex].across.max(cursor);
+                // Each step clears one frame and strictly raises the target,
+                // so this terminates.
+                while let Some(lane) = lanes
+                    .iter()
+                    .find(|lane| lane.covers(rank) && lane.blocks(across, size))
+                {
+                    across = lane.hi() + CLUSTER_PAD;
+                }
+                self.vertices[vertex].across = across;
+                cursor = across + size + NODE_GAP;
+            }
+        }
+    }
+
+    /// Across-extent the members of `cluster` need at `rank`, packed tight.
+    fn packed_extent(&self, rank: usize, cluster: Option<usize>) -> usize {
+        let sizes: Vec<usize> = self.order[rank]
+            .iter()
+            .filter(|&&vertex| self.vertices[vertex].cluster == cluster)
+            .map(|&vertex| self.vertices[vertex].across_size)
+            .collect();
+        sizes.iter().sum::<usize>() + NODE_GAP * sizes.len().saturating_sub(1)
     }
 
     fn cluster_ranks(&self, cluster: usize) -> Option<(usize, usize)> {
@@ -523,9 +657,6 @@ impl<'a> Builder<'a> {
     /// back edge arriving at a node cannot land on the same cell as an edge
     /// leaving it.
     fn assign_ports(&self) -> Vec<(usize, usize)> {
-        const NEAR: usize = 0;
-        const FAR: usize = 1;
-
         let mut ports = vec![(0usize, 0usize); self.hops.len()];
         let mut sides: Vec<[Vec<(usize, bool)>; 2]> =
             vec![[Vec::new(), Vec::new()]; self.vertices.len()];
@@ -649,20 +780,30 @@ impl<'a> Builder<'a> {
         bands
     }
 
+    /// A vertex owns only its own thickness, never the rank's. Taking the
+    /// band's far edge instead detaches an edge from any node narrower than
+    /// its widest neighbour, and makes the two legs of a long edge disagree
+    /// about where their shared waypoint sits.
+    fn along_span(&self, vertex: usize, bands: &[Band]) -> (usize, usize) {
+        let start = bands[self.vertices[vertex].rank].start;
+        (start, start + self.vertices[vertex].along_size - 1)
+    }
+
     fn route(&self, ports: &[(usize, usize)], bands: &[Band], gaps: &[Gap]) -> Vec<Route> {
         let mut routes = Vec::with_capacity(self.hops.len());
         for (idx, hop) in self.hops.iter().enumerate() {
             let (source, target) = (&self.vertices[hop.from], &self.vertices[hop.to]);
             let descending = target.rank > source.rank;
             let low = source.rank.min(target.rank);
-            let (near, far) = (&bands[low], &bands[low + 1]);
+            let near = &bands[low];
             let channel = gaps[low]
                 .channel
                 .iter()
                 .find(|(candidate, _)| *candidate == idx)
                 .map_or(0, |&(_, row)| row);
 
-            let source_real = matches!(source.kind, Kind::Real(_));
+            let (source_lo, source_hi) = self.along_span(hop.from, bands);
+            let (target_lo, target_hi) = self.along_span(hop.to, bands);
             let target_real = matches!(target.kind, Kind::Real(_));
             let last_hop = self.hops[idx].edge;
             let arrowed = self.graph.edges[last_hop].arrow && target_real;
@@ -670,16 +811,8 @@ impl<'a> Builder<'a> {
             // An arrowhead is the terminus: the polyline stops one cell short
             // of the target so the head sits against an unbroken border.
             let (start_along, border_along, arrow_along) = match descending {
-                true => (
-                    if source_real { near.last() } else { near.start },
-                    if target_real { far.start } else { far.last() },
-                    arrowed.then(|| far.start - 1),
-                ),
-                false => (
-                    if source_real { far.start } else { far.last() },
-                    if target_real { near.last() } else { near.start },
-                    arrowed.then(|| near.last() + 1),
-                ),
+                true => (source_hi, target_lo, arrowed.then(|| target_lo - 1)),
+                false => (source_lo, target_hi, arrowed.then(|| target_hi + 1)),
             };
             let end_along = arrow_along.unwrap_or(border_along);
 
@@ -1073,9 +1206,219 @@ mod tests {
     const DIAMOND: &str = "flowchart TD\n A --> B & C\n B & C --> D";
     const CLUSTERED: &str =
         "flowchart TD\n Start --> A\n subgraph Box\n  A --> B\n end\n B --> Done";
+    /// Two subgraphs whose rank spans overlap, outsiders between and after
+    /// them, four edges converging on one node, and members of unequal width.
+    /// Every one of those used to break a different geometric invariant.
+    const PIPELINE: &str = "graph LR\n\
+        \x20   subgraph corpora[\"datasets/\"]\n\
+        \x20       CP[\"caveman_pirate<br/>1,200 authored rows\"]\n\
+        \x20       CS[\"lora_sft_120k<br/>manifest only\"]\n\
+        \x20   end\n\
+        \x20   subgraph pkg[\"src/llmdata/\"]\n\
+        \x20       MIX[\"data_mix<br/>weighted mixing, streaming\"]\n\
+        \x20       TL[\"train_lora\"]\n\
+        \x20       TG[\"train_grpo\"]\n\
+        \x20       PROF[\"targets/<br/>site table, rank ceiling\"]\n\
+        \x20   end\n\
+        \x20   HF[(\"HuggingFace Hub<br/>/ local cache\")]\n\
+        \x20   ADP[/\"PEFT adapter directory<br/>+ training_report.json\"/]\n\
+        \x20   RT[\"serving runtime<br/>(separate repository)\"]\n\
+        \x20   CP --> TL\n\
+        \x20   CS --> HF --> TL\n\
+        \x20   MIX --> TL\n\
+        \x20   MIX --> TG\n\
+        \x20   PROF --> TL\n\
+        \x20   PROF --> TG\n\
+        \x20   TL --> ADP\n\
+        \x20   TG --> ADP\n\
+        \x20   ADP -.->|convert, then serve| RT\n";
 
     fn place(source: &str) -> Layout {
         layout(&parse::parse(source).expect("fixture should parse"))
+    }
+
+    fn rects_overlap(
+        (ax, ay, aw, ah): (usize, usize, usize, usize),
+        (bx, by, bw, bh): (usize, usize, usize, usize),
+    ) -> bool {
+        ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+    }
+
+    fn node_rect(node: &PlacedNode) -> (usize, usize, usize, usize) {
+        (node.x, node.y, node.width, node.height)
+    }
+
+    fn cluster_rect(cluster: &PlacedCluster) -> (usize, usize, usize, usize) {
+        (cluster.x, cluster.y, cluster.width, cluster.height)
+    }
+
+    #[test]
+    fn the_pipeline_parses_with_the_memberships_it_declares() {
+        let graph = parse::parse(PIPELINE).expect("fixture should parse");
+        let named = |title: &str| {
+            let group = graph
+                .subgraphs
+                .iter()
+                .find(|group| group.title == title)
+                .unwrap_or_else(|| panic!("no subgraph {title:?}"));
+            let mut labels: Vec<String> = group
+                .nodes
+                .iter()
+                .map(|&idx| graph.nodes[idx].label[0].clone())
+                .collect();
+            labels.sort();
+            labels
+        };
+        assert_eq!(
+            named("datasets/"),
+            ["caveman_pirate", "lora_sft_120k"]
+        );
+        assert_eq!(
+            named("src/llmdata/"),
+            ["data_mix", "targets/", "train_grpo", "train_lora"]
+        );
+        // The outsiders are only ever named after both groups close, so no
+        // subgraph may claim them.
+        let claimed: Vec<usize> = graph
+            .subgraphs
+            .iter()
+            .flat_map(|group| group.nodes.iter().copied())
+            .collect();
+        for label in [
+            "HuggingFace Hub",
+            "PEFT adapter directory",
+            "serving runtime",
+        ] {
+            let idx = graph
+                .nodes
+                .iter()
+                .position(|node| node.label[0].starts_with(label) || node.label[0].contains(label))
+                .unwrap_or_else(|| panic!("no node {label:?}"));
+            assert!(!claimed.contains(&idx), "{label:?} must stay outside");
+        }
+    }
+
+    #[test_case(PIPELINE  ; "pipeline")]
+    #[test_case(CLUSTERED ; "clustered")]
+    fn subgraph_frames_never_overlap_each_other(source: &str) {
+        let placed = place(source);
+        for (i, cluster) in placed.clusters.iter().enumerate() {
+            for other in &placed.clusters[i + 1..] {
+                assert!(
+                    !rects_overlap(cluster_rect(cluster), cluster_rect(other)),
+                    "{cluster:?} overlaps {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test_case(PIPELINE  ; "pipeline")]
+    #[test_case(CLUSTERED ; "clustered")]
+    fn a_subgraph_frame_holds_its_members_and_no_one_else(source: &str) {
+        let graph = parse::parse(source).expect("fixture should parse");
+        let placed = place(source);
+        for cluster in &placed.clusters {
+            let members = &graph.subgraphs[cluster.subgraph].nodes;
+            for node in &placed.nodes {
+                let rect = node_rect(node);
+                let touches = rects_overlap(rect, cluster_rect(cluster));
+                let contained = node.x >= cluster.x
+                    && node.y >= cluster.y
+                    && node.x + node.width <= cluster.x + cluster.width
+                    && node.y + node.height <= cluster.y + cluster.height;
+                match members.contains(&node.node) {
+                    // A member has to be wholly inside, not merely touching.
+                    true => assert!(
+                        contained,
+                        "member {:?} escapes {:?}",
+                        graph.nodes[node.node].label, graph.subgraphs[cluster.subgraph].title
+                    ),
+                    // An outsider must not even clip the frame.
+                    false => assert!(
+                        !touches,
+                        "{:?} intrudes on {:?}",
+                        graph.nodes[node.node].label, graph.subgraphs[cluster.subgraph].title
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test_case(PIPELINE ; "pipeline")]
+    #[test_case(DIAMOND  ; "diamond")]
+    #[test_case(CYCLE    ; "cycle")]
+    fn every_edge_starts_on_the_border_of_its_own_source(source: &str) {
+        let graph = parse::parse(source).expect("fixture should parse");
+        let placed = place(source);
+        for (edge, wire) in graph.edges.iter().zip(&placed.edges) {
+            let node = placed
+                .nodes
+                .iter()
+                .find(|node| node.node == edge.from)
+                .expect("source is placed");
+            let &(x, y) = wire.points.first().expect("a route has points");
+            let on_border = x >= node.x
+                && x < node.x + node.width
+                && y >= node.y
+                && y < node.y + node.height
+                && (x == node.x
+                    || x == node.x + node.width - 1
+                    || y == node.y
+                    || y == node.y + node.height - 1);
+            assert!(
+                on_border,
+                "{:?} leaves from ({x},{y}), outside {:?}",
+                graph.nodes[edge.from].label, node
+            );
+        }
+    }
+
+    #[test_case(PIPELINE ; "pipeline")]
+    #[test_case(DIAMOND  ; "diamond")]
+    fn converging_edges_keep_one_arrow_each(source: &str) {
+        let placed = place(source);
+        let heads: Vec<(usize, usize)> = placed
+            .edges
+            .iter()
+            .filter_map(|edge| edge.arrow.map(|(x, y, _)| (x, y)))
+            .collect();
+        for (i, head) in heads.iter().enumerate() {
+            assert!(
+                !heads[i + 1..].contains(head),
+                "two arrows share {head:?}: {heads:?}"
+            );
+        }
+    }
+
+    #[test_case(PIPELINE ; "pipeline")]
+    fn no_route_runs_through_a_node(source: &str) {
+        let graph = parse::parse(source).expect("fixture should parse");
+        let placed = place(source);
+        for (edge, wire) in graph.edges.iter().zip(&placed.edges) {
+            for pair in wire.points.windows(2) {
+                let (from, to) = (pair[0], pair[1]);
+                let xs = from.0.min(to.0)..=from.0.max(to.0);
+                let ys = from.1.min(to.1)..=from.1.max(to.1);
+                for node in &placed.nodes {
+                    if node.node == edge.from || node.node == edge.to {
+                        continue;
+                    }
+                    let inside = xs.clone().any(|x| {
+                        ys.clone().any(|y| {
+                            x > node.x
+                                && x < node.x + node.width - 1
+                                && y > node.y
+                                && y < node.y + node.height - 1
+                        })
+                    });
+                    assert!(
+                        !inside,
+                        "a route crosses the inside of {:?}",
+                        graph.nodes[node.node].label
+                    );
+                }
+            }
+        }
     }
 
     /// A decision with two labelled branches used to place both labels in the
