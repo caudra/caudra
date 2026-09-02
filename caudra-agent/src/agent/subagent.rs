@@ -1013,6 +1013,7 @@ mod tests {
     fn tool_start(tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(crate::ToolStartEvent {
             id: TOOL_ID.into(),
+            effect: crate::tools::ToolEffect::Unknown,
             tool: Arc::from(tool),
             summary: String::new(),
             render_header: None,

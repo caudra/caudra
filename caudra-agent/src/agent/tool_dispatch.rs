@@ -12,7 +12,9 @@ use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, ToolContext};
+use crate::tools::{
+    DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect,
+};
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_config::ToolKey;
 
@@ -262,6 +264,7 @@ async fn run_inner(
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
+            effect: entry.effect,
             summary: header_result.text(),
             render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
@@ -330,6 +333,7 @@ async fn run_inner(
             emit,
             &id,
             &tool_id,
+            ToolEffect::Unknown,
             format!("mcp: {mcp_lookup}"),
             input,
         );
@@ -370,6 +374,7 @@ fn emit_raw_start(
     emit: Emit,
     id: &str,
     tool: &Arc<str>,
+    effect: ToolEffect,
     summary: String,
     input: &Value,
 ) {
@@ -379,6 +384,7 @@ fn emit_raw_start(
     let start = ToolStartEvent {
         id: id.to_owned(),
         tool: Arc::clone(tool),
+        effect,
         summary,
         render_header: None,
         annotation: None,
@@ -400,7 +406,15 @@ fn run_tool_search(
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
-    emit_raw_start(ctx, emit, &id, &tool_id, query.to_owned(), input);
+    emit_raw_start(
+        ctx,
+        emit,
+        &id,
+        &tool_id,
+        ToolEffect::ReadOnly,
+        query.to_owned(),
+        input,
+    );
     let (output, is_error) = match mcp.search_tools(query) {
         Ok(out) => (out, false),
         Err(e) => (e, true),
@@ -430,7 +444,15 @@ async fn run_local_tool(
     emit: Emit,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
-    emit_raw_start(ctx, emit, &id, &tool_id, name.to_owned(), input);
+    emit_raw_start(
+        ctx,
+        emit,
+        &id,
+        &tool_id,
+        local.effect,
+        name.to_owned(),
+        input,
+    );
     let tool_ctx = ToolContext {
         tool_use_id: Some(id.clone()),
         ..ctx.clone()

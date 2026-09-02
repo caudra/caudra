@@ -572,6 +572,7 @@ mod tests {
     fn start_event(tool: &str, raw_input: Option<serde_json::Value>) -> ToolStartEvent {
         ToolStartEvent {
             id: "t-1".into(),
+            effect: caudra_agent::tools::ToolEffect::Unknown,
             tool: Arc::from(tool),
             summary: String::new(),
             render_header: None,

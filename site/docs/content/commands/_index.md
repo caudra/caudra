@@ -29,7 +29,7 @@ Type `/` in the input box to open the command palette.
 | `/system-prompt` | Switch system prompt profile |
 | `/review` | Review the last reply passage by passage |
 | `/theme` | Switch color theme |
-| `/view` | Toggle compact / expanded transcript |
+| `/view` | Cycle transcript: auto / compact / expanded |
 | `/mcp` | Configure MCP servers |
 | `/permissions` | Inspect active conversation permission rules |
 | `/login` | Authenticate with an LLM provider |
@@ -99,7 +99,7 @@ Headless mode waits for tracked background agents before evaluating. An impossib
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `code_execution` remains isolated. Config: `always_workflow = true`.
-- **`/view`**: switch the transcript between compact and expanded. Compact draws each tool call as one row that opens on click. `task` and `batch` keep their child rows in both densities, and those children open on click as well. The choice is remembered across restarts.
+- **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. A row opens on click, and a card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout. The choice is remembered across restarts.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.

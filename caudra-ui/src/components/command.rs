@@ -141,7 +141,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/view",
-        description: "Toggle compact / expanded transcript",
+        description: "Cycle transcript: auto / compact / expanded",
         max_args: 0,
     },
     BuiltinCommand {

@@ -1,4 +1,4 @@
-//! The persisted transcript density, so `/view` survives a restart.
+//! The persisted transcript view mode, so `/view` survives a restart.
 
 use std::fs;
 
@@ -7,50 +7,117 @@ use tracing::warn;
 use crate::StateDir;
 
 const VIEW_FILE: &str = "view";
+const AUTO: &str = "auto";
 const COMPACT: &str = "compact";
 const EXPANDED: &str = "expanded";
 
-pub fn persist_compact(dir: &StateDir, compact: bool) {
-    let density = if compact { COMPACT } else { EXPANDED };
-    if let Err(e) = fs::write(dir.path().join(VIEW_FILE), density) {
-        warn!(error = %e, "failed to persist view density");
+/// How much of each transcript card the reader sees without asking.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The card being written is open and the ones scrolled past are closed,
+    /// unless closing one would hide something that changed the workspace.
+    #[default]
+    Auto,
+    /// Every card that can close is closed.
+    Compact,
+    /// Every card is open.
+    Expanded,
+}
+
+impl ViewMode {
+    /// The order `/view` walks. It starts at the default, so the first press
+    /// on a fresh install moves somewhere the reader has not been.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Compact,
+            Self::Compact => Self::Expanded,
+            Self::Expanded => Self::Auto,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => AUTO,
+            Self::Compact => COMPACT,
+            Self::Expanded => EXPANDED,
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            AUTO => Some(Self::Auto),
+            COMPACT => Some(Self::Compact),
+            EXPANDED => Some(Self::Expanded),
+            _ => None,
+        }
     }
 }
 
-/// `None` when nothing was stored or the file names a density this build does
-/// not know, which leaves the caller's own default standing.
-pub fn read_compact(dir: &StateDir) -> Option<bool> {
-    let density = fs::read_to_string(dir.path().join(VIEW_FILE)).ok()?;
-    match density.trim() {
-        COMPACT => Some(true),
-        EXPANDED => Some(false),
-        _ => None,
+pub fn persist(dir: &StateDir, mode: ViewMode) {
+    if let Err(e) = fs::write(dir.path().join(VIEW_FILE), mode.as_str()) {
+        warn!(error = %e, "failed to persist view mode");
     }
+}
+
+/// `None` when nothing was stored or the file names a mode this build does
+/// not know, which leaves the caller's own default standing.
+pub fn read(dir: &StateDir) -> Option<ViewMode> {
+    let mode = fs::read_to_string(dir.path().join(VIEW_FILE)).ok()?;
+    ViewMode::parse(mode.trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use test_case::test_case;
 
-    const UNSET: &str = "an unwritten density must leave the caller's default alone";
-    const ROUND_TRIP: &str = "a stored density must read back as written";
-    const UNKNOWN: &str = "a density this build cannot read is not a density";
+    const UNSET: &str = "an unwritten mode must leave the caller's default alone";
+    const ROUND_TRIP: &str = "a stored mode must read back as written";
+    const UNKNOWN: &str = "a mode this build cannot read is not a mode";
+    const DEFAULT: &str = "a reader who never chose gets the mode that follows the writing";
+    const CYCLE: &str = "every mode must be reachable by pressing the key three times";
 
     #[test]
-    fn view_density_round_trip() {
+    fn an_unchosen_mode_follows_the_latest_card() {
+        assert_eq!(ViewMode::default(), ViewMode::Auto, "{DEFAULT}");
+    }
+
+    #[test]
+    fn the_cycle_visits_every_mode_and_returns() {
+        let mut mode = ViewMode::default();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(mode);
+            mode = mode.next();
+        }
+        seen.sort_by_key(|mode| mode.as_str());
+        assert_eq!(
+            seen,
+            vec![ViewMode::Auto, ViewMode::Compact, ViewMode::Expanded],
+            "{CYCLE}"
+        );
+        assert_eq!(mode, ViewMode::default(), "{CYCLE}");
+    }
+
+    #[test_case(ViewMode::Auto ; "auto")]
+    #[test_case(ViewMode::Compact ; "compact")]
+    #[test_case(ViewMode::Expanded ; "expanded")]
+    fn a_chosen_mode_round_trips(mode: ViewMode) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        assert_eq!(read_compact(&dir), None, "{UNSET}");
+        assert_eq!(read(&dir), None, "{UNSET}");
+        persist(&dir, mode);
+        assert_eq!(read(&dir), Some(mode), "{ROUND_TRIP}");
+    }
 
-        persist_compact(&dir, true);
-        assert_eq!(read_compact(&dir), Some(true), "{ROUND_TRIP}");
-
-        persist_compact(&dir, false);
-        assert_eq!(read_compact(&dir), Some(false), "{ROUND_TRIP}");
+    #[test]
+    fn a_mode_this_build_cannot_read_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
 
         fs::write(dir.path().join(VIEW_FILE), "roomy\n").unwrap();
-        assert_eq!(read_compact(&dir), None, "{UNKNOWN}");
+        assert_eq!(read(&dir), None, "{UNKNOWN}");
     }
 }

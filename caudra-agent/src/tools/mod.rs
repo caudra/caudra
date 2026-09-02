@@ -255,10 +255,8 @@ pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
     INTERNAL_COMPANION_TOOL_NAMES.contains(&name) || !disabled_tools.iter().any(|s| s == name)
 }
 
-pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = "batch";
 pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
-pub const EDIT_TOOL_NAME: &str = "edit";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
 pub const FILE_APPLY_PATCH_TOOL_NAME: &str = "file_apply_patch";
 pub const FILE_EDIT_TOOL_NAME: &str = "file_edit";
@@ -266,20 +264,15 @@ pub const FILE_GLOB_TOOL_NAME: &str = "file_glob";
 pub const FILE_GREP_TOOL_NAME: &str = "file_grep";
 pub const FILE_READ_TOOL_NAME: &str = "file_read";
 pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
-pub const GLOB_TOOL_NAME: &str = "glob";
-pub const GREP_TOOL_NAME: &str = "grep";
 pub const INDEX_TOOL_NAME: &str = "index";
 pub const MEMORY_TOOL_NAME: &str = "memory";
-pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
-pub const READ_TOOL_NAME: &str = "read";
 pub const SHELL_TOOL_NAME: &str = "shell";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_GREP_TOOL_NAME: &str = "tool_output_grep";
 pub const TOOL_OUTPUT_READ_TOOL_NAME: &str = "tool_output_read";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
-pub const WRITE_TOOL_NAME: &str = "write";
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] =
     &[TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME];
 
@@ -886,27 +879,27 @@ mod tests {
 
     #[test]
     fn filter_intersection_cannot_restore_parent_exclusions() {
-        let child = ToolFilter::Only(vec![READ_TOOL_NAME.into(), BASH_TOOL_NAME.into()]);
-        let parent = ToolFilter::Only(vec![READ_TOOL_NAME.into(), TASK_TOOL_NAME.into()]);
+        let child = ToolFilter::Only(vec![FILE_READ_TOOL_NAME.into(), SHELL_TOOL_NAME.into()]);
+        let parent = ToolFilter::Only(vec![FILE_READ_TOOL_NAME.into(), TASK_TOOL_NAME.into()]);
         let filter = child.intersect(&parent);
-        assert!(filter.matches(READ_TOOL_NAME));
-        assert!(!filter.matches(BASH_TOOL_NAME));
+        assert!(filter.matches(FILE_READ_TOOL_NAME));
+        assert!(!filter.matches(SHELL_TOOL_NAME));
         assert!(!filter.matches(TASK_TOOL_NAME));
 
-        let filter = ToolFilter::AllExcept(vec![BASH_TOOL_NAME.into()])
-            .intersect(&ToolFilter::AllExcept(vec![WRITE_TOOL_NAME.into()]));
-        assert!(filter.matches(READ_TOOL_NAME));
-        assert!(!filter.matches(BASH_TOOL_NAME));
-        assert!(!filter.matches(WRITE_TOOL_NAME));
+        let filter = ToolFilter::AllExcept(vec![SHELL_TOOL_NAME.into()])
+            .intersect(&ToolFilter::AllExcept(vec![FILE_WRITE_TOOL_NAME.into()]));
+        assert!(filter.matches(FILE_READ_TOOL_NAME));
+        assert!(!filter.matches(SHELL_TOOL_NAME));
+        assert!(!filter.matches(FILE_WRITE_TOOL_NAME));
     }
 
     #[test]
     fn session_local_tools_can_extend_an_inherited_filter() {
-        let filter =
-            ToolFilter::Only(vec![READ_TOOL_NAME.into()]).including(["structured_output".into()]);
-        assert!(filter.matches(READ_TOOL_NAME));
+        let filter = ToolFilter::Only(vec![FILE_READ_TOOL_NAME.into()])
+            .including(["structured_output".into()]);
+        assert!(filter.matches(FILE_READ_TOOL_NAME));
         assert!(filter.matches("structured_output"));
-        assert!(!filter.matches(BASH_TOOL_NAME));
+        assert!(!filter.matches(SHELL_TOOL_NAME));
     }
 
     #[test_case(TOOL_OUTPUT_READ_TOOL_NAME)]

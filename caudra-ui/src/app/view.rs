@@ -204,8 +204,8 @@ impl App {
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
         // Pushed per frame rather than at construction so subagent chats,
-        // which are created mid-session, inherit the current density.
-        self.chats[render_chat].set_compact(self.compact);
+        // which are created mid-session, inherit the current mode.
+        self.chats[render_chat].set_view(self.view);
         self.chats[render_chat].set_accent(accent);
         self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
     }

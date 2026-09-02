@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use caudra_storage::tool_outputs::ToolOutputRef;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::permissions::{PermissionAuthorityProfile, PermissionResource, PermissionRisk};
@@ -95,7 +96,8 @@ impl ToolSource {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolEffect {
     ReadOnly,
     Isolated,
@@ -108,6 +110,13 @@ pub enum ToolEffect {
 impl ToolEffect {
     pub fn is_safe_in_read_only(self) -> bool {
         matches!(self, Self::ReadOnly | Self::Isolated | Self::Orchestrator)
+    }
+
+    /// Whether a finished call can be hidden behind its header without losing
+    /// the record of what happened. Only a call that reported something and
+    /// changed nothing qualifies, so anything unclassified stays visible.
+    pub fn is_collapsible(self) -> bool {
+        self == Self::ReadOnly
     }
 
     pub fn as_str(self) -> &'static str {
@@ -1170,5 +1179,39 @@ mod tests {
         assert_eq!(result.written_path.as_deref(), Some("first.rs"));
         assert_eq!(result.written_paths, ["first.rs", "second.rs"]);
         assert_eq!(result.model_output.as_deref(), Some("model-only"));
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::ToolEffect;
+    use test_case::test_case;
+
+    const COLLAPSIBLE_MSG: &str =
+        "only a call that reported something and changed nothing may hide behind its header";
+    const SPELLING_MSG: &str = "the serialized effect must match the name Lua is given";
+
+    #[test_case(ToolEffect::ReadOnly, true ; "read_only")]
+    #[test_case(ToolEffect::Isolated, false ; "isolated")]
+    #[test_case(ToolEffect::Orchestrator, false ; "orchestrator")]
+    #[test_case(ToolEffect::Mutating, false ; "mutating")]
+    #[test_case(ToolEffect::Unknown, false ; "unknown")]
+    fn the_effect_decides_whether_a_card_may_close(effect: ToolEffect, expected: bool) {
+        assert_eq!(effect.is_collapsible(), expected, "{COLLAPSIBLE_MSG}");
+    }
+
+    /// Lua reads the effect through `as_str`, so a serialized one that spells
+    /// itself differently would put two names for the same thing on the wire.
+    #[test_case(ToolEffect::ReadOnly ; "read_only")]
+    #[test_case(ToolEffect::Isolated ; "isolated")]
+    #[test_case(ToolEffect::Orchestrator ; "orchestrator")]
+    #[test_case(ToolEffect::Mutating ; "mutating")]
+    #[test_case(ToolEffect::Unknown ; "unknown")]
+    fn an_effect_spells_itself_the_same_way_everywhere(effect: ToolEffect) {
+        assert_eq!(
+            serde_json::to_value(effect).unwrap(),
+            serde_json::Value::from(effect.as_str()),
+            "{SPELLING_MSG}"
+        );
     }
 }

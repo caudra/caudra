@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
 use caudra_agent::permissions::{PermissionManager, PermissionRequest};
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
+use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
@@ -37,6 +38,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
+use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
@@ -51,8 +53,9 @@ pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
-const DENSITY_DEFAULT_MSG: &str = "an app with no stored density starts expanded";
-const DENSITY_PERSIST_MSG: &str = "a chosen density must survive the app that chose it";
+const VIEW_DEFAULT_MSG: &str = "an app with no stored mode follows the newest card";
+const VIEW_PERSIST_MSG: &str = "a chosen mode must survive the app that chose it";
+const VIEW_CYCLE_MSG: &str = "the shortcut must reach every mode and come back";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -315,6 +318,7 @@ fn subagent_msg_with_info(event: AgentEvent, subagent: SubagentInfo) -> Msg {
 fn tool_start(id: &str, tool: &str) -> AgentEvent {
     AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: id.into(),
+        effect: ToolEffect::Unknown,
         tool: tool.into(),
         summary: id.into(),
         annotation: None,
@@ -1735,6 +1739,7 @@ fn cancel_resets_all_chats_and_indices() {
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
+            effect: ToolEffect::Unknown,
             tool: "bash".into(),
             summary: "running".into(),
             annotation: None,
@@ -2629,6 +2634,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     }));
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "t1".into(),
+        effect: ToolEffect::Unknown,
         tool: "bash".into(),
         summary: "running".into(),
         annotation: None,
@@ -4050,6 +4056,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: TASK_ID.into(),
+        effect: ToolEffect::Unknown,
         tool: "task".into(),
         summary: "research".into(),
         annotation: None,
@@ -4140,26 +4147,32 @@ fn command_palette_lists_builtin_and_plugin_commands() {
 }
 
 #[test]
-fn view_toggle_flips_density_for_every_chat() {
+fn the_view_shortcut_cycles_every_mode() {
     let mut app = test_app();
-    assert!(!app.compact);
+    assert_eq!(app.view, ViewMode::Auto, "{VIEW_DEFAULT_MSG}");
 
-    app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
-    assert!(app.compact);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
+        seen.push(app.view);
+    }
 
-    app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
-    assert!(!app.compact);
+    assert_eq!(
+        seen,
+        vec![ViewMode::Compact, ViewMode::Expanded, ViewMode::Auto],
+        "{VIEW_CYCLE_MSG}"
+    );
 }
 
 #[test]
-fn view_command_flips_density_like_the_keybinding() {
+fn the_view_command_cycles_like_the_keybinding() {
     let mut app = test_app();
 
     app.execute_command(cmd("/view"), 0);
-    assert!(app.compact);
+    assert_eq!(app.view, ViewMode::Compact);
 
     app.execute_command(cmd("/view"), 0);
-    assert!(!app.compact);
+    assert_eq!(app.view, ViewMode::Expanded);
 }
 
 /// `/compact` rewrites history and `/view` only changes rendering, so the
@@ -4179,23 +4192,23 @@ fn view_command_does_not_shadow_compact() {
 fn view_toggle_is_reachable_from_lua() {
     let mut app = test_app();
     app.run_builtin(BuiltinAction::ViewToggle);
-    assert!(app.compact);
+    assert_eq!(app.view, ViewMode::Compact);
 }
 
-/// Density is a reading preference, not a per-session one, so it is picked
+/// The mode is a reading preference, not a per-session one, so it is picked
 /// once and then stays picked. Its own state dir, because the shared one
 /// would carry the choice into every other app built on this thread.
 #[test]
-fn view_density_outlives_the_app_that_chose_it() {
+fn a_view_mode_outlives_the_app_that_chose_it() {
     let tmp = TempDir::new().expect("state dir");
     let dir = StateDir::from_path(tmp.path().to_path_buf());
 
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
-    assert!(!app.compact, "{DENSITY_DEFAULT_MSG}");
+    assert_eq!(app.view, ViewMode::Auto, "{VIEW_DEFAULT_MSG}");
     app.run_builtin(BuiltinAction::ViewToggle);
 
     let restarted = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    assert!(restarted.compact, "{DENSITY_PERSIST_MSG}");
+    assert_eq!(restarted.view, ViewMode::Compact, "{VIEW_PERSIST_MSG}");
 }
 
 #[test]
@@ -7170,6 +7183,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     let mut app = streaming_app_with_history();
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
+        effect: ToolEffect::Unknown,
         tool: "task".into(),
         summary: "research".into(),
         annotation: None,
@@ -7181,6 +7195,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "child-tool".into(),
+            effect: ToolEffect::Unknown,
             tool: "read".into(),
             summary: "reading".into(),
             annotation: None,
@@ -7308,6 +7323,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     });
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "agent-tool".into(),
+        effect: ToolEffect::Unknown,
         tool: "read".into(),
         summary: "reading".into(),
         annotation: None,
@@ -7319,6 +7335,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "child-tool".into(),
+            effect: ToolEffect::Unknown,
             tool: "read".into(),
             summary: "reading".into(),
             annotation: None,
@@ -7363,6 +7380,7 @@ fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: id.clone(),
+            effect: ToolEffect::Unknown,
             tool: "read".into(),
             summary: "reading".into(),
             annotation: None,
@@ -8346,6 +8364,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "t1".into(),
+        effect: ToolEffect::Unknown,
         tool: "bash".into(),
         summary: "echo hello".into(),
         annotation: None,

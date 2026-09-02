@@ -14,6 +14,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::permissions::PermissionRequest;
+use crate::tools::ToolEffect;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
@@ -775,6 +776,9 @@ impl ToolOutput {
 pub struct ToolStartEvent {
     pub id: String,
     pub tool: Arc<str>,
+    /// Stamped where the tool is known, so the transcript never has to ask a
+    /// registry that may have changed since the call ran.
+    pub effect: ToolEffect,
     pub summary: String,
     pub render_header: Option<BufferSnapshot>,
     pub annotation: Option<String>,
@@ -2356,6 +2360,7 @@ mod tests {
     fn tool_start(tool: &str, summary: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "toolu_01".into(),
+            effect: ToolEffect::Unknown,
             tool: Arc::from(tool),
             summary: summary.into(),
             render_header: None,

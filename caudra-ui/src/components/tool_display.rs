@@ -86,15 +86,6 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("memory", '⚙', "Memory", &[]),
     tool_row("sessions", '⚙', "Sessions", &[]),
     tool_row("view_image", '→', "Image", &["path"]),
-    // Legacy spellings, still the names in sessions written before the
-    // Workcell tools took over.
-    tool_row("read", '→', "Read", &["file_path"]),
-    tool_row("glob", '✱', "Glob", &["pattern", "path"]),
-    tool_row("grep", '✱', "Grep", &["pattern", "path"]),
-    tool_row("write", '←', "Write", &["file_path", "content"]),
-    tool_row("edit", '←', "Edit", EDIT_KEYS),
-    tool_row("multiedit", '←', "Edit", &["file_path", "edits"]),
-    tool_row("bash", '$', "Shell", &["command"]),
 ];
 
 const fn tool_row(
@@ -1146,7 +1137,7 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use caudra_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use caudra_agent::tools::{FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect};
     use caudra_agent::{
         ShellFilterInfo, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
         ToolOutput,
@@ -1241,8 +1232,9 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status,
-                name: BASH_TOOL_NAME.into(),
+                name: SHELL_TOOL_NAME.into(),
             })),
             text: text.into(),
             source: None,
@@ -1259,7 +1251,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -1492,6 +1484,7 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: TASK_TOOL_NAME.into(),
             })),
@@ -1510,7 +1503,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -1590,6 +1583,7 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: "index".into(),
             })),
@@ -1608,7 +1602,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -1691,6 +1685,7 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: "index".into(),
             })),
@@ -1709,7 +1704,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -1822,6 +1817,7 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Error,
                 name: "code_execution".into(),
             })),
@@ -2007,8 +2003,9 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status,
-                name: BASH_TOOL_NAME.into(),
+                name: SHELL_TOOL_NAME.into(),
             })),
             text,
             source: None,
@@ -2025,7 +2022,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -2125,8 +2122,9 @@ mod tests {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
-                name: READ_TOOL_NAME.into(),
+                name: FILE_READ_TOOL_NAME.into(),
             })),
             text: "read /src/main.rs".into(),
             source: None,
@@ -2149,7 +2147,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -2240,7 +2238,7 @@ mod tests {
 
     fn running_tool_report(tools: u32) -> SubagentProgress {
         report(
-            SubagentActivity::tool(Arc::from(BASH_TOOL_NAME), "cargo nextest run"),
+            SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), "cargo nextest run"),
             tools,
         )
     }
@@ -2276,7 +2274,7 @@ mod tests {
             .collect();
         assert_eq!(
             progress_line,
-            "  ├ bash cargo nextest run · 3 tools · 1m 3.4s"
+            "  ├ shell cargo nextest run · 3 tools · 1m 3.4s"
         );
     }
 
@@ -2341,7 +2339,7 @@ mod tests {
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);
         assert!(
-            text.contains(" · bash cargo nextest run · 3 tools · 1m 3.4s"),
+            text.contains(" · shell cargo nextest run · 3 tools · 1m 3.4s"),
             "{text}"
         );
     }
@@ -2423,6 +2421,7 @@ mod tests {
         let msg = DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: "index".into(),
             })),
@@ -2441,7 +2440,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         };
         let tl = build_tool_lines(
@@ -2465,6 +2464,7 @@ mod tests {
         let msg = DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: "index".into(),
             })),
@@ -2483,7 +2483,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         };
         let tl = build_tool_lines(

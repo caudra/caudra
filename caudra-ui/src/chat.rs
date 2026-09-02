@@ -14,7 +14,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::permissions::PermissionRequest;
-use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
 use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
     AgentEvent, BufferSnapshot, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind,
@@ -24,6 +24,7 @@ use caudra_agent::{
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
 use caudra_providers::{CaudraId, HistoryItem, HistoryItemKind, UserOrigin};
+use caudra_storage::view::ViewMode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -226,7 +227,7 @@ impl Chat {
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
-                let is_full_write = matches!(&*e.tool, WRITE_TOOL_NAME | FILE_WRITE_TOOL_NAME);
+                let is_full_write = &*e.tool == FILE_WRITE_TOOL_NAME;
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -388,8 +389,8 @@ impl Chat {
         self.messages_panel.set_accent(color);
     }
 
-    pub fn set_compact(&mut self, compact: bool) {
-        self.messages_panel.set_compact(compact);
+    pub fn set_view(&mut self, view: ViewMode) {
+        self.messages_panel.set_view(view);
     }
 
     pub fn tick(&mut self) -> Dirty {
@@ -715,8 +716,10 @@ fn history_to_display_with_project(
             } => {
                 let static_name = name.as_str();
                 let reg = ToolRegistry::global();
+                let entry = reg.get(name);
+                let effect = entry.as_ref().map_or(ToolEffect::Unknown, |e| e.effect);
                 let tool_call: Option<Box<dyn ToolInvocation>> =
-                    reg.get(name).and_then(|entry| entry.try_parse(input));
+                    entry.and_then(|entry| entry.try_parse(input));
                 let summary = reg.resolve_header(name, input);
                 let result = results.get(call_id.as_str());
                 let (status, result_text) = result
@@ -781,6 +784,7 @@ fn history_to_display_with_project(
                         id: call_id.clone(),
                         status,
                         name: static_name.into(),
+                        effect,
                     })),
                     text,
                     source: Some(DisplaySource::ToolCall {
@@ -803,7 +807,7 @@ fn history_to_display_with_project(
                     render_snapshot: None,
                     render_header: None,
                     snapshot_theme_gen: 0,
-                    thinking_collapsed: false,
+                    reasoning_open: None,
                     thinking_duration: None,
                 });
             }
@@ -1127,6 +1131,7 @@ mod tests {
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: id.into(),
+            effect: ToolEffect::Unknown,
             tool: tool.into(),
             summary: String::new(),
             annotation: None,
@@ -1232,11 +1237,11 @@ mod tests {
     #[test]
     fn tool_lifecycle() {
         let mut chat = chat();
-        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(tool_start("t1", "shell"), None);
         assert_eq!(chat.in_progress_count(), 1);
 
         chat.handle_event(
-            tool_done("t1", "bash", ToolOutput::Plain("ok".into())),
+            tool_done("t1", "shell", ToolOutput::Plain("ok".into())),
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
@@ -1250,10 +1255,10 @@ mod tests {
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
         let plan_str = plan_path.to_str().unwrap();
 
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path.as_path()));
+        chat.handle_event(tool_start("w1", "file_write"), Some(plan_path.as_path()));
         let (output, wp) = write_output(plan_str);
         chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
+            tool_done_with_written_path("w1", "file_write", output, wp),
             Some(plan_path.as_path()),
         );
 
@@ -1266,10 +1271,10 @@ mod tests {
     fn plan_write_ignores_different_path() {
         let mut chat = chat();
         let plan_path = Path::new("/plans/123.md");
-        chat.handle_event(tool_start("w1", "write"), Some(plan_path));
+        chat.handle_event(tool_start("w1", "file_write"), Some(plan_path));
         let (output, wp) = write_output("src/main.rs");
         chat.handle_event(
-            tool_done_with_written_path("w1", "write", output, wp),
+            tool_done_with_written_path("w1", "file_write", output, wp),
             Some(plan_path),
         );
         assert!(!chat.last_message_is_plan());
@@ -1283,9 +1288,9 @@ mod tests {
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
         let plan_str = plan_path.to_str().unwrap();
 
-        chat.handle_event(tool_start("e1", "edit"), Some(plan_path.as_path()));
+        chat.handle_event(tool_start("e1", "file_edit"), Some(plan_path.as_path()));
         chat.handle_event(
-            tool_done("e1", "edit", edit_output(plan_str)),
+            tool_done("e1", "file_edit", edit_output(plan_str)),
             Some(plan_path.as_path()),
         );
 
@@ -1335,7 +1340,7 @@ mod tests {
                     ContentBlock::Text {
                         text: "running".into(),
                     },
-                    ContentBlock::tool_use("t1", "bash", serde_json::json!({"command": "true"})),
+                    ContentBlock::tool_use("t1", "shell", serde_json::json!({"command": "true"})),
                 ],
                 ..Default::default()
             },
@@ -1401,7 +1406,7 @@ mod tests {
     #[test_case(true,  ToolStatus::Error   ; "error")]
     fn history_tool_result_status(is_error: bool, expected: ToolStatus) {
         let msgs = tool_use_pair(
-            "bash",
+            "shell",
             serde_json::json!({"command": "ls"}),
             "output",
             is_error,
@@ -1685,7 +1690,11 @@ mod tests {
                     ContentBlock::Text {
                         text: "Sure, let me help.".into(),
                     },
-                    ContentBlock::tool_use("t1", "bash", serde_json::json!({"command": "echo hi"})),
+                    ContentBlock::tool_use(
+                        "t1",
+                        "shell",
+                        serde_json::json!({"command": "echo hi"}),
+                    ),
                 ],
                 ..Default::default()
             },
@@ -1720,7 +1729,7 @@ mod tests {
     fn history_stored_output_variants_pass_through() {
         let variants: Vec<(&str, serde_json::Value, ToolOutput)> = vec![
             (
-                "edit",
+                "file_edit",
                 serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
                 ToolOutput::Diff {
                     path: "a".into(),
@@ -1730,7 +1739,7 @@ mod tests {
                 },
             ),
             (
-                "read",
+                "file_read",
                 serde_json::json!({"path": "/src/main.rs"}),
                 ToolOutput::ReadCode {
                     path: "/src/main.rs".into(),
@@ -1741,7 +1750,7 @@ mod tests {
                 },
             ),
             (
-                "grep",
+                "file_grep",
                 serde_json::json!({"pattern": "TODO"}),
                 ToolOutput::GrepResult { entries: vec![] },
             ),
@@ -1772,7 +1781,7 @@ mod tests {
             lines: vec!["fn main() {}".into()],
         };
         let msgs = tool_use_pair(
-            "write",
+            "file_write",
             serde_json::json!({"path": "/src/main.rs", "content": "fn main() {}"}),
             "wrote 12 bytes",
             false,
@@ -1787,7 +1796,7 @@ mod tests {
         let long_output = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let joined = long_output.join("\n");
         let msgs = tool_use_pair(
-            "bash",
+            "shell",
             serde_json::json!({"command": "cmd"}),
             &joined,
             false,
@@ -1803,7 +1812,7 @@ mod tests {
     #[test]
     fn history_no_stored_output_falls_back_to_plain_text() {
         let msgs = tool_use_pair(
-            "read",
+            "file_read",
             serde_json::json!({"path": "/src/main.rs"}),
             "1: fn main() {}",
             false,
@@ -1946,6 +1955,7 @@ mod tests {
         let mut msg = DisplayMessage::new(DisplayRole::User, String::new());
         msg.role = DisplayRole::Tool(Box::new(ToolRole {
             id: "t1".into(),
+            effect: ToolEffect::Unknown,
             status: ToolStatus::Success,
             name: tool.into(),
         }));
@@ -1958,20 +1968,20 @@ mod tests {
 
     #[test]
     fn restore_item_for_round_trips_fields() {
-        let msg = tool_msg_with_input("bash");
+        let msg = tool_msg_with_input("shell");
         let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN)
             .expect("tool message with input and output must produce a RestoreItem");
-        assert_eq!(&*item.tool, "bash");
+        assert_eq!(&*item.tool, "shell");
         assert_eq!(item.tool_use_id, "t1");
         assert!(!item.is_error);
         assert_eq!(item.output, RESTORE_OUTPUT);
         assert_eq!(item.theme_gen, Some(RESTORE_THEME_GEN));
-        assert_eq!(item.input, serde_json::json!({ "q": "bash" }));
+        assert_eq!(item.input, serde_json::json!({ "q": "shell" }));
     }
 
     #[test]
     fn restore_item_for_skips_structured_outputs_rust_renders() {
-        let mut msg = tool_msg_with_input("edit");
+        let mut msg = tool_msg_with_input("file_edit");
         msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
         assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
     }
@@ -1979,7 +1989,7 @@ mod tests {
     #[test]
     fn history_structured_output_produces_no_restore_item() {
         let msgs = tool_use_pair(
-            "edit",
+            "file_edit",
             serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
             "edited a",
             false,
@@ -1999,11 +2009,11 @@ mod tests {
         let plain = DisplayMessage::new(DisplayRole::Assistant, "hi".into());
         assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN).is_none());
 
-        let mut no_input = tool_msg_with_input("bash");
+        let mut no_input = tool_msg_with_input("shell");
         no_input.tool_raw_input = None;
         assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN).is_none());
 
-        let mut no_output = tool_msg_with_input("bash");
+        let mut no_output = tool_msg_with_input("shell");
         no_output.tool_output = None;
         assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
     }

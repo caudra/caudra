@@ -394,7 +394,7 @@ mod tests {
         let mut modal = CommandModal::new();
         modal.open(vec![
             row(WORSE_MATCH, "Review the last reply", 0),
-            row(BETTER_MATCH, "Toggle compact view", 0),
+            row(BETTER_MATCH, "Cycle transcript view", 0),
         ]);
         type_text(&mut modal, SUBSTRING_QUERY);
         let Stage::Pick(picker) = &modal.stage else {

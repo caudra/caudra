@@ -5,8 +5,11 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{
-    BASH_TOOL_NAME, BATCH_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME,
-    WRITE_TOOL_NAME,
+    BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME,
+    FILE_GLOB_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
+    INDEX_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+    TODOWRITE_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME, ToolEffect,
+    VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
     GrepFileEntry, GrepMatchGroup, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan,
@@ -29,9 +32,32 @@ fn snap_line(text: &str) -> SnapshotLine {
     }
 }
 
+/// Mirrors what each tool registers as in production, so a card in a test
+/// answers the disclosure question the way the same card would at runtime.
+fn effect_of(tool: &str) -> ToolEffect {
+    match tool {
+        FILE_READ_TOOL_NAME
+        | FILE_GREP_TOOL_NAME
+        | FILE_GLOB_TOOL_NAME
+        | INDEX_TOOL_NAME
+        | VIEW_IMAGE_TOOL_NAME
+        | TOOL_OUTPUT_READ_TOOL_NAME
+        | TOOL_OUTPUT_GREP_TOOL_NAME => ToolEffect::ReadOnly,
+        BATCH_TOOL_NAME | TASK_TOOL_NAME => ToolEffect::Orchestrator,
+        CODE_EXECUTION_TOOL_NAME | TODOWRITE_TOOL_NAME | QUESTION_TOOL_NAME => ToolEffect::Isolated,
+        SHELL_TOOL_NAME
+        | FILE_WRITE_TOOL_NAME
+        | FILE_EDIT_TOOL_NAME
+        | FILE_APPLY_PATCH_TOOL_NAME
+        | MEMORY_TOOL_NAME => ToolEffect::Mutating,
+        _ => ToolEffect::Unknown,
+    }
+}
+
 fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
         id: id.into(),
+        effect: effect_of(tool),
         tool: tool.into(),
         summary: id.into(),
         annotation: None,
@@ -70,6 +96,7 @@ fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
             DisplaySource::Reasoning(_) => DisplayRole::Thinking,
             DisplaySource::ToolCall { .. } => DisplayRole::Tool(Box::new(ToolRole {
                 id: "tool-row".into(),
+                effect: ToolEffect::Unknown,
                 status: ToolStatus::Success,
                 name: "read".into(),
             })),
@@ -97,7 +124,7 @@ fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
 fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -167,7 +194,7 @@ fn finish_with_live_buf(
     let buf = Arc::new(caudra_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line(text)]);
     panel.register_live_buf(id.into(), Arc::clone(&buf));
-    let mut ev = start(id, BASH_TOOL_NAME);
+    let mut ev = start(id, SHELL_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
     panel.tool_done(ToolDoneEvent {
@@ -203,7 +230,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
 }
 
 #[test_case(
-    WRITE_TOOL_NAME,
+    FILE_WRITE_TOOL_NAME,
     ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
     Some("1 lines")
     ; "write_bytes"
@@ -238,12 +265,12 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
 #[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let mut event = start("t1", BASH_TOOL_NAME);
+    let mut event = start("t1", SHELL_TOOL_NAME);
     event.annotation = Some("2m timeout".into());
     panel.tool_start(event);
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain(output.into()),
         is_error: false,
         annotation: None,
@@ -272,10 +299,10 @@ fn grep_output(n_files: usize) -> ToolOutput {
 #[test]
 fn tool_done_grep_shows_matches() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", GREP_TOOL_NAME));
+    panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME.into(),
+        tool: FILE_GREP_TOOL_NAME.into(),
         output: grep_output(2),
         is_error: false,
         annotation: None,
@@ -528,7 +555,8 @@ fn events_before_cache_built_render_correctly() {
 fn bash_code_start(panel: &mut MessagesPanel, id: &str, code: &str) {
     panel.tool_start(ToolStartEvent {
         id: id.into(),
-        tool: BASH_TOOL_NAME.into(),
+        effect: ToolEffect::Unknown,
+        tool: SHELL_TOOL_NAME.into(),
         summary: code.into(),
         annotation: None,
         input: Some(ToolInput::Code {
@@ -552,7 +580,7 @@ fn bash_live_output_with_code_input() {
 
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("done".into()),
         is_error: false,
         annotation: None,
@@ -631,7 +659,7 @@ fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence 
 #[test_case(false => Cadence::SPINNER ; "waiting_tool_only_spins")]
 #[test_case(true  => Cadence::SMOOTH  ; "streaming_text_beside_it_wins")]
 fn cadence_while_a_tool_is_in_progress(text_streaming: bool) -> Cadence {
-    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
     if text_streaming {
         panel.text_delta("an answer arriving while the tool still runs");
     }
@@ -655,7 +683,7 @@ fn splash_stops_driving_cadence_once_a_message_exists() {
         "the starfield drifts while the splash is the only thing drawn"
     );
 
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_done(done("t1"));
 
     assert_eq!(panel.cadence(), Cadence::IDLE, "the splash is gone");
@@ -830,7 +858,7 @@ fn search_text_bash_with_code_input() {
     bash_code_start(&mut panel, "t1", "echo hello");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("hello".into()),
         is_error: false,
         annotation: None,
@@ -1055,7 +1083,7 @@ fn tool_start_upgrades_pending_in_place() {
     assert_eq!(panel.messages.len(), 1);
     assert_eq!(panel.in_progress_count(), 1);
 
-    let mut event = start("t1", BASH_TOOL_NAME);
+    let mut event = start("t1", SHELL_TOOL_NAME);
     event.annotation = Some("note".into());
     panel.tool_start(event);
 
@@ -1343,7 +1371,8 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        effect: ToolEffect::Unknown,
+        tool: SHELL_TOOL_NAME.into(),
         summary: "cmd".into(),
         annotation: None,
         input: None,
@@ -1353,7 +1382,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain(body.into()),
         is_error: false,
         annotation: None,
@@ -1410,6 +1439,17 @@ fn completed_shell_output_toggles_between_filtered_and_raw_views() {
     assert!(text.contains("raw output · click for filtered"));
 }
 
+fn long_done(id: &str, lines: usize) -> ToolDoneEvent {
+    let body = (0..lines)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ToolDoneEvent {
+        output: ToolOutput::Plain(body.into()),
+        ..done(id)
+    }
+}
+
 fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
     let segment = panel
         .cache
@@ -1420,17 +1460,16 @@ fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
     segment.chrome(80).content_start() + segment.shell_toggle_line.unwrap() as u16
 }
 
-/// The raw/filtered switch is a choice about the body, so re-opening a card
-/// has to return to the view the reader last picked.
+/// The raw/filtered switch is a choice about the body rather than about how
+/// much of the card shows, so the reset that a mode change performs on every
+/// disclosure must leave it alone.
 #[test_case(true; "raw survives")]
 #[test_case(false; "filtered survives")]
-fn collapsing_a_shell_card_remembers_its_raw_or_filtered_view(raw: bool) {
-    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
+fn changing_mode_keeps_a_shell_card_on_its_raw_or_filtered_view(raw: bool) {
+    let mut panel = compact_panel(&[("t1", SHELL_TOOL_NAME)]);
     panel.tool_done(shell_done("t1", true));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
-    render(&mut panel, 80, 24);
     if raw {
         assert!(panel.toggle_expansion_at(shell_toggle_row(&panel), area));
         render(&mut panel, 80, 24);
@@ -1438,11 +1477,7 @@ fn collapsing_a_shell_card_remembers_its_raw_or_filtered_view(raw: bool) {
     let chosen = seg_text(&panel, "t1").contains("raw_8");
     assert_eq!(chosen, raw, "the test must set up the view it checks");
 
-    while !panel.expanded_tools.is_empty() {
-        assert!(panel.handle_click(0, area), "{COMPACT_REHIDE_MSG}");
-        render(&mut panel, 80, 24);
-    }
-    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
 
     assert_eq!(
@@ -1540,15 +1575,17 @@ fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     const HEIGHT: u16 = 240;
 
     let mut panel = panel_with_long_tool(200);
-    assert!(panel.toggle_expansion("t1"));
+    panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, HEIGHT);
+    render(&mut panel, area.width, area.height);
+    assert!(panel.toggle_expansion("t1"));
     render(&mut panel, area.width, area.height);
 
     panel.update_hover(area.y, area.x, area, false);
     let terminal = render(&mut panel, area.width, area.height);
     let buffer = terminal.backend().buffer();
     let rail = buffer.cell((area.x, area.y)).unwrap().style();
-    let header = style_of(&terminal, "bash>");
+    let header = style_of(&terminal, "shell>");
 
     assert_eq!(header.fg, rail.fg, "header and rail share the hover accent");
     assert!(
@@ -1649,7 +1686,8 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME.into(),
+        effect: ToolEffect::Unknown,
+        tool: FILE_GREP_TOOL_NAME.into(),
         summary: "grep pattern".into(),
         annotation: None,
         input: None,
@@ -1659,7 +1697,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME.into(),
+        tool: FILE_GREP_TOOL_NAME.into(),
         output: ToolOutput::GrepResult { entries },
         is_error: false,
         annotation: None,
@@ -1678,7 +1716,9 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
 #[test]
 fn toggle_expand_collapse_grep_tool() {
     let mut panel = panel_with_grep_tool(8);
+    panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, 24);
+    render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
     assert!(panel.toggle_expansion_at(area.y, area));
@@ -1736,7 +1776,7 @@ fn search_text_includes_truncated_bash_output() {
     bash_code_start(&mut panel, "t1", "echo lines");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain(full_output.clone().into()),
         is_error: false,
         annotation: None,
@@ -1783,6 +1823,7 @@ fn segment_has_top_margin(panel: &MessagesPanel, tool_id: &str) -> bool {
 #[test]
 fn instruction_segment_has_margin_before_it() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -1860,10 +1901,10 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
 #[test]
 fn handle_click_on_done_tool_records_click_row() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -1889,7 +1930,7 @@ fn handle_click_on_done_tool_records_click_row() {
 #[test]
 fn handle_click_on_running_tool_forwards_live_without_recording() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_snapshot(
         "t1",
         BufferSnapshot::from_arc(Arc::new(vec![snap_line("streaming")])),
@@ -1927,10 +1968,10 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -1960,7 +2001,7 @@ fn second_register_live_buf_replaces_first() {
     handler.set_lines(vec![snap_line("handler")]);
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&preview));
     panel.register_live_buf("t1".into(), Arc::clone(&handler));
     let _ = panel.poll_live_bufs();
@@ -2065,7 +2106,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
     let (tx, _rx) = flume::unbounded();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
-    let mut ev = start("t1", BASH_TOOL_NAME);
+    let mut ev = start("t1", SHELL_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
     panel.tool_snapshot(
@@ -2097,7 +2138,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = Arc::new(caudra_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line("body")]);
-    let mut ev = start("t1", BASH_TOOL_NAME);
+    let mut ev = start("t1", SHELL_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
@@ -2195,7 +2236,7 @@ fn rebake_request_stops_watching_buf() {
 fn live_buf_streams_across_clean_polls() {
     let buf = Arc::new(caudra_agent::SharedBuf::new());
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
     buf.append(snap_line("first"));
@@ -2213,7 +2254,7 @@ fn live_buf_streams_across_clean_polls() {
 #[test]
 fn tool_done_without_live_buf_preserves_existing_snapshot() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_snapshot(
         "t1",
         BufferSnapshot::from_arc(Arc::new(vec![snap_line("pre-existing")])),
@@ -2221,7 +2262,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
     );
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -2247,10 +2288,10 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -2279,10 +2320,10 @@ const SUPERSEDED_DROP_MSG: &str =
 
 fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start(id, BASH_TOOL_NAME));
+    panel.tool_start(start(id, SHELL_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: id.into(),
-        tool: BASH_TOOL_NAME.into(),
+        tool: SHELL_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
         annotation: None,
@@ -2360,9 +2401,9 @@ const REBAKE_NOOP_MSG: &str = "rebake without channel must be a no-op (no reques
 fn tool_start_propagates_raw_input(pre_pending: bool) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     if pre_pending {
-        panel.tool_pending("t1".into(), BASH_TOOL_NAME);
+        panel.tool_pending("t1".into(), SHELL_TOOL_NAME);
     }
-    let mut event = start("t1", BASH_TOOL_NAME);
+    let mut event = start("t1", SHELL_TOOL_NAME);
     event.raw_input = Some(serde_json::json!({"command": "echo"}));
     panel.tool_start(event);
 
@@ -2382,7 +2423,7 @@ fn tool_start_propagates_raw_input(pre_pending: bool) {
 #[test]
 fn header_snapshot_stamps_gen_on_top_level() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_header_snapshot("t1", rendered_snapshot(), Some(5));
 
     assert_eq!(panel.snapshot_gen_of("t1"), Some(5), "{HEADER_GEN_MSG}");
@@ -2394,7 +2435,7 @@ fn header_snapshot_stamps_gen_on_top_level() {
 fn live_snapshot_uses_panel_generation() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let expected_generation = panel.theme_generation;
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
     assert_eq!(
@@ -2459,7 +2500,7 @@ fn hide_click_expands_streaming_thinking() {
         panel.handle_click(0, area),
         "clicking collapsed thinking should toggle expand"
     );
-    assert!(!panel.thinking_collapsed);
+    assert!(panel.streaming_reasoning_open());
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
@@ -2683,10 +2724,10 @@ fn stream_reset_clears_thinking_expand_state() {
         panel.handle_click(0, area),
         "clicking collapsed thinking should toggle expand"
     );
-    assert!(!panel.thinking_collapsed);
+    assert!(panel.streaming_reasoning_open());
     panel.stream_reset();
     assert!(
-        panel.thinking_collapsed,
+        !panel.streaming_reasoning_open(),
         "stream_reset must restore the collapsed default so it does not leak into retries"
     );
     panel.streaming_thinking.set_buffer("fresh reasoning");
@@ -2832,7 +2873,7 @@ fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
         DisplayRole::Thinking,
         "**First title**\n\none\ntwo".to_string(),
     );
-    m.thinking_collapsed = true;
+    m.reasoning_open = Some(false);
     panel.push(m);
     render(&mut panel, 80, 10);
     assert!(
@@ -3542,10 +3583,11 @@ const SHELL_VIEW_STICKY_MSG: &str =
     "re-opening a shell card must restore the last raw/filtered view";
 const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
 const MAX_COMPACT_CLICK_CYCLE: usize = 4;
+const TRUNCATING_LINES: usize = 200;
 
 fn compact_panel(ids: &[(&str, &'static str)]) -> MessagesPanel {
     let mut panel = panel_with_tools(ids);
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     panel
 }
 
@@ -3565,7 +3607,7 @@ fn first_line_text(panel: &MessagesPanel, seg: usize) -> String {
 
 #[test]
 fn a_compact_tool_call_collapses_to_one_row() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
@@ -3574,7 +3616,7 @@ fn a_compact_tool_call_collapses_to_one_row() {
 
 #[test]
 fn compact_rows_stack_without_separator_lines() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME), ("t2", READ_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME), ("t2", FILE_READ_TOOL_NAME)]);
     finished(&mut panel, &["t1", "t2"]);
     rebuild(&mut panel);
 
@@ -3584,15 +3626,15 @@ fn compact_rows_stack_without_separator_lines() {
 #[test]
 fn reasoning_and_wrapped_rows_join_the_compact_list() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
-    thought.thinking_collapsed = true;
+    thought.reasoning_open = Some(false);
     panel.push(thought);
-    let mut long = start("t1", READ_TOOL_NAME);
+    let mut long = start("t1", FILE_READ_TOOL_NAME);
     long.summary = "a/very/deeply/nested/path/that/has/to/wrap/at/this/width.md".into();
     panel.tool_start(long);
     panel.tool_done(done("t1"));
-    panel.tool_start(start("t2", GREP_TOOL_NAME));
+    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t2"));
     render(&mut panel, 40, 24);
 
@@ -3609,7 +3651,7 @@ fn reasoning_and_wrapped_rows_join_the_compact_list() {
 
 #[test]
 fn a_user_message_still_separates_from_the_compact_list() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     panel.push(DisplayMessage::new(
         DisplayRole::User,
@@ -3627,7 +3669,7 @@ fn a_user_message_still_separates_from_the_compact_list() {
 /// moment the block settled, because only settled blocks reach the margin pass.
 #[test]
 fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     render(&mut panel, 80, 24);
     let settled = panel.last_total_lines;
@@ -3637,7 +3679,7 @@ fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
     let streaming = panel.last_total_lines;
 
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "weighing options".into());
-    msg.thinking_collapsed = true;
+    msg.reasoning_open = Some(false);
     panel.streaming_thinking.clear();
     panel.push(msg);
     render(&mut panel, 80, 24);
@@ -3650,8 +3692,8 @@ fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
 
 #[test]
 fn an_expanded_streaming_thought_keeps_its_separator() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
-    panel.set_compact(false);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     render(&mut panel, 80, 24);
     let settled = panel.last_total_lines;
@@ -3667,7 +3709,7 @@ fn an_expanded_streaming_thought_keeps_its_separator() {
 
 #[test]
 fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
@@ -3686,8 +3728,8 @@ fn an_unknown_tool_falls_back_to_its_registered_name() {
 #[test]
 fn a_compact_row_lists_the_inputs_its_header_omits() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_compact(true);
-    let mut event = start("t1", READ_TOOL_NAME);
+    panel.set_view(ViewMode::Compact);
+    let mut event = start("t1", FILE_READ_TOOL_NAME);
     event.summary = "src/main.rs".into();
     event.raw_input = Some(serde_json::json!({
         "filePath": "src/main.rs",
@@ -3711,7 +3753,7 @@ fn a_compact_row_lists_the_inputs_its_header_omits() {
 
 #[test]
 fn a_click_opens_one_compact_row_and_leaves_its_neighbour_alone() {
-    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME), ("t2", BASH_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME), ("t2", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1", "t2"]);
     rebuild(&mut panel);
 
@@ -3733,21 +3775,21 @@ fn a_click_opens_one_compact_row_and_leaves_its_neighbour_alone() {
 
 #[test]
 fn flipping_density_clears_opened_rows() {
-    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", SHELL_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
     panel.handle_click(0, Rect::new(0, 0, 80, 24));
-    assert!(!panel.expanded_tools.is_empty());
+    assert!(!panel.card_closed("t1"));
 
-    panel.set_compact(false);
+    panel.set_view(ViewMode::Expanded);
 
-    assert!(panel.expanded_tools.is_empty(), "{COMPACT_RESET_MSG}");
+    assert!(panel.disclosure.is_empty(), "{COMPACT_RESET_MSG}");
 }
 
 /// Hover feedback promises the click will do something, so the two must agree
 /// at every step of the compact cycle, not just on the closed header.
-#[test_case(GREP_TOOL_NAME; "short row")]
-#[test_case(BASH_TOOL_NAME; "truncated row")]
+#[test_case(FILE_GREP_TOOL_NAME; "short row")]
+#[test_case(SHELL_TOOL_NAME; "truncated row")]
 fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str) {
     let mut panel = compact_panel(&[("t1", tool)]);
     finished(&mut panel, &["t1"]);
@@ -3761,7 +3803,7 @@ fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str)
             hovered,
             panel.handle_click(0, area),
             "{COMPACT_HOVER_MSG} (expanded={:?})",
-            panel.expanded_tools.get("t1")
+            panel.disclosure.get("t1")
         );
         rebuild(&mut panel);
     }
@@ -3778,7 +3820,7 @@ fn a_container_row_keeps_its_body_in_compact_view(tool: &'static str) {
     rebuild(&mut panel);
 
     let container = panel.segment_heights()[0];
-    let mut plain = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut plain = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut plain, &["t1"]);
     rebuild(&mut plain);
 
@@ -3792,7 +3834,7 @@ fn a_container_row_keeps_its_body_in_compact_view(tool: &'static str) {
 /// the next click has to take it back to its header rather than do nothing.
 #[test]
 fn clicking_an_opened_compact_row_returns_it_to_its_header() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
     let area = Rect::new(0, 0, 80, 24);
@@ -3803,22 +3845,22 @@ fn clicking_an_opened_compact_row_returns_it_to_its_header() {
 
     assert!(panel.handle_click(0, area));
     assert_eq!(panel.segment_heights()[0], header, "{COMPACT_REHIDE_MSG}");
-    assert!(panel.expanded_tools.is_empty(), "{COMPACT_REHIDE_MSG}");
+    assert!(panel.card_closed("t1"), "{COMPACT_REHIDE_MSG}");
 }
 
 /// A row with a truncated body has a middle state, and the cycle still has to
 /// end back at the header instead of stalling on the fully expanded body.
 #[test]
 fn a_truncated_compact_row_cycles_back_to_its_header() {
-    let mut panel = compact_panel(&[("t1", BASH_TOOL_NAME)]);
-    finished(&mut panel, &["t1"]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.tool_done(long_done("t1", TRUNCATING_LINES));
     rebuild(&mut panel);
     let area = Rect::new(0, 0, 80, 24);
     let header = panel.segment_heights()[0];
 
     for _ in 0..MAX_COMPACT_CLICK_CYCLE {
         assert!(panel.handle_click(0, area));
-        if panel.expanded_tools.is_empty() {
+        if panel.card_closed("t1") {
             assert_eq!(panel.segment_heights()[0], header, "{COMPACT_REHIDE_MSG}");
             return;
         }
@@ -3828,8 +3870,8 @@ fn a_truncated_compact_row_cycles_back_to_its_header() {
 
 #[test]
 fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
-    panel.set_compact(false);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
@@ -3838,7 +3880,7 @@ fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
 
 #[test]
 fn a_compact_row_with_nothing_to_show_ignores_clicks() {
-    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
     rebuild(&mut panel);
 
     assert!(!panel.handle_click(0, Rect::new(0, 0, 80, 24)));
@@ -3847,9 +3889,9 @@ fn a_compact_row_with_nothing_to_show_ignores_clicks() {
 #[test]
 fn compact_reasoning_reports_its_summary_and_duration() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "**Weighing options**\n\nbody".into());
-    msg.thinking_collapsed = true;
+    msg.reasoning_open = Some(false);
     msg.thinking_duration = Some(Duration::from_millis(9_700));
     panel.push(msg);
     rebuild(&mut panel);
@@ -3922,9 +3964,9 @@ fn expanded_reasoning_keeps_the_title_out_of_the_body() {
 #[test]
 fn untimed_reasoning_drops_the_duration_suffix() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "just a thought".into());
-    msg.thinking_collapsed = true;
+    msg.reasoning_open = Some(false);
     panel.push(msg);
     rebuild(&mut panel);
 
@@ -3945,14 +3987,17 @@ fn switching_to_compact_collapses_reasoning_that_show_thinking_had_open() {
         "reasoning".into(),
     ));
     rebuild(&mut panel);
-    assert!(!panel.messages[0].thinking_collapsed);
+    assert!(panel.reasoning_open(&panel.messages[0], 0));
 
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     rebuild(&mut panel);
-    assert!(panel.messages[0].thinking_collapsed);
+    assert!(!panel.reasoning_open(&panel.messages[0], 0));
 
-    panel.set_compact(false);
-    assert!(!panel.messages[0].thinking_collapsed, "{COMPACT_RESET_MSG}");
+    panel.set_view(ViewMode::Expanded);
+    assert!(
+        panel.reasoning_open(&panel.messages[0], 0),
+        "{COMPACT_RESET_MSG}"
+    );
 }
 
 #[test]
@@ -3968,11 +4013,11 @@ fn a_compact_thought_reopens_on_click_even_when_show_thinking_is_on() {
         DisplayRole::Thinking,
         THINKING_TEXT.into(),
     ));
-    panel.set_compact(true);
+    panel.set_view(ViewMode::Compact);
     rebuild(&mut panel);
 
     assert!(panel.handle_click(0, Rect::new(0, 0, 80, 24)));
-    assert!(!panel.messages[0].thinking_collapsed);
+    assert!(panel.reasoning_open(&panel.messages[0], 0));
 }
 
 #[test]
@@ -4020,10 +4065,145 @@ fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str
 
 #[test]
 fn expanded_density_keeps_the_status_dot_and_the_card() {
-    let mut panel = panel_with_tools(&[("t1", GREP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert!(first_line_text(&panel, 0).starts_with("● grep> "));
+    assert!(first_line_text(&panel, 0).starts_with("● file_grep> "));
     assert!(panel.segment_heights()[0] > 1);
+}
+
+const MODE_EFFECT_MSG: &str = "the mode decides a read-only card; a writing card decides itself";
+const AUTO_TAIL_MSG: &str = "auto must leave the newest card open";
+const AUTO_HANDOFF_MSG: &str = "the card auto opened must close once a newer one takes its place";
+const AUTO_STREAM_MSG: &str = "nothing settled is newest while the model is still writing";
+const MANUAL_STICKY_MSG: &str = "a card the reader opened must stay open as the transcript grows";
+const REASONING_GATE_MSG: &str =
+    "the gate decides whether reasoning may show; the mode only decides when";
+const REASONING_TAIL_MSG: &str = "auto must open the newest reasoning and close the one before it";
+
+fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
+    let mut panel = panel_with_tools(ids);
+    panel.set_view(view);
+    for &(id, _) in ids {
+        panel.tool_done(done(id));
+    }
+    rebuild(&mut panel);
+    panel
+}
+
+/// Read-only calls are the only ones the mode is allowed to hide: a call that
+/// wrote something keeps its body in every mode, or the transcript stops
+/// showing what happened to the workspace.
+#[test_case(ViewMode::Expanded, FILE_GREP_TOOL_NAME, true; "expanded opens a read")]
+#[test_case(ViewMode::Compact, FILE_GREP_TOOL_NAME, false; "compact closes a read")]
+#[test_case(ViewMode::Auto, FILE_GREP_TOOL_NAME, true; "auto opens the newest read")]
+#[test_case(ViewMode::Expanded, FILE_WRITE_TOOL_NAME, true; "expanded opens a write")]
+#[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, true; "compact still opens a write")]
+#[test_case(ViewMode::Auto, FILE_WRITE_TOOL_NAME, true; "auto still opens a write")]
+fn the_mode_only_decides_cards_that_changed_nothing(
+    view: ViewMode,
+    tool: &'static str,
+    open: bool,
+) {
+    let panel = mode_panel(view, &[("t1", tool)]);
+
+    assert_eq!(!panel.card_closed("t1"), open, "{MODE_EFFECT_MSG}");
+}
+
+/// The point of auto: the call being worked on reads in full, and the ones
+/// behind it fall back to a row without the reader touching anything.
+#[test]
+fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", FILE_GREP_TOOL_NAME)]);
+    assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
+
+    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t2"));
+    rebuild(&mut panel);
+
+    assert!(panel.card_closed("t1"), "{AUTO_HANDOFF_MSG}");
+    assert!(!panel.card_closed("t2"), "{AUTO_TAIL_MSG}");
+}
+
+/// Live text draws under every settled card, so the last card is no longer
+/// the thing being written and has no claim on staying open.
+#[test]
+fn auto_hands_the_newest_slot_to_the_reply_being_written() {
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", FILE_GREP_TOOL_NAME)]);
+    assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
+
+    panel.streaming_text.set_buffer("answering");
+    rebuild(&mut panel);
+
+    assert!(panel.card_closed("t1"), "{AUTO_STREAM_MSG}");
+}
+
+/// Auto may close what auto opened. A card the reader opened is a decision,
+/// and the next tool call is not an argument against it.
+#[test]
+fn a_card_the_reader_opened_survives_the_next_one() {
+    let mut panel = mode_panel(
+        ViewMode::Auto,
+        &[("t1", FILE_GREP_TOOL_NAME), ("t2", FILE_GREP_TOOL_NAME)],
+    );
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    rebuild(&mut panel);
+    assert!(!panel.card_closed("t1"), "{COMPACT_CLICK_MSG}");
+
+    panel.tool_start(start("t3", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t3"));
+    rebuild(&mut panel);
+
+    assert!(!panel.card_closed("t1"), "{MANUAL_STICKY_MSG}");
+    assert!(panel.card_closed("t2"), "{AUTO_HANDOFF_MSG}");
+}
+
+/// `show_thinking` is the reader saying they do not want reasoning at all. No
+/// mode overrules that; the modes only choose among reasoning they may show,
+/// which is why the same three modes answer differently once it is on.
+#[test_case(ViewMode::Expanded, false, false; "expanded obeys the gate")]
+#[test_case(ViewMode::Compact, false, false; "compact obeys the gate")]
+#[test_case(ViewMode::Auto, false, false; "auto obeys the gate")]
+#[test_case(ViewMode::Expanded, true, true; "expanded opens what it may")]
+#[test_case(ViewMode::Compact, true, false; "compact closes what it may")]
+#[test_case(ViewMode::Auto, true, true; "auto opens the newest")]
+fn reasoning_answers_to_the_gate_before_the_mode(view: ViewMode, show_thinking: bool, open: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.show_thinking = show_thinking;
+    panel.set_view(view);
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
+    rebuild(&mut panel);
+
+    assert_eq!(
+        panel.reasoning_open(&panel.messages[0], 0),
+        open,
+        "{REASONING_GATE_MSG}"
+    );
+}
+
+#[test]
+fn auto_follows_the_newest_reasoning_too() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.show_thinking = true;
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "first".into()));
+    rebuild(&mut panel);
+    assert!(
+        panel.reasoning_open(&panel.messages[0], 0),
+        "{REASONING_TAIL_MSG}"
+    );
+
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "second".into()));
+    rebuild(&mut panel);
+
+    assert!(
+        !panel.reasoning_open(&panel.messages[0], 0),
+        "{REASONING_TAIL_MSG}"
+    );
+    assert!(
+        panel.reasoning_open(&panel.messages[1], 1),
+        "{REASONING_TAIL_MSG}"
+    );
 }

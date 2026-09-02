@@ -86,6 +86,7 @@ use caudra_providers::{ContentBlock, Message, Model, ResolvedThinking, ThinkingC
 use caudra_storage::StateDir;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
+use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 use crate::storage_writer::StorageWriter;
@@ -121,6 +122,7 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
 const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
@@ -330,8 +332,9 @@ pub struct App {
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     unsent_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
-    /// Transcript density, shared by every chat and pushed at render time.
-    pub(crate) compact: bool,
+    /// How much of each card is open, shared by every chat and pushed at
+    /// render time.
+    pub(crate) view: ViewMode,
 }
 
 struct PendingSteer {
@@ -370,7 +373,7 @@ impl App {
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
-        let compact = caudra_storage::view::read_compact(&storage).unwrap_or_default();
+        let view = caudra_storage::view::read(&storage).unwrap_or_default();
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -482,7 +485,7 @@ impl App {
             pending_subagent_steers: HashMap::new(),
             unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
-            compact,
+            view,
         };
         app.model_picker.set_recents(
             caudra_storage::model::read_recents(&app.storage)
@@ -1501,16 +1504,19 @@ impl App {
                 return vec![Action::RefreshModels];
             }
             BuiltinAction::ViewToggle => {
-                self.compact = !self.compact;
+                self.view = self.view.next();
                 for chat in &mut self.chats {
-                    chat.set_compact(self.compact);
+                    chat.set_view(self.view);
                 }
-                caudra_storage::view::persist_compact(&self.storage, self.compact);
-                self.flash(if self.compact {
-                    COMPACT_VIEW_MSG.into()
-                } else {
-                    EXPANDED_VIEW_MSG.into()
-                });
+                caudra_storage::view::persist(&self.storage, self.view);
+                self.flash(
+                    match self.view {
+                        ViewMode::Auto => AUTO_VIEW_MSG,
+                        ViewMode::Compact => COMPACT_VIEW_MSG,
+                        ViewMode::Expanded => EXPANDED_VIEW_MSG,
+                    }
+                    .into(),
+                );
             }
             BuiltinAction::StashPush => return self.stash_push(),
             BuiltinAction::StashPop => return self.stash_pop(),

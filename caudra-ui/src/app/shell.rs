@@ -1,3 +1,4 @@
+use caudra_agent::tools::ToolEffect;
 use std::collections::HashSet;
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
@@ -122,6 +123,7 @@ impl App {
             ShellEvent::Start { id, command } => {
                 self.main_chat().shell_tool_start(ToolStartEvent {
                     id,
+                    effect: ToolEffect::Mutating,
                     tool: "bash".into(),
                     summary: command.clone(),
                     annotation: None,

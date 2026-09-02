@@ -44,6 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
+use caudra_agent::tools::ToolEffect;
 use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
 use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
 use caudra_providers::{CaudraId, HistoryItem, ModelTier};
@@ -440,7 +441,9 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
-    pub thinking_collapsed: bool,
+    /// What the reader asked of this reasoning block. `None` leaves the
+    /// disclosure to the view mode, which is where every card starts.
+    pub reasoning_open: Option<bool>,
     /// Wall time the model spent on a `Thinking` block. Absent for sessions
     /// written before reasoning was timed.
     pub thinking_duration: Option<Duration>,
@@ -465,7 +468,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -488,7 +491,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            reasoning_open: None,
             thinking_duration: None,
         }
     }
@@ -516,6 +519,10 @@ pub struct ToolRole {
     pub id: String,
     pub status: ToolStatus,
     pub name: Arc<str>,
+    /// What the call was allowed to do, taken from the call itself rather
+    /// than looked up at render time, so a transcript reads the same however
+    /// long after the run it is opened.
+    pub effect: ToolEffect,
 }
 
 #[derive(Debug, Clone, PartialEq)]

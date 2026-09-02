@@ -39,13 +39,14 @@ use std::time::{Duration, Instant};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
-use caudra_agent::tools::is_container_tool;
+use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
     BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration,
     reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use caudra_storage::view::ViewMode;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -125,10 +126,13 @@ pub struct MessagesPanel {
     highlight_segment: Option<usize>,
     idle_splash: Splash,
     accent: ColorTransition,
-    expanded_tools: HashMap<String, SectionFlags>,
+    /// What the reader asked of a card, keyed by tool id. Absent leaves the
+    /// disclosure to the view mode. `None` inside is an explicit close, which
+    /// only matters where the mode would have opened it.
+    disclosure: HashMap<String, Option<SectionFlags>>,
     /// Which shell cards the reader put into raw view. Kept apart from
-    /// `expanded_tools` because it is a choice about the body rather than an
-    /// expansion of it, so collapsing the card must not forget it.
+    /// `disclosure` because it is a choice about the body rather than an
+    /// expansion of it, so closing the card must not forget it.
     shell_raw: HashSet<String>,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
@@ -146,14 +150,17 @@ pub struct MessagesPanel {
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
-    thinking_collapsed: bool,
+    /// The live reasoning block's override, in the same tri-state as a card's.
+    streaming_reasoning_open: Option<bool>,
     /// Live-turn stand-in for the persisted reasoning duration: the agent only
     /// stamps history once the turn lands, and the header wants a number while
     /// the reply is still streaming.
     thinking_started: Option<Instant>,
-    /// One line per tool call and per reasoning block. Absence from
-    /// `expanded_tools` means header-only, so a click still opens one item.
-    compact: bool,
+    view: ViewMode,
+    /// Which message auto is holding open. The cache only builds segments for
+    /// new messages, so the card that stops being last has to be redrawn by
+    /// hand when the transcript grows past it.
+    auto_open: Option<usize>,
     /// Set when a density switch drops the cache under a scrolled-up reader,
     /// and applied once the next rebuild gives the segment a height again.
     pending_scroll_segment: Option<usize>,
@@ -198,7 +205,7 @@ impl MessagesPanel {
             highlight_segment: None,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
-            expanded_tools: HashMap::new(),
+            disclosure: HashMap::new(),
             shell_raw: HashSet::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
@@ -209,9 +216,10 @@ impl MessagesPanel {
             lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
-            thinking_collapsed: !ui_config.show_thinking,
+            streaming_reasoning_open: None,
             thinking_started: None,
-            compact: false,
+            view: ViewMode::default(),
+            auto_open: None,
             pending_scroll_segment: None,
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
@@ -225,23 +233,22 @@ impl MessagesPanel {
         self.restore_event_tx = event_tx;
     }
 
-    /// Switching density drops every per-item override, so the shortcut that
-    /// flips the mode really does move the whole transcript.
-    pub fn set_compact(&mut self, compact: bool) {
-        if self.compact == compact {
+    /// Switching mode drops every per-card choice, so the shortcut that
+    /// changes the mode really does move the whole transcript.
+    pub fn set_view(&mut self, view: ViewMode) {
+        if self.view == view {
             return;
         }
-        self.compact = compact;
+        self.view = view;
         self.clear_hover();
-        self.expanded_tools.clear();
+        self.disclosure.clear();
+        self.streaming_reasoning_open = None;
+        self.auto_open = None;
         for msg in &mut self.messages {
-            if matches!(msg.role, DisplayRole::Thinking) {
-                msg.thinking_collapsed = compact || !self.show_thinking;
-            }
+            msg.reasoning_open = None;
         }
-        self.thinking_collapsed = compact || !self.show_thinking;
-        // Anchor before the cache goes: the two densities have wildly
-        // different heights, so a raw line offset would land anywhere.
+        // Anchor before the cache goes: the modes have wildly different
+        // heights, so a raw line offset would land anywhere.
         let anchor = self
             .cache
             .anchor_at(self.scroll_top as u32, self.viewport_width);
@@ -251,46 +258,138 @@ impl MessagesPanel {
         }
     }
 
-    /// `None` means header-only, which only compact rows can be. The flags
-    /// inside say how much of the body an opened row shows.
-    fn tool_expansion(&self, tool_id: &str, container: bool) -> Option<SectionFlags> {
-        let flags = self.expanded_tools.get(tool_id).copied();
-        let mut flags = if self.compact && !container {
-            flags?
-        } else {
-            flags.unwrap_or_default()
+    /// Compact and auto both draw a call as one row of a list. Expanded gives
+    /// every call a card of its own.
+    fn compact(&self) -> bool {
+        self.view != ViewMode::Expanded
+    }
+
+    /// The card at the end of the transcript is the one being written. Live
+    /// reasoning and text draw after every settled card, so while either is
+    /// running nothing settled is last.
+    fn is_latest(&self, msg_index: usize) -> bool {
+        self.streaming_thinking.is_empty()
+            && self.streaming_text.is_empty()
+            && msg_index + 1 == self.messages.len()
+    }
+
+    /// Whether the mode alone draws this call's body. A call that changed
+    /// something stays open in every mode: closing it would hide the change.
+    fn opens_by_default(&self, effect: ToolEffect, msg_index: usize) -> bool {
+        if !effect.is_collapsible() {
+            return true;
+        }
+        match self.view {
+            ViewMode::Expanded => true,
+            ViewMode::Compact => false,
+            ViewMode::Auto => self.is_latest(msg_index),
+        }
+    }
+
+    /// Resolved from the message rather than tracked alongside it, so a
+    /// restored session cannot disagree with a live one.
+    fn tool_card(&self, tool_id: &str) -> Option<(usize, &ToolRole)> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, msg)| match &msg.role {
+                DisplayRole::Tool(t) if t.id == tool_id => Some((i, t.as_ref())),
+                _ => None,
+            })
+    }
+
+    fn card_opens_by_default(&self, tool_id: &str) -> bool {
+        self.tool_card(tool_id)
+            .is_some_and(|(idx, role)| self.opens_by_default(role.effect, idx))
+    }
+
+    /// Whether a click can take this card back to its header. An expanded
+    /// transcript has no header to fall to, and a call that changed something
+    /// has no header worth falling to.
+    fn card_can_close(&self, tool_id: &str) -> bool {
+        self.compact()
+            && self
+                .tool_card(tool_id)
+                .is_some_and(|(_, role)| role.effect.is_collapsible())
+    }
+
+    /// `None` means header-only. The flags inside say how much of the body an
+    /// open card shows past the point it would be cut off.
+    fn tool_expansion(&self, tool_id: &str, open_by_default: bool) -> Option<SectionFlags> {
+        let mut flags = match self.disclosure.get(tool_id) {
+            Some(asked) => (*asked)?,
+            None if open_by_default => SectionFlags::default(),
+            None => return None,
         };
         flags.shell_raw = self.shell_raw.contains(tool_id);
         Some(flags)
     }
 
-    /// Resolved from the segment's message rather than tracked alongside it,
-    /// so a restored session cannot disagree with a live one.
-    fn is_container(&self, tool_id: &str) -> bool {
-        self.cache
-            .find_by_tool_id(tool_id)
-            .and_then(|idx| self.cache.get(idx))
-            .and_then(|seg| seg.msg_index)
-            .and_then(|idx| self.messages.get(idx))
-            .is_some_and(|msg| match &msg.role {
-                DisplayRole::Tool(t) => is_container_tool(&t.name),
-                _ => false,
-            })
+    /// Auto keeps the card being written open and closes the one it replaced.
+    /// The cache only builds segments for messages it has not seen, so the
+    /// card that stops being last has to be redrawn by hand.
+    fn follow_latest(&mut self) {
+        let latest = (self.view == ViewMode::Auto)
+            .then(|| self.auto_governed_tail())
+            .flatten();
+        if latest == self.auto_open {
+            return;
+        }
+        let previous = mem::replace(&mut self.auto_open, latest);
+        for idx in [previous, latest].into_iter().flatten() {
+            self.rebuild_card(idx);
+        }
     }
 
-    fn compact_collapsed(&self, tool_id: &str) -> bool {
-        self.compact && !self.expanded_tools.contains_key(tool_id) && !self.is_container(tool_id)
+    /// The last card, when the mode is the only thing deciding whether it is
+    /// open. A card the reader chose for, or one that cannot close at all,
+    /// does not move when the transcript grows past it.
+    fn auto_governed_tail(&self) -> Option<usize> {
+        let idx = self.messages.len().checked_sub(1)?;
+        if !self.is_latest(idx) {
+            return None;
+        }
+        let governed = match &self.messages[idx].role {
+            DisplayRole::Tool(t) => {
+                t.effect.is_collapsible() && !self.disclosure.contains_key(&t.id)
+            }
+            DisplayRole::Thinking => {
+                self.show_thinking && self.messages[idx].reasoning_open.is_none()
+            }
+            _ => false,
+        };
+        governed.then_some(idx)
+    }
+
+    fn rebuild_card(&mut self, msg_index: usize) {
+        let Some(msg) = self.messages.get(msg_index) else {
+            return;
+        };
+        match &msg.role {
+            DisplayRole::Tool(t) => {
+                let id = t.id.clone();
+                self.rebuild_tool_lines(&id);
+            }
+            DisplayRole::Thinking => {
+                self.rebuild_thinking_segment(msg_index, self.viewport_width);
+            }
+            _ => {}
+        }
+    }
+
+    fn card_closed(&self, tool_id: &str) -> bool {
+        self.tool_expansion(tool_id, self.card_opens_by_default(tool_id))
+            .is_none()
     }
 
     /// Whether a click on the row would change anything. Hover feedback and
     /// the click share this, or a row highlights and then ignores the press.
     fn tool_click_acts(&self, tool_id: &str, truncation: SectionFlags) -> bool {
-        // An opened compact row always has its header left to collapse to.
-        (self.compact && self.expanded_tools.contains_key(tool_id) && !self.is_container(tool_id))
+        let exp = self.tool_expansion(tool_id, self.card_opens_by_default(tool_id));
+        (exp.is_some() && self.card_can_close(tool_id))
             || truncation.any()
-            || self
-                .tool_expansion(tool_id, self.is_container(tool_id))
-                .is_some_and(SectionFlags::any)
+            || exp.is_some_and(SectionFlags::any)
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -318,26 +417,24 @@ impl MessagesPanel {
         }
         self.messages.remove(index);
         self.cache.clear();
+        self.auto_open = None;
     }
 
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
-        if !self.show_thinking {
-            for msg in &mut msgs {
-                if matches!(msg.role, DisplayRole::Thinking) {
-                    msg.thinking_collapsed = true;
-                }
-            }
+        for msg in &mut msgs {
+            msg.reasoning_open = None;
         }
         self.messages = msgs;
         self.cache.clear();
-        self.expanded_tools.clear();
+        self.auto_open = None;
+        self.disclosure.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
         self.retained_shell_outputs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
-        self.thinking_collapsed = !self.show_thinking;
+        self.streaming_reasoning_open = None;
     }
 
     pub fn bind_sources(&mut self, source_messages: &[DisplayMessage]) {
@@ -381,6 +478,7 @@ impl MessagesPanel {
             id,
             status: ToolStatus::InProgress,
             name: Arc::from(name),
+            effect: ToolEffect::default(),
         }));
         let mut msg = DisplayMessage::new(role, String::new());
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
@@ -391,6 +489,7 @@ impl MessagesPanel {
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
+                t.effect = event.effect;
             }
             msg.text = event.summary;
             msg.tool_input = event.input.map(Arc::new);
@@ -407,6 +506,7 @@ impl MessagesPanel {
                 id: event.id,
                 status: ToolStatus::InProgress,
                 name: Arc::clone(&event.tool),
+                effect: event.effect,
             })),
             event.summary,
         );
@@ -612,23 +712,26 @@ impl MessagesPanel {
         }
         let inst_id = segment::instruction_id(parent_id);
         let exp = self
-            .tool_expansion(&inst_id, false)
+            .tool_expansion(&inst_id, self.card_opens_by_default(parent_id))
             .map(|flags| flags.output);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
         let tl = build_instructions_lines(blocks, width, exp);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
+            let compact = self.compact();
             let seg = self.cache.get_mut(seg_idx).unwrap();
             seg.search_text = tl.search_text.clone();
-            seg.update_with_reuse(tl, &self.hl_worker, self.compact);
+            seg.update_with_reuse(tl, &self.hl_worker, compact);
         } else {
+            let compact = self.compact();
             let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction);
             seg.search_text = tl.search_text.clone();
-            seg.apply_highlight(tl, &self.hl_worker, self.compact);
+            seg.apply_highlight(tl, &self.hl_worker, compact);
             self.cache.insert(parent_idx + 1, seg);
         }
-        self.cache.update_margins(self.viewport_width, self.compact);
+        self.cache
+            .update_margins(self.viewport_width, self.compact());
     }
 
     fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
@@ -642,7 +745,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
-        self.thinking_collapsed = !self.show_thinking;
+        self.streaming_reasoning_open = None;
         self.thinking_started = None;
         self.cancel_in_progress();
     }
@@ -729,17 +832,21 @@ impl MessagesPanel {
             return false;
         };
         let exp = self
-            .expanded_tools
+            .disclosure
             .get(tool_id)
             .copied()
+            .flatten()
             .unwrap_or_default();
         if !seg.truncation.any() && !exp.any() {
             return false;
         }
         let tool_id = tool_id.to_owned();
-        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
-        entry.script = !entry.script;
-        entry.output = !entry.output;
+        let flags = SectionFlags {
+            script: !exp.script,
+            output: !exp.output,
+            ..exp
+        };
+        self.disclosure.insert(tool_id.clone(), Some(flags));
         self.rebuild_expanded_tool(&tool_id);
         true
     }
@@ -993,14 +1100,15 @@ impl MessagesPanel {
                 .messages
                 .get(msg_index)
                 .is_some_and(|message| {
-                    matches!(message.role, DisplayRole::Thinking) && message.thinking_collapsed
+                    matches!(message.role, DisplayRole::Thinking)
+                        && !self.reasoning_open(message, msg_index)
                 })
                 .then_some(HoverTarget::CachedThinking(msg_index));
         };
 
         // A compact snapshot tool has not reached Lua yet, so the first click
         // is served locally and the row has to advertise itself.
-        let native_toggle = (!self.has_snapshot(tool_id) || self.compact_collapsed(tool_id))
+        let native_toggle = (!self.has_snapshot(tool_id) || self.card_closed(tool_id))
             && self.tool_click_acts(tool_id, segment.truncation);
         let shell_toggle = segment
             .shell_toggle_line
@@ -1198,7 +1306,7 @@ impl MessagesPanel {
             _ => self.diagram_pans.insert(key, next),
         };
         self.reflow_text_segment(seg_idx, width);
-        self.cache.update_margins(width, self.compact);
+        self.cache.update_margins(width, self.compact());
         true
     }
 
@@ -1249,13 +1357,13 @@ impl MessagesPanel {
         // what an expanded row shows unopened. Lua-rendered tools included:
         // their snapshot is already here, so the runtime stays out of it
         // until the reader asks for more.
-        if self.compact_collapsed(tool_id) {
+        if self.card_closed(tool_id) {
             if !seg.truncation.any() {
                 return false;
             }
             let tool_id = tool_id.to_owned();
-            self.expanded_tools
-                .insert(tool_id.clone(), SectionFlags::default());
+            self.disclosure
+                .insert(tool_id.clone(), Some(SectionFlags::default()));
             self.rebuild_expanded_tool(&tool_id);
             return true;
         }
@@ -1297,7 +1405,7 @@ impl MessagesPanel {
         }
 
         let exp = self
-            .tool_expansion(tool_id, self.is_container(tool_id))
+            .tool_expansion(tool_id, self.card_opens_by_default(tool_id))
             .unwrap_or_default();
         let shell_toggle = seg
             .shell_toggle_line
@@ -1314,30 +1422,33 @@ impl MessagesPanel {
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
         if nothing_to_open {
-            // An expanded row is already at rest, but a compact one still has
-            // its header to fall back to.
-            return self.compact && self.collapse_to_compact_header(&tool_id);
+            // An open card is already at rest, unless the mode left it a
+            // header to fall back to.
+            return self.close_card(&tool_id);
         }
 
-        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
-        if truncation.output || entry.output {
-            entry.output = !entry.output;
-        } else if truncation.script || entry.script {
-            entry.script = !entry.script;
+        let mut flags = exp;
+        if truncation.output || flags.output {
+            flags.output = !flags.output;
+        } else if truncation.script || flags.script {
+            flags.script = !flags.script;
         }
-        if self.compact && !entry.any() {
-            return self.collapse_to_compact_header(&tool_id);
+        if !flags.any() && self.card_can_close(&tool_id) {
+            return self.close_card(&tool_id);
         }
+        self.disclosure.insert(tool_id.clone(), Some(flags));
         self.rebuild_expanded_tool(&tool_id);
         true
     }
 
-    /// Closing the last open section drops the override entirely, which is
-    /// what returns a compact row to the single line it started as.
-    fn collapse_to_compact_header(&mut self, tool_id: &str) -> bool {
-        if self.expanded_tools.remove(tool_id).is_none() {
+    /// Takes a card back to the single line it started as. The close is
+    /// recorded rather than forgotten: auto would open this card again while
+    /// it is the last one, and the reader just said not to.
+    fn close_card(&mut self, tool_id: &str) -> bool {
+        if !self.card_can_close(tool_id) || self.card_closed(tool_id) {
             return false;
         }
+        self.disclosure.insert(tool_id.to_owned(), None);
         self.rebuild_expanded_tool(tool_id);
         true
     }
@@ -1397,8 +1508,27 @@ impl MessagesPanel {
         ])
     }
 
+    /// The live block is always the last card, so auto keeps it open.
+    fn streaming_reasoning_open(&self) -> bool {
+        self.streaming_reasoning_open
+            .unwrap_or(self.show_thinking && self.view != ViewMode::Compact)
+    }
+
+    /// What the reader asked of a settled block, or what the mode says when
+    /// they have not asked.
+    fn reasoning_open(&self, msg: &DisplayMessage, msg_index: usize) -> bool {
+        msg.reasoning_open.unwrap_or(
+            self.show_thinking
+                && match self.view {
+                    ViewMode::Expanded => true,
+                    ViewMode::Compact => false,
+                    ViewMode::Auto => self.is_latest(msg_index),
+                },
+        )
+    }
+
     fn streaming_thinking_collapsed(&self) -> bool {
-        self.thinking_collapsed && !self.streaming_thinking.is_empty()
+        !self.streaming_reasoning_open() && !self.streaming_thinking.is_empty()
     }
 
     /// Streaming content lives outside the cache, so it misses the margin pass
@@ -1406,12 +1536,12 @@ impl MessagesPanel {
     /// a list row like the calls above it, and a gap that vanished the instant
     /// the block settled would be the only thing announcing the difference.
     fn streaming_thinking_stacks_flush(&self) -> bool {
-        self.compact
+        self.compact()
             && self.streaming_thinking_collapsed()
             && self
                 .cache
                 .last_kind()
-                .is_some_and(|kind| segment::dense_kind(kind, self.compact))
+                .is_some_and(|kind| segment::dense_kind(kind, self.compact()))
     }
 
     /// Whether a blank line separates this streaming block from what precedes
@@ -1470,6 +1600,7 @@ impl MessagesPanel {
                 assistant.prefix_style,
             );
         }
+        self.follow_latest();
         self.rebuild_line_cache();
         if let Some(seg_idx) = self.pending_scroll_segment.take() {
             self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
@@ -1536,10 +1667,10 @@ impl MessagesPanel {
         // The reflow window is picked from `scroll_top` and the bottom pin,
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
-        self.cache.update_margins(width, self.compact);
+        self.cache.update_margins(width, self.compact());
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
-        self.cache.update_margins(width, self.compact);
+        self.cache.update_margins(width, self.compact());
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
         if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
             self.clear_hover();
@@ -1903,7 +2034,7 @@ impl MessagesPanel {
     }
 
     fn rctx(&self) -> RenderCtx<'_> {
-        let kind = if self.compact {
+        let kind = if self.compact() {
             SegmentKind::ToolInline
         } else {
             SegmentKind::ToolBlock
@@ -1913,7 +2044,7 @@ impl MessagesPanel {
             width: SegmentChrome::for_kind(kind, self.viewport_width, 0)
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
-            compact: self.compact,
+            compact: self.compact(),
         }
     }
 
@@ -1969,9 +2100,8 @@ impl MessagesPanel {
         }
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
-        msg.thinking_collapsed = self.thinking_collapsed;
+        msg.reasoning_open = self.streaming_reasoning_open.take();
         msg.thinking_duration = started.map(|started| started.elapsed());
-        self.thinking_collapsed = !self.show_thinking;
         self.messages.push(msg);
     }
 
@@ -2013,7 +2143,7 @@ impl MessagesPanel {
         if !self.is_collapsed_streaming_thinking_row(doc_row, width) {
             return false;
         }
-        self.thinking_collapsed = false;
+        self.streaming_reasoning_open = Some(true);
         true
     }
 
@@ -2032,17 +2162,18 @@ impl MessagesPanel {
     }
 
     fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking && !self.compact {
+        if self.show_thinking && self.view == ViewMode::Expanded {
             return false;
         }
         let Some(idx) = msg_idx else { return false };
-        let Some(msg) = self.messages.get_mut(idx) else {
+        let Some(msg) = self.messages.get(idx) else {
             return false;
         };
         if !matches!(msg.role, DisplayRole::Thinking) {
             return false;
         }
-        msg.thinking_collapsed = !msg.thinking_collapsed;
+        let open = self.reasoning_open(msg, idx);
+        self.messages[idx].reasoning_open = Some(!open);
         self.rebuild_thinking_segment(idx, width);
         true
     }
@@ -2051,27 +2182,28 @@ impl MessagesPanel {
         let Some(message) = self.messages.get(msg_idx).cloned() else {
             return;
         };
-        let (lines, links, provenance, diagrams, search_text) = if message.thinking_collapsed {
-            let lines =
-                self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
-            let links = LinkMap::none_for(&lines);
-            (
-                lines,
-                links,
-                None,
-                Vec::new(),
-                format!("thinking> {}", message.text),
-            )
-        } else {
-            let built = build_message_lines(&message, width, self.pans_for(msg_idx));
-            (
-                built.lines,
-                built.links,
-                built.provenance,
-                built.diagrams,
-                built.search_text,
-            )
-        };
+        let (lines, links, provenance, diagrams, search_text) =
+            if !self.reasoning_open(&message, msg_idx) {
+                let lines =
+                    self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
+                let links = LinkMap::none_for(&lines);
+                (
+                    lines,
+                    links,
+                    None,
+                    Vec::new(),
+                    format!("thinking> {}", message.text),
+                )
+            } else {
+                let built = build_message_lines(&message, width, self.pans_for(msg_idx));
+                (
+                    built.lines,
+                    built.links,
+                    built.provenance,
+                    built.diagrams,
+                    built.search_text,
+                )
+            };
         let seg_idx = self
             .cache
             .segments()
@@ -2141,22 +2273,16 @@ impl MessagesPanel {
     /// Leaves hover alone, so the clock-driven refresh cannot cancel the
     /// reader's pointer every frame.
     fn rebuild_tool_lines(&mut self, tool_id: &str) {
-        let Some(msg) = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-        else {
+        let Some((msg_idx, t)) = self.tool_card(tool_id) else {
             return;
         };
-        let DisplayRole::Tool(t) = &msg.role else {
-            unreachable!()
-        };
-        let status = t.status;
+        let (status, effect) = (t.status, t.effect);
+        let msg = &self.messages[msg_idx];
         let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
 
-        let exp = self.tool_expansion(tool_id, is_container_tool(&t.name));
+        let exp = self.tool_expansion(tool_id, self.opens_by_default(effect, msg_idx));
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
@@ -2165,14 +2291,16 @@ impl MessagesPanel {
             .as_deref()
             .and_then(|o| o.owned_instructions());
 
+        let compact = self.compact();
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
-        seg.update_with_reuse(tl, &self.hl_worker, self.compact);
+        seg.update_with_reuse(tl, &self.hl_worker, compact);
 
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
-        self.cache.update_margins(self.viewport_width, self.compact);
+        self.cache
+            .update_margins(self.viewport_width, self.compact());
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -2183,14 +2311,15 @@ impl MessagesPanel {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.tool_expansion(&t.id, is_container_tool(&t.name));
+                let exp = self.tool_expansion(&t.id, self.opens_by_default(t.effect, i));
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
+                let compact = self.compact();
                 let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock);
                 seg.search_text = search_text;
-                seg.apply_highlight(tl, &self.hl_worker, self.compact);
+                seg.apply_highlight(tl, &self.hl_worker, compact);
                 self.cache.push(seg);
 
                 let blocks = msg
@@ -2202,7 +2331,7 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks, last_idx);
                 }
             } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
+                if matches!(&msg.role, DisplayRole::Thinking) && !self.reasoning_open(msg, i) {
                     let (text, duration) = (msg.text.clone(), msg.thinking_duration);
                     let lines = self.build_cached_thinking_indicator(&text, duration);
                     let search_text = format!("thinking> {text}");
@@ -2221,7 +2350,8 @@ impl MessagesPanel {
                 self.cache.push(segment);
             }
         }
-        self.cache.update_margins(self.viewport_width, self.compact);
+        self.cache
+            .update_margins(self.viewport_width, self.compact());
         self.cache.mark_built(self.messages.len());
     }
 
@@ -2333,10 +2463,9 @@ impl MessagesPanel {
             return;
         };
 
-        let collapsed = self
-            .messages
-            .get(msg_idx)
-            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
+        let collapsed = self.messages.get(msg_idx).is_some_and(|m| {
+            matches!(m.role, DisplayRole::Thinking) && !self.reasoning_open(m, msg_idx)
+        });
         if collapsed {
             // Geometry is width-independent, but `width_changed` also fires on
             // theme changes; rebuild so spans pick up the new palette.

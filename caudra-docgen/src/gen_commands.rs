@@ -146,7 +146,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/view`**: switch the transcript between compact and expanded. Compact draws each tool call as one row that opens on click. `task` and `batch` keep their child rows in both densities, and those children open on click as well. The choice is remembered across restarts."
+        "- **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. A row opens on click, and a card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout. The choice is remembered across restarts."
     )
     .unwrap();
     writeln!(
