@@ -28,13 +28,19 @@ const FAN_OUT: char = '&';
 const LABEL_PIPE: char = '|';
 const QUOTE: char = '"';
 
-/// Longer openers first so `([` is not mistaken for `(`.
-const SHAPES: [(&str, &str, Shape); 9] = [
+/// Longer openers first so `([` is not mistaken for `(`. The leaning pairs
+/// share an opener and differ only in how they close, so they are tried in
+/// turn and a missing closer falls through to the next candidate.
+const SHAPES: [(&str, &str, Shape); 13] = [
     ("([", "])", Shape::Stadium),
     ("[[", "]]", Shape::Subroutine),
     ("[(", ")]", Shape::Cylinder),
     ("((", "))", Shape::Circle),
     ("{{", "}}", Shape::Hexagon),
+    ("[/", "/]", Shape::LeanRight),
+    ("[/", "\\]", Shape::TrapezoidDown),
+    ("[\\", "\\]", Shape::LeanLeft),
+    ("[\\", "/]", Shape::TrapezoidUp),
     ("[", "]", Shape::Rect),
     ("(", ")", Shape::Round),
     ("{", "}", Shape::Rhombus),
@@ -97,6 +103,62 @@ pub enum Shape {
     Rhombus,
     Hexagon,
     Asymmetric,
+    /// `[/text/]`, mermaid's data input/output.
+    LeanRight,
+    /// `[\text\]`, the same shape mirrored.
+    LeanLeft,
+    /// `[/text\]`, wider along its bottom edge.
+    TrapezoidDown,
+    /// `[\text/]`, wider along its top edge.
+    TrapezoidUp,
+}
+
+impl Shape {
+    /// Columns the left and right borders travel per row going down, or
+    /// `None` when the sides are upright.
+    pub fn lean(self) -> Option<(isize, isize)> {
+        match self {
+            Self::LeanRight => Some((-1, -1)),
+            Self::LeanLeft => Some((1, 1)),
+            Self::TrapezoidDown => Some((-1, 1)),
+            Self::TrapezoidUp => Some((1, -1)),
+            _ => None,
+        }
+    }
+
+    /// Columns a slant adds to a box `height` rows tall. Sides that travel the
+    /// same way shift the box; sides that diverge widen it twice over.
+    pub fn shear(self, height: usize) -> usize {
+        self.lean().map_or(0, |(left, right)| {
+            height.saturating_sub(1) * if left == right { 1 } else { 2 }
+        })
+    }
+
+    /// Columns the two borders occupy on `row`, relative to the box's left
+    /// edge. The offsets are anchored so the widest row spans the whole box.
+    pub fn sides(self, width: usize, height: usize, row: usize) -> (usize, usize) {
+        let far = width.saturating_sub(1) as isize;
+        let Some((left_step, right_step)) = self.lean() else {
+            return (0, far.max(0) as usize);
+        };
+        let last = height.saturating_sub(1) as isize;
+        let row = (row as isize).min(last);
+        let left = if left_step < 0 { last } else { 0 } + left_step * row;
+        let right = if right_step > 0 { far - last } else { far } + right_step * row;
+        (left.clamp(0, far) as usize, right.clamp(0, far) as usize)
+    }
+
+    /// Columns covered by both the top and the bottom rule. An edge meeting a
+    /// horizontal face has to land here, or it arrives beside the slant
+    /// instead of on it.
+    pub fn rule_window(self, width: usize, height: usize) -> (usize, usize) {
+        let top = self.sides(width, height, 0);
+        let bottom = self.sides(width, height, height.saturating_sub(1));
+        (
+            top.0.max(bottom.0),
+            top.1.min(bottom.1).max(top.0.max(bottom.0)),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,7 +438,11 @@ fn read_node(input: &str) -> Option<NodeRef> {
             continue;
         }
         let body = &rest[open.len()..];
-        let end = find_close(body, close)?;
+        // Two shapes can share an opener, so an absent closer means the wrong
+        // candidate rather than a malformed node.
+        let Some(end) = find_close(body, close) else {
+            continue;
+        };
         return Some(NodeRef {
             id,
             label: Some(split_label(&body[..end])),
@@ -580,9 +646,80 @@ mod tests {
     #[test_case("A{Rhombus}", Shape::Rhombus        ; "rhombus")]
     #[test_case("A{{Hex}}", Shape::Hexagon          ; "hexagon")]
     #[test_case("A>Flag]", Shape::Asymmetric        ; "asymmetric")]
+    #[test_case("A[/Lean/]", Shape::LeanRight       ; "lean_right")]
+    #[test_case(r"A[\Lean\]", Shape::LeanLeft       ; "lean_left")]
+    #[test_case(r"A[/Trap\]", Shape::TrapezoidDown  ; "trapezoid_down")]
+    #[test_case(r"A[\Trap/]", Shape::TrapezoidUp    ; "trapezoid_up")]
     fn node_shapes(decl: &str, expected: Shape) {
         let g = graph(&format!("flowchart TD\n  {decl} --> B"));
         assert_eq!(g.nodes[0].shape, expected);
+    }
+
+    #[test_case(Shape::Rect, 0             ; "upright_pays_nothing")]
+    #[test_case(Shape::LeanRight, 4        ; "parallelogram_shifts_once")]
+    #[test_case(Shape::LeanLeft, 4         ; "mirrored_shifts_once")]
+    #[test_case(Shape::TrapezoidDown, 8    ; "trapezoid_widens_twice")]
+    #[test_case(Shape::TrapezoidUp, 8      ; "inverted_trapezoid_widens_twice")]
+    fn a_slant_costs_a_column_per_row(shape: Shape, expected: usize) {
+        const HEIGHT: usize = 5;
+        assert_eq!(shape.shear(HEIGHT), expected);
+    }
+
+    #[test_case(Shape::LeanRight     ; "lean_right")]
+    #[test_case(Shape::LeanLeft      ; "lean_left")]
+    #[test_case(Shape::TrapezoidDown ; "trapezoid_down")]
+    #[test_case(Shape::TrapezoidUp   ; "trapezoid_up")]
+    fn a_slant_fills_its_box_without_leaving_it(shape: Shape) {
+        const TEXT: usize = 10;
+        const HEIGHT: usize = 5;
+        const BORDERS: usize = 2;
+        let width = TEXT + BORDERS + shape.shear(HEIGHT);
+        let rows: Vec<(usize, usize)> = (0..HEIGHT)
+            .map(|row| shape.sides(width, HEIGHT, row))
+            .collect();
+
+        assert_eq!(rows.iter().map(|&(left, _)| left).min(), Some(0));
+        assert_eq!(
+            rows.iter().map(|&(_, right)| right).max(),
+            Some(width - 1),
+            "the widest row spans the box: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().map(|&(l, r)| r - l - 1).min(),
+            Some(TEXT),
+            "the narrowest row still holds the text: {rows:?}"
+        );
+        for pair in rows.windows(2) {
+            let ((left, right), (next_left, next_right)) = (pair[0], pair[1]);
+            assert_eq!(next_left.abs_diff(left), 1, "left steps once: {rows:?}");
+            assert_eq!(next_right.abs_diff(right), 1, "right steps once: {rows:?}");
+        }
+    }
+
+    #[test_case(Shape::LeanRight     ; "lean_right")]
+    #[test_case(Shape::TrapezoidDown ; "trapezoid_down")]
+    fn a_horizontal_face_only_offers_what_both_rules_cover(shape: Shape) {
+        const HEIGHT: usize = 4;
+        let width = 12 + shape.shear(HEIGHT);
+        let (low, high) = shape.rule_window(width, HEIGHT);
+        for row in [0, HEIGHT - 1] {
+            let (left, right) = shape.sides(width, HEIGHT, row);
+            assert!(
+                left <= low && high <= right,
+                "row {row} spans {left}..={right}, outside the window {low}..={high}"
+            );
+        }
+    }
+
+    /// The leaning forms used to fall through to `[`, which kept the slashes
+    /// and the quotes as part of the text.
+    #[test_case("A[/Data/]", "Data"                          ; "bare")]
+    #[test_case("A[/\"Quoted, text\"/]", "Quoted, text"      ; "quoted")]
+    #[test_case(r"A[\Data\]", "Data"                         ; "mirrored")]
+    #[test_case("A[/usr/bin]", "/usr/bin"                    ; "a_path_is_not_a_shape")]
+    fn a_leaning_node_keeps_its_delimiters_out_of_the_label(decl: &str, expected: &str) {
+        let g = graph(&format!("flowchart TD\n  {decl} --> B"));
+        assert_eq!(g.nodes[0].label, vec![expected.to_owned()]);
     }
 
     #[test_case("A --> B", EdgeStyle::Solid, true   ; "solid_arrow")]

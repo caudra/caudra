@@ -218,8 +218,9 @@ impl<'a> Builder<'a> {
                     .map(|line| line.width())
                     .max()
                     .unwrap_or(0);
-                let width = text + 2 * shape_padding(node.shape) + BORDER;
                 let height = node.label.len() + BORDER;
+                let width =
+                    text + 2 * shape_padding(node.shape) + BORDER + node.shape.shear(height);
                 Vertex {
                     kind: Kind::Real(idx),
                     rank: ranks[idx],
@@ -656,6 +657,23 @@ impl<'a> Builder<'a> {
     /// grouped by the side of the node they use, not by edge direction, so a
     /// back edge arriving at a node cannot land on the same cell as an edge
     /// leaving it.
+    /// Across-interval of a vertex that ports may sit on, relative to its own
+    /// across origin. A slant runs along the across axis only when the ranks
+    /// stack vertically, and there it narrows both horizontal faces.
+    fn port_window(&self, vertex: usize) -> (usize, usize) {
+        let vertex = &self.vertices[vertex];
+        let whole = (0, vertex.across_size.saturating_sub(1));
+        let Kind::Real(node) = vertex.kind else {
+            return whole;
+        };
+        match self.vertical {
+            true => self.graph.nodes[node]
+                .shape
+                .rule_window(vertex.across_size, vertex.along_size),
+            false => whole,
+        }
+    }
+
     fn assign_ports(&self) -> Vec<(usize, usize)> {
         let mut ports = vec![(0usize, 0usize); self.hops.len()];
         let mut sides: Vec<[Vec<(usize, bool)>; 2]> =
@@ -671,8 +689,9 @@ impl<'a> Builder<'a> {
         }
 
         for (vertex, attached) in sides.into_iter().enumerate() {
-            let span = self.vertices[vertex].across_size;
-            let base = self.vertices[vertex].across;
+            let (low, high) = self.port_window(vertex);
+            let span = high - low + 1;
+            let base = self.vertices[vertex].across + low;
             for mut side in attached {
                 if side.is_empty() {
                     continue;
@@ -865,6 +884,7 @@ impl<'a> Builder<'a> {
         nodes.sort_by_key(|placed| placed.node);
 
         let mut edges = self.assemble(routes, &mapper);
+        seat_ends(&mut edges, &nodes, self.graph);
         place_labels(&mut edges, &nodes, self.vertical);
         let clusters = self.enclose(bands, &mapper);
         let reach = |axis: fn(usize, usize) -> usize| {
@@ -995,6 +1015,58 @@ impl Occupied {
     fn hits(&self, x: usize, y: usize, width: usize) -> bool {
         x < self.x + self.width && self.x < x + width && y < self.y + self.height && self.y <= y
     }
+}
+
+/// Routing meets a node at its bounding box, which is where the border is for
+/// every upright shape. A slant stands at a different column on every row, so
+/// an end that arrives sideways has to walk in until it reaches one.
+fn seat_ends(edges: &mut [PlacedEdge], nodes: &[PlacedNode], graph: &Graph) {
+    for edge in edges {
+        // The head sits one cell short of the border it points at, so the node
+        // it belongs to starts one cell further on than the polyline does.
+        let clearance = usize::from(edge.arrow.is_some());
+        for (end, inset) in [(0, 0), (edge.points.len().saturating_sub(1), clearance)] {
+            let Some(seated) = seat_end(&edge.points, end, inset, nodes, graph) else {
+                continue;
+            };
+            edge.points[end] = seated;
+            if end > 0 && edge.arrow.is_some() {
+                edge.arrow = edge.arrow.map(|(_, _, arrow)| (seated.0, seated.1, arrow));
+            }
+        }
+    }
+}
+
+/// Where `end` of a polyline belongs once the slant of the node it meets is
+/// taken into account, or `None` when nothing needs to move.
+fn seat_end(
+    points: &[(usize, usize)],
+    end: usize,
+    inset: usize,
+    nodes: &[PlacedNode],
+    graph: &Graph,
+) -> Option<(usize, usize)> {
+    let (x, y) = *points.get(end)?;
+    let neighbour = points.get(if end == 0 { 1 } else { end - 1 })?;
+    if neighbour.1 != y || neighbour.0 == x {
+        return None;
+    }
+    // Both ends measure travel toward the node: the start sits on the one it
+    // leaves, the finish points at the one it meets.
+    let step: isize = if neighbour.0 > x { -1 } else { 1 };
+    let cell = x.checked_add_signed(step * inset as isize)?;
+    let placed = nodes.iter().find(|placed| {
+        (placed.x..placed.x + placed.width).contains(&cell)
+            && (placed.y..placed.y + placed.height).contains(&y)
+    })?;
+    let shape = graph.nodes[placed.node].shape;
+    shape.lean()?;
+    let (left, right) = shape.sides(placed.width, placed.height, y - placed.y);
+    let border = placed.x + if step > 0 { left } else { right };
+    // A line merges into an upright border and takes a corner glyph there. A
+    // slant has no junction to offer, so the line halts just short of it.
+    let clear = inset.max(1) as isize;
+    Some((border.checked_add_signed(-step * clear)?, y))
 }
 
 /// Edge labels are the only text that can land on top of other text, so they
@@ -1248,6 +1320,24 @@ mod tests {
         (node.x, node.y, node.width, node.height)
     }
 
+    /// Whether a cell lies on the shape as drawn, allowing `reach` cells of
+    /// clearance beside a side. Upright borders carry a junction glyph so a
+    /// line lands on them, while a slant has none and is met head on.
+    fn near_outline(shape: Shape, node: &PlacedNode, x: usize, y: usize, reach: isize) -> bool {
+        if !(node.y..node.y + node.height).contains(&y) {
+            return false;
+        }
+        let row = y - node.y;
+        let (left, right) = shape.sides(node.width, node.height, row);
+        let (left, right) = (node.x + left, node.x + right);
+        let sideways = [-reach, reach]
+            .into_iter()
+            .zip([left, right])
+            .any(|(off, border)| Some(x) == border.checked_add_signed(off));
+        let endwise = (row == 0 || row + 1 == node.height) && (left..=right).contains(&x);
+        sideways || endwise
+    }
+
     fn cluster_rect(cluster: &PlacedCluster) -> (usize, usize, usize, usize) {
         (cluster.x, cluster.y, cluster.width, cluster.height)
     }
@@ -1344,9 +1434,20 @@ mod tests {
         }
     }
 
+    /// Both leaning families, entered and left on more than one row, so a
+    /// border that moves per row cannot be mistaken for the bounding box.
+    const LEANING: &str = "flowchart LR\n\
+        A[Start] --> B[/\"Read rows<br/>and headers\"/]\n\
+        C[Also] --> B\n\
+        B --> D[\\Mirror\\]\n\
+        B --> E[/Widen\\]\n\
+        D --> F[End]\n\
+        E --> F";
+
     #[test_case(PIPELINE ; "pipeline")]
     #[test_case(DIAMOND  ; "diamond")]
     #[test_case(CYCLE    ; "cycle")]
+    #[test_case(LEANING  ; "leaning")]
     fn every_edge_starts_on_the_border_of_its_own_source(source: &str) {
         let graph = parse::parse(source).expect("fixture should parse");
         let placed = place(source);
@@ -1357,18 +1458,13 @@ mod tests {
                 .find(|node| node.node == edge.from)
                 .expect("source is placed");
             let &(x, y) = wire.points.first().expect("a route has points");
-            let on_border = x >= node.x
-                && x < node.x + node.width
-                && y >= node.y
-                && y < node.y + node.height
-                && (x == node.x
-                    || x == node.x + node.width - 1
-                    || y == node.y
-                    || y == node.y + node.height - 1);
+            let shape = graph.nodes[edge.from].shape;
+            let reach = isize::from(shape.lean().is_some());
             assert!(
-                on_border,
-                "{:?} leaves from ({x},{y}), outside {:?}",
-                graph.nodes[edge.from].label, node
+                near_outline(shape, node, x, y, reach),
+                "{:?} leaves from ({x},{y}), off the outline of {:?}",
+                graph.nodes[edge.from].label,
+                node
             );
         }
     }
@@ -1586,5 +1682,50 @@ mod tests {
                 );
             }
         }
+    }
+    #[test_case(PIPELINE ; "pipeline")]
+    #[test_case(LEANING  ; "leaning")]
+    fn every_arrow_points_at_the_outline_it_terminates_on(source: &str) {
+        let graph = parse(source).expect("fixture should parse");
+        let placed = place(source);
+        for (edge, wire) in graph.edges.iter().zip(&placed.edges) {
+            let Some((x, y, arrow)) = wire.arrow else {
+                continue;
+            };
+            let node = placed
+                .nodes
+                .iter()
+                .find(|node| node.node == edge.to)
+                .expect("target is placed");
+            let (dx, dy): (isize, isize) = match arrow {
+                Arrow::Right => (1, 0),
+                Arrow::Left => (-1, 0),
+                Arrow::Down => (0, 1),
+                Arrow::Up => (0, -1),
+            };
+            let pointed = (x.checked_add_signed(dx), y.checked_add_signed(dy));
+            let (Some(px), Some(py)) = pointed else {
+                panic!("head at ({x},{y}) points off the canvas");
+            };
+            assert!(
+                near_outline(graph.nodes[edge.to].shape, node, px, py, 0),
+                "{:?} takes an arrow at ({x},{y}) pointing at ({px},{py}), \
+                 which is not on the outline of {node:?}",
+                graph.nodes[edge.to].label,
+            );
+        }
+    }
+
+    #[test]
+    fn a_slant_widens_a_node_instead_of_crowding_its_text() {
+        let upright = place("flowchart LR\n  A[\"Read rows<br/>and headers\"] --> B[End]");
+        let leaning = place("flowchart LR\n  A[/\"Read rows<br/>and headers\"/] --> B[End]");
+        let (upright, leaning) = (&upright.nodes[0], &leaning.nodes[0]);
+        assert_eq!(upright.height, leaning.height, "a slant costs no rows");
+        assert_eq!(
+            leaning.width - upright.width,
+            leaning.height - 1,
+            "a parallelogram pays one column per row of shear"
+        );
     }
 }

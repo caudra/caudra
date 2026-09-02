@@ -109,15 +109,37 @@ Only `flowchart` and `graph` are drawn. Both keywords accept `TD`, `TB`,
 | `A -->\|text\| B`, `A -- text --> B` | edge labels |
 | `A --> B --> C`, `A & B --> C & D` | chains and fan-out |
 | `[]`, `()`, `([])`, `[[]]`, `[()]`, `(())`, `{}`, `{{}}`, `>]` | node shapes |
+| `[//]`, `[\\\\]`, `[/\\]`, `[\\/]` | parallelograms and trapezoids |
 | `subgraph Name ... end` | one level, drawn as a dashed frame |
 | `<br/>` in a label | line break |
 | `%%`, `style`, `classDef`, `class`, `click`, `linkStyle` | accepted and skipped |
 
-A terminal cell cannot carry nine distinct outlines, so shapes collapse onto
-four frames: square corners, round corners, a doubled edge for subroutines,
-and `‹ ›` caps for decisions. Decisions are capped rather than drawn as a
-diamond because a diagonal glyph meets the corner of its cell while `─` runs
-through the middle, so the two never join.
+A terminal cell cannot carry a distinct outline per shape, so upright shapes
+collapse onto square corners, round corners, and a doubled edge for
+subroutines. Decisions keep round corners and take `‹ ›` caps on their middle
+row, because a diagonal glyph meets the corner of its cell while `─` runs
+through the middle, so a drawn diamond never joins up.
+
+Leaning shapes are drawn in full, with a side that steps one column per row:
+
+````markdown
+```mermaid
+flowchart LR
+  A[/"Read rows<br/>and headers"/] --> B[/Widen\]
+```
+````
+
+```
+   ┌─────────────┐
+  /  Read rows  /     ┌───────┐
+ / and headers /╶───▶/  Widen  \
+└─────────────┘     └───────────┘
+```
+
+A slant widens its node by one column per row of text, and the two rules end
+up offset from each other by the same amount. Edges stop hard against a slant
+rather than landing on it, since there is no junction glyph that joins a
+diagonal to a line.
 
 Anything outside that table leaves the block as a highlighted code fence.
 Sequence diagrams, class diagrams, pie charts, nested subgraphs, and self
