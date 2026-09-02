@@ -5,7 +5,7 @@ use crate::theme;
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::{
     GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic,
-    IndexOutput, IndexSourceRange, InstructionBlock, ToolInput, ToolOutput,
+    IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile, ToolInput, ToolOutput,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -270,6 +270,102 @@ fn diff_change_spans(
         }
     }
     spans
+}
+
+/// The `-a` of a `@@ -a,b +c,d @@` header, which is where the hunk's numbering
+/// restarts. `None` for any line that is not a hunk header.
+fn hunk_start(line: &str) -> Option<usize> {
+    line.strip_prefix("@@ -")?
+        .split(&[',', ' '][..])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Widest line number the patch will print, so every gutter lines up.
+fn patch_nr_width(patch: &str) -> usize {
+    let mut width = 1;
+    let mut nr = 0;
+    for line in patch.lines() {
+        match hunk_start(line) {
+            Some(start) => nr = start,
+            None if !line.starts_with('+') => {
+                width = width.max(nr_width(nr));
+                nr += 1;
+            }
+            None => {}
+        }
+    }
+    width
+}
+
+/// A unified diff drawn the way an edit's diff is drawn: real line numbers
+/// down the left, removed and added lines in the diff colours. Syntax
+/// highlighting is left out on purpose, because a hunk carries only its own
+/// context and a highlighter fed that much guesses wrong more than it helps.
+fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let width = patch_nr_width(patch);
+    let mut lines = Vec::new();
+    let mut line_nr = 0;
+    let mut in_hunk = false;
+    for raw in patch.lines() {
+        if let Some(start) = hunk_start(raw) {
+            if in_hunk {
+                lines.push(gap_ellipsis());
+            }
+            (line_nr, in_hunk) = (start, true);
+            continue;
+        }
+        // File headers only precede the first hunk, so a later line starting
+        // the same way is content and keeps its numbering.
+        if !in_hunk {
+            continue;
+        }
+        let (prefix, style, text) = match raw.split_at_checked(1) {
+            Some(("-", rest)) => ("- ", theme.diff_old, rest),
+            Some(("+", rest)) => ("+ ", theme.diff_new, rest),
+            Some((" ", rest)) => ("  ", theme.code_block, rest),
+            _ => ("  ", theme.code_block, raw),
+        };
+        let numbered = prefix != "+ ";
+        let mut spans = vec![if numbered {
+            gutter(&format!("{line_nr:>width$}"))
+        } else {
+            gutter(&" ".repeat(width))
+        }];
+        spans.push(Span::styled(prefix, style.patch(theme.code_block)));
+        spans.push(Span::styled(
+            caudra_highlight::normalize_text(text),
+            style.patch(theme.code_block),
+        ));
+        lines.push(Line::from(spans));
+        if numbered {
+            line_nr += 1;
+        }
+    }
+    lines
+}
+
+/// Each file gets its own heading, because a patch that touches three files
+/// is otherwise three diffs with nothing saying where one ends.
+fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut lines = Vec::new();
+    for file in files {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(file.path.clone(), theme.tool_prefix),
+            Span::styled(
+                format!(" +{} -{}", file.additions, file.deletions),
+                theme.tool_annotation,
+            ),
+        ]));
+        lines.extend(render_unified_patch(&file.patch));
+    }
+    lines
 }
 
 fn render_grep_results(
@@ -622,6 +718,7 @@ pub fn render_tool_content(
             ),
             false,
         ),
+        Some(ToolOutput::Patch { files }) => (render_patch(files), false),
         Some(ToolOutput::GrepResult { entries }) => {
             render_grep_results(entries, limits.output, highlight)
         }
@@ -725,6 +822,78 @@ mod tests {
             READ_MAX_LINES,
         );
         assert_eq!(result.len(), expected);
+    }
+
+    const PATCH: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,4 @@\n context\n-gone\n+added\n+also added\n";
+    const NUMBERED_MSG: &str = "context and removed lines carry their real file line number";
+    const BLANK_GUTTER_MSG: &str = "an added line has no line number on the before side";
+    const HUNK_GAP_MSG: &str = "a jump between hunks must be marked, not silently closed";
+    const HEADING_MSG: &str = "each file names itself and its size";
+
+    fn patch_text(files: &[PatchedFile]) -> Vec<String> {
+        render_patch(files).iter().map(line_text).collect()
+    }
+
+    fn one_file(patch: &str) -> Vec<PatchedFile> {
+        vec![PatchedFile {
+            path: "src/lib.rs".into(),
+            patch: patch.into(),
+            additions: 2,
+            deletions: 1,
+        }]
+    }
+
+    /// Numbering restarts at each `@@` header, so a hunk deep in a file reads
+    /// against the file rather than against the patch.
+    #[test]
+    fn a_patch_numbers_its_lines_from_the_hunk_header() {
+        let rendered = patch_text(&one_file(PATCH));
+        assert!(
+            rendered.contains(&"8   context".to_owned()),
+            "{NUMBERED_MSG}: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"9 - gone".to_owned()),
+            "{NUMBERED_MSG}: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"  + added".to_owned()),
+            "{BLANK_GUTTER_MSG}: {rendered:?}"
+        );
+    }
+
+    /// The `---`/`+++` header names the file twice over, which the heading
+    /// already does, so it must not reach the transcript.
+    #[test]
+    fn a_patch_drops_the_file_header_lines() {
+        let rendered = patch_text(&one_file(PATCH)).join("\n");
+        assert!(
+            !rendered.contains("+++") && !rendered.contains("--- a/"),
+            "file headers belong to the wire format: {rendered}"
+        );
+        assert!(rendered.contains("src/lib.rs +2 -1"), "{HEADING_MSG}");
+    }
+
+    #[test]
+    fn separate_hunks_are_marked_as_a_jump() {
+        let two = "@@ -1,2 +1,2 @@\n first\n+one\n@@ -40,2 +40,2 @@\n second\n+two\n";
+        let rendered = patch_text(&one_file(two));
+        assert!(
+            rendered.iter().any(|l| l.starts_with("...")),
+            "{HUNK_GAP_MSG}: {rendered:?}"
+        );
+    }
+
+    /// A line whose own text starts like a file header arrives after a hunk
+    /// header, so it must be kept rather than mistaken for the preamble.
+    #[test]
+    fn content_that_looks_like_a_file_header_survives() {
+        let tricky = "--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n keep\n+++ added text\n";
+        let rendered = patch_text(&one_file(tricky)).join("\n");
+        assert!(
+            rendered.contains("++ added text"),
+            "content after a hunk header is content: {rendered}"
+        );
     }
 
     fn diff_fg(lines: &[Line<'static>], substr: &str) -> ratatui::style::Color {

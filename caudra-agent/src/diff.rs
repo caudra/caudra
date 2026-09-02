@@ -102,7 +102,7 @@ pub fn stat_of_patch(patch: &str) -> String {
     format_stat(added, removed)
 }
 
-fn format_stat(added: usize, removed: usize) -> String {
+pub fn format_stat(added: usize, removed: usize) -> String {
     format!("+{added} -{removed}")
 }
 

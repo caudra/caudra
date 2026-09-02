@@ -363,6 +363,12 @@ pub enum ToolOutput {
         byte_count: usize,
         lines: Vec<String>,
     },
+    /// A change expressed as unified diffs rather than before/after text.
+    /// `Diff` cannot carry it: a patch may touch several files, and the two
+    /// sides of each hunk are all that is known about any of them.
+    Patch {
+        files: Vec<PatchedFile>,
+    },
 
     GrepResult {
         entries: Vec<GrepFileEntry>,
@@ -384,6 +390,17 @@ pub enum ToolOutput {
         /// the pixels ride separately as a `ContentBlock::Image`.
         text: String,
     },
+}
+
+/// One file's share of a patch. `path` is the project-relative spelling, which
+/// is what a reader recognizes and what the diff header already carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchedFile {
+    pub path: String,
+    /// Unified diff for this file alone.
+    pub patch: String,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 /// Saturating arithmetic so callers can't overflow with any combination of inputs.
@@ -423,6 +440,10 @@ impl ToolOutput {
                 byte_count, lines, ..
             } => Some(written_size(*byte_count, lines)),
             Self::Diff { before, after, .. } => Some(crate::diff::stat(before, after)),
+            Self::Patch { files } => Some(crate::diff::format_stat(
+                files.iter().map(|f| f.additions).sum(),
+                files.iter().map(|f| f.deletions).sum(),
+            )),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
@@ -615,6 +636,11 @@ impl ToolOutput {
                 summary,
                 &crate::tools::relative_path(path),
             ),
+            Self::Patch { files } => files
+                .iter()
+                .map(|f| f.patch.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
             Self::TodoList(items) => {
                 if items.is_empty() {
                     return "No todos.".into();

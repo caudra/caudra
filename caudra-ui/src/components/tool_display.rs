@@ -253,6 +253,7 @@ impl HighlightRequest {
             ToolOutput::ReadCode { .. }
             | ToolOutput::WriteCode { .. }
             | ToolOutput::Diff { .. }
+            | ToolOutput::Patch { .. }
             | ToolOutput::GrepResult { .. }
             | ToolOutput::Index(_)
             | ToolOutput::Instructions { .. } => Some(o),

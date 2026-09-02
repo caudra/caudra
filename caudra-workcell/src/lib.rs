@@ -21,7 +21,7 @@ use caudra_agent::{
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, ShellFilterInfo as AgentShellFilterInfo,
-    ShellOutput as AgentShellOutput, SnapshotLine, TextOutput, ToolInput, ToolOutput,
+    PatchedFile, ShellOutput as AgentShellOutput, SnapshotLine, TextOutput, ToolInput, ToolOutput,
 };
 use futures_lite::future;
 use serde::{Serialize, de::DeserializeOwned};
@@ -36,8 +36,8 @@ use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
 use workcell::files::{
-    FileApplyPatchInput, FileApplyPatchOutput, FileEditInput, FileEditOutput, FileGlobInput,
-    FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
+    FileApplyPatchInput, FileApplyPatchOutput, FileDiff, FileEditInput, FileEditOutput,
+    FileGlobInput, FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
     FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput, IndexDirectoryEntryKind,
     IndexExecutionConfiguration, IndexInput, IndexLimits, IndexLineSemantic,
     IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
@@ -76,6 +76,11 @@ const BYTES_PER_MIB: usize = 1024 * 1024;
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
 const ALLOW_WRITE: bool = true;
+const PATCH_MARKER: &str = "*** ";
+const PATCH_VERBS: &[&str] = &["Add File:", "Update File:", "Delete File:", "Move to:"];
+const PATCH_WITHOUT_FILES: &str = "file patch";
+/// Room a header spends naming files before it reports a count instead.
+const PATCH_HEADER_BUDGET: usize = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -862,7 +867,7 @@ impl ToolInvocation for WorkcellInvocation {
             Input::FileGrep(input) => search_header(&input.pattern, input.path.as_deref()),
             Input::FileWrite(input) => input.file_path.clone(),
             Input::FileEdit(input) => input.file_path.clone(),
-            Input::FileApplyPatch(_) => "file patch".into(),
+            Input::FileApplyPatch(input) => patch_header(&input.patch_text),
             Input::Index(input) => input.path.clone(),
             Input::Websearch(input) => input.query.clone(),
             Input::Webfetch(input) => input.url.clone(),
@@ -872,12 +877,11 @@ impl ToolInvocation for WorkcellInvocation {
         }))
     }
 
+    /// A patch is deliberately absent: its result is the same diff, rendered
+    /// with real line numbers, so echoing the request above it says
+    /// everything twice and truncates both halves.
     fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
         match &self.input {
-            Input::FileApplyPatch(input) => Some(ToolInput::Code {
-                language: "diff".into(),
-                code: input.patch_text.clone(),
-            }),
             Input::Shell(input) => Some(ToolInput::Code {
                 language: "bash".into(),
                 code: input.command.clone(),
@@ -1638,8 +1642,12 @@ fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult
         }))
         .with_model_output(Some(exact))
     } else {
-        let patch = markdown_code("diff", &output.diff.patch);
-        text_result(&output, patch, true, exact)
+        // Nothing was written, so there is no content to show. The diff is
+        // the whole report, and it reads as one.
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
+            files: vec![patched_file(&output.diff)],
+        }))
+        .with_model_output(Some(exact))
     };
     result.with_written_paths(written.into_iter().collect())
 }
@@ -1653,8 +1661,12 @@ fn file_edit_result(
     let exact = model_text(&output);
     let written = output.applied.then(|| output.path.clone());
     let result = if replace_all {
-        let patch = markdown_code("diff", &output.diff.patch);
-        text_result(&output, patch, true, exact)
+        // Every match moved at once, so there is no single before/after pair
+        // to diff. The patch carries all of them with their real line numbers.
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
+            files: vec![patched_file(&output.diff)],
+        }))
+        .with_model_output(Some(exact))
     } else {
         ToolExecResult::from(Ok::<_, String>(ToolOutput::Diff {
             path: output.path.clone(),
@@ -1665,6 +1677,40 @@ fn file_edit_result(
         .with_model_output(Some(exact))
     };
     result.with_written_paths(written.into_iter().collect())
+}
+
+/// Names the files the patch declares, so the row reads like an edit's
+/// instead of the same three words on every patch. The count stands in once
+/// naming them all would cost more room than it earns.
+fn patch_header(patch_text: &str) -> String {
+    let paths: Vec<&str> = patch_text
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix(PATCH_MARKER)?;
+            PATCH_VERBS
+                .iter()
+                .find_map(|verb| rest.strip_prefix(verb))
+                .map(str::trim)
+        })
+        .filter(|path| !path.is_empty())
+        .collect();
+    match paths.len() {
+        0 => PATCH_WITHOUT_FILES.to_owned(),
+        1 => paths[0].to_owned(),
+        _ if paths.iter().map(|p| p.len() + 2).sum::<usize>() <= PATCH_HEADER_BUDGET => {
+            paths.join(", ")
+        }
+        n => format!("{n} files"),
+    }
+}
+
+fn patched_file(diff: &FileDiff) -> PatchedFile {
+    PatchedFile {
+        path: diff.relative_path.clone(),
+        patch: diff.patch.clone(),
+        additions: diff.additions,
+        deletions: diff.deletions,
+    }
 }
 
 fn applied_patch_paths(output: &FileApplyPatchOutput) -> Vec<String> {
@@ -1686,8 +1732,19 @@ fn applied_patch_paths(output: &FileApplyPatchOutput) -> Vec<String> {
 fn file_patch_result(output: FileApplyPatchOutput) -> ToolExecResult {
     let exact = model_text(&output);
     let written = applied_patch_paths(&output);
-    let diff = markdown_code("diff", &output.diff);
-    text_result(&output, diff, true, exact).with_written_paths(written)
+    let files = output
+        .files
+        .iter()
+        .map(|file| PatchedFile {
+            path: file.relative_path.clone(),
+            patch: file.patch.clone(),
+            additions: file.additions,
+            deletions: file.deletions,
+        })
+        .collect();
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch { files }))
+        .with_model_output(Some(exact))
+        .with_written_paths(written)
 }
 
 fn websearch_result(execution: WebExecution<WebsearchOutput>) -> ToolExecResult {
@@ -1867,6 +1924,7 @@ mod tests {
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const PREVIEW_FLAG_MSG: &str = "a dry-run argument must fail the call rather than write";
+    const PATCH_STRUCTURED_MSG: &str = "a patch reports the files it changed, not a diff blob";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
 
     fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
@@ -2541,14 +2599,23 @@ mod tests {
             kind: workcell::files::FilePatchKind::Patch,
             applied: false,
             diff: "--- a/src/lib.rs\n+++ b/src/lib.rs".into(),
-            files: Vec::new(),
+            files: vec![workcell::files::FileMutation {
+                file_path: "/project/src/lib.rs".into(),
+                relative_path: "src/lib.rs".into(),
+                mutation_type: workcell::files::FileMutationType::Update,
+                patch: "@@ -1,1 +1,1 @@\n-old\n+new".into(),
+                additions: 1,
+                deletions: 1,
+                truncated: false,
+                move_path: None,
+            }],
             truncated: false,
         })
         .output
         .expect("patch output");
         assert!(matches!(
             patch,
-            ToolOutput::Markdown(text) if text.text.starts_with("```diff\n")
+            ToolOutput::Patch { files } if files.len() == 1 && files[0].path == "src/lib.rs"
         ));
     }
 
@@ -2774,6 +2841,31 @@ mod tests {
         )
         .expect("structured model output");
         assert_eq!(model_output["applied"], true);
+
+        let ToolOutput::Patch { files } = result.output.expect("patch output") else {
+            panic!("{PATCH_STRUCTURED_MSG}");
+        };
+        assert_eq!(files.len(), 1, "{PATCH_STRUCTURED_MSG}");
+        assert_eq!(files[0].path, "created.txt", "{PATCH_STRUCTURED_MSG}");
+        assert_eq!((files[0].additions, files[0].deletions), (1, 0));
+    }
+
+    #[test_case(PATCH, "created.txt" ; "one_file_names_itself")]
+    #[test_case("*** Begin Patch\n*** Update File: a.rs\n*** Delete File: b.rs\n*** End Patch", "a.rs, b.rs" ; "a_few_files_are_all_named")]
+    #[test_case("*** Begin Patch\n*** End Patch", "file patch" ; "a_patch_naming_nothing_says_so")]
+    fn a_patch_header_names_the_files_it_touches(patch_text: &str, expected: &str) {
+        assert_eq!(patch_header(patch_text), expected);
+    }
+
+    /// Naming every file stops paying once the row cannot hold them, so the
+    /// count takes over rather than the header running off the screen.
+    #[test]
+    fn a_wide_patch_header_reports_a_count() {
+        let patch = (0..9)
+            .map(|i| format!("*** Update File: crates/some/deep/path/file_{i}.rs"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(patch_header(&patch), "9 files");
     }
 
     #[test_case(json!({"pattern": "needle"}), "needle" ; "a_rootless_search_shows_only_its_pattern")]
