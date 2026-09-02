@@ -18,6 +18,9 @@ Type `/` in the input box to open the command palette.
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
 | `/queue` | Inspect and edit queued prompts |
+| `/stash` | Park the current prompt draft for later |
+| `/stash-pop` | Restore the most recently stashed prompt |
+| `/stash-list` | Browse stashed prompts |
 | `/model` | Switch model |
 | `/system-prompt` | Switch system prompt profile |
 | `/review` | Review the last reply passage by passage |
@@ -45,6 +48,16 @@ Type `/` in the input box to open the command palette.
 ## Sessions
 
 Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
+
+## Stash
+
+A prompt you are not ready to send does not have to block the composer. `/stash` (`Alt+T`) moves the draft out of the way, `/stash-pop` (`Alt+R`) brings the newest one back, and `/stash-list` opens the full list.
+
+The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in `~/.local/state/caudra/prompt-stash.json` at mode 0600, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
+
+`/stash-pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
+
+Stashing is for drafts you do not want to send yet. To line up prompts Caudra should send on its own, use the queue instead. See [Queue and Steering](/docs/queue/).
 
 ## Tasks
 

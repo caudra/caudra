@@ -475,6 +475,9 @@ pub enum BuiltinAction {
     CopyMessage,
     Review,
     ViewToggle,
+    StashPush,
+    StashPop,
+    StashList,
 }
 
 pub enum UiAction {

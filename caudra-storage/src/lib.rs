@@ -11,6 +11,7 @@ pub mod model;
 pub mod paths;
 pub mod permission_state;
 pub mod plans;
+pub mod prompt_stash;
 pub mod sessions;
 pub mod theme;
 pub mod thinking;

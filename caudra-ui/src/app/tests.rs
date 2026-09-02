@@ -4,7 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{BUILTIN_COMMANDS, ParsedCommand};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
-use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::keybindings::{Bind, KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
@@ -29,6 +29,7 @@ use caudra_providers::{
     expand_message, project_messages,
 };
 use caudra_storage::id::CaudraId;
+use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     Session, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
@@ -9353,4 +9354,194 @@ fn a_sideways_wheel_over_prose_pans_nothing() {
         app.update(mouse_event(MouseEventKind::ScrollRight, 5, row));
     }
     assert_eq!(app.chats[0].panned_diagram_count(), 0);
+}
+
+/// `test_app` shares one state dir across the whole run, and the stash is a
+/// single global file, so these tests need their own.
+fn stash_app() -> (TempDir, App) {
+    let (tmp, _dir, _writer, mut app) = tempdir_app();
+    let (shared_queue, _rx) = shared_queue::queue();
+    app.queue.set_shared(shared_queue);
+    (tmp, app)
+}
+
+fn stash_entries(app: &App) -> Vec<StashEntry> {
+    PromptStash::open(&app.storage).unwrap().entries().to_vec()
+}
+
+#[test]
+fn stash_moves_the_draft_out_of_the_composer() {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("draft text".into()));
+    app.execute_command(cmd("/stash"), 0);
+
+    assert!(app.input_box.is_empty());
+    let entries = stash_entries(&app);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].text, "draft text");
+    assert_eq!(entries[0].cwd, app.state.session.cwd);
+}
+
+#[test]
+fn stashing_an_empty_composer_stores_nothing() {
+    let (_tmp, mut app) = stash_app();
+    app.execute_command(cmd("/stash"), 0);
+    assert!(stash_entries(&app).is_empty());
+}
+
+#[test]
+fn stash_pop_restores_paste_tokens_and_images() {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("a\nb\nc".into()));
+    with_image(&mut app);
+    app.execute_command(cmd("/stash"), 0);
+    app.execute_command(cmd("/stash-pop"), 0);
+
+    assert_eq!(app.input_box.buffer.display_text(), "[Pasted 3 lines] ");
+    assert_eq!(app.input_box.buffer.expanded_text(), "a\nb\nc ");
+    assert_eq!(app.input_box.pending_images().len(), 1);
+    assert!(stash_entries(&app).is_empty());
+}
+
+#[test]
+fn stash_pop_takes_the_newest_entry() {
+    let (_tmp, mut app) = stash_app();
+    for text in ["older", "newer"] {
+        app.update(Msg::Paste(text.into()));
+        app.execute_command(cmd("/stash"), 0);
+    }
+    app.execute_command(cmd("/stash-pop"), 0);
+
+    assert_eq!(app.input_box.buffer.value(), "newer");
+    assert_eq!(stash_entries(&app)[0].text, "older");
+}
+
+#[test]
+fn stash_pop_refuses_to_overwrite_a_draft() {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("stashed".into()));
+    app.execute_command(cmd("/stash"), 0);
+    app.update(Msg::Paste("in progress".into()));
+    app.execute_command(cmd("/stash-pop"), 0);
+
+    assert_eq!(app.input_box.buffer.value(), "in progress");
+    assert_eq!(stash_entries(&app).len(), 1);
+}
+
+#[test]
+fn stash_pop_on_an_empty_stash_leaves_the_composer_alone() {
+    let (_tmp, mut app) = stash_app();
+    app.execute_command(cmd("/stash-pop"), 0);
+    assert!(app.input_box.is_empty());
+    assert!(!app.stash_picker.is_open());
+}
+
+#[test]
+fn stash_list_restores_the_chosen_entry_and_drops_it() {
+    let (_tmp, mut app) = stash_app();
+    for text in ["older", "newer"] {
+        app.update(Msg::Paste(text.into()));
+        app.execute_command(cmd("/stash"), 0);
+    }
+    app.execute_command(cmd("/stash-list"), 0);
+    assert!(app.stash_picker.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.stash_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "older");
+    assert_eq!(stash_entries(&app)[0].text, "newer");
+}
+
+#[test]
+fn stash_list_deletes_an_entry_after_two_presses() {
+    let (_tmp, mut app) = stash_app();
+    for text in ["older", "newer"] {
+        app.update(Msg::Paste(text.into()));
+        app.execute_command(cmd("/stash"), 0);
+    }
+    app.execute_command(cmd("/stash-list"), 0);
+
+    let delete = KeyEvent::new(kb::DELETE.code, kb::DELETE.modifiers);
+    app.update(Msg::Key(delete));
+    assert_eq!(
+        stash_entries(&app).len(),
+        2,
+        "one press only arms the delete"
+    );
+
+    app.update(Msg::Key(delete));
+    let entries = stash_entries(&app);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].text, "older");
+    assert!(
+        app.stash_picker.is_open(),
+        "the picker stays up for more work"
+    );
+}
+
+#[test]
+fn deleting_the_last_stash_entry_closes_the_picker() {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("only".into()));
+    app.execute_command(cmd("/stash"), 0);
+    app.execute_command(cmd("/stash-list"), 0);
+
+    let delete = KeyEvent::new(kb::DELETE.code, kb::DELETE.modifiers);
+    app.update(Msg::Key(delete));
+    app.update(Msg::Key(delete));
+
+    assert!(!app.stash_picker.is_open());
+    assert!(stash_entries(&app).is_empty());
+}
+
+#[test]
+fn stash_list_on_an_empty_stash_opens_nothing() {
+    let (_tmp, mut app) = stash_app();
+    app.execute_command(cmd("/stash-list"), 0);
+    assert!(!app.stash_picker.is_open());
+}
+
+#[test_case(kb::STASH_PUSH, "" ; "push_clears_the_composer")]
+#[test_case(kb::STASH_POP, "draft" ; "pop_is_inert_while_the_composer_is_busy")]
+fn stash_keybindings_reach_the_builtin(bind: Bind, expected: &str) {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("draft".into()));
+    app.update(Msg::Key(KeyEvent::new(bind.code, bind.modifiers)));
+    assert_eq!(app.input_box.buffer.value(), expected);
+}
+
+#[test]
+fn stashing_is_refused_while_a_queued_prompt_is_being_edited() {
+    let (_tmp, mut app) = stash_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("queued"));
+    app.queue.set_focus_at(0);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.queue_editor_active());
+
+    app.execute_command(cmd("/stash"), 0);
+
+    assert_eq!(app.input_box.buffer.value(), "queued");
+    assert!(stash_entries(&app).is_empty());
+}
+
+#[test]
+fn restoring_is_refused_while_a_queued_prompt_is_being_edited() {
+    let (_tmp, mut app) = stash_app();
+    app.update(Msg::Paste("stashed".into()));
+    app.execute_command(cmd("/stash"), 0);
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("queued"));
+    app.queue.set_focus_at(0);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    app.execute_command(cmd("/stash-pop"), 0);
+
+    assert_eq!(app.input_box.buffer.value(), "queued");
+    assert_eq!(stash_entries(&app).len(), 1);
 }

@@ -4516,7 +4516,8 @@ and call this from it.
 Valid names: `"command_palette"`, `"file_picker"`, `"search"`,
 `"help"`, `"plan_toggle"`, `"plan_editor"`, `"edit_input"`,
 `"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
-`"copy_message"`, `"review"`, `"view_toggle"`.
+`"copy_message"`, `"review"`, `"view_toggle"`, `"stash_push"`,
+`"stash_pop"`, `"stash_list"`.
 
 For slash commands rather than keybound actions, see
 `caudra.api.run_command`.

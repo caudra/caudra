@@ -332,6 +332,7 @@ impl App {
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
         render_if_open!(self.permissions_picker);
+        render_if_open!(self.stash_picker);
 
         overlay_rect
     }

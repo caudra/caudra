@@ -98,6 +98,16 @@ pub(crate) struct InputState {
     images: Vec<ImageSource>,
 }
 
+impl InputState {
+    pub(crate) fn new(draft: InputDraft, images: Vec<ImageSource>) -> Self {
+        Self { draft, images }
+    }
+
+    pub(crate) fn into_parts(self) -> (InputDraft, Vec<ImageSource>) {
+        (self.draft, self.images)
+    }
+}
+
 impl Submission {
     pub fn empty() -> Self {
         Self {

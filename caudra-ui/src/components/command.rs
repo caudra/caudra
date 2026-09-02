@@ -85,6 +85,21 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/stash",
+        description: "Park the current prompt draft for later",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/stash-pop",
+        description: "Restore the most recently stashed prompt",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/stash-list",
+        description: "Browse stashed prompts",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,
@@ -452,7 +467,8 @@ impl CommandPalette {
     fn refresh_sources(&mut self) {
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();
-        if mcp_snap.generation == self.mcp_generation && lua_snap.generation == self.lua_generation {
+        if mcp_snap.generation == self.mcp_generation && lua_snap.generation == self.lua_generation
+        {
             return;
         }
         self.mcp_generation = mcp_snap.generation;

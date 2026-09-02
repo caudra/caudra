@@ -59,6 +59,16 @@ caudra --print '/goal tests pass and cargo clippy is clean'
 
 Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result."#;
 
+const STASH: &str = r#"## Stash
+
+A prompt you are not ready to send does not have to block the composer. `/stash` (`Alt+T`) moves the draft out of the way, `/stash-pop` (`Alt+R`) brings the newest one back, and `/stash-list` opens the full list.
+
+The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in `~/.local/state/caudra/prompt-stash.json` at mode 0600, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
+
+`/stash-pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
+
+Stashing is for drafts you do not want to send yet. To line up prompts Caudra should send on its own, use the queue instead. See [Queue and Steering](/docs/queue/)."#;
+
 const TASKS: &str = r#"## Tasks
 
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X`, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
@@ -106,6 +116,9 @@ pub fn generate() -> String {
         "Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete."
     )
     .unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(out, "{STASH}").unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "{TASKS}").unwrap();

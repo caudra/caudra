@@ -407,7 +407,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(picker.search_text(), "btw");
-        assert_eq!(picker.selected_item().map(|r| r.name.as_str()), Some(WITH_ARGS));
+        assert_eq!(
+            picker.selected_item().map(|r| r.name.as_str()),
+            Some(WITH_ARGS)
+        );
     }
 
     #[test_case(key(KeyCode::Esc) ; "escape")]
@@ -463,7 +466,10 @@ mod tests {
         let (popup, text) = render(&mut modal);
         assert!(popup.width > 0 && popup.height > 0);
         assert!(text.contains(WITH_ARGS), "command missing from {text:?}");
-        assert!(text.contains(WITH_ARGS_DESC), "description missing from {text:?}");
+        assert!(
+            text.contains(WITH_ARGS_DESC),
+            "description missing from {text:?}"
+        );
     }
 
     /// The hint and the typed value both wrap, so the modal has to grow
@@ -484,7 +490,10 @@ mod tests {
             short.height,
             tall.height
         );
-        assert!(text.contains(CHEVRON.trim()), "input row missing from {text:?}");
+        assert!(
+            text.contains(CHEVRON.trim()),
+            "input row missing from {text:?}"
+        );
         assert!(text.contains("Back"), "footer missing from {text:?}");
     }
 

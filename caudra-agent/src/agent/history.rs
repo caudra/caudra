@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use caudra_providers::{
-    CaudraId, ContentBlock, HistoryItem, HistoryItemKind,
-    HistoryProjectionError, Message, Role, expand_message, project_messages,
+    CaudraId, ContentBlock, HistoryItem, HistoryItemKind, HistoryProjectionError, Message, Role,
+    expand_message, project_messages,
 };
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;

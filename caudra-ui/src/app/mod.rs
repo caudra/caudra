@@ -12,6 +12,7 @@ mod queue;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
+mod stash;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -51,6 +52,7 @@ use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
+use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
@@ -243,6 +245,7 @@ pub struct App {
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
+    pub(super) stash_picker: StashPicker,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub(super) status_hits: Vec<StatusBarHit>,
@@ -386,6 +389,7 @@ impl App {
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
+            stash_picker: StashPicker::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             status_hits: Vec::new(),
@@ -778,6 +782,7 @@ impl App {
         try_picker!(self.prompt_profile_picker);
         try_picker!(self.file_picker);
         try_picker!(self.permissions_picker);
+        try_picker!(self.stash_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -833,6 +838,12 @@ impl App {
         }
         if key::POP_QUEUE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::PopQueue));
+        }
+        if key::STASH_PUSH.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::StashPush));
+        }
+        if key::STASH_POP.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::StashPop));
         }
         if key::VIEW_TOGGLE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::ViewToggle));
@@ -1052,6 +1063,11 @@ impl App {
         if self.permissions_picker.is_open() {
             let action = self.permissions_picker.handle_key(key);
             return Some(self.handle_permissions_picker_action(action));
+        }
+
+        if self.stash_picker.is_open() {
+            let action = self.stash_picker.handle_key(key);
+            return Some(self.handle_stash_picker_action(action));
         }
 
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
@@ -1409,6 +1425,9 @@ impl App {
                     EXPANDED_VIEW_MSG.into()
                 });
             }
+            BuiltinAction::StashPush => return self.stash_push(),
+            BuiltinAction::StashPop => return self.stash_pop(),
+            BuiltinAction::StashList => return self.stash_list(),
         }
         vec![]
     }
@@ -2482,6 +2501,9 @@ impl App {
                 self.focus_active_queue();
                 vec![]
             }
+            "/stash" => self.run_builtin(BuiltinAction::StashPush),
+            "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
+            "/stash-list" => self.run_builtin(BuiltinAction::StashList),
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
@@ -2751,7 +2773,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 19] {
+    fn overlays(&self) -> [&dyn Overlay; 20] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2771,11 +2793,12 @@ impl App {
             &self.login_picker,
             &self.mcp_picker,
             &self.permissions_picker,
+            &self.stash_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 20] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2795,6 +2818,7 @@ impl App {
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.permissions_picker,
+            &mut self.stash_picker,
             &mut self.permission_prompt,
         ]
     }
@@ -2996,6 +3020,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.permissions_picker);
+        try_picker!(self.stash_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
             if self.active_subagent_can_steer() || self.queue_editor_active() {

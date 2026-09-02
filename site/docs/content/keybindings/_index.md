@@ -24,6 +24,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Alt+V` | Toggle compact / expanded transcript |
+| `Alt+T` | Stash the current prompt |
+| `Alt+R` | Restore the newest stashed prompt |
 | `Ctrl+M` / `Alt+M` | Model picker |
 
 ## Editing
@@ -118,6 +120,7 @@ Some pickers add extra bindings on top of the defaults:
 | Commands | `Tab` | Complete command |
 | Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
 | Model Picker | `R` | Reset model purpose |
+| Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
@@ -130,12 +133,13 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 |-----|--------|
 | `Alt+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
+| `Ctrl+T` | Toggle todo panel |
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker
 
 ## Overriding Keybindings
 

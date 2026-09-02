@@ -42,6 +42,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.stash_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.stash_picker.handle_mouse(event),
+                |app, action| app.handle_stash_picker_action(action),
+            ) {
+                return actions;
+            }
         } else if self.mcp_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,

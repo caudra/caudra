@@ -201,6 +201,16 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+V",
     };
+    pub const STASH_PUSH: Bind = Bind {
+        code: KeyCode::Char('t'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+T",
+    };
+    pub const STASH_POP: Bind = Bind {
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+R",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -219,6 +229,7 @@ pub enum KeybindContext {
     Review,
     Search,
     FilePicker,
+    StashPicker,
 }
 
 impl KeybindContext {
@@ -238,6 +249,7 @@ impl KeybindContext {
             Self::Review => "Review",
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
+            Self::StashPicker => "Stash Picker",
         }
     }
 
@@ -249,7 +261,8 @@ impl KeybindContext {
             | Self::QueueFocus
             | Self::CommandPalette
             | Self::Search
-            | Self::FilePicker => Some(Self::Picker),
+            | Self::FilePicker
+            | Self::StashPicker => Some(Self::Picker),
             _ => None,
         }
     }
@@ -415,6 +428,18 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::VIEW_TOGGLE.label),
         description: "Toggle compact / expanded transcript",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::STASH_PUSH.label),
+        description: "Stash the current prompt",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::STASH_POP.label),
+        description: "Restore the newest stashed prompt",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -737,6 +762,12 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("R"),
         description: "Reset model purpose",
         context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::DELETE.label),
+        description: "Delete stash entry (press twice)",
+        context: KeybindContext::StashPicker,
         platform: Platform::All,
     },
 ];
