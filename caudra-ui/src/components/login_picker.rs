@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
@@ -502,6 +502,36 @@ impl LoginPicker {
         };
 
         self.transition(action)
+    }
+
+    /// Only the list steps have anywhere to scroll; the rest are a single
+    /// text input and own no viewport.
+    pub fn contains(&self, pos: Position) -> bool {
+        match &self.step {
+            Step::PickProvider(picker) => picker.contains(pos),
+            Step::PickPlan { picker, .. } => picker.contains(pos),
+            Step::CustomProtocol { picker, .. } => picker.contains(pos),
+            Step::Closed
+            | Step::CustomName { .. }
+            | Step::CustomUrl { .. }
+            | Step::BuiltinUrl { .. }
+            | Step::EnterKey { .. }
+            | Step::Done { .. } => false,
+        }
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.scroll(delta),
+            Step::PickPlan { picker, .. } => picker.scroll(delta),
+            Step::CustomProtocol { picker, .. } => picker.scroll(delta),
+            Step::Closed
+            | Step::CustomName { .. }
+            | Step::CustomUrl { .. }
+            | Step::BuiltinUrl { .. }
+            | Step::EnterKey { .. }
+            | Step::Done { .. } => {}
+        }
     }
 
     fn map_provider_action(action: PickerAction<ProviderItem>) -> StepAction {

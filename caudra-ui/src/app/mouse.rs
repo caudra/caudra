@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
+use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
@@ -32,8 +33,18 @@ impl App {
             || self.goal_modal.is_open()
             || self.btw_modal.is_open()
             || self.float_mgr.is_open();
-        if passive_modal_open || self.permission_prompt.is_open() {
+        if passive_modal_open {
             self.clear_control_hovers();
+        } else if self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            match self.permission_prompt.handle_mouse(event) {
+                PromptMouse::Passthrough => {}
+                PromptMouse::Consumed => return Vec::new(),
+                PromptMouse::Decided(decision) => {
+                    self.apply_permission_decision(decision);
+                    return Vec::new();
+                }
+            }
         } else if self.permissions_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -181,6 +192,12 @@ impl App {
                 self.clear_control_hovers();
                 return actions;
             }
+        }
+        // Bottom-stack chrome rather than an overlay, so it is checked after
+        // the overlay chain and only when nothing modal is drawn over it.
+        if !self.has_modal_overlay() && self.todo_panel.handle_mouse(event) {
+            self.clear_control_hovers();
+            return Vec::new();
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -412,6 +429,13 @@ impl App {
         }
         if !self.has_modal_overlay() && self.queue_hit_at(row, column).is_some() {
             self.scroll_active_queue(delta);
+            self.clear_selection_unless_pending_copy();
+            return;
+        }
+        // The panel caps at `MAX_VISIBLE_ROWS`, so without this the rows past
+        // it cannot be reached by any input at all.
+        if !self.has_modal_overlay() && self.todo_panel.contains(Position::new(column, row)) {
+            self.todo_panel.scroll(delta);
             self.clear_selection_unless_pending_copy();
             return;
         }
@@ -688,6 +712,8 @@ impl App {
         self.status_hover = None;
         self.input_box.clear_hover();
         self.subagent_input_box.clear_hover();
+        self.todo_panel.clear_hover();
+        self.permission_prompt.clear_hover();
         for chat in &mut self.chats {
             chat.clear_hover();
         }

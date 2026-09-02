@@ -3,7 +3,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{RetryInfo, Status};
+use super::{RetryInfo, Status, hover_style};
 
 use crate::animation::spinner_frame;
 use crate::theme;
@@ -11,7 +11,7 @@ use crate::theme;
 use caudra_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -473,14 +473,6 @@ impl StatusBar {
     }
 }
 
-fn hover_style(style: Style, hovered: bool) -> Style {
-    if hovered {
-        style.add_modifier(Modifier::REVERSED)
-    } else {
-        style
-    }
-}
-
 fn status_areas(area: Rect, right_spans: &[Span<'_>]) -> [Rect; 2] {
     Layout::horizontal([
         Constraint::Min(0),
@@ -618,6 +610,7 @@ fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Modifier;
     use std::fs;
 
     use super::*;

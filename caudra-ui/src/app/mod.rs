@@ -45,7 +45,7 @@ use crate::components::memory_picker::MemoryPicker;
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
-use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt};
 use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
@@ -791,6 +791,32 @@ impl App {
         }
     }
 
+    /// A decision only clears the prompt once it is recorded. Transient
+    /// answers have nothing to record, and a request that is no longer pending
+    /// was answered elsewhere, so both clear it too.
+    pub(crate) fn apply_permission_decision(&mut self, decision: PermissionDecision) {
+        let transient = matches!(
+            decision.answer,
+            PermissionAnswer::AllowOnce
+                | PermissionAnswer::Deny
+                | PermissionAnswer::DenyWithGuidance(_)
+        );
+        if self
+            .permissions
+            .answer(&decision.request_id, decision.answer)
+            || transient
+            || self
+                .permissions
+                .pending_request(&decision.request_id)
+                .is_none()
+        {
+            self.permission_prompt.resolve(&decision.request_id);
+        } else {
+            self.status_bar
+                .flash("Could not save permission decision".into());
+        }
+    }
+
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.scroll(delta);
@@ -828,6 +854,10 @@ impl App {
             };
         }
         try_picker!(self.command_modal);
+        try_picker!(self.search_modal);
+        try_picker!(self.theme_picker);
+        try_picker!(self.mcp_picker);
+        try_picker!(self.login_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
         try_picker!(self.review);
@@ -837,9 +867,23 @@ impl App {
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
-        try_picker!(self.task_picker);
+        // Not `try_picker!`: scrolling the task list previews the task behind
+        // the float, and only the app can carry that out.
+        if self.task_picker.is_open() {
+            if self.task_picker.contains(pos) {
+                let action = self.task_picker.scroll(delta);
+                self.handle_task_picker_action(action);
+            }
+            return None;
+        }
         try_picker!(self.session_picker);
         try_picker!(self.question_form);
+        // Not modal: the palette floats over the transcript, so it claims the
+        // wheel only where it actually drew.
+        if self.command_palette.is_active() && self.command_palette.contains(pos) {
+            self.command_palette.scroll(delta);
+            return None;
+        }
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -954,26 +998,7 @@ impl App {
 
         if self.permission_prompt.is_open() {
             if let Some(decision) = self.permission_prompt.handle_key(key) {
-                let transient = matches!(
-                    decision.answer,
-                    PermissionAnswer::AllowOnce
-                        | PermissionAnswer::Deny
-                        | PermissionAnswer::DenyWithGuidance(_)
-                );
-                if self
-                    .permissions
-                    .answer(&decision.request_id, decision.answer)
-                    || transient
-                    || self
-                        .permissions
-                        .pending_request(&decision.request_id)
-                        .is_none()
-                {
-                    self.permission_prompt.resolve(&decision.request_id);
-                } else {
-                    self.status_bar
-                        .flash("Could not save permission decision".into());
-                }
+                self.apply_permission_decision(decision);
             }
             return Some(vec![]);
         }

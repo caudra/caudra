@@ -54,6 +54,9 @@ pub struct SearchModal {
     open: bool,
     saved_scroll: Option<(u16, bool)>,
     matcher: Matcher,
+    /// Where the modal last drew, so a wheel event can tell whether it landed
+    /// on the results or on the transcript behind them.
+    popup: Rect,
     row_hits: Vec<SearchRowHit>,
     mouse_down: Option<usize>,
 }
@@ -69,8 +72,31 @@ impl SearchModal {
             open: false,
             saved_scroll: None,
             matcher: Matcher::new(Config::DEFAULT),
+            popup: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+        }
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.popup.contains(pos)
+    }
+
+    /// Moves the viewport without moving the selection, so `ensure_visible`
+    /// stays out of it: pulling the list back to the cursor on the next
+    /// keystroke is the point, doing it on the wheel is not.
+    pub fn scroll(&mut self, delta: i32) {
+        let max_offset = self.matches.len().saturating_sub(self.viewport_height);
+        let offset = if delta > 0 {
+            self.scroll_offset.saturating_sub(delta as usize)
+        } else {
+            self.scroll_offset
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        let offset = offset.min(max_offset);
+        if offset != self.scroll_offset {
+            self.scroll_offset = offset;
+            self.invalidate_mouse_geometry();
         }
     }
 
@@ -283,6 +309,7 @@ impl SearchModal {
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
         let viewport_h = inner.height.saturating_sub(SEARCH_ROW) as usize;
         self.viewport_height = viewport_h;
+        self.popup = popup;
 
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);

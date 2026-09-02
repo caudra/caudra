@@ -4,8 +4,8 @@ use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
-use code_view::RenderLimits;
 use code_view::SectionFlags;
+use code_view::{BatchFoldMap, BatchFolds, RenderLimits, RowTarget};
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -35,6 +35,19 @@ pub struct RenderCtx<'a> {
     pub width: u16,
     pub tool_output_lines: &'a ToolOutputLines,
     pub compact: bool,
+    /// Which batch children the reader has folded, by parent tool id. Looked
+    /// up here rather than passed in, so every path that builds a card reads
+    /// the same folds the click that set them named.
+    pub batch_folds: &'a BatchFoldMap,
+}
+
+impl RenderCtx<'_> {
+    fn folds_for(&self, tool_id: Option<&str>) -> BatchFolds {
+        tool_id
+            .and_then(|id| self.batch_folds.get(id))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 pub const TOOL_INDICATOR: &str = "● ";
@@ -221,6 +234,9 @@ pub struct ToolLines {
     pub shell_toggle_line: Option<usize>,
     pub content_indent: &'static str,
     pub truncation: SectionFlags,
+    /// What each line belongs to, parallel to `lines`, so a splice keeps the
+    /// two in step and the async highlight cannot lose a click target.
+    pub rows: Vec<Option<RowTarget>>,
 }
 
 pub struct HighlightRequest {
@@ -274,7 +290,7 @@ impl HighlightRequest {
 impl ToolLines {
     pub fn send_highlight(&self, worker: &RenderWorker) -> Option<u64> {
         let hl = self.highlight.as_ref()?;
-        Some(worker.send(hl.input.clone(), hl.output.clone(), hl.limits))
+        Some(worker.send(hl.input.clone(), hl.output.clone(), hl.limits.clone()))
     }
 }
 
@@ -441,6 +457,7 @@ struct ToolLineBuilder {
     snapshot_base: Option<usize>,
     shell_toggle_line: Option<usize>,
     content_range: (usize, usize),
+    rows: Vec<Option<RowTarget>>,
     width: u16,
     truncation: SectionFlags,
     limits: RenderLimits,
@@ -454,8 +471,9 @@ impl ToolLineBuilder {
         expanded: SectionFlags,
         max_output_lines: usize,
         indicator: Indicator,
+        folds: BatchFolds,
     ) -> Self {
-        let limits = RenderLimits::new(expanded, max_output_lines);
+        let limits = RenderLimits::new(expanded, max_output_lines, folds);
         Self {
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -464,6 +482,7 @@ impl ToolLineBuilder {
             snapshot_base: None,
             shell_toggle_line: None,
             content_range: (0, 0),
+            rows: Vec::new(),
             width,
             truncation: SectionFlags::default(),
             limits,
@@ -652,7 +671,7 @@ impl ToolLineBuilder {
     }
 
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
-        let content = code_view::render_tool_content(input, output, false, self.limits);
+        let content = code_view::render_tool_content(input, output, false, self.limits.clone());
         self.truncation.script |= content.truncation.script;
         self.truncation.output |= content.truncation.output;
         let start = self.lines.len();
@@ -661,6 +680,8 @@ impl ToolLineBuilder {
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
+        self.rows.resize(start, None);
+        self.rows.extend(content.rows);
         if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input {
             self.push_search_text(code.trim_end());
         }
@@ -780,6 +801,8 @@ impl ToolLineBuilder {
         content_indent: &'static str,
     ) -> ToolLines {
         let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
+        let mut rows = self.rows;
+        rows.resize(self.lines.len(), None);
         let mut links = LinkMap::none_for(&self.lines);
         for (line, row) in self.link_rows {
             links.rows[line] = row;
@@ -794,6 +817,7 @@ impl ToolLineBuilder {
             shell_toggle_line: self.shell_toggle_line,
             content_indent,
             truncation: self.truncation,
+            rows,
         }
     }
 }
@@ -929,6 +953,7 @@ pub fn build_tool_lines(
         expanded,
         rctx.tool_output_lines.get(tool_name),
         status.into(),
+        rctx.folds_for(msg.role.tool_id()),
     );
     b.apply_output_format(msg.tool_output.as_deref());
     if rctx.compact {
@@ -1016,7 +1041,7 @@ pub fn build_tool_lines(
             body,
             msg.live_output.as_deref(),
             msg.truncated_lines,
-            b.limits,
+            b.limits.clone(),
             expanded.shell_raw,
         );
         b.push_resolved_output(&resolved);
@@ -1071,6 +1096,7 @@ pub fn build_instructions_lines(
         exp,
         code_view::instruction_limit(expanded),
         Indicator::Success,
+        BatchFolds::default(),
     );
     b.push_header("load", header, annotation.as_deref(), None, None);
     b.prepend_indicator(Instant::now());
@@ -1122,6 +1148,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         snapshot_base: None,
         shell_toggle_line: None,
         content_indent: TOOL_BODY_INDENT,
+        rows: Vec::new(),
         truncation: SectionFlags {
             script: false,
             output: true,
@@ -1145,12 +1172,16 @@ mod tests {
     use std::time::Duration;
     use test_case::test_case;
 
+    static NO_FOLDS: std::sync::LazyLock<BatchFoldMap> =
+        std::sync::LazyLock::new(BatchFoldMap::new);
+
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
             started_at: Instant::now(),
             width,
             tool_output_lines: &TOL,
             compact: false,
+            batch_folds: &NO_FOLDS,
         }
     }
 
@@ -1962,14 +1993,22 @@ mod tests {
         tool: &str,
         expect_text: bool,
     ) {
-        let limits = RenderLimits::new(SectionFlags::default(), TOL.get(tool));
+        let limits = RenderLimits::new(
+            SectionFlags::default(),
+            TOL.get(tool),
+            BatchFolds::default(),
+        );
         let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
     }
 
     #[test]
     fn resolve_output_pre_truncated_forwarded() {
-        let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
+        let limits = RenderLimits::new(
+            SectionFlags::default(),
+            TOL.get("bash"),
+            BatchFolds::default(),
+        );
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
     }
@@ -1977,7 +2016,11 @@ mod tests {
     #[test]
     fn resolve_output_truncation_overrides_pre_truncated() {
         let long = n_lines(200);
-        let limits = RenderLimits::new(SectionFlags::default(), TOL.get("bash"));
+        let limits = RenderLimits::new(
+            SectionFlags::default(),
+            TOL.get("bash"),
+            BatchFolds::default(),
+        );
         let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);
     }

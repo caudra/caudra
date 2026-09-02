@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::error;
 
-use crate::components::code_view::{self, RenderLimits};
+use crate::components::code_view::{self, RenderLimits, RowTarget};
 use caudra_agent::{ToolInput, ToolOutput};
 use ratatui::text::Line;
 
@@ -26,6 +26,9 @@ struct RenderJob {
 pub struct RenderResult {
     pub id: u64,
     pub lines: Vec<Line<'static>>,
+    /// Parallel to `lines`. Built by the same pass the main thread runs, so
+    /// the highlighted lines carry the rows they replace.
+    pub rows: Vec<Option<RowTarget>>,
 }
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +125,7 @@ fn worker_loop(inner: &PoolInner) {
             .send(RenderResult {
                 id: job.id,
                 lines: content.lines,
+                rows: content.rows,
             })
             .is_err()
         {

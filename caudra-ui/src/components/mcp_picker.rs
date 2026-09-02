@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
 use caudra_agent::mcp::config::McpConfigSource;
@@ -233,6 +233,19 @@ impl McpPicker {
         let action = self.picker.handle_mouse(event);
         self.sync_review();
         self.map_picker_action(action)
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.picker.contains(pos)
+    }
+
+    /// A confirmation owns the whole picker until it is answered, list
+    /// included, so the wheel must not move what it is asking about.
+    pub fn scroll(&mut self, delta: i32) {
+        if self.pending_confirmation.is_some() {
+            return;
+        }
+        self.picker.scroll(delta);
     }
 
     fn map_picker_action(&self, action: PickerAction<McpEntry>) -> McpPickerAction {

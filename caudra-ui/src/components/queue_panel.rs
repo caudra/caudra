@@ -3,11 +3,12 @@ use std::borrow::Cow;
 use caudra_agent::{PromptAdmission, QueueItemId};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::hover_style;
 use crate::theme;
 
 const DELETE_LABEL: &str = "[Delete]";
@@ -145,12 +146,11 @@ pub fn view(
                 .saturating_sub(action_width);
             let style = if selected {
                 theme::current().item_selected
-            } else if state.hovered == Some(select_target) {
-                Style::new()
-                    .fg(entry.color)
-                    .add_modifier(Modifier::REVERSED)
             } else {
-                Style::new().fg(entry.color)
+                hover_style(
+                    Style::new().fg(entry.color),
+                    state.hovered == Some(select_target),
+                )
             };
             let flat = entry.text.replace('\n', " ");
             let text = truncate_span(&flat, available, style);
@@ -169,15 +169,14 @@ pub fn view(
                 } else {
                     theme::current().keybind_key
                 };
-                let action_style = if state.hovered
-                    == Some(QueueHitTarget::Item {
-                        id: entry.id,
-                        action,
-                    }) {
-                    action_style.add_modifier(Modifier::REVERSED)
-                } else {
-                    action_style
-                };
+                let action_style = hover_style(
+                    action_style,
+                    state.hovered
+                        == Some(QueueHitTarget::Item {
+                            id: entry.id,
+                            action,
+                        }),
+                );
                 spans.push(Span::styled(label, action_style));
                 let width = label.width() as u16;
                 action_x = action_x.saturating_add(ACTION_SEPARATOR.width() as u16);
@@ -227,13 +226,10 @@ pub fn view(
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     label,
-                    if state.hovered == Some(QueueHitTarget::ToggleTogether) {
-                        theme::current()
-                            .keybind_key
-                            .add_modifier(Modifier::REVERSED)
-                    } else {
-                        theme::current().keybind_key
-                    },
+                    hover_style(
+                        theme::current().keybind_key,
+                        state.hovered == Some(QueueHitTarget::ToggleTogether),
+                    ),
                 )))
                 .right_aligned(),
                 header_area,
@@ -338,6 +334,7 @@ fn truncate_span(text: &str, max_width: usize, style: Style) -> Span<'static> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     #[test]
     fn height_is_bounded() {

@@ -3,7 +3,7 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::SectionFlags;
+use super::super::code_view::{BatchFolds, RowTarget, SectionFlags};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use ratatui::text::{Line, Span};
@@ -34,6 +34,9 @@ struct CachedHeight {
 struct HighlightKey {
     has_output: bool,
     theme_gen: u64,
+    /// Folding changes which lines the range holds, so reusing across a fold
+    /// would splice back the body the reader just put away.
+    folds: BatchFolds,
 }
 
 impl HighlightKey {
@@ -44,6 +47,7 @@ impl HighlightKey {
         Self {
             has_output: hl.is_some_and(|h| h.output.is_some()),
             theme_gen: theme::generation(),
+            folds: hl.map(|h| h.limits.folds.clone()).unwrap_or_default(),
         }
     }
 }
@@ -75,6 +79,9 @@ pub(super) struct Segment {
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     pub shell_toggle_line: Option<usize>,
+    /// What each line belongs to, parallel to `lines`. Spliced alongside them
+    /// so a highlighted card keeps the rows a click names.
+    rows: Vec<Option<RowTarget>>,
     pub content_indent: &'static str,
     /// Lines were laid out at a width or theme that is no longer current.
     /// Cleared by `set_lines` (whole vector replaced) and up front by
@@ -184,9 +191,10 @@ impl Segment {
         self.lines = lines;
         self.diagrams.clear();
         self.links = LinkMap::none_for(&self.lines);
-        // Line indices moved, so any provenance recorded for the old vector
-        // no longer lines up.
+        // Line indices moved, so any provenance or row recorded for the old
+        // vector no longer lines up.
         self.provenance = None;
+        self.rows.clear();
         self.stale = false;
         self.invalidate_height();
     }
@@ -246,6 +254,12 @@ impl Segment {
         None
     }
 
+    /// What the row at `rel_row` belongs to, for a click or a hover to name.
+    pub fn row_target_at(&self, rel_row: u16, width: u16) -> Option<RowTarget> {
+        let line = self.source_line_at(rel_row, width)?;
+        self.rows.get(line).copied().flatten()
+    }
+
     /// Maps a source line to a 1-based row in the tool's live buffer, or 0
     /// for lines outside it (header etc.). The Lua click-row contract is
     /// computed here and nowhere else, from the base recorded when the
@@ -300,8 +314,10 @@ impl Segment {
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
         let links = std::mem::take(&mut tl.links);
+        let rows = std::mem::take(&mut tl.rows);
         self.set_lines(tl.lines);
         self.set_links(links);
+        self.rows = rows;
     }
 
     pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker, compact: bool) {
@@ -322,8 +338,10 @@ impl Segment {
         self.truncation = tl.truncation;
         if let Some((s, e)) = reused {
             let links = std::mem::take(&mut tl.links);
+            let rows = std::mem::take(&mut tl.rows);
             self.set_lines(tl.lines);
             self.set_links(links);
+            self.rows = rows;
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
@@ -339,9 +357,16 @@ impl Segment {
         self.pending_highlight == Some(id)
     }
 
-    pub fn apply_highlight_result(&mut self, lines: Vec<Line<'static>>) {
+    pub fn apply_highlight_result(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        rows: Vec<Option<RowTarget>>,
+    ) {
         if !self.links.is_aligned(&self.lines) {
             self.links = LinkMap::none_for(&self.lines);
+        }
+        if self.rows.len() != self.lines.len() {
+            self.rows = vec![None; self.lines.len()];
         }
         if let Some((start, end)) = self.highlight_range {
             let indent = self.content_indent;
@@ -359,8 +384,11 @@ impl Segment {
                 .iter()
                 .map(|line| vec![None; line.spans.len()])
                 .collect::<Vec<_>>();
+            let mut rows = rows;
+            rows.resize(new_end - start, None);
             self.lines.splice(start..end, indented);
             self.links.rows.splice(start..end, link_rows);
+            self.rows.splice(start..end, rows);
             self.highlight_range = Some((start, new_end));
             self.shift_after(end, new_end as isize - end as isize);
             self.invalidate_height();
@@ -664,10 +692,7 @@ mod tests {
                 range: (1, 3),
                 input: None,
                 output: Some(Arc::clone(&output)),
-                limits: RenderLimits {
-                    script: 0,
-                    output: 0,
-                },
+                limits: RenderLimits::default(),
             }))
         };
         let seg = Segment {
@@ -702,7 +727,10 @@ mod tests {
         let mut seg = seg_with_base(8, Some(4));
         seg.highlight_range = Some((1, 3));
         seg.spinner_lines = vec![(0, 0), (5, 1)];
-        seg.apply_highlight_result((0..replacement_lines).map(|_| Line::raw("hl")).collect());
+        seg.apply_highlight_result(
+            (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
+            vec![None; replacement_lines],
+        );
         let delta = expected_base as isize - 4;
         assert_eq!(seg.snapshot_base, Some(expected_base));
         assert_eq!(
@@ -710,5 +738,79 @@ mod tests {
             vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
             "positions before the splice stay, after it shift by the delta"
         );
+    }
+    const EXPECT_ROWS_ALIGNED: &str = "the rows have to stay parallel to the lines";
+
+    /// The splice replaces the content range, so the worker's rows have to
+    /// come in with its lines or a click loses the target under it.
+    #[test_case(4 ; "splice_grows")]
+    #[test_case(1 ; "splice_shrinks")]
+    #[test_case(2 ; "same_length")]
+    fn highlight_splice_carries_the_rows_with_the_lines(replacement_lines: usize) {
+        let mut seg = seg_with_base(8, None);
+        seg.highlight_range = Some((1, 3));
+        seg.rows = vec![None; 8];
+        seg.rows[7] = Some(RowTarget::BatchChild(9));
+        let hl_rows: Vec<Option<RowTarget>> = (0..replacement_lines)
+            .map(|i| Some(RowTarget::BatchChild(i)))
+            .collect();
+
+        seg.apply_highlight_result(
+            (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
+            hl_rows.clone(),
+        );
+
+        assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");
+        assert_eq!(&seg.rows[1..1 + replacement_lines], hl_rows.as_slice());
+        assert_eq!(
+            seg.rows.last().copied().flatten(),
+            Some(RowTarget::BatchChild(9)),
+            "a row after the splice moves with its line"
+        );
+    }
+
+    /// A worker that answers with fewer rows than lines must not leave the
+    /// two out of step, or every row below reads as the wrong child.
+    #[test]
+    fn a_short_row_answer_is_padded_rather_than_left_ragged() {
+        let mut seg = seg_with_base(6, None);
+        seg.highlight_range = Some((1, 4));
+        seg.rows = vec![None; 6];
+
+        seg.apply_highlight_result(
+            (0..3).map(|_| Line::raw("hl")).collect(),
+            vec![Some(RowTarget::BatchChild(0))],
+        );
+
+        assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");
+    }
+
+    /// Folding changes which lines the range holds, so a reused highlight
+    /// would splice back the body the reader just put away.
+    #[test]
+    fn a_fold_forces_a_fresh_highlight() {
+        use crate::components::code_view::RenderLimits;
+
+        let request = |folds: BatchFolds| HighlightRequest {
+            range: (1, 3),
+            input: None,
+            output: None,
+            limits: RenderLimits {
+                script: 0,
+                output: 0,
+                folds,
+            },
+        };
+        let seg = Segment {
+            highlight_key: HighlightKey::from_request(Some(&request(BatchFolds::default()))),
+            highlight_range: Some((1, 3)),
+            lines: vec![Line::raw("h"), Line::raw("a"), Line::raw("b")],
+            ..Segment::default()
+        };
+
+        let folded = HighlightKey::from_request(Some(&request(BatchFolds::new([0]))));
+        assert!(seg.reuse_highlight(&folded, (1, 3)).is_none());
+        let same = HighlightKey::from_request(Some(&request(BatchFolds::default())));
+        assert!(seg.reuse_highlight(&same, (1, 3)).is_some());
     }
 }

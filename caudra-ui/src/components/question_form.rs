@@ -10,13 +10,13 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear};
+use unicode_width::UnicodeWidthStr;
 
 use caudra_agent::types::AskedQuestion;
 
-use super::Overlay;
 use super::form::render_form;
-use crate::components::hint_line;
+use super::{Overlay, VisualRows, visual_rows};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -36,6 +36,20 @@ const CUSTOM_PROMPT: &str = "  ❯ ";
 /// Two borders plus the hint row.
 const CHROME_ROWS: u16 = 3;
 const MAX_HEIGHT_PERCENT: u16 = 75;
+
+/// Hint labels, shared by the bar the form draws and the key a click on one
+/// stands in for. One table, so a clicked hint can never do something other
+/// than what it says.
+const HINT_ENTER: &str = "Enter";
+const HINT_SHIFT_ENTER: &str = "Shift+Enter";
+const HINT_TAB: &str = "Tab";
+const HINT_SHIFT_TAB: &str = "Shift+Tab";
+const HINT_ESC: &str = "Esc";
+
+/// Lines `review_lines` spends on the tab bar and heading before the first
+/// question, and the lines each question then takes.
+const REVIEW_HEADER_LINES: u16 = 4;
+const REVIEW_LINES_PER_QUESTION: u16 = 2;
 
 pub enum QuestionFormAction {
     Consumed,
@@ -60,19 +74,45 @@ pub struct QuestionForm {
     answers: Vec<Vec<String>>,
     custom: TextBuffer,
     scroll: u16,
+    /// Whether the viewport is tracking the cursor. A keystroke turns it back
+    /// on, the wheel turns it off: a reader looking around a long option list
+    /// must not be dragged back to the cursor on the next frame.
+    follow_cursor: bool,
     /// Where the form last drew, so a wheel event can tell whether it landed
     /// on the form or on the transcript behind it.
     area: Rect,
     row_hits: Vec<RowHit>,
-    /// The row a left press landed on, so a release somewhere else is a drag
+    /// What a left press landed on, so a release somewhere else is a drag
     /// rather than a click on whatever it ended up over.
-    mouse_down: Option<usize>,
+    mouse_down: Option<FormTarget>,
+    /// What the pointer is resting on, so a control can say it is about to
+    /// act. Option rows are absent: hovering one moves the cursor, which
+    /// already marks it, and reversing it too would say the same thing twice.
+    hover: Option<FormTarget>,
+}
+
+/// Everything on the form a click can name. The form is rebuilt from scratch
+/// each frame, so a target is only ever read in the frame that recorded it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FormTarget {
+    /// An offered option, or the custom-answer row one past the last of them.
+    Option(usize),
+    /// A question's tab in the bar.
+    Tab(usize),
+    /// The review tab at the end of the bar.
+    Review,
+    /// A question's summary in the review, which goes back to answer it again.
+    ReviewRow(usize),
+    /// A line of the custom-answer box, which takes the cursor to the cell.
+    Editor(usize),
+    /// A hint in the bottom bar, by its position in `hint_pairs`.
+    Hint(usize),
 }
 
 #[derive(Clone, Copy)]
 struct RowHit {
     area: Rect,
-    index: usize,
+    target: FormTarget,
 }
 
 impl QuestionForm {
@@ -85,6 +125,8 @@ impl QuestionForm {
             answers: Vec::new(),
             custom: TextBuffer::new(String::new()),
             scroll: 0,
+            follow_cursor: true,
+            hover: None,
             area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
@@ -99,8 +141,10 @@ impl QuestionForm {
         self.cursor = 0;
         self.custom = TextBuffer::new(String::new());
         self.scroll = 0;
+        self.follow_cursor = true;
         self.row_hits.clear();
         self.mouse_down = None;
+        self.hover = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -112,6 +156,7 @@ impl QuestionForm {
         self.answers.clear();
         self.row_hits.clear();
         self.mouse_down = None;
+        self.hover = None;
         self.area = Rect::default();
     }
 
@@ -119,6 +164,7 @@ impl QuestionForm {
         if !self.is_open() {
             return QuestionFormAction::Consumed;
         }
+        self.follow_cursor = true;
         match self.mode {
             Mode::Selecting => self.key_selecting(key),
             Mode::EditingCustom => self.key_editing(key),
@@ -139,7 +185,8 @@ impl QuestionForm {
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        self.scroll = self.scroll.saturating_add_signed(delta as i16);
+        self.scroll = super::apply_scroll_delta(self.scroll, delta);
+        self.follow_cursor = false;
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -159,11 +206,14 @@ impl QuestionForm {
         // The cursor may sit below the fold on a long option list, so the
         // viewport follows it rather than staying where the user left it.
         let visible = height.saturating_sub(CHROME_ROWS);
-        let focus = rows.row_of(self.focus_line());
-        self.scroll = self
-            .scroll
-            .min(focus)
-            .max(focus.saturating_sub(visible - 1));
+        if self.follow_cursor {
+            let focus = rows.row_of(self.focus_line());
+            self.scroll = self
+                .scroll
+                .min(focus)
+                .max(focus.saturating_sub(visible - 1));
+        }
+        self.scroll = self.scroll.min(rows.total.saturating_sub(visible));
         let t = theme::current();
         // The form floats over the transcript, so the cells behind it have to
         // go before anything is drawn: a border alone leaves the old text
@@ -171,7 +221,6 @@ impl QuestionForm {
         frame.render_widget(Clear, form);
         frame.render_widget(Block::default().style(t.surface_style()), form);
         render_form(&t, TITLE, frame, form, lines, (self.scroll, 0));
-        self.record_row_hits(&rows, form, visible);
         // `CHROME_ROWS` reserves the hint a content row of its own. Drawing it
         // one lower puts it on the bottom border, which then carries on to the
         // right of the text.
@@ -182,38 +231,107 @@ impl QuestionForm {
             height: 1,
         };
         frame.render_widget(ratatui::widgets::Paragraph::new(self.hint()), hint);
+        self.record_row_hits(&rows, form, visible, hint);
         form
     }
 
-    /// Where each option landed on screen, so a click can name the row it hit.
-    /// Only the rows inside the viewport are recorded: one scrolled out of
-    /// sight must not be clickable through whatever is drawn over it.
-    fn record_row_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16) {
+    /// Where everything clickable landed on screen, so a click can name what
+    /// it hit. Only what is inside the viewport is recorded: a row scrolled
+    /// out of sight must not be clickable through whatever is drawn over it.
+    fn record_row_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16, hint: Rect) {
         self.row_hits.clear();
-        if self.mode != Mode::Selecting {
+        self.push_tab_hits(rows, form, visible);
+        match self.mode {
+            Mode::Selecting => {
+                let first = self.first_option_line();
+                for index in 0..=self.custom_row() {
+                    let line = first + index as u16;
+                    self.push_line_hit(rows, form, visible, line, FormTarget::Option(index));
+                }
+            }
+            Mode::EditingCustom => {
+                let first = self.first_option_line() + self.custom_row() as u16;
+                for index in 0..self.custom.line_count() {
+                    let line = first + index as u16;
+                    self.push_line_hit(rows, form, visible, line, FormTarget::Editor(index));
+                }
+            }
+            Mode::Confirming => {
+                for index in 0..self.questions.len() {
+                    let first = REVIEW_HEADER_LINES + index as u16 * REVIEW_LINES_PER_QUESTION;
+                    for line in first..first + REVIEW_LINES_PER_QUESTION {
+                        self.push_line_hit(rows, form, visible, line, FormTarget::ReviewRow(index));
+                    }
+                }
+            }
+        }
+        let hints = super::hint_hits(self.hint_pairs(), hint);
+        for (index, area) in hints.into_iter().enumerate() {
+            self.row_hits.push(RowHit {
+                area,
+                target: FormTarget::Hint(index),
+            });
+        }
+    }
+
+    /// The block of rows one form line occupies, clipped to the viewport.
+    fn push_line_hit(
+        &mut self,
+        rows: &VisualRows,
+        form: Rect,
+        visible: u16,
+        line: u16,
+        target: FormTarget,
+    ) {
+        let Some(offset) = rows.row_of(line).checked_sub(self.scroll) else {
+            return;
+        };
+        let height = rows.height_of(line).min(visible.saturating_sub(offset));
+        if height == 0 {
             return;
         }
-        let first = self.first_option_line();
-        let top = form.y + 1;
-        for index in 0..=self.custom_row() {
-            let start = rows.row_of(first + index as u16);
-            let height = rows.height_of(first + index as u16);
-            let Some(offset) = start.checked_sub(self.scroll) else {
-                continue;
-            };
-            let height = height.min(visible.saturating_sub(offset));
-            if height == 0 {
-                continue;
+        self.row_hits.push(RowHit {
+            area: Rect {
+                x: form.x + 1,
+                y: form.y + 1 + offset,
+                width: form.width.saturating_sub(2),
+                height,
+            },
+            target,
+        });
+    }
+
+    /// The tabs are spans on one line, so their hits are column ranges walked
+    /// in step with the spans themselves. A bar wide enough to wrap is left
+    /// alone: past the fold a column no longer maps to the span under it.
+    fn push_tab_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16) {
+        if !self.has_review() || rows.height_of(0) != 1 {
+            return;
+        }
+        let Some(offset) = rows.row_of(0).checked_sub(self.scroll) else {
+            return;
+        };
+        if offset >= visible {
+            return;
+        }
+        let right = form.right().saturating_sub(1);
+        let mut x = form.x + 1;
+        for (span, target) in self.tab_spans() {
+            let width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+            if let Some(target) = target
+                && x < right
+            {
+                self.row_hits.push(RowHit {
+                    area: Rect {
+                        x,
+                        y: form.y + 1 + offset,
+                        width: width.min(right - x),
+                        height: 1,
+                    },
+                    target,
+                });
             }
-            self.row_hits.push(RowHit {
-                area: Rect {
-                    x: form.x + 1,
-                    y: top + offset,
-                    width: form.width.saturating_sub(2),
-                    height,
-                },
-                index,
-            });
+            x = x.saturating_add(width);
         }
     }
 
@@ -223,28 +341,35 @@ impl QuestionForm {
             .row_hits
             .iter()
             .find(|hit| hit.area.contains(position))
-            .map(|hit| hit.index);
+            .copied();
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.mouse_down = hit;
-                if let Some(index) = hit {
-                    self.cursor = index;
+                self.mouse_down = hit.map(|hit| hit.target);
+                if let Some(hit) = hit {
+                    self.aim(hit, event);
                 }
             }
+            // Hovering picks the row out, the same as walking onto it would.
+            // Nothing else moves under the pointer alone.
             MouseEventKind::Moved => {
-                if let Some(index) = hit {
+                self.hover = hit.map(|hit| hit.target);
+                if let Some(FormTarget::Option(index)) = self.hover {
                     self.cursor = index;
+                    self.follow_cursor = true;
                 }
             }
-            // A press and release on the same row is the click; anything else
-            // is a drag that only moved the cursor.
+            // A press and release on the same target is the click; anything
+            // else is a drag that only moved the cursor.
             MouseEventKind::Up(MouseButton::Left) => {
-                let clicked = self
-                    .mouse_down
-                    .take()
-                    .is_some_and(|pressed| hit == Some(pressed));
-                if clicked {
-                    return self.activate();
+                let pressed = self.mouse_down.take();
+                if let Some(target) = hit.map(|hit| hit.target)
+                    && pressed == Some(target)
+                {
+                    // Hints are held by position and a mode change reshuffles
+                    // them, so the mark is dropped rather than left pointing
+                    // at whatever moved into its place.
+                    self.hover = None;
+                    return self.activate(target);
                 }
             }
             _ => {}
@@ -252,9 +377,65 @@ impl QuestionForm {
         QuestionFormAction::Consumed
     }
 
+    /// What a press does before the release decides whether it was a click:
+    /// move whatever cursor the target owns, so the form reads as pressed.
+    fn aim(&mut self, hit: RowHit, event: MouseEvent) {
+        self.follow_cursor = true;
+        match hit.target {
+            FormTarget::Option(index) => self.cursor = index,
+            FormTarget::Editor(line) => {
+                // The prefix is part of the line, so it occupies the first
+                // cells of the wrapped content rather than a gutter beside it.
+                let width = usize::from(hit.area.width.max(1));
+                let wrap_row = usize::from(event.row.saturating_sub(hit.area.y));
+                let column = usize::from(event.column.saturating_sub(hit.area.x));
+                let cell = wrap_row * width + column;
+                self.custom
+                    .set_cursor(line, cell.saturating_sub(CUSTOM_PROMPT.chars().count()));
+            }
+            _ => {}
+        }
+    }
+
+    fn activate(&mut self, target: FormTarget) -> QuestionFormAction {
+        match target {
+            FormTarget::Option(index) => {
+                self.cursor = index;
+                self.activate_cursor()
+            }
+            FormTarget::Tab(index) | FormTarget::ReviewRow(index) => {
+                self.tab = index;
+                self.cursor = 0;
+                self.mode = Mode::Selecting;
+                QuestionFormAction::Consumed
+            }
+            FormTarget::Review => {
+                self.mode = Mode::Confirming;
+                QuestionFormAction::Consumed
+            }
+            // The press already placed the cursor; a release must not move it
+            // again or a click that drifted a cell would land somewhere else.
+            FormTarget::Editor(_) => QuestionFormAction::Consumed,
+            FormTarget::Hint(index) => self.activate_hint(index),
+        }
+    }
+
+    /// A hint stands in for the key it advertises, so the two can never come
+    /// to mean different things.
+    fn activate_hint(&mut self, index: usize) -> QuestionFormAction {
+        let Some(key) = self
+            .hint_pairs()
+            .get(index)
+            .and_then(|(label, _)| hint_key(label))
+        else {
+            return QuestionFormAction::Consumed;
+        };
+        self.handle_key(key)
+    }
+
     /// What `Enter` does on the focused row, shared with the click path so the
     /// two can never drift.
-    fn activate(&mut self) -> QuestionFormAction {
+    fn activate_cursor(&mut self) -> QuestionFormAction {
         if self.cursor == self.custom_row() {
             self.start_editing();
             return QuestionFormAction::Consumed;
@@ -439,25 +620,39 @@ impl QuestionForm {
         QuestionFormAction::Consumed
     }
 
-    fn hint(&self) -> Line<'static> {
+    /// The hint bar's contents, which a click on one of them turns back into
+    /// the key it names.
+    fn hint_pairs(&self) -> &'static [(&'static str, &'static str)] {
         match self.mode {
-            Mode::EditingCustom => hint_line(&[
-                ("Enter", "submit"),
-                ("Shift+Enter", "newline"),
-                ("Esc", "cancel"),
-            ]),
-            Mode::Confirming => hint_line(&[
-                ("Enter", "submit"),
-                ("Shift+Tab", "back"),
-                ("Esc", "dismiss"),
-            ]),
-            Mode::Selecting if self.is_multi() => {
-                hint_line(&[("Enter", "toggle"), ("Tab", "next"), ("Esc", "dismiss")])
-            }
-            Mode::Selecting => {
-                hint_line(&[("Enter", "submit"), ("Tab", "next"), ("Esc", "dismiss")])
-            }
+            Mode::EditingCustom => &[
+                (HINT_ENTER, "submit"),
+                (HINT_SHIFT_ENTER, "newline"),
+                (HINT_ESC, "cancel"),
+            ],
+            Mode::Confirming => &[
+                (HINT_ENTER, "submit"),
+                (HINT_SHIFT_TAB, "back"),
+                (HINT_ESC, "dismiss"),
+            ],
+            Mode::Selecting if self.is_multi() => &[
+                (HINT_ENTER, "toggle"),
+                (HINT_TAB, "next"),
+                (HINT_ESC, "dismiss"),
+            ],
+            Mode::Selecting => &[
+                (HINT_ENTER, "submit"),
+                (HINT_TAB, "next"),
+                (HINT_ESC, "dismiss"),
+            ],
         }
+    }
+
+    fn hint(&self) -> Line<'static> {
+        let hovered = match self.hover {
+            Some(FormTarget::Hint(index)) => Some(index),
+            _ => None,
+        };
+        super::hint_line_hovered(self.hint_pairs(), hovered)
     }
 
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -484,28 +679,47 @@ impl QuestionForm {
         self.first_option_line() + self.cursor as u16
     }
 
-    fn tab_bar(&self) -> Line<'static> {
+    /// The tab bar's spans paired with what each one selects. Drawing and hit
+    /// testing both read this, so a tab can never sit somewhere other than
+    /// where a click looks for it. Separators select nothing.
+    fn tab_spans(&self) -> Vec<(Span<'static>, Option<FormTarget>)> {
         let t = theme::current();
-        let mut spans = Vec::new();
+        let mut spans = Vec::with_capacity(self.questions.len() * 2 + 1);
         for (index, question) in self.questions.iter().enumerate() {
             let label = tab_label(index, question);
             let answered = !self.answers[index].is_empty();
-            spans.push(
-                match (index == self.tab && self.mode != Mode::Confirming, answered) {
-                    (true, _) => Span::styled(format!(" {label} "), t.active),
-                    (false, true) => {
-                        Span::styled(format!(" {label}{ANSWERED_MARK}"), t.todo_completed)
-                    }
-                    (false, false) => Span::styled(format!(" {label} "), t.tool_dim),
-                },
-            );
-            spans.push(Span::styled(TAB_SEPARATOR, t.tool_dim));
+            let target = FormTarget::Tab(index);
+            let span = match (index == self.tab && self.mode != Mode::Confirming, answered) {
+                (true, _) => Span::styled(format!(" {label} "), t.active),
+                (false, true) => Span::styled(format!(" {label}{ANSWERED_MARK}"), t.todo_completed),
+                (false, false) => Span::styled(format!(" {label} "), t.tool_dim),
+            };
+            spans.push((self.hovered(span, target), Some(target)));
+            spans.push((Span::styled(TAB_SEPARATOR, t.tool_dim), None));
         }
-        spans.push(match self.mode {
+        let review = match self.mode {
             Mode::Confirming => Span::styled(REVIEW_TAB, t.active),
             _ => Span::styled(REVIEW_TAB, t.tool_dim),
-        });
-        Line::from(spans)
+        };
+        spans.push((
+            self.hovered(review, FormTarget::Review),
+            Some(FormTarget::Review),
+        ));
+        spans
+    }
+
+    fn hovered(&self, span: Span<'static>, target: FormTarget) -> Span<'static> {
+        let style = super::hover_style(span.style, self.hover == Some(target));
+        Span::styled(span.content, style)
+    }
+
+    fn tab_bar(&self) -> Line<'static> {
+        Line::from(
+            self.tab_spans()
+                .into_iter()
+                .map(|(span, _)| span)
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn selecting_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -626,20 +840,23 @@ impl QuestionForm {
             Line::default(),
         ];
         for (index, question) in self.questions.iter().enumerate() {
-            lines.push(Line::from(Span::raw(format!(
-                " {}. {}",
-                index + 1,
-                question.question.replace('\n', " ")
-            ))));
+            lines.push(Line::from(Span::styled(
+                format!(" {}. {}", index + 1, question.question.replace('\n', " ")),
+                super::hover_style(
+                    Style::default(),
+                    self.hover == Some(FormTarget::ReviewRow(index)),
+                ),
+            )));
             let picked = &self.answers[index];
             let text = if picked.is_empty() {
                 NO_ANSWER.to_owned()
             } else {
                 picked.join(", ")
             };
+            let on = self.hover == Some(FormTarget::ReviewRow(index));
             lines.push(Line::from(vec![
-                Span::styled(ANSWER_ARROW, t.tool_dim),
-                Span::styled(text, t.todo_completed),
+                Span::styled(ANSWER_ARROW, super::hover_style(t.tool_dim, on)),
+                Span::styled(text, super::hover_style(t.todo_completed, on)),
             ]));
         }
         lines
@@ -650,39 +867,6 @@ impl QuestionForm {
 /// occupies more than one row, so the line the form counts in and the row the
 /// terminal draws in are not the same number; scrolling and click targets both
 /// need the second one.
-struct VisualRows {
-    starts: Vec<u16>,
-    total: u16,
-}
-
-impl VisualRows {
-    fn row_of(&self, line: u16) -> u16 {
-        self.starts
-            .get(line as usize)
-            .copied()
-            .unwrap_or(self.total)
-    }
-
-    fn height_of(&self, line: u16) -> u16 {
-        self.row_of(line + 1).saturating_sub(self.row_of(line))
-    }
-}
-
-/// Measured with the same widget that draws them, so the two can never
-/// disagree about where a wrap falls.
-fn visual_rows(lines: &[Line<'static>], width: u16) -> VisualRows {
-    let width = width.max(1);
-    let mut starts = Vec::with_capacity(lines.len());
-    let mut total = 0;
-    for line in lines {
-        starts.push(total);
-        total += Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(width) as u16;
-    }
-    VisualRows { starts, total }
-}
-
 const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::ALT
     .union(KeyModifiers::SHIFT)
     .union(KeyModifiers::CONTROL);
@@ -711,6 +895,20 @@ fn edit(buffer: &mut TextBuffer, key: KeyEvent) {
         KeyCode::End => buffer.move_end(),
         _ => {}
     }
+}
+
+/// The key a hint label names. Every label `hint_pairs` offers has to resolve
+/// here, or the form draws a control that does nothing when pressed.
+fn hint_key(label: &str) -> Option<KeyEvent> {
+    let (code, modifiers) = match label {
+        HINT_ENTER => (KeyCode::Enter, KeyModifiers::NONE),
+        HINT_SHIFT_ENTER => (KeyCode::Enter, KeyModifiers::SHIFT),
+        HINT_TAB => (KeyCode::Tab, KeyModifiers::NONE),
+        HINT_SHIFT_TAB => (KeyCode::BackTab, KeyModifiers::SHIFT),
+        HINT_ESC => (KeyCode::Esc, KeyModifiers::NONE),
+        _ => return None,
+    };
+    Some(KeyEvent::new(code, modifiers))
 }
 
 fn tab_label(index: usize, question: &AskedQuestion) -> String {
@@ -744,6 +942,7 @@ mod tests {
     use super::*;
     use crate::components::key as key_event;
     use caudra_agent::types::QuestionOption;
+    use ratatui::widgets::Paragraph;
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -843,10 +1042,22 @@ mod tests {
         form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
     }
 
-    /// The middle of the row that option `index` was drawn on.
-    fn option_row(form: &QuestionForm, index: usize) -> (u16, u16) {
-        let hit = form.row_hits[index].area;
+    fn hit_area(form: &QuestionForm, target: FormTarget) -> Rect {
+        form.row_hits
+            .iter()
+            .find(|hit| hit.target == target)
+            .unwrap_or_else(|| panic!("{target:?} was not drawn"))
+            .area
+    }
+
+    /// A cell inside the row `target` was drawn on.
+    fn target_cell(form: &QuestionForm, target: FormTarget) -> (u16, u16) {
+        let hit = hit_area(form, target);
         (hit.x + 1, hit.y)
+    }
+
+    fn option_row(form: &QuestionForm, index: usize) -> (u16, u16) {
+        target_cell(form, FormTarget::Option(index))
     }
 
     #[test]
@@ -1015,12 +1226,17 @@ mod tests {
             press(&mut form, KeyCode::Down);
         }
         render(&mut form);
+        let options: Vec<usize> = form
+            .row_hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                FormTarget::Option(index) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert!(options.len() < count, "the list is taller than the form");
         assert!(
-            form.row_hits.len() < count,
-            "the list is taller than the form"
-        );
-        assert!(
-            form.row_hits.iter().all(|hit| hit.index > 0),
+            options.iter().all(|index| *index > 0),
             "the first option has scrolled off and must not be hit"
         );
     }
@@ -1197,5 +1413,335 @@ mod tests {
         let form = opened(vec![question("", false), question("", false)]);
         assert_eq!(tab_label(0, &form.questions[0]), "Q1");
         assert_eq!(tab_label(1, &form.questions[1]), "Q2");
+    }
+
+    const SECOND: &str = "Second";
+    const EXPECT_TAB_SWITCH: &str = "clicking a tab opens that question";
+    const EXPECT_NO_DRIFT: &str = "the hit rects must sit on the spans they name";
+
+    fn two_questions() -> Vec<AskedQuestion> {
+        vec![question(HEADER, false), question(SECOND, false)]
+    }
+
+    fn click_target(form: &mut QuestionForm, target: FormTarget) -> QuestionFormAction {
+        let (column, row) = target_cell(form, target);
+        click(form, column, row)
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_question() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        click_target(&mut form, FormTarget::Tab(1));
+        assert_eq!(form.tab, 1, "{EXPECT_TAB_SWITCH}");
+        click_target(&mut form, FormTarget::Tab(0));
+        assert_eq!(form.tab, 0, "{EXPECT_TAB_SWITCH}");
+    }
+
+    /// The bar is one line of variable-width spans, so a hit rect that is off
+    /// by a cell silently selects the neighbouring tab.
+    #[test]
+    fn every_tab_hit_covers_the_span_it_names() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        for index in 0..form.questions.len() {
+            let area = hit_area(&form, FormTarget::Tab(index));
+            let label = tab_label(index, &form.questions[index]);
+            for column in area.x..area.right() {
+                click(&mut form, column, area.y);
+                assert_eq!(form.tab, index, "{EXPECT_NO_DRIFT}: {label} at {column}");
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_review_tab_opens_the_review() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        click_target(&mut form, FormTarget::Review);
+        assert_eq!(form.mode, Mode::Confirming);
+    }
+
+    /// The review is where a reader notices they picked wrong, so its rows
+    /// are the shortest way back to the question that made them.
+    #[test]
+    fn clicking_a_review_row_goes_back_to_that_question() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        press(&mut form, KeyCode::Enter);
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.mode, Mode::Confirming);
+        render(&mut form);
+        click_target(&mut form, FormTarget::ReviewRow(0));
+        assert_eq!(form.mode, Mode::Selecting);
+        assert_eq!(form.tab, 0);
+    }
+
+    #[test]
+    fn the_review_submits_from_its_hint() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        press(&mut form, KeyCode::Enter);
+        press(&mut form, KeyCode::Enter);
+        render(&mut form);
+        let action = click_target(&mut form, FormTarget::Hint(0));
+        assert!(
+            matches!(&action, QuestionFormAction::Submit(picks) if picks.len() == 2),
+            "the submit hint has to do what Enter does"
+        );
+    }
+
+    #[test]
+    fn the_dismiss_hint_dismisses() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let last = form.hint_pairs().len() - 1;
+        let action = click_target(&mut form, FormTarget::Hint(last));
+        assert!(matches!(action, QuestionFormAction::Dismiss));
+    }
+
+    /// A hint that resolves to no key is a control the form draws and then
+    /// ignores, which is worse than not drawing it.
+    #[test]
+    fn every_hint_stands_for_a_key_and_gets_a_hit() {
+        let mut form = opened(two_questions());
+        for mode in [Mode::Selecting, Mode::EditingCustom, Mode::Confirming] {
+            form.mode = mode;
+            render(&mut form);
+            for (index, (label, _)) in form.hint_pairs().iter().enumerate() {
+                assert!(
+                    hint_key(label).is_some(),
+                    "{label:?} in {mode:?} names no key"
+                );
+                let drawn = form
+                    .row_hits
+                    .iter()
+                    .any(|hit| hit.target == FormTarget::Hint(index));
+                assert!(drawn, "hint {label:?} in {mode:?} got no hit rect");
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_in_the_answer_box_moves_the_cursor() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Down);
+        assert_eq!(form.mode, Mode::Selecting);
+        press(&mut form, KeyCode::Enter);
+        type_text(&mut form, TYPED);
+        render(&mut form);
+        assert_eq!(form.custom.x(), TYPED.chars().count());
+        let area = hit_area(&form, FormTarget::Editor(0));
+        let column = area.x + CUSTOM_PROMPT.chars().count() as u16 + 3;
+        click(&mut form, column, area.y);
+        assert_eq!(form.custom.x(), 3, "the cursor lands on the clicked cell");
+    }
+
+    /// Past the end of the text there is no cell to land on, so the cursor
+    /// stops at the end rather than running off it.
+    #[test]
+    fn clicking_past_the_answer_clamps_to_its_end() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Enter);
+        type_text(&mut form, TYPED);
+        render(&mut form);
+        let area = hit_area(&form, FormTarget::Editor(0));
+        click(&mut form, area.right() - 1, area.y);
+        assert_eq!(form.custom.x(), TYPED.chars().count());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_up_on_a_positive_delta() {
+        let mut form = opened(vec![long_question()]);
+        render(&mut form);
+        for _ in 0..form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        render(&mut form);
+        let scrolled = form.scroll;
+        assert!(scrolled > 0, "a long list has somewhere to scroll from");
+        form.scroll(1);
+        render(&mut form);
+        assert!(
+            form.scroll < scrolled,
+            "positive delta is ScrollUp everywhere else in the app"
+        );
+    }
+
+    /// The viewport used to be dragged back to the cursor on the very next
+    /// frame, which made the wheel look broken.
+    #[test]
+    fn the_wheel_survives_the_next_frame() {
+        let mut form = opened(vec![long_question()]);
+        render(&mut form);
+        for _ in 0..form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        render(&mut form);
+        form.scroll(i32::from(u16::MAX));
+        render(&mut form);
+        assert_eq!(form.scroll, 0, "the wheel reached the top and stayed");
+        render(&mut form);
+        assert_eq!(form.scroll, 0, "and a repaint alone must not undo it");
+    }
+
+    /// Moving the cursor is the reader asking to see it again.
+    #[test]
+    fn a_keystroke_puts_the_viewport_back_on_the_cursor() {
+        let mut form = opened(vec![long_question()]);
+        render(&mut form);
+        for _ in 0..form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        render(&mut form);
+        let followed = form.scroll;
+        form.scroll(i32::from(u16::MAX));
+        render(&mut form);
+        assert_eq!(form.scroll, 0);
+        press(&mut form, KeyCode::Up);
+        render(&mut form);
+        assert!(form.scroll >= followed.saturating_sub(1));
+    }
+
+    fn long_question() -> AskedQuestion {
+        AskedQuestion {
+            question: PICK.into(),
+            header: HEADER.into(),
+            options: (0..60)
+                .map(|index| QuestionOption {
+                    label: format!("option {index}"),
+                    description: String::new(),
+                })
+                .collect(),
+            multiple: false,
+        }
+    }
+    const EXPECT_MARKED: &str = "the control under the pointer has to be marked";
+    const EXPECT_UNMARKED: &str = "nothing else may be marked";
+
+    use ratatui::style::Modifier;
+    use test_case::test_case;
+
+    fn reversed_cells(form: &mut QuestionForm) -> Vec<(u16, u16)> {
+        let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                form.view(frame, SCREEN);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..TERMINAL_HEIGHT)
+            .flat_map(|y| (0..TERMINAL_WIDTH).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].modifier.contains(Modifier::REVERSED))
+            .collect()
+    }
+
+    fn hover(form: &mut QuestionForm, target: FormTarget) {
+        let (column, row) = target_cell(form, target);
+        form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
+    }
+
+    #[test_case(FormTarget::Tab(1)  ; "another_tab")]
+    #[test_case(FormTarget::Review  ; "the_review_tab")]
+    #[test_case(FormTarget::Hint(0) ; "a_hint")]
+    fn hovering_a_control_marks_it(target: FormTarget) {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
+
+        hover(&mut form, target);
+        let marked = reversed_cells(&mut form);
+        assert!(!marked.is_empty(), "{EXPECT_MARKED}");
+        let area = hit_area(&form, target);
+        assert!(
+            marked
+                .iter()
+                .all(|(x, y)| area.contains(Position::new(*x, *y))),
+            "{EXPECT_UNMARKED}: {marked:?} outside {area:?}"
+        );
+    }
+
+    /// A review row is the question and the answer under it, so the mark
+    /// covers both of its lines and nothing outside them.
+    #[test]
+    fn hovering_a_review_row_marks_it() {
+        let mut form = opened(two_questions());
+        form.mode = Mode::Confirming;
+        render(&mut form);
+        hover(&mut form, FormTarget::ReviewRow(1));
+        let marked = reversed_cells(&mut form);
+        assert!(!marked.is_empty(), "{EXPECT_MARKED}");
+        let areas: Vec<Rect> = form
+            .row_hits
+            .iter()
+            .filter(|hit| hit.target == FormTarget::ReviewRow(1))
+            .map(|hit| hit.area)
+            .collect();
+        assert_eq!(areas.len(), REVIEW_LINES_PER_QUESTION as usize);
+        assert!(
+            marked.iter().all(|(x, y)| areas
+                .iter()
+                .any(|area| area.contains(Position::new(*x, *y)))),
+            "{EXPECT_UNMARKED}: {marked:?} outside {areas:?}"
+        );
+    }
+
+    /// An option row is already marked by the cursor the hover moves, so
+    /// reversing it too would say the same thing twice.
+    #[test]
+    fn hovering_an_option_marks_nothing_extra() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        let (column, row) = option_row(&form, 1);
+        form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
+        assert_eq!(form.cursor, 1);
+        assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
+    }
+
+    #[test]
+    fn moving_off_every_control_unmarks_them() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        hover(&mut form, FormTarget::Review);
+        assert!(!reversed_cells(&mut form).is_empty(), "{EXPECT_MARKED}");
+
+        let outside = hit_area(&form, FormTarget::Review);
+        form.handle_mouse(mouse(MouseEventKind::Moved, outside.x, TERMINAL_HEIGHT - 1));
+        assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
+    }
+
+    /// The hover marks what a click would press, so a hint that reads as a
+    /// button has to act like one.
+    #[test]
+    fn the_marked_hint_is_the_one_a_click_presses() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        let (column, row) = target_cell(&form, FormTarget::Hint(1));
+        form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
+        assert_eq!(form.hover, Some(FormTarget::Hint(1)));
+        click(&mut form, column, row);
+        assert_eq!(form.tab, 1, "the next-question hint moved the tab");
+    }
+
+    /// Hints are held by position, so a click that reshuffles them must not
+    /// leave the mark on whatever moved into the old place.
+    #[test]
+    fn a_click_that_changes_the_hints_drops_the_mark() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        let (column, row) = target_cell(&form, FormTarget::Review);
+        form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
+        assert!(form.hover.is_some(), "{EXPECT_MARKED}");
+
+        click(&mut form, column, row);
+        assert_eq!(form.mode, Mode::Confirming, "the review tab opened review");
+        assert_eq!(form.hover, None);
+        assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
     }
 }

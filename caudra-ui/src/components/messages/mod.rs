@@ -16,7 +16,9 @@ use super::tool_display::{
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
-    apply_scroll_delta, code_view::SectionFlags, review,
+    apply_scroll_delta,
+    code_view::{BatchFoldMap, RowTarget, SectionFlags},
+    review,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -134,6 +136,9 @@ pub struct MessagesPanel {
     /// `disclosure` because it is a choice about the body rather than an
     /// expansion of it, so closing the card must not forget it.
     shell_raw: HashSet<String>,
+    /// Which batch children the reader folded away, by parent tool id. Empty
+    /// for every card nobody has clicked, which is nearly all of them.
+    batch_folds: BatchFoldMap,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
     diagram_pans: HashMap<DiagramKey, u16>,
@@ -207,6 +212,7 @@ impl MessagesPanel {
             accent: ColorTransition::new(theme::current().mode_build),
             disclosure: HashMap::new(),
             shell_raw: HashSet::new(),
+            batch_folds: BatchFoldMap::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
@@ -428,6 +434,7 @@ impl MessagesPanel {
         self.cache.clear();
         self.auto_open = None;
         self.disclosure.clear();
+        self.batch_folds.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
@@ -1113,11 +1120,16 @@ impl MessagesPanel {
         let shell_toggle = segment
             .shell_toggle_line
             .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
-        if !native_toggle && !shell_toggle && !known_task_target {
+        let batch_child = segment
+            .row_target_at(rel, width)
+            .and_then(|_| segment.source_line_at(rel, width));
+        if !native_toggle && !shell_toggle && batch_child.is_none() && !known_task_target {
             return None;
         }
         let feedback = if shell_toggle {
             HoverFeedback::ShellToggle
+        } else if let Some(line) = batch_child {
+            HoverFeedback::Row(line)
         } else if native_toggle
             && segment.lines().iter().any(|line| {
                 line.spans
@@ -1418,6 +1430,13 @@ impl MessagesPanel {
             self.rebuild_expanded_tool(&tool_id);
             return true;
         }
+        // A batch child folds on its own, before the card-wide expansion the
+        // rest of the body falls back to.
+        if let Some(RowTarget::BatchChild(index)) = seg.row_target_at(rel, width) {
+            let tool_id = tool_id.to_owned();
+            self.toggle_batch_fold(&tool_id, index);
+            return true;
+        }
         let nothing_to_open = !seg.truncation.any() && !exp.any();
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
@@ -1456,6 +1475,19 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
         self.handle_click(row, area)
+    }
+
+    /// Folding hides a child's body, which is what the reader asked for, and
+    /// leaves every other child exactly as it was.
+    fn toggle_batch_fold(&mut self, tool_id: &str, index: usize) {
+        let folds = self
+            .batch_folds
+            .get(tool_id)
+            .cloned()
+            .unwrap_or_default()
+            .toggled(index);
+        self.batch_folds.insert(tool_id.to_owned(), folds);
+        self.rebuild_tool_segment(tool_id);
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
@@ -2045,6 +2077,7 @@ impl MessagesPanel {
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
             compact: self.compact(),
+            batch_folds: &self.batch_folds,
         }
     }
 
@@ -2258,7 +2291,7 @@ impl MessagesPanel {
                 .iter_mut()
                 .find(|s| s.matches_pending_highlight(result.id))
             {
-                seg.apply_highlight_result(result.lines);
+                seg.apply_highlight_result(result.lines, result.rows);
                 dirty = Dirty::YES;
             }
         }

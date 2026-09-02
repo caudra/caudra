@@ -51,6 +51,8 @@ use caudra_providers::{CaudraId, HistoryItem, ModelTier};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 
@@ -98,20 +100,126 @@ pub(crate) trait Overlay {
     }
 }
 
-pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+/// Leading gap before each hint, and the gap between a key and its label.
+const HINT_GAP: u16 = 2;
+const HINT_KEY_GAP: u16 = 1;
+
+/// One hint's spans and the cells they occupy. Drawing, hit testing and hover
+/// all read this, so a hint cannot be styled in one place and measured in
+/// another, and a hit rect cannot drift off the glyphs it claims to cover.
+fn hint_parts<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Vec<(Vec<Span<'static>>, u16)> {
     let t = crate::theme::current();
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
-    for (key, desc) in pairs {
-        spans.push(Span::raw("  "));
-        for (i, part) in key.as_ref().split('/').enumerate() {
-            if i > 0 {
-                spans.push(Span::styled("/", t.tool_dim));
+    pairs
+        .iter()
+        .map(|(key, desc)| {
+            let mut spans = vec![Span::raw("  ")];
+            for (i, part) in key.as_ref().split('/').enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled("/", t.tool_dim));
+                }
+                spans.push(Span::styled(part.to_string(), t.keybind_key));
             }
-            spans.push(Span::styled(part.to_string(), t.keybind_key));
-        }
-        spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
-    }
+            spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
+            let key_width = UnicodeWidthStr::width(key.as_ref()) as u16;
+            let desc_width = UnicodeWidthStr::width(desc.as_ref()) as u16;
+            (spans, HINT_GAP + key_width + HINT_KEY_GAP + desc_width)
+        })
+        .collect()
+}
+
+pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    hint_line_hovered(pairs, None)
+}
+
+/// The hint bar with one pair marked. A hovered hint reverses whole, key and
+/// description together, so the pointer marks the control rather than half of
+/// it.
+pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
+    pairs: &[(K, V)],
+    hovered: Option<usize>,
+) -> Line<'static> {
+    let spans = hint_parts(pairs)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, (spans, _))| {
+            let on = hovered == Some(index);
+            spans.into_iter().map(move |mut span| {
+                span.style = hover_style(span.style, on);
+                span
+            })
+        })
+        .collect::<Vec<_>>();
     Line::from(spans)
+}
+
+/// Where each hint pair landed inside `area`, so a click can name the one it
+/// hit. Pairs that run past the right edge are dropped rather than clipped:
+/// a hint the reader cannot fully see is not one they can knowingly press.
+pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(
+    pairs: &[(K, V)],
+    area: ratatui::layout::Rect,
+) -> Vec<ratatui::layout::Rect> {
+    let mut x = area.x;
+    let mut hits = Vec::with_capacity(pairs.len());
+    for (_, width) in hint_parts(pairs) {
+        if x.saturating_add(width) > area.right() {
+            break;
+        }
+        hits.push(ratatui::layout::Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        });
+        x += width;
+    }
+    hits
+}
+
+/// Where each logical line starts once wrapping has been applied, so a hit
+/// rect can be placed on a line the reader sees rather than the one it was
+/// written as.
+struct VisualRows {
+    starts: Vec<u16>,
+    total: u16,
+}
+
+impl VisualRows {
+    fn row_of(&self, line: u16) -> u16 {
+        self.starts
+            .get(line as usize)
+            .copied()
+            .unwrap_or(self.total)
+    }
+
+    fn height_of(&self, line: u16) -> u16 {
+        self.row_of(line + 1).saturating_sub(self.row_of(line))
+    }
+}
+
+/// Measured with the same widget that draws them, so the two can never
+/// disagree about where a wrap falls.
+fn visual_rows(lines: &[Line<'static>], width: u16) -> VisualRows {
+    let width = width.max(1);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut total = 0;
+    for line in lines {
+        starts.push(total);
+        total += Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16;
+    }
+    VisualRows { starts, total }
+}
+
+/// How every control in the UI says the pointer is on it. One helper so a new
+/// button cannot invent its own idea of what hovered looks like.
+pub(crate) fn hover_style(style: Style, hovered: bool) -> Style {
+    if hovered {
+        style.add_modifier(ratatui::style::Modifier::REVERSED)
+    } else {
+        style
+    }
 }
 
 pub(crate) fn visual_line_count(text_len: usize, width: usize) -> usize {
@@ -539,6 +647,13 @@ impl DisplayRole {
     pub fn tool_name(&self) -> Option<&str> {
         match self {
             DisplayRole::Tool(t) => Some(&t.name),
+            _ => None,
+        }
+    }
+
+    pub fn tool_id(&self) -> Option<&str> {
+        match self {
+            DisplayRole::Tool(t) => Some(&t.id),
             _ => None,
         }
     }

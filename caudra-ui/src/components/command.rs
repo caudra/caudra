@@ -247,7 +247,7 @@ struct Match {
     indices: Vec<u32>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CommandRowKey {
     Builtin(&'static str),
     Custom(usize),
@@ -286,6 +286,11 @@ pub struct CommandPalette {
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     current_arg_count: usize,
+    /// First visible row. The popup is capped by the space above the input, so
+    /// a long list has rows that only scrolling reaches.
+    scroll_offset: usize,
+    /// Rows the popup last had room for, which only rendering can know.
+    viewport_height: usize,
     popup_area: Option<Rect>,
     row_hits: Vec<CommandRowHit>,
     mouse_down: Option<CommandRowKey>,
@@ -319,6 +324,8 @@ impl CommandPalette {
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
+            scroll_offset: 0,
+            viewport_height: 0,
             popup_area: None,
             row_hits: Vec::new(),
             mouse_down: None,
@@ -606,11 +613,13 @@ impl CommandPalette {
         }
 
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.ensure_visible();
     }
 
     pub fn close(&mut self) {
         self.filtered.clear();
         self.current_arg_count = 0;
+        self.scroll_offset = 0;
         self.invalidate_mouse_geometry();
     }
 
@@ -623,6 +632,7 @@ impl CommandPalette {
         } else {
             self.selected - 1
         };
+        self.ensure_visible();
     }
 
     pub fn move_down(&mut self) {
@@ -634,6 +644,43 @@ impl CommandPalette {
         } else {
             self.selected + 1
         };
+        self.ensure_visible();
+    }
+
+    /// Brings the selection back into the popup. Only a selection move calls
+    /// this: doing it every frame would undo the wheel on the next repaint.
+    fn ensure_visible(&mut self) {
+        if self.viewport_height == 0 {
+            return;
+        }
+        let offset = if self.selected < self.scroll_offset {
+            self.selected
+        } else if self.selected >= self.scroll_offset + self.viewport_height {
+            self.selected + 1 - self.viewport_height
+        } else {
+            return;
+        };
+        self.scroll_offset = offset;
+        self.invalidate_mouse_geometry();
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.popup_area.is_some_and(|area| area.contains(pos))
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        let max_offset = self.filtered.len().saturating_sub(self.viewport_height);
+        let offset = if delta > 0 {
+            self.scroll_offset.saturating_sub(delta as usize)
+        } else {
+            self.scroll_offset
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        let offset = offset.min(max_offset);
+        if offset != self.scroll_offset {
+            self.scroll_offset = offset;
+            self.invalidate_mouse_geometry();
+        }
     }
 
     fn item_name(&self, m: &Match) -> String {
@@ -748,10 +795,16 @@ impl CommandPalette {
         };
 
         let t = theme::current();
-        let lines: Vec<Line> = filtered
+        let viewport_height = popup_height as usize;
+        let scroll_offset = self
+            .scroll_offset
+            .min(filtered.len().saturating_sub(viewport_height));
+        let end = (scroll_offset + viewport_height).min(filtered.len());
+        let lines: Vec<Line> = filtered[scroll_offset..end]
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(row, m)| {
+                let i = scroll_offset + row;
                 let name = self.item_name(m);
                 let desc = self.item_description(m);
                 let selected = i == self.selected;
@@ -781,17 +834,18 @@ impl CommandPalette {
         frame.render_widget(Clear, popup);
         frame.render_widget(Paragraph::new(lines).style(t.surface_style()), popup);
 
-        self.popup_area = Some(popup);
-        self.row_hits = filtered
+        self.row_hits = filtered[scroll_offset..end]
             .iter()
-            .take(popup_height as usize)
             .enumerate()
-            .map(|(filtered_index, item)| CommandRowHit {
-                area: Rect::new(popup.x, popup.y + filtered_index as u16, popup.width, 1),
-                filtered_index,
+            .map(|(row, item)| CommandRowHit {
+                area: Rect::new(popup.x, popup.y + row as u16, popup.width, 1),
+                filtered_index: scroll_offset + row,
                 key: item.command_type.row_key(),
             })
             .collect();
+        self.popup_area = Some(popup);
+        self.viewport_height = viewport_height;
+        self.scroll_offset = scroll_offset;
 
         Some(popup)
     }
@@ -1430,5 +1484,98 @@ mod tests {
         assert_eq!(updated_lua, 2);
         assert!(p.find_lua_command("/old").is_none());
         assert!(p.find_lua_command("/new1").is_some());
+    }
+
+    /// Rows above the input are all the popup gets, so a list longer than that
+    /// has some only scrolling can reach.
+    const CRAMPED_ROWS: u16 = 4;
+    const EXPECT_LAST_ROW: &str = "the last command has to be reachable";
+
+    fn render_cramped(palette: &mut CommandPalette) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                palette.view(frame, Rect::new(0, CRAMPED_ROWS, 80, 1));
+            })
+            .unwrap();
+    }
+
+    fn visible(palette: &CommandPalette) -> Vec<usize> {
+        palette
+            .row_hits
+            .iter()
+            .map(|hit| hit.filtered_index)
+            .collect()
+    }
+
+    /// Walking off the bottom used to leave the selection drawn nowhere: the
+    /// popup always rendered from the first match.
+    #[test]
+    fn walking_past_the_fold_brings_the_selection_with_it() {
+        let mut palette = synced("/");
+        render_cramped(&mut palette);
+        let last = palette.filtered.len() - 1;
+        assert!(
+            last >= usize::from(CRAMPED_ROWS),
+            "the list has to overflow"
+        );
+        for _ in 0..last {
+            palette.move_down();
+            render_cramped(&mut palette);
+        }
+        assert_eq!(palette.selected, last);
+        assert!(visible(&palette).contains(&last), "{EXPECT_LAST_ROW}");
+    }
+
+    #[test]
+    fn the_wheel_reaches_rows_past_the_fold() {
+        let mut palette = synced("/");
+        render_cramped(&mut palette);
+        let last = palette.filtered.len() - 1;
+        palette.scroll(-(last as i32));
+        render_cramped(&mut palette);
+        assert!(visible(&palette).contains(&last), "{EXPECT_LAST_ROW}");
+        assert_eq!(
+            palette.selected, 0,
+            "the wheel moves the view, not the pick"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_up_on_a_positive_delta() {
+        let mut palette = synced("/");
+        render_cramped(&mut palette);
+        palette.scroll(-2);
+        render_cramped(&mut palette);
+        assert_eq!(palette.scroll_offset, 2);
+        palette.scroll(2);
+        render_cramped(&mut palette);
+        assert_eq!(palette.scroll_offset, 0);
+    }
+
+    /// A row hit has to name the command drawn on it, or a click after
+    /// scrolling runs the wrong one.
+    #[test]
+    fn a_scrolled_row_hit_names_the_command_drawn_on_it() {
+        let mut palette = synced("/");
+        render_cramped(&mut palette);
+        palette.scroll(-3);
+        render_cramped(&mut palette);
+        let hit = *palette.row_hits.first().expect("a row was drawn");
+        assert_eq!(hit.filtered_index, palette.scroll_offset);
+        assert_eq!(
+            hit.key,
+            palette.filtered[hit.filtered_index].command_type.row_key()
+        );
+    }
+
+    #[test]
+    fn the_palette_claims_the_wheel_only_where_it_drew() {
+        let mut palette = synced("/");
+        render_cramped(&mut palette);
+        let popup = palette.popup_area.expect("the palette drew");
+        assert!(palette.contains(Position::new(popup.x, popup.y)));
+        assert!(!palette.contains(Position::new(popup.x, popup.bottom())));
     }
 }

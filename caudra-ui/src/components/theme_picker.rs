@@ -5,7 +5,7 @@ use crate::theme;
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Themes ";
 const MAX_VISIBLE: u16 = 15;
@@ -57,6 +57,16 @@ impl ThemePicker {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ThemePickerAction {
         let action = self.picker.handle_mouse(event);
         self.map_picker_action(action)
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.picker.contains(pos)
+    }
+
+    /// The wheel moves the viewport, not the selection, so the previewed theme
+    /// is still the selected one and needs no reapplying.
+    pub fn scroll(&mut self, delta: i32) {
+        self.picker.scroll(delta);
     }
 
     fn map_picker_action(&mut self, action: PickerAction<String>) -> ThemePickerAction {

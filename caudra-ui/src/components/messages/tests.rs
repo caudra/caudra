@@ -4207,3 +4207,153 @@ fn auto_follows_the_newest_reasoning_too() {
         "{REASONING_TAIL_MSG}"
     );
 }
+
+const BATCH_TOOL: &str = "batch";
+const BATCH_CHILD_BODY: &str = "child_body_line";
+const EXPECT_BODY_HIDDEN: &str = "folding a child hides its body";
+const EXPECT_OTHERS_KEPT: &str = "the other children are untouched";
+
+fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
+    caudra_agent::BatchToolEntry {
+        tool: tool.into(),
+        summary: format!("{tool} ran"),
+        status: caudra_agent::BatchToolStatus::Success,
+        input: None,
+        output: Some(ToolOutput::Plain(
+            format!("{BATCH_CHILD_BODY}_{marker}").into(),
+        )),
+        annotation: None,
+    }
+}
+
+fn panel_with_batch() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![batch_child("read", "a"), batch_child("grep", "b")],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+    panel
+}
+
+/// The row a child's summary was drawn on, as the panel counts rows.
+fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some("t1"))
+        .unwrap();
+    let width = segment.chrome(80).content_width(80);
+    let start = segment.chrome(80).content_start();
+    (0..segment.content_height(80))
+        .map(|row| start + row)
+        .find(|row| segment.row_target_at(*row, width) == Some(RowTarget::BatchChild(index)))
+        .expect("the child was drawn")
+}
+
+#[test]
+fn clicking_a_batch_child_folds_only_that_child() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    let before = seg_text(&panel, "t1");
+    assert!(before.contains("child_body_line_a"));
+    assert!(before.contains("child_body_line_b"));
+
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+    let folded = seg_text(&panel, "t1");
+    assert!(
+        !folded.contains("child_body_line_a"),
+        "{EXPECT_BODY_HIDDEN}"
+    );
+    assert!(folded.contains("child_body_line_b"), "{EXPECT_OTHERS_KEPT}");
+    assert!(folded.contains("read ran"), "the summary stays");
+}
+
+#[test]
+fn clicking_a_folded_batch_child_unfolds_it() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+    assert!(seg_text(&panel, "t1").contains("child_body_line_a"));
+}
+
+/// A fold shifts every row below it, so the second child has to be found
+/// where it now is rather than where it started.
+#[test]
+fn a_fold_above_does_not_move_the_click_off_the_child_below() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+
+    assert!(panel.handle_click(batch_child_row(&panel, 1), area));
+    render(&mut panel, 80, 24);
+    let both = seg_text(&panel, "t1");
+    assert!(!both.contains("child_body_line_a"), "{EXPECT_BODY_HIDDEN}");
+    assert!(!both.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
+}
+
+/// A batch child is a control, so the pointer has to say so before the press.
+#[test]
+fn hovering_a_batch_child_marks_that_row() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    let row = batch_child_row(&panel, 1);
+    panel.update_hover(row, area.x, area, false);
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some("t1"))
+        .unwrap();
+    let line = segment
+        .source_line_at(row, segment.chrome(80).content_width(80))
+        .unwrap();
+    assert_eq!(
+        panel.hover,
+        Some(HoverTarget::Tool {
+            id: "t1".into(),
+            feedback: HoverFeedback::Row(line),
+        })
+    );
+}
+
+/// A fold names a tool id from the session that is going away, so carrying it
+/// into the next one would fold whatever inherits the id.
+#[test]
+fn loading_a_session_forgets_the_folds() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    assert!(!panel.batch_folds.is_empty());
+
+    panel.load_messages(Vec::new());
+    assert!(panel.batch_folds.is_empty());
+}
+
+/// Folding is a choice about the body, like the raw/filtered switch, so the
+/// reset a mode change performs on every disclosure must leave it alone.
+#[test]
+fn changing_mode_keeps_a_batch_child_folded() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+
+    panel.set_view(ViewMode::Compact);
+    render(&mut panel, 80, 24);
+    panel.set_view(ViewMode::Expanded);
+    render(&mut panel, 80, 24);
+    assert!(!seg_text(&panel, "t1").contains("child_body_line_a"));
+    assert!(seg_text(&panel, "t1").contains("child_body_line_b"));
+}

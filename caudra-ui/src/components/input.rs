@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::scrollbar::render_vertical_scrollbar;
-use super::{apply_scroll_delta, visual_line_count};
+use super::{apply_scroll_delta, hover_style, visual_line_count};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
@@ -794,16 +794,8 @@ pub(crate) fn admission_hint(
             .saturating_add(ADMISSION_DESCRIPTION_GAP.width() as u16)
             .saturating_add(description_width);
         let is_hovered = hovered == Some(admission);
-        let key_style = if is_hovered {
-            theme.keybind_key.add_modifier(Modifier::REVERSED)
-        } else {
-            theme.keybind_key
-        };
-        let description_style = if is_hovered {
-            theme.tool_dim.add_modifier(Modifier::REVERSED)
-        } else {
-            theme.tool_dim
-        };
+        let key_style = hover_style(theme.keybind_key, is_hovered);
+        let description_style = hover_style(theme.tool_dim, is_hovered);
         spans.push(Span::styled(key, key_style));
         spans.push(Span::styled(
             format!("{ADMISSION_DESCRIPTION_GAP}{description}"),
@@ -1033,10 +1025,8 @@ fn paste_token_spans(
         let text: String = line.chars().skip(range.start).take(range.len()).collect();
         let style = if focused == Some(*id) {
             theme::current().item_selected
-        } else if hovered == Some(*id) {
-            theme::current().active.add_modifier(Modifier::REVERSED)
         } else {
-            theme::current().active
+            hover_style(theme::current().active, hovered == Some(*id))
         };
         spans.push(Span::styled(text, style));
         cursor = range.end;

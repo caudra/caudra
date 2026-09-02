@@ -22,6 +22,10 @@ const FINISHED_SECTION: &str = "Finished";
 const DONE_SUFFIX: &str = "done";
 const ERROR_SUFFIX: &str = "error";
 
+/// `Preview` is the reason this must not be dropped: the picker moved the
+/// selection but only the app can focus the task behind it, so a discarded
+/// action leaves the transcript showing something else.
+#[must_use]
 pub enum TaskPickerAction {
     Consumed,
     /// The selection moved. The app focuses this task so the transcript behind
@@ -307,7 +311,7 @@ mod tests {
     #[test]
     fn cancelling_hands_back_the_task_that_was_focused_on_open() {
         let mut picker = opened();
-        picker.handle_key(key_event(KeyCode::Down));
+        let _ = picker.handle_key(key_event(KeyCode::Down));
         let action = picker.handle_key(key_event(KeyCode::Esc));
         assert!(
             matches!(action, TaskPickerAction::Closed(Some(id)) if id == MAIN_ID),
@@ -319,7 +323,7 @@ mod tests {
     #[test]
     fn committing_keeps_the_previewed_task() {
         let mut picker = opened();
-        picker.handle_key(key_event(KeyCode::Down));
+        let _ = picker.handle_key(key_event(KeyCode::Down));
         let action = picker.handle_key(key_event(KeyCode::Enter));
         assert!(matches!(action, TaskPickerAction::Opened));
         assert!(!picker.is_open());
@@ -328,7 +332,7 @@ mod tests {
     #[test]
     fn a_status_change_keeps_the_cursor_on_its_task() {
         let mut picker = opened();
-        picker.handle_key(key_event(KeyCode::Down));
+        let _ = picker.handle_key(key_event(KeyCode::Down));
         assert_eq!(picker.selected_id().as_deref(), Some(RUNNING_ID));
         picker.refresh(vec![
             task(MAIN_ID, "chat", None, false),

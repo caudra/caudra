@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
+use crate::components::hover_style;
 use crate::components::tool_display::{FILTERED_AFFORDANCE, RAW_AFFORDANCE};
 use crate::markdown::{LinkMap, TerminalLink};
 
@@ -17,6 +18,9 @@ pub(super) enum HoverFeedback {
     /// Only the raw/filtered switch, so hovering it does not also light up an
     /// expand affordance elsewhere on the same card.
     ShellToggle,
+    /// One body line, by its index. A batch child is a control in its own
+    /// right, so it marks itself rather than the card around it.
+    Row(usize),
     Chrome,
 }
 
@@ -25,7 +29,7 @@ impl HoverFeedback {
         match self {
             Self::Affordance => &[EXPAND_AFFORDANCE],
             Self::ShellToggle => &[RAW_AFFORDANCE, FILTERED_AFFORDANCE],
-            Self::Chrome => &[],
+            Self::Row(_) | Self::Chrome => &[],
         }
     }
 }
@@ -164,6 +168,14 @@ fn hover_lines(
                     spans.extend(reverse_affordance(span, feedback.needles()));
                 }
                 line.spans = spans;
+            }
+        }
+        Some((HoverFeedback::Row(line), _)) => {
+            if let Some(row) = lines.get_mut(line) {
+                row.style = hover_style(row.style, true);
+                for span in &mut row.spans {
+                    span.style = hover_style(span.style, true);
+                }
             }
         }
         Some((HoverFeedback::Chrome, accent)) => {
