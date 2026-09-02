@@ -3,54 +3,34 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_lock::Mutex as AsyncMutex;
+use caudra_agent::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent};
 use caudra_agent::agent::tool_dispatch::{self, Emit};
-use caudra_agent::cancel::{CancelMap, CancelSlot};
 use caudra_agent::tools::interpreter_bridge;
 use caudra_agent::tools::registry::ToolRegistry;
 use caudra_agent::tools::schema::sanitize_tool_input_schema;
 use caudra_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolEffect, ToolFilter, ToolLive, audited_local_tool,
+    Deadline, DescriptionContext, LocalToolFn, LocalTools, ToolAudience, ToolContext, ToolEffect,
+    ToolFilter, ToolLive, audited_local_tool,
 };
-use caudra_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, InterruptSource, McpSession,
-    SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
-    SubagentHistoryLease, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
-    SubagentTaskSpecCandidate, ToolDoneEvent, reasoning_summary, steering_queue,
-};
+use caudra_agent::{SubagentTaskMode, ToolDoneEvent};
 use caudra_lua_macro::{lua_class, lua_fn, lua_table};
 use caudra_providers::model::ModelTier;
 use caudra_providers::provider;
-use caudra_providers::{
-    ContentBlock, HistoryItem, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage,
-    add_cost, expand_message,
-};
+use caudra_providers::{Model, ModelError, ThinkingConfig};
 use caudra_storage::id::CaudraId;
 use caudra_storage::thinking::StoredThinking;
 use futures::future::{Either, select};
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
-use tracing::info;
 
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::runtime::CANCELLED_MSG;
-
-const SESSION_CLOSED_ERR: &str = "session closed";
-const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
-const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
-const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra's built-in task prompt";
-/// A thought's title is its first bold line. Past this the block is into
-/// prose and will never resolve one, so it stops being accumulated and a
-/// long reasoning stream cannot be buffered a second time for nothing.
-const THOUGHT_TITLE_SCAN_LIMIT: usize = 200;
 
 fn parse_task_mode(mode: Option<&str>) -> Result<Option<SubagentTaskMode>, String> {
     match mode {
@@ -70,14 +50,6 @@ fn parse_local_tool_effect(effect: Option<&str>) -> Result<ToolEffect, String> {
         Some(other) => Err(format!("unknown local tool effect: {other}")),
         None => Ok(ToolEffect::Unknown),
     }
-}
-
-fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
-    let mut items: Vec<HistoryItem> = Vec::new();
-    for message in messages {
-        items.extend(expand_message(message, items.last().map(|item| item.id)));
-    }
-    items
 }
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -102,148 +74,6 @@ fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
     ctx.agent()
         .ok_or_else(|| ctx.cap_err(&format!("caudra.agent.{method}")))
-}
-
-/// Forwards subagent events to the parent, stamped with the subagent identity.
-/// Usage takes two paths: live on the tool header while the run goes on (last
-/// turn's tokens plus the run's summed cost), and one total per run on
-/// `usage_tx`, which `prompt` waits for. Progress takes the same two paths, so
-/// a standalone task and a batch child both report the same run.
-async fn relay_session_events(
-    sub_rx: flume::Receiver<Envelope>,
-    parent_tx: EventSender,
-    subagent_info: Arc<OnceLock<SubagentInfo>>,
-    usage_tx: flume::Sender<TokenUsage>,
-    live_sink: Option<flume::Sender<ToolLive>>,
-) {
-    let mut cost = None;
-    let mut progress = ProgressRelay::new();
-    while let Ok(mut envelope) = sub_rx.recv_async().await {
-        progress.relay(&envelope, &parent_tx, &subagent_info, live_sink.as_ref());
-        match &envelope.event {
-            AgentEvent::TurnComplete(turn) => {
-                add_cost(&mut cost, turn.cost);
-                if let Some(sink) = &live_sink {
-                    let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
-                }
-            }
-            AgentEvent::Done { usage, .. } => {
-                let _ = usage_tx.send(*usage);
-                continue;
-            }
-            AgentEvent::Error { .. }
-            | AgentEvent::ToolOutput { .. }
-            | AgentEvent::ToolPending { .. } => continue,
-            _ => {}
-        }
-        envelope.subagent = subagent_info.get().cloned();
-        let _ = parent_tx.send_envelope(envelope);
-    }
-}
-
-/// Keeps the running digest one subagent reports to its parent.
-struct ProgressRelay {
-    started: Instant,
-    tools: u32,
-    thought: String,
-    thought_title: Option<String>,
-    last: Option<SubagentActivity>,
-}
-
-impl ProgressRelay {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            tools: 0,
-            thought: String::new(),
-            thought_title: None,
-            last: None,
-        }
-    }
-
-    /// The stateful half of [`SubagentActivity::from_event`]: a thought names
-    /// itself over several deltas, and a tool can rename itself long after it
-    /// started, so both need what came before.
-    fn activity(&mut self, event: &AgentEvent) -> Option<SubagentActivity> {
-        match event {
-            AgentEvent::ThinkingDelta { text } => {
-                // The title fence can straddle two deltas, so once it parses
-                // it is kept: a heading that blinks off reads as a fault.
-                if self.thought_title.is_none() && self.thought.len() < THOUGHT_TITLE_SCAN_LIMIT {
-                    self.thought.push_str(text);
-                    self.thought_title = reasoning_summary(&self.thought).title.map(str::to_owned);
-                }
-                Some(SubagentActivity::Thinking {
-                    title: self.thought_title.clone(),
-                })
-            }
-            // The header a plugin paints mid-run is the one its transcript
-            // shows, and it arrives without a tool name to match on.
-            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => match &self.last {
-                Some(SubagentActivity::Tool { name, .. }) => Some(SubagentActivity::tool(
-                    Arc::clone(name),
-                    &snapshot.first_line_text(),
-                )),
-                _ => None,
-            },
-            _ => {
-                let activity = SubagentActivity::from_event(event);
-                // A turn ends the thought even with nothing after it, and the
-                // next one must not inherit this heading.
-                if activity.is_some() || matches!(event, AgentEvent::TurnComplete(_)) {
-                    self.thought.clear();
-                    self.thought_title = None;
-                }
-                activity
-            }
-        }
-    }
-
-    /// Publishes on every change, and only on a change: text and thinking
-    /// arrive one delta at a time and would otherwise repaint the parent
-    /// header on every token.
-    ///
-    /// An envelope that already carries a subagent came from deeper down, and
-    /// this session is blocked on the nested task that produced it, so
-    /// relaying a grandchild's progress here would read as this session doing
-    /// that work.
-    fn relay(
-        &mut self,
-        envelope: &Envelope,
-        parent_tx: &EventSender,
-        subagent_info: &OnceLock<SubagentInfo>,
-        live_sink: Option<&flume::Sender<ToolLive>>,
-    ) {
-        if envelope.subagent.is_some() {
-            return;
-        }
-        // `ToolPending` announces the same call, so counting that instead
-        // would double every tool the subagent runs.
-        let counted = matches!(envelope.event, AgentEvent::ToolStart(_));
-        self.tools += u32::from(counted);
-        let Some(activity) = self.activity(&envelope.event) else {
-            return;
-        };
-        // Two identical calls in a row leave the activity untouched, and the
-        // count is the only thing that moved.
-        if !counted && self.last.as_ref() == Some(&activity) {
-            return;
-        }
-        self.last = Some(activity.clone());
-        let progress = SubagentProgress {
-            activity,
-            tools: self.tools,
-            elapsed: self.started.elapsed(),
-        };
-        if let Some(sink) = live_sink {
-            let _ = sink.send(ToolLive::Progress(progress.clone()));
-        }
-        let _ = parent_tx.send_envelope(Envelope {
-            event: AgentEvent::SubagentProgress { progress },
-            subagent: subagent_info.get().cloned(),
-            run_id: parent_tx.run_id(),
-        });
-    }
 }
 
 /// Look up the model that the current agent is using, or pick a cheaper one.
@@ -530,7 +360,13 @@ async fn call_tool(
                 err.push_str("\n\n");
                 err.push_str(&suffix);
             }
-            Ok((None, Some(err), Some(done.id), Some(error_restore_allowed), None))
+            Ok((
+                None,
+                Some(err),
+                Some(done.id),
+                Some(error_restore_allowed),
+                None,
+            ))
         }
     }
 }
@@ -589,448 +425,221 @@ async fn session(
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
     drop(ctx);
-    let model_spec: Option<String> = opts.get("model_spec")?;
-    let system: Option<String> = opts.get("system")?;
-    let tools_val: Option<LuaValue> = opts.get("tools")?;
-    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
-    let name: Option<String> = opts.get("name")?;
-    let continued_task_id: Option<String> = opts.get("task_id")?;
-    let thinking_val: Option<LuaValue> = opts.get("thinking")?;
     let task: bool = opts.get::<Option<bool>>("task")?.unwrap_or(false);
-    let requested_profile: Option<String> = opts.get("profile")?;
-    let requested_mode: Option<String> = opts.get("mode")?;
-    if !task && (requested_profile.is_some() || requested_mode.is_some()) {
-        return Ok(err_pair("profile and mode require task = true"));
-    }
+    let name: Option<String> = opts.get("name")?;
+    let task_id: Option<String> = opts.get("task_id")?;
+    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     if task && local_tools_tbl.is_some() && !agent_ctx.caller_is_bundled_tool("task") {
         return Ok(err_pair(
             "task-local tools are reserved for Caudra's bundled task tool",
         ));
     }
-    if !task && !matches!(agent_ctx.mode, AgentMode::Build) {
-        return Ok(err_pair(
-            "generic subagent sessions cannot be launched from a read-only or plan-mode parent",
-        ));
-    }
-    let requested_mode = try_pair!(parse_task_mode(requested_mode.as_deref()));
-    let audience_name: Option<String> = opts.get("audience")?;
-    let requested_audience = match audience_name.as_deref() {
-        Some(s) => {
-            try_pair!(ToolAudience::parse_name(s).ok_or_else(|| format!("unknown audience: {s}")))
-        }
-        None => DEFAULT_SESSION_AUDIENCE,
-    };
-    if !task && requested_audience == ToolAudience::RESEARCH_SUB && local_tools_tbl.is_some() {
-        return Ok(err_pair(
-            "generic research sessions cannot install caller-defined local tools",
-        ));
-    }
-    let fast: bool = opts
-        .get::<Option<bool>>("fast")?
-        .unwrap_or(agent_ctx.opts.fast);
-    let mcp_option: Option<bool> = opts.get("mcp")?;
-    let mcp_enabled = mcp_option.unwrap_or(true);
-    if task
-        && (model_spec.is_some()
-            || system.is_some()
-            || tools_val.is_some()
-            || thinking_val.is_some()
-            || audience_name.is_some()
-            || mcp_option.is_some())
-    {
-        return Ok(err_pair(
-            "task sessions derive model, thinking, system prompt, tools, audience, and MCP policy from their profile and mode",
-        ));
-    }
 
-    let parent_tool_use_id = agent_ctx
-        .tool_use_id
-        .clone()
-        .unwrap_or_else(|| format!("session-{}", CaudraId::generate()));
-    let root_tool_use_id = agent_ctx
-        .root_tool_use_id
-        .clone()
-        .unwrap_or_else(|| parent_tool_use_id.clone());
-    let mut task_id = continued_task_id
-        .clone()
-        .unwrap_or_else(|| parent_tool_use_id.clone());
-    let default_task_spec = SubagentTaskSpec {
-        profile_name: agent_ctx.system_prompt_profile_name.to_string(),
-        mode: SubagentTaskMode::Plan,
-        ..SubagentTaskSpec::default()
-    };
-    let history_lease = if task {
-        match continued_task_id {
-            Some(_) => try_pair!(agent_ctx.subagent_history.continue_task_with_defaults(
-                &task_id,
-                SubagentTaskSpecCandidate {
-                    profile_name: requested_profile,
-                    mode: requested_mode,
-                },
-                default_task_spec,
-            )),
-            None => {
-                let spec = SubagentTaskSpec {
-                    profile_name: requested_profile.unwrap_or(default_task_spec.profile_name),
-                    mode: requested_mode.unwrap_or(SubagentTaskMode::Plan),
-                    ..SubagentTaskSpec::default()
-                };
-                match agent_ctx
-                    .subagent_history
-                    .reserve_with_spec(task_id.clone(), spec.clone())
-                {
-                    Ok(lease) => lease,
-                    Err(
-                        SubagentHistoryError::AlreadyActive { .. }
-                        | SubagentHistoryError::AlreadyCompleted { .. },
-                    ) => {
-                        task_id = format!("session-{}", CaudraId::generate());
-                        try_pair!(
-                            agent_ctx
-                                .subagent_history
-                                .reserve_with_spec(task_id.clone(), spec)
-                        )
-                    }
-                    Err(error) => return Ok(err_pair(error.to_string())),
-                }
-            }
-        }
+    let subagent = if task {
+        try_pair!(open_lua_task(&lua, &agent_ctx, &opts, name, task_id, local_tools_tbl).await)
     } else {
-        match continued_task_id {
-            Some(_) => try_pair!(agent_ctx.subagent_history.continue_task(&task_id)),
-            None => match agent_ctx.subagent_history.reserve(task_id.clone()) {
-                Ok(lease) => lease,
-                Err(
-                    SubagentHistoryError::AlreadyActive { .. }
-                    | SubagentHistoryError::AlreadyCompleted { .. },
-                ) => {
-                    task_id = format!("session-{}", CaudraId::generate());
-                    try_pair!(agent_ctx.subagent_history.reserve(task_id.clone()))
-                }
-                Err(error) => return Ok(err_pair(error.to_string())),
-            },
-        }
+        try_pair!(open_lua_generic(&lua, &agent_ctx, &opts, name, task_id, local_tools_tbl).await)
     };
+    let sess = lua.create_userdata(LuaSession {
+        inner: Arc::new(AsyncMutex::new(subagent)),
+    })?;
+    Ok((Some(sess), None))
+}
 
-    let task_spec = task.then(|| {
-        history_lease
-            .spec()
-            .cloned()
-            .expect("task leases always carry a specification")
-    });
-    if task_spec
-        .as_ref()
-        .is_some_and(|spec| spec.mode == SubagentTaskMode::Build)
-        && !matches!(agent_ctx.mode, AgentMode::Build)
+async fn open_lua_task(
+    lua: &Lua,
+    agent_ctx: &AgentContext,
+    opts: &Table,
+    name: Option<String>,
+    task_id: Option<String>,
+    local_tools_tbl: Option<Table>,
+) -> Result<Subagent, String> {
+    if [
+        "model_spec",
+        "system",
+        "tools",
+        "thinking",
+        "audience",
+        "mcp",
+    ]
+    .iter()
+    .any(|key| opts.get::<Option<LuaValue>>(*key).ok().flatten().is_some())
     {
-        return Ok(err_pair(
-            "build-mode task cannot be launched from a read-only or plan-mode parent",
-        ));
+        return Err(TASK_DERIVES_ITS_OWN.into());
     }
-    let task_bindings = agent_ctx.prompt_profiles.bind_for_tasks(
-        &agent_ctx.model,
-        &agent_ctx.opts.thinking,
-        &agent_ctx.model_policy,
-        agent_ctx.timeouts,
-    );
-    let task_profile = match &task_spec {
-        Some(spec) => {
-            try_pair!(agent_ctx.prompt_profiles.resolve(Some(&spec.profile_name)));
-            Some(try_pair!(task_bindings.resolve(&spec.profile_name)))
-        }
-        None => None,
-    }
-    .flatten();
+    let mode = parse_task_mode(
+        opts.get::<Option<String>>("mode")
+            .map_err(lua_err)?
+            .as_deref(),
+    )?;
+    // Plan-mode tasks are read-only, so the one tool they may install is the
+    // structured-output sink: anything else would be an effect in disguise.
+    let plan_mode = mode.unwrap_or(SubagentTaskMode::Plan) == SubagentTaskMode::Plan;
+    let (local_definitions, local_tools) = build_local_tools(
+        lua,
+        local_tools_tbl,
+        plan_mode.then_some(STRUCTURED_OUTPUT_TOOL),
+    )?;
+    subagent::open_task(
+        agent_ctx,
+        subagent::TaskOptions {
+            name: name.unwrap_or_default(),
+            task_id,
+            profile: opts.get("profile").map_err(lua_err)?,
+            mode,
+            local_definitions,
+            local_tools,
+        },
+    )
+    .await
+}
 
-    let effective_model_spec = task_profile
+async fn open_lua_generic(
+    lua: &Lua,
+    agent_ctx: &AgentContext,
+    opts: &Table,
+    name: Option<String>,
+    task_id: Option<String>,
+    local_tools_tbl: Option<Table>,
+) -> Result<Subagent, String> {
+    if opts
+        .get::<Option<LuaValue>>("profile")
+        .ok()
+        .flatten()
+        .is_some()
+        || opts
+            .get::<Option<LuaValue>>("mode")
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return Err("profile and mode require task = true".into());
+    }
+    let audience = match opts
+        .get::<Option<String>>("audience")
+        .map_err(lua_err)?
         .as_deref()
-        .and_then(|profile| profile.subagent_model())
-        .map(str::to_owned)
-        .or(model_spec);
-
-    let (model, provider): (Model, Arc<dyn provider::Provider>) =
-        if let Some(ref spec) = effective_model_spec {
-            let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
-            let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
-            (m, Arc::from(p))
-        } else {
-            (
-                Model::clone(&agent_ctx.model),
-                Arc::clone(&agent_ctx.provider),
-            )
-        };
-    // A standalone task shows its model via SubagentInfo on the header;
-    // a dispatching caller (batch) gets the same thing as a live annotation.
-    if let Some(sink) = &agent_ctx.live_sink {
-        let _ = sink.send(ToolLive::Annotation(model.spec()));
+    {
+        Some(name) => Some(
+            ToolAudience::parse_name(name).ok_or_else(|| format!("unknown audience: {name}"))?,
+        ),
+        None => None,
+    };
+    if audience == Some(ToolAudience::RESEARCH_SUB) && local_tools_tbl.is_some() {
+        return Err("generic research sessions cannot install caller-defined local tools".into());
     }
-
-    let mut tools_json: JsonValue = match tools_val {
-        Some(val) => {
-            let tools = lua_to_json(&lua, &val)?;
+    let mut tools = match opts.get::<Option<LuaValue>>("tools").map_err(lua_err)? {
+        Some(value) => {
+            let tools = lua_to_json(lua, &value).map_err(lua_err)?;
             if !tools.is_array() {
-                return Err(mlua::Error::runtime("tools must be an array"));
+                return Err("tools must be an array".into());
             }
             tools
         }
-        None => JsonValue::Array(vec![]),
+        None => JsonValue::Array(Vec::new()),
     };
-
-    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
-    if let Some(tbl) = local_tools_tbl {
-        let defs = tools_json.as_array_mut().expect("checked above");
-        for pair in tbl.pairs::<String, Table>() {
-            let (name, spec) = pair?;
-            let description = try_pair!(
-                spec.get::<String>("description")
-                    .map_err(|_| format!("local_tools.{name}: 'description' is required"))
-            );
-            let input_schema = lua_to_json(&lua, &spec.get::<LuaValue>("input_schema")?)?;
-            let sanitized_schema = sanitize_tool_input_schema(input_schema);
-            let handler = try_pair!(
-                spec.get::<Function>("handler")
-                    .map_err(|_| format!("local_tools.{name}: 'handler' is required"))
-            );
-            let effect_name: Option<String> = spec.get("effect")?;
-            let effect = try_pair!(parse_local_tool_effect(effect_name.as_deref()));
-            if task_spec
-                .as_ref()
-                .is_some_and(|task| task.mode == SubagentTaskMode::Plan)
-                && (name != STRUCTURED_OUTPUT_TOOL || effect != ToolEffect::ReadOnly)
-            {
-                return Ok(err_pair(format!(
-                    "local tool {name:?} is not an allowed plan-mode task output tool"
-                )));
-            }
-            defs.push(serde_json::json!({
-                "name": name,
-                "description": description,
-                "input_schema": sanitized_schema,
-            }));
-            let weak = lua.weak();
-            local_map.insert(
-                name,
-                audited_local_tool(effect, move |input, _ctx| {
-                    let result = call_local_tool(&weak, &handler, &input);
-                    Box::pin(async move { result })
-                }),
-            );
-        }
-    }
-    let requested_thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
-            Ok(stored) => ThinkingConfig::from(stored),
-            Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
+    let (local_definitions, local_tools) = build_local_tools(lua, local_tools_tbl, None)?;
+    tools
+        .as_array_mut()
+        .expect("checked above")
+        .extend(local_definitions);
+    subagent::open_generic(
+        agent_ctx,
+        subagent::GenericOptions {
+            name: name.unwrap_or_default(),
+            task_id,
+            model_spec: opts.get("model_spec").map_err(lua_err)?,
+            system: opts
+                .get::<Option<String>>("system")
+                .map_err(lua_err)?
+                .unwrap_or_default(),
+            tools,
+            audience,
+            thinking: parse_thinking(opts.get("thinking").map_err(lua_err)?)?,
+            fast: opts.get("fast").map_err(lua_err)?,
+            mcp: opts.get("mcp").map_err(lua_err)?,
+            local_tools,
         },
+    )
+    .await
+}
+
+const TASK_DERIVES_ITS_OWN: &str = "task sessions derive model, thinking, system prompt, tools, audience, and MCP policy from their profile and mode";
+
+fn lua_err(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+fn parse_thinking(value: Option<LuaValue>) -> Result<Option<ThinkingConfig>, String> {
+    match value {
+        None | Some(LuaValue::Nil) => Ok(None),
+        Some(LuaValue::String(s)) => {
+            let text = s.to_str().map_err(lua_err)?;
+            StoredThinking::parse_setting(&text)
+                .map(|stored| Some(ThinkingConfig::from(stored)))
+                .map_err(|error| format!("invalid thinking: {error}"))
+        }
         Some(LuaValue::Integer(n)) => match u32::try_from(n) {
-            Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
-            _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
+            Ok(tokens) if tokens > 0 => Ok(Some(ThinkingConfig::Budget(tokens))),
+            _ => Err(format!("invalid thinking budget: {n}")),
         },
         Some(LuaValue::Number(n)) if n.fract() == 0.0 && n >= 1.0 && n <= f64::from(u32::MAX) => {
-            ThinkingConfig::Budget(n as u32)
+            Ok(Some(ThinkingConfig::Budget(n as u32)))
         }
-        Some(LuaValue::Number(n)) => {
-            return Ok(err_pair(format!("invalid thinking budget: {n}")));
-        }
-        Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
-        None => agent_ctx.opts.thinking.clone(),
-    };
-
-    let thinking = task_profile
-        .as_deref()
-        .and_then(|profile| profile.subagent_thinking().cloned())
-        .map(ThinkingConfig::from)
-        .unwrap_or(requested_thinking);
-    if task_profile.as_ref().is_some_and(|profile| {
-        profile.subagent_model().is_some() || profile.subagent_thinking().is_some()
-    }) && let Err(error) = thinking.resolve_exact(&model)
-    {
-        let profile_name = task_spec
-            .as_ref()
-            .map_or("builtin", |spec| spec.profile_name.as_str());
-        return Ok(err_pair(format!(
-            "system prompt profile {profile_name:?} is unavailable for subagents: thinking {thinking} is incompatible with model {:?}: {error}",
-            model.spec()
-        )));
+        Some(LuaValue::Number(n)) => Err(format!("invalid thinking budget: {n}")),
+        Some(_) => Err("thinking must be string or number".into()),
     }
+}
 
-    let (agent_mode, audience, system, task_mcp_enabled) = match task_spec.as_ref() {
-        Some(spec) => {
-            let (mode, prompt_id, contract, audience) = match spec.mode {
-                SubagentTaskMode::Plan => (
-                    AgentMode::ReadOnly,
-                    caudra_agent::prompt::PromptId::Research,
-                    caudra_agent::prompt::TASK_PLAN_CONTRACT,
-                    ToolAudience::RESEARCH_SUB,
-                ),
-                SubagentTaskMode::Build => (
-                    AgentMode::Build,
-                    caudra_agent::prompt::PromptId::General,
-                    caudra_agent::prompt::TASK_BUILD_CONTRACT,
-                    ToolAudience::GENERAL_SUB,
-                ),
-            };
-            let vars = caudra_agent::template::env_vars().set(
-                "{task_system_prompt_profiles}",
-                task_bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
-            );
-            let cwd = vars.apply("{cwd}").into_owned();
-            let instructions =
-                smol::unblock(move || caudra_agent::agent::load_instruction_text(&cwd)).await;
-            let base_filter =
-                ToolFilter::from_config(&agent_ctx.config, &model, &[]).for_mode(&mode);
-            let assembled = caudra_agent::prompt::assemble_task_with_filter(
-                prompt_id,
-                &agent_ctx.prompt_slots,
-                &base_filter,
-                &instructions,
-                task_profile.as_deref(),
-                contract,
-            );
-
-            let local_definitions = std::mem::take(
-                tools_json
-                    .as_array_mut()
-                    .expect("tools were validated as an array"),
-            );
-            let description_context = DescriptionContext {
-                filter: &base_filter,
-                audience,
-                workflow: false,
-            };
-            tools_json = ToolRegistry::global().definitions(
-                &vars,
-                &description_context,
-                model.supports_tool_examples(),
-            );
-            tools_json
-                .as_array_mut()
-                .expect("definitions return an array")
-                .extend(local_definitions);
-            (
-                mode,
-                audience,
-                vars.apply(&assembled).into_owned(),
-                spec.mode == SubagentTaskMode::Build,
-            )
+/// Turns the Lua `local_tools` table into tool definitions plus their
+/// handlers. `only` restricts which name may be installed, which is how a
+/// read-only task keeps its single output sink and nothing else.
+fn build_local_tools(
+    lua: &Lua,
+    table: Option<Table>,
+    only: Option<&str>,
+) -> Result<(Vec<JsonValue>, LocalTools), String> {
+    let Some(table) = table else {
+        return Ok((Vec::new(), LocalTools::default()));
+    };
+    let mut definitions = Vec::new();
+    let mut handlers: HashMap<String, LocalToolFn> = HashMap::new();
+    for pair in table.pairs::<String, Table>() {
+        let (name, spec) = pair.map_err(lua_err)?;
+        let description = spec
+            .get::<String>("description")
+            .map_err(|_| format!("local_tools.{name}: 'description' is required"))?;
+        let input_schema =
+            lua_to_json(lua, &spec.get::<LuaValue>("input_schema").map_err(lua_err)?)
+                .map_err(lua_err)?;
+        let handler = spec
+            .get::<Function>("handler")
+            .map_err(|_| format!("local_tools.{name}: 'handler' is required"))?;
+        let effect = parse_local_tool_effect(
+            spec.get::<Option<String>>("effect")
+                .map_err(lua_err)?
+                .as_deref(),
+        )?;
+        if only.is_some_and(|allowed| name != allowed || effect != ToolEffect::ReadOnly) {
+            return Err(format!(
+                "local tool {name:?} is not an allowed plan-mode task output tool"
+            ));
         }
-        None => (
-            AgentMode::Build,
-            requested_audience,
-            system.unwrap_or_default(),
-            mcp_enabled,
-        ),
-    };
-
-    let tool_filter = ToolFilter::Only(
-        tools_json
-            .as_array()
-            .expect("tools were validated as an array")
-            .iter()
-            .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
-            .collect(),
-    )
-    .intersect(&ToolFilter::from_config(&agent_ctx.config, &model, &[]))
-    .including(local_map.keys().cloned())
-    .for_mode(&agent_mode);
-
-    let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
-    let parent_tx = agent_ctx.event_tx.clone();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (steer_tx, steer_rx) = steering_queue();
-
-    let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (usage_tx, usage_rx) = flume::unbounded();
-
-    smol::spawn(relay_session_events(
-        sub_rx,
-        parent_tx.clone(),
-        Arc::clone(&subagent_info),
-        usage_tx,
-        agent_ctx.live_sink.clone(),
-    ))
-    .detach();
-
-    let history_items = history_lease
-        .history()
-        .map_or_else(Vec::new, |messages| expand_history(messages));
-    let history = try_pair!(History::restored(history_items));
-
-    // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth.
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
-    // Several sessions can share one task id, so keep the slot and retire
-    // only ours on close instead of clearing the whole key.
-    let cancel_slot = agent_ctx
-        .subagent_cancels
-        .insert(task_id.clone(), child_trigger);
-
-    let name = name.unwrap_or_default();
-    info!(name = %name, model = %model.id, "subagent session opened");
-
-    let state = SessionState {
-        params: AgentParams {
-            provider,
-            model,
-            config: agent_ctx.config.clone(),
-            tool_output_lines: caudra_config::ToolOutputLines::default(),
-            permissions: Arc::clone(&agent_ctx.permissions),
-            session_id: agent_ctx.session_id.clone(),
-            root_tool_use_id: Some(root_tool_use_id.clone()),
-            mailbox: None,
-            timeouts: agent_ctx.timeouts,
-            file_tracker: FileReadTracker::fresh(),
-            prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
-            prompt_profiles: Arc::clone(&agent_ctx.prompt_profiles),
-            system_prompt_profile_name: Arc::from(task_spec.as_ref().map_or_else(
-                || agent_ctx.system_prompt_profile_name.as_ref(),
-                |spec| spec.profile_name.as_str(),
-            )),
-            subagent_cancels: Arc::new(CancelMap::new()),
-            subagent_history: agent_ctx.subagent_history.clone(),
-            registry: Arc::clone(caudra_agent::tools::ToolRegistry::global_arc()),
-            audience,
-            tool_filter,
-            model_policy: Arc::clone(&agent_ctx.model_policy),
-        },
-        system,
-        tools: tools_json,
-        mode: agent_mode,
-        thinking,
-        fast,
-        mcp: agent_ctx
-            .mcp
-            .as_ref()
-            .filter(|_| task_mcp_enabled)
-            .map(McpSession::fresh),
-        history,
-        history_lease: Some(history_lease),
-        sub_event_tx,
-        child_cancel,
-        interrupt_source: Arc::new(steer_rx),
-        answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
-        answer_tx: Some(answer_tx),
-        steer_tx: Some(steer_tx),
-        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
-        parent_tool_use_id,
-        root_tool_use_id,
-        task_id,
-        cancel_slot,
-        parent_event_tx: parent_tx,
-        subagent_info,
-        local_tools: Arc::new(local_map),
-        name,
-        usage: TokenUsage::default(),
-        usage_rx,
-        start: Instant::now(),
-        closed: false,
-    };
-
-    let sess = lua.create_userdata(LuaSession {
-        inner: Arc::new(AsyncMutex::new(state)),
-    })?;
-    Ok((Some(sess), None))
+        definitions.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "input_schema": sanitize_tool_input_schema(input_schema),
+        }));
+        let weak = lua.weak();
+        handlers.insert(
+            name,
+            audited_local_tool(effect, move |input, _ctx| {
+                let result = call_local_tool(&weak, &handler, &input);
+                Box::pin(async move { result })
+            }),
+        );
+    }
+    Ok((definitions, Arc::new(handlers)))
 }
 
 lua_table! {
@@ -1135,76 +744,8 @@ async fn dispatch_racing_live(
     }
 }
 
-struct SessionState {
-    params: AgentParams,
-    system: String,
-    tools: JsonValue,
-    mode: AgentMode,
-    thinking: ThinkingConfig,
-    fast: bool,
-    /// Fresh per session so `tool_search` loads never leak between a
-    /// subagent and its parent.
-    mcp: Option<McpSession>,
-    history: History,
-    history_lease: Option<SubagentHistoryLease>,
-    sub_event_tx: EventSender,
-    child_cancel: caudra_agent::cancel::CancelToken,
-    interrupt_source: Arc<SteeringQueueReceiver>,
-    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
-    answer_tx: Option<flume::Sender<String>>,
-    steer_tx: Option<SteeringQueue>,
-    parent_cancels: Arc<CancelMap<String>>,
-    parent_tool_use_id: String,
-    root_tool_use_id: String,
-    task_id: String,
-    /// Which cancellation registration under `task_id` is ours.
-    cancel_slot: CancelSlot,
-    parent_event_tx: EventSender,
-    subagent_info: Arc<OnceLock<SubagentInfo>>,
-    local_tools: LocalTools,
-    name: String,
-    usage: TokenUsage,
-    usage_rx: flume::Receiver<TokenUsage>,
-    start: Instant,
-    closed: bool,
-}
-
-impl SessionState {
-    fn close(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        self.parent_cancels.retire(&self.task_id, self.cancel_slot);
-        let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
-        let persisted_spec = self
-            .history_lease
-            .as_ref()
-            .and_then(|lease| lease.spec().cloned());
-        if let Some(lease) = self.history_lease.take() {
-            lease.complete_version(Arc::new(messages.clone()), self.parent_tool_use_id.clone());
-        }
-        let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            task_id: self.task_id.clone(),
-            parent_tool_use_id: self.parent_tool_use_id.clone(),
-            root_tool_use_id: self.root_tool_use_id.clone(),
-            name: self.name.clone(),
-            model: self.params.model.spec(),
-            messages,
-            spec: persisted_spec,
-        });
-        info!(
-            name = %self.name,
-            duration_ms = self.start.elapsed().as_millis() as u64,
-            input_tokens = self.usage.total_input(),
-            output_tokens = self.usage.output,
-            "subagent session closed",
-        );
-    }
-}
-
 struct LuaSession {
-    inner: Arc<AsyncMutex<SessionState>>,
+    inner: Arc<AsyncMutex<Subagent>>,
 }
 
 impl Drop for LuaSession {
@@ -1247,114 +788,27 @@ async fn prompt(
 ) -> LuaResult<Pair<Table>> {
     let inner = Arc::clone(&this.inner);
     drop(this);
-    let mut guard = inner.lock().await;
-    let s = &mut *guard;
-    if s.closed {
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-    }
-    if s.subagent_info.get().is_none() {
-        let _ = s.subagent_info.set(SubagentInfo {
-            parent_tool_use_id: s.parent_tool_use_id.clone(),
-            task_id: s.task_id.clone(),
-            name: s.name.clone(),
-            prompt: Some(message.clone()),
-            model: Some(s.params.model.spec()),
-            answer_tx: s.answer_tx.take(),
-            steer_tx: s.steer_tx.take(),
-        });
-    }
-
-    let history_len = s.history.len();
-    let interrupt_source: Arc<dyn InterruptSource> = s.interrupt_source.clone();
-    let mut agent = Agent::new(
-        s.params.clone(),
-        AgentRunParams {
-            history: &mut s.history,
-            system: s.system.clone(),
-            event_tx: s.sub_event_tx.clone(),
-            tools: s.tools.clone(),
-        },
-    )
-    .with_user_response_rx(Arc::clone(&s.answer_rx))
-    .with_interrupt_source(interrupt_source)
-    .with_cancel(s.child_cancel.clone())
-    .with_mcp(s.mcp.clone())
-    .with_local_tools(Arc::clone(&s.local_tools));
-
-    let input = AgentInput {
-        message,
-        mode: s.mode.clone(),
-        images: Vec::new(),
-        preamble: Vec::new(),
-        thinking: s.thinking.clone(),
-        fast: s.fast,
-        workflow: false,
-        prompt: None,
-    };
-    let result = agent.run(input).await;
-    drop(agent);
-    // Only this call's messages count: older turns may hold stale preamble
-    // text, and the agent loop's empty-response retry leaves a synthetic
-    // "(empty)" assistant marker that must not pass for a real response.
-    // Auto-compaction can shrink the history mid-run, so clamp the start:
-    // after a rewrite the tail is this call's output either way.
-    let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
-    // A subagent can be cancelled on its own, and its caller should hear about
-    // that instead of taking a half-finished answer for a real one, so cancel
-    // reads like an error here even though the run ended normally.
-    let cut_short = match &result {
-        Err(e) => Some(e.to_string()),
-        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(_) => None,
-    };
-    if let Some(err) = cut_short {
-        let partial = turn
-            .iter()
-            .filter(|m| matches!(m.role, Role::Assistant))
-            .flat_map(|m| m.content.iter())
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tbl = if partial.is_empty() {
-            None
-        } else {
+    match inner.lock().await.prompt(message).await {
+        Ok(result) => {
             let tbl = lua.create_table()?;
-            tbl.set("text", partial)?;
-            Some(tbl)
-        };
-        return Ok((tbl, Some(err)));
+            tbl.set("text", result.text)?;
+            tbl.set("duration_ms", result.duration.as_millis() as u64)?;
+            tbl.set("input_tokens", result.input_tokens)?;
+            tbl.set("output_tokens", result.output_tokens)?;
+            Ok((Some(tbl), None))
+        }
+        Err(failure) => {
+            let partial = match failure.partial {
+                Some(text) => {
+                    let tbl = lua.create_table()?;
+                    tbl.set("text", text)?;
+                    Some(tbl)
+                }
+                None => None,
+            };
+            Ok((partial, Some(failure.error)))
+        }
     }
-    // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
-    // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
-    // live channel before `dispatch_racing_live` drains it for the last time.
-    match s.usage_rx.recv_async().await {
-        Ok(usage) => s.usage += usage,
-        Err(_) => tracing::warn!(
-            name = %s.name,
-            "subagent usage tracker stopped, token counts may lag"
-        ),
-    }
-
-    let text = turn
-        .iter()
-        .rfind(|m| matches!(m.role, Role::Assistant))
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-        });
-    let text = text.map_or_else(String::new, str::to_owned);
-
-    let tbl = lua.create_table()?;
-    tbl.set("text", text)?;
-    tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
-    tbl.set("input_tokens", s.usage.total_input())?;
-    tbl.set("output_tokens", s.usage.output)?;
-    Ok((Some(tbl), None))
 }
 
 /// Return the stable task ID used for continuation and UI routing.
@@ -1364,7 +818,7 @@ async fn prompt(
 async fn id(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<String> {
     let inner = Arc::clone(&this.inner);
     drop(this);
-    let task_id = inner.lock().await.task_id.clone();
+    let task_id = inner.lock().await.id().to_owned();
     Ok(task_id)
 }
 
@@ -1406,7 +860,6 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use caudra_agent::{DoneReason, TurnCompleteEvent};
     use serde_json::json;
 
     use super::*;
@@ -1436,419 +889,5 @@ mod tests {
         assert!(raised.contains("boom"), "got: {raised}");
         let wrong = call("function() return 42 end", input).unwrap_err();
         assert!(wrong.contains("expected string"), "got: {wrong}");
-    }
-
-    #[test]
-    fn grouped_history_expands_with_stable_parent_chain_and_round_trips() {
-        const CALL_ID: &str = "call-1";
-        const TOOL_NAME: &str = "read";
-        let messages = vec![
-            Message::user("inspect".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Text {
-                        text: "checking".into(),
-                    },
-                    ContentBlock::tool_use(CALL_ID, TOOL_NAME, json!({"path": "src/lib.rs"})),
-                ],
-                ..Default::default()
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: CALL_ID.into(),
-                    content: "contents".into(),
-                    is_error: false,
-                    output_ref: None,
-                }],
-                ..Default::default()
-            },
-        ];
-
-        let items = expand_history(&messages);
-
-        assert!(
-            items
-                .windows(2)
-                .all(|pair| pair[1].parent_id == Some(pair[0].id))
-        );
-        let projected = History::restored(items).unwrap().into_vec();
-        assert_eq!(
-            serde_json::to_value(projected).unwrap(),
-            serde_json::to_value(messages).unwrap()
-        );
-    }
-
-    const RUN_ID: u64 = 7;
-    const PARENT_ID: &str = "task-1";
-    const TOOL_ID: &str = "toolu_01";
-    const IGNORED_ERROR: &str = "handled by the session caller";
-    const DONE_USAGE: TokenUsage = tokens(150, 30);
-    /// Spelt out rather than read back off the activity, so a rename in
-    /// caudra-agent fails here instead of passing silently.
-    const THINKING_LABEL: &str = "thinking";
-    const RESPONDING_LABEL: &str = "responding";
-    const THOUGHT_TITLE: &str = "Weighing the options";
-
-    const fn tokens(input: u32, output: u32) -> TokenUsage {
-        TokenUsage {
-            input,
-            output,
-            cache_creation: 0,
-            cache_read: 0,
-        }
-    }
-
-    fn envelope(event: AgentEvent) -> Envelope {
-        Envelope {
-            event,
-            subagent: None,
-            run_id: RUN_ID,
-        }
-    }
-
-    fn parent_info() -> Arc<OnceLock<SubagentInfo>> {
-        let info = Arc::new(OnceLock::new());
-        info.set(SubagentInfo {
-            parent_tool_use_id: PARENT_ID.into(),
-            task_id: PARENT_ID.into(),
-            name: "research".into(),
-            prompt: None,
-            model: None,
-            answer_tx: None,
-            steer_tx: None,
-        })
-        .unwrap();
-        info
-    }
-
-    fn turn(usage: TokenUsage, cost: f64) -> AgentEvent {
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Message::default(),
-            usage,
-            model: "test-model".into(),
-            cost: Some(cost),
-            context_size: None,
-            context_window: 0,
-        }))
-    }
-
-    #[test]
-    fn relay_session_events_reports_live_usage_and_done_total() {
-        let (sub_tx, sub_rx) = flume::unbounded();
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let subagent_info = parent_info();
-        let (usage_tx, usage_rx) = flume::unbounded();
-        let (live_tx, live_rx) = flume::unbounded();
-
-        for event in [
-            turn(tokens(100, 20), 0.25),
-            turn(tokens(50, 10), 0.5),
-            AgentEvent::Error {
-                message: IGNORED_ERROR.into(),
-            },
-            AgentEvent::SubagentHistory {
-                task_id: "nested-task".into(),
-                parent_tool_use_id: "nested-call".into(),
-                root_tool_use_id: PARENT_ID.into(),
-                name: "nested".into(),
-                model: "provider/model".into(),
-                messages: Vec::new(),
-                spec: None,
-            },
-            AgentEvent::Done {
-                usage: DONE_USAGE,
-                num_turns: 2,
-                reason: DoneReason::EndTurn,
-            },
-        ] {
-            sub_tx.send(envelope(event)).unwrap();
-        }
-        drop(sub_tx);
-
-        smol::block_on(relay_session_events(
-            sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
-            subagent_info,
-            usage_tx,
-            Some(live_tx),
-        ));
-
-        let live = live_rx
-            .drain()
-            .map(|event| match event {
-                ToolLive::Usage(usage) => usage,
-                _ => panic!("relay must only publish usage"),
-            })
-            .collect::<Vec<_>>();
-        let expected = [
-            tokens(100, 20).format_sum_cost(Some(0.25)),
-            tokens(50, 10).format_sum_cost(Some(0.75)),
-        ];
-        assert_eq!(live, expected);
-        assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
-
-        let forwarded = parent_rx.drain().collect::<Vec<_>>();
-        assert_eq!(forwarded.len(), expected.len() + 1);
-        assert!(forwarded.iter().all(|envelope| {
-            matches!(
-                envelope.event,
-                AgentEvent::TurnComplete(_) | AgentEvent::SubagentHistory { .. }
-            ) && envelope
-                .subagent
-                .as_ref()
-                .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
-        }));
-    }
-
-    fn text_delta() -> AgentEvent {
-        AgentEvent::TextDelta {
-            text: "summarising".into(),
-        }
-    }
-
-    /// Deltas arrive one token at a time, and a nested task's events pass
-    /// through here already stamped while this session sits blocked on it.
-    /// Neither may reach the parent header.
-    #[test]
-    fn relay_publishes_activity_once_per_change_and_ignores_nested_events() {
-        let (sub_tx, sub_rx) = flume::unbounded();
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let (usage_tx, _usage_rx) = flume::unbounded();
-        let (live_tx, live_rx) = flume::unbounded();
-
-        for event in [text_delta(), text_delta()] {
-            sub_tx.send(envelope(event)).unwrap();
-        }
-        sub_tx
-            .send(envelope(AgentEvent::ThinkingDelta { text: "hm".into() }))
-            .unwrap();
-        let mut nested = envelope(text_delta());
-        nested.subagent = Some(parent_info().get().unwrap().clone());
-        sub_tx.send(nested).unwrap();
-        drop(sub_tx);
-
-        smol::block_on(relay_session_events(
-            sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
-            parent_info(),
-            usage_tx,
-            Some(live_tx),
-        ));
-
-        let live = live_rx
-            .drain()
-            .map(|event| match event {
-                ToolLive::Progress(progress) => progress.activity.label().to_owned(),
-                _ => panic!("relay must only publish progress here"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(live, [RESPONDING_LABEL, THINKING_LABEL]);
-
-        assert_eq!(
-            relayed_progress(&parent_rx),
-            [
-                (RESPONDING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
-                (THINKING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
-            ]
-        );
-    }
-
-    fn relayed_progress(rx: &flume::Receiver<Envelope>) -> Vec<(String, u32, Option<String>)> {
-        rx.drain()
-            .filter_map(|envelope| match envelope.event {
-                AgentEvent::SubagentProgress { progress } => Some((
-                    progress.activity.label().to_owned(),
-                    progress.tools,
-                    envelope.subagent.map(|info| info.parent_tool_use_id),
-                )),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn tool_start(tool: &str) -> AgentEvent {
-        AgentEvent::ToolStart(Box::new(caudra_agent::ToolStartEvent {
-            id: TOOL_ID.into(),
-            tool: Arc::from(tool),
-            summary: String::new(),
-            render_header: None,
-            annotation: None,
-            input: None,
-            raw_input: None,
-            output: None,
-        }))
-    }
-
-    /// Drives the relay's stateful half directly: the published sequence is
-    /// what a parent header would show, in order.
-    fn activities(events: Vec<AgentEvent>) -> Vec<(String, Option<String>)> {
-        let (sub_tx, sub_rx) = flume::unbounded();
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let (usage_tx, _usage_rx) = flume::unbounded();
-        for event in events {
-            sub_tx.send(envelope(event)).unwrap();
-        }
-        drop(sub_tx);
-
-        smol::block_on(relay_session_events(
-            sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
-            parent_info(),
-            usage_tx,
-            None,
-        ));
-
-        parent_rx
-            .drain()
-            .filter_map(|envelope| match envelope.event {
-                AgentEvent::SubagentProgress { progress } => Some((
-                    progress.activity.label().to_owned(),
-                    progress.activity.detail().map(str::to_owned),
-                )),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn thinking(text: &str) -> AgentEvent {
-        AgentEvent::ThinkingDelta { text: text.into() }
-    }
-
-    fn thought(title: Option<&str>) -> (String, Option<String>) {
-        (THINKING_LABEL.to_owned(), title.map(str::to_owned))
-    }
-
-    /// A thought names itself in a heading that no single delta carries, so
-    /// the relay has to accumulate the block to read it.
-    #[test]
-    fn a_thought_is_named_once_its_heading_has_streamed_in() {
-        let published = activities(vec![
-            thinking("**Weighing"),
-            thinking(" the options"),
-            thinking("**"),
-            thinking("\n\nBoth read the same file."),
-        ]);
-
-        assert_eq!(published, [thought(None), thought(Some(THOUGHT_TITLE))]);
-    }
-
-    /// The heading is split across deltas, so a parse that reran per delta
-    /// would drop it the moment a chunk landed between the fence and the
-    /// blank line. It must survive that.
-    #[test]
-    fn a_named_thought_keeps_its_heading_through_the_rest_of_the_block() {
-        let published = activities(vec![
-            thinking("**Weighing the options**"),
-            thinking("\n"),
-            thinking("\nBoth read the same file."),
-        ]);
-
-        assert_eq!(published, [thought(Some(THOUGHT_TITLE))]);
-    }
-
-    /// An unnamed thought would otherwise be buffered in full a second time,
-    /// and a reasoning stream runs to tens of kilobytes.
-    #[test]
-    fn an_unnamed_thought_stops_being_accumulated() {
-        let mut relay = ProgressRelay::new();
-        let text = "prose ".repeat(THOUGHT_TITLE_SCAN_LIMIT);
-        let delta = thinking(&text);
-
-        for _ in 0..3 {
-            assert_eq!(
-                relay.activity(&delta),
-                Some(SubagentActivity::Thinking { title: None })
-            );
-        }
-
-        assert_eq!(
-            relay.thought.len(),
-            text.len(),
-            "the delta that passes the limit is the last one buffered"
-        );
-    }
-
-    /// Two thoughts in a row with only a turn boundary between them: the
-    /// second is unnamed and must say so rather than wear the first's name.
-    #[test]
-    fn a_new_turn_starts_a_new_thought() {
-        let published = activities(vec![
-            thinking("**Weighing the options**\n\nBoth read the same file."),
-            turn(TokenUsage::default(), 0.0),
-            thinking("Still unsure."),
-        ]);
-
-        assert_eq!(published, [thought(Some(THOUGHT_TITLE)), thought(None)]);
-    }
-
-    fn header_snapshot(text: &str) -> AgentEvent {
-        AgentEvent::ToolHeaderSnapshot {
-            id: TOOL_ID.into(),
-            snapshot: caudra_agent::BufferSnapshot::plain_text(text.into()),
-            theme_gen: None,
-        }
-    }
-
-    /// A plugin paints its real header after the call starts, and that is the
-    /// text its transcript shows. The snapshot names no tool, so it can only
-    /// retitle the call already on the header.
-    #[test]
-    fn a_mid_run_header_retitles_the_tool_it_belongs_to() {
-        let published = activities(vec![
-            tool_start("batch"),
-            header_snapshot("3 tools"),
-            AgentEvent::TextDelta {
-                text: "done".into(),
-            },
-            header_snapshot("stray"),
-        ]);
-
-        assert_eq!(
-            published,
-            [
-                ("batch".to_owned(), None),
-                ("batch".to_owned(), Some("3 tools".to_owned())),
-                (RESPONDING_LABEL.to_owned(), None),
-            ]
-        );
-    }
-
-    /// `ToolPending` announces the call the following `ToolStart` runs, so a
-    /// relay counting both would report twice the work. Two identical calls
-    /// in a row leave the activity untouched, and the count is then the only
-    /// thing that says anything happened.
-    #[test]
-    fn relay_counts_started_tools_once_each() {
-        let (sub_tx, sub_rx) = flume::unbounded();
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let (usage_tx, _usage_rx) = flume::unbounded();
-
-        for event in [
-            AgentEvent::ToolPending {
-                id: "toolu_01".into(),
-                name: "shell".into(),
-            },
-            tool_start("shell"),
-            tool_start("shell"),
-        ] {
-            sub_tx.send(envelope(event)).unwrap();
-        }
-        drop(sub_tx);
-
-        smol::block_on(relay_session_events(
-            sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
-            parent_info(),
-            usage_tx,
-            None,
-        ));
-
-        let counts: Vec<u32> = relayed_progress(&parent_rx)
-            .into_iter()
-            .map(|(_, tools, _)| tools)
-            .collect();
-        assert_eq!(counts, [0, 1, 2]);
     }
 }

@@ -1,0 +1,534 @@
+//! `skill`: load a named instruction set on demand.
+//!
+//! Skills are `SKILL.md` files with YAML frontmatter, discovered across the
+//! config directory, the user's home, and every project ancestor up to the
+//! repository root. Only the names and descriptions go in the tool
+//! description; the body is paid for when the model asks for it.
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use arc_swap::ArcSwap;
+use serde_json::Value;
+
+use crate::tools::registry::{
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
+    ToolInvocation,
+};
+use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
+use crate::tools::{BoxFuture, DescriptionContext, ToolContext, relative_path};
+use crate::types::ToolOutput;
+
+pub const DESCRIPTION: &str =
+    "Load a skill that provides instructions and workflows for specific tasks.";
+
+const SKILL_FILE: &str = "SKILL.md";
+const NOT_FOUND: &str = "skill not found: ";
+const NO_SKILLS: &str = "No skills available.";
+
+const PROJECT_SKILL_DIRS: &[&str] = &[
+    ".caudra/skills",
+    ".claude/skills",
+    ".opencode/skills",
+    ".agents/skills",
+];
+const GLOBAL_SKILL_DIRS: &[&str] = &[
+    ".claude/skills",
+    ".config/opencode/skills",
+    ".agents/skills",
+];
+
+static NAME_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::String,
+    description: "Name of the skill to load",
+};
+static PROPERTIES: &[Property] = &[("name", &NAME_PARAM, true, &[])];
+static SCHEMA: ParamSchema = ParamSchema::Object {
+    properties: PROPERTIES,
+    description: "",
+    reject_unknown: false,
+};
+
+/// A skill Caudra ships rather than discovers. `caudra-lua` installs the
+/// plugin-authoring skill here at startup: it is generated from the live Lua
+/// API docs, which only that crate can render, and `caudra-agent` must not
+/// depend on it.
+pub struct BuiltinSkill {
+    pub name: String,
+    pub description: String,
+    /// Deferred because resolving may write the reference to disk, which is
+    /// wasted work for every session that never loads the skill.
+    pub resolve: Box<dyn Fn() -> (String, Option<PathBuf>) + Send + Sync>,
+}
+
+/// Absent until something installs one, which is exactly how
+/// `plugins.skill.plugin_dev = false` turns the builtin skill off.
+static BUILTIN: LazyLock<ArcSwap<Option<Arc<BuiltinSkill>>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(None));
+
+pub fn set_builtin_skill(skill: BuiltinSkill) {
+    BUILTIN.store(Arc::new(Some(Arc::new(skill))));
+}
+
+fn installed_builtin() -> Option<Arc<BuiltinSkill>> {
+    BUILTIN.load().as_ref().clone()
+}
+
+#[derive(Clone)]
+struct Skill {
+    name: String,
+    description: String,
+    location: String,
+}
+
+pub struct SkillTool {
+    dirs: Vec<PathBuf>,
+    /// Built on first use, not at registration: tools register before the
+    /// config that decides whether the builtin skill exists. Memoized so the
+    /// list the model was given cannot change under it mid-session.
+    listing: OnceLock<String>,
+}
+
+impl Default for SkillTool {
+    fn default() -> Self {
+        Self {
+            dirs: skill_dirs(),
+            listing: OnceLock::new(),
+        }
+    }
+}
+
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        "skill"
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        Cow::Borrowed(self.listing.get_or_init(|| {
+            let found = discover(&self.dirs, installed_builtin().as_deref());
+            format!("{DESCRIPTION}{}", skill_list(&found))
+        }))
+    }
+
+    fn schema(&self) -> Value {
+        to_json_schema(&SCHEMA)
+    }
+
+    fn tool_kind(&self) -> Option<&str> {
+        Some("read")
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        let input = validate(&SCHEMA, input.clone())?;
+        let name = input
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParseError::custom("name is required"))?;
+        Ok(Box::new(SkillCall {
+            name: name.to_owned(),
+            dirs: self.dirs.clone(),
+        }))
+    }
+}
+
+struct SkillCall {
+    name: String,
+    dirs: Vec<PathBuf>,
+}
+
+impl ToolInvocation for SkillCall {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(self.name.clone()))
+    }
+
+    /// Scoped to the directories a skill can come from, not the individual
+    /// file: approving `skill` once should not re-prompt per skill.
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        let scopes: Vec<String> = self
+            .dirs
+            .iter()
+            .map(|dir| format!("{}/**", dir.to_string_lossy().trim_end_matches('/')))
+            .collect();
+        Box::pin(std::future::ready((!scopes.is_empty()).then_some(
+            PermissionScopes {
+                scopes,
+                force_prompt: false,
+            },
+        )))
+    }
+
+    fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            match smol::unblock(move || self.load()).await {
+                Ok(text) => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
+                Err(message) => ToolExecResult::from(Err(message)),
+            }
+        })
+    }
+}
+
+impl SkillCall {
+    fn load(&self) -> Result<String, String> {
+        load_from(&self.name, &self.dirs, installed_builtin().as_deref())
+    }
+}
+
+fn load_from(
+    name: &str,
+    dirs: &[PathBuf],
+    builtin: Option<&BuiltinSkill>,
+) -> Result<String, String> {
+    let discovered = discover(dirs, builtin);
+    let Some(skill) = discovered.get(name) else {
+        return Err(format!("{NOT_FOUND}{name}{}", skill_list(&discovered)));
+    };
+    let (content, location) = read_skill(skill, builtin)?;
+    Ok(format!("{location}\n{}", numbered(&content)))
+}
+
+/// The model reads this to decide whether to load anything at all, so it
+/// carries names and descriptions only.
+fn skill_list(skills: &BTreeMap<String, Skill>) -> String {
+    if skills.is_empty() {
+        return format!("\n\n<available_skills>\n{NO_SKILLS}\n</available_skills>");
+    }
+    let lines: Vec<String> = skills
+        .values()
+        .map(|s| format!("- {}: {}", s.name, s.description))
+        .collect();
+    format!(
+        "\n\n<available_skills>\n{}\n</available_skills>",
+        lines.join("\n")
+    )
+}
+
+fn discover(dirs: &[PathBuf], builtin: Option<&BuiltinSkill>) -> BTreeMap<String, Skill> {
+    let mut skills = BTreeMap::new();
+    if let Some(builtin) = builtin {
+        skills.insert(
+            builtin.name.clone(),
+            Skill {
+                name: builtin.name.clone(),
+                description: builtin.description.clone(),
+                location: builtin_location(&builtin.name),
+            },
+        );
+    }
+    for dir in dirs {
+        scan(dir, &mut skills);
+    }
+    skills
+}
+
+fn builtin_location(name: &str) -> String {
+    format!("builtin:{name}")
+}
+
+fn scan(dir: &Path, skills: &mut BTreeMap<String, Skill>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path().join(SKILL_FILE);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let (frontmatter, body) = parse_frontmatter(&content);
+        if body.is_empty() {
+            continue;
+        }
+        let name = frontmatter
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+        let description = frontmatter.get("description").cloned().unwrap_or_default();
+        skills.insert(
+            name.clone(),
+            Skill {
+                name,
+                description,
+                location: path.to_string_lossy().into_owned(),
+            },
+        );
+    }
+}
+
+fn read_skill(skill: &Skill, builtin: Option<&BuiltinSkill>) -> Result<(String, String), String> {
+    if let Some(builtin) = builtin
+        && skill.location == builtin_location(&builtin.name)
+    {
+        let (content, reference) = (builtin.resolve)();
+        let location = reference.map_or_else(
+            || skill.location.clone(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+        return Ok((content, location));
+    }
+    let content = std::fs::read_to_string(&skill.location)
+        .map_err(|e| format!("cannot read {}: {e}", skill.location))?;
+    let (_, body) = parse_frontmatter(&content);
+    Ok((body, relative_path(&skill.location)))
+}
+
+/// Line numbers so the model can cite and re-read a section by offset.
+fn numbered(content: &str) -> String {
+    content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} | {line}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Only the scalar `key: value` pairs are read: `name` and `description` are
+/// all a skill header is allowed to carry, and a full YAML parse would accept
+/// shapes the rest of the code cannot use.
+fn parse_frontmatter(content: &str) -> (BTreeMap<String, String>, String) {
+    let Some(rest) = content.trim_start().strip_prefix("---\n") else {
+        return (BTreeMap::new(), content.trim().to_owned());
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (BTreeMap::new(), content.trim().to_owned());
+    };
+    let mut fields = BTreeMap::new();
+    for line in rest[..end].lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']).trim();
+        if !value.is_empty() {
+            fields.insert(key.trim().to_owned(), value.to_owned());
+        }
+    }
+    let body = rest[end + "\n---".len()..].trim().to_owned();
+    (fields, body)
+}
+
+/// Search order is widest to narrowest, and the map keeps the last write, so a
+/// project skill shadows a global one of the same name.
+fn skill_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+
+    if let Ok(config) = caudra_storage::paths::config_dir() {
+        push(config.join("skills"));
+    }
+    if let Some(home) = caudra_storage::paths::home() {
+        for rel in GLOBAL_SKILL_DIRS {
+            push(home.join(rel));
+        }
+    }
+    for ancestor in project_ancestors() {
+        for rel in PROJECT_SKILL_DIRS {
+            push(ancestor.join(rel));
+        }
+    }
+    dirs
+}
+
+/// Stops at the repository root: past it the directories belong to an
+/// unrelated project, or to the whole filesystem.
+fn project_ancestors() -> Vec<PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![cwd.clone()];
+    if cwd.join(".git").exists() {
+        return dirs;
+    }
+    for parent in cwd.ancestors().skip(1) {
+        dirs.push(parent.to_path_buf());
+        if parent.join(".git").exists() {
+            break;
+        }
+    }
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const BUILTIN_NAME: &str = "caudra-plugin-dev";
+    const BUILTIN_BODY: &str = "how to write plugins";
+    const BUILTIN_DESC: &str = "author plugins";
+
+    fn skill_dir(temp: &tempfile::TempDir, name: &str, content: &str) -> PathBuf {
+        let dir = temp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(SKILL_FILE), content).unwrap();
+        temp.path().to_path_buf()
+    }
+
+    fn plugin_dev_skill(reference: Option<PathBuf>) -> BuiltinSkill {
+        BuiltinSkill {
+            name: BUILTIN_NAME.into(),
+            description: BUILTIN_DESC.into(),
+            resolve: Box::new(move || (BUILTIN_BODY.into(), reference.clone())),
+        }
+    }
+
+    #[test]
+    fn a_skill_body_is_returned_with_line_numbers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(
+            &temp,
+            "deploy",
+            "---\nname: deploy\ndescription: ship it\n---\nfirst\nsecond\n",
+        );
+        let out = load_from("deploy", &[root], None).unwrap();
+        assert!(out.contains("   1 | first"), "{out}");
+        assert!(out.contains("   2 | second"), "{out}");
+        assert!(!out.contains("description: ship it"), "frontmatter leaked");
+    }
+
+    #[test]
+    fn the_directory_name_is_the_fallback_skill_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(&temp, "unnamed", "no frontmatter here");
+        let found = discover(&[root], None);
+        assert!(found.contains_key("unnamed"), "{:?}", found.keys());
+    }
+
+    #[test]
+    fn a_frontmatter_name_wins_over_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(&temp, "dirname", "---\nname: realname\n---\nbody\n");
+        let found = discover(&[root], None);
+        assert!(found.contains_key("realname"), "{:?}", found.keys());
+        assert!(!found.contains_key("dirname"));
+    }
+
+    #[test]
+    fn a_body_less_skill_is_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(&temp, "empty", "---\nname: empty\n---\n");
+        assert!(discover(&[root], None).is_empty());
+    }
+
+    /// A later directory shadows an earlier one, which is what makes a project
+    /// skill override a global of the same name.
+    #[test]
+    fn a_later_directory_shadows_an_earlier_one() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global_root = skill_dir(&global, "deploy", "---\ndescription: global\n---\nbody\n");
+        let project_root = skill_dir(&project, "deploy", "---\ndescription: local\n---\nbody\n");
+        let found = discover(&[global_root, project_root], None);
+        assert_eq!(found["deploy"].description, "local");
+    }
+
+    #[test]
+    fn an_unknown_skill_lists_what_is_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
+        let error = load_from("nope", &[root], None).unwrap_err();
+        assert!(error.starts_with(NOT_FOUND), "{error}");
+        assert!(error.contains("- deploy: ship it"), "{error}");
+    }
+
+    #[test]
+    fn no_skills_at_all_still_produces_a_usable_list() {
+        assert!(skill_list(&BTreeMap::new()).contains(NO_SKILLS));
+    }
+
+    #[test]
+    fn the_listing_is_sorted_so_the_description_is_reproducible() {
+        let temp = tempfile::tempdir().unwrap();
+        skill_dir(&temp, "zulu", "---\ndescription: z\n---\nbody\n");
+        skill_dir(&temp, "alpha", "---\ndescription: a\n---\nbody\n");
+        let root = skill_dir(&temp, "mike", "---\ndescription: m\n---\nbody\n");
+        let listing = skill_list(&discover(&[root], None));
+        let alpha = listing.find("alpha").unwrap();
+        let mike = listing.find("mike").unwrap();
+        let zulu = listing.find("zulu").unwrap();
+        assert!(alpha < mike && mike < zulu, "{listing}");
+    }
+
+    #[test]
+    fn permission_scopes_cover_every_search_directory() {
+        let call = SkillCall {
+            name: "x".into(),
+            dirs: vec![PathBuf::from("/a/skills"), PathBuf::from("/b/skills")],
+        };
+        let scopes = smol::block_on(call.permission_scopes()).unwrap();
+        assert_eq!(scopes.scopes, vec!["/a/skills/**", "/b/skills/**"]);
+        assert!(!scopes.force_prompt);
+    }
+
+    #[test]
+    fn no_search_directories_means_no_scopes() {
+        let call = SkillCall {
+            name: "x".into(),
+            dirs: Vec::new(),
+        };
+        assert!(smol::block_on(call.permission_scopes()).is_none());
+    }
+
+    #[test]
+    fn an_uninstalled_builtin_is_simply_absent() {
+        assert!(discover(&[], None).is_empty());
+        let error = load_from(BUILTIN_NAME, &[], None).unwrap_err();
+        assert!(error.starts_with(NOT_FOUND), "{error}");
+    }
+
+    #[test]
+    fn an_installed_builtin_is_listed_and_loadable() {
+        let builtin = plugin_dev_skill(None);
+        assert_eq!(
+            discover(&[], Some(&builtin))[BUILTIN_NAME].description,
+            BUILTIN_DESC
+        );
+        let out = load_from(BUILTIN_NAME, &[], Some(&builtin)).unwrap();
+        assert!(out.contains(BUILTIN_BODY), "{out}");
+        assert!(out.contains(&builtin_location(BUILTIN_NAME)), "{out}");
+    }
+
+    /// The plugin-dev skill spills the API reference to disk and reports that
+    /// path so the model can read it directly.
+    #[test]
+    fn a_builtin_that_spills_a_reference_reports_its_path() {
+        let reference = PathBuf::from("/state/docs/lua-api.md");
+        let builtin = plugin_dev_skill(Some(reference.clone()));
+        let out = load_from(BUILTIN_NAME, &[], Some(&builtin)).unwrap();
+        assert!(
+            out.starts_with(&reference.to_string_lossy().to_string()),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_disk_skill_of_the_same_name_does_not_take_the_builtin_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(
+            &temp,
+            "ondisk",
+            &format!("---\nname: {BUILTIN_NAME}\n---\nreal file content\n"),
+        );
+        let builtin = plugin_dev_skill(None);
+        let out = load_from(BUILTIN_NAME, &[root], Some(&builtin)).unwrap();
+        assert!(out.contains("real file content"), "{out}");
+        assert!(!out.contains(BUILTIN_BODY), "{out}");
+    }
+
+    #[test_case("---\nname: a\n---\nbody", Some("a"), "body" ; "well_formed")]
+    #[test_case("no frontmatter", None, "no frontmatter" ; "absent")]
+    #[test_case("---\nname: a\nbody without close", None, "---\nname: a\nbody without close" ; "unterminated")]
+    #[test_case("---\nname: \"quoted\"\n---\nb", Some("quoted"), "b" ; "quotes_stripped")]
+    #[test_case("---\nname:\n---\nb", None, "b" ; "empty_value_dropped")]
+    fn frontmatter_parsing(input: &str, name: Option<&str>, body: &str) {
+        let (fields, parsed) = parse_frontmatter(input);
+        assert_eq!(fields.get("name").map(String::as_str), name);
+        assert_eq!(parsed, body);
+    }
+}

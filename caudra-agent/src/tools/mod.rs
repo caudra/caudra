@@ -8,6 +8,7 @@
 mod file_tracker;
 pub mod grep;
 pub mod interpreter_bridge;
+pub mod native;
 pub mod registry;
 pub mod schema;
 
@@ -268,6 +269,7 @@ pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
 pub const INDEX_TOOL_NAME: &str = "index";
+pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
@@ -599,18 +601,23 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&name)
-        || caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(&name)
-        || INTERNAL_COMPANION_TOOL_NAMES.contains(&name)
+    all_builtin_tool_names().contains(&name)
 }
 
+/// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
+/// that stay enabled regardless of `disabled_tools`, which is orthogonal to
+/// who implements them. Dedupe so `--help` never prints a name twice.
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
-    caudra_config::WORKCELL_NATIVE_TOOL_NAMES
+    let mut names: Vec<&'static str> = caudra_config::WORKCELL_NATIVE_TOOL_NAMES
         .iter()
+        .chain(caudra_config::CAUDRA_NATIVE_TOOL_NAMES.iter())
         .chain(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.iter())
         .chain(INTERNAL_COMPANION_TOOL_NAMES.iter())
         .copied()
-        .collect()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 use caudra_providers::{Message, ProviderEvent, StreamResponse};

@@ -177,6 +177,8 @@ fn build_stack(
     });
     let (config, prompt_profiles, default_prompt_profile) =
         config_or_fallback(loaded, fallback_config, &mut warnings)?;
+    super::configure_native_tools(&config.agent);
+    super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
 
     if let Err(e) = plugin_host.load_production_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
@@ -267,7 +269,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     load_env_files(&cwd);
-    let _workcell_host = super::register_workcell(&cwd)?;
+    let _workcell_host = super::register_builtin_tools(&cwd)?;
     warn_stale_config_toml(&cwd);
 
     let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
@@ -627,9 +629,8 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    /// `--no-plugins` keeps the Lua host live (tools + default keymap
-    /// still load) but skips user `init.lua`, so a broken project
-    /// `init.lua` must not be executed in that mode.
+    /// `--no-plugins` keeps the Lua host live but skips user `init.lua`, so
+    /// a broken project `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
         use caudra_agent::tools::ToolRegistry;

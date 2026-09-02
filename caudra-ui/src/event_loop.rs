@@ -51,6 +51,7 @@ use crate::app::{
 use crate::appearance::{self, AutoSwitch};
 use crate::color_compat;
 use crate::components::input::Submission;
+use crate::components::session_picker::{SessionActivity, SessionRow};
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
@@ -117,11 +118,25 @@ pub struct EventLoopParams {
     pub herdr_reporter: Option<HerdrReporterHandle>,
 }
 
+const NEEDS_INPUT_MARK: &str = "\u{25c6}";
+const FINISHED_MARK: &str = "\u{2713}";
+const SESSIONS_COMMAND: &str = "/sessions";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionStatus {
     Working,
     NeedsInput,
     Idle,
+}
+
+impl SessionStatus {
+    fn activity(self) -> SessionActivity {
+        match self {
+            Self::Working => SessionActivity::Working,
+            Self::NeedsInput => SessionActivity::NeedsInput,
+            Self::Idle => SessionActivity::Idle,
+        }
+    }
 }
 
 enum PendingCompletion {
@@ -512,6 +527,9 @@ struct SpawnCtx {
     prompt_profiles: Arc<PromptProfileCatalog>,
     default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profile_override: Option<String>,
+    /// One slot shared by every runtime: an `App` can only see its own
+    /// session, so the loop publishes the rest here for the picker to read.
+    live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
 }
 
 impl SpawnCtx {
@@ -605,6 +623,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             Arc::clone(&self.prompt_profiles),
         );
+        app.live_sessions = Arc::clone(&self.live_sessions);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
@@ -887,6 +906,7 @@ impl<'t> EventLoop<'t> {
             prompt_profiles,
             default_prompt_profile,
             prompt_profile_override,
+            live_sessions: Arc::default(),
         };
 
         let active = sessions.iter().map(|tab| tab.session.id).collect();
@@ -1156,13 +1176,15 @@ impl<'t> EventLoop<'t> {
         }
         drop(slot_model);
 
-        // These two only fire Lua autocmds. Anything a handler does comes back
-        // as a `UiAction` on the next wake, which repaints then.
+        // `emit_focus_change` and `emit_status_changes` only fire Lua
+        // autocmds. Anything a handler does comes back as a `UiAction` on the
+        // next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
         dirty |= self.start_goal_checkins();
         self.emit_status_changes();
-        self.emit_task_changes();
+        self.publish_live_sessions();
+        dirty |= self.emit_task_changes();
         self.emit_notifications();
         if let Some(reporter) = &self.herdr_reporter {
             reporter.observe(aggregate_observations(
@@ -1269,32 +1291,48 @@ impl<'t> EventLoop<'t> {
     }
 
     fn emit_status_changes(&mut self) {
+        let mut background = Vec::new();
         let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {
                 continue;
             }
-            rt.last_status = status;
+            let previous = std::mem::replace(&mut rt.last_status, status);
+            let focused = i == self.focused;
+            if !focused {
+                background.push((rt.app.state.session.title.clone(), previous, status));
+            }
             handle.fire_autocmd(
                 "SessionStatusChanged",
                 json!({
                     "session_id": rt.id(),
                     "title": rt.app.state.session.title,
                     "status": status.as_str(),
-                    "focused": i == self.focused,
+                    "focused": focused,
                 }),
             );
+        }
+        // A session you cannot see has no other way to say it wants you, so
+        // the news lands on whichever one you are looking at.
+        for (title, previous, status) in background {
+            if let Some(flash) = background_flash(&title, previous, status) {
+                self.focused_app().flash(flash);
+            }
         }
     }
 
     /// One diff per frame covers every path that finishes, cancels or errors a
-    /// chat, so none of them has to remember to fire an event.
-    fn emit_task_changes(&mut self) {
+    /// chat, so none of them has to remember to fire an event. An open
+    /// `/tasks` picker is refreshed off the same diff, so a subagent that
+    /// starts or ends shows up there without polling.
+    fn emit_task_changes(&mut self) -> Dirty {
         let handle = &self.ctx.lua_event_handle;
+        let mut changed = false;
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
+                changed = true;
                 handle.fire_autocmd(
                     "TaskStatusChanged",
                     json!({
@@ -1306,6 +1344,10 @@ impl<'t> EventLoop<'t> {
                 );
             });
         }
+        if !changed {
+            return Dirty::NO;
+        }
+        self.focused_app().refresh_task_picker()
     }
 
     fn emit_notifications(&mut self) {
@@ -1330,11 +1372,35 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Republished only on a real change: the picker watches this slot by
+    /// pointer, so a fresh `Arc` every frame would rebuild its rows for
+    /// nothing.
+    fn publish_live_sessions(&self) {
+        let rows: Vec<SessionRow> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, rt)| SessionRow {
+                id: rt.id(),
+                title: rt.app.state.session.title.clone(),
+                updated_at: rt.app.state.session.updated_at,
+                activity: Some(SessionStatus::of(&rt.app).activity()),
+                focused: i == self.focused,
+            })
+            .collect();
+        if self.ctx.live_sessions.load().as_slice() != rows {
+            self.ctx.live_sessions.store(Arc::new(rows));
+        }
+    }
+
     fn emit_focus_change(&mut self) {
         let id = self.sessions[self.focused].id();
         if self.last_focused == Some(id) {
             return;
         }
+        // The picker only ever lists the focused session, so a session switch
+        // closes it rather than leaving ids from elsewhere on screen.
+        self.focused_app().task_picker.close();
         let mut data = json!({ "session_id": id });
         if let Some(previous) = self.last_focused {
             data["previous_session_id"] = json!(previous.to_string());
@@ -1407,35 +1473,16 @@ impl<'t> EventLoop<'t> {
             // flushes, so the loop never blocks on disk and a queued save
             // cannot resurrect the files.
             SessionRequest::Delete { id } => {
-                let id = match parse_session_id(&id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        let _ = reply_tx.send(Err(e));
+                let lease = match parse_session_id(&id)
+                    .and_then(|id| self.release_for_delete(id).map(|lease| (id, lease)))
+                {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error));
                         return;
                     }
                 };
-                let lease = if let Some(i) = self.position(id) {
-                    if i == self.focused {
-                        let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
-                        return;
-                    }
-                    if !self.sessions[i].quiescent() {
-                        let _ = reply_tx.send(Err(DELETE_BUSY_ERR.into()));
-                        return;
-                    }
-                    let rt = self.remove_runtime(i);
-                    let SessionRuntime { handles, lease, .. } = rt;
-                    handles.cancel();
-                    lease
-                } else {
-                    match SessionLease::acquire(&self.ctx.storage, id) {
-                        Ok(lease) => Arc::new(lease),
-                        Err(error) => {
-                            let _ = reply_tx.send(Err(error.to_string()));
-                            return;
-                        }
-                    }
-                };
+                let (id, lease) = lease;
                 self.ctx.storage_writer.delete(id, move |res| {
                     let _lease = lease;
                     let reply = match res {
@@ -1522,27 +1569,50 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::SetTitle { id, title } => {
-                let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
-                        let _lease = SessionLease::acquire(&self.ctx.storage, id)
-                            .map_err(|error| error.to_string())?;
-                        let mut session =
-                            load_app_session(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        self.ctx
-                            .storage_writer
-                            .save_sync(Arc::new(session))
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(json!(true))
-                })();
+                let reply = parse_session_id(&id)
+                    .and_then(|id| self.set_session_title(id, &title))
+                    .map(|()| json!(true));
                 let _ = reply_tx.send(reply);
             }
         }
+    }
+
+    /// Clears the way for a delete: a live session is torn down first, a
+    /// stored one is claimed by lease. The lease must outlive the erase, or
+    /// another process could reopen the session halfway through it.
+    fn release_for_delete(&mut self, id: CaudraId) -> Result<Arc<SessionLease>, String> {
+        let Some(i) = self.position(id) else {
+            return SessionLease::acquire(&self.ctx.storage, id)
+                .map(Arc::new)
+                .map_err(|error| error.to_string());
+        };
+        if i == self.focused {
+            return Err(DELETE_FOCUSED_ERR.into());
+        }
+        if !self.sessions[i].quiescent() {
+            return Err(DELETE_BUSY_ERR.into());
+        }
+        let SessionRuntime { handles, lease, .. } = self.remove_runtime(i);
+        handles.cancel();
+        Ok(lease)
+    }
+
+    /// A live session is retitled in memory and saved on its own schedule; a
+    /// stored one is loaded, retitled, and written back under a lease.
+    fn set_session_title(&mut self, id: CaudraId, title: &str) -> Result<(), String> {
+        let title = normalize_title(title);
+        if let Some(i) = self.position(id) {
+            self.sessions[i].app.state.session_mut().set_title(title);
+            return Ok(());
+        }
+        let _lease =
+            SessionLease::acquire(&self.ctx.storage, id).map_err(|error| error.to_string())?;
+        let mut session = load_app_session(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+        session.set_title(title);
+        self.ctx
+            .storage_writer
+            .save_sync(Arc::new(session))
+            .map_err(|error| error.to_string())
     }
 
     /// Lua acts on the focused session, the same target the model picker and
@@ -1982,6 +2052,25 @@ impl<'t> EventLoop<'t> {
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::RequestNewSession => unreachable!("handled by dispatch"),
+            Action::FocusSession(id) => {
+                if let Err(error) = self.focus_session(id) {
+                    self.sessions[idx].app.flash(error);
+                }
+            }
+            Action::DeleteSession(id) => match self.release_for_delete(id) {
+                Ok(lease) => self.ctx.storage_writer.delete(id, move |res| {
+                    let _lease = lease;
+                    if let Err(error) = res {
+                        tracing::error!(%error, %id, "failed to delete session");
+                    }
+                }),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            Action::SetSessionTitle { id, title } => {
+                if let Err(error) = self.set_session_title(id, &title) {
+                    self.sessions[idx].app.flash(error);
+                }
+            }
             Action::NewSession(lease) => {
                 let old_lease = std::mem::replace(&mut self.sessions[idx].lease, lease);
                 self.respawn_agent(idx, Vec::new());
@@ -2454,6 +2543,17 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     } else {
         -(lines as i32)
     }
+}
+
+/// Only the two transitions worth interrupting for: a background session that
+/// wants an answer, and one that just finished. Everything else is noise.
+fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus) -> Option<String> {
+    let mark = match (previous, status) {
+        (_, SessionStatus::NeedsInput) => NEEDS_INPUT_MARK,
+        (SessionStatus::Working, SessionStatus::Idle) => FINISHED_MARK,
+        _ => return None,
+    };
+    Some(format!("{mark} {title} · {SESSIONS_COMMAND}"))
 }
 
 #[cfg(test)]

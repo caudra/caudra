@@ -9,6 +9,10 @@ use caudra_config::{
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
+const PLUGIN_DEV_DESC: &str =
+    "Offer the builtin caudra-plugin-dev skill for writing caudra plugins.";
+const MAX_CONCURRENT_DESC: &str = "Max concurrently running subagents.";
+
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
 fn write_table(out: &mut String, fields: &[ConfigField]) {
@@ -71,17 +75,27 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
     writeln!(out).unwrap();
 }
 
+/// These tables outlived the Lua plugins they were written for: the tool is
+/// native now and Rust validates the same keys.
+fn native_tool_note(plugin: &str) -> Option<String> {
+    match plugin {
+        "index" => Some(format!(
+            "`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts {} through {} MiB to bound parser memory and work.",
+            caudra_config::MIN_INDEX_MAX_FILE_SIZE_MB,
+            caudra_config::MAX_INDEX_MAX_FILE_SIZE_MB,
+        )),
+        "skill" | "task" => Some(format!(
+            "`{plugin}` executes as a native Caudra tool. This table keeps its existing configuration key."
+        )),
+        _ => None,
+    }
+}
+
 fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
     for (plugin, options) in specs {
         writeln!(out, "### `plugins.{plugin}`\n").unwrap();
-        if plugin.as_ref() == "index" {
-            writeln!(
-                out,
-                "`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts {} through {} MiB to bound parser memory and work.\n",
-                caudra_config::MIN_INDEX_MAX_FILE_SIZE_MB,
-                caudra_config::MAX_INDEX_MAX_FILE_SIZE_MB,
-            )
-            .unwrap();
+        if let Some(note) = native_tool_note(plugin) {
+            writeln!(out, "{note}\n").unwrap();
         }
         writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
         writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
@@ -130,6 +144,28 @@ fn collect_plugin_options() -> PluginOptionSpecs {
                 "Refuse to index files larger than this many MiB (maximum {}).",
                 caudra_config::MAX_INDEX_MAX_FILE_SIZE_MB
             ),
+        }],
+    );
+    specs.insert(
+        "task".into(),
+        vec![OptionSpec {
+            name: "max_concurrent".into(),
+            ty: OptionType::Integer,
+            default: Some(serde_json::json!(
+                caudra_config::DEFAULT_TASK_MAX_CONCURRENT
+            )),
+            min: Some(caudra_config::MIN_TASK_MAX_CONCURRENT as f64),
+            desc: MAX_CONCURRENT_DESC.into(),
+        }],
+    );
+    specs.insert(
+        "skill".into(),
+        vec![OptionSpec {
+            name: "plugin_dev".into(),
+            ty: OptionType::Boolean,
+            default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_PLUGIN_DEV)),
+            min: None,
+            desc: PLUGIN_DEV_DESC.into(),
         }],
     );
     assert!(

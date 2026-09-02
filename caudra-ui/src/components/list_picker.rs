@@ -1484,7 +1484,10 @@ mod tests {
         let mut seen: Vec<Option<&str>> = Vec::new();
         for section in &sections {
             if seen.last() != Some(section) {
-                assert!(!seen.contains(section), "section {section:?} was split: {sections:?}");
+                assert!(
+                    !seen.contains(section),
+                    "section {section:?} was split: {sections:?}"
+                );
                 seen.push(*section);
             }
         }
@@ -1506,10 +1509,7 @@ mod tests {
             " Test ",
         );
         search(&mut p, "view");
-        assert_eq!(
-            labels(&p),
-            vec!["view", "preview", "zview", "xxxxview"]
-        );
+        assert_eq!(labels(&p), vec!["view", "preview", "zview", "xxxxview"]);
     }
 
     /// The model picker lists a model twice, once under `Recent`. Identical
@@ -1550,7 +1550,11 @@ mod tests {
         p.open(items, " Test ");
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| { p.view(f, f.area()); }).unwrap();
+        terminal
+            .draw(|f| {
+                p.view(f, f.area());
+            })
+            .unwrap();
         let text: String = terminal
             .backend()
             .buffer()

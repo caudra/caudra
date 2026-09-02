@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display_in_project};
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
+use crate::repaint::Dirty;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
@@ -33,6 +35,7 @@ use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
 
 struct RevertTarget {
@@ -374,6 +377,7 @@ impl App {
         self.queue_hits.clear();
         self.queue_mouse_down = None;
         self.queue_hover = None;
+        self.todo_panel.reset();
         self.admission_hits.clear();
         self.admission_mouse_down = None;
         self.admission_hover = None;
@@ -488,6 +492,19 @@ impl App {
             {
                 subagent_versions.insert(subagent.tool_use_id.clone(), version_id.clone());
             }
+        }
+        // `todo_write` replaces the whole list every call, so the last one in
+        // the transcript is the current plan.
+        if let Some(items) =
+            display_msgs
+                .iter()
+                .rev()
+                .find_map(|msg| match msg.tool_output.as_deref() {
+                    Some(caudra_agent::types::ToolOutput::TodoList(items)) => Some(items.clone()),
+                    _ => None,
+                })
+        {
+            self.todo_panel.set_items(items);
         }
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
@@ -2081,4 +2098,86 @@ fn unrevert_failure_status_value(
             "worktree_reverted": true,
         })
     })
+}
+
+/// The picker merges two sources: sessions this process has open (which the
+/// event loop publishes, and only it can see) and everything else on disk.
+/// Live rows win, because a session mid-turn has state the store has not
+/// caught up with yet.
+impl App {
+    pub(super) fn sessions_browse(&mut self) -> Vec<Action> {
+        let rows = self.session_rows();
+        self.session_picker.open(rows, now_secs());
+        Vec::new()
+    }
+
+    pub(crate) fn refresh_session_picker(&mut self) -> Dirty {
+        if !self.session_picker.is_open() {
+            return Dirty::NO;
+        }
+        if self.live_session_watch.poll(self.live_sessions.load_full()) == Dirty::NO {
+            return Dirty::NO;
+        }
+        let rows = self.session_rows();
+        self.session_picker.refresh(rows, now_secs());
+        Dirty::YES
+    }
+
+    pub(super) fn handle_session_picker_action(
+        &mut self,
+        action: SessionPickerAction,
+    ) -> Vec<Action> {
+        match action {
+            SessionPickerAction::Consumed | SessionPickerAction::Closed => Vec::new(),
+            SessionPickerAction::Focus(id) => vec![Action::FocusSession(id)],
+            SessionPickerAction::Delete(id) => vec![Action::DeleteSession(id)],
+            SessionPickerAction::Rename { id, title } => {
+                vec![Action::SetSessionTitle { id, title }]
+            }
+            SessionPickerAction::New => vec![Action::RequestNewSession],
+        }
+    }
+
+    pub(super) fn rename_session(&mut self, args: &str) -> Vec<Action> {
+        let title = args.trim();
+        if title.is_empty() {
+            self.flash(RENAME_USAGE.into());
+            return Vec::new();
+        }
+        vec![Action::SetSessionTitle {
+            id: self.state.session.id,
+            title: title.to_owned(),
+        }]
+    }
+
+    fn session_rows(&self) -> Vec<SessionRow> {
+        let live = self.live_sessions.load();
+        let seen: HashSet<CaudraId> = live.iter().map(|row| row.id).collect();
+        let stored =
+            AppSession::list(&self.state.session.cwd, &self.storage).unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to list stored sessions");
+                Vec::new()
+            });
+        live.iter()
+            .cloned()
+            .chain(
+                stored
+                    .into_iter()
+                    .filter(|summary| !seen.contains(&summary.id))
+                    .map(|summary| SessionRow {
+                        id: summary.id,
+                        title: summary.title,
+                        updated_at: summary.updated_at,
+                        activity: None,
+                        focused: false,
+                    }),
+            )
+            .collect()
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }

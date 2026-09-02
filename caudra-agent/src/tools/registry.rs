@@ -312,7 +312,10 @@ pub trait ToolInvocation: Send + Sync {
     fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
         None
     }
-    fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+    /// Display-only echo of the call (a shell command, a code block). Takes
+    /// no context so a restored session can rebuild it from the stored input
+    /// alone, without standing up an agent to ask.
+    fn start_input(&self) -> Option<ToolInput> {
         None
     }
     fn mutable_path(&self) -> Option<&Path> {

@@ -2135,6 +2135,15 @@ mod effect_tests {
         );
     }
 
+    /// Every tool the production Lua builtins still own, with the effect that
+    /// read-only mode, plan mode, and the permission defaults rely on. Tools
+    /// leave this table as they move to native Rust; the test below fails in
+    /// both directions so neither side can drift silently.
+    const BUNDLED_EFFECTS: &[(&str, ToolEffect)] = &[];
+
+    const EFFECT_DRIFT: &str = "BUNDLED_EFFECTS must list exactly the tools the \
+         production Lua builtins register";
+
     #[test]
     fn production_bundled_tools_have_explicit_effects() {
         let registry = Arc::new(ToolRegistry::new());
@@ -2142,18 +2151,15 @@ mod effect_tests {
         host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
 
-        for (name, expected) in [
-            ("skill", ToolEffect::Mutating),
-            ("view_image", ToolEffect::ReadOnly),
-            ("todo_write", ToolEffect::Isolated),
-            ("batch", ToolEffect::Orchestrator),
-            ("memory", ToolEffect::Mutating),
-            ("task", ToolEffect::Orchestrator),
-            ("question", ToolEffect::Isolated),
-            ("tool_output_read", ToolEffect::ReadOnly),
-            ("tool_output_grep", ToolEffect::ReadOnly),
-        ] {
-            assert_eq!(registry.get(name).unwrap().effect, expected, "{name}");
+        let names = registry.names();
+        let mut registered: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
+        registered.sort_unstable();
+        let mut expected: Vec<&str> = BUNDLED_EFFECTS.iter().map(|(n, _)| *n).collect();
+        expected.sort_unstable();
+        assert_eq!(registered, expected, "{EFFECT_DRIFT}");
+
+        for (name, effect) in BUNDLED_EFFECTS {
+            assert_eq!(registry.get(name).unwrap().effect, *effect, "{name}");
         }
     }
 }

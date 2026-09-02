@@ -29,6 +29,7 @@ arc-swap = { workspace = true }
 bitflags = { workspace = true }
 event-listener = { workspace = true }
 async-lock = { workspace = true }
+jsonschema = { workspace = true }
 async-io = { workspace = true }
 futures-lite = { workspace = true }
 toml = { workspace = true }
@@ -39,6 +40,7 @@ open = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = { workspace = true }
 base64 = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 url = { workspace = true }
 getrandom = { workspace = true }
 

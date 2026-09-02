@@ -1,7 +1,5 @@
 use caudra_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform, all_contexts};
 
-use crate::lua_util;
-
 const FRONTMATTER: &str = "\
 +++
 title = \"Keybindings\"
@@ -9,12 +7,6 @@ weight = 9
 [extra]
 group = \"Reference\"
 +++";
-
-const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
-    ("Session Picker", "`Ctrl+N`", "New session"),
-    ("Session Picker", "`Ctrl+R`", "Rename session"),
-    ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
-];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
@@ -95,19 +87,6 @@ fn write_context_specific(out: &mut String) {
             kb.description
         ));
     }
-
-    for (ctx, key, desc) in LUA_CONTEXT_BINDS {
-        out.push_str(&format!("| {ctx} | {key} | {desc} |\n"));
-    }
-}
-
-fn write_plugin_binds(out: &mut String) {
-    out.push_str("\n## Plugins\n\n");
-    out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `caudra.keymap.set`:\n\n");
-    out.push_str("| Key | Action |\n|-----|--------|\n");
-    for keymap in lua_util::load_builtin_plugin_keymaps() {
-        out.push_str(&format!("| `{}` | {} |\n", keymap.key, keymap.description));
-    }
 }
 
 fn write_inheritance(out: &mut String) {
@@ -151,7 +130,6 @@ pub fn generate() -> String {
     }
 
     write_context_specific(&mut out);
-    write_plugin_binds(&mut out);
     write_inheritance(&mut out);
     write_overrides(&mut out);
 
@@ -194,8 +172,8 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str("```bash\ncaudra --no-plugins\n```\n\n");
     out.push_str(
-        "Skips user `init.lua` files (global and project) but keeps the \
-         Lua host and builtin plugins running, so tools still work. \
+        "Skips user `init.lua` files (global and project). The Lua host \
+         stays up and every built-in tool is native, so tools still work. \
          `permissions.toml`, custom commands, and env files load as \
          usual.\n\n",
     );
@@ -214,71 +192,4 @@ fn write_overrides(out: &mut String) {
          as compact tokens. Focus one and press `Enter`, or click it, to edit \
          the complete pasted text.\n",
     );
-}
-
-/// Contexts a Lua keymap can reach: `dispatch_override` runs before the
-/// built-in globals and before the input box, but after any open overlay.
-const OVERRIDABLE_CONTEXTS: &[KeybindContext] = &[
-    KeybindContext::General,
-    KeybindContext::Editing,
-    KeybindContext::Streaming,
-];
-
-/// Keys a built-in plugin shares with a built-in binding on purpose. `Ctrl+T`
-/// reaches the plan toggle first because `dispatch_overlay` claims it while a
-/// plan is ready, and falls through to the plugin otherwise.
-#[cfg(test)]
-const SHARED_PLUGIN_KEYS: &[(&str, &str)] = &[("Ctrl+T", "Toggle plan panel")];
-
-fn label_keys(label: KeyLabel) -> Vec<&'static str> {
-    match label {
-        KeyLabel::Single(key) => vec![key],
-        KeyLabel::Alt(first, second) | KeyLabel::MacAlt(first, second) => vec![first, second],
-        KeyLabel::Multi(keys) => keys.to_vec(),
-        KeyLabel::MacMulti(keys, mac) => keys.iter().chain(mac).copied().collect(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A built-in plugin keymap wins over the Rust default on the same key, so
-    /// a new default landing on a taken key goes dead with no compiler or
-    /// runtime complaint. Every overlap has to be a deliberate one.
-    #[test]
-    fn plugin_keymaps_only_share_keys_on_purpose() {
-        let keymaps = lua_util::load_builtin_plugin_keymaps();
-        assert!(!keymaps.is_empty(), "built-in plugins register keymaps");
-
-        let overlaps: Vec<_> = keymaps
-            .iter()
-            .filter_map(|keymap| {
-                KEYBINDS
-                    .iter()
-                    .filter(|bind| OVERRIDABLE_CONTEXTS.contains(&bind.context))
-                    .find(|bind| label_keys(bind.label).contains(&keymap.key.as_str()))
-                    .map(|bind| (keymap.key.as_str(), bind.description))
-            })
-            .collect();
-
-        assert_eq!(overlaps, SHARED_PLUGIN_KEYS);
-    }
-
-    #[test]
-    fn plugin_keymaps_are_read_from_the_plugin_sources() {
-        let keymaps = lua_util::load_builtin_plugin_keymaps();
-        let rendered: Vec<_> = keymaps
-            .iter()
-            .map(|keymap| (keymap.key.as_str(), keymap.description.as_str()))
-            .collect();
-        assert_eq!(
-            rendered,
-            vec![
-                ("Alt+P", "Browse sessions"),
-                ("Ctrl+X", "Open tasks"),
-                ("Ctrl+T", "Toggle todo panel"),
-            ]
-        );
-    }
 }

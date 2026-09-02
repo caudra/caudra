@@ -63,6 +63,11 @@ pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
+/// Off by default: writing Caudra plugins is a niche task, and the skill's
+/// entry costs description tokens in every session that never writes one.
+pub const DEFAULT_SKILL_PLUGIN_DEV: bool = false;
+pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
+pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 pub const DEFAULT_INDEX_MAX_FILE_SIZE_MB: usize = 2;
 pub const MIN_INDEX_MAX_FILE_SIZE_MB: usize = 1;
 /// Workcell briefly holds the input bytes and parser-owned source together,
@@ -85,20 +90,30 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "skill",
     "task",
     "todo_write",
+    "tool_output",
     "view_image",
     "webfetch",
     "websearch",
     "write",
 ];
 
-pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[
+/// Which of [`DEFAULT_BUILTINS`] production still loads from Lua. Empty: every
+/// built-in is native now. The sources stay in the tree as Lua-API coverage
+/// and as worked examples for plugin authors, so tests and docgen can still
+/// load them by name.
+pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
+
+/// Caudra's own native tools: session-shaped work, orchestration, and the
+/// interactive surfaces. Workcell owns everything protocol-neutral.
+pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "batch",
     "memory",
     "question",
-    "sessions",
     "skill",
     "task",
     "todo_write",
+    "tool_output_grep",
+    "tool_output_read",
     "view_image",
 ];
 
@@ -216,8 +231,14 @@ pub enum ConfigError {
          (bundled plugins: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
-    #[error("invalid config: plugins.index.{field}: {message}")]
-    InvalidIndexOption { field: String, message: String },
+    /// A `plugins.<name>` table whose tool is now native: the key is kept for
+    /// compatibility, but Rust validates it instead of the plugin.
+    #[error("invalid config: plugins.{plugin}.{field}: {message}")]
+    InvalidNativeToolOption {
+        plugin: &'static str,
+        field: String,
+        message: String,
+    },
     #[error(
         "invalid config: the `tools` table in caudra.setup was renamed to `plugins` \
          (plugins can provide more than tools).\n\n\
@@ -325,6 +346,8 @@ impl RawConfig {
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
+        let task_max_concurrent = self.task_max_concurrent()?;
+        let skill_plugin_dev = self.skill_plugin_dev()?;
         let disabled_tools: Vec<String> = self
             .plugins
             .iter()
@@ -345,6 +368,8 @@ impl RawConfig {
                 no_rtk,
                 disabled_tools,
                 index_max_file_size_mb,
+                task_max_concurrent,
+                skill_plugin_dev,
             ),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
@@ -380,42 +405,94 @@ impl RawConfig {
         Ok(())
     }
 
-    fn index_max_file_size_mb(&self) -> Result<usize, ConfigError> {
-        let Some(index) = self.plugins.get("index") else {
-            return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
+    /// Rejects any key a native tool does not declare, so a typo in a
+    /// `plugins.<name>` table that no longer reaches a Lua validator still
+    /// fails loudly.
+    fn native_tool_opts<'a>(
+        &'a self,
+        plugin: &'static str,
+        known: &[&str],
+    ) -> Result<Option<&'a JsonMap<String, JsonValue>>, ConfigError> {
+        let Some(table) = self.plugins.get(plugin) else {
+            return Ok(None);
         };
-        if let Some(field) = index
-            .opts
-            .keys()
-            .find(|field| field.as_str() != "max_file_size_mb")
-        {
-            return Err(ConfigError::InvalidIndexOption {
+        if let Some(field) = table.opts.keys().find(|f| !known.contains(&f.as_str())) {
+            return Err(ConfigError::InvalidNativeToolOption {
+                plugin,
                 field: field.clone(),
-                message: "unknown option (expected max_file_size_mb)".into(),
+                message: format!("unknown option (expected {})", known.join(", ")),
             });
         }
-        let Some(value) = index.opts.get("max_file_size_mb") else {
+        Ok(Some(&table.opts))
+    }
+
+    fn index_max_file_size_mb(&self) -> Result<usize, ConfigError> {
+        const FIELD: &str = "max_file_size_mb";
+        let invalid = |message: String| ConfigError::InvalidNativeToolOption {
+            plugin: "index",
+            field: FIELD.into(),
+            message,
+        };
+        let Some(opts) = self.native_tool_opts("index", &[FIELD])? else {
+            return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
+        };
+        let Some(value) = opts.get(FIELD) else {
             return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
         };
         let value = value
             .as_u64()
-            .ok_or_else(|| ConfigError::InvalidIndexOption {
-                field: "max_file_size_mb".into(),
-                message: "expected an integer".into(),
-            })?;
+            .ok_or_else(|| invalid("expected an integer".into()))?;
         if value < MIN_INDEX_MAX_FILE_SIZE_MB as u64 {
-            return Err(ConfigError::InvalidIndexOption {
-                field: "max_file_size_mb".into(),
-                message: format!("{value} is below minimum ({MIN_INDEX_MAX_FILE_SIZE_MB})"),
-            });
+            return Err(invalid(format!(
+                "{value} is below minimum ({MIN_INDEX_MAX_FILE_SIZE_MB})"
+            )));
         }
         if value > MAX_INDEX_MAX_FILE_SIZE_MB as u64 {
-            return Err(ConfigError::InvalidIndexOption {
-                field: "max_file_size_mb".into(),
-                message: format!("{value} exceeds maximum ({MAX_INDEX_MAX_FILE_SIZE_MB})"),
-            });
+            return Err(invalid(format!(
+                "{value} exceeds maximum ({MAX_INDEX_MAX_FILE_SIZE_MB})"
+            )));
         }
         Ok(value as usize)
+    }
+
+    fn task_max_concurrent(&self) -> Result<usize, ConfigError> {
+        const FIELD: &str = "max_concurrent";
+        let Some(opts) = self.native_tool_opts("task", &[FIELD])? else {
+            return Ok(DEFAULT_TASK_MAX_CONCURRENT);
+        };
+        let Some(value) = opts.get(FIELD) else {
+            return Ok(DEFAULT_TASK_MAX_CONCURRENT);
+        };
+        let invalid = |message: String| ConfigError::InvalidNativeToolOption {
+            plugin: "task",
+            field: FIELD.into(),
+            message,
+        };
+        let value = value
+            .as_u64()
+            .ok_or_else(|| invalid("expected an integer".into()))?;
+        if value < MIN_TASK_MAX_CONCURRENT as u64 {
+            return Err(invalid(format!(
+                "{value} is below minimum ({MIN_TASK_MAX_CONCURRENT})"
+            )));
+        }
+        Ok(value as usize)
+    }
+
+    fn skill_plugin_dev(&self) -> Result<bool, ConfigError> {
+        const FIELD: &str = "plugin_dev";
+        let Some(opts) = self.native_tool_opts("skill", &[FIELD])? else {
+            return Ok(DEFAULT_SKILL_PLUGIN_DEV);
+        };
+        match opts.get(FIELD) {
+            None => Ok(DEFAULT_SKILL_PLUGIN_DEV),
+            Some(JsonValue::Bool(value)) => Ok(*value),
+            Some(_) => Err(ConfigError::InvalidNativeToolOption {
+                plugin: "skill",
+                field: FIELD.into(),
+                message: "expected a boolean".into(),
+            }),
+        }
     }
 }
 
@@ -1277,6 +1354,12 @@ pub struct AgentConfig {
 
     #[config(skip, default = DEFAULT_INDEX_MAX_FILE_SIZE_MB)]
     pub index_max_file_size_mb: usize,
+
+    #[config(skip, default = DEFAULT_TASK_MAX_CONCURRENT)]
+    pub task_max_concurrent: usize,
+
+    #[config(skip, default = DEFAULT_SKILL_PLUGIN_DEV)]
+    pub skill_plugin_dev: bool,
 }
 
 impl AgentConfig {
@@ -1285,6 +1368,8 @@ impl AgentConfig {
         no_rtk: bool,
         disabled_tools: Vec<String>,
         index_max_file_size_mb: usize,
+        task_max_concurrent: usize,
+        skill_plugin_dev: bool,
     ) -> Self {
         Self {
             no_rtk,
@@ -1305,6 +1390,8 @@ impl AgentConfig {
             allowed_tools: Vec::new(),
             disabled_tools,
             index_max_file_size_mb,
+            task_max_concurrent,
+            skill_plugin_dev,
         }
     }
 }

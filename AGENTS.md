@@ -78,7 +78,16 @@ For worker or release changes, run the production bundled-worker execution test 
 worker, not only a catalog check. Release smoke tests must fail when `code_execution` is reserved but
 unavailable. Keep Monty's worker and `monty-pool` versions in lockstep.
 
-Active built-in Lua plugins in ./plugins: question, skill, memory, todo_write, task, and batch. Replaced Workcell plugin sources, including index, remain in-tree for tests and reference but are not loaded in production.
+Caudra's own tools are native Rust in `caudra-agent/src/tools/native`, registered from
+`CAUDRA_NATIVE_TOOL_NAMES`: tool_output_read, tool_output_grep, and view_image. They emit structured
+`ToolOutput` so the UI renders and restores them in Rust, with no Lua round-trip on session load,
+click, or theme change. `src/cmd::register_builtin_tools` is the single registration choke point for
+both native families.
+
+No built-in Lua plugin loads in production: `ACTIVE_DEFAULT_LUA_PLUGINS` is empty. The sources in
+./plugins stay in-tree as Lua-API coverage and as worked examples for plugin authors, and
+`DEFAULT_BUILTINS` is what tests and docgen may load by name. The Lua host and its API are fully
+supported for external plugins; only the built-ins moved to Rust.
 
 ## Docs
 

@@ -50,6 +50,38 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.question_form.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.question_form.handle_mouse(event),
+                |app, action| app.handle_question_form_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.session_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.session_picker.handle_mouse(event),
+                |app, action| app.handle_session_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.task_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.task_picker.handle_mouse(event),
+                |app, action| app.handle_task_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.memory_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.memory_picker.handle_mouse(event),
+                |app, action| app.handle_memory_picker_action(action),
+            ) {
+                return actions;
+            }
         } else if self.mcp_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,

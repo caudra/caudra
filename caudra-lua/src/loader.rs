@@ -20,7 +20,10 @@ use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use caudra_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const ALWAYS_LOADED_BUILTINS: &[&str] = &["tool_output"];
+/// Bundled plugins that load regardless of the user's `plugins` config.
+/// Empty since `tool_output` became a native tool; kept because the mechanism
+/// is how any future non-negotiable builtin would arrive.
+const ALWAYS_LOADED_BUILTINS: &[&str] = &[];
 
 struct BundledPlugin {
     name: &'static str,
@@ -720,31 +723,45 @@ mod tests {
         ));
     }
 
+    /// Tools that live in-tree as Lua reference implementations but are owned
+    /// natively in production. Loading one would shadow the native tool, or
+    /// fail registration outright on the name conflict.
+    const NATIVELY_OWNED: &[&str] = &[
+        "bash",
+        "batch",
+        "code_execution",
+        "edit",
+        "glob",
+        "grep",
+        "index",
+        "list",
+        "memory",
+        "question",
+        "read",
+        "skill",
+        "task",
+        "todo_write",
+        "tool_output_grep",
+        "tool_output_read",
+        "view_image",
+        "webfetch",
+        "websearch",
+        "write",
+    ];
+
     #[test]
-    fn production_builtins_leave_index_to_workcell() {
+    fn production_builtins_leave_natively_owned_tools_alone() {
         let reg = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
 
-        assert!(reg.get("index").is_none());
-        assert!(!caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(&"index"));
-        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"index"));
-        assert!(reg.get("tool_output_read").is_some());
-        for name in [
-            "bash",
-            "code_execution",
-            "edit",
-            "glob",
-            "grep",
-            "list",
-            "read",
-            "webfetch",
-            "websearch",
-            "write",
-        ] {
-            assert!(reg.get(name).is_none(), "legacy tool {name} was registered");
+        for name in NATIVELY_OWNED {
+            assert!(reg.get(name).is_none(), "{name} was registered from Lua");
+            assert!(!caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(name));
         }
+        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"index"));
+        assert!(caudra_config::CAUDRA_NATIVE_TOOL_NAMES.contains(&"view_image"));
     }
 
     #[test]

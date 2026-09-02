@@ -20,8 +20,9 @@ use caudra_agent::{
     IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
-    IndexSourceRange as AgentIndexSourceRange, ShellFilterInfo as AgentShellFilterInfo,
-    PatchedFile, ShellOutput as AgentShellOutput, SnapshotLine, TextOutput, ToolInput, ToolOutput,
+    IndexSourceRange as AgentIndexSourceRange, PatchedFile,
+    ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
+    TextOutput, ToolInput, ToolOutput,
 };
 use futures_lite::future;
 use serde::{Serialize, de::DeserializeOwned};
@@ -37,10 +38,10 @@ use workcell::environment::{
 };
 use workcell::files::{
     FileApplyPatchInput, FileApplyPatchOutput, FileDiff, FileEditInput, FileEditOutput,
-    FileGlobInput, FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
-    FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput, IndexDirectoryEntryKind,
-    IndexExecutionConfiguration, IndexInput, IndexLimits, IndexLineSemantic,
-    IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
+    FileGlobInput, FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput,
+    FileResource, FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput,
+    IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
+    IndexLineSemantic, IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
 };
 use workcell::shell::{
     PreparedShell, ShellExecution, ShellFilterInfo as WorkcellShellFilterInfo, ShellInput,
@@ -880,7 +881,7 @@ impl ToolInvocation for WorkcellInvocation {
     /// A patch is deliberately absent: its result is the same diff, rendered
     /// with real line numbers, so echoing the request above it says
     /// everything twice and truncates both halves.
-    fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+    fn start_input(&self) -> Option<ToolInput> {
         match &self.input {
             Input::Shell(input) => Some(ToolInput::Code {
                 language: "bash".into(),

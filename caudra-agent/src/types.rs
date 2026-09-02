@@ -135,6 +135,80 @@ pub enum ToolInput {
     },
 }
 
+/// A question put to the user, as the model asked it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// What the user picked for one question. `labels` is empty when the question
+/// was skipped, and may hold text the user typed rather than an offered label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answer {
+    pub header: String,
+    pub labels: Vec<String>,
+}
+
+/// The run has parked on a question. The front end that shows the form answers
+/// through the user-response channel, which the asking tool holds locked for
+/// the duration, so no id is needed to route the reply back.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuestionEvent {
+    pub questions: Vec<AskedQuestion>,
+}
+
+/// One child of a batch, as the reader sees it. `output` is the child's own
+/// structured result, so a batch renders each child exactly as the same tool
+/// renders standalone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchToolEntry {
+    pub tool: String,
+    /// The child's header line, from the same summary the transcript shows.
+    pub summary: String,
+    pub status: BatchToolStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ToolInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ToolOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+}
+
+/// One child of a running batch changing state. Only the child that moved is
+/// sent: the roster arrived with the batch's `ToolStart`, so the reader
+/// already knows what it is patching.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchProgressEvent {
+    /// The batch's own tool-use id.
+    pub id: String,
+    pub index: usize,
+    pub entry: BatchToolEntry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchToolStatus {
+    Pending,
+    Running,
+    Success,
+    Error,
+}
+
+impl BatchToolStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Success | Self::Error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionBlock {
     pub path: String,
@@ -358,6 +432,7 @@ pub enum ToolOutput {
         summary: String,
     },
     TodoList(Vec<TodoItem>),
+    Answers(Vec<Answer>),
     WriteCode {
         path: String,
         byte_count: usize,
@@ -375,10 +450,12 @@ pub enum ToolOutput {
     },
     Index(IndexOutput),
     Shell(ShellOutput),
-    /// Only here so legacy sessions still deserialize. Batch is a Lua
-    /// plugin now and stores plain text plus a `state` payload, so the old
-    /// per-child `entries` are dropped on load: nothing can render them.
+    /// `text` is what the model was told; `entries` is the same run written
+    /// for a reader. Sessions written while batch was a Lua plugin carry only
+    /// `text`, so `entries` defaults to empty and the body falls back to it.
     Batch {
+        #[serde(default)]
+        entries: Vec<BatchToolEntry>,
         text: String,
     },
     Instructions {
@@ -417,8 +494,6 @@ fn written_size(byte_count: usize, lines: &[String]) -> String {
     }
     format!("{} lines", lines.len())
 }
-
-
 
 impl ToolOutput {
     /// Short header suffix summarizing the output, e.g. `12 lines`.
@@ -549,7 +624,8 @@ impl ToolOutput {
             | Self::GrepResult { .. }
             | Self::Index(_)
             | Self::Shell(_)
-            | Self::TodoList(_) => Some(self.as_display_text()),
+            | Self::TodoList(_)
+            | Self::Answers(_) => Some(self.as_display_text()),
             _ => None,
         }
     }
@@ -641,6 +717,11 @@ impl ToolOutput {
                 .map(|f| f.patch.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Self::Answers(answers) => answers
+                .iter()
+                .map(|a| format!("{}: {}", a.header, a.labels.join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n"),
             Self::TodoList(items) => {
                 if items.is_empty() {
                     return "No todos.".into();
@@ -680,7 +761,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text } | Self::Image { text, .. } => text.clone(),
+            Self::Batch { text, .. } | Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -892,6 +973,8 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    BatchProgress(Box<BatchProgressEvent>),
+    Question(Box<QuestionEvent>),
     GoalEvaluating {
         evaluation: u32,
     },

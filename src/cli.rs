@@ -73,11 +73,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_rtk: bool,
 
-    /// Skip user `init.lua` files (global and project) but keep the Lua
-    /// host and every builtin plugin running, so tools and the default
-    /// keymap still load. Use this to recover from a broken `init.lua`
-    /// or keymap override. Only Lua `init.lua` files are affected;
-    /// `permissions.toml`, custom commands, and env files load as usual.
+    /// Skip user `init.lua` files (global and project). The Lua host stays
+    /// up and every built-in tool is native, so nothing else is lost. Use
+    /// this to recover from a broken `init.lua` or keymap override. Only Lua
+    /// `init.lua` files are affected; `permissions.toml`, custom commands,
+    /// and env files load as usual.
     #[arg(long)]
     pub no_plugins: bool,
 

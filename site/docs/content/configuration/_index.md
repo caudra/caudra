@@ -227,11 +227,15 @@ caudra.setup({
 
 ### `plugins.skill`
 
+`skill` executes as a native Caudra tool. This table keeps its existing configuration key.
+
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `true` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. |
+| `plugin_dev` | boolean | `false` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. |
 
 ### `plugins.task`
+
+`task` executes as a native Caudra tool. This table keeps its existing configuration key.
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|

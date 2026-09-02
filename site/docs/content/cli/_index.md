@@ -49,7 +49,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.caudra/commands`, `.claude/commands`, etc. |
-| `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
+| `--no-plugins` | Skip user `init.lua` (global and project). The Lua host stays up and every built-in tool is native, so nothing else is lost |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |

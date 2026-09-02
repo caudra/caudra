@@ -85,9 +85,9 @@ Read a page of managed tool output owned by the current session.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
+| `offset` | integer | no | 1 | Starting line, 1-indexed. |
 | `byte_offset` | integer | no | 0; use continuation hints | Starting byte within the first line. |
 | `limit` | integer | no | 200; capped at 2000 | Maximum lines to return. |
-| `offset` | integer | no | 1 | Starting line, 1-indexed. |
 
 ### `tool_output_grep` {#tool_output_grep}
 
@@ -95,12 +95,12 @@ Search managed tool output owned by the current session using a regex.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `offset` | integer | no | 1 | Starting line, 1-indexed. |
-| `pattern` | string | yes |  | Regex pattern. |
 | `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
-| `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
-| `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
+| `pattern` | string | yes |  | Regex pattern. |
+| `offset` | integer | no | 1 | Starting line, 1-indexed. |
 | `limit` | integer | no | 100; capped at 200 | Maximum matches to return. |
+| `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
+| `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
 
 ### `view_image` {#view_image}
 
@@ -170,12 +170,12 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `task_id` | string | no | A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh. |
 | `mode` | string | no | Subagent mode. Defaults to "plan" for a new task; omitted continuations retain their stored mode. |
+| `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
+| `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 
 ### `todo_write` {#todo_write}
 

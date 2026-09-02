@@ -24,7 +24,7 @@ pub fn run(
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
-    let _workcell_host = super::register_workcell(&cwd)?;
+    let _workcell_host = super::register_builtin_tools(&cwd)?;
 
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -43,6 +43,8 @@ pub fn run(
         config.permissions.yolo = true;
     }
     config.validate()?;
+    super::configure_native_tools(&config.agent);
+    super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 
     plugin_host
         .load_production_builtins(&config.plugins)

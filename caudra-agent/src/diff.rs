@@ -76,13 +76,14 @@ pub fn compute_hunks(before: &str, after: &str) -> Vec<DiffHunk> {
 /// Added and removed line counts. Walks the changes directly rather than
 /// `compute_hunks`, which would build context lines only to discard them.
 pub fn stat(before: &str, after: &str) -> String {
-    let (added, removed) = TextDiff::from_lines(before, after)
-        .iter_all_changes()
-        .fold((0, 0), |(added, removed), change| match change.tag() {
+    let (added, removed) = TextDiff::from_lines(before, after).iter_all_changes().fold(
+        (0, 0),
+        |(added, removed), change| match change.tag() {
             ChangeTag::Insert => (added + 1, removed),
             ChangeTag::Delete => (added, removed + 1),
             ChangeTag::Equal => (added, removed),
-        });
+        },
+    );
     format_stat(added, removed)
 }
 

@@ -515,6 +515,7 @@ fn validate_array(
     value: Value,
     path: &mut JsonPath,
 ) -> Result<Value, ToolInputError> {
+    let value = wrap_lone_item(item_schema, value, path);
     let Value::Array(arr) = coerce_container(value, ParamKind::Array, path)? else {
         unreachable!("coerce_container(_, Array) returns an Array")
     };
@@ -523,6 +524,31 @@ fn validate_array(
         .map(|(i, item)| path.with_index(i, |p| walk(item_schema, item, p)))
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
+}
+
+/// A model that sends one item where a list is expected means a list of one.
+/// `coerce_container` already does this for objects; scalars need the item
+/// schema to tell a lone element from a genuine type error, so it happens here.
+///
+/// A string that parses as JSON is left alone: that is an encoded list, and
+/// wrapping it would bury the real items one level down.
+fn wrap_lone_item(item_schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Value {
+    let got = ParamKind::of(&value);
+    let fits = match item_schema {
+        ParamSchema::Primitive { kind, .. } => {
+            got == *kind || (*kind == ParamKind::Number && got == ParamKind::Integer)
+        }
+        ParamSchema::Enum { variants, .. } => value.as_str().is_some_and(|s| variants.contains(&s)),
+        _ => false,
+    };
+    let encoded_list =
+        matches!(&value, Value::String(s) if coerce_str_to(s, ParamKind::Array).is_some());
+    if !fits || encoded_list {
+        return value;
+    }
+    let wrapped = Value::Array(vec![value.clone()]);
+    log_coercion(path, got, ParamKind::Array, &value, &wrapped);
+    wrapped
 }
 
 fn schema_type_name(schema: &ParamSchema) -> &'static str {
@@ -1134,6 +1160,42 @@ mod tests {
         });
         let out = validate(&MULTIEDIT_LIKE, input).unwrap();
         assert_eq!(out["edits"][0]["old_string"], "a");
+    }
+
+    const TAGS_LIKE: ParamSchema = ParamSchema::Object {
+        properties: &[(
+            "tags",
+            &ParamSchema::Array {
+                items: &STR_PRIM,
+                description: "",
+            },
+            false,
+            &[],
+        )],
+        description: "",
+        reject_unknown: false,
+    };
+
+    /// Models routinely send one tag as a bare string. The object case was
+    /// already wrapped; a scalar is the same mistake.
+    #[test]
+    fn coerce_single_string_wrapped_as_array() {
+        let out = validate(&TAGS_LIKE, json!({ "tags": "solo" })).unwrap();
+        assert_eq!(out["tags"], json!(["solo"]));
+    }
+
+    /// Wrapping would bury the real items one level down.
+    #[test]
+    fn a_json_encoded_array_is_parsed_rather_than_wrapped() {
+        let out = validate(&TAGS_LIKE, json!({ "tags": r#"["a","b"]"# })).unwrap();
+        assert_eq!(out["tags"], json!(["a", "b"]));
+    }
+
+    /// The item schema is what distinguishes a lone element from a real type
+    /// error, so a scalar it would reject stays an error.
+    #[test]
+    fn a_scalar_the_item_schema_rejects_is_not_wrapped() {
+        assert!(validate(&MULTIEDIT_LIKE, json!({ "path": "/x", "edits": 7 })).is_err());
     }
 
     #[test]

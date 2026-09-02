@@ -176,6 +176,14 @@ pub mod key {
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
+    pub const TASK_PICKER: Bind = ctrl_bind!('x');
+    pub const SESSION_PICKER: Bind = Bind {
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+P",
+    };
+    pub const NEW_SESSION: Bind = ctrl_bind!('n');
+    pub const RENAME_SESSION: Bind = ctrl_bind!('r');
     pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const MODEL_PICKER_FALLBACK: Bind = Bind {
         code: KeyCode::Char('m'),
@@ -247,6 +255,7 @@ pub enum KeybindContext {
     Search,
     FilePicker,
     StashPicker,
+    SessionPicker,
 }
 
 impl KeybindContext {
@@ -267,6 +276,7 @@ impl KeybindContext {
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
+            Self::SessionPicker => "Session Picker",
         }
     }
 
@@ -279,7 +289,8 @@ impl KeybindContext {
             | Self::CommandPalette
             | Self::Search
             | Self::FilePicker
-            | Self::StashPicker => Some(Self::Picker),
+            | Self::StashPicker
+            | Self::SessionPicker => Some(Self::Picker),
             _ => None,
         }
     }
@@ -438,7 +449,19 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::PLAN_TOGGLE.label),
-        description: "Toggle plan panel",
+        description: "Toggle plan / todo panel",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::TASK_PICKER.label),
+        description: "Open tasks",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SESSION_PICKER.label),
+        description: "Browse sessions",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -785,6 +808,24 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("R"),
         description: "Reset model purpose",
         context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::NEW_SESSION.label),
+        description: "New session",
+        context: KeybindContext::SessionPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::RENAME_SESSION.label),
+        description: "Rename session",
+        context: KeybindContext::SessionPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::DELETE.label),
+        description: "Delete session (press twice)",
+        context: KeybindContext::SessionPicker,
         platform: Platform::All,
     },
     Keybind {

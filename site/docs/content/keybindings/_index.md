@@ -22,7 +22,9 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Alt+A` | Review the last reply |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
-| `Ctrl+T` | Toggle plan panel |
+| `Ctrl+T` | Toggle plan / todo panel |
+| `Ctrl+X` | Open tasks |
+| `Alt+P` | Browse sessions |
 | `Alt+V` | Toggle compact / expanded transcript |
 | `Alt+T` | Stash the current prompt |
 | `Alt+R` | Restore the newest stashed prompt |
@@ -121,26 +123,16 @@ Some pickers add extra bindings on top of the defaults:
 | Commands | `Tab` | Complete command |
 | Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
 | Model Picker | `R` | Reset model purpose |
-| Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
-
-## Plugins
-
-Built-in plugins register these themselves, and your own plugins can add more with `caudra.keymap.set`:
-
-| Key | Action |
-|-----|--------|
-| `Alt+P` | Browse sessions |
-| `Ctrl+X` | Open tasks |
-| `Ctrl+T` | Toggle todo panel |
+| Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker
 
 ## Overriding Keybindings
 
@@ -165,7 +157,7 @@ If an override leaves Caudra stuck (a rebound `Ctrl+C`, a modal that won't close
 caudra --no-plugins
 ```
 
-Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
+Skips user `init.lua` files (global and project). The Lua host stays up and every built-in tool is native, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
 
 The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 

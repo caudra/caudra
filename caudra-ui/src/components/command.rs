@@ -100,6 +100,26 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/memory",
+        description: "View, edit, and delete memory files",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/tasks",
+        description: "Browse tasks and steer running subagents",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/sessions",
+        description: "Browse and switch sessions",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rename",
+        description: "Rename the current session",
+        max_args: usize::MAX,
+    },
+    BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,
@@ -1291,9 +1311,9 @@ mod tests {
 
     fn synced_with_nargs(input: &str, max_args: usize) -> CommandPalette {
         let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: Arc::from("/rename"),
-            description: Arc::from("Rename the current session"),
-            plugin: Arc::from("sessions"),
+            name: Arc::from("/deploy"),
+            description: Arc::from("Deploy the project"),
+            plugin: Arc::from("deploy_plugin"),
             max_args,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1301,13 +1321,13 @@ mod tests {
         p
     }
 
-    #[test_case("/rename", usize::MAX, true           ; "nargs_plus_no_args")]
-    #[test_case("/rename ", usize::MAX, true          ; "nargs_plus_trailing_space")]
-    #[test_case("/rename my title", usize::MAX, true  ; "nargs_plus_multi_word")]
-    #[test_case("/rename title", 1, true              ; "nargs_one_single_word")]
-    #[test_case("/rename my title", 1, false          ; "nargs_one_too_many")]
-    #[test_case("/rename", 0, true                    ; "nargs_zero_no_args")]
-    #[test_case("/rename title", 0, false             ; "nargs_zero_with_arg")]
+    #[test_case("/deploy", usize::MAX, true           ; "nargs_plus_no_args")]
+    #[test_case("/deploy ", usize::MAX, true          ; "nargs_plus_trailing_space")]
+    #[test_case("/deploy my target", usize::MAX, true ; "nargs_plus_multi_word")]
+    #[test_case("/deploy target", 1, true             ; "nargs_one_single_word")]
+    #[test_case("/deploy my target", 1, false         ; "nargs_one_too_many")]
+    #[test_case("/deploy", 0, true                    ; "nargs_zero_no_args")]
+    #[test_case("/deploy target", 0, false            ; "nargs_zero_with_arg")]
     fn lua_command_respects_nargs(input: &str, max_args: usize, expect_active: bool) {
         assert_eq!(
             synced_with_nargs(input, max_args).is_active(),
@@ -1317,10 +1337,10 @@ mod tests {
 
     #[test]
     fn confirm_lua_command_keeps_multi_word_args() {
-        let input = "/rename my new title";
+        let input = "/deploy my new target";
         let cmd = synced_with_nargs(input, usize::MAX).confirm(input).unwrap();
-        assert_eq!(cmd.name, "/rename");
-        assert_eq!(cmd.args, "my new title");
+        assert_eq!(cmd.name, "/deploy");
+        assert_eq!(cmd.args, "my new target");
     }
 
     fn synced_with_lua(input: &str) -> CommandPalette {

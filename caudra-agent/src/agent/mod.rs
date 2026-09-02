@@ -5,6 +5,7 @@ mod instructions;
 mod provider_projection;
 mod run;
 mod streaming;
+pub mod subagent;
 pub mod tool_dispatch;
 
 pub use compaction::compact;

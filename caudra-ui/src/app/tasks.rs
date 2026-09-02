@@ -10,7 +10,14 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::app::App;
-use crate::components::DisplayRole;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::components::keybindings::key;
+use crate::components::task_picker::TaskPickerAction;
+use crate::components::{Action, DisplayRole};
+use crate::repaint::Dirty;
+use crate::theme;
 
 pub(crate) const MAIN_TASK_ID: &str = "main";
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
@@ -68,14 +75,15 @@ pub(crate) struct TaskState<'a> {
     pub(crate) status: TaskStatus,
 }
 
-/// The wire shape of `caudra.task.list()`. The main chat leaves `status` unset.
+/// The wire shape of `caudra.task.list()`, and what the `/tasks` picker reads.
+/// The main chat leaves `status` unset.
 #[derive(Serialize)]
 pub(crate) struct TaskInfo {
-    id: Arc<str>,
-    name: String,
+    pub(crate) id: Arc<str>,
+    pub(crate) name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<TaskStatus>,
-    focused: bool,
+    pub(crate) status: Option<TaskStatus>,
+    pub(crate) focused: bool,
 }
 
 impl App {
@@ -125,6 +133,63 @@ impl App {
                 .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
         };
         Ok(())
+    }
+}
+
+/// The `/tasks` picker's side of the conversation. The picker holds no task
+/// state: it is opened from [`App::tasks`] and refreshed from it whenever a
+/// status changes, so it can never disagree with the chats it lists.
+impl App {
+    pub(super) fn tasks_browse(&mut self) -> Vec<Action> {
+        self.task_picker.open(self.tasks());
+        Vec::new()
+    }
+
+    /// Keeps an open picker in step with the chats behind it.
+    pub(crate) fn refresh_task_picker(&mut self) -> Dirty {
+        if !self.task_picker.is_open() {
+            return Dirty::NO;
+        }
+        let tasks = self.tasks();
+        self.task_picker.refresh(tasks);
+        Dirty::YES
+    }
+
+    pub(super) fn handle_task_picker_action(&mut self, action: TaskPickerAction) -> Vec<Action> {
+        match action {
+            TaskPickerAction::Consumed | TaskPickerAction::Opened => {}
+            // Previewing is a real focus, so the transcript behind the float is
+            // the one the app already draws.
+            TaskPickerAction::Preview(id) => self.preview_task(&id),
+            TaskPickerAction::Closed(origin) => {
+                if let Some(id) = origin {
+                    self.preview_task(&id);
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Opening a subagent puts its transcript where the main chat was, so this
+    /// hint advertises the picker as the way back out to every other task.
+    pub(crate) fn task_hint_line(&self) -> Option<Line<'static>> {
+        let count = self.task_states().count();
+        if count == 0 {
+            return None;
+        }
+        let t = theme::current();
+        let noun = if count == 1 { "task" } else { "tasks" };
+        Some(Line::from(vec![
+            Span::styled(format!(" {count} {noun} "), Style::new().fg(t.foreground)),
+            Span::styled(key::TASK_PICKER.label, t.keybind_key),
+            Span::raw(" "),
+        ]))
+    }
+
+    fn preview_task(&mut self, id: &str) {
+        if let Err(error) = self.focus_task(id) {
+            self.flash(error);
+        }
     }
 }
 

@@ -265,7 +265,7 @@ async fn run_inner(
             summary: header_result.text(),
             render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
-            input: invocation.start_input(ctx),
+            input: invocation.start_input(),
             raw_input: Some(input.clone()),
             output: invocation.start_output(ctx),
         };
@@ -1508,7 +1508,7 @@ mod tests {
             HeaderFuture::Ready(HeaderResult::plain("native probe".into()))
         }
 
-        fn start_input(&self, _ctx: &ToolContext) -> Option<ToolInput> {
+        fn start_input(&self) -> Option<ToolInput> {
             Some(ToolInput::Code {
                 language: "rust".into(),
                 code: "fn main() {}".into(),

@@ -41,8 +41,9 @@ use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use caudra_agent::tools::is_container_tool;
 use caudra_agent::{
-    BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, SubagentProgress,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration, reasoning_summary,
+    BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration,
+    reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 
@@ -278,18 +279,14 @@ impl MessagesPanel {
     }
 
     fn compact_collapsed(&self, tool_id: &str) -> bool {
-        self.compact
-            && !self.expanded_tools.contains_key(tool_id)
-            && !self.is_container(tool_id)
+        self.compact && !self.expanded_tools.contains_key(tool_id) && !self.is_container(tool_id)
     }
 
     /// Whether a click on the row would change anything. Hover feedback and
     /// the click share this, or a row highlights and then ignores the press.
     fn tool_click_acts(&self, tool_id: &str, truncation: SectionFlags) -> bool {
         // An opened compact row always has its header left to collapse to.
-        (self.compact
-            && self.expanded_tools.contains_key(tool_id)
-            && !self.is_container(tool_id))
+        (self.compact && self.expanded_tools.contains_key(tool_id) && !self.is_container(tool_id))
             || truncation.any()
             || self
                 .tool_expansion(tool_id, self.is_container(tool_id))
@@ -420,6 +417,32 @@ impl MessagesPanel {
         msg.render_header = event.render_header;
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
+    }
+
+    /// Patches one child of a running batch. The roster arrived with the
+    /// batch's `ToolStart`, so an event that names an index the message does
+    /// not have is from a batch that is already gone.
+    pub fn batch_progress(&mut self, tool_id: &str, index: usize, entry: BatchToolEntry) {
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+        else {
+            return;
+        };
+        let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
+            return;
+        };
+        if index >= entries.len() {
+            return;
+        }
+        let mut entries = entries.clone();
+        entries[index] = entry;
+        msg.tool_output = Some(Arc::new(ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        }));
+        self.rebuild_tool_segment(tool_id);
     }
 
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
@@ -588,7 +611,9 @@ impl MessagesPanel {
             return;
         }
         let inst_id = segment::instruction_id(parent_id);
-        let exp = self.tool_expansion(&inst_id, false).map(|flags| flags.output);
+        let exp = self
+            .tool_expansion(&inst_id, false)
+            .map(|flags| flags.output);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
         let tl = build_instructions_lines(blocks, width, exp);
@@ -1271,7 +1296,9 @@ impl MessagesPanel {
             return true;
         }
 
-        let exp = self.tool_expansion(tool_id, self.is_container(tool_id)).unwrap_or_default();
+        let exp = self
+            .tool_expansion(tool_id, self.is_container(tool_id))
+            .unwrap_or_default();
         let shell_toggle = seg
             .shell_toggle_line
             .is_some_and(|line| seg.source_line_at(rel, width) == Some(line));
@@ -1392,8 +1419,7 @@ impl MessagesPanel {
     /// heights in order, so one extra entry in any of them shifts every row
     /// below it.
     fn streaming_spacer(&self, kind: SegmentKind, has_previous: bool) -> bool {
-        has_previous
-            && !(kind == SegmentKind::Thinking && self.streaming_thinking_stacks_flush())
+        has_previous && !(kind == SegmentKind::Thinking && self.streaming_thinking_stacks_flush())
     }
 
     fn show_idle_splash(&self) -> bool {

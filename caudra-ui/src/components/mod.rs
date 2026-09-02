@@ -12,6 +12,7 @@ pub(crate) mod list_picker;
 pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
+pub(crate) mod memory_picker;
 pub(crate) mod message_actions;
 pub mod messages;
 pub(crate) mod modal;
@@ -22,16 +23,20 @@ pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub(crate) mod prompt_profile_picker;
+pub(crate) mod question_form;
 pub mod queue_panel;
 pub(crate) mod review;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
+pub(crate) mod session_picker;
 pub(crate) mod split_layout;
 pub(crate) mod stash_picker;
 pub mod status_bar;
 pub(crate) mod streaming_content;
+pub(crate) mod task_picker;
 pub(crate) mod theme_picker;
+pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
@@ -277,6 +282,12 @@ pub enum Action {
     TrustMcpOnce(String),
     TrustMcpProject(String),
     RejectMcp(String),
+    FocusSession(caudra_storage::id::CaudraId),
+    DeleteSession(caudra_storage::id::CaudraId),
+    SetSessionTitle {
+        id: caudra_storage::id::CaudraId,
+        title: String,
+    },
     OpenEditor(PathBuf),
     OpenUrl(String),
     EditInputInEditor,

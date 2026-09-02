@@ -1172,12 +1172,8 @@ fn replayed_click_expands_only_the_clicked_child() {
 
     // Rows are 1-based (row 0 = header), so snapshot line i = row i+1.
     // Find child2's notice dynamically so layout changes can't break this.
-    let revealed = restore_snapshot_lines_revealed(
-        &host,
-        input.clone(),
-        "irrelevant",
-        Some(state.clone()),
-    );
+    let revealed =
+        restore_snapshot_lines_revealed(&host, input.clone(), "irrelevant", Some(state.clone()));
     let notice_row = 1 + revealed
         .iter()
         .enumerate()

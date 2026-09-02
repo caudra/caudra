@@ -40,6 +40,30 @@ const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
 const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
 const INDEX_TOOL_USAGE: &str = "- Use the **index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.";
 
+/// `(tool, slot, content)`. Only applied when the tool survives the filter.
+const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
+    (
+        crate::tools::INDEX_TOOL_NAME,
+        Slot::ToolUsage,
+        INDEX_TOOL_USAGE,
+    ),
+    (
+        crate::tools::INDEX_TOOL_NAME,
+        Slot::EfficientTools,
+        crate::tools::INDEX_TOOL_NAME,
+    ),
+    (
+        crate::tools::TODOWRITE_TOOL_NAME,
+        Slot::ToolUsage,
+        crate::tools::native::todo_write::TOOL_USAGE,
+    ),
+    (
+        crate::tools::MEMORY_TOOL_NAME,
+        Slot::ToolUsage,
+        crate::tools::native::memory::TOOL_USAGE,
+    ),
+];
+
 pub const DEFAULT_IDENTITY: &str = r#"You are Caudra, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
 
 You must NEVER generate or guess URLs unless they are for helping the user with programming."#;
@@ -168,26 +192,43 @@ impl ResolvedSlots {
         self.entries.entry((prompt, slot)).or_default().push(entry);
     }
 
+    /// Native tools cannot register prompt hints the way Lua plugins do: they
+    /// register once at startup, long before a prompt exists, and the same
+    /// registry serves filters that exclude them. Applying the hints here ties
+    /// each one to its tool actually being offered.
     pub fn with_native_hints(&self, filter: &crate::tools::ToolFilter) -> Cow<'_, Self> {
-        if !filter.matches(crate::tools::INDEX_TOOL_NAME) {
+        let hints: Vec<_> = NATIVE_HINTS
+            .iter()
+            .filter(|(tool, ..)| filter.matches(tool))
+            .collect();
+        if hints.is_empty() && !filter.matches(crate::tools::MEMORY_TOOL_NAME) {
             return Cow::Borrowed(self);
         }
         let mut slots = self.clone();
         for &prompt in PromptId::ALL {
+            for (tool, slot, content) in &hints {
+                slots.insert(
+                    prompt,
+                    *slot,
+                    SlotEntry {
+                        plugin: Arc::from(format!("native:{tool}")),
+                        content: (*content).into(),
+                    },
+                );
+            }
+        }
+        // The memory tag index is scanned from disk, so unlike the fixed hints
+        // it cannot live in a const table. It only reaches the system prompt:
+        // a subagent gets the tool, not the whole project's tag vocabulary.
+        if filter.matches(crate::tools::MEMORY_TOOL_NAME)
+            && let Some(line) = crate::tools::native::memory::prompt_tag_line_for_cwd()
+        {
             slots.insert(
-                prompt,
-                Slot::ToolUsage,
+                PromptId::System,
+                Slot::AfterInstructions,
                 SlotEntry {
-                    plugin: Arc::from("native:index"),
-                    content: INDEX_TOOL_USAGE.into(),
-                },
-            );
-            slots.insert(
-                prompt,
-                Slot::EfficientTools,
-                SlotEntry {
-                    plugin: Arc::from("native:index"),
-                    content: crate::tools::INDEX_TOOL_NAME.into(),
+                    plugin: Arc::from("native:memory"),
+                    content: line,
                 },
             );
         }

@@ -5,7 +5,6 @@ mod gen_lua_api;
 mod gen_plugins;
 mod gen_providers;
 mod gen_tools;
-mod lua_util;
 
 use std::fs;
 use std::path::{Path, PathBuf};

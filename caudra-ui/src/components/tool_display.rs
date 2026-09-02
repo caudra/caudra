@@ -261,9 +261,12 @@ impl HighlightRequest {
             | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
+            | ToolOutput::Answers(_)
             | ToolOutput::Shell(_)
-            | ToolOutput::Batch { .. }
             | ToolOutput::Image { .. } => None,
+            // Children carry their own code and diffs, so a batch reaches the
+            // highlighting worker exactly as a lone child would.
+            ToolOutput::Batch { ref entries, .. } => (!entries.is_empty()).then_some(o),
         });
         if input.is_none() && output.is_none() {
             return None;
@@ -364,7 +367,11 @@ fn resolve_output<'a>(
         Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
             Some(Cow::Borrowed(t.text.as_str()))
         }
-        Some(ToolOutput::Batch { text }) => Some(Cow::Borrowed(text.as_str())),
+        // A batch with children draws them structurally; only a session from
+        // when batch was a Lua plugin falls back to the model's own text.
+        Some(ToolOutput::Batch { entries, text }) if entries.is_empty() => {
+            Some(Cow::Borrowed(text.as_str()))
+        }
         Some(ToolOutput::Shell(output)) => Some(if output.filter.is_some() && !shell_raw {
             Cow::Borrowed(output.model_text.as_str())
         } else {
@@ -1939,7 +1946,7 @@ mod tests {
         ; "empty_plain_resolves_to_none"
     )]
     #[test_case(
-        Some(ToolOutput::Batch { text: "legacy batch text".into() }),
+        Some(ToolOutput::Batch { entries: vec![], text: "legacy batch text".into() }),
         None, "batch", true
         ; "legacy_batch_falls_back_to_text"
     )]

@@ -21,6 +21,10 @@ Type `/` in the input box to open the command palette.
 | `/stash` | Park the current prompt draft for later |
 | `/stash-pop` | Restore the most recently stashed prompt |
 | `/stash-list` | Browse stashed prompts |
+| `/memory` | View, edit, and delete memory files |
+| `/tasks` | Browse tasks and steer running subagents |
+| `/sessions` | Browse and switch sessions |
+| `/rename` | Rename the current session |
 | `/model` | Switch model |
 | `/system-prompt` | Switch system prompt profile |
 | `/review` | Review the last reply passage by passage |
@@ -40,10 +44,6 @@ Type `/` in the input box to open the command palette.
 | `/workflow` | Toggle workflow context for custom Lua tools |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
-| `/memory` | View, edit, and delete memory files |
-| `/rename` | Rename the current session |
-| `/sessions` | Browse and switch sessions |
-| `/tasks` | Browse tasks and steer running subagents |
 
 ## Sessions
 

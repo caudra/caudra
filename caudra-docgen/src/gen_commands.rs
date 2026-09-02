@@ -2,8 +2,6 @@ use std::fmt::Write;
 
 use caudra_ui::BUILTIN_COMMANDS;
 
-use crate::lua_util;
-
 const ALIASING: &str = r#"## Aliasing commands
 
 Prefer a different name for a command? `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
@@ -103,9 +101,6 @@ pub fn generate() -> String {
     writeln!(out, "|---------|-------------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
         write_row(&mut out, cmd.name, cmd.description);
-    }
-    for cmd in &lua_util::load_builtin_plugin_commands() {
-        write_row(&mut out, &cmd.name, &cmd.description);
     }
 
     writeln!(out).unwrap();

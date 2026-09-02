@@ -3,9 +3,12 @@ use crate::markdown::{should_truncate, truncation_notice};
 use crate::theme;
 
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
+use caudra_agent::types::Answer;
+use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
-    GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic,
-    IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile, ToolInput, ToolOutput,
+    BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
+    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
+    ToolInput, ToolOutput,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -13,6 +16,13 @@ use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
+const BATCH_CHILD_INDENT: &str = "  ";
+const ANSWER_MARK: &str = "  \u{2713} ";
+const ANSWER_INDENT: &str = "    ";
+const NO_ANSWER: &str = "(no answer)";
+const BATCH_PENDING_MARKER: &str = "\u{25cb} ";
+const BATCH_RUNNING_MARKER: &str = "\u{b7} ";
+const BATCH_DONE_MARKER: &str = "\u{25cf} ";
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -345,6 +355,137 @@ fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// The live list lives in the bottom panel; this is the transcript copy, so a
+/// reader scrolling back sees the plan as it stood at that point in the turn.
+fn render_todos(items: &[TodoItem]) -> Vec<Line<'static>> {
+    let t = theme::current();
+    items
+        .iter()
+        .map(|item| {
+            let style = match item.status {
+                TodoStatus::Completed => t.todo_completed,
+                TodoStatus::InProgress => t.todo_in_progress,
+                TodoStatus::Pending => t.todo_pending,
+                TodoStatus::Cancelled => t.todo_cancelled,
+            };
+            Line::from(Span::styled(
+                format!("{} {}", item.status.marker(), item.content),
+                style,
+            ))
+        })
+        .collect()
+}
+
+/// The answers the user gave, one row per pick. Only the picks get a row:
+/// every row here is permanent scrollback, and the options passed over are
+/// spent information. The questions sit in the tool input right above this.
+fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let mut lines = Vec::new();
+    for (index, answer) in answers.iter().enumerate() {
+        let label = if answer.header.is_empty() {
+            format!("Q{}", index + 1)
+        } else {
+            answer.header.clone()
+        };
+        lines.push(Line::styled(label, t.tool_prefix));
+        if answer.labels.is_empty() {
+            lines.push(Line::styled(
+                format!("{ANSWER_INDENT}{NO_ANSWER}"),
+                t.tool_dim,
+            ));
+            continue;
+        }
+        for picked in &answer.labels {
+            for (row, piece) in picked.lines().enumerate() {
+                let prefix = if row == 0 { ANSWER_MARK } else { ANSWER_INDENT };
+                lines.push(Line::styled(format!("{prefix}{piece}"), t.todo_completed));
+            }
+        }
+    }
+    lines
+}
+
+/// A batch reads as a list of what it ran. Each child gets the indicator and
+/// `tool> summary` line the transcript would show it with, then its own body
+/// indented under it, so a child looks the same here as it does standalone.
+fn render_batch(
+    entries: &[BatchToolEntry],
+    highlight: bool,
+    limits: RenderLimits,
+) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let mut lines = Vec::new();
+    for entry in entries {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let (marker, style) = match entry.status {
+            BatchToolStatus::Pending => (BATCH_PENDING_MARKER, t.tool_dim),
+            BatchToolStatus::Running => (BATCH_RUNNING_MARKER, t.spinner),
+            BatchToolStatus::Success => (BATCH_DONE_MARKER, t.tool_success),
+            BatchToolStatus::Error => (BATCH_DONE_MARKER, t.tool_error),
+        };
+        let mut spans = vec![
+            Span::styled(marker, style),
+            Span::styled(format!("{}> ", entry.tool), t.tool_prefix),
+            Span::raw(entry.summary.clone()),
+        ];
+        if let Some(annotation) = &entry.annotation {
+            spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
+        }
+        lines.push(Line::from(spans));
+        lines.extend(indent_all(child_body(entry, highlight, limits)));
+    }
+    lines
+}
+
+/// A child's own rendering, structured where the tool produced structure and
+/// its text otherwise. Errors read as plain text: a failed call has no
+/// structured result to draw.
+fn child_body(entry: &BatchToolEntry, highlight: bool, limits: RenderLimits) -> Vec<Line<'static>> {
+    let output = entry.output.as_ref();
+    if entry.status == BatchToolStatus::Error {
+        return text_lines(
+            output.map_or(String::new(), ToolOutput::as_text),
+            limits.output,
+        );
+    }
+    match output {
+        Some(ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)) => {
+            text_lines(text.text.clone(), limits.output)
+        }
+        Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text(), limits.output),
+        other => render_tool_content(entry.input.as_ref(), other, highlight, limits).lines,
+    }
+}
+
+fn text_lines(text: String, max: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = text
+        .lines()
+        .take(max)
+        .map(|line| Line::from(line.to_owned()))
+        .collect();
+    let total = text.lines().count();
+    if total > max {
+        lines.push(Line::styled(
+            truncation_notice(total - max),
+            theme::current().tool_dim,
+        ));
+    }
+    lines
+}
+
+fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw(BATCH_CHILD_INDENT));
+            line
+        })
+        .collect()
 }
 
 /// Each file gets its own heading, because a patch that touches three files
@@ -733,6 +874,11 @@ pub fn render_tool_content(
             let trunc =
                 render_instructions(blocks, &mut instruction_lines, limits.output, highlight);
             (instruction_lines, trunc)
+        }
+        Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
+        Some(ToolOutput::Answers(answers)) => (render_answers(answers), false),
+        Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {
+            (render_batch(entries, highlight, limits), false)
         }
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
         _ => (Vec::new(), false),

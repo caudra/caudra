@@ -3643,8 +3643,7 @@ fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
     render(&mut panel, 80, 24);
 
     assert_eq!(
-        streaming,
-        panel.last_total_lines,
+        streaming, panel.last_total_lines,
         "{STREAMING_GAP_MSG} (settled without a thought: {settled})"
     );
 }

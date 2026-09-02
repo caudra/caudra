@@ -6,6 +6,7 @@
 
 mod btw;
 mod image_paste;
+mod memory;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
@@ -40,6 +41,7 @@ use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::memory_picker::MemoryPicker;
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
@@ -47,14 +49,18 @@ use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
+use crate::components::question_form::{QuestionForm, QuestionFormAction};
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
+use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
+use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::todo_panel::TodoPanel;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
@@ -64,7 +70,7 @@ use crate::image;
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::permissions::{PermissionAnswer, PermissionManager, RevokedRuleScope};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
@@ -127,6 +133,8 @@ const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
 const PLAN_BLOCKER: &str = "Plan ready";
 const QUESTION_BLOCKER: &str = "Question requested";
+/// Never valid JSON, so the tool reads it as the dismissal it is.
+const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
 const MCP_TRUST_BLOCKER: &str = "MCP trust required";
 
@@ -251,8 +259,18 @@ pub struct App {
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
+    pub(super) memory_picker: MemoryPicker,
+    pub(super) task_picker: TaskPicker,
+    pub(super) question_form: QuestionForm,
+    pub(super) session_picker: SessionPicker,
+    /// Published by the event loop, which is the only thing that can see
+    /// sibling sessions. Polled while the picker is open.
+    pub(crate) live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
+    live_session_watch: Watch<Vec<SessionRow>>,
+    question_subagent: Option<String>,
     pub(super) stash_picker: StashPicker,
     pub(super) plan_form: PlanForm,
+    pub(super) todo_panel: TodoPanel,
     pub(super) status_bar: StatusBar,
     pub(super) status_hits: Vec<StatusBarHit>,
     pub(super) status_mouse_down: Option<StatusBarHit>,
@@ -396,8 +414,16 @@ impl App {
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
+            memory_picker: MemoryPicker::new(),
+            task_picker: TaskPicker::new(),
+            question_form: QuestionForm::new(),
+            session_picker: SessionPicker::new(),
+            live_sessions: Arc::default(),
+            live_session_watch: Watch::default(),
+            question_subagent: None,
             stash_picker: StashPicker::new(),
             plan_form: PlanForm::new(),
+            todo_panel: TodoPanel::default(),
             status_bar: StatusBar::new(flash),
             status_hits: Vec::new(),
             status_mouse_down: None,
@@ -730,6 +756,23 @@ impl App {
         }
     }
 
+    /// The form's reply goes back through the answer channel the asking tool
+    /// is parked on. A dismissal is an unparseable reply by design: the tool
+    /// reads anything it cannot make answers of as "the user declined".
+    fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
+        let reply = match action {
+            QuestionFormAction::Consumed => return Vec::new(),
+            QuestionFormAction::Dismiss => QUESTION_DISMISSED.to_owned(),
+            QuestionFormAction::Submit(answers) => {
+                serde_json::to_string(&answers).unwrap_or_else(|_| QUESTION_DISMISSED.to_owned())
+            }
+        };
+        self.question_form.close();
+        let subagent = self.question_subagent.take();
+        self.send_to_agent(subagent.as_deref(), reply);
+        Vec::new()
+    }
+
     fn send_answer(&self, answer: String) {
         if let Some(tx) = &self.answer_tx {
             let _ = tx.try_send(answer);
@@ -790,6 +833,10 @@ impl App {
         try_picker!(self.file_picker);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
+        try_picker!(self.memory_picker);
+        try_picker!(self.task_picker);
+        try_picker!(self.session_picker);
+        try_picker!(self.question_form);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -1077,8 +1124,40 @@ impl App {
             return Some(self.handle_stash_picker_action(action));
         }
 
+        if self.question_form.is_open() {
+            let action = self.question_form.handle_key(key);
+            return Some(self.handle_question_form_action(action));
+        }
+        if self.session_picker.is_open() {
+            let action = self.session_picker.handle_key(key);
+            return Some(self.handle_session_picker_action(action));
+        }
+        if self.task_picker.is_open() {
+            let action = self.task_picker.handle_key(key);
+            return Some(self.handle_task_picker_action(action));
+        }
+        if self.memory_picker.is_open() {
+            let action = self.memory_picker.handle_key(key);
+            return Some(self.handle_memory_picker_action(action));
+        }
+
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
             return Some(self.run_builtin(BuiltinAction::PlanToggle));
+        }
+
+        // Shares Ctrl+T with the plan form, which never has a plan ready and a
+        // todo list at once: the plan branch above already claimed the key if
+        // it wanted it.
+        if key::PLAN_TOGGLE.matches(key) && self.todo_panel.toggle() {
+            return Some(Vec::new());
+        }
+
+        if key::TASK_PICKER.matches(key) {
+            return Some(self.tasks_browse());
+        }
+
+        if key::SESSION_PICKER.matches(key) {
+            return Some(self.sessions_browse());
         }
 
         if key::COPY_MESSAGE.matches(key) {
@@ -2071,6 +2150,14 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
+            // Subagents get `todo_write` too, but their plans are private:
+            // letting one repaint the panel would erase the main list the user
+            // is watching.
+            if subagent_id.is_none()
+                && let caudra_agent::types::ToolOutput::TodoList(items) = &e.output
+            {
+                self.todo_panel.set_items(items.clone());
+            }
             if subagent_id.is_none()
                 && let Some(task_id) = self.parent_task_ids.get(&e.id)
                 && let Some(&sub_idx) = self.chat_index.get(task_id)
@@ -2308,6 +2395,14 @@ impl App {
             return vec![];
         }
 
+        // A subagent's question routes back through that subagent's own
+        // answer channel, so the form remembers which chat asked.
+        if let ChatEventResult::Question(event) = result {
+            self.question_form.open(event.questions);
+            self.question_subagent = subagent_id;
+            return vec![];
+        }
+
         if let ChatEventResult::AuthRequired = result {
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
@@ -2362,6 +2457,7 @@ impl App {
                     }
                 }
                 ChatEventResult::AuthRequired
+                | ChatEventResult::Question(_)
                 | ChatEventResult::PermissionRequest(_)
                 | ChatEventResult::PermissionRequestResolved { .. }
                 | ChatEventResult::QueueItemConsumed { .. }
@@ -2512,6 +2608,10 @@ impl App {
             "/stash" => self.run_builtin(BuiltinAction::StashPush),
             "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
+            "/memory" => self.memory_browse(),
+            "/tasks" => self.tasks_browse(),
+            "/sessions" => self.sessions_browse(),
+            "/rename" => self.rename_session(&cmd.args),
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
@@ -2781,7 +2881,7 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 20] {
+    fn overlays(&self) -> [&dyn Overlay; 24] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -2802,11 +2902,15 @@ impl App {
             &self.mcp_picker,
             &self.permissions_picker,
             &self.stash_picker,
+            &self.memory_picker,
+            &self.task_picker,
+            &self.question_form,
+            &self.session_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 20] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 24] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -2827,6 +2931,10 @@ impl App {
             &mut self.mcp_picker,
             &mut self.permissions_picker,
             &mut self.stash_picker,
+            &mut self.memory_picker,
+            &mut self.task_picker,
+            &mut self.question_form,
+            &mut self.session_picker,
             &mut self.permission_prompt,
         ]
     }
@@ -2841,6 +2949,7 @@ impl App {
         self.permission_prompt.is_open()
             || self.pending_input != PendingInput::None
             || self.float_mgr.needs_input()
+            || self.question_form.is_open()
     }
 
     pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
@@ -2854,7 +2963,10 @@ impl App {
                 self.status != Status::Streaming && self.plan_form_active(),
                 PLAN_BLOCKER,
             ),
-            (self.float_mgr.needs_input(), QUESTION_BLOCKER),
+            (
+                self.float_mgr.needs_input() || self.question_form.is_open(),
+                QUESTION_BLOCKER,
+            ),
             (self.login_picker.is_open(), LOGIN_BLOCKER),
             (
                 self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
@@ -2945,6 +3057,8 @@ impl App {
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
+            | self.refresh_memory_picker_if_stale()
+            | self.refresh_session_picker()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -3065,6 +3179,10 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
+        try_picker!(self.memory_picker);
+        try_picker!(self.task_picker);
+        try_picker!(self.session_picker);
+        try_picker!(self.question_form);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
             if self.active_subagent_can_steer() || self.queue_editor_active() {

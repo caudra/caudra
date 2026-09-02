@@ -97,7 +97,7 @@ end
 local skill_dirs = configured_skill_dirs()
 
 local opts = caudra.api.register_options({
-  plugin_dev = { default = true, desc = "Offer the builtin caudra-plugin-dev skill for writing caudra plugins." },
+  plugin_dev = { default = false, desc = "Offer the builtin caudra-plugin-dev skill for writing caudra plugins." },
 })
 
 local ok, builtin, reference = pcall(function()

@@ -253,6 +253,7 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     workcell
         .register_documented_tools(&registry)
         .expect("Workcell tools");
+    caudra_agent::tools::native::register(&registry).expect("native Caudra tools");
     let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
 
     host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))

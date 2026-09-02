@@ -16,16 +16,50 @@ use crate::update;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
 
-fn register_workcell(cwd: &Path) -> Result<caudra_workcell::WorkcellHost> {
+/// One choke point for every native tool, so a new entry point cannot boot
+/// with half the built-ins missing. Workcell owns the file, web, shell, and
+/// code contracts; `caudra_agent::tools::native` owns the rest.
+fn register_builtin_tools(cwd: &Path) -> Result<caudra_workcell::WorkcellHost> {
+    let registry = caudra_agent::tools::ToolRegistry::global();
     let worker = std::env::var_os(WORKCELL_CODE_WORKER_ENV).map(std::path::PathBuf::from);
     let host = caudra_workcell::WorkcellHost::new_production(cwd, worker.as_deref())
         .context("initialize native Workcell tools")?;
-    host.register(caudra_agent::tools::ToolRegistry::global())
+    host.register(registry)
         .context("register native Workcell tools")?;
+    caudra_agent::tools::native::register(registry).context("register native Caudra tools")?;
     for warning in host.warnings() {
         eprintln!("warning: {warning}");
     }
     Ok(host)
+}
+
+/// Notes live outside the project, where every effectful tool would otherwise
+/// prompt. Registered under a reserved owner so a plugin reload replaces these
+/// rules rather than stacking duplicates.
+fn install_native_permission_rules(
+    plugin_rules: &caudra_agent::permissions::PluginRuleStore,
+    cwd: &Path,
+) {
+    plugin_rules.replace(
+        caudra_agent::tools::native::memory::RULE_OWNER,
+        caudra_agent::tools::native::memory::permission_rules(cwd),
+    );
+}
+
+/// Native tools read their options from here rather than from config
+/// directly, so `caudra-agent` stays free of a config dependency it would
+/// otherwise need only for two numbers.
+///
+/// The `caudra-plugin-dev` skill is rendered from the live Lua API docs, so
+/// only `caudra-lua` can build it. Not installing it is how
+/// `plugins.skill.plugin_dev = false` takes effect.
+fn configure_native_tools(agent: &caudra_config::AgentConfig) {
+    if agent.skill_plugin_dev {
+        caudra_agent::tools::native::skill::set_builtin_skill(
+            caudra_lua::docs_render::plugin_dev_skill(),
+        );
+    }
+    caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {

@@ -30,6 +30,7 @@ struct ViewLayout {
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
+    todo_area: Rect,
     panel_windows: Vec<(usize, Rect)>,
     input_area: Rect,
     splits: SplitLayout,
@@ -122,11 +123,13 @@ impl App {
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
+                + self.todo_panel.height()
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.active_queue_entries().len())
+                + self.todo_panel.height()
                 + panel_h
                 + if self.active_subagent_can_steer() || self.queue_editor_active() {
                     self.subagent_input_box.height(inner.width).min(max_bottom)
@@ -155,7 +158,16 @@ impl App {
             queue_panel::height(self.queue.panel_len())
         };
 
-        let mut constraints = vec![Constraint::Length(queue_height)];
+        let todo_height = if bottom_takeover {
+            0
+        } else {
+            self.todo_panel.height()
+        };
+
+        let mut constraints = vec![
+            Constraint::Length(queue_height),
+            Constraint::Length(todo_height),
+        ];
         for &(_, h) in &panel_reqs {
             constraints.push(Constraint::Length(h));
         }
@@ -163,10 +175,11 @@ impl App {
 
         let areas = Layout::vertical(constraints).split(bottom_area);
         let queue_area = areas[0];
+        let todo_area = areas[1];
         let panel_windows: Vec<(usize, Rect)> = panel_reqs
             .iter()
             .enumerate()
-            .map(|(i, &(idx, _))| (idx, areas[1 + i]))
+            .map(|(i, &(idx, _))| (idx, areas[2 + i]))
             .collect();
         let input_area = areas[areas.len() - 1];
 
@@ -175,6 +188,7 @@ impl App {
             bottom_area,
             status_area: main_content_area(status_area),
             queue_area,
+            todo_area,
             panel_windows,
             input_area,
             splits,
@@ -217,6 +231,7 @@ impl App {
                     hovered: self.queue_hover,
                 },
             );
+            self.todo_panel.view(frame, layout.todo_area);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
@@ -259,6 +274,7 @@ impl App {
                     hovered: self.queue_hover,
                 },
             );
+            self.todo_panel.view(frame, layout.todo_area);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
@@ -279,6 +295,8 @@ impl App {
                 (self.state.mode == Mode::Plan)
                     .then(|| self.plan_form.hint_line())
                     .flatten()
+                    .or_else(|| self.todo_panel.hint_line())
+                    .or_else(|| self.task_hint_line())
                     .or_else(|| self.lua_hint_line())
             };
             self.input_box.view(
@@ -332,6 +350,10 @@ impl App {
         render_if_open!(self.mcp_picker);
         render_if_open!(self.permissions_picker);
         render_if_open!(self.stash_picker);
+        render_if_open!(self.memory_picker);
+        render_if_open!(self.task_picker);
+        render_if_open!(self.session_picker);
+        render_if_open!(self.question_form);
 
         overlay_rect
     }
@@ -477,6 +499,10 @@ impl App {
 
         if layout.queue_area.height > 0 && !layout.bottom_takeover {
             self.zones.push_overlay(layout.queue_area);
+        }
+
+        if layout.todo_area.height > 0 && !layout.bottom_takeover {
+            self.zones.push_overlay(layout.todo_area);
         }
 
         for dir in Split::ALL {

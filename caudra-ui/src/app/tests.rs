@@ -4978,16 +4978,16 @@ fn typed_lua_command_with_args_executes() {
         dir.clone(),
         Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/rename".into(),
-            description: "Rename the current session".into(),
-            plugin: "sessions".into(),
+            name: "/deploy".into(),
+            description: "Deploy the project".into(),
+            plugin: "deploy_plugin".into(),
             max_args: usize::MAX,
         }]),
     );
     let (handle, probe) = caudra_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    let actions = type_and_submit(&mut app, "/rename my title");
+    let actions = type_and_submit(&mut app, "/deploy staging now");
 
     assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
     assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
@@ -5068,20 +5068,20 @@ fn run_cmdline_forwards_depth_to_lua_command() {
         dir.clone(),
         Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/Sessions".into(),
-            description: "Browse sessions".into(),
-            plugin: "sessions".into(),
+            name: "/Deploy".into(),
+            description: "Deploy the project".into(),
+            plugin: "deploy_plugin".into(),
             max_args: 0,
         }]),
     );
     let (handle, probe) = caudra_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/sessions", 3).unwrap();
+    app.run_cmdline("/deploy", 3).unwrap();
 
     assert_eq!(
         probe.try_recv_command(),
-        Some(("/Sessions".to_string(), String::new(), 3))
+        Some(("/Deploy".to_string(), String::new(), 3))
     );
 }
 

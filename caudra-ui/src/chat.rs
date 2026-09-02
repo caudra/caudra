@@ -15,6 +15,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
     AgentEvent, BufferSnapshot, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind,
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock,
@@ -123,6 +124,7 @@ pub enum ChatEventResult {
         request_id: String,
     },
     AuthRequired,
+    Question(Box<QuestionEvent>),
 }
 
 pub struct Chat {
@@ -219,6 +221,9 @@ impl Chat {
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
+            AgentEvent::BatchProgress(e) => {
+                self.messages_panel.batch_progress(&e.id, e.index, e.entry)
+            }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = matches!(&*e.tool, WRITE_TOOL_NAME | FILE_WRITE_TOOL_NAME);
@@ -291,6 +296,9 @@ impl Chat {
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
+            }
+            AgentEvent::Question(event) => {
+                return ChatEventResult::Question(event);
             }
             AgentEvent::ToolSnapshot {
                 id,
@@ -779,7 +787,10 @@ fn history_to_display_with_project(
                         id: item.id,
                         result_id: result.map(|result| result.id),
                     }),
-                    tool_input: None,
+                    tool_input: tool_call
+                        .as_deref()
+                        .and_then(|call| call.start_input())
+                        .map(Arc::new),
                     tool_raw_input: Some(Arc::new(input.clone())),
                     tool_output,
                     live_output: None,
@@ -1800,6 +1811,88 @@ mod tests {
         let display = display_messages(&msgs, &empty_outputs()).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
+    }
+
+    /// Restoring a session re-parses the stored call, so the command echo above
+    /// a tool's output survives a reload. It used to be dropped outright.
+    #[test]
+    fn a_restored_tool_call_keeps_its_input_echo() {
+        use caudra_agent::tools::registry::{
+            ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult,
+            ToolInvocation,
+        };
+        use caudra_agent::tools::{DescriptionContext, ToolContext};
+        use serde_json::{Value, json};
+
+        const TOOL: &str = "restore_echo_probe";
+        const COMMAND: &str = "echo restored";
+
+        struct Probe;
+        struct Call(String);
+
+        impl Tool for Probe {
+            fn name(&self) -> &str {
+                TOOL
+            }
+            fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+                std::borrow::Cow::Borrowed("")
+            }
+            fn schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+                Ok(Box::new(Call(
+                    input["command"].as_str().unwrap_or_default().to_owned(),
+                )))
+            }
+        }
+
+        impl ToolInvocation for Call {
+            fn start_header(&self) -> HeaderFuture {
+                HeaderFuture::Ready(HeaderResult::plain(String::new()))
+            }
+            fn start_input(&self) -> Option<caudra_agent::ToolInput> {
+                Some(caudra_agent::ToolInput::Code {
+                    language: "bash".into(),
+                    code: self.0.clone(),
+                })
+            }
+            fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+                Box::pin(async move {
+                    ToolExecResult::from(Ok(ToolOutput::Plain(String::new().into())))
+                })
+            }
+        }
+
+        caudra_agent::tools::ToolRegistry::global()
+            .register(
+                Arc::new(Probe),
+                caudra_agent::tools::registry::ToolSource::Native {
+                    owner: "test".into(),
+                    contract: TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("probe registers once");
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "call-1",
+                TOOL,
+                json!({ "command": COMMAND }),
+            )],
+            ..Default::default()
+        }];
+        let display = display_messages(&messages, &HashMap::new()).0;
+        let tool = display
+            .iter()
+            .find(|msg| matches!(msg.role, DisplayRole::Tool(_)))
+            .expect("the call is displayed");
+        let Some(caudra_agent::ToolInput::Code { code, .. }) = tool.tool_input.as_deref() else {
+            panic!("a restored call keeps its code echo");
+        };
+        assert_eq!(code, COMMAND);
     }
 
     #[test]

@@ -3,6 +3,10 @@
 //! repo. `caudra-docgen` calls [`site_page`] for the website; the plugin
 //! `require()` sandbox serves [`virtual_module`] to the skill plugin.
 
+use std::fs;
+use std::path::PathBuf;
+
+use caudra_agent::tools::native::skill::BuiltinSkill;
 use mlua::{Lua, Table};
 
 use crate::docs::{DocKind, FnDoc, ModuleDoc, api_docs};
@@ -294,6 +298,52 @@ pub(crate) fn virtual_module(lua: &Lua, modname: &str) -> Option<mlua::Result<Ta
         Ok(table)
     };
     Some(build())
+}
+
+const REFERENCE_FILE: &str = "lua-api.md";
+const REFERENCE_UNAVAILABLE: &str = "(unavailable; full reference inlined below)";
+
+/// The `caudra-plugin-dev` skill for the native `skill` tool. It documents the
+/// Lua API, so only this crate can render it; `caudra-agent` takes it through
+/// a hook rather than depending on `caudra-lua`.
+///
+/// Resolution spills the full reference to disk and hands back its path: the
+/// index in the skill body maps every function to a line there, so the model
+/// reads only the sections it needs instead of the whole API.
+pub fn plugin_dev_skill() -> BuiltinSkill {
+    BuiltinSkill {
+        name: NAME.to_owned(),
+        description: DESCRIPTION.to_owned(),
+        resolve: Box::new(|| {
+            let reference = reference();
+            let content = skill_content(&reference);
+            match spill_reference(&reference) {
+                Some(path) => (
+                    content.replace(REFERENCE_PLACEHOLDER, &path.to_string_lossy()),
+                    Some(path),
+                ),
+                // Inline the whole reference: a skill that points at a file
+                // the model cannot read is worse than a long one.
+                None => (
+                    format!(
+                        "{}\n---\n\n{reference}",
+                        content.replace(REFERENCE_PLACEHOLDER, REFERENCE_UNAVAILABLE)
+                    ),
+                    None,
+                ),
+            }
+        }),
+    }
+}
+
+fn spill_reference(reference: &str) -> Option<PathBuf> {
+    let dir = caudra_storage::paths::state_dir().ok()?.join("docs");
+    let path = dir.join(REFERENCE_FILE);
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| fs::write(&path, reference)) {
+        tracing::warn!(path = %path.display(), %error, "failed to write lua api reference");
+        return None;
+    }
+    Some(path)
 }
 
 /// The body of the website's "Lua API" page: full render with anchors and

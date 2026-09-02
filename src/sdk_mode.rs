@@ -1659,6 +1659,8 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::BatchProgress(_)
+            | AgentEvent::Question(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::QueueDrained
