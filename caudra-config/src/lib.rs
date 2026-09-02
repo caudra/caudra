@@ -436,6 +436,7 @@ pub struct UiFileConfig {
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
+    pub theme_light: Option<String>,
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
@@ -457,6 +458,7 @@ impl UiFileConfig {
             mouse_scroll_lines,
             show_thinking,
             theme,
+            theme_light,
             clock_format,
             max_input_lines,
             update_check
@@ -1062,6 +1064,9 @@ pub struct UiConfig {
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
+    #[config(skip, default = "None")]
+    pub theme_light: Option<String>,
+
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
 }
@@ -1088,6 +1093,7 @@ impl UiConfig {
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(false),
             theme: f.theme,
+            theme_light: f.theme_light,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
     }

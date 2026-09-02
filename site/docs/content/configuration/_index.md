@@ -84,13 +84,27 @@ All fields are optional. Typos in field names cause an error right away.
 
 ### `ui.theme`
 
-Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Caudra keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Caudra keeps your last selection, which starts out as `opencode`. An unknown name is ignored with a warning.
 
-Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
+Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `opencode`, `opencode_light`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Caudra config directory, for example `~/.config/caudra/themes/`. If it reuses a built-in name, yours wins.
 
 Themes use 24-bit colors, but not every terminal can show them. Caudra checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `CAUDRA_TRUECOLOR=1` to force truecolor or `CAUDRA_TRUECOLOR=0` to force the fallback.
+
+Some themes ship as a light and dark pair: `ayu_dark` and `ayu_light`, `catppuccin_mocha` and `catppuccin_latte`, `gruvbox` and `gruvbox_light`, `opencode` and `opencode_light`, `rose_pine` and `rose_pine_dawn`, `solarized_dark` and `solarized_light`. Choosing either half makes Caudra ask the terminal for its background color and show the half that matches. Themes outside these pairs stay as you left them.
+
+Caudra asks again every ten minutes, and also when the terminal regains focus or changes size, so reattaching a multiplexer to another terminal updates the theme. Following the terminal only changes the running session, and the theme you saved from `/theme` stays saved. Terminals that do not report a background color are asked a few times and then left alone.
+
+### `ui.theme_light`
+
+Light half to use in place of the one from the pairing table, or to give a theme that has no pair. `ui.theme` becomes the dark half:
+
+```lua
+caudra.setup({ ui = { theme = "tokyonight", theme_light = "catppuccin_latte" } })
+```
+
+Leave `ui.theme` unset to pair the light theme with whatever you last picked from `/theme`.
 
 ### `ui.update_check`
 

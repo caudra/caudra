@@ -1,0 +1,209 @@
+# opencode light -- palette sourced from opencode's default TUI theme
+# (packages/tui/src/theme/assets/opencode.json, "light" branch).
+# Each palette entry is commented with the opencode def or theme key it maps to.
+#
+# opencode swaps the primary and accent hues between its two branches: primary
+# is blue and accent is orange here, the reverse of the dark theme.
+
+"comment"                         = { fg = "comment", modifiers = ["italic"] }
+"comment.block"                   = { fg = "comment", modifiers = ["italic"] }
+"comment.block.documentation"     = { fg = "comment", modifiers = ["italic"] }
+"comment.line"                    = { fg = "comment", modifiers = ["italic"] }
+"comment.line.documentation"      = { fg = "comment", modifiers = ["italic"] }
+
+"constant"                        = { fg = "orange" }
+"constant.builtin"                = { fg = "red" }
+"constant.builtin.boolean"        = { fg = "red" }
+"constant.character"              = { fg = "green" }
+"constant.character.escape"       = { fg = "accent" }
+"constant.macro"                  = { fg = "accent" }
+"constant.numeric"                = { fg = "orange" }
+"constructor"                     = { fg = "primary" }
+
+"error"                           = { fg = "red" }
+"warning"                         = { fg = "orange" }
+"info"                            = { fg = "cyan" }
+"hint"                            = { fg = "cyan" }
+
+"diff.delta"                      = { fg = "orange" }
+"diff.minus"                      = { fg = "diff_removed" }
+"diff.plus"                       = { fg = "diff_added" }
+
+"function"                        = { fg = "primary" }
+"function.builtin"                = { fg = "red" }
+"function.call"                   = { fg = "primary" }
+"function.macro"                  = { fg = "accent" }
+"function.method"                 = { fg = "primary" }
+
+"keyword"                         = { fg = "accent", modifiers = ["italic"] }
+"keyword.control.conditional"     = { fg = "accent", modifiers = ["italic"] }
+"keyword.control.exception"       = { fg = "accent", modifiers = ["italic"] }
+"keyword.control.import"          = { fg = "accent", modifiers = ["italic"] }
+"keyword.control.repeat"          = { fg = "accent", modifiers = ["italic"] }
+"keyword.directive"               = { fg = "accent", modifiers = ["italic"] }
+"keyword.function"                = { fg = "accent", modifiers = ["italic"] }
+"keyword.operator"                = { fg = "cyan" }
+"keyword.return"                  = { fg = "accent", modifiers = ["italic"] }
+"keyword.storage"                 = { fg = "accent", modifiers = ["italic"] }
+"keyword.storage.modifier"        = { fg = "accent", modifiers = ["italic"] }
+"keyword.storage.type"            = { fg = "accent", modifiers = ["bold", "italic"] }
+
+"label"                           = { fg = "secondary" }
+"attribute"                       = { fg = "orange" }
+"namespace"                       = { fg = "secondary" }
+"annotation"                      = { fg = "orange" }
+
+"markup.bold"                     = { fg = "orange", modifiers = ["bold"] }
+"markup.heading"                  = { fg = "accent", modifiers = ["bold"] }
+"markup.italic"                   = { fg = "yellow", modifiers = ["italic"] }
+"markup.link.text"                = { fg = "cyan" }
+"markup.link.url"                 = { fg = "primary", modifiers = ["underlined"] }
+"markup.list"                     = { fg = "primary" }
+"markup.quote"                    = { fg = "yellow", modifiers = ["italic"] }
+"markup.raw"                      = { fg = "green" }
+"markup.strikethrough"            = { fg = "comment", modifiers = ["crossed_out"] }
+
+"punctuation"                     = { fg = "foreground" }
+"punctuation.bracket"             = { fg = "foreground" }
+"punctuation.delimiter"           = { fg = "foreground" }
+"punctuation.special"             = { fg = "cyan" }
+
+"special"                         = { fg = "cyan" }
+
+"string"                          = { fg = "green" }
+"string.regexp"                   = { fg = "accent" }
+"string.special"                  = { fg = "accent" }
+"string.symbol"                   = { fg = "green" }
+
+"tag"                             = { fg = "red" }
+"tag.attribute"                   = { fg = "orange" }
+"tag.delimiter"                   = { fg = "foreground" }
+
+"type"                            = { fg = "yellow" }
+"type.builtin"                    = { fg = "red" }
+"type.enum.variant"               = { fg = "yellow" }
+
+"variable"                        = { fg = "red" }
+"variable.builtin"                = { fg = "red", modifiers = ["italic"] }
+"variable.other"                  = { fg = "red" }
+"variable.other.member"           = { fg = "red" }
+"variable.parameter"              = { fg = "red" }
+
+[palette]
+# lightStep1 / background
+background    = "#ffffff"
+# lightStep12 / text
+foreground    = "#1a1a1a"
+# lightStep11 / textMuted, syntaxComment
+comment       = "#8a8a8a"
+# lightStep9 / primary, syntaxFunction
+primary       = "#3b7dd8"
+# lightStep10, primary hover
+primary_bright = "#2968c3"
+# lightSecondary / secondary
+secondary     = "#7b5bb6"
+# lightAccent / accent, syntaxKeyword
+accent        = "#d68c27"
+# lightRed / error, syntaxVariable
+red           = "#d1383d"
+# lightOrange / warning, syntaxNumber
+orange        = "#d68c27"
+# lightGreen / success, syntaxString
+green         = "#3d9a57"
+# lightCyan / info, syntaxOperator
+cyan          = "#318795"
+# lightYellow / syntaxType
+yellow        = "#b0851f"
+# lightStep2 / backgroundPanel
+panel         = "#fafafa"
+# lightStep3 / backgroundElement
+current_line  = "#f5f5f5"
+# lightStep4
+selection     = "#ebebeb"
+# lightStep6 / borderSubtle
+border_subtle = "#d4d4d4"
+# lightStep7 / border
+border        = "#b8b8b8"
+# lightStep8 / borderActive
+border_active = "#a0a0a0"
+# diffAdded
+diff_added    = "#1e725c"
+# diffRemoved
+diff_removed  = "#c53b53"
+# diffLineNumber
+diff_line_nr  = "#595959"
+mode_build    = "#3b7dd8"
+mode_plan     = "#d68c27"
+mode_bash     = "#7b5bb6"
+
+[ui]
+user               = { fg = "primary" }
+assistant          = { fg = "foreground" }
+thinking           = { fg = "comment", modifiers = ["italic"] }
+# backgroundPanel
+tool_bg            = { bg = "#fafafa" }
+tool               = { fg = "foreground" }
+tool_path          = { fg = "primary" }
+tool_annotation    = { fg = "comment" }
+tool_prefix        = { fg = "foreground", modifiers = ["bold"] }
+tool_success       = { fg = "green" }
+tool_error         = { fg = "red" }
+tool_dim           = { fg = "comment" }
+error              = { fg = "red", modifiers = ["bold"] }
+status_dim         = { fg = "comment" }
+bold               = { fg = "orange", modifiers = ["bold"] }
+italic             = { fg = "yellow", modifiers = ["italic"] }
+bold_italic        = { fg = "orange", modifiers = ["bold", "italic"] }
+strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
+# markdownHeading
+heading            = { fg = "accent", modifiers = ["bold"] }
+# markdownListItem
+list_marker        = { fg = "primary" }
+# markdownCode
+inline_code        = { fg = "green" }
+# markdownCodeBlock
+code_block         = { fg = "foreground" }
+code_gutter        = { fg = "comment" }
+math               = { fg = "orange" }
+diagram            = { fg = "cyan" }
+# markdownHorizontalRule
+horizontal_rule    = { fg = "comment" }
+plan_rule          = { fg = "accent", modifiers = ["bold"] }
+table_border       = { fg = "border_subtle" }
+# diffRemovedBg / diffAddedBg
+diff_old           = { bg = "#f7d8db" }
+diff_new           = { bg = "#d5e5d5" }
+diff_old_emphasis  = { bg = "#efb9bf" }
+diff_new_emphasis  = { bg = "#b4d9b4" }
+diff_line_nr       = { fg = "diff_line_nr" }
+todo_completed     = { fg = "green" }
+todo_in_progress   = { fg = "orange" }
+todo_pending       = { fg = "comment" }
+todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
+# selectedListItemText resolves to background
+item_selected      = { fg = "background", bg = "primary" }
+item               = { fg = "foreground" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "primary" }
+active             = { fg = "primary" }
+panel_border       = { fg = "border" }
+panel_title        = { fg = "primary", modifiers = ["bold"] }
+input_border       = { fg = "border_active" }
+cursor             = { fg = "background", bg = "foreground" }
+keybind_key        = { fg = "primary", modifiers = ["bold"] }
+keybind_desc       = { fg = "foreground" }
+keybind_section    = { fg = "accent", modifiers = ["bold"] }
+index_section      = { fg = "accent", modifiers = ["bold"] }
+index_line_nr      = { fg = "comment" }
+index_keyword      = { fg = "accent" }
+shell_prefix       = { fg = "green", modifiers = ["bold"] }
+progress_bar       = { fg = "primary" }
+queue              = { fg = "secondary" }
+queue_delete       = { fg = "red", modifiers = ["bold"] }
+plan_path          = { fg = "primary", modifiers = ["bold"] }
+status_notice      = { fg = "orange" }
+status_retry_error = { fg = "red" }
+status_retry_info  = { fg = "comment" }
+input_placeholder  = { fg = "comment" }
+timestamp          = { fg = "comment" }
+spinner            = { fg = "primary" }

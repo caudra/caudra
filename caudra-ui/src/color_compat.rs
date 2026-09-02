@@ -10,11 +10,17 @@
 //! `CAUDRA_TRUECOLOR=1` or `=0` overrides everything.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
+use crate::tty_query;
+
 const CUBE_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+/// Set an RGB background, query it back with DECRQSS, then reset.
+const RGB_QUERY: &[u8] = b"\x1b[48;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m";
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const TRUECOLOR_TERM_PROGRAMS: [&str; 7] = [
     "iTerm.app",
     "WezTerm",
@@ -62,7 +68,7 @@ fn detect() -> bool {
     let (supported, source) = match truecolor_from_env(|var| std::env::var(var).ok()) {
         Some(v) => (v, "env"),
         None if terminfo_advertises() => (true, "terminfo"),
-        None => (probe::terminal_supports_rgb(), "probe"),
+        None => (terminal_supports_rgb(), "probe"),
     };
     tracing::info!(supported, source, "truecolor detection");
     supported
@@ -109,97 +115,20 @@ fn terminfo_advertises() -> bool {
 /// `48;2`) back in its DECRQSS report; one that ignored it leaves it out.
 /// Only the `$r ... ST` payload counts, so interleaved input (mouse
 /// reports, pastes) cannot spoof a match.
-#[cfg(any(unix, test))]
 fn decrqss_reply_supports_rgb(buf: &[u8]) -> bool {
-    let Some(start) = find(buf, b"$r") else {
+    let Some(start) = tty_query::find(buf, b"$r") else {
         return false;
     };
     let payload = &buf[start + 2..];
-    let payload = find(payload, b"\x1b\\").map_or(payload, |end| &payload[..end]);
-    find(payload, b"48:2").is_some() || find(payload, b"48;2").is_some()
+    let payload = tty_query::find(payload, b"\x1b\\").map_or(payload, |end| &payload[..end]);
+    tty_query::find(payload, b"48:2").is_some() || tty_query::find(payload, b"48;2").is_some()
 }
 
-/// The DA1 reply (`ESC [ ? ... c`) ends the probe: we request it last, and
-/// every terminal answers it, even ones that ignore DECRQSS. Without it we
-/// would sit out the full timeout on every non-RGB terminal.
-#[cfg(any(unix, test))]
-fn da1_answered(buf: &[u8]) -> bool {
-    find(buf, b"\x1b[?").is_some_and(|start| buf[start + 3..].contains(&b'c'))
-}
-
-#[cfg(any(unix, test))]
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-#[cfg(unix)]
-mod probe {
-    use std::fs::File;
-    use std::io::{Write, stdout};
-    use std::os::fd::{AsRawFd, RawFd};
-    use std::time::{Duration, Instant};
-
-    use super::{da1_answered, decrqss_reply_supports_rgb};
-
-    /// Set an RGB background, query it back with DECRQSS, reset, then DA1.
-    const QUERY: &[u8] = b"\x1b[48;2;1;2;3m\x1bP$qm\x1b\\\x1b[0m\x1b[c";
-    const TIMEOUT: Duration = Duration::from_millis(500);
-
-    pub(super) fn terminal_supports_rgb() -> bool {
-        try_probe().unwrap_or(false)
-    }
-
-    fn try_probe() -> Option<bool> {
-        let (_owned, fd) = open_tty()?;
-        let mut out = stdout().lock();
-        out.write_all(QUERY).ok()?;
-        out.flush().ok()?;
-        let deadline = Instant::now() + TIMEOUT;
-        let mut buf = Vec::with_capacity(64);
-        while !da1_answered(&buf) {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            if !wait_readable(fd, remaining) {
-                break;
-            }
-            let mut chunk = [0u8; 256];
-            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-            if n <= 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n as usize]);
-        }
-        Some(decrqss_reply_supports_rgb(&buf))
-    }
-
-    fn open_tty() -> Option<(Option<File>, RawFd)> {
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-            return Some((None, libc::STDIN_FILENO));
-        }
-        let file = File::open("/dev/tty").ok()?;
-        let fd = file.as_raw_fd();
-        Some((Some(file), fd))
-    }
-
-    fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        unsafe { libc::poll(&mut pfd, 1, ms) > 0 && pfd.revents & libc::POLLIN != 0 }
-    }
-}
-
-#[cfg(not(unix))]
-mod probe {
-    /// No tty to poke on non-unix. Windows Terminal does RGB and crossterm
-    /// maps colors for the legacy console, so assuming truecolor is safe.
-    pub(super) fn terminal_supports_rgb() -> bool {
-        true
-    }
+/// Windows Terminal does RGB and crossterm maps colors for the legacy
+/// console, so a terminal we cannot probe is assumed to support truecolor.
+fn terminal_supports_rgb() -> bool {
+    tty_query::query(RGB_QUERY, PROBE_TIMEOUT)
+        .map_or(cfg!(not(unix)), |reply| decrqss_reply_supports_rgb(&reply))
 }
 
 fn downgrade(color: Color) -> Color {
@@ -279,12 +208,5 @@ mod tests {
     #[test_case(b"\x1bP1$r0m\x1b\\48;2\x1b[?1;2c", false; "bytes_after_st_ignored")]
     fn decrqss_reply(buf: &[u8], expected: bool) {
         assert_eq!(decrqss_reply_supports_rgb(buf), expected);
-    }
-
-    #[test_case(b"\x1b[?65;1;9c", true; "da1_reply")]
-    #[test_case(b"\x1bP1$r0;48:2:1:2:3m\x1b\\", false; "decrqss_only")]
-    #[test_case(b"\x1b[?65;1;9", false; "partial_da1")]
-    fn da1(buf: &[u8], expected: bool) {
-        assert_eq!(da1_answered(buf), expected);
     }
 }

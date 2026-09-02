@@ -11,7 +11,8 @@ use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };
 
-const DEFAULT_THEME: &str = "dracula";
+/// Applied on first run and whenever no theme has been picked or configured.
+pub const DEFAULT_THEME: &str = "opencode";
 const MESSAGE_BACKGROUND_TINT: f32 = 0.08;
 const ELEMENT_BACKGROUND_TINT: f32 = 0.1;
 const PANEL_BACKGROUND_TINT: f32 = 0.04;
@@ -149,6 +150,58 @@ pub struct ThemeEntry {
     pub toml: &'static str,
 }
 
+/// Two themes that are the same design drawn for opposite backgrounds.
+pub struct ThemePair {
+    pub dark: &'static str,
+    pub light: &'static str,
+}
+
+impl ThemePair {
+    fn covers(&self, name: &str) -> bool {
+        self.dark == name || self.light == name
+    }
+}
+
+/// Themes that ship as a light and dark pair. Choosing either half is what
+/// turns on following the terminal background, so a theme listed here needs
+/// no configuration to track the terminal, and one that is not listed never
+/// changes on its own.
+///
+/// Only canonical pairs belong here. Themes with several dark variants keep
+/// the one that shares the light half's name, and `ui.theme_light` covers
+/// any other combination.
+pub static THEME_PAIRS: &[ThemePair] = &[
+    ThemePair {
+        dark: "ayu_dark",
+        light: "ayu_light",
+    },
+    ThemePair {
+        dark: "catppuccin_mocha",
+        light: "catppuccin_latte",
+    },
+    ThemePair {
+        dark: "gruvbox",
+        light: "gruvbox_light",
+    },
+    ThemePair {
+        dark: "opencode",
+        light: "opencode_light",
+    },
+    ThemePair {
+        dark: "rose_pine",
+        light: "rose_pine_dawn",
+    },
+    ThemePair {
+        dark: "solarized_dark",
+        light: "solarized_light",
+    },
+];
+
+/// The pair `name` belongs to, whichever half it names.
+pub fn pair_for(name: &str) -> Option<&'static ThemePair> {
+    THEME_PAIRS.iter().find(|pair| pair.covers(name))
+}
+
 pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "ayu_dark",
@@ -245,6 +298,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "onedark",
         toml: include_str!("themes/onedark.toml"),
+    },
+    ThemeEntry {
+        name: "opencode",
+        toml: include_str!("themes/opencode.toml"),
+    },
+    ThemeEntry {
+        name: "opencode_light",
+        toml: include_str!("themes/opencode_light.toml"),
     },
     ThemeEntry {
         name: "rose_pine",
@@ -366,11 +427,16 @@ fn read_theme_name() -> Option<String> {
     caudra_storage::theme::read_theme_name(&dir)
 }
 
+/// Memoized: the event loop asks every frame to notice an interactive pick,
+/// and the persisted name must not be re-read from disk that often.
 pub fn current_theme_name() -> String {
-    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
-        return name;
+    let mut current = CURRENT_NAME.lock().unwrap();
+    if let Some(name) = current.as_ref() {
+        return name.clone();
     }
-    read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
+    let name = read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned());
+    *current = Some(name.clone());
+    name
 }
 
 pub fn style_by_name(name: &str) -> Style {
@@ -1145,6 +1211,149 @@ mod tests {
         assert!(!t.syntax.scopes.is_empty());
         assert!(t.syntax.settings.foreground.is_some());
         assert!(t.syntax.settings.background.is_some());
+    }
+
+    fn bundled_palette(name: &str) -> HashMap<String, Color> {
+        let entry = BUNDLED_THEMES
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("theme '{name}' must exist"));
+        theme_tables(entry.toml).0
+    }
+
+    /// Anchors the port against opencode's published defs so a stray edit to
+    /// either file shows up as a failure rather than a slightly-off hue.
+    ///
+    /// Reads `[palette]` rather than the constructed `Theme`, because
+    /// `ensure_contrast` lifts any role that misses its floor. Asserting the
+    /// built styles would pin this test to our contrast floor instead of to
+    /// opencode's values: `opencode_light` publishes `accent` at 2.75:1 on
+    /// white, so every role drawn from it renders slightly darker than the def.
+    #[test_case(
+        "opencode",
+        &[
+            ("background", 0x0a, 0x0a, 0x0a),
+            ("foreground", 0xee, 0xee, 0xee),
+            ("comment", 0x80, 0x80, 0x80),
+            ("primary", 0xfa, 0xb2, 0x83),
+            ("secondary", 0x5c, 0x9c, 0xf5),
+            ("accent", 0x9d, 0x7c, 0xd8),
+            ("red", 0xe0, 0x6c, 0x75),
+            ("green", 0x7f, 0xd8, 0x8f),
+            ("panel", 0x14, 0x14, 0x14),
+        ];
+        "dark"
+    )]
+    // opencode swaps the two hues between branches: primary is blue here.
+    #[test_case(
+        "opencode_light",
+        &[
+            ("background", 0xff, 0xff, 0xff),
+            ("foreground", 0x1a, 0x1a, 0x1a),
+            ("comment", 0x8a, 0x8a, 0x8a),
+            ("primary", 0x3b, 0x7d, 0xd8),
+            ("secondary", 0x7b, 0x5b, 0xb6),
+            ("accent", 0xd6, 0x8c, 0x27),
+            ("red", 0xd1, 0x38, 0x3d),
+            ("green", 0x3d, 0x9a, 0x57),
+            ("panel", 0xfa, 0xfa, 0xfa),
+        ];
+        "light"
+    )]
+    fn opencode_palette_matches_upstream_defs(name: &str, expected: &[(&str, u8, u8, u8)]) {
+        let palette = bundled_palette(name);
+        for (key, r, g, b) in expected {
+            assert_eq!(
+                palette.get(*key),
+                Some(&Color::Rgb(*r, *g, *b)),
+                "{name}: palette.{key} drifted from opencode's def",
+            );
+        }
+    }
+
+    /// Background roles never pass through `ensure_contrast`, so these stay on
+    /// the constructed theme where they also cover the wiring.
+    #[test_case("opencode", 0x0a, 0x0a, 0x0a, 0x14, 0x14, 0x14; "dark")]
+    #[test_case("opencode_light", 0xff, 0xff, 0xff, 0xfa, 0xfa, 0xfa; "light")]
+    fn opencode_panel_lands_on_background_panel(
+        name: &str,
+        br: u8,
+        bg: u8,
+        bb: u8,
+        pr: u8,
+        pg: u8,
+        pb: u8,
+    ) {
+        let t = bundled(name);
+        assert_eq!(t.background, Color::Rgb(br, bg, bb));
+        // tool_bg is backgroundPanel, so panels land on it exactly instead of
+        // falling back to a tint of the background.
+        assert_eq!(t.panel_style().bg, Some(Color::Rgb(pr, pg, pb)));
+    }
+
+    #[test]
+    fn opencode_diff_backgrounds_match_upstream_defs() {
+        let t = bundled("opencode");
+        assert_eq!(t.diff_old.bg, Some(Color::Rgb(0x37, 0x22, 0x2c)));
+        assert_eq!(t.diff_new.bg, Some(Color::Rgb(0x20, 0x30, 0x3b)));
+    }
+
+    /// A pair naming a theme that does not exist would silently stop the
+    /// terminal from being followed, so both halves must be bundled.
+    #[test]
+    fn theme_pairs_name_bundled_themes() {
+        for pair in THEME_PAIRS {
+            for name in [pair.dark, pair.light] {
+                assert!(
+                    BUNDLED_THEMES.iter().any(|e| e.name == name),
+                    "theme pair names '{name}', which is not bundled",
+                );
+            }
+        }
+    }
+
+    /// Overlapping pairs would make `pair_for` depend on table order.
+    #[test]
+    fn theme_pairs_do_not_overlap() {
+        let mut seen = Vec::new();
+        for pair in THEME_PAIRS {
+            for name in [pair.dark, pair.light] {
+                assert!(!seen.contains(&name), "'{name}' appears in two pairs");
+                seen.push(name);
+            }
+        }
+    }
+
+    /// The default has to follow the terminal without any configuration.
+    #[test]
+    fn default_theme_is_paired() {
+        let pair = pair_for(DEFAULT_THEME).expect("the default theme must have a light half");
+        assert_eq!(pair.dark, DEFAULT_THEME);
+    }
+
+    #[test_case("opencode", "opencode", "opencode_light"; "dark_half_finds_pair")]
+    #[test_case("opencode_light", "opencode", "opencode_light"; "light_half_finds_pair")]
+    #[test_case("gruvbox_light", "gruvbox", "gruvbox_light"; "light_only_name")]
+    fn pair_for_resolves_either_half(name: &str, dark: &str, light: &str) {
+        let pair = pair_for(name).unwrap_or_else(|| panic!("'{name}' must resolve to a pair"));
+        assert_eq!(pair.dark, dark);
+        assert_eq!(pair.light, light);
+    }
+
+    #[test_case("dracula"; "unpaired_dark_theme")]
+    #[test_case("ayu_mirage"; "dark_variant_outside_the_canonical_pair")]
+    #[test_case("nonexistent"; "unknown_name")]
+    fn pair_for_returns_none_for_unpaired(name: &str) {
+        assert!(pair_for(name).is_none());
+    }
+
+    #[test_case("opencode", Color::Rgb(0xfa, 0xb2, 0x83), Color::Rgb(0x9d, 0x7c, 0xd8), Color::Rgb(0x5c, 0x9c, 0xf5); "dark")]
+    #[test_case("opencode_light", Color::Rgb(0x3b, 0x7d, 0xd8), Color::Rgb(0xd6, 0x8c, 0x27), Color::Rgb(0x7b, 0x5b, 0xb6); "light")]
+    fn opencode_mode_colors_come_from_palette(name: &str, build: Color, plan: Color, bash: Color) {
+        let t = bundled(name);
+        assert_eq!(t.mode_build, build);
+        assert_eq!(t.mode_plan, plan);
+        assert_eq!(t.mode_bash, bash);
     }
 
     const COMMENT_COLOR: SynColor = SynColor {

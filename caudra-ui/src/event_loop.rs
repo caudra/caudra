@@ -48,6 +48,7 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{
     App, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content, turn_response,
 };
+use crate::appearance::{self, AutoSwitch};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
@@ -55,6 +56,7 @@ use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::input::InputReader;
 use crate::load_app_session;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::theme;
 use crate::{AppSession, SessionTab};
 
 use crate::storage_writer::StorageWriter;
@@ -592,6 +594,68 @@ impl SpawnCtx {
     }
 }
 
+/// Installs the startup theme, following the terminal background when the
+/// theme in use has a light half. Only the in-memory name is set, so the pick
+/// the user saved interactively survives.
+fn start_theme(ui_config: &UiConfig, warnings: &mut Vec<String>) -> Option<AutoSwitch> {
+    // Without `ui.theme` this is the pick from `/theme`, or the default.
+    let chosen = ui_config
+        .theme
+        .clone()
+        .unwrap_or_else(theme::current_theme_name);
+    if let Err(e) = theme::load_by_name(&chosen) {
+        warnings.push(format!("config ui.theme: {e}"));
+        return None;
+    }
+
+    let Some(auto) = pair_switch(&chosen, ui_config.theme_light.as_deref(), warnings) else {
+        theme::set_current_name(&chosen);
+        apply_theme(&chosen, warnings);
+        return None;
+    };
+    if let Err(e) = auto.apply() {
+        warnings.push(format!("config ui.theme: {e}"));
+        return None;
+    }
+    Some(auto)
+}
+
+/// `ui.theme_light` names the light half outright. Otherwise the pairing
+/// table decides, and `chosen` may be either half of it.
+fn pair_switch(
+    chosen: &str,
+    configured_light: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<AutoSwitch> {
+    if let Some(light) = configured_light {
+        // Report a typo in the half not being installed now, rather than
+        // leaving it to surface the first time the terminal turns light.
+        if let Err(e) = theme::load_by_name(light) {
+            warnings.push(format!("config ui.theme_light: {e}"));
+            return None;
+        }
+        // The probe must precede `InputReader::spawn`, which eats the reply.
+        return Some(AutoSwitch::new(
+            chosen.to_owned(),
+            light.to_owned(),
+            appearance::detect(),
+        ));
+    }
+    let pair = theme::pair_for(chosen)?;
+    Some(AutoSwitch::new(
+        pair.dark.to_owned(),
+        pair.light.to_owned(),
+        appearance::detect(),
+    ))
+}
+
+fn apply_theme(name: &str, warnings: &mut Vec<String>) {
+    match theme::load_by_name(name) {
+        Ok(theme) => theme::set(theme),
+        Err(e) => warnings.push(format!("config ui.theme: {e}")),
+    }
+}
+
 pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
@@ -601,6 +665,7 @@ pub(crate) struct EventLoop<'t> {
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
     input: InputReader,
+    auto_theme: Option<AutoSwitch>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
@@ -724,17 +789,8 @@ impl<'t> EventLoop<'t> {
         } = params;
 
         // Apply the config theme before the warmup thread spawns, or warmup
-        // could bake the syntax palette from the old theme. Only the
-        // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
-            match crate::theme::load_by_name(name) {
-                Ok(theme) => {
-                    crate::theme::set_current_name(name);
-                    crate::theme::set(theme);
-                }
-                Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
-            }
-        }
+        // could bake the syntax palette from the old theme.
+        let auto_theme = start_theme(&ui_config, &mut startup_warnings);
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
@@ -832,6 +888,7 @@ impl<'t> EventLoop<'t> {
             notifier,
             ctx,
             input: InputReader::spawn(),
+            auto_theme,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
@@ -956,7 +1013,8 @@ impl<'t> EventLoop<'t> {
     /// still drain their floats, or a plugin writing to a window nobody is
     /// looking at would lose the output.
     fn tick(&mut self) -> Dirty {
-        let mut dirty = Dirty::NO;
+        self.sync_auto_theme();
+        let mut dirty = self.poll_appearance();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();
@@ -965,6 +1023,46 @@ impl<'t> EventLoop<'t> {
             }
         }
         dirty
+    }
+
+    /// Keep the switch pointed at the theme actually in use. Picking from
+    /// `/theme` re-points it at that theme's pair, or turns it off when the
+    /// new theme has no light half. Previewing does not count: the picker
+    /// only names a theme once the choice is committed.
+    fn sync_auto_theme(&mut self) {
+        let current = theme::current_theme_name();
+        if self
+            .auto_theme
+            .as_ref()
+            .is_some_and(|auto| auto.theme_name() == current)
+        {
+            return;
+        }
+        self.auto_theme = theme::pair_for(&current).map(|pair| AutoSwitch::adopt(pair, &current));
+    }
+
+    /// Re-ask the terminal for its background so a session left open across a
+    /// light/dark switch follows it.
+    ///
+    /// The probe reads the tty directly, so it parks the input reader first
+    /// and waits for a lull: bytes arriving mid-probe would be consumed
+    /// instead of delivered as keystrokes.
+    fn poll_appearance(&mut self) -> Dirty {
+        let Some(auto) = self.auto_theme.as_mut() else {
+            return Dirty::NO;
+        };
+        if !auto.due(Instant::now()) {
+            return Dirty::NO;
+        }
+        if !self.input.receiver().is_empty() {
+            auto.defer();
+            return Dirty::NO;
+        }
+        let observed = {
+            let _pause = self.input.pause();
+            appearance::detect()
+        };
+        auto.observe(observed)
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<caudra_agent::Envelope>) {
@@ -1564,6 +1662,9 @@ impl<'t> EventLoop<'t> {
             if supports_focus_reporting {
                 self.terminal_focused = focused;
             }
+            if focused {
+                self.wake_appearance();
+            }
             return (None, None);
         }
         if supports_focus_reporting && terminal_input_proves_focus(&raw) {
@@ -1574,7 +1675,19 @@ impl<'t> EventLoop<'t> {
             Event::Key(_) => (None, None),
             Event::Paste(text) => (Some(Msg::Paste(text)), None),
             Event::Mouse(mouse) => self.translate_mouse(mouse),
+            // Reattaching a multiplexer to another terminal resizes the
+            // viewport, and that terminal may not share the old background.
+            Event::Resize(..) => {
+                self.wake_appearance();
+                (None, None)
+            }
             _ => (None, None),
+        }
+    }
+
+    fn wake_appearance(&mut self) {
+        if let Some(auto) = self.auto_theme.as_mut() {
+            auto.wake();
         }
     }
 

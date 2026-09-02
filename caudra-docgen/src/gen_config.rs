@@ -144,9 +144,9 @@ fn write_theme_section(out: &mut String) {
     writeln!(
         out,
         "Name of the color theme to load at startup, overriding the theme you \
-         last picked interactively. If unset, Caudra keeps your last selection \
-         (the built-in default on first run). An unknown name is ignored with \
-         a warning.\n"
+         last picked interactively. If unset, Caudra keeps your last selection, \
+         which starts out as `{}`. An unknown name is ignored with a warning.\n",
+        caudra_ui::DEFAULT_THEME
     )
     .unwrap();
     let names = caudra_ui::BUNDLED_THEMES
@@ -170,6 +170,50 @@ fn write_theme_section(out: &mut String) {
          classic terminal colors. If detection gets it wrong, set \
          `CAUDRA_TRUECOLOR=1` to force truecolor or `CAUDRA_TRUECOLOR=0` to force \
          the fallback.\n"
+    )
+    .unwrap();
+
+    let pairs = caudra_ui::THEME_PAIRS
+        .iter()
+        .map(|pair| format!("`{}` and `{}`", pair.dark, pair.light))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        out,
+        "Some themes ship as a light and dark pair: {pairs}. Choosing either \
+         half makes Caudra ask the terminal for its background color and show \
+         the half that matches. Themes outside these pairs stay as you left \
+         them.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Caudra asks again every ten minutes, and also when the terminal \
+         regains focus or changes size, so reattaching a multiplexer to \
+         another terminal updates the theme. Following the terminal only \
+         changes the running session, and the theme you saved from `/theme` \
+         stays saved. Terminals that do not report a background color are \
+         asked a few times and then left alone.\n"
+    )
+    .unwrap();
+
+    writeln!(out, "### `ui.theme_light`\n").unwrap();
+    writeln!(
+        out,
+        "Light half to use in place of the one from the pairing table, or to \
+         give a theme that has no pair. `ui.theme` becomes the dark half:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\ncaudra.setup({{ ui = {{ theme = \"tokyonight\", theme_light = \
+         \"catppuccin_latte\" }} }})\n```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Leave `ui.theme` unset to pair the light theme with whatever you last \
+         picked from `/theme`.\n"
     )
     .unwrap();
 }

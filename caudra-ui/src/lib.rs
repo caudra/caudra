@@ -5,6 +5,7 @@
 
 pub mod animation;
 pub mod app;
+mod appearance;
 pub mod chat;
 mod clipboard;
 mod clock;
@@ -25,7 +26,8 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
-pub use theme::BUNDLED_THEMES;
+pub use theme::{BUNDLED_THEMES, DEFAULT_THEME, THEME_PAIRS};
+mod tty_query;
 pub mod update;
 
 mod agent;
