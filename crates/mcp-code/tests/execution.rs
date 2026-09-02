@@ -314,6 +314,210 @@ async fn the_described_cpython_divergences_hold() {
     group.shutdown().await;
 }
 
+/// Unpacking is nearly complete, and describing it as unsupported would cost far more than the one
+/// gap does. The gap is that the parser accepts only a name, tuple, list, or starred name as a leaf,
+/// so the ordinary element swap is refused; upstream reports that as a bare `SyntaxError`, which
+/// reads as a mistake in the caller's own code. Both halves are pinned: the forms that work, and the
+/// rewrite the diagnostic promises.
+#[tokio::test]
+async fn unpacking_works_except_into_subscripts_and_attributes() {
+    let group = group_or_skip!(true);
+
+    for (label, code, expected) in [
+        ("sequence", "a, b = (1, 2)\n[a, b]", json!([1, 2])),
+        (
+            "starred",
+            "a, *rest = [1, 2, 3]\n[a, rest]",
+            json!([1, [2, 3]]),
+        ),
+        (
+            "nested",
+            "(a, (b, c)) = (1, (2, 3))\n[a, b, c]",
+            json!([1, 2, 3]),
+        ),
+        (
+            "loop target",
+            "t = 0\nfor a, b in [(1, 2)]:\n    t = a + b\nt",
+            json!(3),
+        ),
+        (
+            "call site",
+            "def add(a, b):\n    return a + b\nadd(*[1, 2])",
+            json!(3),
+        ),
+        (
+            "literal splat",
+            "[*range(2), *'ab']",
+            json!([0, 1, "a", "b"]),
+        ),
+        (
+            "name swap",
+            "i, j = 0, 1\ni, j = j, i\n[i, j]",
+            json!([1, 0]),
+        ),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "completed", "{label}: {output}");
+        assert_eq!(output["result"], expected, "{label}");
+    }
+
+    // Both leaf kinds the parser refuses. Nothing ran, so the outcome is a rejection, not a raise.
+    for (label, code) in [
+        ("subscript swap", "x = [1, 2]\nx[0], x[1] = x[1], x[0]\nx"),
+        (
+            "computed index",
+            "x = [1, 2]\ni, j = 0, 1\nx[i], x[j] = x[j], x[i]\nx",
+        ),
+        (
+            "dict subscript",
+            "d = {'a': 1, 'b': 2}\nd['a'], d['b'] = d['b'], d['a']\nd",
+        ),
+        (
+            "attribute",
+            "class P:\n    def __init__(self):\n        self.a = 1\n        self.b = 2\np = P()\np.a, p.b = p.b, p.a\n[p.a, p.b]",
+        ),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "rejected", "{label}: {output}");
+        assert_eq!(output["exception"]["type"], "SyntaxError", "{label}");
+        let diagnostic = output["diagnostic"].as_str().expect("guidance");
+        assert!(
+            diagnostic.contains("did not run") && diagnostic.contains("temporary"),
+            "{label} must be told the rewrite: {diagnostic}"
+        );
+    }
+
+    // The rewrite the diagnostic names has to be one the worker actually accepts.
+    let rewritten = run(&group, "x = [1, 2]\nt = x[0]\nx[0] = x[1]\nx[1] = t\nx").await;
+    assert_eq!(rewritten["result"], json!([2, 1]), "{rewritten}");
+
+    group.shutdown().await;
+}
+
+/// Type checking is on by default, so the description's claim about annotations is one an agent acts
+/// on constantly. The claim is that annotations are optional and only ever add constraints, which is
+/// the opposite of the usual instinct: the failing snippet here is the annotated one.
+#[tokio::test]
+async fn annotations_are_never_required_and_only_add_constraints() {
+    let group = group_or_skip!(true);
+
+    for (label, code) in [
+        (
+            "empty then mixed",
+            "xs = []\nxs.append(1)\nxs.append('a')\nlen(xs)",
+        ),
+        (
+            "widening an inferred list",
+            "xs = [1, 2]\nxs.append('a')\nlen(xs)",
+        ),
+        ("empty dict", "d = {}\nd['a'] = 1\nd['b'] = 'x'\nlen(d)"),
+        (
+            "unannotated parameters",
+            "def f(a, b):\n    return a + b\nf(1, 2)",
+        ),
+        ("heterogeneous literal", "xs = [1, None, 'a']\nlen(xs)"),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(
+            output["outcome"], "completed",
+            "unannotated code must pass the checker; {label}: {output}"
+        );
+    }
+
+    // The constraint an annotation introduces is real, and the guidance must not answer it by
+    // suggesting more annotations.
+    let annotated = run(&group, "x: int = 'nope'\nx").await;
+    assert_eq!(annotated["outcome"], "rejected", "{annotated}");
+    let diagnostic = annotated["diagnostic"].as_str().expect("guidance");
+    assert!(
+        diagnostic.contains("Annotations are never required"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("Widen or drop"), "{diagnostic}");
+
+    // An annotation is never evaluated, so the same expression is fine in a hint and fatal as a
+    // value. This is the distinction the description draws, and it holds in both directions.
+    let hint = run(&group, "x: list[int] = [1]\nx").await;
+    assert_eq!(hint["outcome"], "completed", "{hint}");
+    let value = run(&group, "y = list[int]\n1").await;
+    assert_eq!(value["outcome"], "exception", "{value}");
+    assert_eq!(value["exception"]["type"], "TypeError", "{value}");
+
+    group.shutdown().await;
+}
+
+/// The checker resolves five modules the interpreter does not implement, because the stubs need
+/// them. An agent told only that snippets are checked before running would read a clean check as a
+/// guarantee, so the description says otherwise and this holds it to that.
+#[tokio::test]
+async fn some_modules_pass_the_type_check_and_then_fail_at_import() {
+    let group = group_or_skip!(true);
+    for module in [
+        "abc",
+        "types",
+        "typing_extensions",
+        "_collections_abc",
+        "_typeshed",
+    ] {
+        let output = run(&group, &format!("import {module}\n1")).await;
+        // `exception`, not `rejected`: the snippet was allowed to run and failed at the import.
+        assert_eq!(
+            output["outcome"], "exception",
+            "{module} is described as type-checking clean: {output}"
+        );
+        assert_eq!(
+            output["exception"]["type"], "ModuleNotFoundError",
+            "{module}"
+        );
+    }
+    group.shutdown().await;
+}
+
+/// Both formatting habits the subset omits arrive as unrelated exception types, and the `%` one
+/// names neither formatting nor f-strings. Without guidance it reads as an arithmetic error.
+#[tokio::test]
+async fn both_formatting_habits_redirect_to_f_strings() {
+    let group = group_or_skip!();
+    for (label, code, exc) in [
+        ("str.format", "'{}'.format(1)", "AttributeError"),
+        ("percent", "'%s' % 'x'", "TypeError"),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "exception", "{label}: {output}");
+        assert_eq!(output["exception"]["type"], exc, "{label}");
+        let diagnostic = output["diagnostic"].as_str().expect("guidance");
+        assert!(diagnostic.contains("f-strings"), "{label}: {diagnostic}");
+    }
+
+    // Integer `%` is modulo and must not be mistaken for the formatting operator.
+    let modulo = run(&group, "7 % 3").await;
+    assert_eq!(modulo["result"], json!(1), "{modulo}");
+    assert!(modulo["diagnostic"].is_null(), "{modulo}");
+
+    group.shutdown().await;
+}
+
+/// The arity failure surfaces as a `RuntimeError` describing an internal error in Monty, which tells
+/// a caller nothing about the constructor it wrote.
+#[tokio::test]
+async fn multi_argument_exception_constructors_are_explained() {
+    let group = group_or_skip!();
+    let output = run(&group, "raise OSError(2, 'missing', 'f.txt')").await;
+    assert_eq!(output["outcome"], "exception", "{output}");
+    let diagnostic = output["diagnostic"].as_str().expect("guidance");
+    assert!(diagnostic.contains("at most one string"), "{diagnostic}");
+
+    // The single-argument form the guidance points at has to work.
+    let single = run(
+        &group,
+        "try:\n    raise OSError('missing f.txt')\nexcept OSError as e:\n    r = str(e)\nr",
+    )
+    .await;
+    assert_eq!(single["result"], json!("missing f.txt"), "{single}");
+
+    group.shutdown().await;
+}
+
 /// A failed import must not hand back guidance naming modules that do not exist, which is what made
 /// the drift expensive rather than merely untidy: the diagnostic invited the next failing attempt.
 #[tokio::test]

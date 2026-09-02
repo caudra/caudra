@@ -33,6 +33,17 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
                 )),
             }
         }
+        // The parser accepts only a name, tuple, list, or single starred name as an unpacking leaf,
+        // so the ordinary element-swap idiom is refused before anything runs. Upstream reports it as
+        // a plain `SyntaxError`, which reads as a mistake in the caller's own code; without the
+        // rewrite spelled out an agent retries the same line. Sandbox code can raise `SyntaxError`
+        // itself, so this matches the parser's wording rather than the type.
+        ExcType::SyntaxError if message.contains("invalid unpacking target") => Diagnosis {
+            outcome: Outcome::Rejected,
+            diagnostic: Some(format!(
+                "Unpacking cannot assign into a subscript or an attribute, and the snippet did not run. Assign through a temporary instead: replace `x[i], x[j] = x[j], x[i]` with `t = x[i]`, `x[i] = x[j]`, `x[j] = t`. Only plain names, tuples, lists, and one starred name are valid unpacking targets; every other form of unpacking works. ({message})"
+            )),
+        },
         ExcType::ModuleNotFoundError | ExcType::ImportError => Diagnosis {
             outcome: Outcome::Exception,
             diagnostic: Some(module_guidance(message)),
@@ -63,13 +74,31 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
             outcome: Outcome::Limited,
             diagnostic: Some(timeout_guidance(message)),
         },
-        // `str.format` is the single most common CPython habit the subset does not support.
+        // The two CPython formatting habits the subset omits. `str.format` surfaces as a missing
+        // attribute; `%` surfaces as a missing operator, because `str` has no `__mod__`. They need
+        // the same redirection, and the operator message names neither formatting nor f-strings, so
+        // without this arm the most mechanical of the two failures is the one left unexplained.
         ExcType::AttributeError if message.contains("format") => Diagnosis {
             outcome: Outcome::Exception,
-            diagnostic: Some(format!(
-                "str.format() and %-formatting are not implemented. Use f-strings instead. ({message})"
-            )),
+            diagnostic: Some(formatting_guidance(message)),
         },
+        ExcType::TypeError if message.contains("for %: 'str'") => Diagnosis {
+            outcome: Outcome::Exception,
+            diagnostic: Some(formatting_guidance(message)),
+        },
+        // Exception constructors take at most one string, and the arity failure arrives as an
+        // internal error naming Monty rather than the call the caller wrote.
+        ExcType::RuntimeError
+            if message
+                .contains("exceptions can only be called with zero or one string argument") =>
+        {
+            Diagnosis {
+                outcome: Outcome::Exception,
+                diagnostic: Some(format!(
+                    "Exception constructors accept at most one string argument, so multi-argument forms such as OSError(errno, message, filename) are unavailable. Pass a single message, building it with an f-string if it needs detail. ({message})"
+                )),
+            }
+        }
         // Everything else is an ordinary Python error the caller can read and fix unaided.
         _ => Diagnosis {
             outcome: Outcome::Exception,
@@ -88,6 +117,11 @@ pub(crate) fn timeout_guidance(detail: &str) -> String {
     format!(
         "Execution exceeded its time budget and was stopped. Reduce the work, or raise timeout up to its cap. Note that enumerate, zip, reversed, and generator expressions are eager, so an infinite source such as (f(x) for x in itertools.count()) never terminates.{suffix}"
     )
+}
+
+/// Shared wording for the two formatting mechanisms the subset omits.
+fn formatting_guidance(detail: &str) -> String {
+    format!("str.format() and %-formatting are not implemented. Use f-strings instead. ({detail})")
 }
 
 /// Guidance for an import the subset does not provide.
@@ -160,8 +194,10 @@ pub(crate) fn diagnose_type_errors(diagnostics: &str) -> String {
         };
         return format!("{guidance}\n{trimmed}");
     }
+    // Annotations are optional and only ever add constraints, so the instinctive reaction to a
+    // rejected annotation — annotate harder — is the one reliable way to make this worse.
     format!(
-        "Type checking rejected this snippet before running it, so nothing was executed. Correct the reported problems, or ask the operator to disable type checking if the code is intentionally dynamic.\n{trimmed}"
+        "Type checking rejected this snippet before running it, so nothing was executed. Annotations are never required: unannotated code is inferred permissively, and an annotation only adds a constraint the checker then enforces. Widen or drop the annotation the diagnostic names rather than adding more. Correct the reported problems, or ask the operator to disable type checking if the code is intentionally dynamic.\n{trimmed}"
     )
 }
 
@@ -289,6 +325,93 @@ mod tests {
         let diagnosis = diagnose(&exception(ExcType::NotImplementedError, "subclass me"));
         assert_eq!(diagnosis.outcome, Outcome::Exception);
         assert!(diagnosis.diagnostic.is_none());
+    }
+
+    /// The parser refuses the target before anything runs, so this is a rejection rather than a
+    /// raise, and the guidance has to carry the rewrite: the caller cannot derive it from the
+    /// message, which names only the offending leaf kind.
+    #[test]
+    fn an_unsupported_unpacking_target_is_rejected_with_the_rewrite() {
+        for leaf in ["subscript", "attribute"] {
+            let diagnosis = diagnose(&exception(
+                ExcType::SyntaxError,
+                &format!("invalid unpacking target: {leaf}"),
+            ));
+            assert_eq!(diagnosis.outcome, Outcome::Rejected);
+            let text = diagnosis.diagnostic.expect("guidance");
+            assert!(text.contains("did not run"), "{text}");
+            assert!(text.contains("temporary"), "{text}");
+            // Saying only what fails would imply unpacking is broken generally, which it is not.
+            assert!(
+                text.contains("every other form of unpacking works"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Sandbox code can raise `SyntaxError` itself, so the type alone must not imply a rejection.
+    #[test]
+    fn a_plain_syntax_error_stays_an_exception() {
+        let diagnosis = diagnose(&exception(ExcType::SyntaxError, "bad input from a caller"));
+        assert_eq!(diagnosis.outcome, Outcome::Exception);
+        assert!(diagnosis.diagnostic.is_none());
+    }
+
+    /// The two formatting habits arrive as unrelated exception types and need one answer.
+    #[test]
+    fn both_formatting_mechanisms_point_at_f_strings() {
+        let attribute = diagnose(&exception(
+            ExcType::AttributeError,
+            "'str' object has no attribute 'format'",
+        ));
+        let operator = diagnose(&exception(
+            ExcType::TypeError,
+            "unsupported operand type(s) for %: 'str' and 'str'",
+        ));
+        for diagnosis in [attribute, operator] {
+            assert_eq!(diagnosis.outcome, Outcome::Exception);
+            assert!(
+                diagnosis
+                    .diagnostic
+                    .expect("guidance")
+                    .contains("f-strings")
+            );
+        }
+    }
+
+    /// Integer `%` is modulo. Matching the operator alone would annotate ordinary arithmetic errors
+    /// with formatting advice, so the arm keys on the left operand being a string.
+    #[test]
+    fn modulo_type_errors_are_not_mistaken_for_formatting() {
+        let diagnosis = diagnose(&exception(
+            ExcType::TypeError,
+            "unsupported operand type(s) for %: 'int' and 'str'",
+        ));
+        assert!(diagnosis.diagnostic.is_none());
+    }
+
+    /// The arity failure names Monty's internals rather than the constructor the caller wrote.
+    #[test]
+    fn exception_constructor_arity_is_translated_into_the_callers_terms() {
+        let diagnosis = diagnose(&exception(
+            ExcType::RuntimeError,
+            "Internal error in monty: exceptions can only be called with zero or one string argument",
+        ));
+        assert_eq!(diagnosis.outcome, Outcome::Exception);
+        let text = diagnosis.diagnostic.expect("guidance");
+        assert!(text.contains("at most one string"), "{text}");
+        assert!(text.contains("f-string"), "{text}");
+    }
+
+    /// An annotation is the only thing that can produce `invalid-assignment`, so answering it by
+    /// suggesting more annotations would be the one reliably wrong move.
+    #[test]
+    fn generic_type_guidance_does_not_recommend_more_annotations() {
+        let text = diagnose_type_errors(
+            "snippet.py:1:10: error[invalid-assignment] Object of type `Literal[\"x\"]` is not assignable to `int`",
+        );
+        assert!(text.contains("Annotations are never required"), "{text}");
+        assert!(text.contains("Widen or drop"), "{text}");
     }
 
     #[test]

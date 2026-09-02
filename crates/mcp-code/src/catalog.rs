@@ -36,10 +36,12 @@ This is a Python subset, not CPython. It rejects or fails on:
 - Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.
 - yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.
 - str.format(), %-formatting, str.translate(), and str.maketrans(). Use f-strings.
+- Subscripts and attributes as unpacking targets, so x[i], x[j] = x[j], x[i] and o.a, o.b = 1, 2 are refused. Swap through a temporary instead. Every other unpacking form works, including a, b = xs, a, *rest = xs, nested targets, for a, b in pairs, and *xs in calls and literals.
+- Defining exception classes, since classes cannot inherit. Raise a built-in such as ValueError. Exception constructors take at most one string, so OSError(errno, message, path) fails, and raise X from Y parses but silently drops the cause.
 - These builtins, which are undefined and raise NameError: "#,
     withheld_builtins!(),
     r#".
-- User-defined exception classes, and function attributes such as __name__.
+- Function attributes such as __name__.
 
 Only these standard library modules exist, each covering part of its CPython surface: "#,
     available_modules!(),
@@ -62,6 +64,8 @@ Usage notes:
 - timeout is optional, measured in milliseconds, defaults to 5000, and is capped at 30000.
 - Each call is independent. No variables, definitions, or imports persist between calls.
 - Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.
+- Type annotations are never required. Unannotated code is inferred permissively, so xs = [] then xs.append(1) then xs.append('a') passes. An annotation only adds a constraint that is then enforced, so when a diagnostic names one, widen or remove it rather than annotating more. Annotations themselves are never evaluated, which is why x: list[int] is fine while the same expression in a value position raises TypeError.
+- Passing the type check does not guarantee the snippet runs: abc, types, typing_extensions, _collections_abc, and _typeshed resolve during checking and then raise ModuleNotFoundError at import.
 - Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry."#
 );
 

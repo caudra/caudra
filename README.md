@@ -792,11 +792,18 @@ value of its final expression along with anything it printed.
   `getattr`, `setattr`, and `hasattr` — exist in the interpreter but are absent from its type stubs,
   so they run only when type checking is off. The rejection says so rather than calling them
   undefined.
+- Type annotations are never required to pass the check. Unannotated code is inferred permissively;
+  an annotation only adds a constraint the checker then enforces, so the fix for a rejected
+  annotation is to widen or drop it. A clean check is also not a guarantee of execution: `abc`,
+  `types`, `typing_extensions`, `_collections_abc`, and `_typeshed` resolve during checking because
+  the stubs need them, then raise `ModuleNotFoundError` at import.
 - The interpreter is Monty, not CPython. It implements a large but incomplete subset: notably no
   `str.format()`, `match` statements, generators, or class inheritance, and operators do not dispatch
-  to user-defined dunders. The tool description enumerates the divergences that most often cost a
-  caller a wasted turn, and it is generated from the same lists the runtime diagnostics quote, so the
-  two cannot disagree.
+  to user-defined dunders. Unpacking is complete except that a subscript or attribute cannot be an
+  unpacking target, so `x[i], x[j] = x[j], x[i]` is refused and has to go through a temporary
+  ([pydantic/monty#408](https://github.com/pydantic/monty/issues/408)). The tool description
+  enumerates the divergences that most often cost a caller a wasted turn, and it is generated from
+  the same lists the runtime diagnostics quote, so the two cannot disagree.
 - The structured result reports the outcome, the final value as JSON with a `repr` fallback for values
   JSON cannot express, bounded stdout and stderr, and, when execution fails, the exception type,
   message, and traceback plus targeted guidance.
