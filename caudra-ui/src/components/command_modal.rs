@@ -19,7 +19,6 @@ use crate::theme;
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = " Commands ";
-const MAX_VISIBLE: u16 = 15;
 const ARGS_WIDTH_PERCENT: u16 = 65;
 const PICK_WIDTH_PERCENT: u16 = 80;
 const FOOTER_ROWS: u16 = 1;
@@ -71,9 +70,11 @@ impl CommandModal {
     }
 
     fn build_picker(&self) -> Box<ListPicker<CommandRow>> {
+        // No visible-row cap, so the list grows with the terminal and is
+        // bounded only by the picker's own max-height clamp.
         let mut picker = ListPicker::new()
-            .with_max_visible(MAX_VISIBLE)
             .with_width_percent(PICK_WIDTH_PERCENT)
+            .with_relevance_order()
             .with_footer_builder(footer);
         picker.open(self.rows.clone(), TITLE);
         Box::new(picker)
@@ -297,6 +298,12 @@ mod tests {
     const WITH_ARGS_DESC: &str = "Ask a side question";
     const TEST_WIDTH: u16 = 80;
     const TEST_HEIGHT: u16 = 24;
+    const TALL_HEIGHT: u16 = 60;
+    const MAX_HEIGHT_PERCENT: u16 = 80;
+    const OVERFLOW_ROWS: usize = 40;
+    const SUBSTRING_QUERY: &str = "view";
+    const BETTER_MATCH: &str = "/view";
+    const WORSE_MATCH: &str = "/review";
 
     fn row(name: &str, description: &str, max_args: usize) -> CommandRow {
         CommandRow {
@@ -323,7 +330,11 @@ mod tests {
     }
 
     fn render(modal: &mut CommandModal) -> (Rect, String) {
-        let backend = ratatui::backend::TestBackend::new(TEST_WIDTH, TEST_HEIGHT);
+        render_at(modal, TEST_HEIGHT)
+    }
+
+    fn render_at(modal: &mut CommandModal, height: u16) -> (Rect, String) {
+        let backend = ratatui::backend::TestBackend::new(TEST_WIDTH, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut popup = Rect::default();
         terminal
@@ -345,6 +356,55 @@ mod tests {
             Stage::Pick(_) => "pick",
             Stage::Args { .. } => "args",
         }
+    }
+
+    /// The list is capped only by the picker's max-height clamp, so a taller
+    /// terminal shows more commands instead of a fixed window of them.
+    #[test]
+    fn the_list_grows_with_the_terminal_height() {
+        let rows: Vec<CommandRow> = (0..OVERFLOW_ROWS)
+            .map(|i| row(&format!("/cmd{i}"), "", 0))
+            .collect();
+
+        let mut modal = CommandModal::new();
+        modal.open(rows.clone());
+        let (short, _) = render_at(&mut modal, TEST_HEIGHT);
+
+        let mut modal = CommandModal::new();
+        modal.open(rows);
+        let (tall, _) = render_at(&mut modal, TALL_HEIGHT);
+
+        assert!(
+            tall.height > short.height,
+            "expected the taller terminal to show a taller modal, got {} then {}",
+            short.height,
+            tall.height
+        );
+        assert!(
+            tall.height <= TALL_HEIGHT * MAX_HEIGHT_PERCENT / 100,
+            "modal must stay within the max-height clamp, got {}",
+            tall.height
+        );
+    }
+
+    /// `/review` contains `view` too, and it is listed first in
+    /// `BUILTIN_COMMANDS`. Source order must not beat the fuzzy score.
+    #[test]
+    fn a_better_match_outranks_an_earlier_one() {
+        let mut modal = CommandModal::new();
+        modal.open(vec![
+            row(WORSE_MATCH, "Review the last reply", 0),
+            row(BETTER_MATCH, "Toggle compact view", 0),
+        ]);
+        type_text(&mut modal, SUBSTRING_QUERY);
+        let Stage::Pick(picker) = &modal.stage else {
+            unreachable!()
+        };
+        assert_eq!(
+            picker.selected_item().map(|r| r.name.as_str()),
+            Some(BETTER_MATCH),
+            "the first row should be the better match"
+        );
     }
 
     #[test]

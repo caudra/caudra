@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
@@ -67,6 +68,7 @@ pub struct ListPicker<T> {
     info_text: Option<String>,
     empty_text: &'static str,
     width_percent: u16,
+    relevance_order: bool,
 }
 
 struct State<T> {
@@ -82,6 +84,7 @@ struct State<T> {
     enabled: Option<Vec<bool>>,
     toggleable: Option<Vec<bool>>,
     matcher: Matcher,
+    relevance_order: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -106,7 +109,7 @@ struct RenderContent<'a> {
 }
 
 impl<T: PickerItem> State<T> {
-    fn new(items: Vec<T>) -> Self {
+    fn new(items: Vec<T>, relevance_order: bool) -> Self {
         let filtered = (0..items.len()).collect();
         Self {
             items,
@@ -121,6 +124,7 @@ impl<T: PickerItem> State<T> {
             enabled: None,
             toggleable: None,
             matcher: Matcher::new(Config::DEFAULT),
+            relevance_order,
         }
     }
 
@@ -140,32 +144,33 @@ impl<T: PickerItem> State<T> {
         let query = self.search.value();
         if query.is_empty() {
             self.filtered = (0..self.items.len()).collect();
-        } else {
-            let pattern = Pattern::new(
-                &query,
-                CaseMatching::Smart,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-            );
-            // Create labels with their original indices
-            let labeled: Vec<(usize, &str)> = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, item)| (idx, item.label()))
-                .collect();
-            let matches: HashSet<&str> = pattern
-                .match_list(labeled.iter().map(|(_, label)| *label), &mut self.matcher)
-                .into_iter()
-                .map(|(matched_str, _score)| matched_str)
-                .collect();
-            // Find back all indices that have matching labels
-            self.filtered = labeled
-                .into_iter()
-                .filter(|(_, label)| matches.contains(label))
-                .map(|(idx, _)| idx)
-                .collect();
+            return;
         }
+        let pattern = Pattern::new(
+            &query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        // Ranking needs every score attached to its own index. `match_list`
+        // returns matched labels, and `ModelEntry` and `PermissionEntry` both
+        // repeat labels, so a label cannot be mapped back to one index.
+        let mut buf = Vec::new();
+        let items = &self.items;
+        let matcher = &mut self.matcher;
+        let mut scored: Vec<(usize, u32)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                pattern
+                    .score(Utf32Str::new(item.label(), &mut buf), matcher)
+                    .map(|score| (idx, score))
+            })
+            .collect();
+        if self.relevance_order {
+            rank_by_relevance(&mut scored, &self.items);
+        }
+        self.filtered = scored.into_iter().map(|(idx, _)| idx).collect();
     }
 
     fn clamp_selection(&mut self) {
@@ -272,11 +277,20 @@ impl<T: PickerItem> ListPicker<T> {
             info_text: None,
             empty_text: NO_MATCHES,
             width_percent: MIN_WIDTH_PERCENT,
+            relevance_order: false,
         }
     }
 
     pub fn with_max_visible(mut self, max: u16) -> Self {
         self.max_visible = Some(max);
+        self
+    }
+
+    /// Ranks matches by fuzzy score instead of leaving them in the order the
+    /// items were supplied. Off by default: most pickers carry meaning in that
+    /// order, such as recency, chronology, or a fixed menu.
+    pub fn with_relevance_order(mut self) -> Self {
+        self.relevance_order = true;
         self
     }
 
@@ -316,7 +330,7 @@ impl<T: PickerItem> ListPicker<T> {
             "items and toggleable must have same length"
         );
         self.title = title.into();
-        let mut state = State::new(items);
+        let mut state = State::new(items, self.relevance_order);
         state.enabled = Some(enabled);
         state.toggleable = Some(toggleable);
         self.state = Some(state);
@@ -324,7 +338,7 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn open(&mut self, items: Vec<T>, title: impl Into<String>) {
         self.title = title.into();
-        self.state = Some(State::new(items));
+        self.state = Some(State::new(items, self.relevance_order));
     }
 
     pub fn select(&mut self, index: usize) {
@@ -804,6 +818,25 @@ fn render_ready<T: PickerItem>(
     popup
 }
 
+/// Orders matches by relevance while keeping each section contiguous, which
+/// is what makes the section headers legible: a section is placed by its best
+/// match, then its members by their own score. Equal scores fall back to the
+/// original index, so duplicate labels keep their authored order.
+fn rank_by_relevance<T: PickerItem>(scored: &mut [(usize, u32)], items: &[T]) {
+    let mut best: HashMap<Option<&str>, (u32, usize)> = HashMap::new();
+    for &(idx, score) in scored.iter() {
+        let entry = best
+            .entry(items[idx].section())
+            .or_insert((score, usize::MAX));
+        entry.0 = entry.0.max(score);
+        entry.1 = entry.1.min(idx);
+    }
+    scored.sort_by_key(|&(idx, score)| {
+        let (section_best, section_rank) = best[&items[idx].section()];
+        (Reverse(section_best), section_rank, Reverse(score), idx)
+    });
+}
+
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
     let Some(sec) = items[filtered[idx]].section() else {
         return 0;
@@ -909,19 +942,23 @@ fn render_list<T: PickerItem>(
         let item_idx = filtered[i];
         let item = &items[item_idx];
 
-        if let Some(sec) = item.section()
-            && last_section.is_none_or(|prev| prev != sec)
-        {
-            if !lines.is_empty() && lines.len() < viewport_height {
-                lines.push(Line::raw(""));
+        match item.section() {
+            // A section-less row ends the run, so the next sectioned row
+            // re-emits its header. `section_gap` already counts it that way.
+            None => last_section = None,
+            Some(sec) if last_section.is_none_or(|prev| prev != sec) => {
+                if !lines.is_empty() && lines.len() < viewport_height {
+                    lines.push(Line::raw(""));
+                }
+                if lines.len() < viewport_height {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {sec}"),
+                        theme::current().keybind_section,
+                    )));
+                }
+                last_section = Some(sec);
             }
-            if lines.len() < viewport_height {
-                lines.push(Line::from(Span::styled(
-                    format!("  {sec}"),
-                    theme::current().keybind_section,
-                )));
-            }
-            last_section = Some(sec);
+            Some(_) => {}
         }
 
         if lines.len() >= viewport_height {
@@ -1035,6 +1072,9 @@ mod tests {
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyModifiers};
     use test_case::test_case;
+
+    const SECTION_A: &str = "A";
+    const SECTION_B: &str = "B";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1362,7 +1402,7 @@ mod tests {
 
     struct SectionEntry {
         label: String,
-        section: &'static str,
+        section: Option<&'static str>,
     }
 
     impl PickerItem for SectionEntry {
@@ -1370,24 +1410,166 @@ mod tests {
             &self.label
         }
         fn section(&self) -> Option<&str> {
-            Some(self.section)
+            self.section
         }
+    }
+
+    fn sectioned(label: &str, section: Option<&'static str>) -> SectionEntry {
+        SectionEntry {
+            label: label.into(),
+            section,
+        }
+    }
+
+    fn labels(p: &ListPicker<SectionEntry>) -> Vec<&str> {
+        let s = ready_state(p);
+        s.filtered.iter().map(|&i| s.items[i].label()).collect()
+    }
+
+    fn search(p: &mut ListPicker<SectionEntry>, query: &str) {
+        for c in query.chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// The other pickers carry meaning in their item order, so ranking has to
+    /// stay opt-in. `zview` scores worse than `view` yet is supplied first.
+    #[test]
+    fn source_order_is_kept_without_relevance_order() {
+        let mut p = ListPicker::new();
+        p.open(
+            vec![
+                sectioned("zview", Some(SECTION_A)),
+                sectioned("view", Some(SECTION_A)),
+            ],
+            " Test ",
+        );
+        search(&mut p, "view");
+        assert_eq!(labels(&p), vec!["zview", "view"]);
+    }
+
+    #[test]
+    fn relevance_order_puts_the_better_match_first() {
+        let mut p = ListPicker::new().with_relevance_order();
+        p.open(
+            vec![
+                sectioned("zview", Some(SECTION_A)),
+                sectioned("view", Some(SECTION_A)),
+            ],
+            " Test ",
+        );
+        search(&mut p, "view");
+        assert_eq!(labels(&p), vec!["view", "zview"]);
+    }
+
+    /// Headers are only legible while every member of a section is adjacent,
+    /// so ranking may reorder sections but never interleave them.
+    #[test]
+    fn relevance_order_keeps_sections_contiguous() {
+        let mut p = ListPicker::new().with_relevance_order();
+        p.open(
+            vec![
+                sectioned("zzview", Some(SECTION_A)),
+                sectioned("view", Some(SECTION_B)),
+                sectioned("vieww", Some(SECTION_A)),
+                sectioned("zview", Some(SECTION_B)),
+            ],
+            " Test ",
+        );
+        search(&mut p, "view");
+
+        let s = ready_state(&p);
+        let sections: Vec<Option<&str>> =
+            s.filtered.iter().map(|&i| s.items[i].section()).collect();
+        let mut seen: Vec<Option<&str>> = Vec::new();
+        for section in &sections {
+            if seen.last() != Some(section) {
+                assert!(!seen.contains(section), "section {section:?} was split: {sections:?}");
+                seen.push(*section);
+            }
+        }
+    }
+
+    /// Only B holds a match on the first character, so B is promoted even
+    /// though A supplied the earlier items. Within each section the members
+    /// sort by their own score, and A's equal scores keep the supplied order.
+    #[test]
+    fn relevance_order_ranks_sections_by_their_best_member() {
+        let mut p = ListPicker::new().with_relevance_order();
+        p.open(
+            vec![
+                sectioned("zview", Some(SECTION_A)),
+                sectioned("xxxxview", Some(SECTION_A)),
+                sectioned("preview", Some(SECTION_B)),
+                sectioned("view", Some(SECTION_B)),
+            ],
+            " Test ",
+        );
+        search(&mut p, "view");
+        assert_eq!(
+            labels(&p),
+            vec!["view", "preview", "zview", "xxxxview"]
+        );
+    }
+
+    /// The model picker lists a model twice, once under `Recent`. Identical
+    /// labels score identically, so only the supplied order can separate them.
+    #[test]
+    fn relevance_order_breaks_score_ties_by_original_index() {
+        let mut p = ListPicker::new().with_relevance_order();
+        p.open(
+            vec![
+                sectioned("view", Some(SECTION_A)),
+                sectioned("view", Some(SECTION_A)),
+                sectioned("view", Some(SECTION_A)),
+            ],
+            " Test ",
+        );
+        search(&mut p, "view");
+        assert_eq!(ready_state(&p).filtered, vec![0, 1, 2]);
+    }
+
+    /// `section_gap` treats a section-less row as ending the run, so the next
+    /// sectioned row re-emits its header. `render_list` has to agree or every
+    /// consumer of `visual_rows_in_range` scrolls against the wrong height.
+    #[test]
+    fn a_section_repeats_its_header_after_a_sectionless_row() {
+        let items = vec![
+            sectioned("a1", Some(SECTION_A)),
+            sectioned("loose", None),
+            sectioned("a2", Some(SECTION_A)),
+        ];
+        let filtered: Vec<usize> = (0..items.len()).collect();
+        assert_eq!(
+            visual_rows_in_range(&filtered, &items, 0, items.len()),
+            6,
+            "3 items + first header + blank + repeated header"
+        );
+
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| { p.view(f, f.area()); }).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(
+            text.matches(SECTION_A).count(),
+            2,
+            "header should be redrawn after the section-less row"
+        );
     }
 
     fn section_entries() -> Vec<SectionEntry> {
         vec![
-            SectionEntry {
-                label: "a1".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "a2".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "b1".into(),
-                section: "B",
-            },
+            sectioned("a1", Some(SECTION_A)),
+            sectioned("a2", Some(SECTION_A)),
+            sectioned("b1", Some(SECTION_B)),
         ]
     }
 

@@ -166,7 +166,9 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
-            picker: ListPicker::new().with_footer_builder(model_footer_line),
+            picker: ListPicker::new()
+                .with_relevance_order()
+                .with_footer_builder(model_footer_line),
             models,
             available: Watch::default(),
             recents: Vec::new(),
@@ -634,6 +636,9 @@ mod tests {
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
+    const MODEL_QUERY: &str = "view";
+    const BEST_MATCH_SPEC: &str = "anthropic/view";
+    const WEAKER_MATCH_SPEC: &str = "zai/xxview";
 
     /// A provider that republishes the same number of specs has still changed
     /// the list. Comparing lengths calls that no change, and the picker goes on
@@ -808,6 +813,28 @@ mod tests {
             action,
             ModelPickerAction::SetGoalEvaluator(selected) if selected == target
         ));
+    }
+
+    /// A model row shows only its bare id, so a search has to surface the
+    /// closest id rather than whichever provider the catalog happened to list
+    /// first.
+    #[test]
+    fn search_surfaces_the_closest_model_id_first() {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(vec![
+            WEAKER_MATCH_SPEC.into(),
+            BEST_MATCH_SPEC.into(),
+        ])));
+        let mut p = ModelPicker::new(models);
+        p.open("");
+        for c in MODEL_QUERY.chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+
+        assert_eq!(
+            p.picker.selected_item().map(|e| e.spec.as_str()),
+            Some(BEST_MATCH_SPEC)
+        );
     }
 
     #[test]
