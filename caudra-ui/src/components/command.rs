@@ -759,10 +759,7 @@ impl CommandPalette {
             .collect();
 
         frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::new().bg(t.background)),
-            popup,
-        );
+        frame.render_widget(Paragraph::new(lines).style(t.surface_style()), popup);
 
         self.popup_area = Some(popup);
         self.row_hits = filtered
@@ -786,7 +783,7 @@ impl CommandPalette {
 
         let t = theme::current();
         let highlight = base
-            .fg(t.accent.fg.unwrap_or_default())
+            .fg(t.accent.fg.unwrap_or(t.foreground))
             .add_modifier(Modifier::BOLD);
 
         let mut spans = Vec::new();

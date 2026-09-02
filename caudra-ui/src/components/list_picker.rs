@@ -16,7 +16,6 @@ use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -939,7 +938,7 @@ fn render_list<T: PickerItem>(
         let t = theme::current();
         let (style, detail_style) = match (i == selected, highlighted) {
             (true, true) => {
-                let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
+                let s = t.item_selected.fg(t.accent.fg.unwrap_or(t.foreground));
                 (s, theme::dim_style(s, 0.4))
             }
             (true, false) => (t.item_selected, t.item_selected),
@@ -1019,11 +1018,12 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
     let after_start = cursor_x.saturating_add(1).min(chars.len());
     let after: String = chars[after_start..].iter().collect();
 
+    let text = super::input_text_style();
     let line = Line::from(vec![
         super::chevron_span(),
-        Span::styled(before, Style::default()),
+        Span::styled(before, text),
         Span::styled(cursor_char.to_string(), theme::current().cursor),
-        Span::styled(after, Style::default()),
+        Span::styled(after, text),
     ]);
     frame.render_widget(Paragraph::new(vec![line]), area);
 }

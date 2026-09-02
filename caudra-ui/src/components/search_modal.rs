@@ -11,7 +11,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -355,11 +355,12 @@ impl SearchModal {
         let cursor_char = chars.next().unwrap_or(' ');
         let after = chars.as_str();
 
+        let text = super::input_text_style();
         let line = Line::from(vec![
             Span::styled(SEARCH_PREFIX, t.tool_dim),
-            Span::styled(before.to_owned(), Style::default()),
+            Span::styled(before.to_owned(), text),
             Span::styled(cursor_char.to_string(), t.cursor),
-            Span::styled(after.to_owned(), Style::default()),
+            Span::styled(after.to_owned(), text),
         ]);
         frame.render_widget(Paragraph::new(vec![line]), area);
     }
@@ -404,7 +405,7 @@ fn build_highlighted_line<'a>(
     let index_set: std::collections::HashSet<u32> = indices.iter().copied().collect();
     let base_style = if is_selected { t.item_selected } else { t.item };
     let match_style = base_style
-        .fg(t.accent.fg.unwrap_or_default())
+        .fg(t.accent.fg.unwrap_or(t.foreground))
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base_style)];

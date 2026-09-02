@@ -43,12 +43,21 @@ use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, Too
 use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
 use caudra_providers::{CaudraId, HistoryItem, ModelTier};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 pub(crate) const CHEVRON: &str = "❯ ";
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
+}
+
+/// Style for text the user has typed into a prompt or search field.
+///
+/// Stated explicitly rather than left at `Style::default()`, whose unset
+/// foreground resolves to the terminal's default color instead of the theme's.
+pub(crate) fn input_text_style() -> Style {
+    Style::new().fg(crate::theme::current().foreground)
 }
 
 /// A single-line prompt with the cursor painted onto the cell it occupies.
@@ -59,11 +68,12 @@ pub(crate) fn input_line_with_cursor(input: &crate::text_buffer::TextBuffer) -> 
     let (before, rest) = value.split_at(cursor_byte);
     let mut chars = rest.chars();
     let cursor_char = chars.next().unwrap_or(' ');
+    let text = input_text_style();
     Line::from(vec![
         chevron_span(),
-        Span::raw(before.to_string()),
+        Span::styled(before.to_string(), text),
         Span::styled(cursor_char.to_string(), crate::theme::current().cursor),
-        Span::raw(chars.as_str().to_string()),
+        Span::styled(chars.as_str().to_string(), text),
     ])
 }
 

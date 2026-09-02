@@ -153,7 +153,7 @@ plan_rule          = { fg = "purple", modifiers = ["bold"] }
 item_selected      = { fg = "background", bg = "purple" }
 item               = { fg = "lavender" }
 item_desc          = { fg = "comment" }
-accent             = { fg = "peach" }
+accent             = { fg = "orange" }
 panel_border       = { fg = "lavender" }
 panel_title        = { fg = "purple", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "foreground" }

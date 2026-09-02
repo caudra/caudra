@@ -2,7 +2,6 @@ use crate::theme;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Clear};
 
 pub const CHROME_LINES: u16 = 2;
@@ -34,7 +33,7 @@ impl Modal<'_> {
             .border_style(theme::current().panel_border)
             .title(self.title)
             .title_style(theme::current().panel_title)
-            .style(Style::new().bg(theme::current().background));
+            .style(theme::current().surface_style());
 
         let inner = block.inner(popup);
         frame.render_widget(block, popup);

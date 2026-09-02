@@ -5,7 +5,6 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -225,7 +224,7 @@ impl CommandModal {
                     Constraint::Length(FOOTER_ROWS),
                 ])
                 .areas(inner);
-                let bg = Style::new().bg(t.background);
+                let bg = t.surface_style();
                 frame.render_widget(
                     Paragraph::new(row.description.as_str())
                         .style(bg.patch(t.input_placeholder))

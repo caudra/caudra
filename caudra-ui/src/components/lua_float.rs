@@ -386,7 +386,7 @@ impl FloatManager {
                 .borders(Borders::ALL)
                 .border_type(bt)
                 .border_style(t.panel_border)
-                .style(ratatui::style::Style::new().bg(t.background));
+                .style(t.surface_style());
 
             if !win.config.title.is_empty() {
                 let alignment = match win.config.title_pos {
@@ -404,7 +404,7 @@ impl FloatManager {
             }
             b
         } else {
-            Block::default().style(ratatui::style::Style::new().bg(t.background))
+            Block::default().style(t.surface_style())
         };
 
         let inner = block.inner(popup);

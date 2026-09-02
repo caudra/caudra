@@ -17,6 +17,24 @@ const ELEMENT_BACKGROUND_TINT: f32 = 0.1;
 const PANEL_BACKGROUND_TINT: f32 = 0.04;
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
+/// Minimum contrast ratio for roles that carry text a user has to read.
+const MIN_CONTRAST_TEXT: f32 = 3.0;
+/// Minimum contrast ratio for purely decorative chrome (borders, rules, gutters).
+const MIN_CONTRAST_CHROME: f32 = 2.0;
+/// Roles held to [`MIN_CONTRAST_CHROME`] instead of [`MIN_CONTRAST_TEXT`].
+const CHROME_ROLES: &[&str] = &[
+    "panel_border",
+    "table_border",
+    "horizontal_rule",
+    "plan_rule",
+    "input_border",
+    "diff_line_nr",
+    "code_gutter",
+    "index_line_nr",
+];
+/// Bisection steps used to lift a color to the contrast floor.
+const CONTRAST_STEPS: u32 = 24;
+
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("comment", "comment, comment punctuation.definition.comment"),
     (
@@ -400,7 +418,7 @@ pub fn style_by_name(name: &str) -> Style {
         "warning" | "todo_in_progress" => t.todo_in_progress,
         "todo_pending" | "pending" => t.todo_pending,
         "todo_cancelled" | "cancelled" => t.todo_cancelled,
-        _ => Style::default(),
+        _ => Style::new().fg(t.foreground),
     }
 }
 
@@ -543,6 +561,88 @@ fn resolve_modifier(name: &str) -> Modifier {
     }
 }
 
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    let channel = |c: u8| {
+        let v = f32::from(c) / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Raises `style`'s foreground away from its backdrop until it clears `min`.
+///
+/// Themes routinely reuse one washed-out `comment` color for every secondary
+/// role, which leaves text unreadable against the theme's own background. The
+/// foreground is interpolated toward whichever of black or white contrasts more
+/// with the backdrop, so hue is retained wherever the floor is already met.
+fn ensure_contrast(style: Style, background: Color, min: f32) -> Style {
+    let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) = (
+        style.fg.unwrap_or(Color::Reset),
+        style.bg.unwrap_or(background),
+    ) else {
+        return style;
+    };
+
+    let (foreground, backdrop) = ((fr, fg, fb), (br, bg, bb));
+    if contrast_ratio(foreground, backdrop) >= min {
+        return style;
+    }
+
+    const WHITE: (u8, u8, u8) = (255, 255, 255);
+    const BLACK: (u8, u8, u8) = (0, 0, 0);
+    let target = if contrast_ratio(WHITE, backdrop) >= contrast_ratio(BLACK, backdrop) {
+        WHITE
+    } else {
+        BLACK
+    };
+
+    // A mid-luminance backdrop can cap below the floor; take the best available.
+    if contrast_ratio(target, backdrop) < min {
+        return style.fg(Color::Rgb(target.0, target.1, target.2));
+    }
+
+    let blend = |t: f32| {
+        (
+            lerp_u8(foreground.0, target.0, t),
+            lerp_u8(foreground.1, target.1, t),
+            lerp_u8(foreground.2, target.2, t),
+        )
+    };
+
+    // Contrast rises monotonically as the foreground approaches `target`, so the
+    // least invasive passing blend is a bisection away.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..CONTRAST_STEPS {
+        let mid = f32::midpoint(lo, hi);
+        if contrast_ratio(blend(mid), backdrop) >= min {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    let (r, g, b) = blend(hi);
+    style.fg(Color::Rgb(r, g, b))
+}
+
+fn contrast_floor(role: &str) -> f32 {
+    if CHROME_ROLES.contains(&role) {
+        MIN_CONTRAST_CHROME
+    } else {
+        MIN_CONTRAST_TEXT
+    }
+}
+
 fn resolve_style(def: &StyleDef, palette: &HashMap<String, Color>) -> Style {
     let mut style = Style::new();
     if let Some(fg) = def.fg.as_ref().and_then(|n| resolve_color(n, palette)) {
@@ -662,6 +762,15 @@ fn build_syntax_theme(
 }
 
 impl Theme {
+    /// Base style for any surface that paints the theme background.
+    ///
+    /// Painting only `bg` leaves unstyled spans at `Color::Reset`, which resolves
+    /// to the *terminal's* default foreground rather than the theme's, so a dark
+    /// theme on a light terminal renders near-black text on a dark panel.
+    pub(crate) fn surface_style(&self) -> Style {
+        Style::new().fg(self.foreground).bg(self.background)
+    }
+
     pub(crate) fn user_message_style(&self) -> Style {
         tinted_background(
             self.background,
@@ -723,9 +832,13 @@ impl Theme {
             })
             .unwrap_or_default();
 
+        let background = palette.get("background").copied().unwrap_or(Color::Reset);
+
         let style = |key: &str| -> Style {
             ui.get(key)
-                .map(|d| resolve_style(d, &palette))
+                .map(|d| {
+                    ensure_contrast(resolve_style(d, &palette), background, contrast_floor(key))
+                })
                 .unwrap_or_default()
         };
 
@@ -742,12 +855,17 @@ impl Theme {
         };
 
         let derived_style = |ui_key: &str, scopes: &[&str], mods: Modifier| -> Style {
+            let floor = contrast_floor(ui_key);
             if let Some(d) = ui.get(ui_key) {
-                return resolve_style(d, &palette);
+                return ensure_contrast(resolve_style(d, &palette), background, floor);
             }
             for scope in scopes {
                 if let Some(c) = scope_fg(&full_table, &palette, &raw_palette, scope) {
-                    return Style::new().fg(c).add_modifier(mods);
+                    return ensure_contrast(
+                        Style::new().fg(c).add_modifier(mods),
+                        background,
+                        floor,
+                    );
                 }
             }
             Style::default()
@@ -769,11 +887,15 @@ impl Theme {
 
             user: style("user"),
             assistant: style("assistant"),
-            thinking: brighten_toward(
-                style("thinking"),
-                color("comment"),
-                color("foreground"),
-                0.3,
+            thinking: ensure_contrast(
+                brighten_toward(
+                    style("thinking"),
+                    color("comment"),
+                    color("foreground"),
+                    0.3,
+                ),
+                background,
+                MIN_CONTRAST_TEXT,
             ),
             tool_bg: style("tool_bg"),
             tool: style("tool"),
@@ -788,11 +910,11 @@ impl Theme {
             bold: bold_style,
             italic: ui
                 .get("italic")
-                .map(|d| resolve_style(d, &palette))
+                .map(|d| ensure_contrast(resolve_style(d, &palette), background, MIN_CONTRAST_TEXT))
                 .unwrap_or_else(|| Style::default().add_modifier(Modifier::ITALIC)),
             bold_italic: ui
                 .get("bold_italic")
-                .map(|d| resolve_style(d, &palette))
+                .map(|d| ensure_contrast(resolve_style(d, &palette), background, MIN_CONTRAST_TEXT))
                 .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC)),
             inline_code: derived_style(
                 "inline_code",
@@ -915,7 +1037,7 @@ impl Theme {
         {
             return theme;
         }
-        Self::from_toml(BUNDLED_THEMES[0].toml).expect("bundled theme must parse")
+        load_by_name(DEFAULT_THEME).expect("default theme must parse")
     }
 }
 
@@ -935,14 +1057,16 @@ fn tinted_background(background: Color, tint: Color, factor: f32) -> Style {
 }
 
 pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
-    match (style.fg, current().background) {
+    let background = current().background;
+    let dimmed = match (style.fg, background) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => style.fg(Color::Rgb(
             lerp_u8(fr, br, factor),
             lerp_u8(fg, bg, factor),
             lerp_u8(fb, bb, factor),
         )),
         _ => style,
-    }
+    };
+    ensure_contrast(dimmed, background, MIN_CONTRAST_TEXT)
 }
 
 fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
@@ -971,6 +1095,14 @@ mod tests {
 
     fn dracula() -> Theme {
         Theme::from_toml(dracula_toml()).unwrap()
+    }
+
+    fn bundled(name: &str) -> Theme {
+        let entry = BUNDLED_THEMES
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("theme '{name}' must exist"));
+        Theme::from_toml(entry.toml).unwrap_or_else(|e| panic!("theme '{name}' must parse: {e}"))
     }
 
     #[test]
@@ -1121,6 +1253,182 @@ mod tests {
         assert!(load_by_name("nonexistent").is_err());
     }
 
+    fn theme_tables(toml_str: &str) -> (HashMap<String, Color>, toml::Table) {
+        let table: toml::Table = toml::from_str(toml_str).expect("theme must parse");
+        let palette = table
+            .get("palette")
+            .and_then(|v| v.as_table())
+            .map(|t| {
+                t.iter()
+                    .filter_map(|(k, v)| v.as_str().and_then(parse_hex).map(|c| (k.clone(), c)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ui = table
+            .get("ui")
+            .and_then(|v| v.as_table())
+            .cloned()
+            .unwrap_or_default();
+        (palette, ui)
+    }
+
+    fn rgb(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected an rgb color, got {other:?}"),
+        }
+    }
+
+    /// Every `[ui]` role must clear its contrast floor against its own backdrop.
+    /// Themes habitually reuse one washed-out `comment` color for all secondary
+    /// roles, which is unreadable without the clamp in `ensure_contrast`.
+    #[test]
+    fn bundled_themes_meet_contrast_floor() {
+        for entry in BUNDLED_THEMES {
+            let (palette, ui) = theme_tables(entry.toml);
+            let background = *palette
+                .get("background")
+                .unwrap_or_else(|| panic!("{} must define a background", entry.name));
+
+            for (key, value) in &ui {
+                let def: StyleDef = value
+                    .clone()
+                    .try_into()
+                    .unwrap_or_else(|e| panic!("{}: [ui].{key} is malformed: {e}", entry.name));
+                let floor = contrast_floor(key);
+                let style = ensure_contrast(resolve_style(&def, &palette), background, floor);
+                let Some(fg) = style.fg else { continue };
+                let ratio = contrast_ratio(rgb(fg), rgb(style.bg.unwrap_or(background)));
+                assert!(
+                    ratio >= floor,
+                    "{}: [ui].{key} contrast {ratio:.2} is below its {floor:.1} floor",
+                    entry.name,
+                );
+            }
+        }
+    }
+
+    /// A `[ui]` entry naming a missing palette key is silently dropped by
+    /// `resolve_style`, leaving the role unstyled and falling back to the
+    /// terminal's own colors. Catppuccin shipped `accent = { fg = "peach" }`
+    /// against a palette that only had `orange`.
+    #[test]
+    fn bundled_theme_palette_references_resolve() {
+        for entry in BUNDLED_THEMES {
+            let (palette, ui) = theme_tables(entry.toml);
+            for (key, value) in &ui {
+                let def: StyleDef = value
+                    .clone()
+                    .try_into()
+                    .expect("style def must deserialize");
+                for (slot, name) in [("fg", &def.fg), ("bg", &def.bg)] {
+                    let Some(name) = name else { continue };
+                    assert!(
+                        resolve_color(name, &palette).is_some(),
+                        "{}: [ui].{key}.{slot} = \"{name}\" resolves to nothing",
+                        entry.name,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test_case("ayu_light"; "light_theme_lifts_washed_out_roles")]
+    #[test_case("catppuccin_latte"; "light_theme_with_low_contrast_palette")]
+    #[test_case("material_darker"; "dark_theme_with_dimmest_comment")]
+    #[test_case("solarized_light"; "light_theme_with_invisible_borders")]
+    fn secondary_roles_are_readable(name: &str) {
+        let theme = bundled(name);
+        let background = rgb(theme.background);
+        for (role, style) in [
+            ("item_desc", theme.item_desc),
+            ("input_placeholder", theme.input_placeholder),
+            ("tool_dim", theme.tool_dim),
+            ("timestamp", theme.timestamp),
+            ("status_dim", theme.status_dim),
+            ("thinking", theme.thinking),
+            ("item", theme.item),
+        ] {
+            let fg = rgb(style
+                .fg
+                .unwrap_or_else(|| panic!("{name}: {role} must set fg")));
+            let ratio = contrast_ratio(fg, background);
+            assert!(
+                ratio >= MIN_CONTRAST_TEXT,
+                "{name}: {role} contrast {ratio:.2} is below {MIN_CONTRAST_TEXT:.1}",
+            );
+        }
+    }
+
+    #[test]
+    fn catppuccin_accent_resolves() {
+        for name in [
+            "catppuccin_latte",
+            "catppuccin_frappe",
+            "catppuccin_macchiato",
+            "catppuccin_mocha",
+        ] {
+            assert!(
+                bundled(name).accent.fg.is_some(),
+                "{name}: accent must resolve or pickers lose their highlight color",
+            );
+        }
+    }
+
+    #[test]
+    fn default_theme_is_bundled() {
+        assert!(
+            BUNDLED_THEMES.iter().any(|e| e.name == DEFAULT_THEME),
+            "load_or_bundled unwraps DEFAULT_THEME, so it must exist",
+        );
+    }
+
+    #[test_case(0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 21.0; "white_on_black_is_maximum")]
+    #[test_case(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1.0; "identical_colors_have_no_contrast")]
+    fn contrast_ratio_matches_wcag(fr: u8, fg: u8, fb: u8, br: u8, bg: u8, bb: u8, expected: f32) {
+        let ratio = contrast_ratio((fr, fg, fb), (br, bg, bb));
+        assert!(
+            (ratio - expected).abs() < 0.01,
+            "expected {expected}, got {ratio}",
+        );
+    }
+
+    #[test]
+    fn ensure_contrast_leaves_passing_styles_untouched() {
+        let background = Color::Rgb(0x28, 0x2a, 0x36);
+        let style = Style::new().fg(Color::Rgb(0xf8, 0xf8, 0xf2));
+        assert_eq!(ensure_contrast(style, background, MIN_CONTRAST_TEXT), style);
+    }
+
+    #[test]
+    fn ensure_contrast_measures_against_own_background() {
+        // fg/bg are nearly identical, so the role fails despite the global
+        // background being far away from both.
+        let style = Style::new()
+            .fg(Color::Rgb(0x30, 0x30, 0x30))
+            .bg(Color::Rgb(0x35, 0x35, 0x35));
+        let lifted = ensure_contrast(style, Color::Rgb(0xff, 0xff, 0xff), MIN_CONTRAST_TEXT);
+        assert_ne!(lifted.fg, style.fg);
+        assert_eq!(lifted.bg, style.bg);
+        let ratio = contrast_ratio(rgb(lifted.fg.unwrap()), rgb(style.bg.unwrap()));
+        assert!(ratio >= MIN_CONTRAST_TEXT, "got {ratio:.2}");
+    }
+
+    #[test]
+    fn ensure_contrast_ignores_unset_foreground() {
+        let style = Style::new().bg(Color::Rgb(0x28, 0x2a, 0x36));
+        assert_eq!(
+            ensure_contrast(style, Color::Rgb(0x28, 0x2a, 0x36), MIN_CONTRAST_TEXT),
+            style,
+        );
+    }
+
+    #[test]
+    fn chrome_roles_use_the_lower_floor() {
+        assert_eq!(contrast_floor("panel_border"), MIN_CONTRAST_CHROME);
+        assert_eq!(contrast_floor("item_desc"), MIN_CONTRAST_TEXT);
+    }
+
     #[test]
     fn merge_theme_names_dedups_user_override_and_sorts_in_custom() {
         let names = merge_theme_names(["dracula".to_owned(), "aaa_custom".to_owned()]);
@@ -1251,11 +1559,15 @@ mode_build = "#112233"
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
     }
 
+    /// Plugins pass `""` for plain text (see the question form), so the
+    /// fallback has to name the theme's foreground. Leaving it unset resolves
+    /// to the terminal's default color over a themed background.
     #[test_case("nonexistent_style")]
     #[test_case("")]
     #[test_case("typo_keyword")]
-    fn style_by_name_unknown_returns_default(name: &str) {
-        assert_eq!(style_by_name(name), Style::default());
+    fn style_by_name_unknown_uses_theme_foreground(name: &str) {
+        set(dracula());
+        assert_eq!(style_by_name(name), Style::new().fg(current().foreground));
     }
 
     const DRACULA_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);

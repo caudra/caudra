@@ -1,7 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
@@ -704,7 +703,7 @@ impl LoginPicker {
                 let input_line = input_line_with_cursor(input);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
+                        .style(t.surface_style())
                         .wrap(Wrap { trim: true }),
                     inner,
                 );
@@ -723,7 +722,7 @@ impl LoginPicker {
                 let input_line = input_line_with_cursor(input);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
+                        .style(t.surface_style())
                         .wrap(Wrap { trim: true }),
                     inner,
                 );
@@ -745,7 +744,7 @@ impl LoginPicker {
                 let input_line = input_line_with_cursor(input);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
+                        .style(t.surface_style())
                         .wrap(Wrap { trim: true }),
                     inner,
                 );
@@ -773,7 +772,7 @@ impl LoginPicker {
                 let input_line = input_line_with_cursor(input);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
+                        .style(t.surface_style())
                         .wrap(Wrap { trim: true }),
                     inner,
                 );
@@ -788,7 +787,7 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 1);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(Line::from(message.clone()))
-                        .style(Style::new().bg(theme::current().background)),
+                        .style(theme::current().surface_style()),
                     inner,
                 );
                 popup

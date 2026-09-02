@@ -183,8 +183,7 @@ impl App {
     }
 
     fn render_background(&self, frame: &mut Frame) {
-        let bg =
-            Block::default().style(ratatui::style::Style::new().bg(theme::current().background));
+        let bg = Block::default().style(theme::current().surface_style());
         bg.render(frame.area(), frame.buffer_mut());
     }
 
