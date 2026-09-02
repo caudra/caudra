@@ -181,7 +181,9 @@ end
 -- where a restore that awaits raises instead of yielding. One child's
 -- body must not stop the sweep from repainting the rest.
 local function child_body_buf(c, tol)
-  local output = c.output or ""
+  -- Native tools answer the model with a structured record. `display` is the
+  -- same result written for a reader, which is what belongs in a body.
+  local output = c.display or c.output or ""
   local t = presentation_tool(c)
   local buf
   if c.status == STATUS.ERROR and c.error_restore_allowed ~= true then
@@ -341,6 +343,7 @@ local function to_state(children)
       tool = c.tool,
       status = c.status,
       output = c.output,
+      display = c.display,
       annotation = c.annotation,
       usage = c.usage,
       lua_provenance = c.lua_provenance,
@@ -527,7 +530,8 @@ function Batch:run_child(c, ctx)
   local registered = caudra.api.get_tool(c.tool)
   c.lua_provenance = registered and registered.lua_provenance or nil
   self:rerender()
-  local text, err, invocation_id, error_restore_allowed = caudra.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, invocation_id, error_restore_allowed, display =
+    caudra.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
@@ -548,6 +552,7 @@ function Batch:run_child(c, ctx)
   })
   c.invocation_id = invocation_id
   c.error_restore_allowed = error_restore_allowed
+  c.display = display
   -- The sweep may have settled this child mid-call, and the call knows
   -- nothing about that, so its result is moot. Unless it came back with
   -- more than the sweep's bare reason: that partial output is worth
@@ -663,6 +668,7 @@ local function restore(input, output, _is_error, rctx)
       c.tool = sc.tool or c.tool
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
+      c.display = sc.display
       c.usage = sc.usage
       c.lua_provenance = sc.lua_provenance
       c.invocation_id = sc.invocation_id

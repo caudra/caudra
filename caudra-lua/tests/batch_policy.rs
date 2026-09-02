@@ -1383,6 +1383,8 @@ fn child_restore_awaiting_async_api_keeps_its_body() {
 
 const NATIVE_TOOL: &str = "file_reader";
 const NATIVE_PATH: &str = "caudra-config/src/lib.rs";
+const NATIVE_BODY: &str = "const A: usize = 1;";
+const NATIVE_MODEL_JSON: &str = "{\n  \"kind\": \"read\",\n  \"totalLines\": 1\n}";
 
 /// A native tool whose header renders its argument, the way the real file
 /// tools do. Native tools have no Lua handle, so a batch child used to fall
@@ -1394,8 +1396,20 @@ impl ToolInvocation for NativeHeaderTool {
         HeaderFuture::Ready(HeaderResult::plain(self.0.clone()))
     }
 
+    /// A structured result whose model form is a JSON record, the way every
+    /// Workcell tool answers.
     fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
-        Box::pin(async move { ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("x".into()))) })
+        let path = self.0.clone();
+        Box::pin(async move {
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::ReadCode {
+                path,
+                start_line: 1,
+                lines: vec![NATIVE_BODY.to_owned()],
+                total_lines: 1,
+                instructions: None,
+            }))
+            .with_model_output(Some(NATIVE_MODEL_JSON.to_owned()))
+        })
     }
 }
 
@@ -1453,6 +1467,46 @@ fn native_child_header_comes_from_the_registry() {
     assert!(
         text.contains(&format!("{NATIVE_TOOL}> {NATIVE_PATH}")),
         "native child header must name what it acted on: {text}"
+    );
+}
+
+/// A native tool answers the model with a structured record. The reader gets
+/// the same result written for a person, so a body is never a JSON dump.
+#[test]
+fn a_native_child_body_is_not_the_model_record() {
+    let reg = Arc::new(ToolRegistry::new());
+    reg.register(
+        Arc::new(NativeHeaderTool(String::new())),
+        ToolSource::Native {
+            owner: "test".into(),
+            contract: "test".into(),
+            trusted: true,
+        },
+    )
+    .unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("batch_only", BATCH_PLUGIN_SRC).unwrap();
+
+    let (state, _) = exec_batch_live(
+        &host,
+        &reg,
+        json!([{ "tool": NATIVE_TOOL, "parameters": { "path": NATIVE_PATH } }]),
+    );
+    let text = lines_text(&restore_snapshot_lines_revealed(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": NATIVE_TOOL, "parameters": { "path": NATIVE_PATH } },
+        ] }),
+        "irrelevant",
+        Some(state),
+    ));
+    assert!(
+        text.contains(NATIVE_BODY),
+        "the body must carry the result a reader can use: {text}"
+    );
+    assert!(
+        !text.contains("\"kind\""),
+        "the model's structured record must not reach the transcript: {text}"
     );
 }
 

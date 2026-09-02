@@ -927,7 +927,11 @@ through optional callbacks while the tool runs.
     `detail` is the tool header, or nil; `tally` reads like `"3 tools · 12.4s"`.
     Must not yield.
 
-**Returns:** (`string?`, `string?`, `string?`, `boolean?`) Tool output text, error, generated call ID, and whether an error restore is authorized.
+**Returns:** (`string?`, `string?`, `string?`, `boolean?`, `string?`) Tool output text as
+  the model sees it, error, generated call ID, whether an error restore is
+  authorized, and the same result written for a reader. The last differs
+  for tools whose model output is a structured record: show it instead of
+  the first when presenting the call to a person.
 
 **Example:**
 

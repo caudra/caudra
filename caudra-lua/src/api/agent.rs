@@ -432,7 +432,11 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     `"responding"`, `"compacting"`, `"retrying"`, `"awaiting permission"`;
 ///     `detail` is the tool header, or nil; `tally` reads like `"3 tools · 12.4s"`.
 ///     Must not yield.
-/// @return (string?, string?, string?, boolean?) Tool output text, error, generated call ID, and whether an error restore is authorized.
+/// @return (string?, string?, string?, boolean?, string?) Tool output text as
+///   the model sees it, error, generated call ID, whether an error restore is
+///   authorized, and the same result written for a reader. The last differs
+///   for tools whose model output is a structured record: show it instead of
+///   the first when presenting the call to a person.
 /// @example
 /// local out, err = caudra.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
@@ -447,11 +451,17 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<(Option<String>, Option<String>, Option<String>, Option<bool>)> {
+) -> LuaResult<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+)> {
     let input_json = lua_to_json(&lua, &input)?;
     let agent = match dispatch_ctx(&ctx, "call_tool") {
         Ok(agent) => agent,
-        Err(error) => return Ok((None, Some(error), None, None)),
+        Err(error) => return Ok((None, Some(error), None, None, None)),
     };
     let mut tctx = agent.to_tool_context();
     let (mut on_buf, mut on_ann, mut on_usage, mut on_progress, mut rx) =
@@ -472,7 +482,7 @@ async fn call_tool(
     }
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok((None, Some(e), None, None));
+        return Ok((None, Some(e), None, None, None));
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -496,20 +506,31 @@ async fn call_tool(
         .output
         .lua_provenance()
         .is_none_or(|provenance| provenance.error_restore_allowed);
+    // Workcell tools answer the model with a structured record, which is the
+    // wrong thing to show a reader. The display form comes off the same
+    // output the transcript renders a standalone call from.
+    let display = done.output.as_display_text();
     match interpreter_bridge::flatten(&done) {
         Ok(mut text) => {
             if let Some(suffix) = suffix {
                 text.push_str("\n\n");
                 text.push_str(&suffix);
             }
-            Ok((Some(text), None, Some(done.id), Some(error_restore_allowed)))
+            let display = (display != text).then_some(display);
+            Ok((
+                Some(text),
+                None,
+                Some(done.id),
+                Some(error_restore_allowed),
+                display,
+            ))
         }
         Err(mut err) => {
             if let Some(suffix) = suffix {
                 err.push_str("\n\n");
                 err.push_str(&suffix);
             }
-            Ok((None, Some(err), Some(done.id), Some(error_restore_allowed)))
+            Ok((None, Some(err), Some(done.id), Some(error_restore_allowed), None))
         }
     }
 }
