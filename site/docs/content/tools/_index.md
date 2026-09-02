@@ -156,14 +156,14 @@ Inspect the execution host's current sanitized environment.
 ### `question` {#question}
 
 Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
+1. Gather user preferences or requirements
+2. Clarify ambiguous instructions
+3. Get decisions on implementation choices as you work
+4. Offer choices to the user about what direction to take.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `questions` | array | yes | List of questions to ask the user |
+| `questions` | array | yes | Questions to ask |
 
 ## Agent & Knowledge
 

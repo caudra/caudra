@@ -3,15 +3,15 @@ local QuestionHelpers = require("question_helpers")
 local ToolView = require("caudra.tool_view")
 
 local DESCRIPTION = [[Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
+1. Gather user preferences or requirements
+2. Clarify ambiguous instructions
+3. Get decisions on implementation choices as you work
+4. Offer choices to the user about what direction to take.
 
-Rules:
-- `custom` enabled by default adds "Type your own answer" - don't include catch-all options.
-- Answers returned as arrays of labels. Set `multiSelect: true` for multi-select.
-- Put recommended option first with "(Recommended)" suffix.]]
+Usage notes:
+- A "Type your own answer" option is added automatically; don't include "Other" or catch-all options
+- Answers are returned as arrays of labels; set `multiSelect: true` to allow selecting more than one
+- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label]]
 
 local function normalize(questions)
   questions = questions or {}
@@ -43,28 +43,28 @@ caudra.api.register_tool({
     properties = {
       questions = {
         type = "array",
-        description = "List of questions to ask the user",
+        description = "Questions to ask",
         items = {
           type = "object",
-          required = { "question" },
+          required = { "question", "header", "options" },
           properties = {
-            question = { type = "string", description = "The question text" },
-            header = { type = "string", description = "Short tab header for the question" },
+            question = { type = "string", description = "Complete question" },
+            header = { type = "string", description = "Very short label (max 30 chars)" },
             options = {
               type = "array",
-              description = "List of predefined options",
+              description = "Available choices",
               items = {
                 type = "object",
-                required = { "label" },
+                required = { "label", "description" },
                 properties = {
-                  label = { type = "string", description = "Option label" },
-                  description = { type = "string", description = "Option description" },
+                  label = { type = "string", description = "Display text (1-5 words, concise)" },
+                  description = { type = "string", description = "Explanation of choice" },
                 },
               },
             },
             multiSelect = {
               type = "boolean",
-              description = "Whether multiple options can be selected",
+              description = "Allow selecting multiple choices",
               alias = "multiple",
             },
           },

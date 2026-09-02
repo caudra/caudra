@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
-    ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QUESTION_TOOL_NAME,
+    Tool, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry,
+    ToolSource, timeout_annotation,
 };
 use caudra_agent::{ToolOutput, ToolOutputLimits};
 use caudra_config::{
@@ -898,6 +898,42 @@ fn managed_tool_output_is_default_documentable_and_prompt_free() {
         let invocation = entry.tool.parse(&input).unwrap();
         assert!(smol::block_on(invocation.permission_scopes()).is_none());
     }
+}
+
+// `required` is emitted in property order, which comes from a Lua hash table.
+fn sorted_required(schema: &Value) -> Vec<&str> {
+    let mut fields: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("object schema must declare required fields")
+        .iter()
+        .map(|field| field.as_str().expect("required entry must be a string"))
+        .collect();
+    fields.sort_unstable();
+    fields
+}
+
+#[test]
+fn question_schema_requires_header_options_and_option_descriptions() {
+    let (reg, _host) = builtins_host();
+    let schema = reg
+        .get(QUESTION_TOOL_NAME)
+        .expect("question builtin was not registered")
+        .tool
+        .schema();
+
+    let question = &schema["properties"]["questions"]["items"];
+    assert_eq!(sorted_required(question), ["header", "options", "question"]);
+    assert_eq!(
+        sorted_required(&question["properties"]["options"]["items"]),
+        ["description", "label"]
+    );
+
+    let multi_select = &question["properties"]["multiSelect"];
+    assert_eq!(multi_select["type"], "boolean");
+    assert!(
+        multi_select.get("alias").is_none(),
+        "alias must stay host-side and never reach the model"
+    );
 }
 
 #[test]
