@@ -151,6 +151,11 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
+        "- **`/view`**: switch the transcript between compact and expanded. Compact draws each tool call as one row that opens on click. `task` and `batch` keep their child rows in both densities, and those children open on click as well. The choice is remembered across restarts."
+    )
+    .unwrap();
+    writeln!(
+        out,
         "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only)."
     )
     .unwrap();

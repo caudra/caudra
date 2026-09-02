@@ -73,6 +73,39 @@ pub fn compute_hunks(before: &str, after: &str) -> Vec<DiffHunk> {
     hunks
 }
 
+/// Added and removed line counts. Walks the changes directly rather than
+/// `compute_hunks`, which would build context lines only to discard them.
+pub fn stat(before: &str, after: &str) -> String {
+    let (added, removed) = TextDiff::from_lines(before, after)
+        .iter_all_changes()
+        .fold((0, 0), |(added, removed), change| match change.tag() {
+            ChangeTag::Insert => (added + 1, removed),
+            ChangeTag::Delete => (added, removed + 1),
+            ChangeTag::Equal => (added, removed),
+        });
+    format_stat(added, removed)
+}
+
+/// The same summary for an edit that only ever produced a patch, so both
+/// shapes of edit report their size identically.
+pub fn stat_of_patch(patch: &str) -> String {
+    let (added, removed) = patch
+        .lines()
+        .filter(|line| !line.starts_with("+++") && !line.starts_with("---"))
+        .fold((0, 0), |(added, removed), line| {
+            match line.as_bytes().first() {
+                Some(b'+') => (added + 1, removed),
+                Some(b'-') => (added, removed + 1),
+                _ => (added, removed),
+            }
+        });
+    format_stat(added, removed)
+}
+
+fn format_stat(added: usize, removed: usize) -> String {
+    format!("+{added} -{removed}")
+}
+
 pub fn unified_text(before: &str, after: &str, summary: &str, display_path: &str) -> String {
     let mut out = format!("{summary}\n--- {display_path}\n+++ {display_path}");
     let write_change = |out: &mut String, prefix: &str, spans: &[DiffSpan]| {
@@ -99,6 +132,29 @@ pub fn unified_text(before: &str, after: &str, summary: &str, display_path: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REPLACED_LINE_STAT: &str = "+2 -1";
+
+    /// The two edit shapes reach the stat by different routes, so they are
+    /// pinned to the same answer for the same change.
+    #[test]
+    fn both_edit_shapes_report_the_same_size() {
+        let patch = unified_text("a\nb\n", "a\nc\nd\n", "edited", "a.rs");
+
+        assert_eq!(stat("a\nb\n", "a\nc\nd\n"), REPLACED_LINE_STAT);
+        assert_eq!(stat_of_patch(&patch), REPLACED_LINE_STAT);
+    }
+
+    #[test]
+    fn a_patch_header_is_not_counted_as_a_change() {
+        let patch = unified_text("a\n", "b\n", "edited", "some/file.rs");
+
+        assert!(
+            patch.contains("--- some/file.rs") && patch.contains("+++ some/file.rs"),
+            "the header this guards against must be present: {patch}"
+        );
+        assert_eq!(stat_of_patch(&patch), "+1 -1");
+    }
 
     fn line_text(line: &DiffLine) -> String {
         match line {

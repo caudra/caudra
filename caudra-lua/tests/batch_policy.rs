@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use caudra_agent::cancel::CancelToken;
 use caudra_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use caudra_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
+use caudra_agent::tools::{
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
+    ToolContext, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+};
 use caudra_agent::{
     AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
 };
@@ -19,6 +22,8 @@ const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
 
 // Mirrors of the plugin's format contracts.
 const MAX_BATCH_SIZE: usize = 25;
+/// The batch header row, which reveals every collapsed child at once.
+const REVEAL_CHILDREN: usize = 0;
 const ERROR_PREFIX: &str = "[ERROR] ";
 const EMPTY_ERROR: &str = "provide at least one tool call";
 const NESTED_ERROR: &str = "cannot nest batch inside batch";
@@ -743,6 +748,17 @@ fn restore_snapshot_lines(
     restore_snapshot_lines_opts(host, input, output, state, Vec::new())
 }
 
+/// Children start at their header, so anything asserting on a body has to
+/// reveal it first. Row 0 is the batch header, which reveals all of them.
+fn restore_snapshot_lines_revealed(
+    host: &PluginHost,
+    input: Value,
+    output: &str,
+    state: Option<Value>,
+) -> Vec<Vec<(String, SpanStyle)>> {
+    restore_snapshot_lines_opts(host, input, output, state, vec![REVEAL_CHILDREN])
+}
+
 fn restore_snapshot_lines_opts(
     host: &PluginHost,
     input: Value,
@@ -817,7 +833,7 @@ fn lines_text(lines: &[Vec<(String, SpanStyle)>]) -> String {
 #[test]
 fn restore_with_state_renders_child_header_contract() {
     let (_reg, host) = load_batch_host();
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [{ "tool": "hdrtool", "parameters": { "x": "A" } }] }),
         "irrelevant",
@@ -857,7 +873,7 @@ fn restore_with_state_renders_child_header_contract() {
 #[test]
 fn restore_error_child_renders_error_style() {
     let (_reg, host) = load_batch_host();
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [{ "tool": "ok", "parameters": {} }] }),
         "irrelevant",
@@ -889,7 +905,7 @@ fn restore_error_child_renders_error_style() {
 #[test]
 fn restore_child_body_equals_child_restore_view() {
     let (_reg, host) = load_batch_host();
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [{ "tool": "viewer", "parameters": {} }] }),
         "irrelevant",
@@ -1027,7 +1043,7 @@ fn annotations_append_on_child_in_order() {
 #[test]
 fn throwing_child_callbacks_degrade_to_plain() {
     let (_reg, host) = load_batch_host();
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [
             { "tool": "badhdr", "parameters": {} },
@@ -1055,7 +1071,7 @@ fn restore_without_state_parses_llm_sections() {
         section("ok", &format!("{ERROR_PREFIX}{BOOM_ERR}")),
         summary_mixed(1, 2, 1)
     );
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [
             { "tool": "hdrtool", "parameters": { "x": "A" } },
@@ -1096,7 +1112,7 @@ fn restore_without_state_keeps_header_lookalike_in_body() {
         section("hdrtool", "real body"),
         summary_all_ok(2)
     );
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [
             { "tool": "ok", "parameters": {} },
@@ -1156,8 +1172,13 @@ fn replayed_click_expands_only_the_clicked_child() {
 
     // Rows are 1-based (row 0 = header), so snapshot line i = row i+1.
     // Find child2's notice dynamically so layout changes can't break this.
-    let collapsed = restore_snapshot_lines(&host, input.clone(), "irrelevant", Some(state.clone()));
-    let notice_row = 1 + collapsed
+    let revealed = restore_snapshot_lines_revealed(
+        &host,
+        input.clone(),
+        "irrelevant",
+        Some(state.clone()),
+    );
+    let notice_row = 1 + revealed
         .iter()
         .enumerate()
         .filter(|(_, l)| l.iter().any(|(t, _)| t.contains("(click to expand)")))
@@ -1170,7 +1191,7 @@ fn replayed_click_expands_only_the_clicked_child() {
         input.clone(),
         "irrelevant",
         Some(state.clone()),
-        vec![notice_row],
+        vec![REVEAL_CHILDREN, notice_row],
     ));
     assert!(text.contains("b5"), "clicked child expands: {text}");
     assert!(!text.contains("a3"), "other child stays truncated: {text}");
@@ -1185,14 +1206,49 @@ fn replayed_click_expands_only_the_clicked_child() {
         input,
         "irrelevant",
         Some(state),
-        vec![notice_row, notice_row],
+        vec![REVEAL_CHILDREN, notice_row, notice_row],
     ));
     assert!(!text.contains("b3"), "second click collapses: {text}");
 }
 
-/// Row 0 is the batch header: a click there fans out to every child.
-/// The second click must collapse again, pinning the broadcast as a real
-/// toggle rather than an expand-all.
+/// A batch is a summary first: every child settles at its header so the
+/// transcript stays scannable, and a body arrives only when asked for.
+#[test]
+fn children_start_collapsed_and_open_on_click() {
+    let (_reg, host) = load_batch_host();
+    let (input, state) = two_truncated_viewers();
+
+    let collapsed = lines_text(&restore_snapshot_lines(
+        &host,
+        input.clone(),
+        "irrelevant",
+        Some(state.clone()),
+    ));
+    assert_eq!(
+        collapsed.lines().filter(|l| l.contains("viewer> ")).count(),
+        2,
+        "both child headers render: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("a1") && !collapsed.contains("b1"),
+        "no child body before a click: {collapsed}"
+    );
+
+    let revealed = lines_text(&restore_snapshot_lines_revealed(
+        &host,
+        input,
+        "irrelevant",
+        Some(state),
+    ));
+    assert!(
+        revealed.contains("a1") && revealed.contains("b1"),
+        "a revealed child shows its body: {revealed}"
+    );
+}
+
+/// Row 0 is the batch header: a click there fans out to every child. It
+/// reveals them first, then expands them, then collapses again, pinning the
+/// broadcast as a real toggle rather than an expand-all.
 #[test]
 fn header_click_toggles_all_children() {
     let (_reg, host) = load_batch_host();
@@ -1203,7 +1259,7 @@ fn header_click_toggles_all_children() {
         input.clone(),
         "irrelevant",
         Some(state.clone()),
-        vec![0],
+        vec![REVEAL_CHILDREN, REVEAL_CHILDREN],
     ));
     assert!(
         text.contains("a5") && text.contains("b5"),
@@ -1215,11 +1271,11 @@ fn header_click_toggles_all_children() {
         input,
         "irrelevant",
         Some(state),
-        vec![0, 0],
+        vec![REVEAL_CHILDREN, REVEAL_CHILDREN, REVEAL_CHILDREN],
     ));
     assert!(
         !text.contains("a3") && !text.contains("b3"),
-        "second header click collapses every child: {text}"
+        "a later header click collapses every child: {text}"
     );
 }
 
@@ -1233,7 +1289,7 @@ fn header_click_toggles_all_children() {
 fn edit_child_body_renders_diff_not_summary() {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let lines = restore_snapshot_lines(
+    let lines = restore_snapshot_lines_revealed(
         &host,
         json!({ "tool_calls": [{ "tool": "edit", "parameters": {
             "path": "/nonexistent/f",
@@ -1271,7 +1327,7 @@ fn edit_child_body_renders_diff_not_summary() {
 /// full batch render.
 #[test]
 fn async_highlight_tasks_never_shrink_and_reach_final_snapshot() {
-    let snapshots = run_live_batch(HL_CHILD_SRC, "hl");
+    let (host, state, snapshots) = live_batch(HL_CHILD_SRC, "hl");
     let header_counts: Vec<usize> = snapshots
         .iter()
         .map(|s| s.text().matches("hl> ").count())
@@ -1285,16 +1341,23 @@ fn async_highlight_tasks_never_shrink_and_reach_final_snapshot() {
         Some(&2),
         "final snapshot must carry all children"
     );
-    let last = snapshots.last().expect("at least one batch snapshot");
-    let has_inline = last
-        .lines
+    let revealed = restore_snapshot_lines_revealed(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": "hl", "parameters": {} },
+            { "tool": "hl", "parameters": {} },
+        ] }),
+        "irrelevant",
+        Some(state),
+    );
+    let has_inline = revealed
         .iter()
-        .flat_map(|l| &l.spans)
-        .any(|s| matches!(s.style, SpanStyle::Inline(_)));
+        .flatten()
+        .any(|(_, style)| matches!(style, SpanStyle::Inline(_)));
     assert!(
         has_inline,
-        "final snapshot must contain highlighted spans, got:\n{}",
-        last.text()
+        "a revealed child must contain highlighted spans, got:\n{}",
+        lines_text(&revealed)
     );
 }
 
@@ -1302,12 +1365,94 @@ fn async_highlight_tasks_never_shrink_and_reach_final_snapshot() {
 /// must not throw out of the `get_tool` wrapper.
 #[test]
 fn child_restore_awaiting_async_api_keeps_its_body() {
-    let snapshots = run_live_batch(&hl_child_src(CMD_TOOL), CMD_TOOL);
-    let last = snapshots.last().expect("at least one batch snapshot");
-    let text = last.text();
+    let (host, state, _) = live_batch(&hl_child_src(CMD_TOOL), CMD_TOOL);
+    let text = lines_text(&restore_snapshot_lines_revealed(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": CMD_TOOL, "parameters": {} },
+            { "tool": CMD_TOOL, "parameters": {} },
+        ] }),
+        "irrelevant",
+        Some(state),
+    ));
     assert!(
         text.contains("echo header-marker"),
         "child restore header must survive, got:\n{text}"
+    );
+}
+
+const NATIVE_TOOL: &str = "file_reader";
+const NATIVE_PATH: &str = "caudra-config/src/lib.rs";
+
+/// A native tool whose header renders its argument, the way the real file
+/// tools do. Native tools have no Lua handle, so a batch child used to fall
+/// back to the bare tool name and render `file_reader> file_reader`.
+struct NativeHeaderTool(String);
+
+impl ToolInvocation for NativeHeaderTool {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(self.0.clone()))
+    }
+
+    fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move { ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("x".into()))) })
+    }
+}
+
+impl Tool for NativeHeaderTool {
+    fn name(&self) -> &str {
+        NATIVE_TOOL
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+        "native header".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": { "path": { "type": "string" } } })
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(NativeHeaderTool(
+            input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        )))
+    }
+}
+
+/// A native child's header comes from the registry, so it reads like the
+/// standalone tool instead of repeating the tool name.
+#[test]
+fn native_child_header_comes_from_the_registry() {
+    let reg = Arc::new(ToolRegistry::new());
+    reg.register(
+        Arc::new(NativeHeaderTool(String::new())),
+        ToolSource::Native {
+            owner: "test".into(),
+            contract: "test".into(),
+            trusted: true,
+        },
+    )
+    .unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("batch_only", BATCH_PLUGIN_SRC).unwrap();
+
+    let text = lines_text(&restore_snapshot_lines(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": NATIVE_TOOL, "parameters": { "path": NATIVE_PATH } },
+        ] }),
+        "irrelevant",
+        Some(json!({ "children": [
+            { "tool": NATIVE_TOOL, "status": "success", "output": "x" },
+        ] })),
+    ));
+    assert!(
+        text.contains(&format!("{NATIVE_TOOL}> {NATIVE_PATH}")),
+        "native child header must name what it acted on: {text}"
     );
 }
 
@@ -1393,12 +1538,14 @@ fn hl_child_src(tool: &str) -> String {
     SYNC_HL_CHILD_SRC.replace("@TOOL@", tool)
 }
 
-fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
+/// The host and state outlive the run so a caller can reveal the children and
+/// inspect a body the live snapshots leave collapsed.
+fn live_batch(child_src: &str, tool: &str) -> (PluginHost, Value, Vec<BufferSnapshot>) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("live_batch", &format!("{child_src}\n{BATCH_PLUGIN_SRC}"))
         .unwrap();
-    let (_state, snapshots) = exec_batch_live(
+    let (state, snapshots) = exec_batch_live(
         &host,
         &reg,
         json!([
@@ -1406,5 +1553,5 @@ fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
             { "tool": tool, "parameters": {} },
         ]),
     );
-    snapshots
+    (host, state, snapshots)
 }

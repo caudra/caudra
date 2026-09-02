@@ -16,6 +16,8 @@ const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
+/// The batch header row, which reveals every collapsed child at once.
+const REVEAL_CHILDREN: usize = 0;
 /// Fixed caps so truncation tests don't depend on the product defaults. The
 /// index and read caps differ so a body rendered through the wrong view is
 /// visibly different.
@@ -123,9 +125,10 @@ fn bash_restore_renders_real_view() {
     assert!(r.header.contains("print hi"), "header: {}", r.header);
 }
 
-/// Phase 1: children render through their own real views (grep gutter,
-/// bash command header), not the raw-llm fallback. Phase 2: a replayed
-/// click inside grep's range reaches its real toggle and expands only it.
+/// Phase 1: revealed children render through their own real views (grep
+/// gutter, bash command header), not the raw-llm fallback. Phase 2: a
+/// replayed click inside grep's range reaches its real toggle and expands
+/// only it.
 #[test]
 fn batch_restore_renders_real_children_and_click_expands_grep() {
     let host = load_host();
@@ -136,7 +139,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
         input.clone(),
         "whatever",
         Some(batch_state()),
-        Vec::new(),
+        vec![REVEAL_CHILDREN],
     );
     let text = &collapsed.body;
     assert!(text.contains("grep> "), "grep child header: {text}");
@@ -172,7 +175,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
         input,
         "whatever",
         Some(batch_state()),
-        vec![notice_row],
+        vec![REVEAL_CHILDREN, notice_row],
     );
     let text = &clicked.body;
     assert!(
@@ -240,7 +243,14 @@ fn multiedit_batch_child_shows_full_numbered_diff() {
     let state = json!({ "children": [
         { "tool": "multiedit", "status": "success", "output": "applied 1 edit" },
     ]});
-    let r = restore(&host, "batch", input, "whatever", Some(state), Vec::new());
+    let r = restore(
+        &host,
+        "batch",
+        input,
+        "whatever",
+        Some(state),
+        vec![REVEAL_CHILDREN],
+    );
 
     let text = &r.body;
     // keep = "head" truncation would cut the tail, so the last added line

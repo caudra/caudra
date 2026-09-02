@@ -1672,7 +1672,7 @@ fn tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
     for item in items {
         match &item.kind {
             HistoryItemKind::ToolCall { call_id, name, .. }
-                if name == "task" || name == "batch" =>
+                if caudra_agent::tools::is_container_tool(name) =>
             {
                 ids.insert(call_id.clone());
             }

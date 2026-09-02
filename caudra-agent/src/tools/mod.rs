@@ -255,6 +255,7 @@ pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
 }
 
 pub const BASH_TOOL_NAME: &str = "bash";
+pub const BATCH_TOOL_NAME: &str = "batch";
 pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 pub const EDIT_TOOL_NAME: &str = "edit";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
@@ -279,6 +280,13 @@ pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] =
     &[TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME];
+
+/// Containers own nested tool calls: their result is the list of children
+/// rather than output of their own. Callers use this to follow the children
+/// and to keep the parent row from collapsing over them.
+pub fn is_container_tool(name: &str) -> bool {
+    matches!(name, TASK_TOOL_NAME | BATCH_TOOL_NAME)
+}
 
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub const READ_ONLY_TOOL_RESTRICTED: &str = "tool is not available in strict read-only mode";

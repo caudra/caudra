@@ -352,6 +352,7 @@ impl App {
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
+        let compact = caudra_storage::view::read_compact(&storage).unwrap_or_default();
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -455,7 +456,7 @@ impl App {
             pending_subagent_steers: HashMap::new(),
             unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
-            compact: false,
+            compact,
         };
         app.model_picker.set_recents(
             caudra_storage::model::read_recents(&app.storage)
@@ -1425,6 +1426,7 @@ impl App {
                 for chat in &mut self.chats {
                     chat.set_compact(self.compact);
                 }
+                caudra_storage::view::persist_compact(&self.storage, self.compact);
                 self.flash(if self.compact {
                     COMPACT_VIEW_MSG.into()
                 } else {

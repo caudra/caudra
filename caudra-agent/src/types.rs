@@ -392,6 +392,17 @@ fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize
     total.saturating_sub(end)
 }
 
+/// Lines are what the rest of the annotations count, so a write reports them
+/// too. Sessions written before the line split only carry the byte count.
+fn written_size(byte_count: usize, lines: &[String]) -> String {
+    if lines.is_empty() && byte_count > 0 {
+        return format!("{byte_count} bytes");
+    }
+    format!("{} lines", lines.len())
+}
+
+
+
 impl ToolOutput {
     /// Short header suffix summarizing the output, e.g. `12 lines`.
     /// The UI uses it on tool completion, and `caudra.agent.call_tool` falls
@@ -408,7 +419,10 @@ impl ToolOutput {
                     Some(format!("{shown} lines"))
                 }
             }
-            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
+            Self::WriteCode {
+                byte_count, lines, ..
+            } => Some(written_size(*byte_count, lines)),
+            Self::Diff { before, after, .. } => Some(crate::diff::stat(before, after)),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
@@ -612,10 +626,12 @@ impl ToolOutput {
                     .join("\n")
             }
             Self::WriteCode {
-                path, byte_count, ..
+                path,
+                byte_count,
+                lines,
             } => {
                 let display = crate::tools::relative_path(path);
-                format!("wrote {byte_count} bytes to {display}")
+                format!("wrote {} to {display}", written_size(*byte_count, lines))
             }
             Self::GrepResult { entries } => {
                 let mut out = String::new();
@@ -1480,9 +1496,12 @@ mod tests {
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
-    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
+    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec!["x".into(); 3] }, Some("3 lines") ; "write_code_lines")]
+    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_falls_back_for_old_sessions")]
+    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some("0 lines") ; "write_code_empty_file")]
     #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
-    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
+    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
+    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
     }

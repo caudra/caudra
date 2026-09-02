@@ -411,13 +411,20 @@ fn tool_kind(current: SegmentKind, lines: &ToolLines, compact: bool) -> SegmentK
     }
 }
 
+/// A row that reads as one entry in a list rather than as its own block.
+/// Compact folds reasoning in, which is what lets a thought sit against the
+/// tool calls it interleaves with.
+pub(super) fn dense_kind(kind: SegmentKind, compact: bool) -> bool {
+    kind == SegmentKind::ToolInline || (compact && kind == SegmentKind::Thinking)
+}
+
 /// Single-line tool rows read as a list, so they sit flush against each other.
-/// Compact folds reasoning into that list and drops the height condition:
-/// every row there is one entry, and a wrapped one is still one entry.
+/// Compact drops the height condition: every row there is one entry, and a
+/// wrapped one is still one entry.
 fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16), compact: bool) -> bool {
-    let dense =
-        |kind| kind == SegmentKind::ToolInline || (compact && kind == SegmentKind::Thinking);
-    dense(previous.0) && dense(current.0) && (compact || (previous.1 <= 1 && current.1 <= 1))
+    dense_kind(previous.0, compact)
+        && dense_kind(current.0, compact)
+        && (compact || (previous.1 <= 1 && current.1 <= 1))
 }
 
 pub(super) struct SegmentCache {
@@ -518,6 +525,11 @@ impl SegmentCache {
 
     pub fn len(&self) -> usize {
         self.segments.len()
+    }
+
+    /// What the streaming block below the cache would be following.
+    pub fn last_kind(&self) -> Option<SegmentKind> {
+        self.segments.last().map(Segment::kind)
     }
 
     pub fn update_margins(&mut self, width: u16, compact: bool) {

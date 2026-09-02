@@ -1011,6 +1011,26 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
     Ok(out)
 }
 
+/// The one-line summary a tool shows for a given call, as the transcript
+/// would render it. Native tools have no Lua `header`, so a plugin that
+/// presents someone else's call needs this to avoid falling back to the bare
+/// tool name.
+///
+/// @param name string Exact tool name.
+/// @param input table Arguments the tool was called with.
+/// @return string Header text, or the tool name when it cannot be summarized.
+/// @example
+/// local text = caudra.api.tool_header("file_read", { path = "src/main.rs" })
+#[lua_fn]
+fn tool_header(lua: &Lua, name: String, input: LuaValue) -> LuaResult<String> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("tool_header: tool registry not available"))?;
+    let input = lua.from_value(input).unwrap_or(Value::Null);
+    Ok(registry.resolve_header(&name, &input))
+}
+
 /// Look up a single tool by name. Returns its metadata table or nil if the
 /// tool does not exist. For Lua-registered tools the returned table also
 /// includes `header` and `restore` handle functions (wrapped so they never
@@ -1071,7 +1091,7 @@ lua_table! {
     extend "caudra.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, rule_policy: PermissionRulePolicy, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending), register_permission_rule(pending_rules, rule_policy), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
+        get_tools, get_tool, tool_header,
         manual run_command,
     ]
 }

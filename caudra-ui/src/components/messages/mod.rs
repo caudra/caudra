@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
+use caudra_agent::tools::is_container_tool;
 use caudra_agent::{
     BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, SubagentProgress,
     ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration, reasoning_summary,
@@ -251,9 +252,9 @@ impl MessagesPanel {
 
     /// `None` means header-only, which only compact rows can be. The flags
     /// inside say how much of the body an opened row shows.
-    fn tool_expansion(&self, tool_id: &str) -> Option<SectionFlags> {
+    fn tool_expansion(&self, tool_id: &str, container: bool) -> Option<SectionFlags> {
         let flags = self.expanded_tools.get(tool_id).copied();
-        let mut flags = if self.compact {
+        let mut flags = if self.compact && !container {
             flags?
         } else {
             flags.unwrap_or_default()
@@ -262,17 +263,37 @@ impl MessagesPanel {
         Some(flags)
     }
 
+    /// Resolved from the segment's message rather than tracked alongside it,
+    /// so a restored session cannot disagree with a live one.
+    fn is_container(&self, tool_id: &str) -> bool {
+        self.cache
+            .find_by_tool_id(tool_id)
+            .and_then(|idx| self.cache.get(idx))
+            .and_then(|seg| seg.msg_index)
+            .and_then(|idx| self.messages.get(idx))
+            .is_some_and(|msg| match &msg.role {
+                DisplayRole::Tool(t) => is_container_tool(&t.name),
+                _ => false,
+            })
+    }
+
     fn compact_collapsed(&self, tool_id: &str) -> bool {
-        self.compact && !self.expanded_tools.contains_key(tool_id)
+        self.compact
+            && !self.expanded_tools.contains_key(tool_id)
+            && !self.is_container(tool_id)
     }
 
     /// Whether a click on the row would change anything. Hover feedback and
     /// the click share this, or a row highlights and then ignores the press.
     fn tool_click_acts(&self, tool_id: &str, truncation: SectionFlags) -> bool {
         // An opened compact row always has its header left to collapse to.
-        (self.compact && self.expanded_tools.contains_key(tool_id))
+        (self.compact
+            && self.expanded_tools.contains_key(tool_id)
+            && !self.is_container(tool_id))
             || truncation.any()
-            || self.tool_expansion(tool_id).is_some_and(SectionFlags::any)
+            || self
+                .tool_expansion(tool_id, self.is_container(tool_id))
+                .is_some_and(SectionFlags::any)
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -567,7 +588,7 @@ impl MessagesPanel {
             return;
         }
         let inst_id = segment::instruction_id(parent_id);
-        let exp = self.tool_expansion(&inst_id).map(|flags| flags.output);
+        let exp = self.tool_expansion(&inst_id, false).map(|flags| flags.output);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
         let tl = build_instructions_lines(blocks, width, exp);
@@ -1017,7 +1038,7 @@ impl MessagesPanel {
             if stream.is_empty() {
                 continue;
             }
-            if has_previous {
+            if self.streaming_spacer(kind, has_previous) {
                 block_start = block_start.saturating_add(1);
             }
             let chrome = SegmentChrome::for_kind(kind, width, 0);
@@ -1250,7 +1271,7 @@ impl MessagesPanel {
             return true;
         }
 
-        let exp = self.tool_expansion(tool_id).unwrap_or_default();
+        let exp = self.tool_expansion(tool_id, self.is_container(tool_id)).unwrap_or_default();
         let shell_toggle = seg
             .shell_toggle_line
             .is_some_and(|line| seg.source_line_at(rel, width) == Some(line));
@@ -1353,6 +1374,28 @@ impl MessagesPanel {
         self.thinking_collapsed && !self.streaming_thinking.is_empty()
     }
 
+    /// Streaming content lives outside the cache, so it misses the margin pass
+    /// and needs the same rule applied by hand. A compact collapsed thought is
+    /// a list row like the calls above it, and a gap that vanished the instant
+    /// the block settled would be the only thing announcing the difference.
+    fn streaming_thinking_stacks_flush(&self) -> bool {
+        self.compact
+            && self.streaming_thinking_collapsed()
+            && self
+                .cache
+                .last_kind()
+                .is_some_and(|kind| segment::dense_kind(kind, self.compact))
+    }
+
+    /// Whether a blank line separates this streaming block from what precedes
+    /// it. Measuring, painting, and hit-testing all walk the same list of
+    /// heights in order, so one extra entry in any of them shifts every row
+    /// below it.
+    fn streaming_spacer(&self, kind: SegmentKind, has_previous: bool) -> bool {
+        has_previous
+            && !(kind == SegmentKind::Thinking && self.streaming_thinking_stacks_flush())
+    }
+
     fn show_idle_splash(&self) -> bool {
         self.messages.is_empty()
             && self.streaming_thinking.is_empty()
@@ -1423,7 +1466,7 @@ impl MessagesPanel {
         let mut expanded_thinking = None;
 
         if thinking_collapsed {
-            if cached_count > 0 || !streaming_heights.is_empty() {
+            if self.streaming_spacer(SegmentKind::Thinking, cached_count > 0) {
                 streaming_heights.push(1);
             }
             let content_width =
@@ -1443,7 +1486,7 @@ impl MessagesPanel {
             }
             expanded_thinking = Some(self.build_streaming_expanded_lines());
             let lines = &expanded_thinking.as_ref().unwrap().0;
-            if cached_count > 0 || !streaming_heights.is_empty() {
+            if self.streaming_spacer(SegmentKind::Thinking, cached_count > 0) {
                 streaming_heights.push(1);
             }
             streaming_heights.push(wrapped_line_count(lines, content_width));
@@ -1456,7 +1499,8 @@ impl MessagesPanel {
                 self.clear_hover();
             }
             let lines = self.streaming_text.cached_lines();
-            if cached_count > 0 || !streaming_heights.is_empty() {
+            let has_previous = cached_count > 0 || !streaming_heights.is_empty();
+            if self.streaming_spacer(SegmentKind::Assistant, has_previous) {
                 streaming_heights.push(1);
             }
             streaming_heights.push(wrapped_line_count(lines, content_width));
@@ -1515,7 +1559,7 @@ impl MessagesPanel {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
                 continue;
             }
-            if cached_count > 0 || height_idx > 0 {
+            if self.streaming_spacer(kind, cached_count > 0 || height_idx > 0) {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 cursor.render(
@@ -2086,7 +2130,7 @@ impl MessagesPanel {
             return;
         };
 
-        let exp = self.tool_expansion(tool_id);
+        let exp = self.tool_expansion(tool_id, is_container_tool(&t.name));
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
@@ -2113,7 +2157,7 @@ impl MessagesPanel {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.tool_expansion(&t.id);
+                let exp = self.tool_expansion(&t.id, is_container_tool(&t.name));
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();

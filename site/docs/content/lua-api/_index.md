@@ -512,6 +512,32 @@ end
 
 ---
 
+### `caudra.api.tool_header()` {#caudra-api-tool_header}
+
+```lua
+caudra.api.tool_header({name}, {input})
+```
+
+The one-line summary a tool shows for a given call, as the transcript
+would render it. Native tools have no Lua `header`, so a plugin that
+presents someone else's call needs this to avoid falling back to the bare
+tool name.
+
+**Parameters:**
+
+- `{name}` (`string`) Exact tool name.
+- `{input}` (`table`) Arguments the tool was called with.
+
+**Returns:** string Header text, or the tool name when it cannot be summarized.
+
+**Example:**
+
+```lua
+local text = caudra.api.tool_header("file_read", { path = "src/main.rs" })
+```
+
+---
+
 ### `caudra.api.run_command()` {#caudra-api-run_command}
 
 ```lua

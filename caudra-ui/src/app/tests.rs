@@ -51,6 +51,8 @@ pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
+const DENSITY_DEFAULT_MSG: &str = "an app with no stored density starts expanded";
+const DENSITY_PERSIST_MSG: &str = "a chosen density must survive the app that chose it";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -4178,6 +4180,22 @@ fn view_toggle_is_reachable_from_lua() {
     let mut app = test_app();
     app.run_builtin(BuiltinAction::ViewToggle);
     assert!(app.compact);
+}
+
+/// Density is a reading preference, not a per-session one, so it is picked
+/// once and then stays picked. Its own state dir, because the shared one
+/// would carry the choice into every other app built on this thread.
+#[test]
+fn view_density_outlives_the_app_that_chose_it() {
+    let tmp = TempDir::new().expect("state dir");
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+    assert!(!app.compact, "{DENSITY_DEFAULT_MSG}");
+    app.run_builtin(BuiltinAction::ViewToggle);
+
+    let restarted = build_app(dir.clone(), Arc::new(test_writer(dir)));
+    assert!(restarted.compact, "{DENSITY_PERSIST_MSG}");
 }
 
 #[test]

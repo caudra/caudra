@@ -141,17 +141,19 @@ end
 
 --- Child presentation ------------------------------------------------------
 
--- Let the child tool draw its own header. Some tools have none (MCP
--- ones, for example) and a broken one comes back nil; either way the
--- plain tool name is enough.
+-- Native tools have no Lua header, so ask the registry for the same summary
+-- the transcript would show. Falls back to the tool name, which is what the
+-- registry itself answers when a call cannot be summarized.
+local function plain_header(tool, params)
+  return { { caudra.api.tool_header(tool, params or {}), "tool" } }
+end
+
+-- Let the child tool draw its own header. Some tools have none (MCP ones,
+-- for example) and a broken one comes back nil.
 local function header_spans(tool, params)
   local t = caudra.api.get_tool(tool)
   local spans = t and t.header and t.header(params)
-  return spans or { { tool, "tool" } }
-end
-
-local function plain_header(tool)
-  return { { tool, "tool" } }
+  return spans or plain_header(tool, params)
 end
 
 local function presentation_tool(c)
@@ -212,7 +214,7 @@ local function prepare_children(tool_calls, ctx)
     elseif c.tool == "batch" then
       c.status, c.output = STATUS.ERROR, NESTED_ERROR
     end
-    c.header = plain_header(c.tool)
+    c.header = plain_header(c.tool, c.params)
     children[i] = c
   end
   return children
@@ -281,12 +283,14 @@ end
 -- map can never drift from what is on screen. Bodies come from each
 -- child's cache; headers are one line each, cheaper to rebuild than to
 -- track.
+--
+-- A batch reads as a list of what it ran, so children start at their header
+-- and open one at a time. Fifteen bodies stacked under one call is not a
+-- transcript anyone can follow, and the separators only existed to tell those
+-- bodies apart.
 local function render_children(children)
   local lines, ranges = {}, {}
   for i, c in ipairs(children) do
-    if i > 1 then
-      append_separator(lines)
-    end
     local first = #lines + 1
     lines[#lines + 1] = child_header_line(c)
     -- The progress row sits between the header and the body, so a click below
@@ -296,10 +300,11 @@ local function render_children(children)
       lines[#lines + 1] = child_progress_line(c, TERMINAL[c.status])
       shift = 1
     end
-    if c.buf then
+    if c.buf and c.open then
       for _, l in ipairs(child_body_lines(c)) do
         lines[#lines + 1] = l
       end
+      append_separator(lines)
     end
     ranges[i] = { first = first, shift = shift, last = #lines }
   end
@@ -457,12 +462,29 @@ function Batch:route_click(row)
     for i, r in ipairs(self.ranges) do
       if row >= r.first and row <= r.last then
         local c = self.children[i]
-        if c.buf then
+        -- A closed child has only its header on screen, so the first click
+        -- reveals the body rather than reaching the child's own toggle.
+        if not c.open then
+          c.open = true
+          self:rerender()
+        elseif c.buf then
           c.buf:click({ row = math.max(row - r.first - r.shift, 0) })
         end
         return
       end
     end
+  end
+  -- The batch header drives every child at once, and reveals before it
+  -- expands so the two levels stay in step with a single child's clicks.
+  local closed = false
+  for _, c in ipairs(self.children) do
+    if not c.open then
+      c.open, closed = true, true
+    end
+  end
+  if closed then
+    self:rerender()
+    return
   end
   for _, c in ipairs(self.children) do
     if c.buf then
@@ -648,7 +670,7 @@ local function restore(input, output, _is_error, rctx)
       if c.status ~= STATUS.ERROR then
         local t = presentation_tool(c)
         local spans = t and t.header and t.header(c.params)
-        c.header = spans or plain_header(c.tool)
+        c.header = spans or plain_header(c.tool, c.params)
       end
     end
     return Batch.new(children, tol).buf

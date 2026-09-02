@@ -17,6 +17,7 @@ pub mod theme;
 pub mod thinking;
 pub mod tool_outputs;
 pub mod version;
+pub mod view;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

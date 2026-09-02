@@ -175,6 +175,11 @@ impl ToolExecResult {
         self
     }
 
+    pub fn with_annotation(mut self, annotation: Option<String>) -> Self {
+        self.annotation = annotation;
+        self
+    }
+
     pub fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = is_error;
         self

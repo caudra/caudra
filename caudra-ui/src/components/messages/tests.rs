@@ -4,7 +4,10 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
-use caudra_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME};
+use caudra_agent::tools::{
+    BASH_TOOL_NAME, BATCH_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME,
+    WRITE_TOOL_NAME,
+};
 use caudra_agent::{
     GrepFileEntry, GrepMatchGroup, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan,
     SpanStyle, ToolInput, ToolOutput,
@@ -202,7 +205,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
 #[test_case(
     WRITE_TOOL_NAME,
     ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
-    Some("42 bytes")
+    Some("1 lines")
     ; "write_bytes"
 )]
 #[test_case(
@@ -3529,10 +3532,12 @@ fn a_chart_that_fits_leaves_the_arrow_keys_alone() {
 
 const COMPACT_ROW_MSG: &str = "a compact tool call must occupy exactly one row";
 const COMPACT_GAPLESS_MSG: &str = "consecutive compact rows must stack without a blank line";
+const STREAMING_GAP_MSG: &str = "a live compact thought must occupy the same rows as a settled one";
 const COMPACT_CLICK_MSG: &str = "a compact row must open on click";
 const COMPACT_RESET_MSG: &str = "flipping density must drop every per-item override";
 const COMPACT_REHIDE_MSG: &str = "clicking through a compact row must end back at its header";
 const COMPACT_HOVER_MSG: &str = "a compact row must highlight exactly when a click would act";
+const CONTAINER_BODY_MSG: &str = "a container must keep its child rows in compact view";
 const SHELL_VIEW_STICKY_MSG: &str =
     "re-opening a shell card must restore the last raw/filtered view";
 const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
@@ -3615,6 +3620,49 @@ fn a_user_message_still_separates_from_the_compact_list() {
     assert!(
         panel.segment_heights()[1] > 1,
         "a user bubble keeps its card padding"
+    );
+}
+
+/// The gap used to appear while the model was thinking and disappear the
+/// moment the block settled, because only settled blocks reach the margin pass.
+#[test]
+fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut panel, &["t1"]);
+    render(&mut panel, 80, 24);
+    let settled = panel.last_total_lines;
+
+    panel.thinking_delta("weighing options");
+    render(&mut panel, 80, 24);
+    let streaming = panel.last_total_lines;
+
+    let mut msg = DisplayMessage::new(DisplayRole::Thinking, "weighing options".into());
+    msg.thinking_collapsed = true;
+    panel.streaming_thinking.clear();
+    panel.push(msg);
+    render(&mut panel, 80, 24);
+
+    assert_eq!(
+        streaming,
+        panel.last_total_lines,
+        "{STREAMING_GAP_MSG} (settled without a thought: {settled})"
+    );
+}
+
+#[test]
+fn an_expanded_streaming_thought_keeps_its_separator() {
+    let mut panel = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    panel.set_compact(false);
+    finished(&mut panel, &["t1"]);
+    render(&mut panel, 80, 24);
+    let settled = panel.last_total_lines;
+
+    panel.thinking_delta("weighing options");
+    render(&mut panel, 80, 24);
+
+    assert!(
+        panel.last_total_lines > settled + 1,
+        "expanded reasoning must keep the blank line above it"
     );
 }
 
@@ -3718,6 +3766,27 @@ fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str)
         );
         rebuild(&mut panel);
     }
+}
+
+/// A container's body is its list of child rows, and those already collapse
+/// to their own headers. Hiding it behind one more click would bury the
+/// structure the row exists to show.
+#[test_case(TASK_TOOL_NAME; "task")]
+#[test_case(BATCH_TOOL_NAME; "batch")]
+fn a_container_row_keeps_its_body_in_compact_view(tool: &'static str) {
+    let mut panel = compact_panel(&[("t1", tool)]);
+    finished(&mut panel, &["t1"]);
+    rebuild(&mut panel);
+
+    let container = panel.segment_heights()[0];
+    let mut plain = compact_panel(&[("t1", GREP_TOOL_NAME)]);
+    finished(&mut plain, &["t1"]);
+    rebuild(&mut plain);
+
+    assert!(
+        container > plain.segment_heights()[0],
+        "{CONTAINER_BODY_MSG}: {container} rows"
+    );
 }
 
 /// A short row opens on the first click and has nothing further to give, so

@@ -99,6 +99,7 @@ Headless mode waits for tracked background agents before evaluating. An impossib
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `code_execution` remains isolated. Config: `always_workflow = true`.
+- **`/view`**: switch the transcript between compact and expanded. Compact draws each tool call as one row that opens on click. `task` and `batch` keep their child rows in both densities, and those children open on click as well. The choice is remembered across restarts.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
