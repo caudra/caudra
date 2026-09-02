@@ -72,6 +72,10 @@ const CODE_WORKER_UNAVAILABLE: &str =
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
+/// Caudra owns authorization, so Workcell always hands over the mutation
+/// tools and every write still passes through the permission layer first.
+/// Withholding them here would hide tools the user is allowed to approve.
+const ALLOW_WRITE: bool = true;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -104,7 +108,7 @@ impl HostInner {
         if let Some(groups) = projects.get(&cwd) {
             return Ok(groups.clone());
         }
-        let files = FileToolGroup::new_unconfined(&cwd, true, None)
+        let files = FileToolGroup::new_unconfined(&cwd, ALLOW_WRITE, None)
             .await
             .map_err(|error| error.to_string())?;
         let shell = ShellToolGroup::new_unconfined(&cwd)
@@ -199,7 +203,7 @@ impl WorkcellHost {
         let project_cwd = std::fs::canonicalize(project_cwd.as_ref())
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
         let (files, shell, environment, code_result) = runtime.block_on(async {
-            let files = FileToolGroup::new_unconfined(&project_cwd, true, None).await;
+            let files = FileToolGroup::new_unconfined(&project_cwd, ALLOW_WRITE, None).await;
             let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
             let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
             let code = if let Some(worker) = worker_source {
@@ -299,7 +303,7 @@ impl WorkcellHost {
         &self,
         include_unavailable_code: bool,
     ) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
-        let mut specs = workcell::files::specs();
+        let mut specs = workcell::files::specs(ALLOW_WRITE);
         let year = jiff::Timestamp::now()
             .strftime("%Y")
             .to_string()
@@ -638,7 +642,7 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let inspection_input = input.clone();
-                let (group, mut resource) = self
+                let (group, resource) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
@@ -650,9 +654,6 @@ impl WorkcellInvocation {
                         Ok::<_, String>((groups.files, resource))
                     })
                     .await??;
-                if input.dry_run.unwrap_or(false) {
-                    resource.access = FileResourceAccess::Read;
-                }
                 check_stale(ctx, std::slice::from_ref(&resource.path))?;
                 let mut authorized = input.clone();
                 authorized.file_path = resource.path.to_string_lossy().into_owned();
@@ -668,7 +669,7 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let inspection_input = input.clone();
-                let (group, mut resource) = self
+                let (group, resource) = self
                     .host
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
@@ -680,9 +681,6 @@ impl WorkcellInvocation {
                         Ok::<_, String>((groups.files, resource))
                     })
                     .await??;
-                if input.dry_run.unwrap_or(false) {
-                    resource.access = FileResourceAccess::Read;
-                }
                 check_stale(ctx, std::slice::from_ref(&resource.path))?;
                 let mut authorized = input.clone();
                 authorized.file_path = resource.path.to_string_lossy().into_owned();
@@ -710,12 +708,7 @@ impl WorkcellInvocation {
                         Ok::<_, String>((groups.files, patch))
                     })
                     .await??;
-                let mut resources = patch.resources().to_vec();
-                if input.dry_run.unwrap_or(false) {
-                    for resource in &mut resources {
-                        resource.access = FileResourceAccess::Read;
-                    }
-                }
+                let resources = patch.resources().to_vec();
                 let stale_paths = resources
                     .iter()
                     .filter(|resource| {
@@ -1036,21 +1029,17 @@ impl WorkcellInvocation {
                     Err(error) => Err(error).into(),
                 }
             }
-            (Input::FileApplyPatch(input), PreparedExecution::FilePatch(group, patch)) => {
+            (Input::FileApplyPatch(_), PreparedExecution::FilePatch(group, patch)) => {
                 if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
                     return Err(error).into();
                 }
-                let dry_run = input.dry_run.unwrap_or(false);
-                let result = if dry_run {
-                    Ok(patch.preview().clone())
-                } else {
-                    self.host
-                        .run(ctx, move |token| async move {
-                            group.execute_prepared_patch(patch, &token).await
-                        })
-                        .await
-                        .and_then(|result| result.map_err(|error| error.to_string()))
-                };
+                let result = self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.execute_prepared_patch(patch, &token).await
+                    })
+                    .await
+                    .and_then(|result| result.map_err(|error| error.to_string()));
                 match result {
                     Ok(output) => {
                         if output.applied {
@@ -1877,6 +1866,7 @@ mod tests {
     use test_case::test_case;
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+    const PREVIEW_FLAG_MSG: &str = "a dry-run argument must fail the call rather than write";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
 
     fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
@@ -2086,7 +2076,7 @@ mod tests {
     fn registered_schema_is_the_workcell_schema_and_parsing_is_strict() {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
-        let expected = workcell::files::specs()
+        let expected = workcell::files::specs(ALLOW_WRITE)
             .into_iter()
             .find(|spec| spec.name == "file_read")
             .expect("file_read spec");
@@ -2108,7 +2098,7 @@ mod tests {
     fn index_uses_workcell_schema_contract_and_native_policy() {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
-        let expected = workcell::files::specs()
+        let expected = workcell::files::specs(ALLOW_WRITE)
             .into_iter()
             .find(|spec| spec.name == "index")
             .expect("index spec");
@@ -2580,8 +2570,10 @@ mod tests {
         );
     }
 
+    /// A write asks for write access and names the file it would change, so
+    /// the permission layer can prompt before anything is touched.
     #[test]
-    fn dry_run_file_write_has_read_intent_and_no_mutation_target() {
+    fn file_write_has_write_intent_and_a_mutation_target() {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
@@ -2589,11 +2581,7 @@ mod tests {
             .get("file_write")
             .expect("registered file write")
             .tool
-            .parse(&json!({
-                "filePath": "preview.txt",
-                "content": "preview",
-                "dryRun": true
-            }))
+            .parse(&json!({ "filePath": "target.txt", "content": "body" }))
             .expect("valid write input");
 
         let intent = smol::block_on(invocation.preflight(&ctx))
@@ -2603,9 +2591,31 @@ mod tests {
         assert_eq!(intent.resources.len(), 1);
         assert_eq!(
             intent.resources[0].access,
-            Some(PermissionResourceAccess::Read)
+            Some(PermissionResourceAccess::Write)
         );
-        assert!(invocation.mutation_targets(&ctx).is_empty());
+        assert!(!invocation.mutation_targets(&ctx).is_empty());
+    }
+
+    /// Write authority is Caudra's to grant, so a model cannot ask for a
+    /// preview that skips it. The flag that used to do so is now an unknown
+    /// argument, and an unknown argument fails the call instead of writing.
+    #[test]
+    fn a_mutation_tool_rejects_a_model_supplied_preview_flag() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        assert!(
+            registry
+                .get("file_write")
+                .expect("registered file write")
+                .tool
+                .parse(&json!({
+                    "filePath": "preview.txt",
+                    "content": "preview",
+                    "dryRun": true
+                }))
+                .is_err(),
+            "{PREVIEW_FLAG_MSG}"
+        );
     }
 
     #[test]

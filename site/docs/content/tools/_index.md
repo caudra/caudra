@@ -31,7 +31,6 @@ Writes a file to the local filesystem.
 |-----------|------|----------|-------------|
 | `filePath` | string | yes | File path inside the configured root. |
 | `content` | string | yes | Complete UTF-8 text content. |
-| `dryRun` | boolean | no | Preview the diff without changing the filesystem. |
 
 ### `file_edit` {#file_edit}
 
@@ -43,7 +42,6 @@ Performs exact string replacements in files.
 | `oldString` | string | yes | Exact text to replace. |
 | `newString` | string | yes | Replacement text. |
 | `replaceAll` | boolean | no | Replace every exact match. |
-| `dryRun` | boolean | no | Preview the diff without changing the filesystem. |
 
 ### `file_apply_patch` {#file_apply_patch}
 
@@ -52,7 +50,6 @@ Use file_apply_patch to edit files with a stripped-down, file-oriented diff form
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `patchText` | string | yes | Complete stripped-down file patch. |
-| `dryRun` | boolean | no | Validate and preview the patch without changing files. |
 
 ### `index` {#index}
 
