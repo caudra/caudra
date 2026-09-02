@@ -2075,7 +2075,10 @@ fn cancelling_from_inside_a_subagent_reports_error() {
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
     kb::EXIT.to_key_event(),
     kb::SCROLL_HALF_UP.to_key_event(),
+    kb::SCROLL_HALF_UP_ALT.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
+    kb::SCROLL_TOP_ALT.to_key_event(),
+    kb::SCROLL_BOTTOM_ALT.to_key_event(),
     kb::HELP.to_key_event(),
 ];
 
@@ -2095,6 +2098,10 @@ fn focus_queue(app: &mut App) {
     app.queue.set_focus_at(0);
 }
 
+/// Off both ends of the document so every blocked key would visibly move it:
+/// the top and half-page binds clamp it to 0, and unpinning is observable.
+const OVERLAY_SEED_SCROLL: u16 = 5;
+
 #[test_case(open_help as fn(&mut App) ; "help_modal")]
 #[test_case(open_search               ; "search_modal")]
 #[test_case(focus_queue               ; "queue_focus")]
@@ -2102,7 +2109,7 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     let mut app = app_with_subagent();
     setup(&mut app);
     let before = app.active_chat;
-    let scroll_before = app.chats[app.active_chat].scroll_top();
+    app.chats[before].restore_scroll(OVERLAY_SEED_SCROLL, false);
 
     for k in OVERLAY_BLOCKED_KEYS {
         app.update(Msg::Key(*k));
@@ -2114,8 +2121,12 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     );
     assert_eq!(
         app.chats[app.active_chat].scroll_top(),
-        scroll_before,
+        OVERLAY_SEED_SCROLL,
         "scroll changed through overlay"
+    );
+    assert!(
+        !app.chats[app.active_chat].auto_scroll(),
+        "auto-scroll re-armed through overlay"
     );
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(app.last_exit.is_none());
@@ -2189,26 +2200,99 @@ fn scroll_shortcuts_toggle_auto_scroll() {
     assert!(app.chats[0].auto_scroll());
 }
 
-#[test]
-fn page_down_scrolls_main_chat_half_page() {
-    let mut app = test_app();
-    for i in 0..50 {
+const TRANSCRIPT_LINES: usize = 50;
+const TRANSCRIPT_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 20,
+};
+
+fn main_chat_app() -> App {
+    test_app()
+}
+
+fn read_only_task_app() -> App {
+    let mut app = app_with_subagent();
+    app.focus_task(TASK_ID).unwrap();
+    app
+}
+
+/// A steerable task owns a second input box, the one path a transcript key
+/// could still be swallowed by.
+fn steerable_task_app() -> App {
+    let mut app = streaming_app();
+    let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_tx);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta { text: "x".into() },
+        info,
+    ));
+    app.focus_task(TASK_ID).unwrap();
+    assert!(app.active_subagent_can_steer());
+    app
+}
+
+/// Scrolling is claimed in `handle_global_key`, ahead of the main/subagent
+/// split, so one press moves whichever transcript is focused.
+#[test_case(main_chat_app as fn() -> App ; "main_chat")]
+#[test_case(read_only_task_app           ; "read_only_task")]
+#[test_case(steerable_task_app           ; "steerable_task")]
+fn transcript_scroll_keys_reach_every_chat(build: fn() -> App) {
+    let mut app = build();
+    for i in 0..TRANSCRIPT_LINES {
         app.active_chat()
             .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
     }
-    let area = Rect::new(0, 0, 80, 20);
-    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let backend = ratatui::backend::TestBackend::new(TRANSCRIPT_AREA.width, TRANSCRIPT_AREA.height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, area, false))
+        .draw(|frame| app.active_chat().view(frame, TRANSCRIPT_AREA, false))
         .unwrap();
-    app.active_chat().scroll_to_top();
-    let expected = app.active_chat().half_page() as u16;
+    let half = app.active_chat().half_page() as u16;
+
+    app.update(Msg::Key(kb::SCROLL_TOP_ALT.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0, "Ctrl+Home");
+    assert!(
+        !app.chats[app.active_chat].auto_scroll(),
+        "Ctrl+Home must unpin"
+    );
 
     app.update(Msg::Key(kb::SCROLL_HALF_DOWN.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), half, "PageDown");
 
+    app.update(Msg::Key(kb::SCROLL_HALF_UP_ALT.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0, "PageUp");
+
+    app.update(Msg::Key(kb::SCROLL_BOTTOM_ALT.to_key_event()));
+    assert!(app.chats[app.active_chat].auto_scroll(), "Ctrl+End");
+}
+
+#[test]
+fn transcript_scroll_binds_use_the_navigation_keys() {
+    assert_eq!(kb::SCROLL_HALF_UP_ALT.code, KeyCode::PageUp);
     assert_eq!(kb::SCROLL_HALF_DOWN.code, KeyCode::PageDown);
-    assert_eq!(app.active_chat().scroll_top(), expected);
+    assert_eq!(kb::SCROLL_TOP_ALT.code, KeyCode::Home);
+    assert_eq!(kb::SCROLL_BOTTOM_ALT.code, KeyCode::End);
+}
+
+/// Ctrl is what promotes Home/End to transcript navigation; bare presses stay
+/// on the input cursor.
+#[test]
+fn bare_home_and_end_keep_moving_the_input_cursor() {
+    let mut app = test_app();
+    for c in "abc".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    app.update(Msg::Key(key(KeyCode::Home)));
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    assert_eq!(app.input_box.buffer.value(), "!abc");
+
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.input_box.buffer.value(), "!abc?");
 }
 
 #[test]

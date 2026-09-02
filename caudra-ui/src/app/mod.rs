@@ -848,7 +848,7 @@ impl App {
         if key::VIEW_TOGGLE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::ViewToggle));
         }
-        if key::SCROLL_HALF_UP.matches(key) {
+        if key::SCROLL_HALF_UP.matches(key) || key::SCROLL_HALF_UP_ALT.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
             return Some(vec![]);
@@ -865,11 +865,11 @@ impl App {
                 return Some(vec![]);
             }
         }
-        if key::SCROLL_TOP.matches(key) {
+        if key::SCROLL_TOP.matches(key) || key::SCROLL_TOP_ALT.matches(key) {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
         }
-        if key::SCROLL_BOTTOM.matches(key) {
+        if key::SCROLL_BOTTOM.matches(key) || key::SCROLL_BOTTOM_ALT.matches(key) {
             self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }

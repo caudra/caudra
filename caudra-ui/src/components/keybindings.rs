@@ -132,6 +132,11 @@ pub mod key {
     pub const HELP: Bind = ctrl_bind!('h');
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
+    pub const SCROLL_HALF_UP_ALT: Bind = Bind {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        label: "PageUp",
+    };
     pub const SCROLL_HALF_DOWN: Bind = Bind {
         code: KeyCode::PageDown,
         modifiers: KeyModifiers::NONE,
@@ -153,6 +158,18 @@ pub mod key {
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
+    /// Ctrl is the only free Home/End modifier: bare Home/End move the input
+    /// cursor to the start/end of the line.
+    pub const SCROLL_TOP_ALT: Bind = Bind {
+        code: KeyCode::Home,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Home",
+    };
+    pub const SCROLL_BOTTOM_ALT: Bind = Bind {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+End",
+    };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
@@ -525,8 +542,14 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll half page up / down",
+        label: KeyLabel::Multi(&[key::SCROLL_HALF_UP.label, key::SCROLL_HALF_UP_ALT.label]),
+        description: "Scroll half page up",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SCROLL_HALF_DOWN.label),
+        description: "Scroll half page down",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -543,13 +566,13 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::SCROLL_TOP.label),
+        label: KeyLabel::Multi(&[key::SCROLL_TOP.label, key::SCROLL_TOP_ALT.label]),
         description: "Scroll to top",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
+        label: KeyLabel::Multi(&[key::SCROLL_BOTTOM.label, key::SCROLL_BOTTOM_ALT.label]),
         description: "Scroll to bottom",
         context: KeybindContext::Editing,
         platform: Platform::All,
