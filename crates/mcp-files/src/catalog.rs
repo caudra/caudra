@@ -113,14 +113,18 @@ const INDEX_DESCRIPTION: &str = r#"Return a compact structural overview of a sou
 /// Returns fresh values so a composing server may safely augment its own copy.
 /// Order is part of the public compatibility contract and mirrors registration
 /// order in the TypeScript MCP server.
+///
+/// `allow_write` must be the write authority of the group that will serve these
+/// tools. Advertising a mutation tool a call can never satisfy would spend model
+/// turns on a guaranteed failure, so the read-only catalog omits them entirely.
 #[cfg(feature = "mcp")]
-pub fn catalog() -> Vec<Tool> {
-    specs().iter().map(to_mcp_tool).collect()
+pub fn catalog(allow_write: bool) -> Vec<Tool> {
+    specs(allow_write).iter().map(to_mcp_tool).collect()
 }
 
 #[must_use]
-pub fn specs() -> Vec<ToolSpec> {
-    let specs = vec![
+pub fn specs(allow_write: bool) -> Vec<ToolSpec> {
+    let mut specs = vec![
         spec(
             "file_read",
             "Read file or directory",
@@ -148,34 +152,38 @@ pub fn specs() -> Vec<ToolSpec> {
             "file.search.v1",
             "file.grep.v1",
         ),
-        spec(
-            "file_write",
-            "Write file",
-            WRITE_DESCRIPTION,
-            write_schema(),
-            mutation_annotations(true),
-            "file.diff.v1",
-            "file.write.v1",
-        ),
-        spec(
-            "file_edit",
-            "Edit file",
-            EDIT_DESCRIPTION,
-            edit_schema(),
-            mutation_annotations(false),
-            "file.diff.v1",
-            "file.edit.v1",
-        ),
-        spec(
-            "file_apply_patch",
-            "Apply file patch",
-            PATCH_DESCRIPTION,
-            patch_schema(),
-            mutation_annotations(false),
-            "file.diff.v1",
-            "file.patch.v1",
-        ),
     ];
+    if allow_write {
+        specs.extend([
+            spec(
+                "file_write",
+                "Write file",
+                WRITE_DESCRIPTION,
+                write_schema(),
+                mutation_annotations(true),
+                "file.diff.v1",
+                "file.write.v1",
+            ),
+            spec(
+                "file_edit",
+                "Edit file",
+                EDIT_DESCRIPTION,
+                edit_schema(),
+                mutation_annotations(false),
+                "file.diff.v1",
+                "file.edit.v1",
+            ),
+            spec(
+                "file_apply_patch",
+                "Apply file patch",
+                PATCH_DESCRIPTION,
+                patch_schema(),
+                mutation_annotations(false),
+                "file.diff.v1",
+                "file.patch.v1",
+            ),
+        ]);
+    }
     append_index_spec(specs)
 }
 
@@ -353,13 +361,10 @@ fn write_schema() -> Map<String, Value> {
             "content": {
                 "type": "string",
                 "description": "Complete UTF-8 text content."
-            },
-            "dryRun": {
-                "description": "Preview the diff without changing the filesystem.",
-                "type": "boolean"
             }
         },
         "required": ["filePath", "content"],
+        "additionalProperties": false,
         "$schema": DRAFT_07
     }))
 }
@@ -385,13 +390,10 @@ fn edit_schema() -> Map<String, Value> {
             "replaceAll": {
                 "description": "Replace every exact match.",
                 "type": "boolean"
-            },
-            "dryRun": {
-                "description": "Preview the diff without changing the filesystem.",
-                "type": "boolean"
             }
         },
         "required": ["filePath", "oldString", "newString"],
+        "additionalProperties": false,
         "$schema": DRAFT_07
     }))
 }
@@ -404,13 +406,10 @@ fn patch_schema() -> Map<String, Value> {
                 "type": "string",
                 "minLength": 1,
                 "description": "Complete stripped-down file patch."
-            },
-            "dryRun": {
-                "description": "Validate and preview the patch without changing files.",
-                "type": "boolean"
             }
         },
         "required": ["patchText"],
+        "additionalProperties": false,
         "$schema": DRAFT_07
     }))
 }
@@ -529,7 +528,7 @@ mod tests {
 
     #[test]
     fn catalog_has_compatible_order_annotations_and_metadata() {
-        let tools = catalog();
+        let tools = catalog(true);
         let expected = vec![
             "file_read",
             "file_glob",
@@ -561,7 +560,7 @@ mod tests {
         );
         assert_eq!(tools[0].input_schema["$schema"], json!(super::DRAFT_07));
 
-        for (spec, tool) in specs().iter().zip(&tools) {
+        for (spec, tool) in specs(true).iter().zip(&tools) {
             assert_eq!(spec.name, tool.name);
             assert_eq!(spec.description, tool.description.as_deref().unwrap());
             assert_eq!(&spec.input_schema, tool.input_schema.as_ref());
@@ -572,7 +571,7 @@ mod tests {
         }
         #[cfg(feature = "index")]
         {
-            let index = specs().pop().expect("index spec");
+            let index = specs(true).pop().expect("index spec");
             assert_eq!(index.name, "index");
             assert_eq!(index.contract_id, "file.index.v1");
             assert_eq!(index.presentation, "file.index.v1");
@@ -586,6 +585,38 @@ mod tests {
                     crate::INDEX_MAX_PATH_BYTES
                 ))
             );
+        }
+    }
+
+    #[test]
+    fn read_only_catalog_omits_every_mutation_tool_and_keeps_order() {
+        let names = catalog(false)
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        let expected = vec!["file_read", "file_glob", "file_grep"];
+        #[cfg(feature = "index")]
+        let expected = expected.into_iter().chain(["index"]).collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        assert_eq!(specs(false).len(), names.len());
+    }
+
+    #[test]
+    fn mutation_schemas_reject_unknown_arguments() {
+        // A stale `dryRun` argument must fail loudly rather than be dropped into
+        // an unintended write.
+        for spec in specs(true)
+            .into_iter()
+            .filter(|spec| spec.name.starts_with("file_") && spec.name != "file_read")
+            .filter(|spec| spec.annotations.read_only_hint == Some(false))
+        {
+            assert_eq!(
+                spec.input_schema["additionalProperties"],
+                json!(false),
+                "{} must reject unknown arguments",
+                spec.name
+            );
+            assert!(spec.input_schema["properties"].get("dryRun").is_none());
         }
     }
 }

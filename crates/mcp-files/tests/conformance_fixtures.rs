@@ -15,6 +15,7 @@ const CASES: &[&str] = &[
     "glob.json",
     "grep.json",
     "write.json",
+    "write-without-write-access.json",
     "edit.json",
     "apply-patch.json",
     #[cfg(feature = "index")]
@@ -54,17 +55,26 @@ async fn run_case(case: &str) {
         .await
         .unwrap_or_else(|error| panic!("initialize {case}: {error}"));
     let input = resolve_assets(fixture["input"].clone(), &fixture_root);
-    let result = group
-        .dispatch(
-            fixture["tool"].as_str().expect("fixture tool"),
-            input,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("known fixture tool")
-        .unwrap_or_else(|error| panic!("dispatch {case}: {error}"));
+    let tool = fixture["tool"].as_str().expect("fixture tool");
+    let dispatched = group.dispatch(tool, input, CancellationToken::new()).await;
 
-    assert_result(case, &result, &fixture["expected"], temporary.path());
+    // A case may assert that the configuration removes the tool entirely. The
+    // group must then neither advertise nor answer for the name.
+    if fixture["expected"]["toolAvailable"] == json!(false) {
+        assert!(
+            dispatched.is_none(),
+            "{case}: {tool} must not be dispatchable"
+        );
+        assert!(
+            !group.catalog().iter().any(|listed| listed.name == tool),
+            "{case}: {tool} must not be advertised"
+        );
+    } else {
+        let result = dispatched
+            .expect("known fixture tool")
+            .unwrap_or_else(|error| panic!("dispatch {case}: {error}"));
+        assert_result(case, &result, &fixture["expected"], temporary.path());
+    }
     assert_post_filesystem(case, temporary.path(), &fixture_root, &fixture["expected"]);
 }
 

@@ -112,33 +112,29 @@ pub struct FileGrepInput {
     pub include: Option<String>,
 }
 
+// Mutation inputs reject unknown fields so a misspelled or stale argument fails
+// loudly instead of being dropped into a silent, unintended write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FileWriteInput {
     pub file_path: String,
     pub content: String,
-    #[serde(default)]
-    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FileEditInput {
     pub file_path: String,
     pub old_string: String,
     pub new_string: String,
     #[serde(default)]
     pub replace_all: Option<bool>,
-    #[serde(default)]
-    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FileApplyPatchInput {
     pub patch_text: String,
-    #[serde(default)]
-    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

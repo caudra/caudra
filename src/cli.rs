@@ -76,7 +76,7 @@ pub struct RawOptions {
     #[arg(long = "tool-group", value_enum, action = clap::ArgAction::Append)]
     pub groups: Vec<ToolGroup>,
 
-    /// Permit non-dry-run file mutations.
+    /// Permit file mutations and expose the file mutation tools.
     #[arg(long)]
     pub allow_write: bool,
 

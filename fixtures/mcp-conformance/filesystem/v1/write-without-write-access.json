@@ -1,0 +1,45 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.write.absent-without-write-access",
+  "provenance": [
+    "rust/crates/mcp-files/src/catalog.rs",
+    "rust/crates/mcp-files/src/group.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_write",
+  "input": {
+    "filePath": "new.txt",
+    "content": {
+      "$asset": "assets/filesystem/new-two.txt",
+      "encoding": "utf8"
+    }
+  },
+  "configuration": {
+    "allowWrite": false
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "toolAvailable": false,
+    "postFilesystem": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

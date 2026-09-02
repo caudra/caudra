@@ -34,7 +34,6 @@ async fn protocol_ceiling_rejects_patch_before_publication() {
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text: "*** Begin Patch\n*** Delete File: one.txt\n*** Delete File: two.txt\n*** End Patch".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -74,7 +73,6 @@ async fn aggregate_plan_budget_fails_before_retained_changes_publish() {
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text: patch.into(),
-                dry_run: None,
             },
             &token(),
         )

@@ -12,7 +12,8 @@ otherwise.
 
 ## Layout
 
-- `catalog/v1/`: ordered MCP tool catalogs emitted by the Rust server.
+- `catalog/v1/`: ordered MCP tool catalogs emitted by the Rust server. The filesystem catalog has one
+  case per write authority, because the mutation tools exist only when the process can write.
 - `filesystem/v1/`: independent filesystem calls with setup, normalized MCP output, and complete
   expected post-state.
 - `shell/v1/`: shell calls that pin the filtered model rendering against the unfiltered capture.
@@ -32,10 +33,14 @@ optional sections:
   `bodyEncoding` of `base64` decodes the asset before constructing the response.
 - `configuration`: non-secret execution configuration. Shell cases select a reviewed permission
   policy by name in `shellPolicy` and set `shellOutputFilter`, because shell policy and filtering are
-  startup configuration rather than tool input.
+  startup configuration rather than tool input. Filesystem and filesystem-catalog cases set
+  `allowWrite`, because write authority is startup configuration that a call cannot negotiate.
 - `expected.contentText`: exact model-visible text.
 - `expected.structuredContent`: structurally compared JSON output.
 - `expected.isError`: expected MCP tool-error classification.
+- `expected.toolAvailable`: `false` asserts that the case configuration removes the tool, so the
+  implementation neither advertises nor dispatches the name. Such a case has no result to compare and
+  asserts only the unchanged post-state.
 - `expected.postFilesystem`: complete, sorted root-relative file state after the call. Asset content
   is compared after UTF-8 loading.
 - `expected.requests`: exact request order when source/tests establish it.

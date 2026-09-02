@@ -59,8 +59,10 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - Shell policy is startup configuration. Never add policy, approval, or bypass fields to tool input.
 - Describe shell policy as best effort. Allowed interpreters and programs can execute scripts or
   equivalent behavior that is not represented by the visible command scope.
-- File mutation remains preview-only unless write access is explicit: `--allow-write` in the server,
-  the `allow_write` argument in native constructors.
+- File mutation requires explicit write access: `--allow-write` in the server, the `allow_write`
+  argument in native constructors. Without it the mutation tools are absent from the catalog and
+  undispatchable, and the crate denies direct native calls. Never add a tool-input field that can
+  soften, preview, or otherwise negotiate that decision.
 - Prepared operations must disclose every resource they would touch before any effect occurs, so a
   native host can authorize them.
 - Container HTTP bind must remain authenticated. Do not add an unauthenticated wildcard bind.

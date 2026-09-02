@@ -32,17 +32,15 @@ impl FilesystemCore {
             None,
             self.limits.max_diff_bytes,
         )?;
-        let applied = self.should_apply(input.dry_run)?;
-        if applied {
-            self.commit_write(&file_path, &input.content, token, false, None)
-                .await?;
-        }
+        self.require_write()?;
+        self.commit_write(&file_path, &input.content, token, false, None)
+            .await?;
         Ok(FileWriteOutput {
             kind: FileWriteKind::Write,
             path: path_string(&file_path),
             relative_path: self.policy.relative(&file_path)?,
             existed,
-            applied,
+            applied: true,
             diff,
         })
     }

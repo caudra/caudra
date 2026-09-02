@@ -128,7 +128,7 @@ impl FileToolGroup {
 
     #[cfg(feature = "mcp")]
     pub fn catalog(&self) -> Vec<Tool> {
-        catalog()
+        catalog(self.core.allow_write)
     }
 
     pub async fn file_read(
@@ -349,7 +349,8 @@ impl FileToolGroup {
     }
 
     /// Fully plan a patch for host authorization without mutating the filesystem.
-    /// `dry_run` is ignored because publication only occurs through `execute_prepared_patch`.
+    /// Planning does not require write access; publication occurs only through
+    /// `execute_prepared_patch`, which does.
     pub async fn prepare_apply_patch(
         &self,
         input: FileApplyPatchInput,
@@ -442,18 +443,26 @@ impl FileToolGroup {
                 Ok(input) => run(self.file_grep(input, &token).await),
                 Err(error) => tool_error(error),
             },
-            "file_write" => match parse_arguments::<FileWriteInput>(name, arguments) {
-                Ok(input) => run(self.file_write(input, &token).await),
-                Err(error) => tool_error(error),
-            },
-            "file_edit" => match parse_arguments::<FileEditInput>(name, arguments) {
-                Ok(input) => run(self.file_edit(input, &token).await),
-                Err(error) => tool_error(error),
-            },
-            "file_apply_patch" => match parse_arguments::<FileApplyPatchInput>(name, arguments) {
-                Ok(input) => run(self.file_apply_patch(input, &token).await),
-                Err(error) => tool_error(error),
-            },
+            // Resolution must match enumeration: a read-only catalog omits these
+            // names, so this group does not own them and must not answer for them.
+            "file_write" if self.core.allow_write => {
+                match parse_arguments::<FileWriteInput>(name, arguments) {
+                    Ok(input) => run(self.file_write(input, &token).await),
+                    Err(error) => tool_error(error),
+                }
+            }
+            "file_edit" if self.core.allow_write => {
+                match parse_arguments::<FileEditInput>(name, arguments) {
+                    Ok(input) => run(self.file_edit(input, &token).await),
+                    Err(error) => tool_error(error),
+                }
+            }
+            "file_apply_patch" if self.core.allow_write => {
+                match parse_arguments::<FileApplyPatchInput>(name, arguments) {
+                    Ok(input) => run(self.file_apply_patch(input, &token).await),
+                    Err(error) => tool_error(error),
+                }
+            }
             #[cfg(feature = "index")]
             "index" => match parse_arguments::<IndexInput>(name, arguments) {
                 Ok(input) => run_index(self.index(input, &token).await),

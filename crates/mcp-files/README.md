@@ -30,8 +30,8 @@ methods are available alongside JSON MCP dispatch.
 | `file_read`        | Bounded file windows and deterministic directory listings.                 |
 | `file_glob`        | Bounded `*`, `**`, `?`, and brace matching with UTF-16 wildcard semantics. |
 | `file_grep`        | Linear-time regex search over bounded UTF-8 text.                          |
-| `file_write`       | Dry-run diff or atomic same-directory replacement.                         |
-| `file_edit`        | Exact unique replacement, optional replace-all, and dry-run diff.          |
+| `file_write`       | Atomic same-directory replacement with a bounded diff.                     |
+| `file_edit`        | Exact unique replacement with optional replace-all and a bounded diff.     |
 | `file_apply_patch` | Validated add, update, move, and delete sections with bounded results.     |
 | `index`            | Feature-gated source skeletons and deterministic typed directory listings. |
 
@@ -62,7 +62,11 @@ backtracking controlled by model input.
   inspection and extraction; they do not cap tree-sitter construction memory.
 - Index directory `totalCount` is exact for complete scans and a lower bound on processed visible entries
   when `truncated` is true.
-- Mutations are read-only by default; dry-run validation remains available.
+- Write authority is a constructor argument, never tool input. Without it the mutation tools are
+  absent from the catalog, `dispatch` does not own their names, and direct native calls are denied.
+- Mutation inputs reject unknown fields, so a stale or misspelled argument cannot be dropped into an
+  unintended write.
+- `prepare_apply_patch` plans without write access; only `execute_prepared_patch` requires it.
 - Existing mode bits are preserved and new files use mode `0600` on supported platforms.
 - Replacements use exclusive same-directory temporary files and atomic rename.
 - Source identity and content are revalidated before edit or patch publication.

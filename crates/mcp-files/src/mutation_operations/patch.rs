@@ -24,15 +24,13 @@ impl FilesystemCore {
         check_cancelled(token)?;
         enforce_bytes("patchText", &input.patch_text, self.limits.max_patch_bytes)?;
         let changes = self.plan_patch(&input.patch_text, token).await?;
-        let applied = self.should_apply(input.dry_run)?;
-        let output = self.patch_output(&changes, applied)?;
+        self.require_write()?;
+        let output = self.patch_output(&changes, true)?;
         self.validate_patch_output(&output)?;
         // The exact text + structured MCP response shape, including a
         // conservative envelope, fits the MCP raw result ceiling
         // before the first file is published.
-        if applied {
-            publish_patch(self, &changes, token).await?;
-        }
+        publish_patch(self, &changes, token).await?;
         Ok(output)
     }
 
@@ -54,7 +52,7 @@ impl FilesystemCore {
         changes: &[PlannedChange],
         token: &CancellationToken,
     ) -> Result<(), FilesystemError> {
-        self.should_apply(None)?;
+        self.require_write()?;
         publish_patch(self, changes, token).await
     }
 

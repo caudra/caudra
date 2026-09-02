@@ -50,15 +50,16 @@ impl FilesystemCore {
         self.policy.root()
     }
 
-    pub(crate) fn should_apply(&self, dry_run: Option<bool>) -> Result<bool, FilesystemError> {
-        if dry_run.unwrap_or(false) {
-            return Ok(false);
-        }
+    /// Write authority is immutable process configuration, so a call can never
+    /// negotiate it. Protocol hosts never reach this because the mutation tools
+    /// are absent from a read-only catalog; native hosts calling the group
+    /// directly are denied here.
+    pub(crate) fn require_write(&self) -> Result<(), FilesystemError> {
         if !self.allow_write {
             return Err(FilesystemError::message(
-                "Filesystem is read-only; restart with write access or use dryRun",
+                "Filesystem is read-only; restart with write access",
             ));
         }
-        Ok(true)
+        Ok(())
     }
 }

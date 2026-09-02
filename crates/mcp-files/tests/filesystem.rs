@@ -75,7 +75,6 @@ async fn denies_lexical_and_symlink_escapes_for_reads_and_new_writes() {
             FileWriteInput {
                 file_path: "escape/new.txt".into(),
                 content: "bad".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -85,7 +84,6 @@ async fn denies_lexical_and_symlink_escapes_for_reads_and_new_writes() {
     let patch = files
         .file_apply_patch(
             FileApplyPatchInput {
-                dry_run: Some(true),
                 patch_text:
                     "*** Begin Patch\n*** Add File: ../outside/patched.txt\n+bad\n*** End Patch"
                         .into(),
@@ -446,7 +444,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
             FileWriteInput {
                 file_path: "editable.bin".into(),
                 content: "alpha\n".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -459,7 +456,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
                 old_string: "alpha".into(),
                 new_string: "beta".into(),
                 replace_all: None,
-                dry_run: None,
             },
             &token(),
         )
@@ -471,7 +467,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
                 patch_text:
                     "*** Begin Patch\n*** Update File: editable.bin\n@@\n-beta\n+gamma\n*** End Patch"
                         .into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -488,7 +483,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
                 FileWriteInput {
                     file_path: "document.txt".into(),
                     content: "replacement\n".into(),
-                    dry_run: Some(true),
                 },
                 &token(),
             )
@@ -501,7 +495,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
                     old_string: "needle".into(),
                     new_string: "replacement".into(),
                     replace_all: None,
-                    dry_run: Some(true),
                 },
                 &token(),
             )
@@ -511,7 +504,6 @@ async fn classifies_file_content_independently_from_extensions_across_operations
             .file_apply_patch(
                 FileApplyPatchInput {
                     patch_text: "*** Begin Patch\n*** Update File: document.txt\n@@\n-%PDF-1.7\n+replacement\n needle\n*** End Patch".into(),
-                    dry_run: Some(true),
                 },
                 &token(),
             )
@@ -624,51 +616,57 @@ async fn directory_scans_stop_at_the_traversal_budget() {
     assert!(truncated);
 }
 
+/// Write authority is immutable process configuration. A call carries no field
+/// that could soften it, so every mutation entry point is denied outright.
 #[tokio::test]
-async fn is_read_only_by_default_but_permits_mutation_previews() {
+async fn is_read_only_by_default_and_offers_no_way_to_mutate() {
     let fixture = fixture();
     let files = FileToolGroup::new(&fixture.root, false, None)
         .await
         .expect("tool group");
-    let preview = files
-        .file_write(
-            FileWriteInput {
-                file_path: "new.txt".into(),
-                content: "hello\n".into(),
-                dry_run: Some(true),
-            },
-            &token(),
-        )
-        .await
-        .expect("preview");
-    assert!(!preview.applied);
-    assert!(!fixture.root.join("new.txt").exists());
-
     let denied = files
         .file_write(
             FileWriteInput {
                 file_path: "new.txt".into(),
                 content: "hello\n".into(),
-                dry_run: None,
             },
             &token(),
         )
         .await
         .expect_err("read-only");
     assert!(denied.to_string().contains("read-only"));
+    assert!(!fixture.root.join("new.txt").exists());
 
-    let patch = files
+    let patch = "*** Begin Patch\n*** Add File: preview.txt\n+preview\n*** End Patch";
+    let denied = files
         .file_apply_patch(
             FileApplyPatchInput {
-                patch_text: "*** Begin Patch\n*** Add File: preview.txt\n+preview\n*** End Patch"
-                    .into(),
-                dry_run: Some(true),
+                patch_text: patch.into(),
             },
             &token(),
         )
         .await
-        .expect("patch preview");
-    assert!(!patch.applied);
+        .expect_err("read-only");
+    assert!(denied.to_string().contains("read-only"));
+    assert!(!fixture.root.join("preview.txt").exists());
+
+    // Planning for host authorization is still allowed, but publication is not,
+    // so a prepared patch cannot become a write without startup authority.
+    let prepared = files
+        .prepare_apply_patch(
+            FileApplyPatchInput {
+                patch_text: patch.into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepare without write access");
+    assert!(!prepared.preview().applied);
+    let denied = files
+        .execute_prepared_patch(prepared, &token())
+        .await
+        .expect_err("read-only");
+    assert!(denied.to_string().contains("read-only"));
     assert!(!fixture.root.join("preview.txt").exists());
 }
 
@@ -686,7 +684,6 @@ async fn atomically_replaces_files_preserves_mode_and_leaves_no_temporary_files(
             FileWriteInput {
                 file_path: "notes.txt".into(),
                 content: "replacement\n".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -716,7 +713,6 @@ async fn exclusive_patch_adds_never_overwrite_existing_or_racing_files() {
                 patch_text:
                     "*** Begin Patch\n*** Add File: existing.txt\n+replacement\n*** End Patch"
                         .into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -736,11 +732,9 @@ async fn exclusive_patch_adds_never_overwrite_existing_or_racing_files() {
         .expect("second group");
     let first_patch = FileApplyPatchInput {
         patch_text: "*** Begin Patch\n*** Add File: raced.txt\n+first\n*** End Patch".into(),
-        dry_run: None,
     };
     let second_patch = FileApplyPatchInput {
         patch_text: "*** Begin Patch\n*** Add File: raced.txt\n+second\n*** End Patch".into(),
-        dry_run: None,
     };
     let first_token = token();
     let second_token = token();
@@ -764,7 +758,6 @@ async fn multi_file_patch_keeps_changes_published_before_a_later_failure() {
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text: "*** Begin Patch\n*** Add File: published.txt\n+first\n*** Add File: published.txt/second.txt\n+second\n*** End Patch".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -793,7 +786,6 @@ async fn writes_edits_and_applies_add_update_move_and_delete_patches() {
             FileWriteInput {
                 file_path: "new.txt".into(),
                 content: "one\ntwo\n".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -806,7 +798,6 @@ async fn writes_edits_and_applies_add_update_move_and_delete_patches() {
                 old_string: "two".into(),
                 new_string: "three".into(),
                 replace_all: None,
-                dry_run: None,
             },
             &token(),
         )
@@ -814,25 +805,26 @@ async fn writes_edits_and_applies_add_update_move_and_delete_patches() {
         .expect("edit");
 
     let patch_text = "*** Begin Patch\n*** Update File: new.txt\n*** Move to: moved.txt\n@@\n-one\n+ONE\n three\n*** Add File: added.txt\n+added\n*** Delete File: notes.txt\n*** End Patch";
-    let preview = files
-        .file_apply_patch(
+    // Planning is the only way to see a patch before it lands, and dropping the
+    // prepared value leaves the filesystem untouched.
+    let prepared = files
+        .prepare_apply_patch(
             FileApplyPatchInput {
                 patch_text: patch_text.into(),
-                dry_run: Some(true),
             },
             &token(),
         )
         .await
-        .expect("preview");
-    assert!(!preview.applied);
-    assert_eq!(preview.files.len(), 3);
+        .expect("prepare");
+    assert!(!prepared.preview().applied);
+    assert_eq!(prepared.preview().files.len(), 3);
+    drop(prepared);
     assert!(fixture.root.join("new.txt").exists());
 
     let applied = files
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text: patch_text.into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -865,7 +857,6 @@ async fn exact_edit_requires_unique_match_unless_replace_all_is_set() {
                 old_string: "old".into(),
                 new_string: "new".into(),
                 replace_all: None,
-                dry_run: None,
             },
             &token(),
         )
@@ -879,7 +870,6 @@ async fn exact_edit_requires_unique_match_unless_replace_all_is_set() {
                 old_string: "old".into(),
                 new_string: "new".into(),
                 replace_all: Some(true),
-                dry_run: None,
             },
             &token(),
         )
@@ -892,7 +882,7 @@ async fn exact_edit_requires_unique_match_unless_replace_all_is_set() {
 }
 
 #[tokio::test]
-async fn bounds_diff_previews_and_rejects_oversized_patch_results_before_publication() {
+async fn bounds_reported_diffs_and_rejects_oversized_patch_results_before_publication() {
     let fixture = fixture();
     fs::write(fixture.root.join("large.txt"), "old\n".repeat(20_000)).expect("large file");
     let files = FileToolGroup::new(
@@ -907,27 +897,34 @@ async fn bounds_diff_previews_and_rejects_oversized_patch_results_before_publica
     .await
     .expect("tool group");
 
-    let preview = files
+    // A diff too large to report is truncated for the model rather than failing
+    // the mutation, so the edit still lands in full.
+    let edited = files
         .file_edit(
             FileEditInput {
                 file_path: "large.txt".into(),
                 old_string: "old".into(),
                 new_string: "new".into(),
                 replace_all: Some(true),
-                dry_run: Some(true),
             },
             &token(),
         )
         .await
-        .expect("bounded preview");
-    assert!(preview.diff.truncated);
-    assert!(preview.diff.patch.len() <= 128);
+        .expect("bounded edit");
+    assert!(edited.applied);
+    assert!(edited.diff.truncated);
+    assert!(edited.diff.patch.len() <= 128);
     assert_eq!(
-        serde_json::to_value(&preview).expect("serialized preview")["diff"]["truncated"],
+        serde_json::to_value(&edited).expect("serialized edit")["diff"]["truncated"],
         serde_json::json!(true)
     );
+    assert!(
+        fs::read_to_string(fixture.root.join("large.txt"))
+            .expect("edited file")
+            .starts_with("new\n")
+    );
 
-    let patch_preview_files = FileToolGroup::new(
+    let bounded_patch_files = FileToolGroup::new(
         &fixture.root,
         true,
         Some(FilesystemLimits {
@@ -937,19 +934,19 @@ async fn bounds_diff_previews_and_rejects_oversized_patch_results_before_publica
         }),
     )
     .await
-    .expect("patch preview group");
-    let patch_preview = patch_preview_files
+    .expect("bounded patch group");
+    let bounded_patch = bounded_patch_files
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text: "*** Begin Patch\n*** Delete File: large.txt\n*** End Patch".into(),
-                dry_run: Some(true),
             },
             &token(),
         )
         .await
-        .expect("bounded patch preview");
-    assert!(patch_preview.truncated);
-    assert!(patch_preview.files[0].truncated);
+        .expect("bounded patch");
+    assert!(bounded_patch.truncated);
+    assert!(bounded_patch.files[0].truncated);
+    assert!(!fixture.root.join("large.txt").exists());
 
     let original = fs::read_to_string(fixture.root.join("notes.txt")).expect("original");
     let result = files
@@ -958,7 +955,6 @@ async fn bounds_diff_previews_and_rejects_oversized_patch_results_before_publica
                 patch_text:
                     "*** Begin Patch\n*** Update File: notes.txt\n@@\n-alpha\n+changed\n*** End Patch"
                         .into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -1050,13 +1046,7 @@ async fn prepared_native_patch_exposes_every_resource_and_mutates_only_on_execut
     );
 
     let prepared = files
-        .prepare_apply_patch(
-            FileApplyPatchInput {
-                patch_text,
-                dry_run: None,
-            },
-            &token(),
-        )
+        .prepare_apply_patch(FileApplyPatchInput { patch_text }, &token())
         .await
         .expect("prepared patch");
 
@@ -1090,7 +1080,6 @@ async fn unconfined_read_only_hosting_rejects_mutation() {
             FileWriteInput {
                 file_path: outside_file.to_string_lossy().into_owned(),
                 content: "overwritten\n".into(),
-                dry_run: None,
             },
             &token(),
         )
@@ -1098,7 +1087,7 @@ async fn unconfined_read_only_hosting_rejects_mutation() {
         .expect_err("read-only hosting must reject writes");
     assert_eq!(
         error.to_string(),
-        "Filesystem is read-only; restart with write access or use dryRun"
+        "Filesystem is read-only; restart with write access"
     );
     assert_eq!(fs::read_to_string(&outside_file).unwrap(), "secret\n");
 }

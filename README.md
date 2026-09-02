@@ -60,7 +60,7 @@ sequenceDiagram
 | Group | Tools | Notes |
 | --- | --- | --- |
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
-| Files | `file_write`, `file_edit`, `file_apply_patch` | Preview-only unless `--allow-write` is set. |
+| Files | `file_write`, `file_edit`, `file_apply_patch` | Present in the catalog only when `--allow-write` is set. |
 | Files | `index` | Bounded source skeletons and deterministic directory listings. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
@@ -555,6 +555,13 @@ Confinement is a property of the server's constructor, not of the crate. Native 
 unconfined resolution, which disables both root confinement and protected-path denial; see
 [Embedding](#embedding).
 
+Write authority is immutable process configuration and no tool argument can negotiate it. Without
+`--allow-write` the server omits `file_write`, `file_edit`, and `file_apply_patch` from `tools/list`
+and does not route calls to those names, so a model is never offered a mutation that could only fail.
+The three mutation schemas also reject unknown arguments, so a stale or misspelled field fails the
+call instead of being silently dropped into an unintended write. Native hosts that call the group
+directly are denied at the crate boundary regardless of the catalog.
+
 The standalone defaults limit individual files and writes to 5 MiB, model-facing reads to 50 KiB,
 lines to 2,000 characters, read windows to 2,000 lines, search results to 100, and broad traversal to
 10,000 entries. Results report truncation when a presentation bound is reached. Embedders using the
@@ -615,11 +622,9 @@ large file.
 
 - `filePath` and `content` are required. Existing files should normally be read first so an intentional
   full replacement is reviewable.
-- `dryRun: true` validates the operation and returns a bounded diff without changing the filesystem.
-- Without `--allow-write`, a non-dry-run call is rejected. Workcell never promotes a preview to a write
-  dynamically; write authority is immutable process configuration.
-- Applied writes use an exclusive same-directory temporary file and atomic rename. Existing mode bits
-  are preserved, while new files use mode `0600` on supported platforms.
+- The result carries a bounded unified diff of the change that was applied.
+- Writes use an exclusive same-directory temporary file and atomic rename. Existing mode bits are
+  preserved, while new files use mode `0600` on supported platforms.
 
 #### `file_edit`
 
@@ -628,7 +633,6 @@ large file.
 - `filePath`, `oldString`, and `newString` are required.
 - By default, the edit fails if `oldString` is absent or appears more than once. Set `replaceAll: true`
   only when replacing every exact occurrence is intentional.
-- `dryRun: true` returns the planned diff. Applied edits require `--allow-write`.
 - Workcell revalidates source identity and content before publication, then uses the same atomic
   same-directory replacement path as `file_write`.
 
@@ -641,8 +645,8 @@ delete sections.
   for every file.
 - Add-file content uses `+` lines. Update sections use contextual hunks and may include
   `*** Move to:`. Delete sections remove an existing file.
-- `dryRun: true` validates the complete patch and returns its bounded plan without publishing files.
-  Applied patches require `--allow-write`.
+- The complete patch is validated and its result checked against the MCP size ceiling before the
+  first file is published.
 - Patch text, section count, file sizes, plan memory, diffs, and final MCP output are independently
   bounded. Source files are revalidated before publication.
 - A multi-file patch is validated as a unit but is not transactional after publication starts. A later

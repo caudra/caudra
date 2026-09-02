@@ -6,13 +6,8 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_files::{FileToolGroup, catalog};
 
-#[test]
-fn exposes_exact_order_titles_schemas_annotations_and_presentations() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../fixtures/mcp-conformance/catalog/v1/filesystem-tools.json"
-    ))
-    .expect("filesystem catalog fixture");
-    let actual = serde_json::to_value(catalog()).expect("serialize filesystem catalog");
+fn expected_tools(fixture: &str) -> Value {
+    let fixture: Value = serde_json::from_str(fixture).expect("filesystem catalog fixture");
     #[cfg(feature = "index")]
     let expected = fixture["expected"]["tools"].clone();
     #[cfg(not(feature = "index"))]
@@ -21,7 +16,85 @@ fn exposes_exact_order_titles_schemas_annotations_and_presentations() {
         expected.as_array_mut().expect("fixture tools").pop();
         expected
     };
+    expected
+}
+
+#[test]
+fn exposes_exact_order_titles_schemas_annotations_and_presentations() {
+    let expected = expected_tools(include_str!(
+        "../../../fixtures/mcp-conformance/catalog/v1/filesystem-tools.json"
+    ));
+    let actual = serde_json::to_value(catalog(true)).expect("serialize filesystem catalog");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn read_only_catalog_omits_the_mutation_tools() {
+    let expected = expected_tools(include_str!(
+        "../../../fixtures/mcp-conformance/catalog/v1/filesystem-tools-read-only.json"
+    ));
+    let actual = serde_json::to_value(catalog(false)).expect("serialize read-only catalog");
+    assert_eq!(actual, expected);
+}
+
+/// Enumeration and resolution must agree: a name the catalog does not advertise
+/// is not owned by this group and must fall through to the composing server.
+#[tokio::test]
+async fn read_only_dispatch_does_not_own_mutation_names() {
+    let root = tempdir().expect("root");
+    std::fs::write(root.path().join("present.txt"), "present\n").expect("file");
+    let group = FileToolGroup::new(root.path(), false, None)
+        .await
+        .expect("group");
+    for (name, arguments) in [
+        (
+            "file_write",
+            json!({"filePath": "new.txt", "content": "written"}),
+        ),
+        (
+            "file_edit",
+            json!({"filePath": "present.txt", "oldString": "present", "newString": "changed"}),
+        ),
+        (
+            "file_apply_patch",
+            json!({"patchText": "*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch\n"}),
+        ),
+    ] {
+        assert!(
+            group
+                .dispatch(name, arguments, CancellationToken::new())
+                .await
+                .is_none(),
+            "{name} must not be dispatchable without write access"
+        );
+    }
+    assert!(!root.path().join("new.txt").exists());
+    assert!(!root.path().join("added.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("present.txt")).expect("read"),
+        "present\n"
+    );
+}
+
+/// A stale `dryRun` argument must fail loudly instead of being dropped into an
+/// unintended write.
+#[tokio::test]
+async fn mutation_dispatch_rejects_unknown_arguments() {
+    let root = tempdir().expect("root");
+    let group = FileToolGroup::new(root.path(), true, None)
+        .await
+        .expect("group");
+    let rejected = group
+        .dispatch(
+            "file_write",
+            json!({"filePath": "new.txt", "content": "written", "dryRun": true}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("known tool")
+        .expect("tool error, not protocol error");
+    assert_eq!(rejected.is_error, Some(true));
+    assert!(!root.path().join("new.txt").exists());
 }
 
 #[tokio::test]

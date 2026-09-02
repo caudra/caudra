@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn composed_catalog_is_exact_and_ordered() {
         let names = compose_catalog([
-            file_catalog(),
+            file_catalog(true),
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
             workcell_mcp_code::catalog(),

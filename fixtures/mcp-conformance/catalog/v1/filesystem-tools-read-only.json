@@ -1,0 +1,248 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.filesystem.sdk-emitted.read-only.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-mcp",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-files/src/catalog.rs",
+    "rust/crates/mcp-files/tests/catalog_dispatch.rs"
+  ],
+  "configuration": {
+    "allowWrite": false
+  },
+  "expected": {
+    "tools": [
+      {
+        "name": "file_read",
+        "title": "Read file or directory",
+        "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The filePath parameter can be absolute or file-root-relative.\n- An empty filePath is treated as \".\" and reads the file root directory.\n- By default, this tool returns up to 2000 lines from the start of the file.\n- The offset parameter is the line number to start from (1-indexed).\n- To read later sections, call this tool again with a larger offset.\n- Use file_grep to find specific content in large files or files with long lines.\n- If you are unsure of the correct file path, use file_glob to look up filenames by glob pattern.\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. Directories return sorted entries one per line, with a trailing `/` for subdirectories.\n- Any line longer than 2000 characters is truncated, and total model-facing output is byte-limited.\n- Avoid tiny repeated slices. If you need more context, read a larger window.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute path inside the configured root."
+            },
+            "offset": {
+              "description": "1-indexed starting line.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "description": "Maximum lines to return.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": ["filePath"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.read.v1"
+        }
+      },
+      {
+        "name": "file_glob",
+        "title": "Glob files",
+        "description": "Fast file pattern matching tool for files under the file root.\n\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\".\n- Returns matching file paths with byte sizes and line counts for bounded text files.\n- Use this tool when you need to find files by name patterns.\n- The optional path parameter limits the search root. Omit it to search the file root.\n- An empty path is treated as \".\".\n- Results skip .git and node_modules and are truncated to a safe result limit.\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, prefer a higher-level sidequest/task flow once available.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Glob pattern supporting *, **, ?, and brace alternatives."
+            },
+            "path": {
+              "description": "Optional directory under the configured root.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["pattern"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.list.v1"
+        }
+      },
+      {
+        "name": "file_grep",
+        "title": "Search file contents",
+        "description": "Fast content search tool for files under the file root.\n\n- Searches file contents using linear-time regular expressions.\n- Supports common regex syntax such as alternation, groups, classes, and repetition. Look-around and backreferences are rejected to guarantee bounded matching time.\n- Filter files by pattern with the include parameter, for example \"*.js\" or \"*.{ts,tsx}\".\n- An empty path is treated as \".\", and an empty include filter is ignored.\n- Returns file paths, line numbers, and matching lines.\n- Use this tool when you need to find files containing specific patterns.\n- For filtering the output of a shell command pipeline, use shell with rg when available, falling back to grep only when rg is unavailable.\n- Results skip binary files, .git, and node_modules and are truncated to a safe match limit.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Linear-time regular expression without look-around or backreferences."
+            },
+            "path": {
+              "description": "Optional file or directory under the root.",
+              "type": "string",
+              "minLength": 1
+            },
+            "include": {
+              "description": "Optional file glob filter.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["pattern"],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.search.v1"
+        }
+      },
+      {
+        "name": "index",
+        "title": "Index source file or directory",
+        "description": "Return a compact structural overview of a source file, or a deterministic listing of a directory.\n\n- Use this first to understand file structure before reading specific sections with file_read.\n- File results include imports, declarations, signatures, source ranges, parse recovery status, and semantic output-line metadata.\n- Directory results list directories before files and append / to directory names.\n- The path may be absolute or relative to the configured file root.\n- Unsupported file types, binary files, and non-UTF-8 source are rejected.\n- Parsing, traversal, source, lines, output, admission, and concurrency are bounded by host-only policy.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute source file or directory path, limited to 4096 UTF-8 bytes."
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "language",
+                "skeleton",
+                "lines",
+                "sourceLineCount",
+                "parseError",
+                "truncated"
+              ],
+              "properties": {
+                "kind": { "const": "file" },
+                "path": { "type": "string" },
+                "relativePath": { "type": "string" },
+                "language": { "type": "string" },
+                "skeleton": { "type": "string" },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["outputLine", "text", "semantic"],
+                    "properties": {
+                      "outputLine": { "type": "integer", "minimum": 1 },
+                      "text": { "type": "string" },
+                      "semantic": {
+                        "type": "string",
+                        "enum": ["section", "item", "dimmed", "plain"]
+                      },
+                      "body": { "type": "string" },
+                      "sourceRange": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["startLine", "endLine"],
+                        "properties": {
+                          "startLine": { "type": "integer", "minimum": 1 },
+                          "endLine": { "type": "integer", "minimum": 1 }
+                        }
+                      }
+                    }
+                  }
+                },
+                "sourceLineCount": { "type": "integer", "minimum": 1 },
+                "parseError": { "type": "boolean" },
+                "truncated": { "type": "boolean" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "entries",
+                "totalCount",
+                "truncated",
+                "listing"
+              ],
+              "properties": {
+                "kind": { "const": "directory" },
+                "path": { "type": "string" },
+                "relativePath": { "type": "string" },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "kind"],
+                    "properties": {
+                      "name": { "type": "string" },
+                      "kind": {
+                        "type": "string",
+                        "enum": ["directory", "file"]
+                      }
+                    }
+                  }
+                },
+                "totalCount": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
+                },
+                "truncated": { "type": "boolean" },
+                "listing": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.index.v1"
+        }
+      }
+      ]
+  }
+}

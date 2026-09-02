@@ -23,6 +23,12 @@ Source-icon lookup is disabled by default. `--web-icons` or `WORKCELL_WEB_ICONS=
 web tools and may issue additional page, icon-link, and fallback favicon requests to public origins.
 Disabled mode omits provider-supplied inline icon data as well as locally resolved icons.
 
+File mutation authority is immutable process configuration. Without `--allow-write` the server omits
+`file_write`, `file_edit`, and `file_apply_patch` from its catalog and does not route calls to those
+names, and the filesystem crate denies direct native calls independently. No tool argument can relax
+this, and the mutation schemas reject unknown fields so a stale argument cannot be dropped into an
+unintended write.
+
 Shell requests are parsed into command scopes before execution. Without `--shell-policy` or `--yolo`,
 all shell requests are denied. An explicit deny rejects the entire request before any command starts;
 `--yolo` permits unmatched classified scopes but does not override a deny. If deny rules exist, opaque

@@ -52,22 +52,20 @@ impl FilesystemCore {
             None,
             self.limits.max_diff_bytes,
         )?;
-        let applied = self.should_apply(input.dry_run)?;
-        if applied {
-            self.commit_write(
-                &file_path,
-                &new_content,
-                token,
-                false,
-                Some(&snapshot.version),
-            )
-            .await?;
-        }
+        self.require_write()?;
+        self.commit_write(
+            &file_path,
+            &new_content,
+            token,
+            false,
+            Some(&snapshot.version),
+        )
+        .await?;
         Ok(FileEditOutput {
             kind: FileEditKind::Edit,
             path: path_string(&file_path),
             relative_path: self.policy.relative(&file_path)?,
-            applied,
+            applied: true,
             diff,
         })
     }

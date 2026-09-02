@@ -10,6 +10,9 @@
     "rust/crates/mcp-files/src/catalog.rs",
     "rust/crates/mcp-files/tests/catalog_dispatch.rs"
   ],
+  "configuration": {
+    "allowWrite": true
+  },
   "expected": {
     "tools": [
       {
@@ -132,13 +135,10 @@
             "content": {
               "type": "string",
               "description": "Complete UTF-8 text content."
-            },
-            "dryRun": {
-              "description": "Preview the diff without changing the filesystem.",
-              "type": "boolean"
             }
           },
           "required": ["filePath", "content"],
+          "additionalProperties": false,
           "$schema": "http://json-schema.org/draft-07/schema#"
         },
         "annotations": {
@@ -175,13 +175,10 @@
             "replaceAll": {
               "description": "Replace every exact match.",
               "type": "boolean"
-            },
-            "dryRun": {
-              "description": "Preview the diff without changing the filesystem.",
-              "type": "boolean"
             }
           },
           "required": ["filePath", "oldString", "newString"],
+          "additionalProperties": false,
           "$schema": "http://json-schema.org/draft-07/schema#"
         },
         "annotations": {
@@ -205,13 +202,10 @@
               "type": "string",
               "minLength": 1,
               "description": "Complete stripped-down file patch."
-            },
-            "dryRun": {
-              "description": "Validate and preview the patch without changing files.",
-              "type": "boolean"
             }
           },
           "required": ["patchText"],
+          "additionalProperties": false,
           "$schema": "http://json-schema.org/draft-07/schema#"
         },
         "annotations": {

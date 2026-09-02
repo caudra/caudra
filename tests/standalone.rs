@@ -249,7 +249,7 @@ async fn stdio_streams_standard_shell_progress_before_the_result() {
 
 #[tokio::test]
 async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
-    let (_root, server) = fixture_server().await;
+    let (root, server) = fixture_server().await;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         server
@@ -300,15 +300,14 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
+    // This fixture runs without write access, so the mutation tools are absent
+    // rather than advertised as calls that could only ever fail.
     assert_eq!(
         names,
         [
             "file_read",
             "file_glob",
             "file_grep",
-            "file_write",
-            "file_edit",
-            "file_apply_patch",
             "index",
             "websearch",
             "webfetch",
@@ -316,6 +315,20 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "execution_environment",
         ]
     );
+
+    write_json(
+        &mut write,
+        &mcp_request(
+            21,
+            "tools/call",
+            json!({"name":"file_write","arguments":{"filePath":"new.txt","content":"x"}}),
+        ),
+    )
+    .await;
+    let unknown = read_json(&mut read).await;
+    assert!(unknown["result"].is_null());
+    assert!(unknown["error"].is_object());
+    assert!(!root.path().join("new.txt").exists());
 
     write_json(
         &mut write,
@@ -423,12 +436,13 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
     )
     .await;
     assert_eq!(listed.status(), StatusCode::OK);
+    // The fixture server has no write access, so the three mutation tools are absent.
     assert_eq!(
         final_sse_json(listed).await["result"]["tools"]
             .as_array()
             .unwrap()
             .len(),
-        11
+        8
     );
 
     let private_route = client
@@ -564,7 +578,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
     .await;
     assert!(!listed.headers().contains_key("mcp-session-id"));
     let listed = final_sse_json(listed).await;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 8);
     assert!(listed["result"].get("ttlMs").is_none());
     assert!(listed["result"].get("cacheScope").is_none());
 
@@ -1024,7 +1038,9 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             modern_only: false,
         },
         ToolConfiguration {
-            allow_write: false,
+            // The full catalog includes the mutation tools, which are exposed
+            // only when the process actually holds write authority.
+            allow_write: true,
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
             shell_policy: ShellPermissionPolicy::restricted(),
@@ -1108,4 +1124,59 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
 
     drop(write);
     let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+}
+
+/// Write authority is immutable process configuration, so it decides the shape
+/// of the catalog rather than being negotiated per call.
+#[tokio::test]
+async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
+    async fn files_catalog(allow_write: bool) -> (TempDir, Vec<String>) {
+        let root = tempfile::tempdir().expect("temporary root");
+        let server = WorkcellServer::configured(
+            Some(root.path()),
+            &[ToolGroup::Files],
+            ServerBehavior {
+                expose_execution_environment: false,
+                modern_only: false,
+            },
+            ToolConfiguration {
+                allow_write,
+                web: WebsearchExecutionConfiguration::unconfigured(),
+                web_icons: false,
+                shell_policy: ShellPermissionPolicy::restricted(),
+                shell_output_filter: true,
+                code: CodeConfiguration {
+                    worker: WorkerSource::Discover {
+                        bundled_cache_root: None,
+                    },
+                    type_check: true,
+                },
+            },
+        )
+        .await
+        .expect("files server");
+        let names = server
+            .catalog()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        (root, names)
+    }
+
+    let (_read_only_root, read_only) = files_catalog(false).await;
+    assert_eq!(read_only, ["file_read", "file_glob", "file_grep", "index"]);
+
+    let (_writable_root, writable) = files_catalog(true).await;
+    assert_eq!(
+        writable,
+        [
+            "file_read",
+            "file_glob",
+            "file_grep",
+            "file_write",
+            "file_edit",
+            "file_apply_patch",
+            "index",
+        ]
+    );
 }
