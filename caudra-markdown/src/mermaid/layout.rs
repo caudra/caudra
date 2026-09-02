@@ -590,9 +590,18 @@ impl<'a> Builder<'a> {
         let spans: Vec<(usize, usize)> = (0..self.graph.subgraphs.len())
             .filter_map(|cluster| self.cluster_ranks(cluster))
             .collect();
-        let closing = spans.iter().any(|&(_, last)| last == rank);
         let opening = spans.iter().any(|&(first, _)| first == rank + 1);
-        (usize::from(closing) + usize::from(opening)) * CLUSTER_PAD
+        self.channel_base(rank) + usize::from(opening) * CLUSTER_PAD
+    }
+
+    /// Offset into the gap after `rank` where channels may start. A subgraph
+    /// ending here closes its frame inside that gap, and an edge sharing the
+    /// frame's column would draw itself on top of the border.
+    fn channel_base(&self, rank: usize) -> usize {
+        let closing = (0..self.graph.subgraphs.len())
+            .filter_map(|cluster| self.cluster_ranks(cluster))
+            .any(|(_, last)| last == rank);
+        usize::from(closing) * CLUSTER_PAD
     }
 
     fn align_rank(&mut self, rank: usize, downward: bool) {
@@ -840,7 +849,7 @@ impl<'a> Builder<'a> {
                 from_across: ports[idx].0,
                 to_across: ports[idx].1,
                 start_along,
-                channel_along: near.gap_start() + channel,
+                channel_along: near.gap_start() + self.channel_base(low) + channel,
                 end_along,
                 arrow_along,
                 descending,
@@ -1309,6 +1318,12 @@ mod tests {
         layout(&parse::parse(source).expect("fixture should parse"))
     }
 
+    /// Cells two inclusive intervals have in common.
+    fn overlap((a_lo, a_hi): (usize, usize), (b_lo, b_hi): (usize, usize)) -> usize {
+        let (lo, hi) = (a_lo.max(b_lo), a_hi.min(b_hi));
+        hi.saturating_sub(lo) + usize::from(lo <= hi)
+    }
+
     fn rects_overlap(
         (ax, ay, aw, ah): (usize, usize, usize, usize),
         (bx, by, bw, bh): (usize, usize, usize, usize),
@@ -1727,5 +1742,38 @@ mod tests {
             leaning.height - 1,
             "a parallelogram pays one column per row of shear"
         );
+    }
+
+    /// A frame may be crossed, since an edge that leaves a subgraph has to get
+    /// out, but an edge that runs along one erases it.
+    #[test_case(PIPELINE  ; "pipeline")]
+    #[test_case(CLUSTERED ; "clustered")]
+    fn no_edge_runs_along_a_subgraph_border(source: &str) {
+        const CROSSING: usize = 1;
+        let placed = place(source);
+        for wire in &placed.edges {
+            for pair in wire.points.windows(2) {
+                let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+                let (xs, ys) = ((x0.min(x1), x0.max(x1)), (y0.min(y1), y0.max(y1)));
+                for cluster in &placed.clusters {
+                    let right = cluster.x + cluster.width - 1;
+                    let bottom = cluster.y + cluster.height - 1;
+                    let shared = match (y0 == y1, x0 == x1) {
+                        (true, _) if y0 == cluster.y || y0 == bottom => {
+                            overlap(xs, (cluster.x, right))
+                        }
+                        (_, true) if x0 == cluster.x || x0 == right => {
+                            overlap(ys, (cluster.y, bottom))
+                        }
+                        _ => 0,
+                    };
+                    assert!(
+                        shared <= CROSSING,
+                        "an edge shares {shared} cells with the border of {cluster:?} \
+                         between ({x0},{y0}) and ({x1},{y1})"
+                    );
+                }
+            }
+        }
     }
 }
