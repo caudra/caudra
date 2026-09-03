@@ -485,18 +485,19 @@ fn child_body(
     }
 }
 
+/// Hiding a single line costs the same row as the notice that says so, so the
+/// line itself is shown instead and nothing is truncated.
 fn text_lines(text: String, max: usize) -> Vec<Line<'static>> {
+    let total = text.lines().count();
+    let hidden = total.saturating_sub(max);
+    let truncated = should_truncate(hidden);
     let mut lines: Vec<Line<'static>> = text
         .lines()
-        .take(max)
+        .take(if truncated { max } else { total })
         .map(|line| Line::from(line.to_owned()))
         .collect();
-    let total = text.lines().count();
-    if total > max {
-        lines.push(Line::styled(
-            truncation_notice(total - max),
-            theme::current().tool_dim,
-        ));
+    if truncated {
+        lines.push(truncation_line(hidden));
     }
     lines
 }
@@ -1474,6 +1475,29 @@ mod tests {
         let result = merge_syntax_with_diff(&syn, &diff, base, emph);
         assert_eq!(spans_text(&result), input);
     }
+    const TEXT_MAX_LINES: usize = 5;
+    const NOTICE_EARNED: &str = "a line is only hidden when hiding it saves a row";
+
+    #[test_case(3, 3, false ; "short_output_is_whole")]
+    #[test_case(5, 5, false ; "exactly_the_budget")]
+    #[test_case(6, 6, false ; "one_hidden_shows_all")]
+    #[test_case(7, TEXT_MAX_LINES + 1, true ; "two_hidden_truncate")]
+    fn text_lines_line_count(total: usize, expected: usize, notice: bool) {
+        let text = (0..total)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = text_lines(text, TEXT_MAX_LINES);
+        assert_eq!(lines.len(), expected);
+        assert_eq!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains(TRUNCATION_PREFIX)),
+            notice,
+            "{NOTICE_EARNED}"
+        );
+    }
+
     const CHILD_BODY: &str = "child body line";
     const EXPECT_ROW: &str = "the summary row has to name its child";
 
