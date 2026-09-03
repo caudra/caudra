@@ -7,14 +7,17 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use workcell_mcp_files::FileToolGroup;
+use workcell_mcp_files::{FileToolGroup, FilesystemLimits};
 
 const CASES: &[&str] = &[
     "read-file.json",
     "read-directory.json",
     "glob.json",
     "grep.json",
+    "glob-truncated.json",
+    "grep-truncated.json",
     "write.json",
+    "write-creates-parent-directories.json",
     "write-without-write-access.json",
     "edit.json",
     "apply-patch.json",
@@ -51,7 +54,11 @@ async fn run_case(case: &str) {
     let allow_write = fixture["configuration"]["allowWrite"]
         .as_bool()
         .unwrap_or(false);
-    let group = FileToolGroup::new(temporary.path(), allow_write, None)
+    // Truncation cases tighten a single bound so the case stays small. Limits
+    // are host configuration, never tool input, so they are set here rather
+    // than being smuggled through the call.
+    let limits = case_limits(&fixture["configuration"]["limits"], case);
+    let group = FileToolGroup::new(temporary.path(), allow_write, limits)
         .await
         .unwrap_or_else(|error| panic!("initialize {case}: {error}"));
     let input = resolve_assets(fixture["input"].clone(), &fixture_root);
@@ -76,6 +83,24 @@ async fn run_case(case: &str) {
         assert_result(case, &result, &fixture["expected"], temporary.path());
     }
     assert_post_filesystem(case, temporary.path(), &fixture_root, &fixture["expected"]);
+}
+
+fn case_limits(configured: &Value, case: &str) -> Option<FilesystemLimits> {
+    let overrides = configured.as_object()?;
+    let mut limits = FilesystemLimits::default();
+    for (key, value) in overrides {
+        let value = value
+            .as_u64()
+            .unwrap_or_else(|| panic!("{case}: limit {key} must be a positive integer"))
+            as usize;
+        match key.as_str() {
+            "maxSearchResults" => limits.max_search_results = value,
+            "maxTraversalEntries" => limits.max_traversal_entries = value,
+            "maxGlobMatchSteps" => limits.max_glob_match_steps = value,
+            other => panic!("{case}: unsupported fixture limit {other}"),
+        }
+    }
+    Some(limits)
 }
 
 fn fixture_root() -> PathBuf {

@@ -1,0 +1,53 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.write.creates-parent-directories",
+  "provenance": [
+    "rust/crates/mcp-files/src/mutation_operations/atomic_write.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_write",
+  "input": {
+    "filePath": "deep/nested/new.txt",
+    "content": {
+      "$asset": "assets/filesystem/new-two.txt",
+      "encoding": "utf8"
+    }
+  },
+  "configuration": {
+    "allowWrite": true
+  },
+  "setup": {
+    "files": []
+  },
+  "expected": {
+    "contentText": "--- deep/nested/new.txt\n+++ deep/nested/new.txt\n@@ -1,0 +1,2 @@\n+one\n+two",
+    "structuredContent": {
+      "kind": "write",
+      "path": "{{ROOT}}/deep/nested/new.txt",
+      "relativePath": "deep/nested/new.txt",
+      "existed": false,
+      "applied": true,
+      "diff": {
+        "file": "{{ROOT}}/deep/nested/new.txt",
+        "relativePath": "deep/nested/new.txt",
+        "patch": "--- deep/nested/new.txt\n+++ deep/nested/new.txt\n@@ -1,0 +1,2 @@\n+one\n+two",
+        "additions": 2,
+        "deletions": 0
+      }
+    },
+    "postFilesystem": [
+      {
+        "path": "deep/nested/new.txt",
+        "asset": "assets/filesystem/new-two.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

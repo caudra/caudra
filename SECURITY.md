@@ -90,8 +90,10 @@ for hosts that authorize paths and commands themselves:
   Absolute paths and `..` traversal resolve anywhere the process can reach, and credential-bearing
   entries such as `.env`, `.ssh`, `.netrc`, `*.key`, and `id_rsa` are readable. Its `allow_write`
   argument independently controls mutation; pass `false` for inspection-only hosting. Broad traversal
-  reports the same entries `file_read` will return, so a host can enumerate the full reachable set
-  rather than authorizing against a filtered view.
+  applies the same authorization decisions `file_read` applies, so a host never authorizes against a
+  view filtered by confinement or protected-path policy. Traversal does skip directories holding
+  regenerable build output by name, which is a relevance filter rather than an authorization one:
+  those paths remain readable, and naming one as an explicit path enumerates it.
 - `ShellToolGroup::new_unconfined` and `with_policy_unconfined` relax only workdir resolution.
   Permission policy stays fail-closed unless the host supplies its own, and deny rules still reject a
   request before any command runs.

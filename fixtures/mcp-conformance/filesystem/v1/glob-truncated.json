@@ -1,0 +1,90 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.glob.truncated-reports-total",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations/glob.rs",
+    "rust/crates/mcp-files/src/model_text.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_glob",
+  "input": {
+    "pattern": "**/*.md"
+  },
+  "configuration": {
+    "limits": {
+      "maxSearchResults": 2
+    }
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "a.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "b.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "c.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "a.md\nb.md\n[truncated: showing 2 of 3 matching files]",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "**/*.md",
+      "files": [
+        {
+          "path": "{{ROOT}}/a.md",
+          "relativePath": "a.md",
+          "sizeBytes": 8,
+          "lineCount": 2
+        },
+        {
+          "path": "{{ROOT}}/b.md",
+          "relativePath": "b.md",
+          "sizeBytes": 8,
+          "lineCount": 2
+        }
+      ],
+      "count": 2,
+      "total": 3,
+      "scanComplete": true,
+      "truncated": true
+    },
+    "postFilesystem": [
+      {
+        "path": "a.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "b.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "c.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

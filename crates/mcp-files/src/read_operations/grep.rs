@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     FilesystemError,
-    glob::GlobMatcher,
+    glob::{GlobMatcher, MatchOutcome, MatchScratch},
     operations::FilesystemCore,
     text::{
         check_cancelled, decode_text, is_binary_content, js_length, read_bounded, split_text_lines,
@@ -62,16 +62,31 @@ impl FilesystemCore {
         let mut rows = Vec::new();
         let mut truncated = listed.truncated;
         let mut glob_match_steps = self.limits.max_glob_match_steps;
+        let mut scratch = MatchScratch::default();
+        let files_listed = listed.paths.len();
+        let mut files_scanned = 0usize;
         'files: for file in listed.paths {
             check_cancelled(token)?;
             let relative_path = relative_to(&cwd, &file);
             let basename = file.file_name().unwrap_or_default().to_string_lossy();
-            if let Some(matcher) = &include_matcher
-                && !matcher.is_match(&relative_path, &mut glob_match_steps)?
-                && !matcher.is_match(&basename, &mut glob_match_steps)?
-            {
-                continue;
+            if let Some(matcher) = &include_matcher {
+                match matcher.matches_candidate(
+                    &relative_path,
+                    &basename,
+                    &mut glob_match_steps,
+                    &mut scratch,
+                )? {
+                    MatchOutcome::Matched => {}
+                    MatchOutcome::Missed => continue,
+                    // Exhausting the work budget truncates the result rather
+                    // than discarding every row already collected.
+                    MatchOutcome::BudgetExhausted => {
+                        truncated = true;
+                        break;
+                    }
+                }
             }
+            files_scanned += 1;
             let bytes = match read_bounded(&file, self.limits.max_file_bytes, token).await {
                 Ok(bytes) => bytes,
                 Err(FilesystemError::Aborted) => return Err(FilesystemError::Aborted),
@@ -108,6 +123,8 @@ impl FilesystemCore {
             pattern: input.pattern,
             include: input.include,
             matches: rows.len(),
+            files_scanned,
+            files_listed,
             rows,
             truncated,
         })

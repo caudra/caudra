@@ -1,5 +1,6 @@
 use std::{
-    ffi::OsString,
+    borrow::Cow,
+    ffi::{OsStr, OsString},
     io,
     path::{Component, Path, PathBuf},
 };
@@ -140,14 +141,41 @@ impl RootPathPolicy {
             .join("/"))
     }
 
-    pub(crate) fn traversal_allowed(&self, traversal_root: &Path, candidate: &Path) -> bool {
+    /// Loop-invariant half of [`Self::traversal_allowed`], evaluated once per
+    /// traversal rather than once per entry.
+    pub(crate) fn traversal_allows_protected(&self, traversal_root: &Path) -> bool {
         // Enumeration must agree with `resolve`. When protected-path denial is off, hiding these
         // entries from traversal would leave a host able to read a path it could never discover,
         // and unable to enumerate what a call is about to touch.
+        !self.confined || self.is_protected_path(traversal_root)
+    }
+
+    pub(crate) fn traversal_entry_allowed(&self, allows_protected: bool, candidate: &Path) -> bool {
+        allows_protected || !self.is_protected_path(candidate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn traversal_allowed(&self, traversal_root: &Path, candidate: &Path) -> bool {
+        self.traversal_entry_allowed(self.traversal_allows_protected(traversal_root), candidate)
+    }
+
+    /// Authorizes a traversal entry that is already canonical.
+    ///
+    /// Traversal starts at a canonical root and descends only through entries
+    /// that were verified not to be symlinks, so every ancestor stays canonical
+    /// and the joined path is canonical too. Calling `realpath` per entry would
+    /// only recompute that, at the cost of a blocking syscall per entry. The
+    /// confinement and protected-path decisions are identical to `resolve`.
+    pub(crate) fn authorize_canonical_entry(&self, candidate: &Path) -> bool {
         if !self.confined {
             return true;
         }
-        self.is_protected_path(traversal_root) || !self.is_protected_path(candidate)
+        if !starts_with_root(candidate, &self.root) {
+            return false;
+        }
+        candidate
+            .strip_prefix(&self.root)
+            .is_ok_and(|relative| relative.as_os_str().is_empty() || !protected_relative(relative))
     }
 
     fn assert_inside(&self, candidate: &Path, requested: &str) -> Result<(), FilesystemError> {
@@ -184,19 +212,42 @@ impl RootPathPolicy {
 }
 
 fn protected_relative(path: &Path) -> bool {
-    let parts = path
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-        .collect::<Vec<_>>();
-    let basename = parts.last().map(String::as_str).unwrap_or_default();
-    parts
-        .iter()
-        .any(|part| matches!(part.as_str(), ".git" | ".ssh" | ".workcell"))
-        || basename == ".env"
+    let mut basename = None;
+    for component in path.components() {
+        let folded = fold_case(component.as_os_str());
+        if matches!(folded.as_ref(), ".git" | ".ssh" | ".workcell") {
+            return true;
+        }
+        basename = Some(folded);
+    }
+    let Some(basename) = basename else {
+        return false;
+    };
+    let basename = basename.as_ref();
+    basename == ".env"
         || basename.starts_with(".env.")
         || matches!(basename, ".npmrc" | ".pypirc" | ".netrc")
         || basename.ends_with(".key")
         || matches!(basename, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
+}
+
+/// Lowercases a path component for protected-name comparison.
+///
+/// This runs for every traversal entry, so the common already-lowercase ASCII
+/// component borrows instead of allocating. Non-ASCII components keep full
+/// Unicode lowercasing, which matters because names such as `.KEY` spelled with
+/// U+212A KELVIN SIGN must still fold onto a protected name.
+fn fold_case(component: &OsStr) -> Cow<'_, str> {
+    match component.to_str() {
+        Some(text) if text.is_ascii() => {
+            if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                Cow::Owned(text.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(text)
+            }
+        }
+        _ => Cow::Owned(component.to_string_lossy().to_lowercase()),
+    }
 }
 
 async fn canonicalize(path: &Path) -> io::Result<PathBuf> {
@@ -242,18 +293,54 @@ fn normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use proptest::{
         prelude::*,
         test_runner::{Config as ProptestConfig, RngSeed},
     };
 
-    use super::RootPathPolicy;
+    use super::{RootPathPolicy, protected_relative};
     use crate::FilesystemError;
 
     fn safe_component() -> impl Strategy<Value = String> {
         proptest::string::string_regex("[A-Za-z0-9_-]{1,8}").expect("safe component regex is valid")
+    }
+
+    /// Protected-name folding runs for every traversal entry and takes an
+    /// allocation-free path for plain ASCII. That shortcut must not weaken the
+    /// Unicode case folding a non-ASCII name still relies on: U+212A KELVIN
+    /// SIGN lowercases to `k`, so `.KEY` spelled with it is still `.key`.
+    #[test]
+    fn protected_name_folding_is_case_insensitive_beyond_ascii() {
+        for protected in [
+            "secret.key",
+            "secret.KEY",
+            "secret.Key",
+            "SECRET.KEY",
+            "secret.\u{212a}EY",
+            "ID_RSA",
+            ".Env.Local",
+            ".NPMRC",
+        ] {
+            assert!(
+                protected_relative(Path::new(protected)),
+                "{protected} must be protected"
+            );
+        }
+        for allowed in [
+            "secret.keys",
+            "keyboard.rs",
+            "environment.rs",
+            "id_rsa.pub.rs",
+        ] {
+            assert!(
+                !protected_relative(Path::new(allowed)),
+                "{allowed} must not be protected"
+            );
+        }
+        assert!(protected_relative(Path::new(".GIT/config")));
+        assert!(protected_relative(Path::new("nested/.SSH/known_hosts")));
     }
 
     #[test]

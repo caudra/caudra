@@ -36,6 +36,8 @@
         }
       ],
       "count": 1,
+      "total": 1,
+      "scanComplete": true,
       "truncated": false
     },
     "postFilesystem": [

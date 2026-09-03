@@ -547,9 +547,15 @@ annotations do not replace client consent, Workcell admission checks, or deploym
 
 In the standalone server, all filesystem paths are resolved against one canonical root. Inputs may
 use root-relative paths or absolute paths inside that root. Lexical escapes, stable symlink escapes,
-protected paths, and paths outside the root are rejected. Broad traversal skips symlinks, `.git`,
-`node_modules`, and protected entries. Binary classification uses bounded content inspection rather
-than filename extensions.
+protected paths, and paths outside the root are rejected. Broad traversal skips symlinks, protected
+entries, and directories holding regenerable build output or tool caches: `.git`, `node_modules`,
+`target`, `dist`, `.venv`, `venv`, `__pycache__`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`,
+`.parcel-cache`, `.gradle`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.dart_tool`,
+`.terraform`, and `.stack-work`. Dependency source trees such as `vendor`, `Pods`, `deps`, and
+`third_party` are deliberately searchable, as are ambiguous names such as `build`, `bin`, and `out`
+that carry real source in many projects. Skipping applies only to broad traversal: naming one of
+these directories as the `path` searches inside it. Binary classification uses bounded content
+inspection rather than filename extensions.
 
 Confinement is a property of the server's constructor, not of the crate. Native hosts may opt into
 unconfined resolution, which disables both root confinement and protected-path denial; see
@@ -563,9 +569,13 @@ call instead of being silently dropped into an unintended write. Native hosts th
 directly are denied at the crate boundary regardless of the catalog.
 
 The standalone defaults limit individual files and writes to 5 MiB, model-facing reads to 50 KiB,
-lines to 2,000 characters, read windows to 2,000 lines, search results to 100, and broad traversal to
-10,000 entries. Results report truncation when a presentation bound is reached. Embedders using the
-filesystem crate can supply stricter limits.
+lines to 2,000 characters, read windows to 2,000 lines, search results to 500, and broad traversal to
+50,000 entries. Glob matching has an independent whole-operation work budget, sized so the heaviest
+ordinary wildcard pattern can evaluate every candidate the traversal budget admits; a pathological
+pattern exhausts it and truncates rather than failing. Search results are additionally fitted to the
+protocol result ceiling, because one grep row can carry a full-length line. Results report truncation
+when any of these bounds is reached, and `file_glob` and `file_grep` also say so in their model-facing
+text. Embedders using the filesystem crate can supply stricter limits.
 
 The optional indexer has independent defaults: 2 MiB of strict UTF-8 source, 50 KiB of model text,
 2,000 bytes per output line, 1,000 returned directory entries, 10,000 scanned directory entries,
@@ -602,7 +612,10 @@ large file.
 - Matches are returned in deterministic order with relative paths, byte sizes, and line counts for
   bounded text files.
 - Pattern size, brace depth, generated alternatives, matching work, traversal entries, and result count
-  are all bounded. Results indicate when additional matches were omitted.
+  are all bounded. Exhausting any of them truncates the result rather than failing the call.
+- `total` counts every matching file, because counting continues past the returned window. It is exact
+  when `scanComplete` is true and a lower bound otherwise. A truncated result also states both numbers
+  on its last line of model-facing text.
 
 #### `file_grep`
 
@@ -613,8 +626,13 @@ large file.
   rejected.
 - `path` optionally selects a file or directory. `include` optionally filters files with a glob such as
   `*.rs` or `*.{ts,tsx}`.
-- Binary files, symlinks, `.git`, and `node_modules` are skipped during broad searches.
+- Binary files, symlinks, and the skipped build-output directories listed above are ignored during
+  broad searches.
 - Regex length, file size, traversal work, match count, line length, and total output are bounded.
+  Exhausting any of them truncates the result rather than failing the call.
+- `filesScanned` and `filesListed` report scan coverage. An exact match total is not reported, because
+  producing one would require reading every remaining file. A truncated result states both numbers on
+  its last line of model-facing text.
 
 #### `file_write`
 
@@ -623,8 +641,12 @@ large file.
 - `filePath` and `content` are required. Existing files should normally be read first so an intentional
   full replacement is reviewable.
 - The result carries a bounded unified diff of the change that was applied.
+- Missing parent directories are created before the write, so a path several levels deep needs no
+  preparation. The created chain is subject to the same root confinement and protected-path denial as
+  the target, and is created only after the write-authority check.
 - Writes use an exclusive same-directory temporary file and atomic rename. Existing mode bits are
-  preserved, while new files use mode `0600` on supported platforms.
+  preserved, while new files use mode `0600` on supported platforms. Created directories take the
+  process umask.
 
 #### `file_edit`
 

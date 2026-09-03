@@ -13,6 +13,20 @@ enum Token {
 pub(crate) struct GlobMatcher {
     alternatives: Vec<Vec<Token>>,
     fast_path: Option<FastPath>,
+    // True when every alternative is anchored with `**/`, which makes a
+    // separate basename attempt redundant: `**/` accepts an empty prefix or any
+    // prefix ending in `/`, so a basename hit implies a relative-path hit.
+    subsumes_basename: bool,
+}
+
+/// Result of matching one candidate against a bounded work budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchOutcome {
+    Matched,
+    Missed,
+    /// The operation work budget ran out. Callers report a truncated result
+    /// instead of discarding everything already collected.
+    BudgetExhausted,
 }
 
 #[derive(Debug)]
@@ -36,47 +50,99 @@ impl GlobMatcher {
         let fast_path = (expanded.len() == 1)
             .then(|| FastPath::new(&expanded[0]))
             .flatten();
+        let subsumes_basename = expanded
+            .iter()
+            .all(|alternative| alternative.starts_with("**/"));
         Ok(Self {
             alternatives: expanded
                 .iter()
                 .map(|alternative| tokenize(alternative))
                 .collect(),
             fast_path,
+            subsumes_basename,
         })
     }
 
-    pub(crate) fn is_match(
+    /// Matches a traversal candidate, retrying against `basename` only when the
+    /// pattern does not already subsume it. Skipping the redundant retry halves
+    /// the work for the common `**/`-anchored shapes.
+    pub(crate) fn matches_candidate(
+        &self,
+        relative_path: &str,
+        basename: &str,
+        remaining_steps: &mut usize,
+        scratch: &mut MatchScratch,
+    ) -> Result<MatchOutcome, FilesystemError> {
+        match self.try_match(relative_path, remaining_steps, scratch)? {
+            MatchOutcome::Missed if !self.subsumes_basename => {
+                self.try_match(basename, remaining_steps, scratch)
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    pub(crate) fn try_match(
         &self,
         value: &str,
         remaining_steps: &mut usize,
-    ) -> Result<bool, FilesystemError> {
+        scratch: &mut MatchScratch,
+    ) -> Result<MatchOutcome, FilesystemError> {
         let normalized = normalize_separators(value);
         if let Some(fast_path) = &self.fast_path {
             let steps = fast_path.steps();
             if steps > *remaining_steps {
-                return Err(FilesystemError::message(
-                    "glob matching exceeded its operation work budget",
-                ));
+                return Ok(MatchOutcome::BudgetExhausted);
             }
             *remaining_steps -= steps;
-            return Ok(fast_path.is_match(&normalized));
+            return Ok(outcome(fast_path.is_match(&normalized)));
         }
-        let value = normalized.encode_utf16().collect::<Vec<_>>();
+        scratch.value.clear();
+        scratch.value.extend(normalized.encode_utf16());
         let token_count = self.alternatives.iter().map(Vec::len).sum::<usize>();
         let steps = token_count
-            .checked_mul(value.len().saturating_add(1))
+            .checked_mul(scratch.value.len().saturating_add(1))
             .ok_or_else(|| FilesystemError::message("glob matching work is too large"))?;
         if steps > *remaining_steps {
-            return Err(FilesystemError::message(
-                "glob matching exceeded its operation work budget",
-            ));
+            return Ok(MatchOutcome::BudgetExhausted);
         }
         *remaining_steps -= steps;
-        Ok(self
-            .alternatives
-            .iter()
-            .any(|tokens| matches_tokens(tokens, &value)))
+        let matched = self.alternatives.iter().any(|tokens| {
+            matches_tokens(
+                tokens,
+                &scratch.value,
+                &mut scratch.current,
+                &mut scratch.next,
+            )
+        });
+        Ok(outcome(matched))
     }
+
+    #[cfg(test)]
+    pub(crate) fn debug_uses_fast_path(&self) -> bool {
+        self.fast_path.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_subsumes_basename(&self) -> bool {
+        self.subsumes_basename
+    }
+}
+
+fn outcome(matched: bool) -> MatchOutcome {
+    if matched {
+        MatchOutcome::Matched
+    } else {
+        MatchOutcome::Missed
+    }
+}
+
+/// Reusable match buffers. One instance is threaded through a whole operation so
+/// per-token and per-candidate allocation does not dominate the work budget.
+#[derive(Debug, Default)]
+pub(crate) struct MatchScratch {
+    value: Vec<u16>,
+    current: Vec<bool>,
+    next: Vec<bool>,
 }
 
 impl FastPath {
@@ -220,11 +286,18 @@ fn tokenize(pattern: &str) -> Vec<Token> {
     tokens
 }
 
-fn matches_tokens(tokens: &[Token], value: &[u16]) -> bool {
-    let mut next = vec![false; value.len() + 1];
+fn matches_tokens(
+    tokens: &[Token],
+    value: &[u16],
+    current: &mut Vec<bool>,
+    next: &mut Vec<bool>,
+) -> bool {
+    next.clear();
+    next.resize(value.len() + 1, false);
     next[value.len()] = true;
     for token in tokens.iter().rev() {
-        let mut current = vec![false; value.len() + 1];
+        current.clear();
+        current.resize(value.len() + 1, false);
         match token {
             Token::RecursiveDirectories => {
                 let mut slash_exit = false;
@@ -259,7 +332,7 @@ fn matches_tokens(tokens: &[Token], value: &[u16]) -> bool {
                 }
             }
         }
-        next = current;
+        std::mem::swap(current, next);
     }
     next[0]
 }

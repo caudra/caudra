@@ -35,6 +35,9 @@ optional sections:
   policy by name in `shellPolicy` and set `shellOutputFilter`, because shell policy and filtering are
   startup configuration rather than tool input. Filesystem and filesystem-catalog cases set
   `allowWrite`, because write authority is startup configuration that a call cannot negotiate.
+  Filesystem cases may also set `limits`, a partial override of the reviewed filesystem bounds, so a
+  truncation case can pin its behavior on a small corpus. Resource bounds are startup configuration
+  for the same reason, and only the bounds a case actually needs are named.
 - `expected.contentText`: exact model-visible text.
 - `expected.structuredContent`: structurally compared JSON output.
 - `expected.isError`: expected MCP tool-error classification.

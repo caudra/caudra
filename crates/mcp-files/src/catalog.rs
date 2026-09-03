@@ -33,7 +33,8 @@ const GLOB_DESCRIPTION: &str = r#"Fast file pattern matching tool for files unde
 - Use this tool when you need to find files by name patterns.
 - The optional path parameter limits the search root. Omit it to search the file root.
 - An empty path is treated as ".".
-- Results skip .git and node_modules and are truncated to a safe result limit.
+- Broad searches skip .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.
+- Results are truncated to a safe result limit. A truncated result says so on its last line and reports how many files matched in total.
 - When you are doing an open-ended search that may require multiple rounds of globbing and grepping, prefer a higher-level sidequest/task flow once available.
 - This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it."#;
 
@@ -46,7 +47,8 @@ const GREP_DESCRIPTION: &str = r#"Fast content search tool for files under the f
 - Returns file paths, line numbers, and matching lines.
 - Use this tool when you need to find files containing specific patterns.
 - For filtering the output of a shell command pipeline, use shell with rg when available, falling back to grep only when rg is unavailable.
-- Results skip binary files, .git, and node_modules and are truncated to a safe match limit.
+- Broad searches skip binary files, .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.
+- Results are truncated to a safe match limit. A truncated result says so on its last line and reports how many files were searched.
 - This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it."#;
 
 const WRITE_DESCRIPTION: &str = r#"Writes a file to the local filesystem.

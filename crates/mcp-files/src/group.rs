@@ -436,11 +436,11 @@ impl FileToolGroup {
                 Err(error) => tool_error(error),
             },
             "file_glob" => match parse_arguments::<FileGlobInput>(name, arguments) {
-                Ok(input) => run(self.file_glob(input, &token).await),
+                Ok(input) => run_search(self.file_glob(input, &token).await),
                 Err(error) => tool_error(error),
             },
             "file_grep" => match parse_arguments::<FileGrepInput>(name, arguments) {
-                Ok(input) => run(self.file_grep(input, &token).await),
+                Ok(input) => run_search(self.file_grep(input, &token).await),
                 Err(error) => tool_error(error),
             },
             // Resolution must match enumeration: a read-only catalog omits these
@@ -488,6 +488,86 @@ fn run<T: Serialize + ModelText>(
         Ok(output) => success(output),
         Err(error) => tool_error(error),
     }
+}
+
+/// A search result whose returned rows can be shortened to fit the protocol
+/// result ceiling.
+///
+/// `max_search_results` is a coarse count bound; a single grep row can carry a
+/// full `max_line_length` line, so the byte ceiling is the binding constraint
+/// for wide results and must be enforced rather than assumed.
+#[cfg(feature = "mcp")]
+pub(crate) trait BoundedSearchResult: Serialize + ModelText + Clone {
+    fn returned_len(&self) -> usize;
+    fn retain_prefix(&mut self, retained: usize);
+}
+
+#[cfg(feature = "mcp")]
+impl BoundedSearchResult for FileGlobOutput {
+    fn returned_len(&self) -> usize {
+        self.files.len()
+    }
+
+    fn retain_prefix(&mut self, retained: usize) {
+        self.files.truncate(retained);
+        self.count = self.files.len();
+        self.truncated = true;
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl BoundedSearchResult for FileGrepOutput {
+    fn returned_len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn retain_prefix(&mut self, retained: usize) {
+        self.rows.truncate(retained);
+        self.matches = self.rows.len();
+        self.truncated = true;
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn run_search<T: BoundedSearchResult>(
+    result: Result<T, FilesystemError>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    match result {
+        Ok(output) => {
+            let output = fit_search_result(output).map_err(|error| {
+                rmcp::ErrorData::internal_error(
+                    "Failed to serialize filesystem tool result",
+                    Some(Value::String(error.to_string())),
+                )
+            })?;
+            success(output)
+        }
+        Err(error) => tool_error(error),
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn fit_search_result<T: BoundedSearchResult>(output: T) -> Result<T, serde_json::Error> {
+    if mcp_response_size(&output)? <= MCP_RAW_RESULT_CEILING_BYTES {
+        return Ok(output);
+    }
+    // Binary search the largest retained prefix that fits. Dropping rows keeps
+    // the result usable and honestly marked instead of failing the call.
+    let mut lower = 0usize;
+    let mut upper = output.returned_len();
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        let mut probe = output.clone();
+        probe.retain_prefix(candidate);
+        if mcp_response_size(&probe)? <= MCP_RAW_RESULT_CEILING_BYTES {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    let mut fitted = output;
+    fitted.retain_prefix(lower);
+    Ok(fitted)
 }
 
 #[cfg(feature = "mcp")]
@@ -777,19 +857,53 @@ fn validate_index(input: IndexInput) -> Result<IndexInput, FilesystemError> {
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::{
-        ContentBlock, ModelText, SerializedTextContent, SerializedToolResult, build_success_result,
-        mcp_response_size,
+        ContentBlock, MCP_RAW_RESULT_CEILING_BYTES, ModelText, SerializedTextContent,
+        SerializedToolResult, build_success_result, fit_search_result, mcp_response_size,
     };
     #[cfg(feature = "index")]
-    use super::{
-        INDEX_TRUNCATED, MCP_RAW_RESULT_CEILING_BYTES, mcp_response_size_from_parts, run_index,
-        validate_index,
-    };
+    use super::{INDEX_TRUNCATED, mcp_response_size_from_parts, run_index, validate_index};
     use crate::types::{FileGrepOutput, FileGrepRow};
     #[cfg(feature = "index")]
     use crate::{IndexDirectoryEntry, IndexDirectoryEntryKind};
     #[cfg(feature = "index")]
     use crate::{IndexLineSemantic, IndexOutput, IndexOutputLine, IndexSourceRange};
+
+    /// `max_search_results` is a count bound, but one grep row can carry a whole
+    /// `max_line_length` line. Without a byte bound a legal result already
+    /// exceeded the protocol ceiling, so the ceiling is enforced directly and
+    /// the shortened result is marked truncated rather than failing the call.
+    #[test]
+    fn wide_search_results_are_fitted_to_the_protocol_ceiling() {
+        let rows = (0..500)
+            .map(|line| FileGrepRow {
+                path: "/root/a.txt".into(),
+                relative_path: "a.txt".into(),
+                line,
+                text: "x".repeat(2_000),
+            })
+            .collect::<Vec<_>>();
+        let output = FileGrepOutput {
+            cwd: "/root".into(),
+            relative_path: ".".into(),
+            pattern: "x".into(),
+            include: None,
+            matches: rows.len(),
+            files_scanned: 1,
+            files_listed: 1,
+            rows,
+            truncated: false,
+        };
+        assert!(
+            mcp_response_size(&output).expect("size") > MCP_RAW_RESULT_CEILING_BYTES,
+            "the unbounded result must exceed the ceiling for this test to mean anything"
+        );
+
+        let fitted = fit_search_result(output).expect("fitted result");
+        assert!(mcp_response_size(&fitted).expect("size") <= MCP_RAW_RESULT_CEILING_BYTES);
+        assert!(fitted.truncated);
+        assert!(!fitted.rows.is_empty(), "a usable prefix must survive");
+        assert_eq!(fitted.matches, fitted.rows.len());
+    }
 
     #[test]
     fn response_size_counts_both_result_forms_and_envelope() {
@@ -805,6 +919,8 @@ mod tests {
                 text: "x".repeat(1_000),
             }],
             matches: 1,
+            files_scanned: 1,
+            files_listed: 1,
             truncated: false,
         };
         let structured = serde_json::to_value(&output).expect("structured output");

@@ -3,7 +3,10 @@ use proptest::{
     test_runner::{Config as ProptestConfig, RngSeed},
 };
 
-use crate::{FilesystemError, FilesystemLimits, glob::GlobMatcher};
+use crate::{
+    FilesystemError, FilesystemLimits,
+    glob::{GlobMatcher, MatchOutcome, MatchScratch},
+};
 
 fn matcher(pattern: &str) -> GlobMatcher {
     GlobMatcher::new(pattern, &FilesystemLimits::default()).expect("valid glob")
@@ -12,8 +15,9 @@ fn matcher(pattern: &str) -> GlobMatcher {
 fn is_match(matcher: &GlobMatcher, value: &str) -> bool {
     let mut budget = usize::MAX;
     matcher
-        .is_match(value, &mut budget)
+        .try_match(value, &mut budget, &mut MatchScratch::default())
         .expect("matching budget")
+        == MatchOutcome::Matched
 }
 
 fn ascii_path() -> impl Strategy<Value = String> {
@@ -135,15 +139,21 @@ fn rejects_expansion_before_exponential_allocation() {
         );
     }
 
+    // Budget exhaustion is a truncation signal, not an error: callers report the
+    // results they already collected instead of discarding all of them.
     let bounded = matcher("**/*");
     let mut one_step = 1;
-    assert!(
+    assert_eq!(
         bounded
-            .is_match("nested/file.txt", &mut one_step)
-            .expect_err("matching work")
-            .to_string()
-            .contains("work budget")
+            .try_match(
+                "nested/file.txt",
+                &mut one_step,
+                &mut MatchScratch::default()
+            )
+            .expect("budget exhaustion is not an error"),
+        MatchOutcome::BudgetExhausted
     );
+    assert_eq!(one_step, 1, "an exhausted attempt must not consume budget");
 }
 
 #[test]
@@ -154,27 +164,174 @@ fn literal_paths_stay_within_the_default_budget_in_large_trees() {
 
     for pattern in [MATCHING_PATH, "**/cmd/tui.rs"] {
         let matcher = matcher(pattern);
+        let mut scratch = MatchScratch::default();
         let mut budget = FilesystemLimits::default().max_glob_match_steps;
-        assert!(
+        assert_eq!(
             matcher
-                .is_match(MATCHING_PATH, &mut budget)
-                .expect("matching path")
+                .try_match(MATCHING_PATH, &mut budget, &mut scratch)
+                .expect("matching path"),
+            MatchOutcome::Matched
         );
 
         for index in 0..CANDIDATE_COUNT {
             let candidate = format!("target/debug/deps/dependency-{index}.rlib");
-            assert!(
-                !matcher
-                    .is_match(&candidate, &mut budget)
-                    .expect("non-matching path")
-            );
-            assert!(
-                !matcher
-                    .is_match(CANDIDATE_BASENAME, &mut budget)
-                    .expect("non-matching basename")
+            assert_eq!(
+                matcher
+                    .matches_candidate(&candidate, CANDIDATE_BASENAME, &mut budget, &mut scratch)
+                    .expect("non-matching candidate"),
+                MatchOutcome::Missed
             );
         }
     }
+}
+
+/// The default work budget must cover the ordinary wildcard patterns the tool
+/// descriptions advertise, evaluated against a full traversal budget worth of
+/// candidates.
+///
+/// The pre-existing budget regression covered only literal and `**/<literal>`
+/// patterns, which take the cheap fast path. Every advertised pattern with a
+/// wildcard in its suffix uses the quadratic matcher instead, and that is the
+/// shape that used to exhaust the budget on an ordinary repository.
+#[test]
+fn wildcard_patterns_stay_within_the_default_budget_at_traversal_scale() {
+    let limits = FilesystemLimits::default();
+    let corpus = synthetic_corpus(limits.max_traversal_entries);
+    for pattern in [
+        "**/*.rs",
+        "src/**/*.ts",
+        "**/*.{ts,tsx}",
+        "**/*.{ts,tsx,js,jsx,mjs,cjs}",
+        "**/test_*.py",
+    ] {
+        let matcher = matcher(pattern);
+        assert!(
+            !matcher.debug_uses_fast_path(),
+            "{pattern} must exercise the quadratic matcher, not the cheap fast path"
+        );
+        let mut scratch = MatchScratch::default();
+        let mut budget = limits.max_glob_match_steps;
+        for candidate in &corpus {
+            let basename = candidate.rsplit('/').next().unwrap_or(candidate);
+            assert_ne!(
+                matcher
+                    .matches_candidate(candidate, basename, &mut budget, &mut scratch)
+                    .expect("bounded matching"),
+                MatchOutcome::BudgetExhausted,
+                "{pattern} exhausted the default budget before the traversal budget"
+            );
+        }
+    }
+}
+
+/// Skipping the basename retry must never change which candidates match.
+///
+/// A `**/`-anchored pattern accepts an empty prefix or any prefix ending in
+/// `/`, so a basename hit implies a relative-path hit and the retry is pure
+/// waste. This pins that reasoning against the unoptimized behaviour.
+#[test]
+fn skipping_the_basename_retry_preserves_match_semantics() {
+    for pattern in [
+        "**/*.rs",
+        "**/*.{ts,tsx}",
+        "**/cmd/tui.rs",
+        "*.rs",
+        "src/*.rs",
+        "{**/*.ts,src/*.js}",
+    ] {
+        let matcher = matcher(pattern);
+        for candidate in [
+            "main.rs",
+            "src/main.rs",
+            "a/b/c/deep.rs",
+            "src/app.ts",
+            "src/app.js",
+            "cmd/tui.rs",
+            "src/cmd/tui.rs",
+            "notes.txt",
+        ] {
+            let basename = candidate.rsplit('/').next().unwrap_or(candidate);
+            let mut optimized_budget = usize::MAX;
+            let optimized = matcher
+                .matches_candidate(
+                    candidate,
+                    basename,
+                    &mut optimized_budget,
+                    &mut MatchScratch::default(),
+                )
+                .expect("bounded matching");
+
+            let mut reference_budget = usize::MAX;
+            let mut scratch = MatchScratch::default();
+            let reference = if is_match(&matcher, candidate) {
+                MatchOutcome::Matched
+            } else {
+                matcher
+                    .try_match(basename, &mut reference_budget, &mut scratch)
+                    .expect("bounded matching")
+            };
+            assert_eq!(
+                optimized, reference,
+                "pattern={pattern:?} candidate={candidate:?}"
+            );
+
+            if matcher.debug_subsumes_basename() {
+                assert!(
+                    !(is_match(&matcher, basename) && !is_match(&matcher, candidate)),
+                    "pattern={pattern:?} claims subsumption but basename {basename:?} \
+                     matches while path {candidate:?} does not"
+                );
+            }
+        }
+    }
+}
+
+fn synthetic_corpus(count: usize) -> Vec<String> {
+    // Shapes sampled to reproduce the measured distribution across 34 real
+    // repositories: mean 47.7, p50 43, p90 72, p99 122, max 167.
+    const DIRS: &[&str] = &[
+        "src",
+        "crates",
+        "lib",
+        "tests",
+        "internal",
+        "packages",
+        "components",
+        "read_operations",
+        "mutation_operations",
+        "very_long_generated_module_directory_name",
+    ];
+    const STEMS: &[&str] = &[
+        "mod",
+        "index",
+        "traversal",
+        "glob",
+        "handler",
+        "test_client",
+        "a_rather_long_generated_source_file_name_for_tail_coverage",
+    ];
+    const EXTS: &[&str] = &["rs", "ts", "tsx", "js", "py", "json", "rlib", "md"];
+    let mut out = Vec::with_capacity(count);
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as usize
+    };
+    for _ in 0..count {
+        let depth = 1 + next() % 5;
+        let mut path = String::new();
+        for _ in 0..depth {
+            path.push_str(DIRS[next() % DIRS.len()]);
+            path.push('/');
+        }
+        path.push_str(STEMS[next() % STEMS.len()]);
+        path.push('.');
+        path.push_str(EXTS[next() % EXTS.len()]);
+        out.push(path);
+    }
+    out
 }
 
 proptest! {

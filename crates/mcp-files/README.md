@@ -52,7 +52,15 @@ backtracking controlled by model input.
 
 - The root must exist and be a directory.
 - Lexical escapes, stable symlink escapes, and protected paths are rejected.
-- Broad traversal skips symlinks, `.git`, `node_modules`, and protected entries.
+- Broad traversal skips symlinks, protected entries, and directories holding regenerable build output
+  or tool caches. Dependency source trees such as `vendor` and ambiguous names such as `build` are not
+  skipped. Skipping never applies to an explicitly named path.
+- Traversal descends from a canonical root through entries verified not to be symlinks, so a joined
+  entry path is already canonical and is authorized without a per-entry `realpath`.
+- Exhausting the traversal budget, the result count, the glob work budget, or the protocol result
+  ceiling truncates a search result. None of them fails the call.
+- `file_glob` reports `total`, exact when `scanComplete` and a lower bound otherwise; `file_grep`
+  reports `filesScanned` and `filesListed`. A truncated result states its counts in the model text.
 - Binary files are rejected using content signatures and a bounded byte-sample fallback; filename
   extensions do not control classification.
 - Reads, lines, traversal, regexes, globs, patches, diffs, plans, and MCP responses have independent
@@ -68,6 +76,8 @@ backtracking controlled by model input.
   unintended write.
 - `prepare_apply_patch` plans without write access; only `execute_prepared_patch` requires it.
 - Existing mode bits are preserved and new files use mode `0600` on supported platforms.
+- Missing parent directories are created for every mutation publication, after the write-authority
+  check and inside the resolved root. Created directories take the process umask.
 - Replacements use exclusive same-directory temporary files and atomic rename.
 - Source identity and content are revalidated before edit or patch publication.
 - Patch output is constructed and checked against the host's 64,000-byte MCP result ceiling before

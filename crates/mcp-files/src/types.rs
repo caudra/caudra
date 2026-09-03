@@ -34,8 +34,15 @@ impl Default for FilesystemLimits {
             max_file_bytes: 5 * 1024 * 1024,
             max_line_length: 2_000,
             max_read_lines: 2_000,
-            max_search_results: 100,
-            max_traversal_entries: 10_000,
+            // Search results are additionally bounded by the protocol result
+            // ceiling, so this count is a coarse cap rather than the binding
+            // constraint for wide rows.
+            max_search_results: 500,
+            // Sized from measured traversal cost of roughly 7 microseconds per
+            // entry, so an exhaustive scan of a very large tree stays near one
+            // second. Ordinary repositories finish well inside this budget once
+            // build output is skipped.
+            max_traversal_entries: 50_000,
             max_write_bytes: 5 * 1024 * 1024,
             max_patch_bytes: 1024 * 1024,
             max_patch_files: 100,
@@ -45,7 +52,11 @@ impl Default for FilesystemLimits {
             max_glob_brace_depth: 8,
             max_glob_alternatives: 256,
             max_glob_generated_bytes: 64 * 1024,
-            max_glob_match_steps: 1_000_000,
+            // A whole-operation work bound, not a per-pattern one. Sized so the
+            // heaviest ordinary pattern can evaluate every candidate the
+            // traversal budget admits; a pathological pattern exhausts it and
+            // truncates instead of failing.
+            max_glob_match_steps: 400_000_000,
             max_diff_bytes: 16 * 1024,
             max_patch_result_bytes: 4 * 1024 * 1024,
         }
@@ -207,6 +218,13 @@ pub struct FileGlobOutput {
     pub pattern: String,
     pub files: Vec<FileListing>,
     pub count: usize,
+    /// Files matching the pattern. Counting continues past the returned window,
+    /// so this exceeds `count` when results were withheld. Exact when
+    /// `scanComplete` is true, otherwise a lower bound.
+    pub total: usize,
+    /// Whether every candidate the traversal produced was examined. False when
+    /// the traversal or the match work budget stopped the scan early.
+    pub scan_complete: bool,
     pub truncated: bool,
 }
 
@@ -229,6 +247,11 @@ pub struct FileGrepOutput {
     pub include: Option<String>,
     pub rows: Vec<FileGrepRow>,
     pub matches: usize,
+    /// Candidate files actually searched. An exact match total is not reported
+    /// because producing one would require reading every remaining file.
+    pub files_scanned: usize,
+    /// Candidate files the traversal listed. A lower bound when `truncated`.
+    pub files_listed: usize,
     pub truncated: bool,
 }
 

@@ -748,6 +748,177 @@ async fn exclusive_patch_adds_never_overwrite_existing_or_racing_files() {
     assert!(temporary_files(&fixture.root, "raced.txt").is_empty());
 }
 
+/// Exhausting the glob work budget must truncate, not fail.
+///
+/// The result cap and the traversal cap in the same loop already degrade to a
+/// partial result. A work budget that instead returned an error discarded every
+/// match already collected, which is what made ordinary wildcard searches fail
+/// outright on large repositories.
+#[tokio::test]
+async fn exhausting_the_glob_work_budget_truncates_instead_of_failing() {
+    let fixture = fixture();
+    for index in 0..40 {
+        fs::write(fixture.root.join(format!("file-{index}.ts")), "x\n").expect("candidate");
+    }
+    let files = FileToolGroup::new(
+        &fixture.root,
+        false,
+        Some(FilesystemLimits {
+            // Enough for a few candidates, far short of the whole corpus.
+            max_glob_match_steps: 600,
+            ..FilesystemLimits::default()
+        }),
+    )
+    .await
+    .expect("tool group");
+
+    let output = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.ts".into(),
+                path: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("budget exhaustion must not fail the call");
+
+    assert!(output.truncated);
+    assert!(!output.scan_complete, "the scan stopped early");
+    assert!(
+        !output.files.is_empty(),
+        "results collected before exhaustion must be kept"
+    );
+    assert!(output.count < 40);
+
+    let output = files
+        .file_grep(
+            FileGrepInput {
+                pattern: "x".into(),
+                path: None,
+                include: Some("**/*.ts".into()),
+            },
+            &token(),
+        )
+        .await
+        .expect("budget exhaustion must not fail the call");
+    assert!(output.truncated);
+    assert!(output.files_scanned < output.files_listed);
+}
+
+/// Counting continues past the returned window so a caller learns how much was
+/// withheld, and the model-facing text says so.
+#[tokio::test]
+async fn truncated_searches_report_totals_and_say_so_in_the_model_text() {
+    let fixture = fixture();
+    for index in 0..12 {
+        fs::write(fixture.root.join(format!("file-{index}.ts")), "needle\n")
+            .expect("candidate file");
+    }
+    let files = FileToolGroup::new(
+        &fixture.root,
+        false,
+        Some(FilesystemLimits {
+            max_search_results: 3,
+            ..FilesystemLimits::default()
+        }),
+    )
+    .await
+    .expect("tool group");
+
+    let output = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.ts".into(),
+                path: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("glob");
+    assert_eq!(output.count, 3);
+    assert_eq!(output.total, 12, "counting continues past the shown window");
+    assert!(output.scan_complete, "the scan itself completed");
+    assert!(output.truncated);
+
+    let output = files
+        .file_grep(
+            FileGrepInput {
+                pattern: "needle".into(),
+                path: None,
+                include: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("grep");
+    assert_eq!(output.matches, 3);
+    assert!(output.truncated);
+    assert!(output.files_scanned <= output.files_listed);
+    assert_eq!(output.files_listed, 13, "twelve candidates plus notes.txt");
+}
+
+/// Broad traversal skips regenerable build output, but an explicit path still
+/// searches inside it. Dependency source trees are never skipped.
+#[tokio::test]
+async fn broad_traversal_skips_build_output_but_an_explicit_path_does_not() {
+    let fixture = fixture();
+    for directory in ["target", "node_modules", ".venv", "dist", "__pycache__"] {
+        fs::create_dir_all(fixture.root.join(directory)).expect("skipped directory");
+        fs::write(fixture.root.join(directory).join("generated.rs"), "x\n").expect("artifact");
+    }
+    for directory in ["vendor", "build", "deps", "third_party", "Pods"] {
+        fs::create_dir_all(fixture.root.join(directory)).expect("searchable directory");
+        fs::write(fixture.root.join(directory).join("source.rs"), "x\n").expect("source");
+    }
+    fs::write(fixture.root.join("own.rs"), "x\n").expect("own source");
+    let files = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .expect("tool group");
+
+    let output = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.rs".into(),
+                path: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("glob");
+    let found = output
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        vec![
+            "Pods/source.rs",
+            "build/source.rs",
+            "deps/source.rs",
+            "own.rs",
+            "third_party/source.rs",
+            "vendor/source.rs",
+        ],
+        "dependency source and ambiguous names stay searchable; build output does not"
+    );
+
+    // The skip list is recoverable: naming the directory searches inside it.
+    let output = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.rs".into(),
+                path: Some("target".into()),
+            },
+            &token(),
+        )
+        .await
+        .expect("explicit glob");
+    assert_eq!(output.count, 1);
+    assert_eq!(output.files[0].relative_path, "generated.rs");
+}
+
 #[tokio::test]
 async fn multi_file_patch_keeps_changes_published_before_a_later_failure() {
     let fixture = fixture();
@@ -773,6 +944,57 @@ async fn multi_file_patch_keeps_changes_published_before_a_later_failure() {
     // Publication is atomic per file, not transactional across files. Rolling
     // back earlier files could overwrite unrelated concurrent filesystem work.
     assert!(!fixture.root.join("published.txt/second.txt").exists());
+}
+
+/// A write to a path whose parents do not exist creates the whole chain.
+///
+/// The second half is the load-bearing part: directory creation must stay
+/// behind path resolution, so a rejected path can never leave directories
+/// behind outside the root.
+#[tokio::test]
+async fn file_write_creates_missing_parent_directories_without_escaping_the_root() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    let output = files
+        .file_write(
+            FileWriteInput {
+                file_path: "deep/nested/new.txt".into(),
+                content: "one\ntwo\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("write into missing directories");
+
+    assert!(!output.existed);
+    assert!(output.applied);
+    assert_eq!(output.relative_path, "deep/nested/new.txt");
+    assert!(fixture.root.join("deep").is_dir());
+    assert!(fixture.root.join("deep/nested").is_dir());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("deep/nested/new.txt")).expect("written content"),
+        "one\ntwo\n"
+    );
+    assert!(temporary_files(&fixture.root, "new.txt").is_empty());
+
+    let error = files
+        .file_write(
+            FileWriteInput {
+                file_path: "../outside/deep/new.txt".into(),
+                content: "escaped\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect_err("escaping write");
+    assert!(matches!(error, FilesystemError::RootEscape(_)));
+    assert!(
+        !fixture.outside.join("deep").exists(),
+        "a rejected path must not create directories outside the root"
+    );
 }
 
 #[tokio::test]
