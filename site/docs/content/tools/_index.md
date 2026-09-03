@@ -63,6 +63,8 @@ Return a compact structural overview of a source file, or a deterministic listin
 
 Fast file pattern matching tool for files under the file root.
 
+A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `pattern` | string | yes | Glob pattern supporting *, **, ?, and brace alternatives. |
@@ -71,6 +73,8 @@ Fast file pattern matching tool for files under the file root.
 ### `file_grep` {#file_grep}
 
 Fast content search tool for files under the file root.
+
+A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -124,7 +128,9 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 Execute a Bash command on the MCP server host.
 
-Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
+Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
+
+A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it; the footer reports how many frames were absorbed.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

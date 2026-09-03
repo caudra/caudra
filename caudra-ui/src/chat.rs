@@ -1752,7 +1752,10 @@ mod tests {
             (
                 "file_grep",
                 serde_json::json!({"pattern": "TODO"}),
-                ToolOutput::GrepResult { entries: vec![] },
+                ToolOutput::GrepResult {
+                    entries: vec![],
+                    capped: None,
+                },
             ),
             (
                 "todo_write",

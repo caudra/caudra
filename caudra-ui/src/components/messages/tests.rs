@@ -12,8 +12,8 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    GrepFileEntry, GrepMatchGroup, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan,
-    SpanStyle, ToolInput, ToolOutput,
+    GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput,
+    SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -163,8 +163,10 @@ fn shell_done(id: &str, filtered: bool) -> ToolDoneEvent {
         stderr_capture_truncated: false,
         stdout_preview_truncated: false,
         stderr_preview_truncated: false,
+        stdout_redraws_collapsed: 0,
+        stderr_redraws_collapsed: 0,
         filter: filtered.then(|| ShellFilterInfo {
-            rule: "cargo".into(),
+            stages: vec!["cargo".into()],
             unfiltered_utf8_bytes: 200,
             filtered_utf8_bytes: 40,
         }),
@@ -293,6 +295,7 @@ fn grep_output(n_files: usize) -> ToolOutput {
                 groups: vec![GrepMatchGroup::single(1, "")],
             })
             .collect(),
+        capped: None,
     }
 }
 
@@ -317,6 +320,49 @@ fn tool_done_grep_shows_matches() {
     let text = &panel.messages[0].text;
     assert!(!text.contains('\n'), "grep body should not be in msg.text");
     assert!(panel.messages[0].tool_output.is_some());
+}
+
+/// "No files found" alone would be a claim the search never established.
+#[test]
+fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: FILE_GREP_TOOL_NAME.into(),
+        output: ToolOutput::GrepResult {
+            entries: Vec::new(),
+            capped: Some(SearchCap {
+                files_scanned: 40,
+                files_listed: 900,
+            }),
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    });
+    render(&mut panel, 80, 24);
+    let rendered = seg_text(&panel, "t1");
+
+    assert!(rendered.contains(NO_FILES_FOUND), "{rendered}");
+    assert!(
+        rendered.contains("searched 40 of 900 files; more matches may exist"),
+        "{rendered}"
+    );
+    assert!(
+        panel.messages[0]
+            .annotation
+            .as_deref()
+            .is_some_and(|annotation| annotation.contains("capped, 40/900 searched")),
+        "{:?}",
+        panel.messages[0].annotation
+    );
 }
 
 #[test]
@@ -1698,7 +1744,10 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: FILE_GREP_TOOL_NAME.into(),
-        output: ToolOutput::GrepResult { entries },
+        output: ToolOutput::GrepResult {
+            entries,
+            capped: None,
+        },
         is_error: false,
         annotation: None,
         written_path: None,

@@ -689,7 +689,7 @@ impl MessagesPanel {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
                 }
             }
-            ToolOutput::GrepResult { entries } if entries.is_empty() => {
+            ToolOutput::GrepResult { entries, .. } if entries.is_empty() => {
                 msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
             }
             _ => {}

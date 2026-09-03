@@ -20,7 +20,7 @@ use caudra_agent::{
     IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
-    IndexSourceRange as AgentIndexSourceRange, PatchedFile,
+    IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap,
     ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
     TextOutput, ToolInput, ToolOutput,
 };
@@ -41,11 +41,13 @@ use workcell::files::{
     FileGlobInput, FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput,
     FileResource, FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput,
     IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
-    IndexLineSemantic, IndexOutput as WorkcellIndexOutput, PreparedFilePatch,
+    IndexLineSemantic, IndexOutput as WorkcellIndexOutput, ModelText, PreparedFilePatch,
 };
+use workcell::output_filter::RowRenderer;
 use workcell::shell::{
     PreparedShell, ShellExecution, ShellFilterInfo as WorkcellShellFilterInfo, ShellInput,
-    ShellOutput as WorkcellShellOutput, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
+    ShellOutput as WorkcellShellOutput, ShellProgressChunk, ShellProgressSink, ShellStream,
+    ShellToolGroup,
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, WebExecution, WebToolGroup, WebfetchInput, WebfetchOutput,
@@ -1532,23 +1534,43 @@ fn file_read_result(output: FileReadOutput) -> ToolExecResult {
     ToolExecResult::from(Ok::<_, String>(tool_output)).with_model_output(Some(exact))
 }
 
+/// A search reports its own truncation notice, so the rendering Workcell writes
+/// is what both the model and the reader get. Serializing the record instead
+/// would carry every path twice and drop the sentence that says what was
+/// withheld.
 fn file_glob_result(output: FileGlobOutput) -> ToolExecResult {
-    let exact = model_text(&output);
-    let text = if output.files.is_empty() {
+    let text = output.model_text().into_owned();
+    let display = if text.is_empty() {
         caudra_agent::NO_FILES_FOUND.into()
     } else {
-        output
-            .files
-            .iter()
-            .map(|file| file.relative_path.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        text.clone()
     };
-    text_result(&output, text, false, exact)
+    let annotation = glob_annotation(&output);
+    text_result(&output, display, false, text).with_annotation(Some(annotation))
+}
+
+/// `count` is the window, `total` what matched. A scan that stopped early knows
+/// neither exactly, so it says so rather than quoting a total as if it were one.
+fn glob_annotation(output: &FileGlobOutput) -> String {
+    let files = if output.count == 1 { "file" } else { "files" };
+    if !output.truncated {
+        return format!("{} {files}", output.count);
+    }
+    if output.scan_complete {
+        return format!("{} of {} files", output.count, output.total);
+    }
+    if output.total > output.count {
+        return format!("{} of at least {} files", output.count, output.total);
+    }
+    format!("{} {files}, scan capped", output.count)
 }
 
 fn file_grep_result(output: FileGrepOutput) -> ToolExecResult {
-    let exact = model_text(&output);
+    let exact = output.model_text().into_owned();
+    let capped = output.truncated.then_some(SearchCap {
+        files_scanned: output.files_scanned,
+        files_listed: output.files_listed,
+    });
     let mut entries: Vec<GrepFileEntry> = Vec::new();
     for row in output.rows {
         let group = GrepMatchGroup::single(row.line, row.text);
@@ -1564,7 +1586,7 @@ fn file_grep_result(output: FileGrepOutput) -> ToolExecResult {
             });
         }
     }
-    ToolExecResult::from(Ok::<_, String>(ToolOutput::GrepResult { entries }))
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::GrepResult { entries, capped }))
         .with_model_output(Some(exact))
 }
 
@@ -1852,8 +1874,10 @@ fn shell_result_parts(
         stderr_capture_truncated: output.stderr_capture_truncated,
         stdout_preview_truncated: output.stdout_preview_truncated,
         stderr_preview_truncated: output.stderr_preview_truncated,
+        stdout_redraws_collapsed: output.stdout_redraws_collapsed,
+        stderr_redraws_collapsed: output.stderr_redraws_collapsed,
         filter: filter.map(|filter| AgentShellFilterInfo {
-            rule: filter.rule,
+            stages: filter.stages,
             unfiltered_utf8_bytes: filter.unfiltered_utf8_bytes,
             filtered_utf8_bytes: filter.filtered_utf8_bytes,
         }),
@@ -1901,12 +1925,53 @@ fn environment_error(error: ExecutionEnvironmentError) -> String {
     error.to_string()
 }
 
+/// The live tail of a running command, rendered as a terminal would show it.
+///
+/// Progress chunks are byte-exact by contract, so a bar that redraws arrives as
+/// a control stream rather than as lines. Splitting it on newlines would make an
+/// hour of redrawing one row hundreds of kilobytes wide, and its frames would
+/// evict everything printed before them from the retained window. Rendering on
+/// the way in costs that window the width of one row instead.
+///
+/// One renderer per stream, because a row is a property of the stream that drew
+/// it, and one buffer for both, because arrival order is what a reader saw.
+#[derive(Default)]
+struct ProgressTail {
+    stdout: RowRenderer,
+    stderr: RowRenderer,
+    rows: String,
+}
+
+impl ProgressTail {
+    fn push(&mut self, chunk: &ShellProgressChunk) -> String {
+        let renderer = match chunk.stream {
+            ShellStream::Stdout => &mut self.stdout,
+            ShellStream::Stderr => &mut self.stderr,
+        };
+        renderer.push(&chunk.text, &mut self.rows);
+        if self.rows.len() > PROGRESS_MAX_BYTES {
+            let keep = PROGRESS_MAX_BYTES.saturating_sub(PROGRESS_TRUNCATED.len());
+            let mut start = self.rows.len().saturating_sub(keep);
+            while !self.rows.is_char_boundary(start) {
+                start += 1;
+            }
+            self.rows = format!("{PROGRESS_TRUNCATED}{}", &self.rows[start..]);
+        }
+        // A bar writes no newline until it ends, so the row still being drawn is
+        // the only thing there is to show for the length of the run.
+        let mut text = self.rows.clone();
+        self.stdout.row(&mut text);
+        self.stderr.row(&mut text);
+        text
+    }
+}
+
 struct NativeProgressSink {
     id: Option<String>,
     event_tx: caudra_agent::EventSender,
     live_sink: Option<flume::Sender<ToolLive>>,
     body: Arc<caudra_agent::SharedBuf>,
-    text: Mutex<String>,
+    tail: Mutex<ProgressTail>,
 }
 
 impl NativeProgressSink {
@@ -1916,7 +1981,7 @@ impl NativeProgressSink {
             event_tx: ctx.event_tx.clone(),
             live_sink: ctx.live_sink.clone(),
             body: Arc::new(caudra_agent::SharedBuf::new()),
-            text: Mutex::new(String::new()),
+            tail: Mutex::new(ProgressTail::default()),
         }
     }
 
@@ -1925,26 +1990,16 @@ impl NativeProgressSink {
             let _ = sink.try_send(ToolLive::Buf(Arc::clone(&self.body)));
         }
     }
-
-    fn append_bounded(&self, chunk: &ShellProgressChunk) -> String {
-        let mut text = self.text.lock().unwrap_or_else(|error| error.into_inner());
-        text.push_str(&chunk.text);
-        if text.len() > PROGRESS_MAX_BYTES {
-            let keep = PROGRESS_MAX_BYTES.saturating_sub(PROGRESS_TRUNCATED.len());
-            let mut start = text.len().saturating_sub(keep);
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            *text = format!("{PROGRESS_TRUNCATED}{}", &text[start..]);
-        }
-        text.clone()
-    }
 }
 
 #[async_trait::async_trait]
 impl ShellProgressSink for NativeProgressSink {
     async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
-        let text = self.append_bounded(&chunk);
+        let text = self
+            .tail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(&chunk);
         self.body.set_lines(
             text.lines()
                 .map(|line| SnapshotLine::plain(line.to_owned()))
@@ -2126,6 +2181,8 @@ mod tests {
             stderr_capture_truncated: false,
             stdout_preview_truncated: false,
             stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 190,
+            stderr_redraws_collapsed: 2,
         }
     }
 
@@ -2133,9 +2190,9 @@ mod tests {
     fn shell_result_keeps_raw_output_and_surfaces_exit_status_to_the_model() {
         let success = shell_result_parts(
             shell_output(0),
-            "filtered\n[filtered: cargo]".into(),
+            "filtered\n[filtered: make, progress]".into(),
             Some(WorkcellShellFilterInfo {
-                rule: "cargo".into(),
+                stages: vec!["make".into(), "progress".into()],
                 unfiltered_utf8_bytes: 100,
                 filtered_utf8_bytes: 20,
             }),
@@ -2143,7 +2200,7 @@ mod tests {
         assert!(!success.is_error);
         assert_eq!(
             success.model_output.as_deref(),
-            Some("filtered\n[filtered: cargo]\n\n[shell status: exit code 0]")
+            Some("filtered\n[filtered: make, progress]\n\n[shell status: exit code 0]")
         );
         let ToolOutput::Shell(output) = success.output.unwrap() else {
             panic!("expected typed shell output");
@@ -2151,9 +2208,12 @@ mod tests {
         assert_eq!(output.stdout, "raw");
         assert_eq!(
             output.model_text,
-            "filtered\n[filtered: cargo]\n\n[shell status: exit code 0]"
+            "filtered\n[filtered: make, progress]\n\n[shell status: exit code 0]"
         );
-        assert_eq!(output.filter.unwrap().rule, "cargo");
+        // Every reduction is named, and rendering is disclosed separately
+        // because it can absorb frames with no rule matching at all.
+        assert_eq!(output.redraws_collapsed(), 192);
+        assert_eq!(output.filter.unwrap().stages, ["make", "progress"]);
 
         let failure = shell_result_parts(shell_output(101), "filtered".into(), None);
         assert!(failure.is_error);
@@ -2201,6 +2261,109 @@ mod tests {
             assert_eq!(output.model_text.contains("Entering directory"), !filtered);
             assert!(output.stdout.contains("Entering directory"));
         }
+    }
+
+    #[test]
+    fn terminal_rendering_survives_no_rtk_because_it_is_decoding() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.config = caudra_config::RawConfig::default()
+            .into_config(true)
+            .unwrap()
+            .agent;
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": r"printf '1/3\r2/3\r3/3\n'"}))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let ToolOutput::Shell(output) = smol::block_on(invocation.execute(&ctx)).output.unwrap()
+        else {
+            panic!("expected typed shell output");
+        };
+
+        // Disabling the filter withholds a judgement about content. It does not
+        // ask for a control stream back, so the capture is still the row a
+        // terminal would have shown.
+        assert!(output.filter.is_none());
+        assert_eq!(output.stdout, "3/3\n");
+        assert_eq!(output.redraws_collapsed(), 2);
+    }
+
+    fn progress_chunk(stream: ShellStream, text: &str) -> ShellProgressChunk {
+        ShellProgressChunk {
+            version: 1,
+            sequence: 0,
+            stream,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_live_bar_is_one_updating_row_that_does_not_evict_what_preceded_it() {
+        let mut tail = ProgressTail::default();
+        tail.push(&progress_chunk(ShellStream::Stdout, "loading dataset\n"));
+        let mut shown = String::new();
+        for step in 0..400 {
+            shown = tail.push(&progress_chunk(
+                ShellStream::Stdout,
+                &format!("\r{step:>3}/400 [{}]", "#".repeat(step / 20)),
+            ));
+        }
+
+        // Splitting the raw stream on newlines would make all 400 frames one
+        // row several kilobytes wide, and long enough runs would push the line
+        // printed before the bar out of the retained window entirely.
+        assert_eq!(shown.lines().count(), 2, "{shown}");
+        assert_eq!(shown.lines().next(), Some("loading dataset"));
+        assert_eq!(
+            shown.lines().next_back(),
+            Some("399/400 [###################]")
+        );
+    }
+
+    #[test]
+    fn a_running_command_publishes_rendered_rows_rather_than_a_control_stream() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let (tx, rx) = flume::unbounded::<Envelope>();
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.event_tx = EventSender::new(tx, 0);
+        ctx.tool_use_id = Some("shell-call".into());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": r"printf 'setup done\n0%%\r50%%\r100%%\n'"}))
+            .expect("valid shell input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        smol::block_on(invocation.execute(&ctx));
+
+        let published: Vec<String> = rx
+            .drain()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::ToolOutput { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        let last = published
+            .last()
+            .expect("a running command publishes output");
+        assert_eq!(last.lines().collect::<Vec<_>>(), ["setup done", "100%"]);
+    }
+
+    #[test]
+    fn a_bar_on_one_stream_does_not_overwrite_the_other() {
+        // A row belongs to the stream that drew it, so the renderers are
+        // separate; the buffer is shared because arrival order is what a reader
+        // saw.
+        let mut tail = ProgressTail::default();
+        tail.push(&progress_chunk(ShellStream::Stdout, "compiling\n"));
+        let shown = tail.push(&progress_chunk(ShellStream::Stderr, "  0%\r 50%"));
+        assert_eq!(shown, "compiling\n 50%");
     }
 
     #[test]
@@ -2633,6 +2796,96 @@ mod tests {
         assert!(!target.exists());
     }
 
+    fn glob_output(count: usize, total: usize, scan_complete: bool) -> FileGlobOutput {
+        FileGlobOutput {
+            cwd: "/project".into(),
+            relative_path: ".".into(),
+            pattern: "**/*.rs".into(),
+            files: (0..count)
+                .map(|index| workcell::files::FileListing {
+                    path: format!("/project/{index}.rs"),
+                    relative_path: format!("{index}.rs"),
+                    size_bytes: None,
+                    line_count: None,
+                })
+                .collect(),
+            count,
+            total,
+            scan_complete,
+            truncated: total > count || !scan_complete,
+        }
+    }
+
+    #[test_case(glob_output(2, 2, true),   "2 files"              ; "complete_scan_reports_what_it_found")]
+    #[test_case(glob_output(1, 340, true), "1 of 340 files"       ; "a_result_cap_knows_the_total")]
+    #[test_case(glob_output(1, 5, false),  "1 of at least 5 files" ; "an_early_stop_only_has_a_lower_bound")]
+    #[test_case(glob_output(0, 0, false),  "0 files, scan capped" ; "an_early_stop_that_matched_nothing_quotes_no_total")]
+    fn glob_annotation_distinguishes_a_capped_search_from_a_complete_one(
+        output: FileGlobOutput,
+        expected: &str,
+    ) {
+        assert_eq!(
+            file_glob_result(output).annotation.as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_capped_glob_reports_what_it_withheld_to_both_readers() {
+        let result = file_glob_result(glob_output(1, 340, true));
+        let model = result.model_output.clone().expect("model text");
+        assert!(
+            model.contains("[truncated: showing 1 of 340 matching files]"),
+            "{model}"
+        );
+        let ToolOutput::Plain(text) = result.output.unwrap() else {
+            panic!("expected plain glob output");
+        };
+        // Workcell writes the notice, so restating it is what would make the
+        // two renderings disagree.
+        assert_eq!(text.text, model);
+    }
+
+    #[test]
+    fn a_capped_glob_that_matched_nothing_is_not_a_complete_miss() {
+        let ToolOutput::Plain(text) = file_glob_result(glob_output(0, 0, false)).output.unwrap()
+        else {
+            panic!("expected plain glob output");
+        };
+        assert_ne!(text.text, caudra_agent::NO_FILES_FOUND);
+        assert!(text.text.contains("scan stopped early"), "{}", text.text);
+    }
+
+    #[test]
+    fn a_capped_grep_carries_how_far_it_searched_into_the_result() {
+        let result = file_grep_result(FileGrepOutput {
+            cwd: "/project".into(),
+            relative_path: ".".into(),
+            pattern: "needle".into(),
+            include: None,
+            rows: vec![workcell::files::FileGrepRow {
+                path: "/project/a.rs".into(),
+                relative_path: "a.rs".into(),
+                line: 3,
+                text: "needle".into(),
+            }],
+            matches: 1,
+            files_scanned: 40,
+            files_listed: 900,
+            truncated: true,
+        });
+        let model = result.model_output.clone().expect("model text");
+        assert!(
+            model.contains("[truncated: showing 1 matches from 40 of 900 files searched]"),
+            "{model}"
+        );
+        let ToolOutput::GrepResult { capped, .. } = result.output.unwrap() else {
+            panic!("expected typed grep output");
+        };
+        let cap = capped.expect("a truncated search reports its reach");
+        assert_eq!((cap.files_scanned, cap.files_listed), (40, 900));
+    }
+
     #[test]
     fn file_results_use_syntax_aware_presentations() {
         let read = file_read_result(FileReadOutput::File {
@@ -2664,13 +2917,15 @@ mod tests {
                 text: "fn main() {}".into(),
             }],
             matches: 1,
+            files_scanned: 1,
+            files_listed: 1,
             truncated: false,
         })
         .output
         .expect("grep output");
         assert!(matches!(
             grep,
-            ToolOutput::GrepResult { entries }
+            ToolOutput::GrepResult { entries, capped: None }
                 if entries.first().is_some_and(|entry| entry.path == "src/lib.rs")
         ));
 
@@ -2880,7 +3135,7 @@ mod tests {
         smol::block_on(invocation.preflight(&ctx)).expect("grep preflight");
         let result = smol::block_on(invocation.execute(&ctx));
         let output = result.output.expect("successful grep");
-        let ToolOutput::GrepResult { entries } = output else {
+        let ToolOutput::GrepResult { entries, .. } = output else {
             panic!("expected syntax-aware grep output");
         };
         assert_eq!(entries.len(), 1);

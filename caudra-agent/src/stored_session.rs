@@ -249,8 +249,10 @@ mod tests {
             stderr_capture_truncated: false,
             stdout_preview_truncated: false,
             stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 190,
+            stderr_redraws_collapsed: 0,
             filter: Some(ShellFilterInfo {
-                rule: "cargo".into(),
+                stages: vec!["make".into(), "progress".into()],
                 unfiltered_utf8_bytes: 100,
                 filtered_utf8_bytes: 20,
             }),

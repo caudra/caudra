@@ -11,7 +11,7 @@ use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
-    ToolInput, ToolOutput,
+    SearchCap, ToolInput, ToolOutput,
 };
 use caudra_config::ToolOutputLines;
 use ratatui::style::Style;
@@ -686,6 +686,27 @@ fn render_grep_lines(
 
 fn render_grep_results(
     entries: &[GrepFileEntry],
+    capped: Option<&SearchCap>,
+    max_lines: usize,
+    highlight: bool,
+) -> (Vec<Line<'static>>, bool) {
+    let (mut out, truncated) = render_grep_matches(entries, max_lines, highlight);
+    // A capped search read part of the tree, so an absent match is not evidence
+    // that there is none. Saying how far it got is what separates the two.
+    if let Some(cap) = capped {
+        out.push(Line::from(Span::styled(
+            format!(
+                "searched {} of {} files; more matches may exist",
+                cap.files_scanned, cap.files_listed
+            ),
+            theme::current().tool_dim,
+        )));
+    }
+    (out, truncated)
+}
+
+fn render_grep_matches(
+    entries: &[GrepFileEntry],
     max_lines: usize,
     highlight: bool,
 ) -> (Vec<Line<'static>>, bool) {
@@ -1079,8 +1100,8 @@ pub fn render_tool_content(
             false,
         ),
         Some(ToolOutput::Patch { files }) => (render_patch(files), false),
-        Some(ToolOutput::GrepResult { entries }) => {
-            render_grep_results(entries, limits.output, highlight)
+        Some(ToolOutput::GrepResult { entries, capped }) => {
+            render_grep_results(entries, capped.as_ref(), limits.output, highlight)
         }
         Some(ToolOutput::Index(IndexOutput::File {
             language, lines, ..
@@ -1395,15 +1416,42 @@ mod tests {
     #[test_case(&[("a.rs", &[1_usize,2])],                              1, 2 ; "the_way_back_outranks_a_single_row")]
     fn render_grep_line_count(files: &[(&str, &[usize])], max: usize, expected: usize) {
         let entries = grep_entries(files);
-        assert_eq!(render_grep_results(&entries, max, true).0.len(), expected);
+        assert_eq!(
+            render_grep_results(&entries, None, max, true).0.len(),
+            expected
+        );
     }
 
     fn grep_text(files: &[(&str, &[usize])], max: usize) -> Vec<String> {
-        render_grep_results(&grep_entries(files), max, false)
+        render_grep_results(&grep_entries(files), None, max, false)
             .0
             .iter()
             .map(line_text)
             .collect()
+    }
+
+    /// A search that stopped at a bound read part of the tree, so an absent
+    /// match is not evidence that there is none.
+    #[test]
+    fn a_capped_grep_says_how_far_it_searched() {
+        let entries = grep_entries(&[("a.rs", &[1_usize])]);
+        let cap = SearchCap {
+            files_scanned: 40,
+            files_listed: 900,
+        };
+        let capped: Vec<String> = render_grep_results(&entries, Some(&cap), 10, false)
+            .0
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            capped.last().map(String::as_str),
+            Some("searched 40 of 900 files; more matches may exist")
+        );
+        assert_eq!(
+            capped.len(),
+            grep_text(&[("a.rs", &[1_usize])], 10).len() + 1
+        );
     }
 
     /// The question a grep answers is how much matched and where, which the
@@ -1473,7 +1521,7 @@ mod tests {
     #[test]
     fn multi_file_grep_headers_and_alignment() {
         let entries = grep_entries(&[("a.rs", &[1]), ("b.rs", &[100])]);
-        let (lines, _) = render_grep_results(&entries, 10, false);
+        let (lines, _) = render_grep_results(&entries, None, 10, false);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(texts.iter().any(|t| t.contains("a.rs")));

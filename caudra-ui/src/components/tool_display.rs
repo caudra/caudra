@@ -718,28 +718,47 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_shell_view_toggle(&mut self, output: &ShellOutput, shell_raw: bool) {
-        let Some(filter) = &output.filter else {
+    /// Discloses what the body is not showing: the reductions that ran, and the
+    /// redraw frames rendering absorbed. Rendering is decoding rather than
+    /// filtering, so a command can collapse redraws without being filtered at
+    /// all, and then there is nothing to toggle to.
+    fn push_shell_footer(&mut self, output: &ShellOutput, shell_raw: bool) {
+        let redraws = output.redraws_collapsed();
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(filter) = &output.filter {
+            if shell_raw {
+                parts.push("raw output".into());
+            } else {
+                let saved = filter
+                    .unfiltered_utf8_bytes
+                    .saturating_sub(filter.filtered_utf8_bytes);
+                let reduction = saved
+                    .saturating_mul(100)
+                    .checked_div(filter.unfiltered_utf8_bytes)
+                    .unwrap_or(0);
+                parts.push(format!("filtered · {}", filter.stages.join(", ")));
+                parts.push(format!("{reduction}% smaller"));
+            }
+        }
+        if redraws > 0 {
+            parts.push(format!("{redraws} redraws collapsed"));
+        }
+        if parts.is_empty() {
             return;
-        };
-        let saved = filter
-            .unfiltered_utf8_bytes
-            .saturating_sub(filter.filtered_utf8_bytes);
-        let reduction = saved
-            .saturating_mul(100)
-            .checked_div(filter.unfiltered_utf8_bytes)
-            .unwrap_or(0);
-        let label = if shell_raw {
-            format!("raw output · {FILTERED_AFFORDANCE}")
-        } else {
-            format!(
-                "filtered · {} · {reduction}% smaller · {RAW_AFFORDANCE}",
-                filter.rule
-            )
-        };
-        self.shell_toggle_line = Some(self.lines.len());
+        }
+        // Only a filtered result has a second view, and the hit test finds the
+        // row by its affordance, so a line without one must not claim it.
+        if output.filter.is_some() {
+            let affordance = if shell_raw {
+                FILTERED_AFFORDANCE
+            } else {
+                RAW_AFFORDANCE
+            };
+            parts.push(affordance.to_owned());
+            self.shell_toggle_line = Some(self.lines.len());
+        }
         self.lines.push(Line::from(Span::styled(
-            format!("  {label}"),
+            format!("  {}", parts.join(" · ")),
             theme::current().tool_dim,
         )));
     }
@@ -1049,7 +1068,7 @@ pub fn build_tool_lines(
         b.push_resolved_output(&resolved);
     }
     if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
-        b.push_shell_view_toggle(output, expanded.shell_raw);
+        b.push_shell_footer(output, expanded.shell_raw);
     }
     b.finish(
         msg.tool_input.clone(),
@@ -1226,6 +1245,10 @@ mod tests {
     }
 
     fn shell_output(filtered: bool) -> ToolOutput {
+        shell_output_with(filtered, 0)
+    }
+
+    fn shell_output_with(filtered: bool, redraws: u64) -> ToolOutput {
         ToolOutput::Shell(ShellOutput {
             model_text: (1..=8)
                 .map(|line| format!("model_{line}"))
@@ -1250,8 +1273,10 @@ mod tests {
             stderr_capture_truncated: false,
             stdout_preview_truncated: false,
             stderr_preview_truncated: false,
+            stdout_redraws_collapsed: redraws,
+            stderr_redraws_collapsed: 0,
             filter: filtered.then(|| ShellFilterInfo {
-                rule: "cargo".into(),
+                stages: vec!["cargo".into(), "progress".into()],
                 unfiltered_utf8_bytes: 200,
                 filtered_utf8_bytes: 40,
             }),
@@ -1375,7 +1400,9 @@ mod tests {
         assert!(collapsed_text.contains("model_8"));
         assert!(!collapsed_text.contains("model_1"));
         assert!(!collapsed_text.contains("raw_8"));
-        assert!(collapsed_text.contains("filtered · cargo · 80% smaller · click for raw"));
+        assert!(
+            collapsed_text.contains("filtered · cargo, progress · 80% smaller · click for raw")
+        );
         assert!(collapsed.truncation.output);
         assert!(collapsed.shell_toggle_line.is_some());
         assert!(lines_text(&filtered_expanded).contains("model_1"));
@@ -1406,6 +1433,55 @@ mod tests {
         assert!(!text.contains("click for"));
         assert!(!text.contains("model_8"));
         assert!(lines.shell_toggle_line.is_none());
+    }
+
+    #[test]
+    fn collapsed_redraws_are_disclosed_without_a_view_to_toggle_to() {
+        // Rendering is decoding, so it runs whether or not a rule matched. A
+        // reader still has to be told the frames existed, but there is no
+        // second view holding them and the row must not claim a click.
+        let msg = bash_msg(
+            "python train.py",
+            ToolStatus::Success,
+            None,
+            Some(shell_output_with(false, 190)),
+        );
+        let lines = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(SectionFlags::default()),
+        );
+        let text = lines_text(&lines);
+
+        assert!(text.contains("190 redraws collapsed"), "{text}");
+        assert!(!text.contains("click for"), "{text}");
+        assert!(lines.shell_toggle_line.is_none());
+    }
+
+    #[test]
+    fn a_filtered_result_reports_its_redraws_beside_its_stages() {
+        let msg = bash_msg(
+            "cargo test",
+            ToolStatus::Success,
+            None,
+            Some(shell_output_with(true, 12)),
+        );
+        let lines = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(SectionFlags::default()),
+        );
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains(
+                "filtered · cargo, progress · 80% smaller · 12 redraws collapsed · click for raw"
+            ),
+            "{text}"
+        );
+        assert!(lines.shell_toggle_line.is_some());
     }
 
     #[test_case(ToolStatus::InProgress, None           ; "live_streaming_shows_body")]

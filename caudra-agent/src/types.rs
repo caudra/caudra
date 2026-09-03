@@ -240,7 +240,9 @@ pub struct TextOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellFilterInfo {
-    pub rule: String,
+    /// Reductions that ran, in order. A corpus rule appears under its own name;
+    /// the command-independent progress collapse appears as `progress`.
+    pub stages: Vec<String>,
     pub unfiltered_utf8_bytes: usize,
     pub filtered_utf8_bytes: usize,
 }
@@ -264,10 +266,20 @@ pub struct ShellOutput {
     pub stderr_capture_truncated: bool,
     pub stdout_preview_truncated: bool,
     pub stderr_preview_truncated: bool,
+    /// Redraw frames absorbed while rendering the capture as a terminal would
+    /// show it. `stdout_utf8_bytes` still reports what the command wrote.
+    pub stdout_redraws_collapsed: u64,
+    pub stderr_redraws_collapsed: u64,
     pub filter: Option<ShellFilterInfo>,
 }
 
 impl ShellOutput {
+    /// Frames a reader is not being shown, across both streams.
+    pub fn redraws_collapsed(&self) -> u64 {
+        self.stdout_redraws_collapsed
+            .saturating_add(self.stderr_redraws_collapsed)
+    }
+
     pub fn raw_text(&self) -> String {
         match (self.stdout.is_empty(), self.stderr.is_empty()) {
             (false, true) => self.stdout.clone(),
@@ -448,6 +460,10 @@ pub enum ToolOutput {
 
     GrepResult {
         entries: Vec<GrepFileEntry>,
+        /// Present when a bound stopped the search rather than the tree ending.
+        /// Without it a capped result is indistinguishable from a complete one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capped: Option<SearchCap>,
     },
     Index(IndexOutput),
     Shell(ShellOutput),
@@ -468,6 +484,14 @@ pub enum ToolOutput {
         /// the pixels ride separately as a `ContentBlock::Image`.
         text: String,
     },
+}
+
+/// How far a search reached before a bound stopped it. Both counts are lower
+/// bounds: an exact match total would mean reading every remaining file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchCap {
+    pub files_scanned: usize,
+    pub files_listed: usize,
 }
 
 /// One file's share of a patch. `path` is the project-relative spelling, which
@@ -520,11 +544,17 @@ impl ToolOutput {
                 files.iter().map(|f| f.additions).sum(),
                 files.iter().map(|f| f.deletions).sum(),
             )),
-            Self::GrepResult { entries } => {
+            Self::GrepResult { entries, capped } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
                 let f = if files == 1 { "file" } else { "files" };
-                Some(format!("{matches} matches in {files} {f}"))
+                Some(match capped {
+                    Some(cap) => format!(
+                        "{matches} matches in {files} {f} (capped, {}/{} searched)",
+                        cap.files_scanned, cap.files_listed
+                    ),
+                    None => format!("{matches} matches in {files} {f}"),
+                })
             }
             Self::ReadDir(t) => {
                 let n = t.text.lines().count();
@@ -633,7 +663,7 @@ impl ToolOutput {
 
     pub fn is_empty_result(&self) -> bool {
         match self {
-            Self::GrepResult { entries } => entries.is_empty(),
+            Self::GrepResult { entries, .. } => entries.is_empty(),
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.is_empty(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.is_empty(),
             Self::Shell(output) => output.stdout.is_empty() && output.stderr.is_empty(),
@@ -741,7 +771,7 @@ impl ToolOutput {
                 let display = crate::tools::relative_path(path);
                 format!("wrote {} to {display}", written_size(*byte_count, lines))
             }
-            Self::GrepResult { entries } => {
+            Self::GrepResult { entries, .. } => {
                 let mut out = String::new();
                 for (i, entry) in entries.iter().enumerate() {
                     if i > 0 {
@@ -1581,8 +1611,10 @@ mod tests {
             stderr_capture_truncated: false,
             stdout_preview_truncated: false,
             stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 0,
+            stderr_redraws_collapsed: 0,
             filter: Some(ShellFilterInfo {
-                rule: "cargo".into(),
+                stages: vec!["cargo".into()],
                 unfiltered_utf8_bytes: 100,
                 filtered_utf8_bytes: 20,
             }),
@@ -1612,7 +1644,8 @@ mod tests {
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec!["x".into(); 3] }, Some("3 lines") ; "write_code_lines")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_falls_back_for_old_sessions")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some("0 lines") ; "write_code_empty_file")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, Some("1 matches in 1 file") ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, Some("1 matches in 1 file (capped, 40/900 searched)") ; "grep_capped_reports_how_far_it_got")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
@@ -1726,6 +1759,7 @@ mod tests {
                     groups: vec![GrepMatchGroup::single(1, "use crate")],
                 },
             ],
+            capped: None,
         };
         let text = output.as_text();
         assert!(text.contains("src/a.rs"));
@@ -1751,6 +1785,7 @@ mod tests {
                     GrepMatchGroup::single(20, "fn bar()"),
                 ],
             }],
+            capped: None,
         };
         let text = output.as_text();
         assert!(text.contains("2  let x = 1;"), "context before: {text}");
