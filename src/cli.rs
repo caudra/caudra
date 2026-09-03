@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use caudra_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 
 use crate::print::OutputFormat;
 
@@ -36,6 +37,10 @@ pub struct Cli {
     /// Non-interactive mode. Runs the prompt and exits. Compatible with Claude Code's --print flag
     #[arg(short, long)]
     pub print: bool,
+
+    /// Store session data in a temporary directory removed when Caudra exits
+    #[arg(long, global = true)]
+    pub ephemeral: bool,
 
     /// Attach an image to the prompt in --print mode as vision content (repeatable)
     #[arg(long = "image", value_name = "PATH")]
@@ -276,7 +281,7 @@ pub enum Command {
 pub enum StorageAction {
     /// Print the session database path
     Path,
-    /// Show aggregate database and row statistics
+    /// Show aggregate database, row, and artifact statistics
     Stats {
         /// Emit JSON
         #[arg(long)]
@@ -295,6 +300,152 @@ pub enum StorageAction {
         #[arg(long, default_value_t = 1024)]
         pages: u32,
     },
+    /// List sessions with their last activity, size, and retention state
+    Sessions {
+        /// Only sessions for this working directory
+        #[arg(long, value_name = "DIR")]
+        directory: Option<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Demote sessions outside a keep policy to the transcript tier
+    ///
+    /// Trimming removes workspace snapshots, retained tool output files, rewind
+    /// archives, and large rich tool output records. The conversation stays
+    /// and the session can still be resumed. Without any --keep-* flag the
+    /// configured storage.retention.trim policy applies.
+    Trim {
+        #[command(flatten)]
+        policy: KeepPolicyArgs,
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        /// Show the plan without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit the plan and outcomes as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete sessions outside a keep policy, or the given session IDs
+    ///
+    /// Without any --keep-* flag the configured storage.retention.forget
+    /// policy applies. An empty policy is refused unless
+    /// --unsafe-allow-remove-all is combined with --directory.
+    Forget {
+        /// Session IDs to delete regardless of policy
+        #[arg(value_name = "ID", conflicts_with_all = ["directory", "group_by", "unsafe_allow_remove_all"])]
+        ids: Vec<String>,
+        #[command(flatten)]
+        policy: KeepPolicyArgs,
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        /// Show the plan without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit the plan and outcomes as JSON
+        #[arg(long)]
+        json: bool,
+        /// Run prune afterwards when at least one session was forgotten
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Reclaim space no session references: cleanup jobs, orphaned artifact
+    /// directories, the WAL, and freelist pages
+    Prune {
+        /// Show what would be reclaimed without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Keep sessions regardless of any policy
+    Pin {
+        #[arg(value_name = "ID", required = true)]
+        ids: Vec<String>,
+    },
+    /// Make sessions subject to policies again
+    Unpin {
+        #[arg(value_name = "ID", required = true)]
+        ids: Vec<String>,
+    },
+}
+
+/// Which sessions to keep, in `restic forget` terms. A session is kept when
+/// it matches at least one rule. Durations are like `90d` or `2y5m7d3h`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct KeepPolicyArgs {
+    /// Keep the N most recently active sessions
+    #[arg(long, value_name = "N")]
+    pub keep_last: Option<u32>,
+    /// For the last N hours with sessions, keep the newest session of each
+    #[arg(long, value_name = "N")]
+    pub keep_hourly: Option<u32>,
+    /// For the last N days with sessions, keep the newest session of each
+    #[arg(long, value_name = "N")]
+    pub keep_daily: Option<u32>,
+    /// For the last N ISO weeks with sessions, keep the newest session of each
+    #[arg(long, value_name = "N")]
+    pub keep_weekly: Option<u32>,
+    /// For the last N months with sessions, keep the newest session of each
+    #[arg(long, value_name = "N")]
+    pub keep_monthly: Option<u32>,
+    /// For the last N years with sessions, keep the newest session of each
+    #[arg(long, value_name = "N")]
+    pub keep_yearly: Option<u32>,
+    /// Keep every session active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within: Option<RetentionDuration>,
+    /// Keep hourly sessions active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within_hourly: Option<RetentionDuration>,
+    /// Keep daily sessions active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within_daily: Option<RetentionDuration>,
+    /// Keep weekly sessions active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within_weekly: Option<RetentionDuration>,
+    /// Keep monthly sessions active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within_monthly: Option<RetentionDuration>,
+    /// Keep yearly sessions active within this duration
+    #[arg(long, value_name = "DURATION")]
+    pub keep_within_yearly: Option<RetentionDuration>,
+}
+
+impl KeepPolicyArgs {
+    /// `None` when no flag was given, so the configured policy applies.
+    pub fn policy(&self) -> Option<KeepPolicy> {
+        let policy = KeepPolicy {
+            keep_last: self.keep_last,
+            keep_hourly: self.keep_hourly,
+            keep_daily: self.keep_daily,
+            keep_weekly: self.keep_weekly,
+            keep_monthly: self.keep_monthly,
+            keep_yearly: self.keep_yearly,
+            keep_within: self.keep_within,
+            keep_within_hourly: self.keep_within_hourly,
+            keep_within_daily: self.keep_within_daily,
+            keep_within_weekly: self.keep_within_weekly,
+            keep_within_monthly: self.keep_within_monthly,
+            keep_within_yearly: self.keep_within_yearly,
+        };
+        (policy != KeepPolicy::default()).then_some(policy)
+    }
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct PolicyScopeArgs {
+    /// Evaluate the policy per working directory, or across every session
+    #[arg(long, value_name = "directory|none")]
+    pub group_by: Option<GroupBy>,
+    /// Only sessions for this working directory
+    #[arg(long, value_name = "DIR")]
+    pub directory: Option<String>,
+    /// Allow an empty policy to act on every session matched by --directory
+    #[arg(long, requires = "directory")]
+    pub unsafe_allow_remove_all: bool,
 }
 
 #[derive(Subcommand)]
@@ -395,5 +546,12 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn ephemeral_flag_parses() {
+        let cli = Cli::try_parse_from(["caudra", "--ephemeral"]).unwrap();
+
+        assert!(cli.ephemeral);
     }
 }

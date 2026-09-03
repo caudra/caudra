@@ -19,6 +19,14 @@ Caudra releases ownership on normal exit, process termination, or a crash. A
 running process that has stopped responding still owns its session. Forking an
 active session remains available because the child receives a new ID.
 
+## Ephemeral sessions
+
+Run `caudra --ephemeral` for a session that leaves no session record behind. Set `storage.ephemeral = true` to make this the default.
+
+Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the system temporary directory. Session rows, tool outputs, snapshots, input history, and stashed prompts use that root. It is removed when Caudra exits through its normal success or error paths. A forced process kill can leave the temporary root for the operating system to clean up.
+
+Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run.
+
 ## Message actions
 
 Right-click a message, or hold the left mouse button for half a second, to open Message Actions. Normal left clicks still select text, expand reasoning, and interact with tool output.
@@ -51,11 +59,51 @@ Forking does not restore files. The child uses the same working directory and se
 
 ## Managed tool outputs
 
-Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Caudra state directory. An output ID can be read or searched only from its owning session. Live sessions have no age-based expiry for these results.
+Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Caudra state directory. An output ID can be read or searched only from its owning session. Retained outputs expire only through [retention](#retention).
 
 Each retained output is capped at 100 MiB. Deleting a session deletes its retained outputs. A fork copies the outputs referenced by its selected ancestor path and reachable subagent histories into the child session, preserving their opaque IDs there.
 
 If a failed deletion or interrupted write leaves output without a session, output-store startup cleanup removes it after a seven-day grace period. Retained outputs belonging to a live session remain untouched.
+
+## Retention
+
+Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and file snapshots. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It has no file revert, no `tool_output_read` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
+
+Trimming moves a session from full to transcript. Forgetting deletes it. A trimmed session that runs again becomes full for its new work and is trimmed again later.
+
+Policies use the vocabulary of `restic forget`. A session is kept when any rule matches:
+
+| Rule | Keeps |
+|------|-------|
+| `keep_last = N` | the N most recently active sessions |
+| `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly = N` | for the last N periods that contain sessions, the newest session of each |
+| `keep_within = "90d"` | every session active within the duration |
+| `keep_within_hourly` ... `keep_within_yearly = "7d"` | one session per period within the duration |
+
+Activity is the later of the last write and the last open. Calendar rules use natural boundaries in the local time zone: hours on the hour, days at midnight, ISO weeks from Monday. Durations are a sequence of `y`, `m`, `d`, and `h` parts, for example `2y5m7d3h`. `w` is not accepted, write `7d`.
+
+The policy is evaluated per working directory by default, so one busy project cannot starve another project of its kept sessions. Pinned sessions, sessions open in any Caudra process, sessions with a pending revert, and sessions with activity in the future are always kept.
+
+The default keeps the twenty most recently active sessions of every directory in full, trims anything older than ninety days, and never forgets:
+
+```lua
+caudra.setup({
+    storage = {
+        retention = {
+            group_by = "directory",
+            sweep_interval_hours = 24,
+            trim = { keep_last = 20, keep_within = "90d" },
+            forget = {},
+        },
+    },
+})
+```
+
+An empty `forget` policy disables automatic deletion. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
+
+The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the write-ahead log is checkpointed, and free pages are returned to the filesystem. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
+
+`caudra storage trim --dry-run` and `caudra storage forget --dry-run` print the plan with the reason each session is kept. `caudra storage sessions` lists sessions with their tier. `caudra storage pin <ID>` keeps a session regardless of policy. See [CLI](/docs/cli/#caudra-storage) for every flag.
 
 ## Conversation revert
 

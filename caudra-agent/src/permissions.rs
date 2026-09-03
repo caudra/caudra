@@ -12,9 +12,8 @@ use caudra_storage::permission_config_trust::{
     revoke_project_trust as revoke_project_permission_config,
     trust_project as trust_project_permission_config,
 };
-use caudra_storage::permission_state::{
-    PERMISSION_STATE_FILE, PermissionState, validate_conversation_record,
-};
+use caudra_storage::permission_state::{PermissionState, validate_conversation_record};
+use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::{StateDir, now_epoch};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -387,7 +386,8 @@ fn shared_policies() -> &'static Mutex<SharedPolicies> {
 }
 
 fn shared_policy(state_dir: StateDir) -> Arc<SharedPermissionState> {
-    let key = caudra_storage::paths::normalize_path(&state_dir.path().join(PERMISSION_STATE_FILE));
+    let key =
+        caudra_storage::paths::normalize_path(&state_dir.persistent_path().join(SESSIONS_DB_FILE));
     let mut policies = shared_policies().lock().unwrap_or_else(|error| {
         warn!("permission policy registry mutex was poisoned, recovering");
         error.into_inner()
@@ -2446,8 +2446,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use caudra_storage::permission_state::PERMISSION_STATE_FILE;
+    use caudra_storage::sessions::SessionDatabase;
     use test_case::test_case;
+
+    const PERMISSION_RULES_STATE_KEY: &str = "permission.rules";
 
     fn make_config(rules: Vec<PermissionRule>) -> PermissionsConfig {
         PermissionsConfig {
@@ -4679,8 +4681,8 @@ mod tests {
             .await
             .unwrap();
 
-            let bytes = std::fs::read(state_dir.path().join(PERMISSION_STATE_FILE)).unwrap();
-            let serialized = String::from_utf8(bytes).unwrap();
+            let state = PermissionState::open(&state_dir).unwrap();
+            let serialized = serde_json::to_string(state.records()).unwrap();
             assert!(!serialized.contains(secret));
             assert!(!serialized.contains("super-secret-value"));
             drop(manager);
@@ -4723,8 +4725,8 @@ mod tests {
             )
             .await
             .unwrap();
-            let stored =
-                std::fs::read_to_string(state_dir.path().join(PERMISSION_STATE_FILE)).unwrap();
+            let state = PermissionState::open(&state_dir).unwrap();
+            let stored = serde_json::to_string(state.records()).unwrap();
             assert!(!stored.contains("example.com"));
             assert!(!stored.contains("secret"));
             drop(manager);
@@ -4962,10 +4964,12 @@ mod tests {
             let project = temp.path().join("project");
             let state_path = temp.path().join("state");
             std::fs::create_dir(&project).unwrap();
-            std::fs::create_dir(&state_path).unwrap();
-            let corrupt = b"{corrupt permission state";
-            std::fs::write(state_path.join(PERMISSION_STATE_FILE), corrupt).unwrap();
-            let manager = persistent_manager(StateDir::from_path(state_path.clone()), &project);
+            let state_dir = StateDir::from_path(state_path);
+            let database = SessionDatabase::open_state(&state_dir).unwrap();
+            database
+                .global_state_set(PERMISSION_RULES_STATE_KEY, &"corrupt")
+                .unwrap();
+            let manager = persistent_manager(state_dir, &project);
 
             assert!(
                 enforce_without_prompt(
@@ -4977,8 +4981,10 @@ mod tests {
                 .is_err()
             );
             assert_eq!(
-                std::fs::read(state_path.join(PERMISSION_STATE_FILE)).unwrap(),
-                corrupt
+                database
+                    .global_state_get::<String>(PERMISSION_RULES_STATE_KEY)
+                    .unwrap(),
+                Some("corrupt".into())
             );
         });
     }
@@ -5025,8 +5031,10 @@ mod tests {
                 serde_json::json!({"command": "cargo test"}),
             );
             second_events.recv_async().await.unwrap();
-            std::fs::rename(&state_path, temp.path().join("old-state")).unwrap();
-            std::fs::write(&state_path, b"blocks directory recreation").unwrap();
+            SessionDatabase::open_state(&StateDir::from_path(state_path))
+                .unwrap()
+                .global_state_set(PERMISSION_RULES_STATE_KEY, &"corrupt")
+                .unwrap();
             assert!(!manager.answer("failed-persist", PermissionAnswer::AllowAlwaysGlobal));
             assert_eq!(manager.pending_count(), 2);
             assert!(second_events.is_empty());

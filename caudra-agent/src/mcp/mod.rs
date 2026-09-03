@@ -1632,6 +1632,8 @@ mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
     use caudra_providers::Role;
+    use caudra_storage::sessions::SessionDatabase;
+    use caudra_storage::state::project_scope;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1978,7 +1980,12 @@ mod tests {
             Some(state_dir.clone()),
         );
         assert_eq!(drifted.entries[0].status, McpServerStatus::AwaitingTrust);
-        let persisted = std::fs::read_to_string(state_dir.path().join("mcp-trust.json")).unwrap();
+        let persisted = SessionDatabase::open_state(&state_dir)
+            .unwrap()
+            .state_get::<HashMap<String, String>>(&project_scope(&project), "mcp.trust")
+            .unwrap()
+            .unwrap();
+        let persisted = serde_json::to_string(&persisted).unwrap();
         assert!(!persisted.contains("raw-secret-value"));
     }
 

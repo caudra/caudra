@@ -31,7 +31,7 @@ use thiserror::Error;
 use crate::id::{CaudraId, CaudraIdParseError};
 use crate::{StateDir, StorageError, lock_session_artifacts, sync_parent_dir};
 
-const TOOL_OUTPUT_DIR: &str = "tool-output";
+pub(crate) const TOOL_OUTPUT_DIR: &str = "tool-output";
 const OUTPUT_EXTENSION: &str = "txt";
 const DEFAULT_MAX_STORED_BYTES: usize = 100 * 1024 * 1024;
 pub const TOOL_OUTPUT_CONTROL_RESERVE_BYTES: usize = 256;
@@ -908,6 +908,20 @@ impl ToolOutputStore {
     }
 
     pub fn cleanup_orphans(&self, live_session_ids: &[CaudraId]) -> Result<usize, ToolOutputError> {
+        self.visit_orphans(live_session_ids, false)
+    }
+
+    /// The entries `cleanup_orphans` would remove right now.
+    pub fn count_orphans(&self, live_session_ids: &[CaudraId]) -> Result<u64, ToolOutputError> {
+        self.visit_orphans(live_session_ids, true)
+            .map(|count| u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    fn visit_orphans(
+        &self,
+        live_session_ids: &[CaudraId],
+        dry_run: bool,
+    ) -> Result<usize, ToolOutputError> {
         let root = self.root();
         let entries = match fs::read_dir(&root) {
             Ok(entries) => entries,
@@ -928,11 +942,12 @@ impl ToolOutputStore {
             {
                 let referenced = self.referenced_outputs(session_id);
                 let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
-                removed += self.cleanup_live_session(&entry.path(), now, referenced.as_ref())?;
+                removed +=
+                    self.cleanup_live_session(&entry.path(), now, referenced.as_ref(), dry_run)?;
             } else {
                 let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
                 if is_stale(&entry.path(), now, self.orphan_grace)?
-                    && remove_artifact(&entry.path(), file_type.is_dir())?
+                    && (dry_run || remove_artifact(&entry.path(), file_type.is_dir())?)
                 {
                     removed += 1;
                 }
@@ -947,6 +962,7 @@ impl ToolOutputStore {
         session_dir: &Path,
         now: SystemTime,
         referenced: Option<&HashSet<ToolOutputId>>,
+        dry_run: bool,
     ) -> Result<usize, ToolOutputError> {
         let mut removed = 0;
         for entry in fs::read_dir(session_dir)? {
@@ -959,7 +975,7 @@ impl ToolOutputStore {
                 continue;
             }
             if is_stale(&entry.path(), now, self.orphan_grace)?
-                && remove_artifact(&entry.path(), file_type.is_dir())?
+                && (dry_run || remove_artifact(&entry.path(), file_type.is_dir())?)
             {
                 removed += 1;
             }
@@ -970,7 +986,6 @@ impl ToolOutputStore {
     fn referenced_outputs(&self, session_id: CaudraId) -> Option<HashSet<ToolOutputId>> {
         let sessions_dir = self.state_dir.path().join(crate::sessions::SESSIONS_DIR);
         let mut referenced = HashSet::new();
-        let mut found_session = false;
         // `None` is fail-closed: callers retain every managed output whenever
         // the canonical reference snapshot cannot be read or parsed.
         match crate::sessions::SessionDatabase::open(&self.state_dir) {
@@ -983,37 +998,12 @@ impl ToolOutputStore {
                     };
                     collect_output_ids(&value, &mut referenced);
                 }) {
-                    Ok(()) if valid => {
-                        found_session = true;
-                    }
+                    Ok(()) if valid => {}
                     Ok(()) => return None,
-                    Err(crate::sessions::SessionError::Storage(StorageError::NotFound(_))) => {}
                     Err(_) => return None,
                 }
             }
             Err(_) => return None,
-        }
-        if !found_session {
-            for entry in fs::read_dir(&sessions_dir).ok()? {
-                let path = entry.ok()?.path();
-                if path.is_file()
-                    && matches!(
-                        path.extension().and_then(OsStr::to_str),
-                        Some("json" | "jsonl")
-                    )
-                    && path
-                        .file_stem()
-                        .and_then(OsStr::to_str)
-                        .and_then(|stem| stem.parse::<CaudraId>().ok())
-                        == Some(session_id)
-                {
-                    found_session = true;
-                    collect_references_from_session_file(&path, &mut referenced)?;
-                }
-            }
-        }
-        if !found_session {
-            return None;
         }
         let archive_dir = sessions_dir
             .join(crate::sessions::ARCHIVE_DIR)
@@ -3097,20 +3087,11 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_keeps_live_outputs_when_session_json_cannot_be_parsed() {
-        let (temp, mut store) = test_store();
+    fn cleanup_fails_closed_when_live_session_is_missing_from_database() {
+        let (_temp, mut store) = test_store();
         store.orphan_grace = Duration::ZERO;
-        let state_dir = StateDir::from_path(temp.path().to_path_buf());
-        let sessions_dir = state_dir
-            .ensure_subdir(crate::sessions::SESSIONS_DIR)
-            .unwrap();
         let session_id = CaudraId::generate();
         let output = store.put(session_id, EXACT_TEXT).unwrap();
-        fs::write(
-            sessions_dir.join(format!("{session_id}.jsonl")),
-            "not json\n",
-        )
-        .unwrap();
 
         let removed = store.cleanup_orphans(&[session_id]).unwrap();
 
@@ -3119,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_does_not_fall_back_to_stale_legacy_data_after_database_error() {
+    fn cleanup_does_not_fall_back_to_standalone_data_after_database_error() {
         let (temp, mut store) = test_store();
         store.orphan_grace = Duration::ZERO;
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
@@ -3131,10 +3112,10 @@ mod tests {
         let stale = store.put(session.id, "stale").unwrap();
         session.push_message(serde_json::json!({"output_ref": current}));
         session.save(&state_dir).unwrap();
-        let mut legacy: Session<Value, Value, Value> = Session::new("model", "/project");
-        legacy.id = session.id;
-        legacy.push_message(serde_json::json!({"output_ref": stale}));
-        legacy.save_to(&sessions_dir).unwrap();
+        let mut standalone: Session<Value, Value, Value> = Session::new("model", "/project");
+        standalone.id = session.id;
+        standalone.push_message(serde_json::json!({"output_ref": stale}));
+        standalone.save_to(&sessions_dir).unwrap();
         let database = state_dir.path().join(crate::sessions::SESSIONS_DB_FILE);
         fs::write(&database, b"corrupt").unwrap();
         let _ = fs::remove_file(format!("{}-wal", database.display()));
@@ -3148,7 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_collects_references_from_legacy_session_json() {
+    fn cleanup_ignores_standalone_session_json() {
         let (temp, mut store) = test_store();
         store.orphan_grace = Duration::ZERO;
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
@@ -3159,9 +3140,13 @@ mod tests {
         let referenced = store.put(session.id, "referenced").unwrap();
         let unreferenced = store.put(session.id, "unreferenced").unwrap();
         session.push_message(serde_json::json!({"output_ref": referenced}));
+        session.save(&state_dir).unwrap();
+        let mut standalone: Session<Value, Value, Value> = Session::new("model", "/project");
+        standalone.id = session.id;
+        standalone.push_message(serde_json::json!({"output_ref": unreferenced}));
         fs::write(
             sessions_dir.join(format!("{}.json", session.id)),
-            serde_json::to_vec(&session).unwrap(),
+            serde_json::to_vec(&standalone).unwrap(),
         )
         .unwrap();
 

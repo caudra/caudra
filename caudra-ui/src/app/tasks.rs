@@ -30,6 +30,7 @@ pub(crate) enum TaskOutcome {
     /// Ended, and nobody said how. Reads as done unless a verdict follows.
     Unknown,
     Done,
+    Killed,
     Error,
 }
 
@@ -44,7 +45,7 @@ impl TaskOutcome {
     /// than passed beside it, so a green marker cannot sit on a failed task.
     pub(crate) fn role(self) -> DisplayRole {
         match self {
-            Self::Error => DisplayRole::Error,
+            Self::Killed | Self::Error => DisplayRole::Error,
             Self::Unknown | Self::Done => DisplayRole::Done,
         }
     }
@@ -62,7 +63,7 @@ impl From<Option<TaskOutcome>> for TaskStatus {
     fn from(outcome: Option<TaskOutcome>) -> Self {
         match outcome {
             None => Self::Working,
-            Some(TaskOutcome::Error) => Self::Error,
+            Some(TaskOutcome::Killed | TaskOutcome::Error) => Self::Error,
             Some(TaskOutcome::Unknown | TaskOutcome::Done) => Self::Done,
         }
     }
@@ -224,11 +225,13 @@ mod tests {
         RESEARCH_NAME, app_with_subagent_id, cancel_app, close_subagent_transcript, end_turn,
         error_app, finish_subagent, start_subagent,
     };
-    use crate::chat::{DONE_TEXT, ERROR_TEXT};
+    use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+    use caudra_storage::sessions::StoredSubagentOutcome;
     use test_case::test_case;
 
     const TASK_ID: &str = "toolu_01";
     const OTHER_ID: &str = "toolu_02";
+    const ERROR_ID: &str = "toolu_03";
     const MISSING_ID: &str = "toolu_nope";
     const BUILD_NAME: &str = "build";
     const UNCHANGED_CHAT: usize = 2;
@@ -370,6 +373,63 @@ mod tests {
         end(&mut app);
         assert_eq!(app.chats[1].task_status(), status);
         assert_eq!(app.chats[1].last_message_text(), text);
+    }
+
+    #[test]
+    fn completion_kill_and_error_outcomes_restore_exactly() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        start_subagent(&mut app, OTHER_ID, BUILD_NAME);
+        start_subagent(&mut app, ERROR_ID, RESEARCH_NAME);
+
+        close_subagent_transcript(&mut app, TASK_ID);
+        finish_subagent(&mut app, TASK_ID, false);
+        app.focus_task(OTHER_ID).unwrap();
+        let actions = app.handle_subagent_cancel();
+        assert!(
+            matches!(actions.as_slice(), [Action::CancelSubagent { tool_use_id }] if tool_use_id == OTHER_ID)
+        );
+        close_subagent_transcript(&mut app, OTHER_ID);
+        close_subagent_transcript(&mut app, ERROR_ID);
+        finish_subagent(&mut app, ERROR_ID, true);
+
+        let stored = app
+            .state
+            .session
+            .subagents()
+            .iter()
+            .map(|subagent| (subagent.tool_use_id.as_str(), subagent.outcome))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored,
+            [
+                (TASK_ID, StoredSubagentOutcome::Done),
+                (OTHER_ID, StoredSubagentOutcome::Killed),
+                (ERROR_ID, StoredSubagentOutcome::Error),
+            ]
+        );
+
+        app.reset_ui_chrome();
+        app.restore_display();
+
+        for (id, outcome, text, status) in [
+            (TASK_ID, TaskOutcome::Done, DONE_TEXT, TaskStatus::Done),
+            (
+                OTHER_ID,
+                TaskOutcome::Killed,
+                CANCELLED_TEXT,
+                TaskStatus::Error,
+            ),
+            (ERROR_ID, TaskOutcome::Error, ERROR_TEXT, TaskStatus::Error),
+        ] {
+            let chat = app
+                .chats
+                .iter()
+                .find(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
+                .unwrap();
+            assert_eq!(chat.task_outcome(), Some(outcome));
+            assert_eq!(chat.last_message_text(), text);
+            assert_eq!(chat.task_status(), status);
+        }
     }
 
     /// No way of ending a turn may leave a task `working`: nothing runs after

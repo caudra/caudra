@@ -36,7 +36,9 @@ mod tool_output;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
-pub use stored_session::{StoredSession, latest_stored_session, load_stored_session};
+pub use stored_session::{
+    StoredSession, latest_stored_session, load_stored_session, open_stored_session,
+};
 pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,
     SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate,

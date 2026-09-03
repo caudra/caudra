@@ -36,8 +36,8 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    Session, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
-    StoredSubagent,
+    Session, StoredImage, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
+    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
@@ -781,6 +781,8 @@ fn alt_s_steers_the_active_run() {
         app.queue.pending_prompts(),
         [shared_queue::PendingPrompt {
             text: "guide this run".into(),
+            images: Vec::new(),
+            paste_ranges: Vec::new(),
             admission: caudra_agent::PromptAdmission::Steer,
         }]
     );
@@ -1077,6 +1079,15 @@ fn queued_msg(text: &str) -> QueuedMessage {
     QueuedMessage {
         text: text.into(),
         images: vec![],
+        paste_ranges: Vec::new(),
+    }
+}
+
+fn stored_queued_prompt(text: &str) -> StoredQueuedPrompt {
+    StoredQueuedPrompt {
+        text: text.into(),
+        images: Vec::new(),
+        paste_ranges: Vec::new(),
     }
 }
 
@@ -4289,7 +4300,7 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.input_draft = None;
 
-    session.meta.queued_messages = vec!["queued".into()];
+    session.meta.queued_messages = vec![stored_queued_prompt("queued")];
     assert!(session_has_content(&session));
     session.meta.queued_messages.clear();
 
@@ -4393,7 +4404,10 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(session.messages().is_empty());
     assert!(session.meta.input_draft.is_none());
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
-    assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
+    assert_eq!(
+        session.meta.queued_messages,
+        [stored_queued_prompt("queued")]
+    );
     assert!(session_has_content(session));
 }
 
@@ -4499,29 +4513,94 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
 }
 
 #[test]
-fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
+fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
+    const QUEUED_TEXT: &str = "pasted prompt";
+
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let (queue, _receiver) = shared_queue::queue();
+    app.queue.set_shared(queue);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let draft_text = format!("  {QUEUED_TEXT}  ");
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="));
+
+    let actions = app.handle_submit_with_admission(
+        Submission {
+            text: QUEUED_TEXT.into(),
+            images: vec![image],
+            draft: InputDraft {
+                text: draft_text.clone(),
+                paste_ranges: std::iter::once(0..draft_text.len()).collect(),
+            },
+        },
+        caudra_agent::PromptAdmission::Steer,
+    );
+    app.checkpoint_now();
+
+    assert!(actions.is_empty());
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let saved = AppSession::load(id, &dir).unwrap();
+    assert_eq!(
+        saved.meta.queued_messages,
+        [StoredQueuedPrompt {
+            text: QUEUED_TEXT.into(),
+            images: vec![StoredImage {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }],
+            paste_ranges: vec![StoredPasteRange {
+                start: 0,
+                end: QUEUED_TEXT.len(),
+            }],
+        }]
+    );
+    assert_eq!(
+        saved.meta.queued_message_admissions,
+        [StoredPromptAdmission::Steer]
+    );
+}
+
+#[test]
+fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
     let mut app = test_app();
-    app.state.session_mut().meta.queued_messages = vec!["q1".into(), "q2".into()];
+    let stored_prompts = vec![
+        StoredQueuedPrompt {
+            text: "q1".into(),
+            images: vec![StoredImage {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }],
+            paste_ranges: vec![StoredPasteRange { start: 0, end: 2 }],
+        },
+        stored_queued_prompt("q2"),
+    ];
+    app.state.session_mut().meta.queued_messages = stored_prompts.clone();
     app.state.session_mut().meta.queued_message_admissions =
         vec![StoredPromptAdmission::Steer, StoredPromptAdmission::Queue];
 
     app.restore_resumed_session();
-    assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
     assert_eq!(
-        app.queue
-            .pending_prompts()
-            .into_iter()
-            .map(|prompt| prompt.admission)
-            .collect::<Vec<_>>(),
+        app.queue.pending_prompts(),
         [
-            caudra_agent::PromptAdmission::Steer,
-            caudra_agent::PromptAdmission::Queue,
+            shared_queue::PendingPrompt {
+                text: "q1".into(),
+                images: vec![ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="))],
+                paste_ranges: std::iter::once(0..2).collect(),
+                admission: caudra_agent::PromptAdmission::Steer,
+            },
+            shared_queue::PendingPrompt {
+                text: "q2".into(),
+                images: Vec::new(),
+                paste_ranges: Vec::new(),
+                admission: caudra_agent::PromptAdmission::Queue,
+            },
         ]
     );
     assert_eq!(app.status, Status::Streaming);
 
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
+    assert_eq!(app.state.session.meta.queued_messages, stored_prompts);
     assert_eq!(
         app.state.session.meta.queued_message_admissions,
         [StoredPromptAdmission::Steer, StoredPromptAdmission::Queue]
@@ -4532,14 +4611,17 @@ fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
 fn apply_loaded_session_defers_queued_messages_until_respawn() {
     let mut app = test_app();
     let mut session = AppSession::new("test-model", &app.state.session.cwd);
-    session.meta.queued_messages = vec!["deferred".into()];
+    session.meta.queued_messages = vec![stored_queued_prompt("deferred")];
     crate::push_history_message(&mut session, Message::user("hello".into()));
 
     let model = app.state.model.clone();
     app.apply_loaded_session(session, &model).unwrap();
 
     assert!(app.queue.is_empty());
-    assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("deferred")]
+    );
 }
 
 #[test]
@@ -5339,6 +5421,7 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
     let actions = app.start_from_queue(&QueuedMessage {
         text: "next prompt".into(),
         images: Vec::new(),
+        paste_ranges: Vec::new(),
     });
 
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
@@ -6048,6 +6131,7 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
             root_tool_use_id: Some("task-live".into()),
             name: "live".into(),
             model: Some("test-model".into()),
+            outcome: StoredSubagentOutcome::Done,
         },
         StoredSubagent {
             tool_use_id: "task-late".into(),
@@ -6055,6 +6139,7 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
             root_tool_use_id: Some("task-late".into()),
             name: "late".into(),
             model: None,
+            outcome: StoredSubagentOutcome::Unknown,
         },
     ]);
     let before = serde_json::to_value(&*app.state.session).unwrap();
@@ -6431,7 +6516,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.permissions.set_session_yolo(Some(true));
     app.state.token_usage.input = 42;
     app.state.session_mut().meta.input_draft = Some("old draft".into());
-    app.state.session_mut().meta.queued_messages = vec!["queued".into()];
+    app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt("queued")];
     app.state.session_mut().meta.active_goal = Some("goal".into());
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);
@@ -7626,11 +7711,17 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     app.checkpoint();
 
     assert_eq!(app.state.session.messages().len(), 2);
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("next")]
+    );
     assert!(app.state.session.meta.queued_messages_together);
     assert!(app.queue.is_empty());
 
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("next")]
+    );
 
     type_and_submit(&mut app, "replacement");
     app.checkpoint();
@@ -7648,12 +7739,18 @@ fn flush_restored_queue_drops_recovery_snapshot() {
         message: "boom".into(),
     }));
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("next")]
+    );
     assert!(app.state.session.meta.queued_messages_together);
 
     app.flush_restored_queue();
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("next")]
+    );
     assert!(app.state.session.meta.queued_messages_together);
     assert!(app.recoverable_queue.is_empty());
 
@@ -8242,6 +8339,7 @@ fn workflow_toggle_flows_into_agent_input() {
     let msg = QueuedMessage {
         text: "hi".into(),
         images: Vec::new(),
+        paste_ranges: Vec::new(),
     };
     assert!(!app.build_agent_input(&msg).workflow);
 
@@ -9447,7 +9545,10 @@ fn shutdown_preparation_preserves_unclaimed_queue_for_the_final_checkpoint() {
     app.disconnect_agent_queue();
     app.checkpoint_now();
 
-    assert_eq!(app.state.session.meta.queued_messages, ["queued"]);
+    assert_eq!(
+        app.state.session.meta.queued_messages,
+        [stored_queued_prompt("queued")]
+    );
 }
 
 /// Submitting empties the draft a frame before the agent mirrors the prompt

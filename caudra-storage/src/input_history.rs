@@ -1,15 +1,22 @@
+//! Prompts the user sent, for up-arrow recall. A volatile state row: an
+//! ephemeral run starts from the persistent history but writes its own.
+
 use std::collections::VecDeque;
-use std::fs;
 
-use crate::{StateDir, StorageError, atomic_write};
+use crate::state::{self, SCOPE_GLOBAL, StateKey};
+use crate::{StateClass, StateDir, StorageError};
 
-const HISTORY_FILE: &str = "input_history.json";
+const HISTORY: StateKey = StateKey {
+    name: "input.history",
+    class: StateClass::Volatile,
+};
 pub const MAX_ENTRIES: usize = 100;
 
 #[derive(Debug)]
 pub struct InputHistory {
     entries: VecDeque<String>,
     max_entries: usize,
+    storage: Option<StateDir>,
 }
 
 impl Default for InputHistory {
@@ -17,36 +24,27 @@ impl Default for InputHistory {
         Self {
             entries: VecDeque::new(),
             max_entries: MAX_ENTRIES,
+            storage: None,
         }
     }
 }
 
 impl InputHistory {
     pub fn load(dir: &StateDir, max_entries: usize) -> Self {
-        let path = dir.path().join(HISTORY_FILE);
-        let data = match fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => {
-                return Self {
-                    entries: VecDeque::new(),
-                    max_entries,
-                };
-            }
-        };
-        let items: Vec<String> = serde_json::from_slice(&data).unwrap_or_default();
+        let items = stored_entries(dir).unwrap_or_default();
         let mut history = Self {
             entries: VecDeque::with_capacity(max_entries),
             max_entries,
+            storage: Some(dir.clone()),
         };
         for entry in items {
-            history.push_inner(entry);
+            let _ = history.push_inner(entry);
         }
         history
     }
 
     pub fn save(&self, dir: &StateDir) -> Result<(), StorageError> {
-        let data = serde_json::to_vec(&self.entries)?;
-        atomic_write(&dir.path().join(HISTORY_FILE), &data)
+        state::set(dir, SCOPE_GLOBAL, HISTORY, &self.entries)
     }
 
     pub fn push(&mut self, entry: String) {
@@ -54,17 +52,23 @@ impl InputHistory {
         if trimmed.is_empty() {
             return;
         }
-        self.push_inner(trimmed);
+        if self.push_inner(trimmed)
+            && let Some(storage) = &self.storage
+            && let Err(error) = self.save(storage)
+        {
+            tracing::warn!(%error, "input history save failed");
+        }
     }
 
-    fn push_inner(&mut self, entry: String) {
+    fn push_inner(&mut self, entry: String) -> bool {
         if self.entries.back().is_some_and(|last| *last == entry) {
-            return;
+            return false;
         }
         if self.entries.len() == self.max_entries {
             self.entries.pop_front();
         }
         self.entries.push_back(entry);
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -80,10 +84,19 @@ impl InputHistory {
     }
 }
 
+/// The volatile row, then the persistent one during an ephemeral run, so
+/// recall works from the first prompt without writing anything back.
+fn stored_entries(dir: &StateDir) -> Result<Vec<String>, StorageError> {
+    if let Some(entries) = state::get::<Vec<String>>(dir, SCOPE_GLOBAL, HISTORY)? {
+        return Ok(entries);
+    }
+    let persistent = dir.for_class(StateClass::Persistent);
+    Ok(state::get(&persistent, SCOPE_GLOBAL, HISTORY)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_case::test_case;
 
     fn tmp_dir() -> (tempfile::TempDir, StateDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -92,13 +105,12 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip() {
+    fn push_persists_immediately() {
         let (_tmp, dir) = tmp_dir();
         let mut history = InputHistory::load(&dir, MAX_ENTRIES);
         history.push("a".into());
         history.push("b".into());
         history.push("c".into());
-        history.save(&dir).unwrap();
         let loaded = InputHistory::load(&dir, MAX_ENTRIES);
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded.get(0), Some("a"));
@@ -142,14 +154,19 @@ mod tests {
         assert_eq!(history.get(0), Some("hello"));
     }
 
-    #[test_case(None      ; "missing_file")]
-    #[test_case(Some(b"not json" as &[u8]) ; "corrupt_file")]
-    fn load_bad_state_returns_empty(content: Option<&[u8]>) {
-        let (_tmp, dir) = tmp_dir();
-        if let Some(data) = content {
-            fs::write(dir.path().join(HISTORY_FILE), data).unwrap();
-        }
-        let history = InputHistory::load(&dir, MAX_ENTRIES);
-        assert!(history.is_empty());
+    #[test]
+    fn ephemeral_run_reads_persistent_history_and_writes_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persistent = StateDir::from_path(tmp.path().join("persistent"));
+        let mut history = InputHistory::load(&persistent, MAX_ENTRIES);
+        history.push("kept".into());
+        let ephemeral = StateDir::split(tmp.path().join("volatile"), persistent.path().into());
+
+        let mut seeded = InputHistory::load(&ephemeral, MAX_ENTRIES);
+        assert_eq!(seeded.get(0), Some("kept"));
+        seeded.push("secret".into());
+
+        assert_eq!(InputHistory::load(&ephemeral, MAX_ENTRIES).len(), 2);
+        assert_eq!(InputHistory::load(&persistent, MAX_ENTRIES).len(), 1);
     }
 }

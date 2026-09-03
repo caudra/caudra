@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use caudra_providers::{HistoryItem, Message, TokenUsage, expand_message};
 use caudra_storage::id::CaudraId;
-use caudra_storage::sessions::{Session, SessionError, TitleSource};
+use caudra_storage::sessions::{Session, SessionError, TitleSource, mark_opened};
 use caudra_storage::{StateDir, StorageError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -34,6 +34,17 @@ pub fn load_stored_session(
 ) -> Result<StoredSession, SessionError> {
     let session = CompatibleSession::load_compatible(id, storage)?;
     convert_session(session, storage)
+}
+
+/// A load that is the user opening the session: resume, `--continue`, the
+/// picker, an ACP `session/load`. Records the activity retention keys on.
+pub fn open_stored_session(
+    id: CaudraId,
+    storage: &StateDir,
+) -> Result<StoredSession, SessionError> {
+    let session = load_stored_session(id, storage)?;
+    mark_opened(id, storage)?;
+    Ok(session)
 }
 
 pub fn latest_stored_session(
@@ -107,9 +118,12 @@ mod tests {
         IndexOutput, IndexSourceRange, ShellFilterInfo, ShellOutput,
     };
     use caudra_providers::{ContentBlock, Role, active_history_items, resolve_history_head};
+    use caudra_storage::sessions::SessionDatabase;
 
     const CWD: &str = "/repo";
     const MODEL: &str = "anthropic/test";
+    const LOAD_IS_NOT_ACTIVITY: &str = "a recovery scan or retitle must not count as opening";
+    const OPEN_IS_ACTIVITY: &str = "opening a session must record last_opened_at";
 
     type LegacySession = Session<Message, TokenUsage, ToolOutput>;
 
@@ -142,6 +156,28 @@ mod tests {
 
         assert_eq!(restored.as_slice().len(), 1);
         assert_eq!(restored.as_slice()[0].user_text(), Some("keep"));
+    }
+
+    #[test]
+    fn only_opening_a_session_counts_as_activity() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = StoredSession::new(MODEL, CWD);
+        let id = session.id;
+        session.save(&storage).unwrap();
+        let last_opened_at = || {
+            SessionDatabase::open(&storage)
+                .unwrap()
+                .session_facts(None)
+                .unwrap()[0]
+                .last_opened_at
+        };
+
+        load_stored_session(id, &storage).unwrap();
+        assert_eq!(last_opened_at(), None, "{LOAD_IS_NOT_ACTIVITY}");
+
+        open_stored_session(id, &storage).unwrap();
+        assert!(last_opened_at().is_some(), "{OPEN_IS_ACTIVITY}");
     }
 
     #[test]

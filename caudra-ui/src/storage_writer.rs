@@ -11,13 +11,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_storage::id::CaudraId;
 #[cfg(test)]
 use caudra_storage::sessions::SESSIONS_DB_FILE;
-use caudra_storage::sessions::{SessionCursor, SessionDatabase, SessionError};
+use caudra_storage::sessions::{SessionCursor, SessionDatabase, SessionError, SessionRecreation};
+use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -25,12 +27,14 @@ use crate::AppSession;
 
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
+const WORKSPACE_TABS_SAVE_FAILED_PREFIX: &str = "Workspace tabs save failed";
 const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
 const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
+type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -45,9 +49,15 @@ enum Entry {
     Delete(DeleteCallback),
 }
 
+struct WorkspaceTabsRequest {
+    cwd: PathBuf,
+    tabs: WorkspaceTabs,
+}
+
 pub struct StorageWriter {
     pending: Pending,
     wake: flume::Sender<()>,
+    workspace_tabs: PendingWorkspaceTabs,
     done_rx: flume::Receiver<()>,
 }
 
@@ -55,6 +65,8 @@ impl StorageWriter {
     pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
+        let workspace_tabs: PendingWorkspaceTabs = Arc::default();
+        let writer_workspace_tabs = Arc::clone(&workspace_tabs);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let (done_tx, done_rx) = flume::bounded::<()>(1);
 
@@ -66,7 +78,7 @@ impl StorageWriter {
                     warn_tx,
                     database: None,
                     cursors: HashMap::new(),
-                    deleted_versions: HashMap::new(),
+                    deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     size_warning_level: 0,
                     wal_warning_active: false,
@@ -75,8 +87,10 @@ impl StorageWriter {
                 };
                 while wake_rx.recv().is_ok() {
                     writer.flush(&writer_pending);
+                    writer.flush_workspace_tabs(&writer_workspace_tabs);
                 }
                 writer.flush(&writer_pending);
+                writer.flush_workspace_tabs(&writer_workspace_tabs);
                 if let Some(database) = &writer.database
                     && let Err(error) = database.checkpoint(false)
                 {
@@ -89,6 +103,7 @@ impl StorageWriter {
         Self {
             pending,
             wake,
+            workspace_tabs,
             done_rx,
         }
     }
@@ -121,6 +136,19 @@ impl StorageWriter {
             let _ = done_tx.send(result);
         });
         done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
+    }
+
+    pub fn persist_workspace_tabs(&self, cwd: PathBuf, tabs: WorkspaceTabs) {
+        *self
+            .workspace_tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(WorkspaceTabsRequest { cwd, tabs });
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => {}
+            Err(flume::TrySendError::Disconnected(())) => {
+                warn!("storage writer unavailable; workspace tabs may not be saved");
+            }
+        }
     }
 
     fn enqueue(&self, id: CaudraId, entry: Entry) {
@@ -183,7 +211,7 @@ struct Writer {
     cursors: HashMap<CaudraId, SessionCursor>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
-    deleted_versions: HashMap<CaudraId, i64>,
+    deleted_sessions: HashMap<CaudraId, SessionRecreation>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     failing: HashSet<CaudraId>,
@@ -222,11 +250,11 @@ impl Writer {
                     let _ = done.send(result);
                 }
                 Entry::Delete(done) => {
-                    let (session_result, deleted_version) = self.delete(id);
+                    let (session_result, recreation) = self.delete(id);
                     if session_result.is_ok() {
                         self.forget(id);
-                        if let Some(deleted_version) = deleted_version {
-                            self.deleted_versions.insert(id, deleted_version);
+                        if let Some(recreation) = recreation {
+                            self.deleted_sessions.insert(id, recreation);
                         }
                         self.checkpoint(true);
                     }
@@ -234,6 +262,57 @@ impl Writer {
                 }
             }
         }
+    }
+
+    fn flush_workspace_tabs(&mut self, pending: &PendingWorkspaceTabs) {
+        let Some(request) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let cwd = request.cwd.clone();
+        if let Err(error) = self.write_workspace_tabs(request) {
+            warn!(cwd = %cwd.display(), %error, "workspace tabs write failed");
+            let _ = self
+                .warn_tx
+                .send(format!("{WORKSPACE_TABS_SAVE_FAILED_PREFIX}: {error}"));
+        }
+    }
+
+    fn write_workspace_tabs(
+        &mut self,
+        mut request: WorkspaceTabsRequest,
+    ) -> Result<(), SessionError> {
+        if self.dir.is_ephemeral() {
+            return Ok(());
+        }
+        if self.database.is_none() {
+            self.database = Some(SessionDatabase::open(&self.dir)?);
+        }
+        let cwd = request.cwd.canonicalize().map_err(StorageError::from)?;
+        let existing = self
+            .database
+            .as_ref()
+            .expect("database initialized")
+            .session_facts(None)?
+            .into_iter()
+            .filter_map(|facts| {
+                Path::new(&facts.cwd)
+                    .canonicalize()
+                    .ok()
+                    .filter(|stored_cwd| stored_cwd == &cwd)
+                    .map(|_| facts.id)
+            })
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        request
+            .tabs
+            .open
+            .retain(|id| existing.contains(id) && seen.insert(*id));
+        request.tabs.focused = request
+            .tabs
+            .focused
+            .filter(|id| request.tabs.open.contains(id));
+        write_workspace_tabs(&self.dir, &cwd, &request.tabs)?;
+        Ok(())
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
@@ -252,14 +331,14 @@ impl Writer {
             // that commit before the repository checks its frozen base.
             session.adopt_persisted_write_version(cursor.write_version());
         }
-        let saved = if let Some(&deleted_version) = self.deleted_versions.get(&session.id) {
-            database.recreate(session, deleted_version)?
+        let saved = if let Some(recreation) = self.deleted_sessions.get(&session.id) {
+            database.recreate(session, recreation)?
         } else {
             // Borrow rather than remove: a retryable failure must retain the
             // latest committed cursor instead of falling back to a stale full write.
             database.save(session, self.cursors.get(&session.id))?
         };
-        self.deleted_versions.remove(&session.id);
+        self.deleted_sessions.remove(&session.id);
         self.cursors.insert(session.id, saved);
         self.commits_since_checkpoint = self.commits_since_checkpoint.saturating_add(1);
         self.checkpoint(false);
@@ -267,7 +346,7 @@ impl Writer {
         Ok(())
     }
 
-    fn delete(&mut self, id: CaudraId) -> (Result<(), SessionError>, Option<i64>) {
+    fn delete(&mut self, id: CaudraId) -> (Result<(), SessionError>, Option<SessionRecreation>) {
         if self.database.is_none() {
             match SessionDatabase::open(&self.dir) {
                 Ok(database) => self.database = Some(database),
@@ -379,7 +458,6 @@ fn retryable(error: &SessionError) -> bool {
             | SessionError::CorruptDatabaseValue { .. }
             | SessionError::LimitExceeded { .. }
             | SessionError::LoadBudgetExceeded { .. }
-            | SessionError::LegacySourceChanged { .. }
             | SessionError::VersionMismatch { .. }
             | SessionError::CorruptHeaderId { .. }
             | SessionError::IdMismatch { .. }
@@ -465,6 +543,43 @@ mod tests {
 
         assert!(done_rx.recv().unwrap().is_ok());
         assert!(AppSession::load(id, &dir).is_err());
+    }
+
+    #[test]
+    fn workspace_tabs_keep_only_sessions_present_after_ordered_writes() {
+        let (tmp, dir) = state_dir();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let cwd = workspace.to_string_lossy();
+        let (writer, _warn_rx) = writer(&dir);
+        let kept = Arc::new(AppSession::new(MODEL, &cwd));
+        let deleted = Arc::new(AppSession::new(MODEL, &cwd));
+        let unsaved = AppSession::new(MODEL, &cwd);
+        let (kept_id, deleted_id, unsaved_id) = (kept.id, deleted.id, unsaved.id);
+
+        writer.save_sync(Arc::clone(&deleted)).unwrap();
+        writer.send(kept);
+        let (done_tx, done_rx) = flume::bounded(1);
+        writer.delete(deleted_id, move |result| {
+            let _ = done_tx.send(result);
+        });
+        writer.persist_workspace_tabs(
+            workspace.clone(),
+            WorkspaceTabs {
+                open: vec![kept_id, deleted_id, unsaved_id, kept_id],
+                focused: Some(deleted_id),
+            },
+        );
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        done_rx.recv().unwrap().unwrap();
+        assert_eq!(
+            caudra_storage::state::read_workspace_tabs(&dir, &workspace).unwrap(),
+            Some(WorkspaceTabs {
+                open: vec![kept_id],
+                focused: None,
+            })
+        );
     }
 
     #[test]
@@ -711,7 +826,7 @@ mod tests {
             warn_tx,
             database: None,
             cursors: HashMap::new(),
-            deleted_versions: HashMap::new(),
+            deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             size_warning_level: 0,
             wal_warning_active: false,
@@ -749,7 +864,7 @@ mod tests {
             warn_tx,
             database: None,
             cursors: HashMap::new(),
-            deleted_versions: HashMap::new(),
+            deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             size_warning_level: 0,
             wal_warning_active: false,
@@ -778,7 +893,7 @@ mod tests {
             warn_tx,
             database: None,
             cursors: HashMap::new(),
-            deleted_versions: HashMap::new(),
+            deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             size_warning_level: 0,
             wal_warning_active: false,

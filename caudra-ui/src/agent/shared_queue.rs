@@ -7,6 +7,7 @@
 //! set it.
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +16,9 @@ use caudra_agent::{
     InterruptSource, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt, editable_queue,
 };
 
-use crate::components::input::Submission;
+use crate::components::input::{InputState, Submission};
 use crate::components::queue_panel::QueueEntry;
+use crate::input_document::InputDraft;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
@@ -24,19 +26,35 @@ const COMPACT_LABEL: &str = "/compact";
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
+    pub(crate) paste_ranges: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPrompt {
     pub(crate) text: String,
+    pub(crate) images: Vec<ImageSource>,
+    pub(crate) paste_ranges: Vec<Range<usize>>,
     pub(crate) admission: PromptAdmission,
 }
 
 impl From<Submission> for QueuedMessage {
     fn from(sub: Submission) -> Self {
+        let trim_start = sub.draft.text.len() - sub.draft.text.trim_start().len();
+        let trim_end = trim_start + sub.text.len();
+        let paste_ranges = sub
+            .draft
+            .paste_ranges
+            .into_iter()
+            .filter_map(|range| {
+                let start = range.start.max(trim_start);
+                let end = range.end.min(trim_end);
+                (start < end).then(|| start - trim_start..end - trim_start)
+            })
+            .collect();
         Self {
             text: sub.text,
             images: sub.images,
+            paste_ranges,
         }
     }
 }
@@ -45,6 +63,7 @@ pub(crate) enum QueueItem {
     Message {
         text: String,
         image_count: usize,
+        paste_ranges: Vec<Range<usize>>,
         input: AgentInput,
         run_id: u64,
         admission: PromptAdmission,
@@ -187,23 +206,39 @@ impl QueueSender {
         })
     }
 
-    pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<String> {
+    pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<InputState> {
         self.queue.begin_edit(id, |item| match item {
-            QueueItem::Message { text, .. } => Some(text.clone()),
+            QueueItem::Message {
+                text,
+                paste_ranges,
+                input,
+                ..
+            } => Some(InputState::new(
+                InputDraft {
+                    text: text.clone(),
+                    paste_ranges: paste_ranges.clone(),
+                },
+                input.images.clone(),
+            )),
             QueueItem::Compact { .. } => None,
         })
     }
 
-    pub(crate) fn finish_edit(&self, id: QueueItemId, text: String) -> bool {
-        self.queue.finish_edit(id, |item| {
+    pub(crate) fn finish_edit(&self, id: QueueItemId, message: QueuedMessage) -> bool {
+        self.queue.finish_edit(id, move |item| {
             if let QueueItem::Message {
                 text: display,
+                image_count,
+                paste_ranges,
                 input,
                 ..
             } = item
             {
-                display.clone_from(&text);
-                input.message = text;
+                display.clone_from(&message.text);
+                *image_count = message.images.len();
+                paste_ranges.clone_from(&message.paste_ranges);
+                input.message = message.text;
+                input.images = message.images;
             }
         })
     }
@@ -340,11 +375,15 @@ impl QueueSender {
             .entries(|_, item, _| match item {
                 QueueItem::Message {
                     text,
+                    paste_ranges,
+                    input,
                     admission,
                     displayed: false,
                     ..
                 } => Some(PendingPrompt {
                     text: text.clone(),
+                    images: input.images.clone(),
+                    paste_ranges: paste_ranges.clone(),
                     admission: *admission,
                 }),
                 QueueItem::Message { .. } | QueueItem::Compact { .. } => None,
@@ -542,10 +581,13 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const PADDED_DRAFT: &str = "  ab cd  ";
+
     fn msg(displayed: bool) -> QueueItem {
         QueueItem::Message {
             text: "t".into(),
             image_count: 0,
+            paste_ranges: Vec::new(),
             input: AgentInput {
                 message: String::new(),
                 mode: Default::default(),
@@ -560,6 +602,29 @@ mod tests {
             admission: PromptAdmission::Queue,
             displayed,
         }
+    }
+
+    #[test_case(3..5, Some(1..3) ; "shifts_by_leading_whitespace")]
+    #[test_case(0..4, Some(0..2) ; "clips_leading_whitespace")]
+    #[test_case(5..9, Some(3..5) ; "clips_trailing_whitespace")]
+    #[test_case(0..2, None       ; "drops_range_in_leading_whitespace")]
+    #[test_case(7..9, None       ; "drops_range_in_trailing_whitespace")]
+    fn submission_paste_ranges_follow_the_trimmed_text(
+        range: Range<usize>,
+        expected: Option<Range<usize>>,
+    ) {
+        let message = QueuedMessage::from(Submission {
+            text: PADDED_DRAFT.trim().into(),
+            images: Vec::new(),
+            draft: InputDraft {
+                text: PADDED_DRAFT.into(),
+                paste_ranges: vec![range],
+            },
+        });
+        assert_eq!(
+            message.paste_ranges,
+            expected.into_iter().collect::<Vec<_>>()
+        );
     }
 
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]

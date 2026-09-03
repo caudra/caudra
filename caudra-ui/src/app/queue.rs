@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use caudra_agent::AgentInput;
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId};
+use caudra_providers::{ImageMediaType, ImageSource};
 
 use super::{Action, App, Status, format_with_images};
 
@@ -123,14 +124,14 @@ impl MessageQueue {
             .map_or(vec![], QueueSender::pending_prompts)
     }
 
-    pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<String> {
+    pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<InputState> {
         self.shared.as_ref()?.begin_edit(id)
     }
 
-    pub(crate) fn finish_edit(&self, id: QueueItemId, text: String) -> bool {
+    pub(crate) fn finish_edit(&self, id: QueueItemId, message: QueuedMessage) -> bool {
         self.shared
             .as_ref()
-            .is_some_and(|shared| shared.finish_edit(id, text))
+            .is_some_and(|shared| shared.finish_edit(id, message))
     }
 
     pub(crate) fn cancel_edit(&self, id: QueueItemId) -> bool {
@@ -507,19 +508,13 @@ impl App {
         if self.queue_editor.is_some() {
             return;
         }
-        let (target, draft) = if self.is_main_chat() {
-            let Some(text) = self.queue.begin_edit(id) else {
+        let (target, input) = if self.is_main_chat() {
+            let Some(input) = self.queue.begin_edit(id) else {
                 self.flash("Queued message was already sent".into());
                 self.clamp_active_queue_focus();
                 return;
             };
-            (
-                QueueTarget::Main,
-                InputDraft {
-                    text,
-                    paste_ranges: Vec::new(),
-                },
-            )
+            (QueueTarget::Main, input)
         } else {
             let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
                 return;
@@ -545,11 +540,13 @@ impl App {
                 self.clamp_active_queue_focus();
                 return;
             }
-            (QueueTarget::Task(task_id), draft)
+            (
+                QueueTarget::Task(task_id),
+                InputState::new(draft, Vec::new()),
+            )
         };
         let previous_input = self.active_input_box_mut().take_state();
-        self.active_input_box_mut().set_draft(draft);
-        self.active_input_box_mut().move_to_end();
+        self.active_input_box_mut().set_state(input);
         self.queue_editor = Some(QueueEditor {
             target,
             id,
@@ -588,7 +585,7 @@ impl App {
             return Vec::new();
         };
         let saved = match &editor.target {
-            QueueTarget::Main => self.queue.finish_edit(editor.id, sub.text.clone()),
+            QueueTarget::Main => self.queue.finish_edit(editor.id, sub.into()),
             QueueTarget::Task(task_id) => {
                 let queue_saved = self
                     .subagent_steers
@@ -650,6 +647,7 @@ impl App {
             QueuedMessage {
                 text: item.text.clone(),
                 images: Vec::new(),
+                paste_ranges: Vec::new(),
             },
             PromptAdmission::Queue,
         ) {
@@ -770,6 +768,7 @@ impl App {
         let msg = QueuedMessage {
             text: condition.to_owned(),
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         };
         let mut input = self.build_agent_input(&msg);
         input.preamble.push(caudra_providers::Message::synthetic(
@@ -783,6 +782,7 @@ impl App {
             shared.push(QueueItem::Message {
                 text: msg.text,
                 image_count: 0,
+                paste_ranges: msg.paste_ranges,
                 input,
                 run_id: self.run_id,
                 admission: PromptAdmission::Queue,
@@ -814,6 +814,7 @@ impl App {
         shared.push(QueueItem::Message {
             text: msg.text,
             image_count: msg.images.len(),
+            paste_ranges: msg.paste_ranges,
             input,
             run_id: self.run_id,
             admission,
@@ -830,6 +831,7 @@ impl App {
         let mut replacement = QueueItem::Message {
             text: msg.text,
             image_count: msg.images.len(),
+            paste_ranges: msg.paste_ranges,
             input,
             run_id: self.run_id,
             admission: PromptAdmission::Interrupt,
@@ -871,7 +873,7 @@ impl App {
     /// load/rewind the display is restored before `respawn` swaps the shared
     /// queue, so pushing earlier would fill a queue that is about to die.
     pub(crate) fn flush_restored_queue(&mut self) {
-        // The live queue owns the text from here on, so the recovery
+        // The live queue owns the prompts from here on, so the recovery
         // snapshot must stop overriding it on save.
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
@@ -883,7 +885,7 @@ impl App {
         }
         // Read, not taken: the live queue is what the next checkpoint mirrors
         // back into the session, so emptying it here changes nothing on disk.
-        for (index, text) in self
+        for (index, prompt) in self
             .state
             .session
             .meta
@@ -907,10 +909,29 @@ impl App {
                     PromptAdmission::Interrupt
                 }
             };
+            let images = prompt
+                .images
+                .into_iter()
+                .filter_map(|image| {
+                    let Some(media_type) = ImageMediaType::from_mime(&image.media_type) else {
+                        tracing::warn!(
+                            media_type = %image.media_type,
+                            "skipping stored queued image"
+                        );
+                        return None;
+                    };
+                    Some(ImageSource::new(media_type, image.data.into()))
+                })
+                .collect();
             self.queue_with_admission(
                 QueuedMessage {
-                    text,
-                    images: Vec::new(),
+                    text: prompt.text,
+                    images,
+                    paste_ranges: prompt
+                        .paste_ranges
+                        .into_iter()
+                        .map(|range| range.start..range.end)
+                        .collect(),
                 },
                 admission,
             );
@@ -977,6 +998,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         });
         input.preamble = preamble;
         self.start_run(input, String::new())
@@ -990,6 +1012,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         });
         input.preamble.push(caudra_providers::Message::synthetic(
             caudra_agent::goal_checkin_message(&goal.condition),

@@ -18,6 +18,7 @@ use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
     SessionCursor, SessionDatabase, SessionLease, StoredEffect, StoredRule, StoredSubagent,
+    StoredSubagentOutcome,
 };
 use flume::Receiver;
 use serde_json::Value;
@@ -36,7 +37,7 @@ use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
     StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput, ToolOutputLines,
-    load_stored_session,
+    open_stored_session,
 };
 
 struct SessionStore {
@@ -80,7 +81,7 @@ impl SessionStore {
         lease: Arc<SessionLease>,
     ) -> Result<Self, caudra_storage::sessions::SessionError> {
         lease.validate(&dir, session_id)?;
-        match load_stored_session(session_id, &dir) {
+        match open_stored_session(session_id, &dir) {
             Ok(session) => Ok(Self::from_session(dir, session, false, lease)),
             Err(caudra_storage::sessions::SessionError::Storage(
                 caudra_storage::StorageError::NotFound(_),
@@ -324,6 +325,18 @@ impl SessionStore {
             AgentEvent::ToolDone(done) => {
                 self.session
                     .insert_tool_output(done.id.clone(), done.output.clone());
+                let mut subagents = self.session.subagents().to_vec();
+                if let Some(subagent) = subagents.iter_mut().find(|subagent| {
+                    subagent.parent_tool_use_id.as_deref() == Some(done.id.as_str())
+                        && subagent.outcome == StoredSubagentOutcome::Unknown
+                }) {
+                    subagent.outcome = if done.is_error {
+                        StoredSubagentOutcome::Error
+                    } else {
+                        StoredSubagentOutcome::Done
+                    };
+                    self.session.set_subagents(subagents);
+                }
             }
             AgentEvent::SubagentHistory {
                 task_id,
@@ -367,6 +380,7 @@ impl SessionStore {
                     stored.root_tool_use_id = Some(root_tool_use_id.clone());
                     stored.name.clone_from(name);
                     stored.model = Some(model.clone());
+                    stored.outcome = StoredSubagentOutcome::Unknown;
                 } else {
                     subagents.push(StoredSubagent {
                         tool_use_id: task_id.clone(),
@@ -374,6 +388,7 @@ impl SessionStore {
                         root_tool_use_id: Some(root_tool_use_id.clone()),
                         name: name.clone(),
                         model: Some(model.clone()),
+                        outcome: StoredSubagentOutcome::Unknown,
                     });
                 }
                 self.session.set_subagents(subagents);
@@ -1446,8 +1461,8 @@ mod tests {
         let mut original = StoredSession::new(MODEL_SPEC, CWD);
         original.id = session_id();
         original.save(&dir).unwrap();
-        let stale = load_stored_session(session_id(), &dir).unwrap();
-        let mut current = load_stored_session(session_id(), &dir).unwrap();
+        let stale = crate::load_stored_session(session_id(), &dir).unwrap();
+        let mut current = crate::load_stored_session(session_id(), &dir).unwrap();
         current.set_title("current".into());
         current.save(&dir).unwrap();
         let lease = Arc::new(SessionLease::acquire(&dir, stale.id).unwrap());
@@ -1524,6 +1539,15 @@ mod tests {
                 run_id: 0,
             })
             .unwrap();
+        let mut nested_done = crate::ToolDoneEvent::error("nested-call".into(), "nested output");
+        nested_done.is_error = false;
+        store
+            .record_event(&Envelope {
+                event: AgentEvent::ToolDone(Box::new(nested_done)),
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
 
         let loaded = load(&tmp);
         assert_eq!(
@@ -1536,6 +1560,7 @@ mod tests {
             subagent.tool_use_id == "nested-task"
                 && subagent.parent_tool_use_id.as_deref() == Some("nested-call")
                 && subagent.root_tool_use_id.as_deref() == Some("batch-call")
+                && subagent.outcome == StoredSubagentOutcome::Done
         }));
     }
 
@@ -1591,6 +1616,7 @@ mod tests {
                 root_tool_use_id: Some("generic-root".into()),
                 name: "root".into(),
                 model: None,
+                outcome: StoredSubagentOutcome::Unknown,
             },
             StoredSubagent {
                 tool_use_id: "generic-nested".into(),
@@ -1598,6 +1624,7 @@ mod tests {
                 root_tool_use_id: Some("generic-root".into()),
                 name: "nested".into(),
                 model: None,
+                outcome: StoredSubagentOutcome::Unknown,
             },
         ]);
 

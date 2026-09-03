@@ -1,8 +1,8 @@
-//! Session state with canonical SQLite persistence and legacy JSONL support.
+//! Session state with canonical SQLite persistence and explicit JSONL interchange.
 //!
 //! `StateDir` APIs use the global SQLite repository. Path-based APIs retain the
-//! tolerant JSON/JSONL reader, writer, and archive format for import, rollback,
-//! and explicit export without becoming a second canonical store.
+//! tolerant JSON/JSONL reader, writer, and archive format for recovery and
+//! explicit export without becoming a second canonical store.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -30,10 +30,12 @@ use crate::{StateDir, StorageError, atomic_write, now_epoch};
 mod database;
 #[path = "sessions/lease.rs"]
 mod lease;
+#[path = "sessions/sweep.rs"]
+pub mod sweep;
 
 pub use database::{
     CheckpointResult, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor, SessionDatabase,
-    SessionMigration, SessionStorageStats,
+    SessionMigration, SessionRecreation, SessionStorageStats, TrimReport,
 };
 pub use lease::SessionLease;
 
@@ -75,6 +77,13 @@ pub fn next_epoch() -> u64 {
     EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Records that the user opened `id`, which counts as activity for retention.
+/// Separate from loading: startup recovery scans and retitling load sessions
+/// nobody opened.
+pub fn mark_opened(id: CaudraId, dir: &StateDir) -> Result<(), SessionError> {
+    SessionDatabase::open(dir)?.mark_opened(id)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
@@ -108,7 +117,7 @@ pub enum SessionError {
         expected: i64,
         actual: i64,
     },
-    #[error("database schema version {found} is newer than supported version {supported}")]
+    #[error("database schema version {found} is unsupported; expected version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("invalid database value in {field}: {reason}")]
     CorruptDatabaseValue { field: &'static str, reason: String },
@@ -124,8 +133,8 @@ pub enum SessionError {
         logical_bytes: usize,
         maximum: usize,
     },
-    #[error("legacy session source changed while importing: {path}")]
-    LegacySourceChanged { path: String },
+    #[error("tool output cleanup failed: {0}")]
+    ToolOutputCleanup(#[source] Box<crate::tool_outputs::ToolOutputError>),
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -217,6 +226,15 @@ pub struct StoredQueuedDraft {
     pub paste_ranges: Vec<StoredPasteRange>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredQueuedPrompt {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<StoredImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paste_ranges: Vec<StoredPasteRange>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredPromptAdmission {
@@ -253,7 +271,7 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_draft_pastes: Vec<StoredPasteRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_messages: Vec<String>,
+    pub queued_messages: Vec<StoredQueuedPrompt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_message_admissions: Vec<StoredPromptAdmission>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -557,6 +575,37 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    pub outcome: StoredSubagentOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredSubagentOutcome {
+    Unknown,
+    Done,
+    Killed,
+    Error,
+}
+
+impl StoredSubagentOutcome {
+    pub(crate) const fn storage_name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Done => "done",
+            Self::Killed => "killed",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "done" => Some(Self::Done),
+            "killed" => Some(Self::Killed),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1508,28 +1557,7 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
 }
 
 pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<CaudraId>, SessionError> {
-    let database = SessionDatabase::open(dir)?;
-    let imported = database.imported_session_ids()?;
-    let mut ids: HashSet<CaudraId> = database.persisted_session_ids()?.into_iter().collect();
-    ids.extend(
-        legacy_session_ids(dir)?
-            .into_iter()
-            .filter(|id| !imported.contains(id)),
-    );
-    Ok(ids.into_iter().collect())
-}
-
-fn legacy_session_ids(dir: &StateDir) -> Result<HashSet<CaudraId>, StorageError> {
-    let sessions_dir = dir.path().join(SESSIONS_DIR);
-    let entries = match session_entries(&sessions_dir) {
-        Ok(entries) => entries,
-        Err(StorageError::Io(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error),
-    };
-    Ok(entries
-        .into_iter()
-        .filter_map(|path| path.file_stem()?.to_str()?.parse().ok())
-        .collect())
+    SessionDatabase::open(dir)?.persisted_session_ids()
 }
 
 fn is_session_file(p: &Path) -> bool {
@@ -1978,49 +2006,19 @@ where
     }
 
     pub fn save_to(&mut self, dir: &Path) -> Result<(), SessionError> {
-        // Path-based APIs remain an explicit legacy/export surface. StateDir
-        // APIs above and below are the canonical SQLite repository.
+        // Path-based APIs remain an explicit interchange/export surface.
+        // StateDir APIs above and below are the canonical SQLite repository.
         self.updated_at = now_epoch();
         SessionLog::rewrite(dir, self)?;
         Ok(())
     }
 
     pub fn load(id: CaudraId, dir: &StateDir) -> Result<Self, SessionError> {
-        Self::load_database_or_legacy(id, dir, false)
+        SessionDatabase::open(dir)?.load(id)
     }
 
     pub fn load_compatible(id: CaudraId, dir: &StateDir) -> Result<Self, SessionError> {
-        Self::load_database_or_legacy(id, dir, true)
-    }
-
-    fn load_database_or_legacy(
-        id: CaudraId,
-        dir: &StateDir,
-        accept_previous_version: bool,
-    ) -> Result<Self, SessionError> {
-        let mut database = SessionDatabase::open(dir)?;
-        match database.load(id) {
-            Ok(session) => return Ok(session),
-            Err(SessionError::Storage(StorageError::NotFound(_))) => {}
-            Err(error) => return Err(error),
-        }
-        if database.was_imported(id)? {
-            return Err(StorageError::NotFound(id.to_string()).into());
-        }
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        let Some(path) = locate_session_file(&sessions_dir, id) else {
-            return Err(StorageError::NotFound(id.to_string()).into());
-        };
-        // Lazy import preserves the tolerant JSONL commit-boundary reader and
-        // leaves source files untouched as rollback data.
-        let data = fs::read(&path).map_err(StorageError::from)?;
-        let mut session = parse_session_at::<M, U, T>(&path, &data, accept_previous_version)?;
-        match database.import_legacy(&path, &data, &session) {
-            Ok(cursor) => session.set_persisted_write_version(Some(cursor.write_version())),
-            Err(SessionError::AlreadyExists { .. }) => return database.load(id),
-            Err(error) => return Err(error),
-        }
-        Ok(session)
+        SessionDatabase::open(dir)?.load(id)
     }
 
     pub fn load_from(id: CaudraId, dir: &Path) -> Result<Self, SessionError> {
@@ -2050,28 +2048,7 @@ where
     }
 
     pub fn list(cwd: &str, dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
-        let database = SessionDatabase::open(dir)?;
-        let imported = database.imported_session_ids()?;
-        let mut summaries = database.list(cwd)?;
-        let database_ids: HashSet<CaudraId> =
-            database.persisted_session_ids()?.into_iter().collect();
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        // During cutover, list only unmigrated legacy sources. Ledger entries,
-        // including tombstones, prevent deleted sessions from resurfacing.
-        summaries.extend(
-            Self::list_in(cwd, &sessions_dir)?
-                .into_iter()
-                .filter(|summary| {
-                    !imported.contains(&summary.id) && !database_ids.contains(&summary.id)
-                }),
-        );
-        summaries.sort_unstable_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.id.as_bytes().cmp(left.id.as_bytes()))
-        });
-        Ok(summaries)
+        SessionDatabase::open(dir)?.list(cwd)
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
@@ -2081,22 +2058,15 @@ where
     }
 
     pub fn latest(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
-        Self::latest_database_or_legacy(cwd, dir, false)
+        let database = SessionDatabase::open(dir)?;
+        database
+            .latest_id(cwd)?
+            .map(|id| database.load(id))
+            .transpose()
     }
 
     pub fn latest_compatible(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
-        Self::latest_database_or_legacy(cwd, dir, true)
-    }
-
-    fn latest_database_or_legacy(
-        cwd: &str,
-        dir: &StateDir,
-        accept_previous_version: bool,
-    ) -> Result<Option<Self>, SessionError> {
-        let Some(summary) = Self::list(cwd, dir)?.into_iter().next() else {
-            return Ok(None);
-        };
-        Self::load_database_or_legacy(summary.id, dir, accept_previous_version).map(Some)
+        Self::latest(cwd, dir)
     }
 
     pub fn latest_in(cwd: &str, dir: &Path) -> Result<Option<Self>, SessionError> {
@@ -2168,32 +2138,31 @@ where
         dir: &StateDir,
         expected_write_version: Option<i64>,
     ) -> Result<(), SessionError> {
-        Self::delete_impl(id, dir, expected_write_version, false).map(|_| ())
+        let recreation = Self::delete_impl(id, dir, expected_write_version)?;
+        if !recreation.removed_existing() {
+            return Err(StorageError::NotFound(id.to_string()).into());
+        }
+        Ok(())
     }
 
     pub fn delete_for_recreation(
         id: CaudraId,
         dir: &StateDir,
         expected_write_version: Option<i64>,
-    ) -> Result<i64, SessionError> {
-        Self::delete_impl(id, dir, expected_write_version, true)
+    ) -> Result<SessionRecreation, SessionError> {
+        Self::delete_impl(id, dir, expected_write_version)
     }
 
     fn delete_impl(
         id: CaudraId,
         dir: &StateDir,
         expected_write_version: Option<i64>,
-        allow_missing: bool,
-    ) -> Result<i64, SessionError> {
+    ) -> Result<SessionRecreation, SessionError> {
         let mut database = SessionDatabase::open(dir)?;
-        let result = match database.delete(id, expected_write_version) {
-            Ok(version) => Ok(version),
-            Err(SessionError::Storage(StorageError::NotFound(_))) if allow_missing => database
-                .tombstone_version(id)?
-                .ok_or_else(|| StorageError::NotFound(id.to_string()).into()),
-            Err(error) => Err(error),
-        };
-        database.process_cleanup_jobs()?;
+        let result = database.delete(id, expected_write_version);
+        if let Err(error) = database.process_cleanup_jobs() {
+            warn!(%error, %id, "session artifact cleanup deferred");
+        }
         result
     }
 
@@ -2252,10 +2221,11 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         LOG_FORMAT_VERSION, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, PREVIOUS_LOG_FORMAT_VERSION,
-        SESSION_VERSION, SESSIONS_DIR, StoredMode, StoredPasteRange, StoredPromptAdmission,
-        StoredQueuedDraft, StoredSubagent, StoredSubagentTaskSpec, TAIL_BUF, finish_delete,
-        generate_title, json_path, jsonl_path, load_cwd_index, meta_record, next_epoch,
-        persisted_session_ids, update_cwd_index, write_full_session,
+        SESSION_VERSION, SESSIONS_DIR, StoredImage, StoredMode, StoredPasteRange,
+        StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+        StoredSubagentOutcome, StoredSubagentTaskSpec, TAIL_BUF, finish_delete, generate_title,
+        json_path, jsonl_path, load_cwd_index, meta_record, next_epoch, persisted_session_ids,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, PendingConversationRevert, SCAN_CACHE_FILE, Session, SessionError,
@@ -2311,6 +2281,21 @@ mod tests {
             super::DEFAULT_SUBAGENT_PROFILE_NAME
         );
         assert_eq!(without_profile.mode, StoredMode::Plan);
+    }
+
+    #[test_case(StoredSubagentOutcome::Unknown, r#""unknown""# ; "unknown")]
+    #[test_case(StoredSubagentOutcome::Done, r#""done""# ; "done")]
+    #[test_case(StoredSubagentOutcome::Killed, r#""killed""# ; "killed")]
+    #[test_case(StoredSubagentOutcome::Error, r#""error""# ; "error")]
+    fn subagent_outcome_has_a_compact_serde_representation(
+        outcome: StoredSubagentOutcome,
+        expected: &str,
+    ) {
+        assert_eq!(serde_json::to_string(&outcome).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<StoredSubagentOutcome>(expected).unwrap(),
+            outcome
+        );
     }
 
     #[test]
@@ -2448,6 +2433,7 @@ mod tests {
                 root_tool_use_id: None,
                 name: "sub".into(),
                 model: None,
+                outcome: StoredSubagentOutcome::Unknown,
             }
         }
 
@@ -2660,7 +2646,7 @@ mod tests {
         let id: CaudraId = LEGACY_HEX_ID.parse().unwrap();
         let meta_line = concat!(
             r#"{"t":"meta","title":"t","token_usage":null,"updated_at":0,"fast":true,"#,
-            r#""subagents":[{"tool_use_id":"t1","name":"child"}],"#,
+            r#""subagents":[{"tool_use_id":"t1","name":"child","outcome":"done"}],"#,
             r#""usage_by_model":{"m":{"input":7,"output":3}}}"#,
         );
         let json = format!(
@@ -3666,7 +3652,7 @@ mod tests {
 
     #[test_case(LEGACY_HEX_ID ; "hyphenated_legacy")]
     #[test_case("550e8400e29b41d4a716446655440000" ; "compact_legacy")]
-    fn persisted_ids_include_canonical_and_legacy_session_names(legacy_name: &str) {
+    fn state_dir_session_ids_ignore_jsonl_files(legacy_name: &str) {
         let tmp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(tmp.path().to_path_buf());
         let sessions_dir = state_dir.ensure_subdir(SESSIONS_DIR).unwrap();
@@ -3679,9 +3665,7 @@ mod tests {
 
         let ids = persisted_session_ids(&state_dir).unwrap();
 
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&canonical.id));
-        assert!(ids.contains(&legacy_id));
+        assert_eq!(ids, vec![canonical.id]);
     }
 
     #[test]
@@ -4002,6 +3986,12 @@ mod tests {
     }
 
     #[test]
+    fn session_meta_rejects_string_queued_messages() {
+        let json = r#"{"queued_messages":["legacy"]}"#;
+        assert!(serde_json::from_str::<SessionMeta>(json).is_err());
+    }
+
+    #[test]
     fn session_meta_persists_through_save_load() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -4010,7 +4000,21 @@ mod tests {
         session.meta.fast = true;
         session.meta.workflow = true;
         session.meta.queued_messages_together = true;
-        session.meta.queued_messages = vec!["guide".into(), "next".into()];
+        session.meta.queued_messages = vec![
+            StoredQueuedPrompt {
+                text: "guide".into(),
+                images: vec![StoredImage {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+                paste_ranges: vec![StoredPasteRange { start: 0, end: 5 }],
+            },
+            StoredQueuedPrompt {
+                text: "next".into(),
+                images: Vec::new(),
+                paste_ranges: Vec::new(),
+            },
+        ];
         session.meta.queued_message_admissions =
             vec![StoredPromptAdmission::Steer, StoredPromptAdmission::Queue];
         session.meta.unsent_subagent_messages.insert(
@@ -4031,6 +4035,7 @@ mod tests {
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
         assert!(loaded.meta.queued_messages_together);
+        assert_eq!(loaded.meta.queued_messages, session.meta.queued_messages);
         assert_eq!(
             loaded.meta.queued_message_admissions,
             [StoredPromptAdmission::Steer, StoredPromptAdmission::Queue]

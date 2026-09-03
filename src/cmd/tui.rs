@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
@@ -11,12 +13,14 @@ use color_eyre::eyre::Context;
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::ToolRegistry;
-use caudra_config::{Config, load_env_files, load_permissions};
+use caudra_config::{Config, RetentionConfig, load_env_files, load_permissions};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::sessions::SessionLease;
+use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
+use caudra_storage::sessions::{SessionDatabase, SessionLease};
+use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_ui::{AppSession, HerdrReporter, RunOutcome, SessionTab};
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -25,6 +29,58 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+/// The first sweep waits for startup and the first prompt to settle.
+const SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
+/// How often the sweep thread re-checks whether the interval has elapsed.
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+
+/// Runs the retention sweep on its own thread while the TUI is open. Dropping
+/// the sender wakes and stops the thread. Every step the sweep takes is
+/// crash-safe, so shutdown never waits for a deletion in progress.
+struct RetentionSweeper {
+    _stop: Option<Sender<()>>,
+}
+
+impl RetentionSweeper {
+    fn spawn(storage: StateDir, retention: RetentionConfig) -> Self {
+        if storage.is_ephemeral() {
+            return Self { _stop: None };
+        }
+        let policy = SweepPolicy {
+            group_by: retention.group_by,
+            interval: Duration::from_secs(retention.sweep_interval_hours * SECONDS_PER_HOUR),
+            trim: retention.trim,
+            forget: retention.forget,
+        };
+        if policy.interval.is_zero() {
+            return Self { _stop: None };
+        }
+        let (stop, stopped) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("retention-sweep".into())
+            .spawn(move || {
+                let mut delay = SWEEP_STARTUP_DELAY;
+                loop {
+                    match stopped.recv_timeout(delay) {
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                    if let Err(error) = sweep_if_due(&storage, &policy, &jiff::Zoned::now()) {
+                        tracing::warn!(%error, "retention sweep failed");
+                    }
+                    delay = SWEEP_POLL_INTERVAL.min(policy.interval);
+                }
+            });
+        match spawned {
+            Ok(_) => Self { _stop: Some(stop) },
+            Err(error) => {
+                tracing::warn!(%error, "retention sweep thread not started");
+                Self { _stop: None }
+            }
+        }
+    }
+}
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -250,6 +306,168 @@ fn resolve_session(
     Ok(SessionTab { session, lease })
 }
 
+struct ResolvedSessions {
+    tabs: Vec<SessionTab>,
+    focused: usize,
+    warnings: Vec<String>,
+}
+
+fn restore_warning(warnings: &mut Vec<String>, message: String) {
+    tracing::warn!(warning = %message, "workspace tab not restored");
+    warnings.push(message);
+}
+
+fn restore_workspace_tabs(
+    stored: WorkspaceTabs,
+    cwd: &Path,
+    storage: &StateDir,
+) -> ResolvedSessions {
+    let mut warnings = Vec::new();
+    let facts = match SessionDatabase::open_state(storage)
+        .and_then(|database| database.session_facts(None))
+    {
+        Ok(facts) => facts
+            .into_iter()
+            .map(|facts| (facts.id, facts.cwd))
+            .collect::<HashMap<_, _>>(),
+        Err(error) => {
+            restore_warning(
+                &mut warnings,
+                format!("Could not inspect stored workspace tabs: {error}"),
+            );
+            return ResolvedSessions {
+                tabs: Vec::new(),
+                focused: 0,
+                warnings,
+            };
+        }
+    };
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut seen = HashSet::new();
+    let mut tabs = Vec::new();
+
+    for id in stored.open {
+        if !seen.insert(id) {
+            restore_warning(
+                &mut warnings,
+                format!("Stored workspace tab {id} is duplicated"),
+            );
+            continue;
+        }
+        let Some(stored_cwd) = facts.get(&id) else {
+            restore_warning(
+                &mut warnings,
+                format!("Stored workspace tab {id} no longer exists"),
+            );
+            continue;
+        };
+        let stored_cwd = match Path::new(stored_cwd).canonicalize() {
+            Ok(stored_cwd) => stored_cwd,
+            Err(error) => {
+                restore_warning(
+                    &mut warnings,
+                    format!("Stored workspace tab {id} has a stale working directory: {error}"),
+                );
+                continue;
+            }
+        };
+        if stored_cwd != canonical_cwd {
+            restore_warning(
+                &mut warnings,
+                format!(
+                    "Stored workspace tab {id} belongs to {}, not {}",
+                    stored_cwd.display(),
+                    canonical_cwd.display()
+                ),
+            );
+            continue;
+        }
+        let lease = match SessionLease::acquire(storage, id) {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                restore_warning(
+                    &mut warnings,
+                    format!("Stored workspace tab {id} is unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        match setup::load_session(id, storage) {
+            Ok(session) => {
+                setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(session.id));
+                tabs.push(SessionTab { session, lease });
+            }
+            Err(error) => restore_warning(
+                &mut warnings,
+                format!("Stored workspace tab {id} could not be loaded: {error:#}"),
+            ),
+        }
+    }
+
+    let focused = stored
+        .focused
+        .and_then(|id| tabs.iter().position(|tab| tab.session.id == id));
+    if let Some(id) = stored.focused
+        && focused.is_none()
+        && !tabs.is_empty()
+    {
+        restore_warning(
+            &mut warnings,
+            format!("Stored focused workspace tab {id} could not be restored"),
+        );
+    }
+    ResolvedSessions {
+        tabs,
+        focused: focused.unwrap_or(0),
+        warnings,
+    }
+}
+
+fn resolve_sessions(
+    continue_session: bool,
+    session_id: Option<&str>,
+    model: &str,
+    cwd: &Path,
+    storage: &StateDir,
+) -> Result<ResolvedSessions> {
+    let cwd_str = cwd.to_string_lossy();
+    if continue_session && session_id.is_none() {
+        let mut warnings = Vec::new();
+        if !storage.is_ephemeral() {
+            match read_workspace_tabs(storage, cwd) {
+                Ok(Some(stored)) => {
+                    let restored = restore_workspace_tabs(stored, cwd, storage);
+                    warnings.extend(restored.warnings);
+                    if !restored.tabs.is_empty() {
+                        return Ok(ResolvedSessions {
+                            warnings,
+                            ..restored
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => restore_warning(
+                    &mut warnings,
+                    format!("Could not read stored workspace tabs: {error}"),
+                ),
+            }
+        }
+        let tab = resolve_session(true, None, model, &cwd_str, storage)?;
+        return Ok(ResolvedSessions {
+            tabs: vec![tab],
+            focused: 0,
+            warnings,
+        });
+    }
+    Ok(ResolvedSessions {
+        tabs: vec![resolve_session(
+            false, session_id, model, &cwd_str, storage,
+        )?],
+        focused: 0,
+        warnings: Vec::new(),
+    })
+}
+
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     match cli_prompt {
         Some(p) => Ok(Some(p)),
@@ -263,8 +481,8 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
 }
 
 pub fn run(mut cli: Cli) -> Result<()> {
-    let storage = StateDir::resolve().context("resolve data directory")?;
-    caudra_providers::model_registry::load_from_storage(&storage);
+    let persistent_storage = StateDir::resolve().context("resolve data directory")?;
+    caudra_providers::model_registry::load_from_storage(&persistent_storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
@@ -272,7 +490,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let _workcell_host = super::register_builtin_tools(&cwd)?;
     warn_stale_config_toml(&cwd);
 
-    let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
+    let (mut stack, _) = build_stack(&cli, &cwd, &persistent_storage, None)?;
+    let ephemeral = cli.ephemeral || stack.config.storage.ephemeral;
+    let (storage, _ephemeral_root) = super::run_storage(persistent_storage, ephemeral)?;
 
     setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
@@ -341,18 +561,20 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let mut tabs = vec![resolve_session(
+    let resolved = resolve_sessions(
         cli.continue_session,
         cli.session.as_deref(),
         &stack.model.spec(),
-        &cwd_str,
+        &cwd,
         &storage,
-    )?];
-    let mut focused = 0;
-    let mut warnings: Vec<String> = Vec::new();
+    )?;
+    let mut tabs = resolved.tabs;
+    let mut focused = resolved.focused;
+    let mut warnings = resolved.warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
+    let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
 
     loop {
         for tab in &mut tabs {
@@ -420,6 +642,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     eprintln!("Resume session:\n\n  caudra -s {session_id}");
                 }
                 let started = Instant::now();
+                drop(sweeper);
                 drop(stack);
                 let stack_ms = started.elapsed().as_millis() as u64;
                 teardown.join();
@@ -465,6 +688,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
                     tabs.push(SessionTab { session, lease });
                 }
+                sweeper =
+                    RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
                 stack = new_stack;
                 warnings = new_warnings;
                 focused = f.min(tabs.len() - 1);
@@ -502,6 +727,18 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    const TEST_MODEL: &str = "test/model";
+    const DUPLICATE_TAB_WARNING: &str = "is duplicated";
+    const MISSING_TAB_WARNING: &str = "no longer exists";
+    const WRONG_CWD_WARNING: &str = "belongs to";
+
+    fn save_test_session(storage: &StateDir, cwd: &Path) -> CaudraId {
+        let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());
+        let id = session.id;
+        session.save(storage).unwrap();
+        id
+    }
+
     /// `second_saw_first` requires both joins: `defer` joining the first
     /// closure before spawning the second, and `Drop` joining the second
     /// before the assert reads the flag.
@@ -536,6 +773,16 @@ mod tests {
 
         std::panic::set_hook(prev_hook);
         assert!(after_panic_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ephemeral_storage_disables_the_retention_sweeper() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::split(temp.path().join("volatile"), temp.path().join("persistent"));
+
+        let sweeper = RetentionSweeper::spawn(storage, RetentionConfig::default());
+
+        assert!(sweeper._stop.is_none());
     }
 
     #[test]
@@ -582,16 +829,138 @@ mod tests {
     fn continue_does_not_fall_back_when_latest_session_is_active() {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
-        let mut session = AppSession::new("test/model", "/project");
+        let mut session = AppSession::new(TEST_MODEL, "/project");
         session.save(&storage).unwrap();
-        let first = resolve_session(true, None, "test/model", "/project", &storage).unwrap();
+        let first =
+            resolve_sessions(true, None, TEST_MODEL, Path::new("/project"), &storage).unwrap();
 
-        let error = resolve_session(true, None, "test/model", "/project", &storage)
+        let error = resolve_sessions(true, None, TEST_MODEL, Path::new("/project"), &storage)
             .err()
             .unwrap();
 
         assert!(error.to_string().contains("already open"), "{error}");
         drop(first);
+    }
+
+    #[test]
+    fn continue_restores_valid_workspace_tabs_in_order_and_focus() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let workspace = temp.path().join("workspace");
+        let other_workspace = temp.path().join("other-workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&other_workspace).unwrap();
+        let first = save_test_session(&storage, &workspace);
+        let focused = save_test_session(&storage, &workspace);
+        let wrong_cwd = save_test_session(&storage, &other_workspace);
+        let missing = AppSession::new(TEST_MODEL, &workspace.to_string_lossy()).id;
+        caudra_storage::state::write_workspace_tabs(
+            &storage,
+            &workspace,
+            &WorkspaceTabs {
+                open: vec![first, wrong_cwd, missing, first, focused],
+                focused: Some(focused),
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve_sessions(true, None, TEST_MODEL, &workspace, &storage).unwrap();
+
+        assert_eq!(
+            resolved
+                .tabs
+                .iter()
+                .map(|tab| tab.session.id)
+                .collect::<Vec<_>>(),
+            vec![first, focused]
+        );
+        assert_eq!(resolved.focused, 1);
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(DUPLICATE_TAB_WARNING)),
+            "{:?}",
+            resolved.warnings
+        );
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(MISSING_TAB_WARNING)),
+            "{:?}",
+            resolved.warnings
+        );
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(WRONG_CWD_WARNING)),
+            "{:?}",
+            resolved.warnings
+        );
+        let facts = SessionDatabase::open_state(&storage)
+            .unwrap()
+            .session_facts(None)
+            .unwrap();
+        assert!(
+            facts
+                .iter()
+                .filter(|facts| facts.id == first || facts.id == focused)
+                .all(|facts| facts.last_opened_at.is_some())
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .find(|facts| facts.id == wrong_cwd)
+                .unwrap()
+                .last_opened_at,
+            None
+        );
+    }
+
+    #[test]
+    fn continue_falls_back_to_newest_when_no_workspace_tab_is_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let workspace = temp.path().join("workspace");
+        let other_workspace = temp.path().join("other-workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&other_workspace).unwrap();
+        let newest = save_test_session(&storage, &workspace);
+        let wrong_cwd = save_test_session(&storage, &other_workspace);
+        let missing = AppSession::new(TEST_MODEL, &workspace.to_string_lossy()).id;
+        caudra_storage::state::write_workspace_tabs(
+            &storage,
+            &workspace,
+            &WorkspaceTabs {
+                open: vec![wrong_cwd, missing],
+                focused: Some(wrong_cwd),
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve_sessions(true, None, TEST_MODEL, &workspace, &storage).unwrap();
+
+        assert_eq!(resolved.tabs.len(), 1);
+        assert_eq!(resolved.tabs[0].session.id, newest);
+        assert_eq!(resolved.focused, 0);
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(MISSING_TAB_WARNING)),
+            "{:?}",
+            resolved.warnings
+        );
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(WRONG_CWD_WARNING)),
+            "{:?}",
+            resolved.warnings
+        );
     }
 
     fn test_config() -> Config {

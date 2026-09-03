@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use caudra_config::providers::ProvidersConfig;
-use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
+use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
+use caudra_storage::{StateClass, StateDir};
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,7 +41,10 @@ use super::zai::Zai;
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
-const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
+const SCRIPT_CACHE: StateKey = StateKey {
+    name: "provider.scripts",
+    class: StateClass::Persistent,
+};
 const THINKING_FIELDS_KEY: &str = "thinking_fields";
 
 struct DynamicProviderMeta {
@@ -240,7 +244,7 @@ fn resolve_auth(meta: &DynamicProviderMeta) -> Result<ResolvedAuth, AgentError> 
 /// `info` and `models` describe the script, not the world, so their output only
 /// changes when the script does. Caching them keeps two process spawns per
 /// provider off every startup.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 struct ScriptDescription {
     modified_ns: u128,
     size: u64,
@@ -251,14 +255,12 @@ struct ScriptDescription {
 
 type ScriptCache = HashMap<String, ScriptDescription>;
 
-fn cache_path() -> Option<PathBuf> {
-    Some(StateDir::resolve().ok()?.path().join(SCRIPT_CACHE_FILE))
-}
-
-fn read_cache() -> ScriptCache {
-    cache_path()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+fn read_cache(dir: &StateDir) -> ScriptCache {
+    state::get(dir, SCOPE_GLOBAL, SCRIPT_CACHE)
+        .unwrap_or_else(|error| {
+            debug!(%error, "failed to read provider script cache");
+            None
+        })
         .unwrap_or_default()
 }
 
@@ -381,26 +383,35 @@ fn build_meta(
     })
 }
 
-fn write_cache(cache: &ScriptCache) {
-    let Some(path) = cache_path() else {
-        return;
+fn write_cache(dir: &StateDir, previous: &ScriptCache, next: &ScriptCache) {
+    let update = |stored: &mut ScriptCache| {
+        // Only apply deltas whose base is unchanged since this process read it.
+        for (slug, description) in previous {
+            if !next.contains_key(slug) && stored.get(slug) == Some(description) {
+                stored.remove(slug);
+            }
+        }
+        for (slug, description) in next {
+            let previous_description = previous.get(slug);
+            if previous_description != Some(description) && stored.get(slug) == previous_description
+            {
+                stored.insert(slug.clone(), description.clone());
+            }
+        }
     };
-    let Ok(bytes) = serde_json::to_vec(cache) else {
-        return;
-    };
-    if let Err(e) = caudra_storage::atomic_write(&path, &bytes) {
-        debug!(error = %e, "failed to write provider script cache");
+    if let Err(error) = state::update(dir, SCOPE_GLOBAL, SCRIPT_CACHE, update) {
+        debug!(%error, "failed to write provider script cache");
     }
 }
 
-fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+fn discover_in(dir: &Path, state_dir: Option<&StateDir>) -> Vec<DynamicProviderMeta> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
 
     let builtins = builtin_slugs();
-    let cache = read_cache();
+    let cache = state_dir.map(read_cache).unwrap_or_default();
     let mut next = ScriptCache::new();
     let mut result = Vec::new();
 
@@ -464,8 +475,10 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
         next.insert(slug, described);
     }
 
-    if next != cache {
-        write_cache(&next);
+    if next != cache
+        && let Some(state_dir) = state_dir
+    {
+        write_cache(state_dir, &cache, &next);
     }
     result
 }
@@ -477,7 +490,10 @@ fn discover() -> &'static [DynamicProviderMeta] {
         // Load config first: it hard-exits on malformed providers.toml, so fail
         // before spawning every provider script.
         let custom = ProvidersConfig::load();
-        let mut metas = providers_dir().map(|d| discover_in(&d)).unwrap_or_default();
+        let state_dir = StateDir::resolve().ok();
+        let mut metas = providers_dir()
+            .map(|dir| discover_in(&dir, state_dir.as_ref()))
+            .unwrap_or_default();
         // A script and a providers.toml entry must not share a slug. The script
         // loses, the same way it already loses to a builtin, and we say so
         // instead of silently picking a winner.
@@ -843,7 +859,6 @@ mod tests {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -942,6 +957,48 @@ mod tests {
         assert!(meta.models[0].thinking_fields.is_none());
     }
 
+    fn cached_description(info: &str) -> ScriptDescription {
+        ScriptDescription {
+            modified_ns: 1,
+            size: 1,
+            info: info.into(),
+            models: None,
+        }
+    }
+
+    #[test]
+    fn stale_cache_snapshot_does_not_clobber_newer_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let old = cached_description("old");
+        let external = cached_description("external");
+        let replacement = cached_description("replacement");
+        let previous = HashMap::from([
+            ("changed".into(), old.clone()),
+            ("removed".into(), old.clone()),
+            ("unchanged".into(), old.clone()),
+        ]);
+        let next = HashMap::from([
+            ("changed".into(), replacement.clone()),
+            ("unchanged".into(), old.clone()),
+        ]);
+        let current: ScriptCache = HashMap::from([
+            ("changed".into(), old),
+            ("removed".into(), external.clone()),
+            ("unchanged".into(), external.clone()),
+            ("added".into(), external.clone()),
+        ]);
+        state::set(&dir, SCOPE_GLOBAL, SCRIPT_CACHE, &current).unwrap();
+
+        write_cache(&dir, &previous, &next);
+
+        let stored = read_cache(&dir);
+        assert_eq!(stored["changed"], replacement);
+        assert_eq!(stored["removed"], external);
+        assert_eq!(stored["unchanged"], external);
+        assert_eq!(stored["added"], external);
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
@@ -965,7 +1022,7 @@ mod tests {
             "test-provider",
             r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
         );
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), None);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
@@ -975,13 +1032,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn discovery_persists_script_cache_in_state() {
+        let tmp = TempDir::new().unwrap();
+        let providers_dir = tmp.path().join("providers");
+        fs::create_dir(&providers_dir).unwrap();
+        write_script(
+            &providers_dir,
+            "test-provider",
+            r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
+        );
+        let state_dir = StateDir::from_path(tmp.path().join("state"));
+
+        let providers = discover_in(&providers_dir, Some(&state_dir));
+
+        assert_eq!(providers.len(), 1);
+        assert!(read_cache(&state_dir).contains_key("test-provider"));
+    }
+
+    #[cfg(unix)]
     #[test_case("anthropic", r#"{"display_name": "Fake", "base": "anthropic", "has_auth": false}"# ; "builtin_collision")]
     #[test_case("has.dot", r#"{"display_name": "Bad", "base": "anthropic", "has_auth": false}"# ; "invalid_slug")]
     #[test_case("weird", r#"{"display_name": "Weird", "base": "unknown-provider", "has_auth": false}"# ; "unknown_base")]
     fn discover_skips_invalid(name: &str, info_json: &str) {
         let tmp = TempDir::new().unwrap();
         write_script(tmp.path(), name, info_json);
-        assert!(discover_in(tmp.path()).is_empty());
+        assert!(discover_in(tmp.path(), None).is_empty());
     }
 
     #[cfg(unix)]
@@ -1002,7 +1078,7 @@ esac
         file.sync_all().unwrap();
         drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), None);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
@@ -1109,7 +1185,7 @@ esac
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), None);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
     }

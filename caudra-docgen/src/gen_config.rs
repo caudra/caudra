@@ -4,8 +4,8 @@ use std::sync::Arc;
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, RetentionConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
@@ -275,6 +275,21 @@ fn write_update_check_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_retention_section(out: &mut String) {
+    write_section(out, "[storage.retention]", RetentionConfig::FIELDS);
+    writeln!(
+        out,
+        "`trim` and `forget` are keep policies in `restic forget` terms: `keep_last`, \
+         `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly` take a \
+         count, and `keep_within` plus `keep_within_hourly` through `keep_within_yearly` \
+         take a duration such as `\"90d\"` or `\"2y5m7d3h\"`. A session is kept when any \
+         rule matches. An empty `forget` policy disables automatic deletion. See \
+         [Sessions](/docs/sessions/#retention) for what each tier keeps and how the sweep \
+         runs.\n"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -396,6 +411,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_retention_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();

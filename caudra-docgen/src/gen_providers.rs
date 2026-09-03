@@ -12,9 +12,9 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose; uppercase `R` resets the displayed purpose.
+const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose. Uppercase `R` resets the displayed purpose.
 
-Fast, Balanced, and Best are global exact-model presets saved to `~/.local/state/caudra/model-tiers`. Goal and Compact are workload roles saved to `~/.local/state/caudra/model-roles`. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model; Default Compact uses the chat model."#;
+Fast, Balanced, and Best are global exact-model presets saved in the `model.tiers` row of Caudra's SQLite state database. Goal and Compact use its `model.roles` row. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model. Default Compact uses the chat model."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 

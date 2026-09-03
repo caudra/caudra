@@ -2002,7 +2002,7 @@ impl App {
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
-        self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
+        self.finish_subagents(TaskOutcome::Killed, CANCELLED_TEXT);
         self.subagent_answers.clear();
         self.preserve_all_unconsumed_steers();
         self.subagent_steers.clear();
@@ -2030,7 +2030,8 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
+        self.chats[self.active_chat].mark_finished(TaskOutcome::Killed, CANCELLED_TEXT);
+        self.sync_subagents();
         self.subagent_answers.remove(&task_id);
         self.preserve_unconsumed_steers(&task_id);
 
@@ -2155,6 +2156,7 @@ impl App {
                         root_tool_use_id: Some(root_tool_use_id.clone()),
                         name: name.clone(),
                         model: Some(model.clone()),
+                        outcome: caudra_storage::sessions::StoredSubagentOutcome::Unknown,
                     });
                 }
                 self.state.session_mut().set_subagents(subagents);
@@ -2268,6 +2270,7 @@ impl App {
                     (TaskOutcome::Done, DONE_TEXT)
                 };
                 self.chats[sub_idx].mark_finished(outcome, text);
+                self.sync_subagents();
             }
         }
 
@@ -2893,6 +2896,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: display_text.clone(),
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         });
         input.prompt = Some(Box::new(prompt_ref));
 
@@ -2936,6 +2940,7 @@ impl App {
         self.submit_or_queue(QueuedMessage {
             text: cmd.render(args),
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         })
     }
 
@@ -3400,6 +3405,7 @@ impl App {
         let msg = QueuedMessage {
             text,
             images: vec![],
+            paste_ranges: Vec::new(),
         };
         actions.extend(self.start_from_queue(&msg));
         actions

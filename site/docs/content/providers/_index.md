@@ -9,9 +9,9 @@ group = "Reference"
 
 Caudra talks to LLM providers over their HTTP APIs. Models are split into three capability tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). Compaction is a separate workload role, not a capability tier.
 
-Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose; uppercase `R` resets the displayed purpose.
+Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose. Uppercase `R` resets the displayed purpose.
 
-Fast, Balanced, and Best are global exact-model presets saved to `~/.local/state/caudra/model-tiers`. Goal and Compact are workload roles saved to `~/.local/state/caudra/model-roles`. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model; Default Compact uses the chat model.
+Fast, Balanced, and Best are global exact-model presets saved in the `model.tiers` row of Caudra's SQLite state database. Goal and Compact use its `model.roles` row. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model. Default Compact uses the chat model.
 
 ## Auth Reloading
 

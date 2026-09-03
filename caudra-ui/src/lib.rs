@@ -55,6 +55,11 @@ pub(crate) fn load_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSe
     caudra_agent::load_stored_session(id, storage).context("load persisted session")
 }
 
+/// The picker path: the user chose this session, so it counts as opened.
+pub(crate) fn open_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSession> {
+    caudra_agent::open_stored_session(id, storage).context("load persisted session")
+}
+
 pub(crate) fn session_history_head(session: &AppSession) -> Option<CaudraId> {
     resolve_history_head(
         session.messages(),

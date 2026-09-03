@@ -37,7 +37,7 @@ At the end of each natural work turn, a separate model call evaluates the condit
 
 Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Default tries the global Fast preset, then the active provider's weak model, and finally the current conversation model. Fast, Balanced, and Best use their global exact-model preset when assigned, otherwise the matching tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
 
-The evaluator choice is saved globally in `~/.local/state/caudra/model-roles` and applies across sessions. The same Goal mode is available from `/model` with `Tab`; press uppercase `R` in that mode to restore Default.
+The evaluator choice is saved globally in the `model.roles` row of Caudra's SQLite state database and applies across sessions. The same Goal mode is available from `/model` with `Tab`. Press uppercase `R` in that mode to restore Default.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
 
@@ -61,7 +61,7 @@ const STASH: &str = r#"## Stash
 
 A prompt you are not ready to send does not have to block the composer. `/stash` (`Alt+T`) moves the draft out of the way, `/stash-pop` (`Alt+R`) brings the newest one back, and `/stash-list` opens the full list.
 
-The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in `~/.local/state/caudra/prompt-stash.json` at mode 0600, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
+The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in the `input.stash` row of Caudra's SQLite state database, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
 
 `/stash-pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
 

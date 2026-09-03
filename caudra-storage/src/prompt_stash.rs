@@ -1,43 +1,26 @@
 //! Unsent prompt drafts parked for later, shared across every session and
-//! project. Each mutation takes the lock, re-reads, and rewrites atomically,
-//! so two Caudra processes stashing at once cannot clobber each other.
-
-use std::fs;
-use std::path::{Path, PathBuf};
+//! project. A volatile state row: an ephemeral run keeps its own stash and
+//! never touches the persistent one. Each mutation is one write transaction
+//! that re-reads first, so two Caudra processes stashing at once cannot
+//! clobber each other.
 
 use serde::{Deserialize, Serialize};
 
 use crate::id::CaudraId;
 use crate::sessions::{StoredImage, StoredPasteRange};
-use crate::{StateDir, atomic_write_permissions, exclusive_state_lock, now_epoch};
+use crate::state::{SCOPE_GLOBAL, StateKey, StateStore};
+use crate::{StateClass, StateDir, StorageError, now_epoch};
 
-pub const STASH_FILE: &str = "prompt-stash.json";
 pub const MAX_ENTRIES: usize = 50;
 
-const STASH_VERSION: u32 = 1;
-const STASH_MODE: u32 = 0o600;
-const STASH_LOCK_FILE: &str = "prompt-stash.lock";
-
+const STASH: StateKey = StateKey {
+    name: "input.stash",
+    class: StateClass::Volatile,
+};
 #[derive(Debug, thiserror::Error)]
 pub enum PromptStashError {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error("prompt stash version {found} is not supported (expected {expected})")]
-    Version { found: u32, expected: u32 },
-    #[error("prompt stash file disappeared")]
-    Vanished,
-}
-
-impl From<crate::StorageError> for PromptStashError {
-    fn from(error: crate::StorageError) -> Self {
-        match error {
-            crate::StorageError::Io(error) => Self::Io(error),
-            crate::StorageError::Json(error) => Self::Json(error),
-            other => Self::Io(std::io::Error::other(other.to_string())),
-        }
-    }
+    Storage(#[from] StorageError),
 }
 
 /// The composer contents a stash entry is built from. Mirrors the draft fields
@@ -64,146 +47,82 @@ pub struct StashEntry {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StashFile {
-    version: u32,
-    entries: Vec<StashEntry>,
-}
-
-/// Oldest first on disk, so the newest entry is the last one and `pop` is a
+/// Oldest first, so the newest entry is the last one and `pop` is a
 /// truncation rather than a shift.
 pub struct PromptStash {
-    path: PathBuf,
-    existed: bool,
-    file: StashFile,
+    store: StateStore,
+    entries: Vec<StashEntry>,
 }
 
 impl PromptStash {
     pub fn open(state_dir: &StateDir) -> Result<Self, PromptStashError> {
-        let path = state_dir.path().join(STASH_FILE);
-        let (existed, file) = match load_file(&path)? {
-            Some(file) => (true, file),
-            None => (
-                false,
-                StashFile {
-                    version: STASH_VERSION,
-                    entries: Vec::new(),
-                },
-            ),
-        };
-        Ok(Self {
-            path,
-            existed,
-            file,
-        })
+        let store = StateStore::open(state_dir, STASH.class)?;
+        let entries = store.get(SCOPE_GLOBAL, STASH)?.unwrap_or_default();
+        Ok(Self { store, entries })
     }
 
     /// Another process may have stashed since this handle was opened, so
     /// anything that shows or consumes entries re-reads first.
     pub fn refresh(&mut self) -> Result<(), PromptStashError> {
-        match load_file(&self.path)? {
-            Some(file) => {
-                self.file = file;
-                self.existed = true;
-                Ok(())
-            }
-            None if !self.existed => Ok(()),
-            None => Err(PromptStashError::Vanished),
-        }
+        self.entries = self.store.get(SCOPE_GLOBAL, STASH)?.unwrap_or_default();
+        Ok(())
     }
 
     pub fn entries(&self) -> &[StashEntry] {
-        &self.file.entries
+        &self.entries
     }
 
     pub fn len(&self) -> usize {
-        self.file.entries.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.file.entries.is_empty()
+        self.entries.is_empty()
     }
 
     pub fn push(&mut self, draft: StashDraft) -> Result<(), PromptStashError> {
-        let _lock = self.lock()?;
-        self.refresh()?;
-        let mut next = self.file.clone();
-        next.entries.push(StashEntry {
-            id: CaudraId::generate().to_string(),
-            text: draft.text,
-            paste_ranges: draft.paste_ranges,
-            images: draft.images,
-            cwd: draft.cwd,
-            created_at: now_epoch(),
-        });
-        let overflow = next.entries.len().saturating_sub(MAX_ENTRIES);
-        next.entries.drain(..overflow);
-        self.write(next)
+        self.mutate(|entries| {
+            entries.push(StashEntry {
+                id: CaudraId::generate().to_string(),
+                text: draft.text,
+                paste_ranges: draft.paste_ranges,
+                images: draft.images,
+                cwd: draft.cwd,
+                created_at: now_epoch(),
+            });
+            let overflow = entries.len().saturating_sub(MAX_ENTRIES);
+            entries.drain(..overflow);
+        })
     }
 
     pub fn pop(&mut self) -> Result<Option<StashEntry>, PromptStashError> {
-        let _lock = self.lock()?;
-        self.refresh()?;
-        let mut next = self.file.clone();
-        let Some(entry) = next.entries.pop() else {
-            return Ok(None);
-        };
-        self.write(next)?;
-        Ok(Some(entry))
+        self.mutate(Vec::pop)
     }
 
     pub fn remove(&mut self, id: &str) -> Result<Option<StashEntry>, PromptStashError> {
-        let _lock = self.lock()?;
-        self.refresh()?;
-        let Some(index) = self.file.entries.iter().position(|entry| entry.id == id) else {
-            return Ok(None);
-        };
-        let mut next = self.file.clone();
-        let entry = next.entries.remove(index);
-        self.write(next)?;
-        Ok(Some(entry))
+        self.mutate(|entries| {
+            let index = entries.iter().position(|entry| entry.id == id)?;
+            Some(entries.remove(index))
+        })
     }
 
-    fn lock(&self) -> Result<fs::File, PromptStashError> {
-        let lock_path = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(STASH_LOCK_FILE);
-        Ok(exclusive_state_lock(&lock_path, STASH_MODE)?)
+    fn mutate<R>(
+        &mut self,
+        update: impl FnOnce(&mut Vec<StashEntry>) -> R,
+    ) -> Result<R, PromptStashError> {
+        let (result, entries) =
+            self.store
+                .update(SCOPE_GLOBAL, STASH, |entries: &mut Vec<StashEntry>| {
+                    (update(entries), entries.clone())
+                })?;
+        self.entries = entries;
+        Ok(result)
     }
-
-    fn write(&mut self, next: StashFile) -> Result<(), PromptStashError> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let data = serde_json::to_vec_pretty(&next)?;
-        atomic_write_permissions(&self.path, &data, STASH_MODE)?;
-        self.file = next;
-        self.existed = true;
-        Ok(())
-    }
-}
-
-fn load_file(path: &Path) -> Result<Option<StashFile>, PromptStashError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let file: StashFile = serde_json::from_slice(&data)?;
-    if file.version != STASH_VERSION {
-        return Err(PromptStashError::Version {
-            found: file.version,
-            expected: STASH_VERSION,
-        });
-    }
-    Ok(Some(file))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_case::test_case;
 
     const CWD: &str = "/tmp/project";
 
@@ -318,35 +237,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_opens_empty() {
+    fn missing_state_opens_empty() {
         let (_tmp, dir) = tmp_dir();
         assert!(PromptStash::open(&dir).unwrap().is_empty());
     }
 
-    #[test_case(b"not json" as &[u8] ; "corrupt")]
-    #[test_case(br#"{"version":99,"entries":[]}"# ; "future_version")]
-    fn unreadable_file_is_reported_not_overwritten(content: &[u8]) {
-        let (_tmp, dir) = tmp_dir();
-        let path = dir.path().join(STASH_FILE);
-        fs::write(&path, content).unwrap();
-
-        assert!(PromptStash::open(&dir).is_err());
-        assert_eq!(fs::read(&path).unwrap(), content);
-    }
-
-    #[cfg(unix)]
     #[test]
-    fn stash_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (_tmp, dir) = tmp_dir();
-        let mut stash = PromptStash::open(&dir).unwrap();
-        stash.push(draft("secret")).unwrap();
-
-        let mode = fs::metadata(dir.path().join(STASH_FILE))
+    fn ephemeral_stash_never_reaches_the_persistent_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persistent = StateDir::from_path(tmp.path().join("persistent"));
+        let ephemeral = StateDir::split(tmp.path().join("volatile"), persistent.path().into());
+        PromptStash::open(&ephemeral)
             .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, STASH_MODE);
+            .push(draft("secret"))
+            .unwrap();
+
+        assert!(PromptStash::open(&persistent).unwrap().is_empty());
+        assert_eq!(PromptStash::open(&ephemeral).unwrap().len(), 1);
     }
 }

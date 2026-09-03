@@ -27,6 +27,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `--system-prompt-profile` | yes | yes | yes |
+| `--ephemeral` | yes | yes | yes |
 | `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
@@ -41,6 +42,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | Flag | Description |
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
+| `--ephemeral` | Store the session, outputs, snapshots, input history, and stash in a temporary root removed at exit. Credentials, trust, and preferences remain persistent |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
@@ -127,10 +129,11 @@ Uses the same install locations as the install scripts.
 caudra acp
 caudra acp -m anthropic/claude-sonnet-4-6
 caudra acp --yolo
+caudra --ephemeral acp
 caudra --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags such as `--ephemeral` and `--no-jit` must come before the subcommand.
 
 ### `caudra index`
 
@@ -152,6 +155,39 @@ caudra prompt --tools --names  # tool names only, one per line
 ```
 
 Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants.
+
+### `caudra storage`
+
+```bash
+caudra storage path                       # session database path
+caudra storage stats [--json]             # rows, bytes, artifacts, pending cleanup
+caudra storage check                      # integrity check
+caudra storage sessions [--directory DIR] # list sessions with activity, size, state
+caudra storage trim   [POLICY] [--dry-run]
+caudra storage forget [POLICY | ID...] [--dry-run] [--prune]
+caudra storage prune  [--dry-run]
+caudra storage pin <ID>...
+caudra storage unpin <ID>...
+caudra storage checkpoint [--truncate]
+caudra storage vacuum [--pages N]
+```
+
+`trim` demotes sessions to the transcript tier and `forget` deletes them. Both take a keep policy in `restic forget` terms and fall back to the configured `storage.retention` policy when no `--keep-*` flag is given. `prune` reclaims space that no session references. See [Sessions](/docs/sessions/#retention) for the policy rules and what each tier keeps.
+
+| Flag | Description |
+|------|-------------|
+| `--keep-last <N>` | Keep the N most recently active sessions |
+| `--keep-hourly`, `--keep-daily`, `--keep-weekly`, `--keep-monthly`, `--keep-yearly <N>` | For the last N periods that contain sessions, keep the newest session of each |
+| `--keep-within <DURATION>` | Keep every session active within the duration, for example `90d` or `2y5m7d3h` |
+| `--keep-within-hourly` ... `--keep-within-yearly <DURATION>` | Keep one session per period within the duration |
+| `--group-by <directory\|none>` | Evaluate the policy per working directory (default) or across every session |
+| `--directory <DIR>` | Only sessions for one working directory |
+| `--dry-run` | Print the plan and change nothing |
+| `--json` | Emit the plan and outcomes as JSON |
+| `--prune` | `forget` only: run `prune` when at least one session was forgotten |
+| `--unsafe-allow-remove-all` | Allow an empty policy, which keeps nothing. Requires `--directory` |
+
+A session is kept when any rule matches. Pinned sessions, sessions open in any Caudra process, and sessions with a pending revert are never trimmed or forgotten by policy. `forget <ID>` refuses pinned sessions.
 
 ## Everyday examples
 

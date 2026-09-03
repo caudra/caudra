@@ -76,7 +76,9 @@ pub fn now_millis() -> u64 {
 }
 
 fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
-    dir.path().join(AUTH_DIR).join(format!("{filename}.json"))
+    dir.persistent_path()
+        .join(AUTH_DIR)
+        .join(format!("{filename}.json"))
 }
 
 fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -121,7 +123,9 @@ pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageErro
 
 pub fn lock_provider_auth(dir: &StateDir, provider: &str) -> Result<File, StorageError> {
     exclusive_state_lock(
-        &dir.path().join(AUTH_DIR).join(format!("{provider}.lock")),
+        &dir.persistent_path()
+            .join(AUTH_DIR)
+            .join(format!("{provider}.lock")),
         AUTH_FILE_MODE,
     )
 }
@@ -228,6 +232,26 @@ mod tests {
         assert!(delete_tokens(&dir, "anthropic").unwrap());
         assert!(load_tokens(&dir, "anthropic").is_none());
         assert!(!delete_tokens(&dir, "anthropic").unwrap());
+    }
+
+    #[test]
+    fn ephemeral_access_uses_the_persistent_root() {
+        let tmp = TempDir::new().unwrap();
+        let persistent = tmp.path().join("persistent");
+        let volatile = tmp.path().join("volatile");
+        let dir = StateDir::split(volatile.clone(), persistent.clone());
+        let tokens = OAuthTokens {
+            access: "access_tok".into(),
+            refresh: "refresh_tok".into(),
+            expires: 9_999_999_999,
+            account_id: None,
+        };
+
+        save_tokens(&dir, "anthropic", &tokens).unwrap();
+
+        assert_eq!(load_tokens(&dir, "anthropic").unwrap().access, "access_tok");
+        assert!(persistent.join(AUTH_DIR).join("anthropic.json").is_file());
+        assert!(!volatile.join(AUTH_DIR).exists());
     }
 
     #[test]

@@ -1,12 +1,15 @@
-//! The persisted transcript view mode, so `/view` survives a restart.
-
-use std::fs;
+//! The persisted transcript view mode, so `/view` survives a restart. A
+//! global state row.
 
 use tracing::warn;
 
-use crate::StateDir;
+use crate::state::{self, SCOPE_GLOBAL, StateKey};
+use crate::{StateClass, StateDir};
 
-const VIEW_FILE: &str = "view";
+const VIEW: StateKey = StateKey {
+    name: "ui.view",
+    class: StateClass::Persistent,
+};
 const AUTO: &str = "auto";
 const COMPACT: &str = "compact";
 const EXPANDED: &str = "expanded";
@@ -54,23 +57,28 @@ impl ViewMode {
 }
 
 pub fn persist(dir: &StateDir, mode: ViewMode) {
-    if let Err(e) = fs::write(dir.path().join(VIEW_FILE), mode.as_str()) {
-        warn!(error = %e, "failed to persist view mode");
+    if let Err(error) = state::set(dir, SCOPE_GLOBAL, VIEW, &mode.as_str()) {
+        warn!(%error, "failed to persist view mode");
     }
 }
 
-/// `None` when nothing was stored or the file names a mode this build does
+/// `None` when nothing was stored or the value names a mode this build does
 /// not know, which leaves the caller's own default standing.
 pub fn read(dir: &StateDir) -> Option<ViewMode> {
-    let mode = fs::read_to_string(dir.path().join(VIEW_FILE)).ok()?;
-    ViewMode::parse(mode.trim())
+    state::get::<String>(dir, SCOPE_GLOBAL, VIEW)
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to read view mode");
+            None
+        })
+        .and_then(|mode| ViewMode::parse(&mode))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    use super::*;
 
     const UNSET: &str = "an unwritten mode must leave the caller's default alone";
     const ROUND_TRIP: &str = "a stored mode must read back as written";
@@ -117,7 +125,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        fs::write(dir.path().join(VIEW_FILE), "roomy\n").unwrap();
+        state::set(&dir, SCOPE_GLOBAL, VIEW, &"roomy").unwrap();
         assert_eq!(read(&dir), None, "{UNKNOWN}");
     }
 }

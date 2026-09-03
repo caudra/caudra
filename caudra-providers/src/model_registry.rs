@@ -11,21 +11,27 @@
 //! return owned data, so a caller can never hold a read guard across model
 //! construction (recursive read + queued writer = deadlock). The module owns
 //! persistence: [`load_from_storage`] at startup and typed setters on user edits.
-//! Callers never touch the on-disk format directly.
+//! Callers never touch the stored representation directly.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use caudra_storage::{StateDir, atomic_write};
+use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
+use caudra_storage::{StateClass, StateDir};
 use tracing::warn;
 
 use crate::manifest::ManifestRegistry;
 use crate::model::{ModelInfo, ModelTier};
 
-const TIERS_FILE: &str = "model-tiers";
-const ROLES_FILE: &str = "model-roles";
+const TIERS: StateKey = StateKey {
+    name: "model.tiers",
+    class: StateClass::Persistent,
+};
+const ROLES: StateKey = StateKey {
+    name: "model.roles",
+    class: StateClass::Persistent,
+};
 
 static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
 
@@ -123,62 +129,69 @@ pub fn compaction_target() -> CompactionTarget {
 }
 
 pub fn load_from_storage(dir: &StateDir) {
-    let (overrides, roles, had_legacy_compaction) = read_state(dir);
+    let overrides = read_overrides(dir);
+    let PersistedRoles {
+        goal_evaluator,
+        compaction,
+    } = read_roles(dir);
     let mut registry = write();
-    registry.set_overrides(overrides.clone());
-    registry.goal_evaluator = roles
-        .goal_evaluator
-        .clone()
-        .filter(|target| *target != GoalEvaluatorTarget::Auto);
-    registry.compaction = roles.compaction.clone();
-    drop(registry);
-    if had_legacy_compaction {
-        write_overrides(dir.path().join(TIERS_FILE).as_path(), &overrides);
-        write_roles(dir.path().join(ROLES_FILE).as_path(), &roles);
-    }
+    registry.set_overrides(overrides);
+    registry.goal_evaluator = goal_evaluator.filter(|target| *target != GoalEvaluatorTarget::Auto);
+    registry.compaction = compaction;
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.set(spec, tier));
+    update_and_persist(dir, move |overrides| {
+        overrides.insert(tier, spec.clone());
+    });
 }
 
 pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.unset(spec, tier));
+    update_and_persist(dir, |overrides| {
+        if overrides.get(&tier).map(String::as_str) == Some(spec) {
+            overrides.remove(&tier);
+        }
+    });
 }
 
 pub fn reset_tier_and_persist(tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |registry| {
-        registry.overrides.remove(&tier);
+    update_and_persist(dir, |overrides| {
+        overrides.remove(&tier);
     });
 }
 
 pub fn set_goal_evaluator_and_persist(target: GoalEvaluatorTarget, dir: &StateDir) {
-    let snapshot = {
+    let persisted = (target != GoalEvaluatorTarget::Auto).then_some(target.clone());
+    {
         let mut registry = write();
         registry.goal_evaluator = (target != GoalEvaluatorTarget::Auto).then_some(target);
-        registry.roles_snapshot()
-    };
-    write_roles(dir.path().join(ROLES_FILE).as_path(), &snapshot);
+    }
+    update_persisted_roles(dir, |roles| roles.goal_evaluator = persisted);
 }
 
 pub fn set_compaction_and_persist(target: CompactionTarget, dir: &StateDir) {
-    let snapshot = {
+    {
         let mut registry = write();
-        registry.compaction = Some(target);
-        registry.roles_snapshot()
-    };
-    write_roles(dir.path().join(ROLES_FILE).as_path(), &snapshot);
+        registry.compaction = Some(target.clone());
+    }
+    update_persisted_roles(dir, |roles| roles.compaction = Some(target));
 }
 
-/// Snapshot under the lock, persist outside it: file IO must never run while
-/// holding the registry lock.
-fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut ModelRegistry)) {
-    let snapshot = {
+fn update_and_persist(dir: &StateDir, update: impl Fn(&mut BTreeMap<ModelTier, String>)) {
+    {
         let mut reg = write();
-        update(&mut reg);
-        reg.overrides.clone()
-    };
-    write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
+        update(&mut reg.overrides);
+    }
+    update_persisted_overrides(dir, update);
+}
+
+fn update_persisted_overrides(
+    dir: &StateDir,
+    update: impl FnOnce(&mut BTreeMap<ModelTier, String>),
+) {
+    if let Err(error) = state::update(dir, SCOPE_GLOBAL, TIERS, update) {
+        warn!(%error, "failed to persist tier overrides");
+    }
 }
 
 #[derive(Debug, Default)]
@@ -191,8 +204,6 @@ struct ModelRegistry {
     /// and discovered metadata lookup.
     known_models: HashMap<String, Vec<ModelInfo>>,
     goal_evaluator: Option<GoalEvaluatorTarget>,
-    /// `None` means no new-format value was loaded. `Some(Auto)` is an explicit
-    /// reset and must suppress a stale legacy compaction tier on restart.
     compaction: Option<CompactionTarget>,
 }
 
@@ -205,25 +216,21 @@ impl ModelRegistry {
         self.known_models.insert(provider.to_string(), models);
     }
 
+    #[cfg(test)]
     fn set(&mut self, spec: String, tier: ModelTier) {
         self.overrides.insert(tier, spec);
     }
 
+    #[cfg(test)]
     fn unset(&mut self, spec: &str, tier: ModelTier) {
         if self.has_override(spec, tier) {
             self.overrides.remove(&tier);
         }
     }
 
+    #[cfg(test)]
     fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
         self.overrides.get(&tier).map(String::as_str) == Some(spec)
-    }
-
-    fn roles_snapshot(&self) -> RolesFile {
-        RolesFile {
-            goal_evaluator: self.goal_evaluator.clone(),
-            compaction: self.compaction.clone(),
-        }
     }
 
     /// Lookup discovered metadata for a model by ID.
@@ -349,120 +356,35 @@ fn tier_for_position(pos: usize) -> ModelTier {
     [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak][pos.min(2)]
 }
 
-// On-disk format: { "tier": "spec", ... } keyed by tier, matching the in-memory
-// `BTreeMap<ModelTier, String>`. Tier-keyed storage preserves a model assigned
-// to multiple tiers; a spec-keyed file would collapse them to a single entry.
-// Legacy files were spec-keyed and are inverted on read.
-
-#[derive(Default)]
-struct PersistedOverrides {
-    presets: BTreeMap<ModelTier, String>,
-    legacy_compaction: Option<String>,
-}
-
-fn quality_tier(value: &str) -> Option<ModelTier> {
-    match value {
-        "weak" => Some(ModelTier::Weak),
-        "medium" => Some(ModelTier::Medium),
-        "strong" => Some(ModelTier::Strong),
-        _ => None,
-    }
-}
-
-fn read_persisted_overrides(path: &Path) -> PersistedOverrides {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return PersistedOverrides::default();
-    };
-    if raw.trim().is_empty() {
-        return PersistedOverrides::default();
-    }
-    let map = match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
-        Ok(map) => map,
-        Err(error) => {
-            warn!(path = %path.display(), %error, "failed to parse tier overrides, ignoring");
-            return PersistedOverrides::default();
-        }
-    };
-    let tier_keyed = map
-        .keys()
-        .any(|key| quality_tier(key).is_some() || key == "compaction");
-    let mut persisted = PersistedOverrides::default();
-    for (key, value) in map {
-        let (tier_name, spec) = if tier_keyed {
-            (key.as_str(), value)
-        } else {
-            (value.as_str(), key)
-        };
-        if tier_name == "compaction" {
-            persisted.legacy_compaction = Some(spec);
-        } else if let Some(tier) = quality_tier(tier_name) {
-            persisted.presets.insert(tier, spec);
-        } else {
-            warn!(path = %path.display(), tier = tier_name, "unknown model tier override, ignoring");
-        }
-    }
-    persisted
-}
-
-#[cfg(test)]
-fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
-    read_persisted_overrides(path).presets
-}
-
-fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
-    let json = match serde_json::to_vec_pretty(overrides) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "failed to serialize tier overrides");
-            return;
-        }
-    };
-    if let Err(e) = atomic_write(path, &json) {
-        warn!(path = %path.display(), error = %e, "failed to persist tier overrides");
-    }
-}
-
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct RolesFile {
+struct PersistedRoles {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_evaluator: Option<GoalEvaluatorTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionTarget>,
 }
 
-fn read_state(dir: &StateDir) -> (BTreeMap<ModelTier, String>, RolesFile, bool) {
-    let persisted = read_persisted_overrides(dir.path().join(TIERS_FILE).as_path());
-    let had_legacy_compaction = persisted.legacy_compaction.is_some();
-    let mut roles = read_roles(dir.path().join(ROLES_FILE).as_path());
-    if roles.compaction.is_none() {
-        roles.compaction = persisted.legacy_compaction.map(CompactionTarget::Model);
-    }
-    (persisted.presets, roles, had_legacy_compaction)
+fn read_overrides(dir: &StateDir) -> BTreeMap<ModelTier, String> {
+    state::get(dir, SCOPE_GLOBAL, TIERS)
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to read tier overrides");
+            None
+        })
+        .unwrap_or_default()
 }
 
-fn read_roles(path: &Path) -> RolesFile {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return RolesFile::default();
-    };
-    if raw.trim().is_empty() {
-        return RolesFile::default();
-    }
-    serde_json::from_str(&raw).unwrap_or_else(|error| {
-        warn!(path = %path.display(), %error, "failed to parse model roles, ignoring");
-        RolesFile::default()
-    })
+fn read_roles(dir: &StateDir) -> PersistedRoles {
+    state::get(dir, SCOPE_GLOBAL, ROLES)
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to read model roles");
+            None
+        })
+        .unwrap_or_default()
 }
 
-fn write_roles(path: &Path, roles: &RolesFile) {
-    let json = match serde_json::to_vec_pretty(roles) {
-        Ok(value) => value,
-        Err(error) => {
-            warn!(%error, "failed to serialize model roles");
-            return;
-        }
-    };
-    if let Err(error) = atomic_write(path, &json) {
-        warn!(path = %path.display(), %error, "failed to persist model roles");
+fn update_persisted_roles(dir: &StateDir, update: impl FnOnce(&mut PersistedRoles)) {
+    if let Err(error) = state::update(dir, SCOPE_GLOBAL, ROLES, update) {
+        warn!(%error, "failed to persist model roles");
     }
 }
 
@@ -471,6 +393,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    fn state_dir() -> (TempDir, StateDir) {
+        let temp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        (temp, dir)
+    }
 
     fn make_map(overrides: &[(ModelTier, &str)], models: &[&str]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
@@ -661,140 +589,57 @@ mod tests {
     }
 
     #[test]
-    fn persistence_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(TIERS_FILE);
+    fn tier_state_updates_merge_and_preserve_multi_tier_assignments() {
+        let (_temp, dir) = state_dir();
+        assert!(read_overrides(&dir).is_empty());
 
-        assert!(read_overrides(&path).is_empty());
+        update_persisted_overrides(&dir, |overrides| {
+            overrides.insert(ModelTier::Strong, "ollama/qwen3".into());
+        });
+        update_persisted_overrides(&dir, |overrides| {
+            overrides.insert(ModelTier::Medium, "ollama/qwen3".into());
+        });
+        update_persisted_overrides(&dir, |overrides| {
+            overrides.insert(ModelTier::Weak, "ollama/qwen3:8b".into());
+        });
 
-        let mut m = BTreeMap::new();
-        m.insert(ModelTier::Strong, "ollama/qwen3".into());
-        m.insert(ModelTier::Medium, "ollama/qwen3:8b".into());
-        write_overrides(&path, &m);
-
-        let loaded = read_overrides(&path);
+        let loaded = read_overrides(&dir);
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3:8b");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
     }
 
     #[test]
-    fn goal_evaluator_role_round_trips() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(ROLES_FILE);
-        let roles = RolesFile {
-            goal_evaluator: Some(GoalEvaluatorTarget::Tier(ModelTier::Medium)),
-            compaction: None,
-        };
+    fn role_state_updates_do_not_clobber_other_roles() {
+        let (_temp, dir) = state_dir();
+        let goal_evaluator = GoalEvaluatorTarget::Model("openai/gpt-5.4-nano".into());
+        let compaction = CompactionTarget::Model("openai/gpt-5.4-mini".into());
 
-        write_roles(&path, &roles);
+        update_persisted_roles(&dir, |roles| {
+            roles.goal_evaluator = Some(goal_evaluator.clone());
+        });
+        update_persisted_roles(&dir, |roles| {
+            roles.compaction = Some(compaction.clone());
+        });
 
-        assert_eq!(
-            read_roles(&path).goal_evaluator,
-            Some(GoalEvaluatorTarget::Tier(ModelTier::Medium))
-        );
-        let raw = std::fs::read_to_string(path).unwrap();
-        assert!(raw.contains("\"goal_evaluator\""));
-        assert!(raw.contains("\"kind\": \"tier\""));
-        assert!(raw.contains("\"value\": \"medium\""));
+        let roles = read_roles(&dir);
+        assert_eq!(roles.goal_evaluator, Some(goal_evaluator));
+        assert_eq!(roles.compaction, Some(compaction.clone()));
+
+        update_persisted_roles(&dir, |roles| roles.goal_evaluator = None);
+        let roles = read_roles(&dir);
+        assert!(roles.goal_evaluator.is_none());
+        assert_eq!(roles.compaction, Some(compaction));
     }
 
     #[test]
-    fn goal_evaluator_exact_model_round_trips() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(ROLES_FILE);
-        let target = GoalEvaluatorTarget::Model("openai/gpt-5.4-nano".into());
+    fn invalid_role_state_is_ignored() {
+        let (_temp, dir) = state_dir();
+        state::set(&dir, SCOPE_GLOBAL, ROLES, &"wrong type").unwrap();
 
-        write_roles(
-            &path,
-            &RolesFile {
-                goal_evaluator: Some(target.clone()),
-                compaction: None,
-            },
-        );
-
-        assert_eq!(read_roles(&path).goal_evaluator, Some(target));
-    }
-
-    #[test]
-    fn invalid_goal_evaluator_role_is_ignored() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(ROLES_FILE);
-        std::fs::write(&path, b"not json").unwrap();
-
-        assert!(read_roles(&path).goal_evaluator.is_none());
-    }
-
-    #[test]
-    fn compaction_role_round_trips_without_entering_tier_file() {
-        let tmp = TempDir::new().unwrap();
-        let tiers_path = tmp.path().join(TIERS_FILE);
-        let roles_path = tmp.path().join(ROLES_FILE);
-        let mut overrides = BTreeMap::new();
-        overrides.insert(ModelTier::Strong, "openai/gpt-5.4".into());
-
-        write_overrides(&tiers_path, &overrides);
-        write_roles(
-            &roles_path,
-            &RolesFile {
-                goal_evaluator: None,
-                compaction: Some(CompactionTarget::Model("openai/gpt-5.4-mini".into())),
-            },
-        );
-
-        assert!(
-            !std::fs::read_to_string(tiers_path)
-                .unwrap()
-                .contains("compaction")
-        );
-        assert_eq!(
-            read_roles(&roles_path).compaction,
-            Some(CompactionTarget::Model("openai/gpt-5.4-mini".into()))
-        );
-    }
-
-    #[test]
-    fn legacy_compaction_tier_migrates_unless_role_was_reset() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-        std::fs::write(
-            tmp.path().join(TIERS_FILE),
-            r#"{"strong":"openai/gpt-5.4","compaction":"openai/gpt-5.4-mini"}"#,
-        )
-        .unwrap();
-
-        let (overrides, roles, had_legacy_compaction) = read_state(&dir);
-        assert!(had_legacy_compaction);
-        assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides[&ModelTier::Strong], "openai/gpt-5.4");
-        assert_eq!(
-            roles.compaction,
-            Some(CompactionTarget::Model("openai/gpt-5.4-mini".into()))
-        );
-
-        write_roles(
-            &tmp.path().join(ROLES_FILE),
-            &RolesFile {
-                goal_evaluator: None,
-                compaction: Some(CompactionTarget::Auto),
-            },
-        );
-        assert_eq!(read_state(&dir).1.compaction, Some(CompactionTarget::Auto));
-    }
-
-    #[test]
-    fn persistence_handles_missing_or_invalid_input() {
-        let tmp = TempDir::new().unwrap();
-        assert!(read_overrides(&tmp.path().join("does-not-exist")).is_empty());
-
-        for bad in [
-            b"".as_slice(),
-            b"   \n".as_slice(),
-            b"not json at all".as_slice(),
-        ] {
-            let path = tmp.path().join(TIERS_FILE);
-            std::fs::write(&path, bad).unwrap();
-            assert!(read_overrides(&path).is_empty());
-        }
+        let roles = read_roles(&dir);
+        assert!(roles.goal_evaluator.is_none());
+        assert!(roles.compaction.is_none());
     }
 
     #[test]
@@ -823,49 +668,5 @@ mod tests {
     fn has_override_returns_false_for_no_override() {
         let reg = make_map(&[], &[]);
         assert!(!reg.has_override("ollama/a", ModelTier::Strong));
-    }
-
-    #[test]
-    fn backwards_compat_reads_legacy_format() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(TIERS_FILE);
-        let legacy = r#"{"ollama/a": "strong", "ollama/b": "strong", "ollama/c": "weak"}"#;
-        std::fs::write(&path, legacy).unwrap();
-
-        let loaded = read_overrides(&path);
-        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/b");
-        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/c");
-    }
-
-    #[test]
-    fn backwards_compat_extracts_compaction_from_legacy_spec_keyed_format() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(TIERS_FILE);
-        std::fs::write(
-            &path,
-            r#"{"ollama/compact":"compaction","ollama/strong":"strong"}"#,
-        )
-        .unwrap();
-
-        let loaded = read_persisted_overrides(&path);
-        assert_eq!(loaded.presets[&ModelTier::Strong], "ollama/strong");
-        assert_eq!(loaded.legacy_compaction.as_deref(), Some("ollama/compact"));
-    }
-
-    #[test]
-    fn write_then_read_preserves_multi_tier_assignment() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(TIERS_FILE);
-
-        let mut m = BTreeMap::new();
-        m.insert(ModelTier::Strong, "ollama/qwen3".into());
-        m.insert(ModelTier::Medium, "ollama/qwen3".into());
-        m.insert(ModelTier::Weak, "ollama/qwen3:8b".into());
-        write_overrides(&path, &m);
-
-        let loaded = read_overrides(&path);
-        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
     }
 }

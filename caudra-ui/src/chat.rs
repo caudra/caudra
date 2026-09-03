@@ -191,6 +191,10 @@ impl Chat {
         self.finish.map(|(outcome, _)| outcome).into()
     }
 
+    pub(crate) fn task_outcome(&self) -> Option<TaskOutcome> {
+        self.finish.map(|(outcome, _)| outcome)
+    }
+
     pub(crate) fn resume(&mut self) {
         self.flush();
         if let Some((_, bubble)) = self.finish.take() {
@@ -1224,6 +1228,7 @@ mod tests {
 
     fn end(chat: &mut Chat, outcome: TaskOutcome) {
         let text = match outcome {
+            TaskOutcome::Killed => CANCELLED_TEXT,
             TaskOutcome::Error => ERROR_TEXT,
             TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
         };
@@ -2125,6 +2130,7 @@ mod tests {
     /// Every order two endings can arrive in. Only the placeholder gives way,
     /// a verdict is never walked back, and no order grows a second bubble.
     #[test_case(TaskOutcome::Unknown, TaskOutcome::Done, DONE_TEXT, DisplayRole::Done, TaskStatus::Done   ; "placeholder_settles_as_done")]
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Killed, CANCELLED_TEXT, DisplayRole::Error, TaskStatus::Error ; "placeholder_corrected_to_killed")]
     #[test_case(TaskOutcome::Unknown, TaskOutcome::Error, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error ; "placeholder_corrected_to_error")]
     #[test_case(TaskOutcome::Done, TaskOutcome::Error, DONE_TEXT, DisplayRole::Done, TaskStatus::Done     ; "verdict_survives_late_error")]
     #[test_case(TaskOutcome::Error, TaskOutcome::Done, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error  ; "verdict_survives_late_done")]

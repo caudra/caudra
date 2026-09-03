@@ -15,6 +15,7 @@ use crate::setup;
 pub fn run(
     model_arg: Option<String>,
     yolo: bool,
+    ephemeral: bool,
     no_plugins: bool,
     no_jit: bool,
     profile_arg: Option<String>,
@@ -43,6 +44,8 @@ pub fn run(
         config.permissions.yolo = true;
     }
     config.validate()?;
+    let (storage, _ephemeral_root) =
+        super::run_storage(storage, ephemeral || config.storage.ephemeral)?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 

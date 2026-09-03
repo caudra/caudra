@@ -9,12 +9,21 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use caudra_storage::StateDir;
+use caudra_storage::{EphemeralRoot, StateDir};
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
+
+fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Option<EphemeralRoot>)> {
+    if !ephemeral {
+        return Ok((persistent, None));
+    }
+    let (storage, root) =
+        StateDir::activate_ephemeral(persistent).context("create ephemeral state directory")?;
+    Ok((storage, Some(root)))
+}
 
 /// One choke point for every native tool, so a new entry point cannot boot
 /// with half the built-ins missing. Workcell owns the file, web, shell, and
@@ -95,6 +104,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             acp::run(
                 model,
                 yolo,
+                cli.ephemeral,
                 cli.no_plugins,
                 cli.no_jit,
                 cli.system_prompt_profile,
@@ -103,7 +113,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
         },
-        Some(Command::Storage { action }) => storage::run(action)?,
+        Some(Command::Storage { action }) => {
+            storage::run(action, cli.no_plugins, cli.no_jit)?;
+        }
         Some(Command::Prompt {
             variant,
             plan,

@@ -1,27 +1,34 @@
-use std::fs;
+//! The theme picked from `/theme`, as a global state row.
 
 use tracing::warn;
 
-use crate::StateDir;
+use crate::state::{self, SCOPE_GLOBAL, StateKey};
+use crate::{StateClass, StateDir};
 
-const THEME_FILE: &str = "theme";
-
+const THEME: StateKey = StateKey {
+    name: "ui.theme",
+    class: StateClass::Persistent,
+};
 pub fn persist_theme_name(dir: &StateDir, name: &str) {
-    if let Err(e) = fs::write(dir.path().join(THEME_FILE), name) {
-        warn!(error = %e, "failed to persist theme name");
+    if let Err(error) = state::set(dir, SCOPE_GLOBAL, THEME, &name) {
+        warn!(%error, "failed to persist theme name");
     }
 }
 
 pub fn read_theme_name(dir: &StateDir) -> Option<String> {
-    let name = fs::read_to_string(dir.path().join(THEME_FILE)).ok()?;
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_owned())
+    state::get::<String>(dir, SCOPE_GLOBAL, THEME)
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to read theme name");
+            None
+        })
+        .filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn theme_persistence_round_trip() {
@@ -32,8 +39,5 @@ mod tests {
 
         persist_theme_name(&dir, "gruvbox");
         assert_eq!(read_theme_name(&dir).as_deref(), Some("gruvbox"));
-
-        fs::write(dir.path().join(THEME_FILE), "  \n").unwrap();
-        assert!(read_theme_name(&dir).is_none());
     }
 }

@@ -23,7 +23,7 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -37,16 +37,17 @@ use rusqlite::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tracing::warn;
 
+use super::lease::SessionLease;
 use super::{
-    SESSION_VERSION, Session, SessionError, SessionSummary, StoredSubagent, StoredSubagentTaskSpec,
-    StoredTokenUsage, next_epoch,
+    SESSION_VERSION, Session, SessionError, SessionSummary, StoredSubagent, StoredSubagentOutcome,
+    StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
 };
 use crate::id::CaudraId;
-use crate::tool_outputs::delete_session_outputs;
+use crate::retention::SessionFacts;
+use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::{
     StateDir, StorageError, atomic_write_permissions, exclusive_state_lock, lock_session_artifacts,
     shared_existing_state_lock, shared_state_lock,
@@ -57,7 +58,9 @@ pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 const SESSIONS_DB_MIGRATION_FILE: &str = "sessions.sqlite3.migrating";
 const SESSIONS_DB_CUTOVER_PENDING_FILE: &str = "sessions.sqlite3.cutover-pending";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 1;
+const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
+const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1000;
@@ -72,9 +75,16 @@ const MAX_DECODED_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
 const MAX_EAGER_LOAD_BYTES: usize = 512 * 1024 * 1024;
 const OWNER_FILE_MODE: u32 = 0o600;
-const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
+pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
+const ARTIFACT_CLEANUP_KINDS: [&str; 3] = ["tool_output", "archive", "snapshot"];
+const STATE_SCOPE_GLOBAL: &str = "global";
+/// Rich tool output rows at or below this size survive a trim so old
+/// transcripts keep their todo panels and other small structured records.
+const TRIM_KEEP_OUTPUT_BYTES: i64 = 4096;
+const SESSION_OPEN_ELSEWHERE: &str = "session is open in another Caudra instance";
+const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
 
 // This schema stores canonical state only. Adding any second durable
 // representation requires bounded retention and explicit recovery semantics.
@@ -93,11 +103,22 @@ CREATE TABLE sessions (
     tool_output_count    INTEGER NOT NULL DEFAULT 0,
     subagent_item_count  INTEGER NOT NULL DEFAULT 0,
     token_usage          TEXT NOT NULL CHECK(json_valid(token_usage)),
-    metadata             TEXT NOT NULL CHECK(json_valid(metadata))
+    metadata             TEXT NOT NULL CHECK(json_valid(metadata)),
+    last_opened_at       INTEGER,
+    pinned               INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
+    trimmed_at           INTEGER
 ) STRICT;
 
 CREATE INDEX sessions_cwd_updated
     ON sessions(cwd, updated_at DESC, id DESC);
+
+CREATE TABLE state (
+    scope      TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL CHECK(json_valid(value)),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(scope, key)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE main_history_items (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -142,6 +163,7 @@ CREATE TABLE subagents (
     root_tool_use_id   TEXT,
     name               TEXT NOT NULL,
     model              TEXT,
+    outcome            TEXT CHECK(outcome IS NULL OR outcome IN ('unknown', 'done', 'killed', 'error')),
     PRIMARY KEY(session_id, ordinal),
     UNIQUE(session_id, tool_use_id)
 ) STRICT, WITHOUT ROWID;
@@ -157,16 +179,10 @@ CREATE TABLE model_usage (
     PRIMARY KEY(session_id, model)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE legacy_imports (
-    session_id     BLOB PRIMARY KEY CHECK(length(session_id) = 16),
-    source_path    TEXT,
-    source_size    INTEGER,
-    source_mtime   INTEGER,
-    source_digest  BLOB,
-    status         TEXT NOT NULL CHECK(status IN ('imported', 'deleted', 'recreated')),
-    deleted_version INTEGER,
-    imported_at    INTEGER
-) STRICT;
+CREATE TABLE session_tombstones (
+    session_id      BLOB PRIMARY KEY CHECK(length(session_id) = 16),
+    deleted_version INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE cleanup_jobs (
     id              INTEGER PRIMARY KEY,
@@ -202,6 +218,19 @@ pub struct SessionCursor {
     task_spec_bytes: usize,
 }
 
+#[derive(Debug)]
+pub struct SessionRecreation {
+    session_id: CaudraId,
+    deleted_write_version: i64,
+    removed_existing: bool,
+}
+
+impl SessionRecreation {
+    pub(super) fn removed_existing(&self) -> bool {
+        self.removed_existing
+    }
+}
+
 pub struct SessionDatabase {
     connection: Connection,
     state_dir: StateDir,
@@ -233,17 +262,41 @@ pub struct SessionStorageStats {
     pub auto_vacuum: i64,
     pub schema_version: i64,
     pub session_count: u64,
+    pub pinned_count: u64,
+    pub trimmed_count: u64,
     pub history_item_count: u64,
     pub tool_output_count: u64,
     pub subagent_item_count: u64,
     pub logical_bytes: u64,
+    pub tool_output_file_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub archive_bytes: u64,
+    pub pending_cleanup_jobs: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+/// What one trim released. Row bytes are exact; artifact bytes are measured
+/// before deletion and describe files the cleanup jobs then remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TrimReport {
+    pub tool_output_rows: u64,
+    pub tool_output_row_bytes: u64,
+    pub artifact_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CheckpointResult {
     pub busy: u64,
     pub log_frames: u64,
     pub checkpointed_frames: u64,
+}
+
+/// Why a cleanup job may run. `Stale` means the session was written after
+/// its trim or was recreated, so the job must be dropped rather than run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupGuard {
+    Deleted,
+    Trimmed,
+    Stale,
 }
 
 struct SerializedRoot {
@@ -317,6 +370,24 @@ impl SessionDatabase {
         Ok(database)
     }
 
+    /// Opens the repository for `state` table work only. Skips artifact
+    /// cleanup and archive reconciliation so a preference read never does
+    /// filesystem maintenance on the caller's thread.
+    pub fn open_state(state_dir: &StateDir) -> Result<Self, SessionError> {
+        reject_retired_state_dir(state_dir)?;
+        let migration_lock = shared_state_lock(
+            &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
+            OWNER_FILE_MODE,
+        )?;
+        reject_retired_state_dir(state_dir)?;
+        let connection = open_writable_connection(state_dir)?;
+        Ok(Self {
+            connection,
+            state_dir: state_dir.clone(),
+            _migration_lock: migration_lock,
+        })
+    }
+
     pub fn migrate(source: &StateDir, target: &StateDir) -> Result<SessionMigration, SessionError> {
         reject_retired_state_dir(source)?;
         // Every repository holds its shared lock for the connection lifetime.
@@ -339,9 +410,8 @@ impl SessionDatabase {
             fs::remove_file(&pending_path).map_err(StorageError::from)?;
         }
         remove_database_files(&temporary_path)?;
-        // A target database can contain rows or tombstones that shadow legacy
-        // sources copied below the CLI layer. Refuse the whole cutover rather
-        // than silently choosing either history generation.
+        // A target database can contain canonical rows or tombstones. Refuse
+        // the whole cutover rather than silently replacing either generation.
         if target_path.exists() {
             return Err(StorageError::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -440,8 +510,8 @@ impl SessionDatabase {
             ))
             .into());
         }
-        // Inspection must not create files, change journal mode, or trigger
-        // migrations. Normal writable initialization creates this lock file.
+        // Inspection must not create files, change journal mode, or initialize
+        // a schema. Normal writable initialization creates this lock file.
         let migration_lock =
             shared_existing_state_lock(&state_dir.path().join(SESSIONS_DB_LOCK_FILE))?;
         let connection = Connection::open_with_flags(
@@ -452,6 +522,7 @@ impl SessionDatabase {
         )?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
+        verify_current_schema(&connection)?;
         connection.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")?;
         Ok(Self {
             connection,
@@ -476,12 +547,16 @@ impl SessionDatabase {
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
         let (
             session_count,
+            pinned_count,
+            trimmed_count,
             history_item_count,
             tool_output_count,
             subagent_item_count,
             logical_bytes,
         ) = self.connection.query_row(
-            "SELECT count(*), coalesce(sum(history_item_count), 0),\
+            "SELECT count(*), coalesce(sum(pinned), 0),\
+                    coalesce(sum(trimmed_at IS NOT NULL AND trimmed_at >= updated_at), 0),\
+                    coalesce(sum(history_item_count), 0),\
                     coalesce(sum(tool_output_count), 0),\
                     coalesce(sum(subagent_item_count), 0),\
                     coalesce(sum(logical_bytes), 0) FROM sessions",
@@ -493,9 +568,15 @@ impl SessionDatabase {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )?;
+        let pending_cleanup_jobs: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))?;
+        let state_path = self.state_dir.path();
         Ok(SessionStorageStats {
             database_bytes,
             wal_bytes,
@@ -506,11 +587,280 @@ impl SessionDatabase {
             auto_vacuum,
             schema_version,
             session_count: from_i64(session_count, "session count")?,
+            pinned_count: from_i64(pinned_count, "pinned count")?,
+            trimmed_count: from_i64(trimmed_count, "trimmed count")?,
             history_item_count: from_i64(history_item_count, "history item count")?,
             tool_output_count: from_i64(tool_output_count, "tool output count")?,
             subagent_item_count: from_i64(subagent_item_count, "subagent item count")?,
             logical_bytes: from_i64(logical_bytes, "logical bytes")?,
+            tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
+            snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR)),
+            archive_bytes: directory_bytes(
+                &state_path
+                    .join(super::SESSIONS_DIR)
+                    .join(super::ARCHIVE_DIR),
+            ),
+            pending_cleanup_jobs: from_i64(pending_cleanup_jobs, "pending cleanup jobs")?,
         })
+    }
+
+    /// Records that a session was opened without touching `updated_at` or
+    /// `write_version`, so list order and in-flight delta saves are unaffected.
+    pub fn mark_opened(&self, id: CaudraId) -> Result<(), SessionError> {
+        self.connection.execute(
+            "UPDATE sessions SET last_opened_at = unixepoch() WHERE id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, id: CaudraId, pinned: bool) -> Result<(), SessionError> {
+        let changed = self.connection.execute(
+            "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+            params![id.as_bytes().as_slice(), i64::from(pinned)],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()).into());
+        }
+        Ok(())
+    }
+
+    /// Scalar facts for every session, or for one working directory. Payload
+    /// tables are never joined to plan retention.
+    pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
+                    logical_bytes, json_extract(metadata, '$.pending_revert') IS NOT NULL \
+             FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
+             ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
+        )?;
+        let mut rows = statement.query(params![cwd])?;
+        let mut facts = Vec::new();
+        while let Some(row) = rows.next()? {
+            facts.push(SessionFacts {
+                id: id_from_row(row, 0)?,
+                title: row.get(1)?,
+                cwd: row.get(2)?,
+                created_at: from_i64(row.get(3)?, "sessions.created_at")?,
+                updated_at: from_i64(row.get(4)?, "sessions.updated_at")?,
+                last_opened_at: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| from_i64(value, "sessions.last_opened_at"))
+                    .transpose()?,
+                pinned: row.get::<_, i64>(6)? != 0,
+                trimmed_at: row
+                    .get::<_, Option<i64>>(7)?
+                    .map(|value| from_i64(value, "sessions.trimmed_at"))
+                    .transpose()?,
+                logical_bytes: from_i64(row.get(8)?, "sessions.logical_bytes")?,
+                pending_revert: row.get::<_, i64>(9)? != 0,
+            });
+        }
+        Ok(facts)
+    }
+
+    /// Demotes a session to the transcript tier. The lease proves nobody has
+    /// the session open, so the counters this rewrites cannot race a writer.
+    pub fn trim(&mut self, lease: &SessionLease) -> Result<TrimReport, SessionError> {
+        let id = lease.id();
+        lease.validate(&self.state_dir, id)?;
+        let artifact_bytes = self.artifact_bytes(id);
+        let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let root = root_on(&transaction, id)?;
+        let (rows, bytes) = transaction.query_row(
+            "SELECT count(*), coalesce(sum(byte_count), 0) FROM tool_outputs \
+             WHERE session_id = ?1 AND byte_count > ?2",
+            params![id.as_bytes().as_slice(), TRIM_KEEP_OUTPUT_BYTES],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        transaction.execute(
+            "DELETE FROM tool_outputs WHERE session_id = ?1 AND byte_count > ?2",
+            params![id.as_bytes().as_slice(), TRIM_KEEP_OUTPUT_BYTES],
+        )?;
+        let removed_rows = from_i64_usize(rows, "trimmed tool output rows")?;
+        let removed_bytes = from_i64_usize(bytes, "trimmed tool output bytes")?;
+        let tool_output_count = root.tool_output_count.checked_sub(removed_rows);
+        let logical_bytes = root.logical_bytes.checked_sub(removed_bytes);
+        let (Some(tool_output_count), Some(logical_bytes)) = (tool_output_count, logical_bytes)
+        else {
+            return Err(SessionError::CorruptDatabaseValue {
+                field: "sessions.tool_output_count",
+                reason: "trim removed more than the root row accounts for".into(),
+            });
+        };
+        transaction.execute(
+            "UPDATE sessions SET tool_output_count = ?2, logical_bytes = ?3,\
+                 trimmed_at = unixepoch(), write_version = write_version + 1 \
+             WHERE id = ?1 AND write_version = ?4",
+            params![
+                id.as_bytes().as_slice(),
+                to_i64(tool_output_count, "tool output count")?,
+                to_i64(logical_bytes, "logical_bytes")?,
+                root.write_version,
+            ],
+        )?;
+        enqueue_cleanup_jobs(&transaction, id)?;
+        transaction.commit()?;
+        drop(_artifact_lock);
+        // The lease is still held, so the jobs run now instead of waiting
+        // for the next repository open.
+        for kind in ARTIFACT_CLEANUP_KINDS {
+            self.run_cleanup_job(id, kind)?;
+        }
+        Ok(TrimReport {
+            tool_output_rows: from_i64(rows, "trimmed tool output rows")?,
+            tool_output_row_bytes: from_i64(bytes, "trimmed tool output bytes")?,
+            artifact_bytes,
+        })
+    }
+
+    /// Bytes under every external artifact directory of one session.
+    pub fn artifact_bytes(&self, id: CaudraId) -> u64 {
+        let state_path = self.state_dir.path();
+        let name = id.to_string();
+        [
+            state_path.join(TOOL_OUTPUT_DIR).join(&name),
+            state_path.join(SESSION_SNAPSHOT_DIR).join(&name),
+            state_path
+                .join(super::SESSIONS_DIR)
+                .join(super::ARCHIVE_DIR)
+                .join(&name),
+        ]
+        .iter()
+        .map(|path| directory_bytes(path))
+        .sum()
+    }
+
+    pub fn state_get<T: DeserializeOwned>(
+        &self,
+        scope: &str,
+        key: &str,
+    ) -> Result<Option<T>, SessionError> {
+        self.connection
+            .query_row(
+                "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| deserialize_json(&value, "state value"))
+            .transpose()
+    }
+
+    pub fn state_set<T: Serialize>(
+        &self,
+        scope: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<(), SessionError> {
+        let value = serialize_json(value, "state value", MAX_METADATA_BYTES)?;
+        self.connection.execute(
+            "INSERT INTO state (scope, key, value, updated_at) \
+             VALUES (?1, ?2, ?3, unixepoch()) \
+             ON CONFLICT(scope, key) DO UPDATE SET \
+                 value = excluded.value, updated_at = excluded.updated_at",
+            params![scope, key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn state_delete(&self, scope: &str, key: &str) -> Result<bool, SessionError> {
+        Ok(self.connection.execute(
+            "DELETE FROM state WHERE scope = ?1 AND key = ?2",
+            params![scope, key],
+        )? != 0)
+    }
+
+    /// Read-modify-write under one write transaction, so two processes
+    /// updating the same value cannot lose each other's change. A missing
+    /// row starts from `T::default()`.
+    pub fn state_update<T, R>(
+        &mut self,
+        scope: &str,
+        key: &str,
+        update: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, SessionError>
+    where
+        T: DeserializeOwned + Serialize + Default,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut value: T = transaction
+            .query_row(
+                "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| deserialize_json(&value, "state value"))
+            .transpose()?
+            .unwrap_or_default();
+        let result = update(&mut value);
+        let value = serialize_json(&value, "state value", MAX_METADATA_BYTES)?;
+        transaction.execute(
+            "INSERT INTO state (scope, key, value, updated_at) \
+             VALUES (?1, ?2, ?3, unixepoch()) \
+             ON CONFLICT(scope, key) DO UPDATE SET \
+                 value = excluded.value, updated_at = excluded.updated_at",
+            params![scope, key, value],
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Like [`Self::state_update`], but leaves the row untouched when the
+    /// domain-specific update rejects its current or proposed value.
+    pub fn state_try_update<T, R, E>(
+        &mut self,
+        scope: &str,
+        key: &str,
+        update: impl FnOnce(&mut T) -> Result<R, E>,
+    ) -> Result<Result<R, E>, SessionError>
+    where
+        T: DeserializeOwned + Serialize + Default,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut value: T = transaction
+            .query_row(
+                "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| deserialize_json(&value, "state value"))
+            .transpose()?
+            .unwrap_or_default();
+        let result = match update(&mut value) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        let value = serialize_json(&value, "state value", MAX_METADATA_BYTES)?;
+        transaction.execute(
+            "INSERT INTO state (scope, key, value, updated_at) \
+             VALUES (?1, ?2, ?3, unixepoch()) \
+             ON CONFLICT(scope, key) DO UPDATE SET \
+                 value = excluded.value, updated_at = excluded.updated_at",
+            params![scope, key, value],
+        )?;
+        transaction.commit()?;
+        Ok(Ok(result))
+    }
+
+    pub fn global_state_get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, SessionError> {
+        self.state_get(STATE_SCOPE_GLOBAL, key)
+    }
+
+    pub fn global_state_set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), SessionError> {
+        self.state_set(STATE_SCOPE_GLOBAL, key, value)
     }
 
     pub fn checkpoint(&self, truncate: bool) -> Result<CheckpointResult, SessionError> {
@@ -533,12 +883,33 @@ impl SessionDatabase {
         })
     }
 
-    pub fn incremental_vacuum(&self, pages: u32) -> Result<(), SessionError> {
-        // Reclaim only a caller-bounded page count. Full VACUUM is never an
-        // automatic startup or write-path operation.
-        self.connection
-            .execute_batch(&format!("PRAGMA incremental_vacuum({pages})"))?;
-        Ok(())
+    /// Reclaims up to `pages` freelist pages. Full VACUUM is never an
+    /// automatic startup or write-path operation. Returns the pages freed.
+    pub fn incremental_vacuum(&self, pages: u32) -> Result<u64, SessionError> {
+        // The pragma yields one row per freed page, so it must be stepped to
+        // completion; a single step frees exactly one page.
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
+        let mut rows = statement.query([])?;
+        let mut freed = 0;
+        while rows.next()?.is_some() {
+            freed += 1;
+        }
+        Ok(freed)
+    }
+
+    pub fn freelist_pages(&self) -> Result<u64, SessionError> {
+        pragma_u64(&self.connection, "freelist_count")
+    }
+
+    pub fn due_cleanup_jobs(&self) -> Result<u64, SessionError> {
+        let due: i64 = self.connection.query_row(
+            "SELECT count(*) FROM cleanup_jobs WHERE next_attempt_ms <= unixepoch('subsec') * 1000",
+            [],
+            |row| row.get(0),
+        )?;
+        from_i64(due, "due cleanup jobs")
     }
 
     pub fn quick_check(&self) -> Result<(), SessionError> {
@@ -591,38 +962,26 @@ impl SessionDatabase {
         {
             return self.save_delta(session, cursor);
         }
-        self.save_full(session, None, cursor.map(SessionCursor::write_version))
-    }
-
-    pub fn import_legacy<M, U, T>(
-        &mut self,
-        source: &Path,
-        source_bytes: &[u8],
-        session: &Session<M, U, T>,
-    ) -> Result<SessionCursor, SessionError>
-    where
-        M: Serialize,
-        U: Serialize,
-        T: Serialize,
-    {
-        let source_info = LegacySource::capture(source, source_bytes)?;
-        // Legacy files are external rollback inputs. Recheck them immediately
-        // before SQLite work so filesystem traversal never extends the write
-        // transaction's global lock hold.
-        source_info.validate()?;
-        self.save_full(session, Some(source_info), None)
+        self.save_full(session, cursor.map(SessionCursor::write_version))
     }
 
     pub fn recreate<M, U, T>(
         &mut self,
         session: &Session<M, U, T>,
-        deleted_write_version: i64,
+        recreation: &SessionRecreation,
     ) -> Result<SessionCursor, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
     {
+        if recreation.session_id != session.id {
+            return Err(SessionError::IdMismatch {
+                log_id: recreation.session_id,
+                given_id: session.id,
+            });
+        }
+        let deleted_write_version = recreation.deleted_write_version;
         validate_scalars(session)?;
         let serialized = SerializedSession::new(session)?;
         // Cleanup performs slow filesystem work outside SQLite. This lock
@@ -638,8 +997,8 @@ impl SessionDatabase {
             Err(error) => return Err(error),
         }
         // Ordinary saves may never cross a tombstone. Only the writer that
-        // completed the ordered delete receives this explicit recreation value;
-        // advancing it prevents an old version from matching a new generation.
+        // completed the ordered delete receives the recreation token; advancing
+        // its version prevents an old generation from matching a new one.
         match deleted_version(&transaction, session.id)? {
             Some(actual) if actual == deleted_write_version => {}
             Some(actual) => {
@@ -653,7 +1012,7 @@ impl SessionDatabase {
         }
         let write_version = deleted_write_version.checked_add(1).ok_or_else(|| {
             SessionError::CorruptDatabaseValue {
-                field: "legacy_imports.deleted_version",
+                field: "session_tombstones.deleted_version",
                 reason: "write version overflow".into(),
             }
         })?;
@@ -664,8 +1023,7 @@ impl SessionDatabase {
         )?;
         insert_children(&transaction, session, &serialized)?;
         transaction.execute(
-            "UPDATE legacy_imports SET status = 'recreated', deleted_version = NULL \
-             WHERE session_id = ?1",
+            "DELETE FROM session_tombstones WHERE session_id = ?1",
             params![session.id.as_bytes().as_slice()],
         )?;
         transaction.execute(
@@ -761,7 +1119,7 @@ impl SessionDatabase {
         &mut self,
         id: CaudraId,
         expected_write_version: Option<i64>,
-    ) -> Result<i64, SessionError> {
+    ) -> Result<SessionRecreation, SessionError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -781,46 +1139,38 @@ impl SessionDatabase {
                 actual,
             });
         }
-        let removed = transaction.execute(
+        let removed_existing = actual.is_some();
+        let deleted_write_version = match (actual, deleted_version(&transaction, id)?) {
+            (Some(version), _) => version,
+            (None, None) if expected_write_version.is_none() => -1,
+            (None, _) => return Err(StorageError::NotFound(id.to_string()).into()),
+        };
+        transaction.execute(
             "DELETE FROM sessions WHERE id = ?1",
             params![id.as_bytes().as_slice()],
         )?;
-        // Idempotent retries preserve the original generation. Resetting an
-        // existing tombstone to -1 would let an old version zero match again.
-        let deleted_write_version = match actual {
-            Some(version) => version,
-            None => deleted_version(&transaction, id)?.unwrap_or(-1),
-        };
         transaction.execute(
-            "INSERT INTO legacy_imports \
-             (session_id, status, deleted_version, imported_at) \
-             VALUES (?1, 'deleted', ?2, unixepoch()) \
-             ON CONFLICT(session_id) DO UPDATE SET \
-                 status = 'deleted', deleted_version = excluded.deleted_version",
+            "INSERT INTO session_tombstones (session_id, deleted_version) \
+             VALUES (?1, ?2) \
+             ON CONFLICT(session_id) DO UPDATE SET deleted_version = excluded.deleted_version",
             params![id.as_bytes().as_slice(), deleted_write_version],
         )?;
         // Queue external work before commit so a crash can leak artifacts only
         // temporarily; a later repository open resumes these idempotent jobs.
-        for kind in ["tool_output", "archive", "snapshot"] {
-            transaction.execute(
-                "INSERT OR IGNORE INTO cleanup_jobs \
-                 (session_id, kind, next_attempt_ms) VALUES (?1, ?2, 0)",
-                params![id.as_bytes().as_slice(), kind],
-            )?;
-        }
+        enqueue_cleanup_jobs(&transaction, id)?;
         transaction.commit()?;
-        if removed == 0 {
-            return Err(StorageError::NotFound(id.to_string()).into());
-        }
-        Ok(actual.expect("deleted session had a write version"))
+        Ok(SessionRecreation {
+            session_id: id,
+            deleted_write_version,
+            removed_existing,
+        })
     }
 
     pub fn tombstone_version(&self, id: CaudraId) -> Result<Option<i64>, SessionError> {
         Ok(self
             .connection
             .query_row(
-                "SELECT deleted_version FROM legacy_imports \
-                 WHERE session_id = ?1 AND status = 'deleted'",
+                "SELECT deleted_version FROM session_tombstones WHERE session_id = ?1",
                 params![id.as_bytes().as_slice()],
                 |row| row.get(0),
             )
@@ -837,30 +1187,6 @@ impl SessionDatabase {
             ids.push(id_from_row(row, 0)?);
         }
         Ok(ids)
-    }
-
-    pub fn imported_session_ids(&self) -> Result<HashSet<CaudraId>, SessionError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT session_id FROM legacy_imports")?;
-        let mut rows = statement.query([])?;
-        let mut ids = HashSet::new();
-        while let Some(row) = rows.next()? {
-            ids.insert(id_from_row(row, 0)?);
-        }
-        Ok(ids)
-    }
-
-    pub fn was_imported(&self, id: CaudraId) -> Result<bool, SessionError> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT 1 FROM legacy_imports WHERE session_id = ?1",
-                params![id.as_bytes().as_slice()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
     }
 
     pub(crate) fn visit_payload_json(
@@ -896,7 +1222,8 @@ impl SessionDatabase {
         Ok(())
     }
 
-    pub(super) fn process_cleanup_jobs(&mut self) -> Result<(), SessionError> {
+    /// Runs every due cleanup job. Returns how many completed.
+    pub fn process_cleanup_jobs(&mut self) -> Result<u64, SessionError> {
         // Cleanup is durable work, not an event history: successful rows are
         // removed, while failures retain only bounded retry metadata.
         let jobs = {
@@ -911,71 +1238,97 @@ impl SessionDatabase {
             }
             jobs
         };
+        let mut completed = 0;
         for (id, kind) in jobs {
-            if !matches!(kind.as_str(), "tool_output" | "archive" | "snapshot") {
-                self.record_cleanup_failure(id, &kind, "unknown cleanup job kind")?;
+            if !ARTIFACT_CLEANUP_KINDS.contains(&kind.as_str()) {
+                self.record_cleanup_failure(id, &kind, UNKNOWN_CLEANUP_KIND)?;
                 continue;
             }
-            let _artifact_lock = match lock_session_artifacts(&self.state_dir) {
-                Ok(lock) => lock,
-                Err(error) => {
-                    self.record_cleanup_failure(id, &kind, &error.to_string())?;
-                    continue;
-                }
-            };
-            let active = self
-                .connection
-                .query_row(
-                    "SELECT 1 FROM cleanup_jobs AS job \
-                     JOIN legacy_imports AS legacy ON legacy.session_id = job.session_id \
-                     WHERE job.session_id = ?1 AND job.kind = ?2 AND legacy.status = 'deleted'",
-                    params![id.as_bytes().as_slice(), &kind],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !active {
-                continue;
+            match self.cleanup_guard(id, &kind)? {
+                CleanupGuard::Stale => self.remove_cleanup_job(id, &kind)?,
+                CleanupGuard::Deleted => completed += u64::from(self.run_cleanup_job(id, &kind)?),
+                // A trimmed session may be reopened at any time. Holding its
+                // lease during deletion keeps new artifacts out of harm's way,
+                // and the lease precedes the artifact lock as it does in trim.
+                CleanupGuard::Trimmed => match SessionLease::acquire(&self.state_dir, id) {
+                    Ok(_lease) => completed += u64::from(self.run_cleanup_job(id, &kind)?),
+                    Err(SessionError::SessionInUse { .. }) => {
+                        self.record_cleanup_failure(id, &kind, SESSION_OPEN_ELSEWHERE)?;
+                    }
+                    Err(error) => self.record_cleanup_failure(id, &kind, &error.to_string())?,
+                },
             }
-            // Recreation takes the same artifact lock. It therefore cannot
-            // publish a new generation between this tombstone check and the
-            // filesystem deletion, while unrelated SQLite writers stay free.
-            let cleanup = match kind.as_str() {
-                "tool_output" => delete_session_outputs(&self.state_dir, id),
-                "archive" => remove_state_directory(
-                    &self.state_dir,
-                    &[super::SESSIONS_DIR, super::ARCHIVE_DIR],
-                    id,
-                ),
-                "snapshot" => remove_state_directory(&self.state_dir, &[SESSION_SNAPSHOT_DIR], id),
-                _ => unreachable!("cleanup kind validated"),
-            };
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            match cleanup {
-                Ok(()) => {
-                    transaction.execute(
-                        "DELETE FROM cleanup_jobs WHERE session_id = ?1 AND kind = ?2",
-                        params![id.as_bytes().as_slice(), &kind],
-                    )?;
-                }
-                Err(error) => {
-                    transaction.execute(
-                        "UPDATE cleanup_jobs SET attempts = attempts + 1, last_error = ?3, \
-                         next_attempt_ms = unixepoch('subsec') * 1000 + ?4 \
-                         WHERE session_id = ?1 AND kind = ?2",
-                        params![
-                            id.as_bytes().as_slice(),
-                            &kind,
-                            error.to_string(),
-                            CLEANUP_RETRY_DELAY_MS
-                        ],
-                    )?;
-                }
-            }
-            transaction.commit()?;
         }
+        Ok(completed)
+    }
+
+    fn cleanup_guard(&self, id: CaudraId, kind: &str) -> Result<CleanupGuard, SessionError> {
+        let guard = self
+            .connection
+            .query_row(
+                "SELECT \
+                     EXISTS(SELECT 1 FROM session_tombstones \
+                            WHERE session_id = job.session_id),\
+                     EXISTS(SELECT 1 FROM sessions \
+                            WHERE id = job.session_id AND trimmed_at IS NOT NULL \
+                              AND trimmed_at >= updated_at) \
+                 FROM cleanup_jobs AS job WHERE job.session_id = ?1 AND job.kind = ?2",
+                params![id.as_bytes().as_slice(), kind],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        Ok(match guard {
+            Some((true, _)) => CleanupGuard::Deleted,
+            Some((false, true)) => CleanupGuard::Trimmed,
+            Some((false, false)) | None => CleanupGuard::Stale,
+        })
+    }
+
+    /// Deletes one session's artifact directory for `kind`. The caller holds
+    /// the session lease when the session still exists. Returns whether the
+    /// job completed.
+    fn run_cleanup_job(&mut self, id: CaudraId, kind: &str) -> Result<bool, SessionError> {
+        // Recreation takes the same artifact lock. It therefore cannot
+        // publish a new generation between this guard check and the
+        // filesystem deletion, while unrelated SQLite writers stay free.
+        let _artifact_lock = match lock_session_artifacts(&self.state_dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.record_cleanup_failure(id, kind, &error.to_string())?;
+                return Ok(false);
+            }
+        };
+        if matches!(self.cleanup_guard(id, kind)?, CleanupGuard::Stale) {
+            self.remove_cleanup_job(id, kind)?;
+            return Ok(false);
+        }
+        let cleanup = match kind {
+            "tool_output" => delete_session_outputs(&self.state_dir, id),
+            "archive" => remove_state_directory(
+                &self.state_dir,
+                &[super::SESSIONS_DIR, super::ARCHIVE_DIR],
+                id,
+            ),
+            "snapshot" => remove_state_directory(&self.state_dir, &[SESSION_SNAPSHOT_DIR], id),
+            _ => unreachable!("cleanup kind validated"),
+        };
+        match cleanup {
+            Ok(()) => {
+                self.remove_cleanup_job(id, kind)?;
+                Ok(true)
+            }
+            Err(error) => {
+                self.record_cleanup_failure(id, kind, &error.to_string())?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn remove_cleanup_job(&self, id: CaudraId, kind: &str) -> Result<(), SessionError> {
+        self.connection.execute(
+            "DELETE FROM cleanup_jobs WHERE session_id = ?1 AND kind = ?2",
+            params![id.as_bytes().as_slice(), kind],
+        )?;
         Ok(())
     }
 
@@ -1002,7 +1355,6 @@ impl SessionDatabase {
     fn save_full<M, U, T>(
         &mut self,
         session: &Session<M, U, T>,
-        source: Option<LegacySource>,
         expected_write_version: Option<i64>,
     ) -> Result<SessionCursor, SessionError>
     where
@@ -1049,25 +1401,6 @@ impl SessionDatabase {
             }
         };
         insert_children(&transaction, session, &serialized)?;
-        if let Some(source) = source {
-            transaction.execute(
-                "INSERT INTO legacy_imports \
-                  (session_id, source_path, source_size, source_mtime, source_digest, status, imported_at) \
-                  VALUES (?1, ?2, ?3, ?4, ?5, 'imported', unixepoch()) \
-                  ON CONFLICT(session_id) DO UPDATE SET \
-                     source_path = excluded.source_path, source_size = excluded.source_size,\
-                     source_mtime = excluded.source_mtime, source_digest = excluded.source_digest,\
-                     status = 'imported',\
-                     deleted_version = NULL, imported_at = excluded.imported_at",
-                params![
-                    session.id.as_bytes().as_slice(),
-                    &source.path,
-                    source.size,
-                    source.mtime,
-                    &source.digest,
-                ],
-            )?;
-        }
         if let Some(archive) = &archive {
             transaction.execute(
                 "INSERT INTO pending_archives \
@@ -1665,53 +1998,6 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
         )
 }
 
-struct LegacySource {
-    path: String,
-    size: i64,
-    mtime: i64,
-    digest: Vec<u8>,
-}
-
-impl LegacySource {
-    fn capture(path: &Path, expected: &[u8]) -> Result<Self, SessionError> {
-        let metadata = fs::metadata(path).map_err(StorageError::from)?;
-        let current = fs::read(path).map_err(StorageError::from)?;
-        let path = path.to_string_lossy().into_owned();
-        if current != expected {
-            return Err(SessionError::LegacySourceChanged { path });
-        }
-        Ok(Self {
-            path,
-            size: to_i64(metadata.len(), "legacy source size")?,
-            mtime: modified_millis(&metadata),
-            digest: Sha256::digest(expected).to_vec(),
-        })
-    }
-
-    fn validate(&self) -> Result<(), SessionError> {
-        let path = Path::new(&self.path);
-        let metadata = fs::metadata(path).map_err(StorageError::from)?;
-        let digest = Sha256::digest(fs::read(path).map_err(StorageError::from)?);
-        if to_i64(metadata.len(), "legacy source size")? != self.size
-            || modified_millis(&metadata) != self.mtime
-            || digest.as_slice() != self.digest
-        {
-            return Err(SessionError::LegacySourceChanged {
-                path: self.path.clone(),
-            });
-        }
-        Ok(())
-    }
-}
-
-fn modified_millis(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_millis() as i64)
-}
-
 impl SessionCursor {
     pub fn write_version(&self) -> i64 {
         self.write_version
@@ -1836,7 +2122,22 @@ fn create_owner_only(path: &Path) -> Result<(), SessionError> {
             ))
             .into());
         }
-        Ok(_) => return Ok(()),
+        Ok(metadata) => {
+            #[cfg(unix)]
+            if metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "session database {} must be owned by the current user and inaccessible to other users",
+                        path.display()
+                    ),
+                ))
+                .into());
+            }
+            return Ok(());
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(StorageError::from(error).into()),
     }
@@ -1904,7 +2205,7 @@ fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionE
     )?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-    initialize(&mut connection)?;
+    initialize(&mut connection, state_dir)?;
     configure(&connection)?;
     Ok(connection)
 }
@@ -1919,14 +2220,54 @@ fn open_migration_source_connection(state_dir: &StateDir) -> Result<Connection, 
     )?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
+    verify_current_schema(&connection)?;
+    Ok(connection)
+}
+
+fn verify_current_schema(connection: &Connection) -> Result<(), SessionError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
+    if version != SCHEMA_VERSION {
         return Err(SessionError::UnsupportedSchemaVersion {
             found: version,
             supported: SCHEMA_VERSION,
         });
     }
-    Ok(connection)
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if application_id != APPLICATION_ID {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: "PRAGMA application_id",
+            reason: format!(
+                "expected Caudra schema identity {APPLICATION_ID}, found {application_id}; reset required"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn verify_empty_database(connection: &Connection) -> Result<(), SessionError> {
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if application_id != 0 {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: "PRAGMA application_id",
+            reason: format!(
+                "expected 0 for an empty database, found {application_id}; reset required"
+            ),
+        });
+    }
+    let object_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if object_count != 0 {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: "sqlite_schema",
+            reason: "version 0 database is not empty; reset required".into(),
+        });
+    }
+    Ok(())
 }
 
 fn quick_check_on(connection: &Connection) -> Result<(), SessionError> {
@@ -2085,62 +2426,83 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn initialize(connection: &mut Connection) -> Result<(), SessionError> {
+fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), SessionError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
+    if version != 0 && version != SCHEMA_VERSION {
         return Err(SessionError::UnsupportedSchemaVersion {
             found: version,
             supported: SCHEMA_VERSION,
         });
     }
-    if version == 0 {
-        // These settings rewrite file layout only when set before schema
-        // creation. Existing NONE databases require an explicit full vacuum.
-        connection.pragma_update(None, "page_size", PAGE_SIZE)?;
-        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    if version == SCHEMA_VERSION {
+        return configure_current_schema(connection);
     }
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    // Database-level exclusion works across processes. Re-read under the lock
-    // so two initializers cannot apply the same migration concurrently.
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-    let locked_version: i64 =
-        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version == 0 {
-        transaction.execute_batch(SCHEMA)?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    } else if locked_version == 1 {
-        transaction.execute_batch(
-            "ALTER TABLE legacy_imports ADD COLUMN source_digest BLOB;\
-             CREATE TABLE pending_archives (\
-                 session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\
-                 expected_write_version INTEGER NOT NULL,\
-                 pending_name TEXT NOT NULL, byte_count INTEGER NOT NULL,\
-                 PRIMARY KEY(session_id, pending_name)\
-             ) STRICT, WITHOUT ROWID;",
-        )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    } else if locked_version == 2 {
-        transaction.execute_batch(
-            "CREATE TABLE pending_archives (\
-                 session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\
-                 expected_write_version INTEGER NOT NULL,\
-                 pending_name TEXT NOT NULL, byte_count INTEGER NOT NULL,\
-                 PRIMARY KEY(session_id, pending_name)\
-             ) STRICT, WITHOUT ROWID;",
-        )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    } else if locked_version > SCHEMA_VERSION {
+
+    // Caudra initializers serialize on the existing artifact lock, while the
+    // SQLite exclusive mode below also excludes non-cooperating connections.
+    let _initialization_lock = lock_session_artifacts(state_dir)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return configure_current_schema(connection);
+    }
+    if version != 0 {
         return Err(SessionError::UnsupportedSchemaVersion {
-            found: locked_version,
+            found: version,
             supported: SCHEMA_VERSION,
         });
     }
-    transaction.commit()?;
+
+    // Retain SQLite's exclusive file lock across the empty-header pragmas and
+    // schema transaction. This prevents a foreign version-zero database from
+    // appearing between validation and the first persistent setting.
+    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+    let locked_version = {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        let locked_version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if locked_version != 0 && locked_version != SCHEMA_VERSION {
+            return Err(SessionError::UnsupportedSchemaVersion {
+                found: locked_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if locked_version == 0 {
+            verify_empty_database(&transaction)?;
+        }
+        transaction.commit()?;
+        locked_version
+    };
+    if locked_version == 0 {
+        connection.pragma_update(None, "page_size", PAGE_SIZE)?;
+        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        // The validation read initialized the empty header, so persist the
+        // auto-vacuum pointer map before creating any tables.
+        connection.execute_batch("VACUUM")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        verify_empty_database(&transaction)?;
+        transaction.execute_batch(SCHEMA)?;
+        transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    }
+    connection.pragma_update(None, "locking_mode", "NORMAL")?;
+    configure_current_schema(connection)
+}
+
+fn configure_current_schema(connection: &Connection) -> Result<(), SessionError> {
+    // A current database needs no initialization lock; this keeps frequent state
+    // opens off the write lock.
+    verify_current_schema(connection)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    verify_auto_vacuum(connection)
+}
+
+fn verify_auto_vacuum(connection: &Connection) -> Result<(), SessionError> {
     let auto_vacuum: i64 = connection.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
-    if auto_vacuum != 2 {
+    if auto_vacuum != INCREMENTAL_AUTO_VACUUM {
         return Err(SessionError::CorruptDatabaseValue {
             field: "PRAGMA auto_vacuum",
-            reason: format!("expected 2, found {auto_vacuum}"),
+            reason: format!("expected {INCREMENTAL_AUTO_VACUUM}, found {auto_vacuum}"),
         });
     }
     Ok(())
@@ -2426,6 +2788,38 @@ fn update_root_values<M, U, T>(
     Ok(())
 }
 
+fn enqueue_cleanup_jobs(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), SessionError> {
+    for kind in ARTIFACT_CLEANUP_KINDS {
+        transaction.execute(
+            "INSERT INTO cleanup_jobs (session_id, kind, next_attempt_ms) VALUES (?1, ?2, 0) \
+             ON CONFLICT(session_id, kind) DO UPDATE SET next_attempt_ms = 0",
+            params![id.as_bytes().as_slice(), kind],
+        )?;
+    }
+    Ok(())
+}
+
+/// Total size of regular files below `path`, following no symlinks. Missing
+/// or unreadable entries count as zero because this feeds diagnostics only.
+pub(super) fn directory_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| directory_bytes(&entry.path()))
+        .sum()
+}
+
 fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), SessionError> {
     for table in [
         "main_history_items",
@@ -2445,7 +2839,7 @@ fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), Ses
 fn is_tombstoned(transaction: &Transaction<'_>, id: CaudraId) -> Result<bool, SessionError> {
     Ok(transaction
         .query_row(
-            "SELECT 1 FROM legacy_imports WHERE session_id = ?1 AND status = 'deleted'",
+            "SELECT 1 FROM session_tombstones WHERE session_id = ?1",
             params![id.as_bytes().as_slice()],
             |_| Ok(()),
         )
@@ -2459,8 +2853,7 @@ fn deleted_version(
 ) -> Result<Option<i64>, SessionError> {
     Ok(transaction
         .query_row(
-            "SELECT deleted_version FROM legacy_imports \
-             WHERE session_id = ?1 AND status = 'deleted'",
+            "SELECT deleted_version FROM session_tombstones WHERE session_id = ?1",
             params![id.as_bytes().as_slice()],
             |row| row.get(0),
         )
@@ -2583,8 +2976,9 @@ fn replace_auxiliary<M, U, T>(
     for (ordinal, subagent) in session.subagents.iter().enumerate() {
         transaction.execute(
             "INSERT INTO subagents (\
-                 session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name, model\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name, model,\
+                 outcome\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 session.id.as_bytes().as_slice(),
                 to_i64(ordinal, "subagent ordinal")?,
@@ -2593,6 +2987,7 @@ fn replace_auxiliary<M, U, T>(
                 subagent.root_tool_use_id,
                 subagent.name,
                 subagent.model,
+                subagent.outcome.storage_name(),
             ],
         )?;
     }
@@ -2675,18 +3070,29 @@ fn query_subagents(
     id: CaudraId,
 ) -> Result<Vec<StoredSubagent>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT tool_use_id, parent_tool_use_id, root_tool_use_id, name, model \
+        "SELECT tool_use_id, parent_tool_use_id, root_tool_use_id, name, model, outcome \
          FROM subagents WHERE session_id = ?1 ORDER BY ordinal",
     )?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
     let mut values = Vec::new();
     while let Some(row) = rows.next()? {
+        let stored_outcome: Option<String> = row.get(5)?;
+        let outcome = match stored_outcome {
+            None => StoredSubagentOutcome::Unknown,
+            Some(value) => StoredSubagentOutcome::from_storage_name(&value).ok_or_else(|| {
+                SessionError::CorruptDatabaseValue {
+                    field: "subagents.outcome",
+                    reason: value,
+                }
+            })?,
+        };
         values.push(StoredSubagent {
             tool_use_id: row.get(0)?,
             parent_tool_use_id: row.get(1)?,
             root_tool_use_id: row.get(2)?,
             name: row.get(3)?,
             model: row.get(4)?,
+            outcome,
         });
     }
     Ok(values)
@@ -2792,17 +3198,29 @@ fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, SessionError> 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Barrier;
 
+    use super::*;
+    use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use tempfile::TempDir;
-
-    use super::*;
-    use crate::sessions::{Session, TitleSource};
+    use test_case::test_case;
 
     const CWD: &str = "/project";
     const MODEL: &str = "test/model";
-    const TOOL_OUTPUT_DIR: &str = "tool-output";
+    const ARTIFACT_NAME: &str = "artifact";
+    const LARGE_OUTPUT_ID: &str = "large";
+    const FOREIGN_APPLICATION_ID: i64 = 1;
+    const INITIALIZER_COUNT: usize = 2;
+    const SMALL_OUTPUT_ID: &str = "small";
+    const TOMBSTONES_TABLE: &str = "session_tombstones";
+    const OLDER_SCHEMA_VERSION: i64 = -1;
+    const NEWER_SCHEMA_VERSION: i64 = SCHEMA_VERSION + 1;
+    const TRIM_KEEPS_SMALL: &str = "trim must keep rich outputs at or below the threshold";
+    const TRIM_DROPS_LARGE: &str = "trim must drop rich outputs above the threshold";
+    const ARTIFACTS_REMOVED: &str = "trim must remove every artifact directory";
+    const VERSION_UNCHANGED: &str = "mark_opened must not bump write_version";
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct TestMessage(String);
@@ -2819,6 +3237,17 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
         (temp, state_dir)
+    }
+
+    fn stored_subagent(id: &str, outcome: StoredSubagentOutcome) -> StoredSubagent {
+        StoredSubagent {
+            tool_use_id: id.into(),
+            parent_tool_use_id: Some(id.into()),
+            root_tool_use_id: Some(id.into()),
+            name: format!("task {id}"),
+            model: Some(MODEL.into()),
+            outcome,
+        }
     }
 
     #[test]
@@ -2844,6 +3273,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn subagent_outcomes_round_trip() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        let subagents = vec![
+            stored_subagent("unknown", StoredSubagentOutcome::Unknown),
+            stored_subagent("done", StoredSubagentOutcome::Done),
+            stored_subagent("killed", StoredSubagentOutcome::Killed),
+            stored_subagent("error", StoredSubagentOutcome::Error),
+        ];
+        session.set_subagents(subagents.clone());
+
+        database.save(&session, None).unwrap();
+
+        let mut statement = database
+            .connection
+            .prepare("SELECT outcome FROM subagents ORDER BY ordinal")
+            .unwrap();
+        let stored = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            ["unknown", "done", "killed", "error"].map(|outcome| Some(outcome.to_owned()))
+        );
+        drop(statement);
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(loaded.subagents(), subagents);
     }
 
     #[test]
@@ -2949,7 +3413,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_tombstone_prevents_legacy_resurrection() {
+    fn state_dir_apis_ignore_jsonl_sessions() {
         let (_temp, state_dir) = state_dir();
         let sessions_dir = state_dir.ensure_subdir(super::super::SESSIONS_DIR).unwrap();
         let mut session = TestSession::new(MODEL, CWD);
@@ -2957,12 +3421,6 @@ mod tests {
         session.save_to(&sessions_dir).unwrap();
         let source = sessions_dir.join(format!("{}.jsonl", session.id));
 
-        let error = TestSession::delete(session.id, &state_dir).unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
         assert!(source.exists());
         assert!(matches!(
             TestSession::load(session.id, &state_dir),
@@ -2981,7 +3439,7 @@ mod tests {
         let mut stale = database
             .load::<TestMessage, Value, Value>(session.id)
             .unwrap();
-        let deleted_version = database.delete(session.id, Some(0)).unwrap();
+        let recreation = database.delete(session.id, Some(0)).unwrap();
         assert!(matches!(
             database.delete(session.id, None),
             Err(SessionError::Storage(StorageError::NotFound(_)))
@@ -2996,7 +3454,7 @@ mod tests {
             SessionError::Storage(StorageError::NotFound(_))
         ));
         let older_generation = stale.clone();
-        let recreated_cursor = database.recreate(&stale, deleted_version).unwrap();
+        let recreated_cursor = database.recreate(&stale, &recreation).unwrap();
         assert_eq!(
             database
                 .load::<TestMessage, Value, Value>(session.id)
@@ -3234,41 +3692,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_import_rejects_changed_source() {
-        let (_temp, state_dir) = state_dir();
-        let sessions_dir = state_dir.ensure_subdir(super::super::SESSIONS_DIR).unwrap();
-        let mut session = TestSession::new(MODEL, CWD);
-        session.push_message(TestMessage("legacy".into()));
-        session.save_to(&sessions_dir).unwrap();
-        let source = sessions_dir.join(format!("{}.jsonl", session.id));
-        let original = fs::read(&source).unwrap();
-        fs::write(&source, [original.as_slice(), b"\n"].concat()).unwrap();
-        let mut database = SessionDatabase::open(&state_dir).unwrap();
-
-        let error = database
-            .import_legacy(&source, &original, &session)
-            .unwrap_err();
-
-        assert!(matches!(error, SessionError::LegacySourceChanged { .. }));
-        assert!(database.persisted_session_ids().unwrap().is_empty());
-    }
-
-    #[test]
-    fn legacy_enumeration_error_does_not_report_an_empty_live_set() {
-        let (_temp, state_dir) = state_dir();
-        fs::create_dir_all(state_dir.path()).unwrap();
-        fs::write(
-            state_dir.path().join(super::super::SESSIONS_DIR),
-            b"not a directory",
-        )
-        .unwrap();
-
-        let error = super::super::persisted_session_ids(&state_dir).unwrap_err();
-
-        assert!(matches!(error, SessionError::Storage(StorageError::Io(_))));
-    }
-
-    #[test]
     fn database_migration_backs_up_wal_state() {
         let temp = TempDir::new().unwrap();
         let source = StateDir::from_path(temp.path().join("source"));
@@ -3323,7 +3746,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_only_migration_rejects_existing_target_database() {
+    fn database_migration_rejects_an_incompatible_v1_source() {
+        let temp = TempDir::new().unwrap();
+        let source = StateDir::from_path(temp.path().join("source"));
+        let target = StateDir::from_path(temp.path().join("target"));
+        fs::create_dir_all(source.path()).unwrap();
+        let source_path = source.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&source_path).unwrap();
+        let connection = Connection::open(source_path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::migrate(&source, &target).err().unwrap();
+
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: "PRAGMA application_id",
+                ..
+            }
+        ));
+        assert!(!target.path().join(SESSIONS_DB_FILE).exists());
+        assert!(
+            !source
+                .path()
+                .join(crate::paths::XDG_MIGRATED_MARKER)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn database_absent_migration_rejects_existing_target_database() {
         let temp = TempDir::new().unwrap();
         let source = StateDir::from_path(temp.path().join("source"));
         let target = StateDir::from_path(temp.path().join("target"));
@@ -3462,10 +3917,10 @@ mod tests {
         fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
         fs::write(&archive_path, b"not a directory").unwrap();
 
-        let deleted_version =
+        let recreation =
             TestSession::delete_for_recreation(session.id, &state_dir, Some(0)).unwrap();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
-        database.recreate(&session, deleted_version).unwrap();
+        database.recreate(&session, &recreation).unwrap();
 
         assert!(
             database
@@ -3563,6 +4018,28 @@ mod tests {
     }
 
     #[test]
+    fn incremental_vacuum_frees_every_requested_page() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        for index in 0..64 {
+            session
+                .insert_tool_output(format!("output-{index}"), json!({"text": "x".repeat(8192)}));
+        }
+        database.save(&session, None).unwrap();
+        database.delete(session.id, None).unwrap();
+        let freelist = database.freelist_pages().unwrap();
+        assert!(freelist > 1, "deleting rows must leave several free pages");
+
+        let freed = database
+            .incremental_vacuum(u32::try_from(freelist).unwrap())
+            .unwrap();
+
+        assert_eq!(freed, freelist);
+        assert_eq!(database.freelist_pages().unwrap(), 0);
+    }
+
+    #[test]
     fn oversized_payload_is_rejected_before_write() {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
@@ -3615,6 +4092,35 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn database_and_sidecars_are_owner_only() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let path = database.path();
+
+        for path in [
+            path.clone(),
+            database_sidecar(&path, "-wal"),
+            database_sidecar(&path, "-shm"),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, OWNER_FILE_MODE);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_database_file_is_rejected() {
+        let (_temp, state_dir) = state_dir();
+        fs::create_dir_all(state_dir.path()).unwrap();
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(SessionDatabase::open(&state_dir).is_err());
+    }
+
     #[test]
     fn read_only_open_never_creates_missing_wal_shared_memory() {
         let (_temp, state_dir) = state_dir();
@@ -3628,5 +4134,415 @@ mod tests {
 
         assert!(SessionDatabase::open_read_only(&state_dir).is_err());
         assert!(!shm.exists());
+    }
+
+    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+        let name = id.to_string();
+        [
+            state_dir.path().join(TOOL_OUTPUT_DIR).join(&name),
+            state_dir
+                .path()
+                .join(super::super::SESSIONS_DIR)
+                .join(super::super::ARCHIVE_DIR)
+                .join(&name),
+            state_dir.path().join(SESSION_SNAPSHOT_DIR).join(&name),
+        ]
+    }
+
+    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+        let paths = artifact_paths(state_dir, id);
+        for path in &paths {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join(ARTIFACT_NAME), b"data").unwrap();
+        }
+        paths
+    }
+
+    fn session_with_outputs() -> TestSession {
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage("prompt".into()));
+        session.insert_tool_output(
+            LARGE_OUTPUT_ID.into(),
+            json!({"text": "x".repeat(usize::try_from(TRIM_KEEP_OUTPUT_BYTES).unwrap())}),
+        );
+        session.insert_tool_output(SMALL_OUTPUT_ID.into(), json!({"todo": []}));
+        session
+    }
+
+    #[test]
+    fn fresh_database_uses_the_single_current_schema() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let table_exists = |name| {
+            database
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                    params![name],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 1);
+        let application_id: i64 = database
+            .connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, APPLICATION_ID);
+        assert!(table_exists(TOMBSTONES_TABLE));
+    }
+
+    #[test]
+    fn concurrent_initializers_share_the_complete_schema() {
+        let (_temp, state_dir) = state_dir();
+        let barrier = Arc::new(Barrier::new(INITIALIZER_COUNT + 1));
+        let handles = (0..INITIALIZER_COUNT)
+            .map(|_| {
+                let state_dir = state_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SessionDatabase::open(&state_dir)?.stats()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        for handle in handles {
+            let stats = handle.join().unwrap().unwrap();
+            assert_eq!(stats.schema_version, SCHEMA_VERSION);
+            assert_eq!(stats.auto_vacuum, INCREMENTAL_AUTO_VACUUM);
+        }
+    }
+
+    #[test]
+    fn historical_v1_without_schema_identity_requires_a_reset() {
+        let (_temp, state_dir) = state_dir();
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+
+        let error = verify_current_schema(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: "PRAGMA application_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn foreign_version_zero_database_is_not_claimed() {
+        let (_temp, state_dir) = state_dir();
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "application_id", FOREIGN_APPLICATION_ID)
+            .unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::open(&state_dir).err().unwrap();
+        let connection = Connection::open(path).unwrap();
+        let application_id: i64 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: "PRAGMA application_id",
+                ..
+            }
+        ));
+        assert_eq!(application_id, FOREIGN_APPLICATION_ID);
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn populated_version_zero_database_is_not_claimed() {
+        let (_temp, state_dir) = state_dir();
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("CREATE TABLE foreign_data (id)", [])
+            .unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::open(&state_dir).err().unwrap();
+        let connection = Connection::open(path).unwrap();
+        let foreign_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'foreign_data')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: "sqlite_schema",
+                ..
+            }
+        ));
+        assert!(foreign_table_exists);
+        assert_eq!(version, 0);
+    }
+
+    #[test_case(OLDER_SCHEMA_VERSION; "older")]
+    #[test_case(NEWER_SCHEMA_VERSION; "newer")]
+    fn noncurrent_schema_requires_a_reset(version: i64) {
+        let (_temp, state_dir) = state_dir();
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::open(&state_dir).err().unwrap();
+
+        assert!(matches!(
+            error,
+            SessionError::UnsupportedSchemaVersion {
+                found,
+                supported: SCHEMA_VERSION
+            } if found == version
+        ));
+    }
+
+    #[test]
+    fn mark_opened_records_activity_without_touching_versions() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = session_with_outputs();
+        let cursor = database.save(&session, None).unwrap();
+        let before = database.session_facts(None).unwrap();
+        assert!(before[0].last_opened_at.is_none());
+
+        database.mark_opened(session.id).unwrap();
+
+        let after = database.session_facts(None).unwrap();
+        assert!(after[0].last_opened_at.is_some());
+        assert_eq!(after[0].updated_at, before[0].updated_at);
+        assert_eq!(
+            database.write_version(session.id).unwrap(),
+            Some(cursor.write_version()),
+            "{VERSION_UNCHANGED}"
+        );
+        session.set_title("still writable".into());
+        database.save(&session, Some(&cursor)).unwrap();
+    }
+
+    #[test]
+    fn trim_keeps_transcript_and_small_outputs_and_removes_artifacts() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = session_with_outputs();
+        let cursor = database.save(&session, None).unwrap();
+        let paths = seed_artifacts(&state_dir, session.id);
+        let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
+
+        let report = database.trim(&lease).unwrap();
+
+        assert_eq!(report.tool_output_rows, 1, "{TRIM_DROPS_LARGE}");
+        assert!(report.tool_output_row_bytes > 0);
+        assert!(report.artifact_bytes > 0);
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "{ARTIFACTS_REMOVED}"
+        );
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert!(
+            loaded.tool_outputs().contains_key(SMALL_OUTPUT_ID),
+            "{TRIM_KEEPS_SMALL}"
+        );
+        assert!(
+            !loaded.tool_outputs().contains_key(LARGE_OUTPUT_ID),
+            "{TRIM_DROPS_LARGE}"
+        );
+        let facts = database.session_facts(None).unwrap();
+        assert!(facts[0].is_trimmed());
+        assert_eq!(database.stats().unwrap().trimmed_count, 1);
+        assert_ne!(
+            database.write_version(session.id).unwrap(),
+            Some(cursor.write_version())
+        );
+        let jobs: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(jobs, 0);
+    }
+
+    #[test]
+    fn trim_rejects_a_lease_for_another_session() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = session_with_outputs();
+        database.save(&session, None).unwrap();
+        let other = TestSession::new(MODEL, CWD);
+        let lease = SessionLease::acquire(&state_dir, other.id).unwrap();
+
+        assert!(matches!(
+            database.trim(&lease),
+            Err(SessionError::Storage(StorageError::NotFound(_)))
+        ));
+        assert_eq!(
+            database
+                .load::<TestMessage, Value, Value>(session.id)
+                .unwrap()
+                .tool_outputs()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn trimmed_session_written_again_becomes_a_candidate_and_drops_stale_jobs() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = session_with_outputs();
+        database.save(&session, None).unwrap();
+        let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
+        database.trim(&lease).unwrap();
+        drop(lease);
+        let mut reopened = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        reopened.push_message(TestMessage("later".into()));
+        reopened.updated_at += 1;
+        database.save(&reopened, None).unwrap();
+        session.updated_at = reopened.updated_at;
+        let transaction = database
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        enqueue_cleanup_jobs(&transaction, session.id).unwrap();
+        transaction.commit().unwrap();
+        let paths = seed_artifacts(&state_dir, session.id);
+
+        let completed = database.process_cleanup_jobs().unwrap();
+
+        assert_eq!(completed, 0);
+        assert!(paths.iter().all(|path| path.exists()));
+        assert!(!database.session_facts(None).unwrap()[0].is_trimmed());
+        let jobs: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(jobs, 0);
+    }
+
+    #[test]
+    fn trimmed_session_cleanup_waits_while_the_session_is_open() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = session_with_outputs();
+        database.save(&session, None).unwrap();
+        let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
+        let transaction = database
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE sessions SET trimmed_at = updated_at WHERE id = ?1",
+                params![session.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        enqueue_cleanup_jobs(&transaction, session.id).unwrap();
+        transaction.commit().unwrap();
+        let paths = seed_artifacts(&state_dir, session.id);
+
+        let completed = database.process_cleanup_jobs().unwrap();
+        assert_eq!(completed, 0);
+        assert!(paths.iter().all(|path| path.exists()));
+        let deferred: i64 = database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM cleanup_jobs WHERE last_error = ?1",
+                params![SESSION_OPEN_ELSEWHERE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred, 3);
+        drop(lease);
+        database
+            .connection
+            .execute("UPDATE cleanup_jobs SET next_attempt_ms = 0", [])
+            .unwrap();
+
+        let completed = database.process_cleanup_jobs().unwrap();
+
+        assert_eq!(completed, 3);
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "{ARTIFACTS_REMOVED}"
+        );
+    }
+
+    #[test]
+    fn pin_marks_facts_and_rejects_unknown_sessions() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = session_with_outputs();
+        database.save(&session, None).unwrap();
+
+        database.set_pinned(session.id, true).unwrap();
+        assert!(database.session_facts(None).unwrap()[0].pinned);
+        assert_eq!(database.stats().unwrap().pinned_count, 1);
+        database.set_pinned(session.id, false).unwrap();
+        assert!(!database.session_facts(None).unwrap()[0].pinned);
+        assert!(matches!(
+            database.set_pinned(CaudraId::generate(), true),
+            Err(SessionError::Storage(StorageError::NotFound(_)))
+        ));
+    }
+
+    #[test]
+    fn session_facts_filter_by_directory_and_report_pending_revert() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut reverting = TestSession::new(MODEL, CWD);
+        reverting.meta.pending_revert = Some(super::super::PendingConversationRevert {
+            original_head: None,
+            target_head: None,
+            original_workspace_head: None,
+            workspace_head: None,
+            file_status: None,
+            restore_operation: None,
+        });
+        database.save(&reverting, None).unwrap();
+        database
+            .save(&TestSession::new(MODEL, "/elsewhere"), None)
+            .unwrap();
+
+        let all = database.session_facts(None).unwrap();
+        let here = database.session_facts(Some(CWD)).unwrap();
+
+        assert_eq!(all.len(), 2);
+        assert_eq!(here.len(), 1);
+        assert_eq!(here[0].id, reverting.id);
+        assert!(here[0].pending_revert);
     }
 }

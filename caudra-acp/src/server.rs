@@ -25,7 +25,7 @@ use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use caudra_agent::types::AgentEvent;
 use caudra_agent::{
-    AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, load_stored_session,
+    AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, open_stored_session,
 };
 use caudra_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use caudra_providers::model::Model;
@@ -703,7 +703,7 @@ fn load_history_from(
     storage: &caudra_storage::StateDir,
     session_id: CaudraId,
 ) -> Result<Restored, AcpError> {
-    let session = load_stored_session(session_id, storage).map_err(|e| {
+    let session = open_stored_session(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
     let recorded = if Path::new(&session.cwd).is_absolute() {

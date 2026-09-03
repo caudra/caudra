@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
-use crate::chat::{Chat, DONE_TEXT, history_to_display_in_project};
+use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display_in_project};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
@@ -23,7 +23,8 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     SessionLease, SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
-    StoredPromptAdmission, StoredQueuedDraft, StoredSubagent,
+    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 
@@ -37,6 +38,24 @@ use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+
+fn stored_subagent_outcome(outcome: Option<TaskOutcome>) -> StoredSubagentOutcome {
+    match outcome {
+        None | Some(TaskOutcome::Unknown) => StoredSubagentOutcome::Unknown,
+        Some(TaskOutcome::Done) => StoredSubagentOutcome::Done,
+        Some(TaskOutcome::Killed) => StoredSubagentOutcome::Killed,
+        Some(TaskOutcome::Error) => StoredSubagentOutcome::Error,
+    }
+}
+
+fn restored_subagent_outcome(outcome: StoredSubagentOutcome) -> (TaskOutcome, &'static str) {
+    match outcome {
+        StoredSubagentOutcome::Unknown => (TaskOutcome::Unknown, DONE_TEXT),
+        StoredSubagentOutcome::Done => (TaskOutcome::Done, DONE_TEXT),
+        StoredSubagentOutcome::Killed => (TaskOutcome::Killed, CANCELLED_TEXT),
+        StoredSubagentOutcome::Error => (TaskOutcome::Error, ERROR_TEXT),
+    }
+}
 
 struct RevertTarget {
     head: Option<CaudraId>,
@@ -242,7 +261,25 @@ impl App {
                 .collect(),
             queued_messages: queued_prompts
                 .iter()
-                .map(|prompt| prompt.text.clone())
+                .map(|prompt| StoredQueuedPrompt {
+                    text: prompt.text.clone(),
+                    images: prompt
+                        .images
+                        .iter()
+                        .map(|image| StoredImage {
+                            media_type: image.media_type.mime().into(),
+                            data: image.data.to_string(),
+                        })
+                        .collect(),
+                    paste_ranges: prompt
+                        .paste_ranges
+                        .iter()
+                        .map(|range| StoredPasteRange {
+                            start: range.start,
+                            end: range.end,
+                        })
+                        .collect(),
+                })
                 .collect(),
             queued_message_admissions: queued_prompts
                 .iter()
@@ -336,6 +373,7 @@ impl App {
                     root_tool_use_id: roots.get(task_id.as_ref()).cloned().flatten(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    outcome: stored_subagent_outcome(chat.task_outcome()),
                 })
             })
             .collect();
@@ -619,9 +657,8 @@ impl App {
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
             chat.load_messages(display);
-            // The session file keeps the transcript but never how it ended,
-            // so a reload admits that instead of guessing.
-            chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            let (outcome, text) = restored_subagent_outcome(sa.outcome);
+            chat.mark_finished(outcome, text);
             self.fire_restore_items(items);
             self.chats.push(chat);
         }

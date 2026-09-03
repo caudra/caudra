@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use caudra_config_macro::ConfigSection;
 use caudra_storage::paths;
+use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,10 @@ pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
+pub const DEFAULT_EPHEMERAL: bool = false;
+pub const DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS: u64 = 24;
+pub const DEFAULT_RETENTION_TRIM_KEEP_LAST: u32 = 20;
+pub const DEFAULT_RETENTION_TRIM_KEEP_WITHIN_DAYS: u32 = 90;
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
@@ -745,6 +750,8 @@ pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
     pub max_log_files: Option<u32>,
     pub input_history_size: Option<usize>,
+    pub ephemeral: Option<bool>,
+    pub retention: Option<RetentionFileConfig>,
 }
 
 impl StorageFileConfig {
@@ -754,8 +761,31 @@ impl StorageFileConfig {
             overlay,
             max_log_bytes_mb,
             max_log_files,
-            input_history_size
+            input_history_size,
+            ephemeral
         );
+        match (self.retention.as_mut(), overlay.retention) {
+            (Some(base), Some(over)) => base.merge(over),
+            (None, Some(over)) => self.retention = Some(over),
+            _ => {}
+        }
+    }
+}
+
+/// A project policy replaces the matching global policy whole, the way
+/// `provider.allowed_models` does, so a project cannot inherit half a rule set.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionFileConfig {
+    pub group_by: Option<GroupBy>,
+    pub sweep_interval_hours: Option<u64>,
+    pub trim: Option<KeepPolicy>,
+    pub forget: Option<KeepPolicy>,
+}
+
+impl RetentionFileConfig {
+    fn merge(&mut self, overlay: RetentionFileConfig) {
+        merge_option!(self, overlay, group_by, sweep_interval_hours, trim, forget);
     }
 }
 
@@ -1604,6 +1634,13 @@ pub struct StorageConfig {
     #[config(default = DEFAULT_INPUT_HISTORY_SIZE, min = MIN_INPUT_HISTORY_SIZE,
              desc = "Number of input history entries to retain")]
     pub input_history_size: usize,
+
+    #[config(default = DEFAULT_EPHEMERAL,
+             desc = "Store session data in a temporary directory removed when Caudra exits")]
+    pub ephemeral: bool,
+
+    #[config(skip)]
+    pub retention: RetentionConfig,
 }
 
 impl Default for StorageConfig {
@@ -1612,6 +1649,8 @@ impl Default for StorageConfig {
             max_log_bytes: DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024,
             max_log_files: DEFAULT_MAX_LOG_FILES,
             input_history_size: DEFAULT_INPUT_HISTORY_SIZE,
+            ephemeral: DEFAULT_EPHEMERAL,
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -1622,7 +1661,86 @@ impl StorageConfig {
             max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
+            ephemeral: f.ephemeral.unwrap_or(DEFAULT_EPHEMERAL),
+            retention: RetentionConfig::from_file(f.retention.unwrap_or_default()),
         }
+    }
+}
+
+/// Which sessions the background sweep trims and forgets. Policies use the
+/// `restic forget` vocabulary; an empty `forget` policy disables deletion
+/// rather than deleting everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    pub group_by: GroupBy,
+    /// Zero disables the background sweep. The CLI commands still work.
+    pub sweep_interval_hours: u64,
+    pub trim: KeepPolicy,
+    pub forget: KeepPolicy,
+}
+
+impl RetentionConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "group_by",
+            ty: "string",
+            default: ConfigValue::Str("directory"),
+            min: None,
+            env: None,
+            description: "Evaluate policies per working directory (`directory`) or across every session (`none`)",
+        },
+        ConfigField {
+            name: "sweep_interval_hours",
+            ty: "u64",
+            default: ConfigValue::U64(DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS),
+            min: None,
+            env: None,
+            description: "Hours between background sweeps. `0` disables the sweep; `caudra storage` commands still work",
+        },
+        ConfigField {
+            name: "trim",
+            ty: "table",
+            default: ConfigValue::Str("{ keep_last = 20, keep_within = \"90d\" }"),
+            min: None,
+            env: None,
+            description: "Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable",
+        },
+        ConfigField {
+            name: "forget",
+            ty: "table",
+            default: ConfigValue::Str("{}"),
+            min: None,
+            env: None,
+            description: "Sessions outside this policy are deleted. Empty means never delete automatically",
+        },
+    ];
+
+    pub fn default_trim() -> KeepPolicy {
+        KeepPolicy {
+            keep_last: Some(DEFAULT_RETENTION_TRIM_KEEP_LAST),
+            keep_within: Some(RetentionDuration {
+                days: DEFAULT_RETENTION_TRIM_KEEP_WITHIN_DAYS,
+                ..RetentionDuration::default()
+            }),
+            ..KeepPolicy::default()
+        }
+    }
+
+    fn from_file(f: RetentionFileConfig) -> Self {
+        Self {
+            group_by: f.group_by.unwrap_or_default(),
+            sweep_interval_hours: f
+                .sweep_interval_hours
+                .unwrap_or(DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS),
+            trim: f.trim.unwrap_or_else(Self::default_trim),
+            forget: f.forget.unwrap_or_default(),
+        }
+    }
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self::from_file(RetentionFileConfig::default())
     }
 }
 
@@ -3849,6 +3967,73 @@ mod tests {
     fn show_thinking_deserializes_false() {
         let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
         assert!(!raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn retention_defaults_trim_only() {
+        let config = RawConfig::default().into_config(false).unwrap();
+        let retention = config.storage.retention;
+        assert_eq!(retention.group_by, GroupBy::Directory);
+        assert_eq!(
+            retention.sweep_interval_hours,
+            DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS
+        );
+        assert_eq!(retention.trim, RetentionConfig::default_trim());
+        assert!(retention.forget.is_empty());
+    }
+
+    #[test]
+    fn ephemeral_storage_defaults_off_and_parses_true() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        let configured: RawConfig = toml::from_str("[storage]\nephemeral = true\n").unwrap();
+
+        assert!(!defaults.storage.ephemeral);
+        assert!(configured.into_config(false).unwrap().storage.ephemeral);
+    }
+
+    #[test]
+    fn retention_policies_parse_and_project_replaces_whole_policy() {
+        let mut base: RawConfig = toml::from_str(
+            "[storage.retention]\ngroup_by = \"none\"\nsweep_interval_hours = 0\n\
+             [storage.retention.trim]\nkeep_last = 5\nkeep_within = \"2y5m7d3h\"\n\
+             keep_within_daily = \"\"\n\
+             [storage.retention.forget]\nkeep_weekly = 4\n",
+        )
+        .unwrap();
+        let overlay: RawConfig =
+            toml::from_str("[storage.retention.trim]\nkeep_daily = 7\n").unwrap();
+
+        base.merge(overlay);
+        let retention = base.into_config(false).unwrap().storage.retention;
+
+        assert_eq!(retention.group_by, GroupBy::None);
+        assert_eq!(retention.sweep_interval_hours, 0);
+        assert_eq!(
+            retention.trim,
+            KeepPolicy {
+                keep_daily: Some(7),
+                ..KeepPolicy::default()
+            }
+        );
+        assert_eq!(
+            retention.forget,
+            KeepPolicy {
+                keep_weekly: Some(4),
+                ..KeepPolicy::default()
+            }
+        );
+    }
+
+    #[test]
+    fn retention_rejects_unknown_rules_and_bad_durations() {
+        assert!(
+            toml::from_str::<RawConfig>("[storage.retention.trim]\nkeep_fortnightly = 1\n")
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<RawConfig>("[storage.retention.trim]\nkeep_within = \"7w\"\n")
+                .is_err()
+        );
     }
 
     #[test]

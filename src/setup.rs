@@ -39,7 +39,7 @@ pub fn active_session_history(session: &StoredSession) -> Result<Vec<HistoryItem
 }
 
 pub fn load_session(id: CaudraId, storage: &StateDir) -> Result<StoredSession> {
-    caudra_agent::load_stored_session(id, storage).context("load persisted session")
+    caudra_agent::open_stored_session(id, storage).context("load persisted session")
 }
 
 pub fn resolve_model(
@@ -193,16 +193,13 @@ mod tests {
     use super::*;
     use caudra_agent::{History, ToolOutput};
     use caudra_providers::{ContentBlock, Message, Role, TokenUsage, project_messages};
-    use caudra_storage::sessions::{SESSIONS_DIR, Session, SessionError};
+    use caudra_storage::sessions::Session;
 
     const CWD: &str = "/repo";
     const MAIN_PROMPT: &str = "main prompt";
     const MODEL_SPEC: &str = "anthropic/test-model";
     const SUBAGENT_PROMPT: &str = "subagent prompt";
     const TITLE: &str = "Migrated session";
-    const CURRENT_LOG_VERSION: &str = r#""v":3"#;
-    const PREVIOUS_LOG_VERSION: &str = r#""v":2"#;
-    const PREVIOUS_LOG_FORMAT_VERSION: u32 = 2;
 
     type LegacySession = Session<Message, TokenUsage, ToolOutput>;
 
@@ -238,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_load_expands_all_message_collections() {
+    fn stored_message_payloads_expand_all_message_collections() {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let messages = messages();
@@ -248,25 +245,7 @@ mod tests {
         session.set_title(TITLE.into());
         session.replace_messages(messages);
         session.set_subagent_messages("task-1".into(), vec![Message::user(SUBAGENT_PROMPT.into())]);
-        let sessions_dir = storage.path().join(SESSIONS_DIR);
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        session.save_to(&sessions_dir).unwrap();
-        let path = sessions_dir.join(format!("{id}.jsonl"));
-        let data = std::fs::read_to_string(&path).unwrap();
-        assert!(data.contains(CURRENT_LOG_VERSION));
-        std::fs::write(
-            &path,
-            data.replacen(CURRENT_LOG_VERSION, PREVIOUS_LOG_VERSION, 1),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            StoredSession::load(id, &storage),
-            Err(SessionError::VersionMismatch {
-                found: PREVIOUS_LOG_FORMAT_VERSION,
-                ..
-            })
-        ));
+        session.save(&storage).unwrap();
 
         let loaded = load_session(id, &storage).unwrap();
 

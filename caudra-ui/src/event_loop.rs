@@ -35,6 +35,7 @@ use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::sessions::{SessionError, SessionLease, StoredImage, normalize_title};
+use caudra_storage::state::WorkspaceTabs;
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
@@ -56,10 +57,10 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
 use crate::input::InputReader;
-use crate::load_app_session;
 use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, SessionTab};
+use crate::{load_app_session, open_app_session};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -715,6 +716,7 @@ pub(crate) struct EventLoop<'t> {
     sessions: Vec<SessionRuntime>,
     focused: usize,
     last_focused: Option<CaudraId>,
+    last_workspace_tabs: Option<WorkspaceTabsSnapshot>,
     terminal_focused: bool,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
@@ -725,6 +727,22 @@ pub(crate) struct EventLoop<'t> {
     ui_action_rx: flume::Receiver<UiAction>,
     herdr_reporter: Option<HerdrReporterHandle>,
     _model_fetch_task: smol::Task<()>,
+}
+
+/// Empty sessions are deleted only after becoming idle, so both transitions
+/// participate in the persistence trigger.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabStorageState {
+    Content,
+    EmptyBusy,
+    EmptyIdle,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WorkspaceTabsSnapshot {
+    cwd: PathBuf,
+    tabs: WorkspaceTabs,
+    storage_states: Vec<TabStorageState>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -942,6 +960,7 @@ impl<'t> EventLoop<'t> {
             sessions: runtimes,
             focused,
             last_focused: None,
+            last_workspace_tabs: None,
             terminal_focused: false,
             notifier,
             ctx,
@@ -978,6 +997,7 @@ impl<'t> EventLoop<'t> {
                 dirty = Dirty::YES;
             }
             self.checkpoint_all();
+            self.persist_workspace_tabs_if_changed();
             if dirty.take() {
                 let app = &mut self.sessions[self.focused].app;
                 if let Err(e) = self.terminal.draw(|f| {
@@ -1068,6 +1088,43 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             rt.app.checkpoint();
         }
+    }
+
+    fn workspace_tabs_snapshot(&self) -> WorkspaceTabsSnapshot {
+        let focused = self.sessions[self.focused].id();
+        WorkspaceTabsSnapshot {
+            cwd: PathBuf::from(&self.sessions[self.focused].app.state.session.cwd),
+            tabs: WorkspaceTabs {
+                open: self.sessions.iter().map(SessionRuntime::id).collect(),
+                focused: Some(focused),
+            },
+            storage_states: self
+                .sessions
+                .iter()
+                .map(|runtime| {
+                    if runtime.app.has_content() {
+                        TabStorageState::Content
+                    } else if runtime.app.status == Status::Idle {
+                        TabStorageState::EmptyIdle
+                    } else {
+                        TabStorageState::EmptyBusy
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn persist_workspace_tabs_if_changed(&mut self) {
+        let snapshot = self.workspace_tabs_snapshot();
+        if self.last_workspace_tabs.as_ref() == Some(&snapshot) {
+            return;
+        }
+        if !self.ctx.storage.is_ephemeral() {
+            self.ctx
+                .storage_writer
+                .persist_workspace_tabs(snapshot.cwd.clone(), snapshot.tabs.clone());
+        }
+        self.last_workspace_tabs = Some(snapshot);
     }
 
     /// Only the focused session is drawn, so only it can owe a frame; focusing
@@ -1666,6 +1723,7 @@ impl<'t> EventLoop<'t> {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
+            paste_ranges: Vec::new(),
         };
         match self.sessions[idx]
             .app
@@ -1726,7 +1784,7 @@ impl<'t> EventLoop<'t> {
             SessionLease::acquire(&self.ctx.storage, id)
                 .map_err(|error| format!("Failed to open session: {error}"))?,
         );
-        let session = load_app_session(id, &self.ctx.storage)
+        let session = open_app_session(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
         let process_cwd = canonical_cwd(
             &std::env::current_dir()
@@ -2046,6 +2104,7 @@ impl<'t> EventLoop<'t> {
                 rt.handles.queue.push(QueueItem::Message {
                     text: input.message.clone(),
                     image_count: input.images.len(),
+                    paste_ranges: Vec::new(),
                     input,
                     run_id,
                     admission: caudra_agent::PromptAdmission::Queue,
@@ -2462,6 +2521,7 @@ impl<'t> EventLoop<'t> {
             std::thread::sleep(Duration::from_millis(5));
         }
         self.drain_shutdown_envelopes();
+        let final_workspace_tabs = self.workspace_tabs_snapshot();
 
         let mut apps = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
@@ -2504,6 +2564,11 @@ impl<'t> EventLoop<'t> {
                 lease,
             });
             session_clone_ms += step_ms();
+        }
+        if !self.ctx.storage.is_ephemeral() {
+            self.ctx
+                .storage_writer
+                .persist_workspace_tabs(final_workspace_tabs.cwd, final_workspace_tabs.tabs);
         }
         let save_sessions_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
@@ -2844,7 +2909,11 @@ mod tests {
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
         let mut session = AppSession::new("test-model", &cwd.to_string_lossy());
-        session.meta.queued_messages = vec!["still queued".into()];
+        session.meta.queued_messages = vec![caudra_storage::sessions::StoredQueuedPrompt {
+            text: "still queued".into(),
+            images: Vec::new(),
+            paste_ranges: Vec::new(),
+        }];
         session.save(&storage).unwrap();
         corrupt_restore_journal(&storage, &session, &cwd);
         let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
@@ -2863,7 +2932,11 @@ mod tests {
                 .unwrap()
                 .meta
                 .queued_messages,
-            ["still queued"]
+            [caudra_storage::sessions::StoredQueuedPrompt {
+                text: "still queued".into(),
+                images: Vec::new(),
+                paste_ranges: Vec::new(),
+            }]
         );
         writer.shutdown(Duration::from_secs(30));
     }

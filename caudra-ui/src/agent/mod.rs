@@ -638,7 +638,12 @@ mod tests {
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert_eq!(app.run_id, run_id_before + 1);
 
-        app.state.session_mut().meta.queued_messages = vec![RESTORED_TEXT.into()];
+        app.state.session_mut().meta.queued_messages =
+            vec![caudra_storage::sessions::StoredQueuedPrompt {
+                text: RESTORED_TEXT.into(),
+                images: Vec::new(),
+                paste_ranges: Vec::new(),
+            }];
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert_eq!(
             app.run_id,

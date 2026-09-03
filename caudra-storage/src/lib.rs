@@ -13,13 +13,16 @@ pub mod permission_config_trust;
 pub mod permission_state;
 pub mod plans;
 pub mod prompt_stash;
+pub mod retention;
 pub mod sessions;
+pub mod state;
 pub mod theme;
 pub mod thinking;
 pub mod tool_outputs;
 pub mod version;
 pub mod view;
 
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -27,6 +30,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::OnceLock;
 #[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
@@ -38,31 +43,138 @@ use paths::state_dir;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
+const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
+const EPHEMERAL_DIR_PREFIX: &str = "caudra";
 const SESSION_ARTIFACT_LOCK_FILE: &str = "sessions.sqlite3.artifacts.lock";
 
+/// Where state lives. Normally one directory. An ephemeral run splits it:
+/// session data goes to a volatile root removed at exit, while credentials,
+/// preferences, and trust keep using the persistent root.
 #[derive(Debug, Clone)]
-pub struct StateDir(PathBuf);
+pub struct StateDir {
+    root: PathBuf,
+    persistent: Option<PathBuf>,
+}
+
+/// Which root a stored value belongs to during an ephemeral run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateClass {
+    /// Preferences, trust, and credentials: written where a later run finds them.
+    Persistent,
+    /// Sessions and what they produce: discarded with an ephemeral run.
+    Volatile,
+}
+
+/// Removes the volatile root when dropped. Held by the process that
+/// activated ephemeral mode for as long as the run lasts.
+pub struct EphemeralRoot(PathBuf);
+
+impl EphemeralRoot {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for EphemeralRoot {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.0.display(), %error, "ephemeral state root not removed");
+        }
+    }
+}
+
+static PROCESS_OVERRIDE: OnceLock<StateDir> = OnceLock::new();
 
 pub struct SessionArtifactLock {
     _file: File,
 }
 
 impl StateDir {
+    /// The process state directory. Returns the ephemeral split after
+    /// [`Self::activate_ephemeral`] so every lazy resolver in the process
+    /// agrees on where session data goes.
     pub fn resolve() -> Result<Self, StorageError> {
-        let dir = state_dir()?;
-        Ok(Self(dir))
+        if let Some(dir) = PROCESS_OVERRIDE.get() {
+            return Ok(dir.clone());
+        }
+        Ok(Self::from_path(state_dir()?))
     }
 
     pub fn from_path(path: PathBuf) -> Self {
-        Self(path)
+        Self {
+            root: path,
+            persistent: None,
+        }
     }
 
+    /// A split directory: `volatile` for sessions, `persistent` for the rest.
+    pub fn split(volatile: PathBuf, persistent: PathBuf) -> Self {
+        Self {
+            root: volatile,
+            persistent: Some(persistent),
+        }
+    }
+
+    /// Creates a volatile root and makes every later [`Self::resolve`] in
+    /// this process return the split. Fails when ephemeral mode was already
+    /// activated.
+    pub fn activate_ephemeral(persistent: Self) -> Result<(Self, EphemeralRoot), StorageError> {
+        let parent = env::var_os(XDG_RUNTIME_DIR_ENV)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .unwrap_or_else(env::temp_dir);
+        let (dir, root) = Self::ephemeral_in(&persistent, &parent)?;
+        if PROCESS_OVERRIDE.set(dir.clone()).is_err() {
+            drop(root);
+            return Err(StorageError::EphemeralAlreadyActive);
+        }
+        Ok((dir, root))
+    }
+
+    fn ephemeral_in(
+        persistent: &Self,
+        parent: &Path,
+    ) -> Result<(Self, EphemeralRoot), StorageError> {
+        let prefix = format!("{EPHEMERAL_DIR_PREFIX}-{}-", process::id());
+        let volatile = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir_in(parent)?
+            .keep();
+        Ok((
+            Self::split(volatile.clone(), persistent.persistent_path().to_path_buf()),
+            EphemeralRoot(volatile),
+        ))
+    }
+
+    /// The root for session data: the volatile root during an ephemeral run.
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.root
+    }
+
+    pub fn persistent_path(&self) -> &Path {
+        self.persistent.as_deref().unwrap_or(&self.root)
+    }
+
+    pub fn root_for(&self, class: StateClass) -> &Path {
+        match class {
+            StateClass::Persistent => self.persistent_path(),
+            StateClass::Volatile => self.path(),
+        }
+    }
+
+    /// The directory holding values of `class`, as its own `StateDir`.
+    pub fn for_class(&self, class: StateClass) -> Self {
+        Self::from_path(self.root_for(class).to_path_buf())
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        self.persistent.is_some()
     }
 
     pub fn ensure_subdir(&self, name: &str) -> Result<PathBuf, StorageError> {
-        let dir = self.0.join(name);
+        let dir = self.root.join(name);
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -80,6 +192,19 @@ pub enum StorageError {
     NotFound(String),
     #[error("slug collision after max attempts")]
     SlugCollision,
+    #[error("ephemeral state was already activated for this process")]
+    EphemeralAlreadyActive,
+    #[error("state database: {0}")]
+    Database(Box<sessions::SessionError>),
+}
+
+impl From<sessions::SessionError> for StorageError {
+    fn from(error: sessions::SessionError) -> Self {
+        match error {
+            sessions::SessionError::Storage(error) => error,
+            other => Self::Database(Box::new(other)),
+        }
+    }
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
@@ -408,11 +533,41 @@ pub fn now_epoch() -> u64 {
 mod tests {
     use super::*;
 
+    const CWD: &str = "/repo";
+    const INPUT_HISTORY_KEY: &str = "input.history";
     const ORIGINAL: &[u8] = b"original";
     const OWNER_ONLY_FILE_MODE: u32 = 0o600;
+    const PERSISTENT_TRACE: &str = "ephemeral session data reached the persistent root";
+    const PROMPT_STASH_KEY: &str = "input.stash";
     const REPLACEMENT: &[u8] = b"replacement";
     #[cfg(unix)]
     const FILE_MODE_MASK: u32 = 0o777;
+
+    #[derive(Clone, serde::Deserialize, serde::Serialize)]
+    struct TestMessage;
+
+    impl sessions::TitleSource for TestMessage {
+        fn first_user_text(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn tree_entries(root: &Path) -> Vec<PathBuf> {
+        fn collect(root: &Path, dir: &Path, entries: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                entries.push(path.strip_prefix(root).unwrap().to_path_buf());
+                if path.is_dir() {
+                    collect(root, &path, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        collect(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
 
     #[test]
     fn atomic_write_replaces_existing_file() {
@@ -423,6 +578,73 @@ mod tests {
         atomic_write(&path, REPLACEMENT).unwrap();
 
         assert_eq!(fs::read(path).unwrap(), REPLACEMENT);
+    }
+
+    #[test]
+    fn ephemeral_root_is_removed_with_its_guard() {
+        let persistent_root = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let persistent = StateDir::from_path(persistent_root.path().to_path_buf());
+        let (state_dir, guard) = StateDir::ephemeral_in(&persistent, parent.path()).unwrap();
+        let volatile = state_dir.path().to_path_buf();
+
+        assert!(volatile.is_dir());
+        assert_eq!(state_dir.persistent_path(), persistent.path());
+
+        drop(guard);
+        assert!(!volatile.exists());
+    }
+
+    #[test]
+    fn ephemeral_session_data_leaves_no_persistent_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persistent = tmp.path().join("persistent");
+        let volatile = tmp.path().join("volatile");
+        fs::create_dir(&persistent).unwrap();
+        let persistent_dir = StateDir::from_path(persistent.clone());
+        drop(sessions::SessionDatabase::open_state(&persistent_dir).unwrap());
+        let before = tree_entries(&persistent);
+        let state_dir = StateDir::split(volatile.clone(), persistent.clone());
+
+        let mut session = sessions::Session::<TestMessage, (), serde_json::Value>::new("test", CWD);
+        let session_id = session.id;
+        session.save(&state_dir).unwrap();
+        tool_outputs::ToolOutputStore::new(state_dir.clone())
+            .put(session_id, "tool output")
+            .unwrap();
+        let mut history = input_history::InputHistory::load(&state_dir, 10);
+        history.push("prompt".into());
+        prompt_stash::PromptStash::open(&state_dir)
+            .unwrap()
+            .push(prompt_stash::StashDraft {
+                text: "draft".into(),
+                cwd: CWD.into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(tree_entries(&persistent), before, "{PERSISTENT_TRACE}");
+        let database = sessions::SessionDatabase::open_state(&persistent_dir).unwrap();
+        assert!(
+            database.session_facts(None).unwrap().is_empty(),
+            "{PERSISTENT_TRACE}"
+        );
+        assert!(
+            database
+                .state_get::<serde_json::Value>(state::SCOPE_GLOBAL, INPUT_HISTORY_KEY)
+                .unwrap()
+                .is_none(),
+            "{PERSISTENT_TRACE}"
+        );
+        assert!(
+            database
+                .state_get::<serde_json::Value>(state::SCOPE_GLOBAL, PROMPT_STASH_KEY)
+                .unwrap()
+                .is_none(),
+            "{PERSISTENT_TRACE}"
+        );
+        assert!(volatile.join(sessions::SESSIONS_DB_FILE).is_file());
+        assert!(volatile.join(tool_outputs::TOOL_OUTPUT_DIR).is_dir());
     }
 
     #[test]

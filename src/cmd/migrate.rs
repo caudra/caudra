@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use caudra_storage::input_history::MAX_ENTRIES;
 use caudra_storage::paths;
 use caudra_storage::sessions::{SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionDatabase};
 use caudra_storage::{StateDir, lock_session_artifacts};
@@ -78,11 +77,6 @@ fn remove_file_durable(path: &Path) -> Result<()> {
     sync_parent(path)
 }
 
-fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
-    caudra_storage::atomic_write(path, data)?;
-    Ok(())
-}
-
 #[cfg(unix)]
 fn is_cross_device(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::EXDEV)
@@ -132,69 +126,6 @@ fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {
 
     let plural = if count == 1 { "" } else { "s" };
     log_move("auth/", target_dir, Some(&format!("{count} file{plural}")));
-    Ok(())
-}
-
-fn merge_json_file(legacy: &Path, target: &Path, name: &str) -> Result<()> {
-    if !legacy.exists() {
-        return Ok(());
-    }
-
-    if !target.exists() {
-        move_file(legacy, target)?;
-        log_move(name, target.parent().unwrap_or(target), None);
-        return Ok(());
-    }
-
-    let legacy_bytes = fs::read(legacy)?;
-    let target_bytes = fs::read(target)?;
-
-    let mut merged: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&target_bytes).unwrap_or_default();
-    let legacy_map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&legacy_bytes).unwrap_or_default();
-    merged.extend(legacy_map);
-
-    write_file_atomically(target, &serde_json::to_vec_pretty(&merged)?)
-        .with_context(|| format!("write {}", tilde(target)))?;
-    remove_file_durable(legacy)?;
-    log_move(name, target.parent().unwrap_or(target), Some("merged"));
-    Ok(())
-}
-
-fn merge_input_history(legacy: &Path, target: &Path) -> Result<()> {
-    if !legacy.exists() {
-        return Ok(());
-    }
-
-    let legacy_items: Vec<String> = serde_json::from_slice(&fs::read(legacy)?).unwrap_or_default();
-
-    if !target.exists() {
-        move_file(legacy, target)?;
-        log_move(
-            "input_history.json",
-            target.parent().unwrap_or(target),
-            Some(&format!("{} entries", legacy_items.len())),
-        );
-        return Ok(());
-    }
-
-    let target_items: Vec<String> = serde_json::from_slice(&fs::read(target)?).unwrap_or_default();
-
-    let mut merged = Vec::with_capacity(target_items.len() + legacy_items.len());
-    merged.extend(target_items);
-    merged.extend(legacy_items);
-    merged.dedup();
-    merged.truncate(MAX_ENTRIES);
-
-    write_file_atomically(target, &serde_json::to_vec(&merged)?)
-        .with_context(|| format!("write {}", tilde(target)))?;
-    remove_file_durable(legacy)?;
-    log_move(
-        "input_history.json",
-        target.parent().unwrap_or(target),
-        Some(&format!("merged, {} entries", merged.len())),
-    );
     Ok(())
 }
 
@@ -509,39 +440,6 @@ pub fn xdg() -> Result<()> {
     merge_dir(&legacy, &xdg.state, "plans", false)?;
     merge_dir(&legacy, &xdg.state, "projects", true)?;
     merge_dir(&legacy, &xdg.config, "providers", false)?;
-
-    merge_json_file(
-        &legacy.join("cwd_latest.json"),
-        &xdg.state.join("cwd_latest.json"),
-        "cwd_latest.json",
-    )?;
-    merge_input_history(
-        &legacy.join("input_history.json"),
-        &xdg.state.join("input_history.json"),
-    )?;
-    merge_json_file(
-        &legacy.join("model-tiers"),
-        &xdg.state.join("model-tiers"),
-        "model-tiers",
-    )?;
-    merge_json_file(
-        &legacy.join("model-roles"),
-        &xdg.state.join("model-roles"),
-        "model-roles",
-    )?;
-
-    for name in ["theme", "model"] {
-        let src = legacy.join(name);
-        if src.exists() {
-            let dst = xdg.state.join(name);
-            if dst.exists() {
-                fs::remove_file(&dst)
-                    .with_context(|| format!("remove existing {}", tilde(&dst)))?;
-            }
-            move_file(&src, &dst)?;
-            log_move(name, dst.parent().unwrap_or(&dst), None);
-        }
-    }
 
     move_logs(&legacy, &xdg.logs)?;
 

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use crate::{StateDir, StorageError};
+use crate::{StateClass, StateDir, StorageError};
 
 const PLANS_DIR: &str = "plans";
 const SLUG_RETRIES: usize = 10;
@@ -17,7 +17,9 @@ fn load_words(text: &'static str) -> Vec<&'static str> {
 }
 
 pub fn new_plan_path(dir: &StateDir) -> Result<PathBuf, StorageError> {
-    let plans_dir = dir.ensure_subdir(PLANS_DIR)?;
+    let plans_dir = dir
+        .for_class(StateClass::Persistent)
+        .ensure_subdir(PLANS_DIR)?;
     for _ in 0..SLUG_RETRIES {
         let path = plans_dir.join(format!("{}.md", generate_slug()));
         if !path.exists() {
@@ -69,5 +71,18 @@ mod tests {
         let path = new_plan_path(&dir).unwrap();
         assert!(path.starts_with(tmp.path().join("plans")));
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
+    }
+
+    #[test]
+    fn ephemeral_plans_use_the_persistent_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persistent = tmp.path().join("persistent");
+        let volatile = tmp.path().join("volatile");
+        let dir = StateDir::split(volatile.clone(), persistent.clone());
+
+        let path = new_plan_path(&dir).unwrap();
+
+        assert!(path.starts_with(persistent.join(PLANS_DIR)));
+        assert!(!volatile.join(PLANS_DIR).exists());
     }
 }

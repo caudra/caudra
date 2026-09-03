@@ -70,9 +70,11 @@ Multiple requests are queued by request ID. The prompt identifies the requesting
 
 Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker distinguishes exact, selected-input, filesystem subtree, URL subtree, URL origin, and unrestricted authority. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
 
-Project and global prompt decisions are stored in `permission-rules.json` under Caudra's user state directory. The file and its update lock are owner-only. Exact input and resource values are stored as SHA-256 digests. Host-derived command patterns are stored as clear-text policy, such as `git diff *`. Review metadata keeps only anonymous field positions and value types. Selected-input authorities store their JSON pointers and a digest, but never the selected values.
+Project and global prompt decisions are stored in the `permission.rules` row of Caudra's owner-only SQLite state database. Exact input and resource values are stored as SHA-256 digests. Host-derived command patterns are stored as clear-text policy, such as `git diff *`. Review metadata keeps only anonymous field positions and value types. Selected-input authorities store their JSON pointers and a digest, but never the selected values.
 
 Conversation rules are stored with the session. A persistent write must finish before Caudra executes the approved call. If storage fails, the durable approval fails and the prompt remains open in the TUI.
+
+Ephemeral runs still read and write project and global permission decisions in the persistent state database. Conversation rules stay with the temporary session and disappear with it.
 
 ## TOML policy
 

@@ -1,23 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::id::CaudraId;
-use crate::{StateDir, atomic_write_permissions, exclusive_state_lock, now_epoch};
+use crate::state::{SCOPE_GLOBAL, StateKey, StateStore};
+use crate::{StateClass, StateDir, StorageError, now_epoch};
 
-pub const PERMISSION_STATE_FILE: &str = "permission-rules.json";
-
-const PERMISSION_STATE_VERSION: u32 = 3;
-const LEGACY_PERMISSION_STATE_VERSION: u32 = 1;
-const PREVIOUS_PERMISSION_STATE_VERSION: u32 = 2;
-const PERMISSION_STATE_MODE: u32 = 0o600;
-const PERMISSION_STATE_LOCK_FILE: &str = "permission-rules.lock";
+const PERMISSION_RULES: StateKey = StateKey {
+    name: "permission.rules",
+    class: StateClass::Persistent,
+};
 pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
@@ -191,68 +185,52 @@ impl PermissionRuleRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PermissionStateError {
-    #[error("permission state I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("permission state is corrupt: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("unsupported permission state version {found} (expected {expected})")]
-    Version { found: u32, expected: u32 },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error("invalid permission state: {0}")]
     Invalid(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PermissionStateFile {
-    version: u32,
-    records: Vec<PermissionRuleRecord>,
-}
-
 pub struct PermissionState {
-    path: PathBuf,
+    store: StateStore,
     existed: bool,
-    file: PermissionStateFile,
+    records: Vec<PermissionRuleRecord>,
 }
 
 impl PermissionState {
     pub fn open(state_dir: &StateDir) -> Result<Self, PermissionStateError> {
-        let path = state_dir.path().join(PERMISSION_STATE_FILE);
-        match load_file(&path)? {
-            Some(file) => Ok(Self {
-                path,
-                existed: true,
-                file,
-            }),
-            None => Ok(Self {
-                path,
-                existed: false,
-                file: PermissionStateFile {
-                    version: PERMISSION_STATE_VERSION,
-                    records: Vec::new(),
-                },
-            }),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
+        let store = StateStore::open(state_dir, PERMISSION_RULES.class)?;
+        let records = store.get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES)?;
+        let existed = records.is_some();
+        let records = records.unwrap_or_default();
+        validate_records(&records)?;
+        Ok(Self {
+            store,
+            existed,
+            records,
+        })
     }
 
     pub fn refresh(&mut self) -> Result<(), PermissionStateError> {
-        match load_file(&self.path)? {
-            Some(file) => {
-                self.file = file;
+        match self
+            .store
+            .get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES)?
+        {
+            Some(records) => {
+                validate_records(&records)?;
+                self.records = records;
                 self.existed = true;
                 Ok(())
             }
             None if !self.existed => Ok(()),
             None => Err(PermissionStateError::Invalid(
-                "permission state file disappeared".into(),
+                "permission state row disappeared".into(),
             )),
         }
     }
 
     pub fn records(&self) -> &[PermissionRuleRecord] {
-        &self.file.records
+        &self.records
     }
 
     pub fn insert(
@@ -269,19 +247,6 @@ impl PermissionState {
         rule: StructuredPermissionRule,
         review: Option<Value>,
     ) -> Result<PermissionRuleRecord, PermissionStateError> {
-        let lock_path = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(PERMISSION_STATE_LOCK_FILE);
-        let _lock =
-            exclusive_state_lock(&lock_path, PERMISSION_STATE_MODE).map_err(
-                |error| match error {
-                    crate::StorageError::Io(error) => PermissionStateError::Io(error),
-                    other => PermissionStateError::Invalid(other.to_string()),
-                },
-            )?;
-        self.refresh()?;
         let record = PermissionRuleRecord {
             id: CaudraId::generate().to_string(),
             project,
@@ -291,56 +256,40 @@ impl PermissionState {
             revoked_at: None,
         };
         validate_record(&record, true)?;
-        let mut next = self.file.clone();
-        next.records.push(record.clone());
-        self.write(next)?;
+        let inserted = record.clone();
+        self.records = self.store.try_update(
+            SCOPE_GLOBAL,
+            PERMISSION_RULES,
+            |records: &mut Vec<PermissionRuleRecord>| -> Result<_, PermissionStateError> {
+                validate_records(records)?;
+                records.push(inserted);
+                validate_records(records)?;
+                Ok(records.clone())
+            },
+        )??;
+        self.existed = true;
         Ok(record)
     }
 
     pub fn revoke(&mut self, id: &str) -> Result<bool, PermissionStateError> {
-        let lock_path = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(PERMISSION_STATE_LOCK_FILE);
-        let _lock =
-            exclusive_state_lock(&lock_path, PERMISSION_STATE_MODE).map_err(
-                |error| match error {
-                    crate::StorageError::Io(error) => PermissionStateError::Io(error),
-                    other => PermissionStateError::Invalid(other.to_string()),
-                },
-            )?;
-        self.refresh()?;
-        let Some(index) = self
-            .file
-            .records
-            .iter()
-            .position(|record| record.id == id && record.is_active())
-        else {
-            return Ok(false);
-        };
-        let mut next = self.file.clone();
-        next.records[index].revoked_at = Some(now_epoch());
-        self.write(next)?;
-        Ok(true)
-    }
-
-    fn write(&mut self, mut next: PermissionStateFile) -> Result<(), PermissionStateError> {
-        next.version = PERMISSION_STATE_VERSION;
-        validate_file(&next)?;
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let data = serde_json::to_vec_pretty(&next)?;
-        atomic_write_permissions(&self.path, &data, PERMISSION_STATE_MODE).map_err(|error| {
-            match error {
-                crate::StorageError::Io(error) => PermissionStateError::Io(error),
-                crate::StorageError::Json(error) => PermissionStateError::Json(error),
-                other => PermissionStateError::Invalid(other.to_string()),
-            }
-        })?;
-        self.file = next;
+        let (revoked, records) = self.store.try_update(
+            SCOPE_GLOBAL,
+            PERMISSION_RULES,
+            |records: &mut Vec<PermissionRuleRecord>| -> Result<_, PermissionStateError> {
+                validate_records(records)?;
+                let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.id == id && record.is_active())
+                else {
+                    return Ok((false, records.clone()));
+                };
+                record.revoked_at = Some(now_epoch());
+                Ok((true, records.clone()))
+            },
+        )??;
+        self.records = records;
         self.existed = true;
-        Ok(())
+        Ok(revoked)
     }
 }
 
@@ -350,81 +299,9 @@ pub fn validate_conversation_record(
     validate_record(record, false)
 }
 
-fn load_file(path: &Path) -> Result<Option<PermissionStateFile>, PermissionStateError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(PermissionStateError::Invalid(format!(
-                "permission state path {} is not a regular file",
-                path.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(PermissionStateError::Invalid(format!(
-            "permission state path {} is not a regular file",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    if metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(PermissionStateError::Invalid(format!(
-            "permission state file {} must be owned by the current user and inaccessible to other users",
-            path.display()
-        )));
-    }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    let mut file: PermissionStateFile = serde_json::from_slice(&data)?;
-    let stored_version = file.version;
-    if matches!(
-        stored_version,
-        LEGACY_PERMISSION_STATE_VERSION | PREVIOUS_PERMISSION_STATE_VERSION
-    ) {
-        if file.records.iter().any(|record| {
-            record.rule.resources.iter().any(|resource| {
-                matches!(
-                    &resource.selector,
-                    PermissionResourceSelector::CommandPattern { .. }
-                ) || resource.attributes.values().any(|selector| {
-                    matches!(selector, PermissionResourceSelector::CommandPattern { .. })
-                })
-            })
-        }) {
-            return Err(PermissionStateError::Invalid(format!(
-                "permission state version {stored_version} contains a version 3 command pattern"
-            )));
-        }
-        file.version = PERMISSION_STATE_VERSION;
-    }
-    validate_file(&file)?;
-    Ok(Some(file))
-}
-
-fn validate_file(file: &PermissionStateFile) -> Result<(), PermissionStateError> {
-    if file.version != PERMISSION_STATE_VERSION {
-        return Err(PermissionStateError::Version {
-            found: file.version,
-            expected: PERMISSION_STATE_VERSION,
-        });
-    }
-    let mut ids = HashSet::with_capacity(file.records.len());
-    for record in &file.records {
+fn validate_records(records: &[PermissionRuleRecord]) -> Result<(), PermissionStateError> {
+    let mut ids = HashSet::with_capacity(records.len());
+    for record in records {
         validate_record(record, true)?;
         if !ids.insert(&record.id) {
             return Err(PermissionStateError::Invalid(format!(
@@ -611,21 +488,19 @@ fn validate_digest(digest: &str) -> Result<(), PermissionStateError> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::{
-        COMMAND_PATTERN_MAX_BYTES, LEGACY_PERMISSION_STATE_VERSION, PERMISSION_STATE_FILE,
-        PERMISSION_STATE_MODE, PERMISSION_STATE_VERSION, PREVIOUS_PERMISSION_STATE_VERSION,
-        PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
-        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
-        PermissionResourceSelector, PermissionRuleRecord, PermissionState, PermissionStateError,
-        PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
+        COMMAND_PATTERN_MAX_BYTES, PERMISSION_RULES, PermissionArgumentConstraint,
+        PermissionExecutorKind, PermissionLifetime, PermissionResourceAccess,
+        PermissionResourceConstraint, PermissionResourceKind, PermissionResourceSelector,
+        PermissionRuleRecord, PermissionState, PermissionStateError, PermissionSubject,
+        SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
         validate_command_pattern,
     };
-    use crate::StateDir;
+    use crate::state::{self, SCOPE_GLOBAL};
+    use crate::{StateDir, now_epoch};
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -751,17 +626,20 @@ mod tests {
     }
 
     #[test]
-    fn version_three_command_pattern_round_trips() {
+    fn command_pattern_round_trips() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let mut state = PermissionState::open(&state_dir).unwrap();
         let rule = command_pattern_rule(PermissionLifetime::Global, "git status *");
 
         let inserted = state.insert(None, rule.clone()).unwrap();
-        let stored: Value = serde_json::from_slice(&fs::read(state.path()).unwrap()).unwrap();
-        assert_eq!(stored["version"], PERMISSION_STATE_VERSION);
+        let stored =
+            state::get::<Vec<PermissionRuleRecord>>(&state_dir, SCOPE_GLOBAL, PERMISSION_RULES)
+                .unwrap()
+                .unwrap();
+        let stored = serde_json::to_value(&stored[0]).unwrap();
         assert_eq!(
-            stored["records"][0]["rule"]["resources"][0]["selector"],
+            stored["rule"]["resources"][0]["selector"],
             json!({"match": "command_pattern", "pattern": "git status *"})
         );
         drop(state);
@@ -801,112 +679,74 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_state_is_not_overwritten() {
+    fn invalid_state_is_not_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
-        let path = state_dir.path().join(PERMISSION_STATE_FILE);
-        let corrupt = b"{not valid JSON";
-        fs::write(&path, corrupt).unwrap();
-
-        assert!(PermissionState::open(&state_dir).is_err());
-        assert_eq!(fs::read(path).unwrap(), corrupt);
-    }
-
-    #[test]
-    fn version_one_and_two_rules_migrate_and_are_rewritten_as_version_three() {
-        for old_version in [
-            LEGACY_PERMISSION_STATE_VERSION,
-            PREVIOUS_PERMISSION_STATE_VERSION,
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let state_dir = StateDir::from_path(temp.path().join("state"));
-            let mut state = PermissionState::open(&state_dir).unwrap();
-            let record = state
-                .insert(None, rule(PermissionLifetime::Global))
-                .unwrap();
-            drop(state);
-            let path = state_dir.path().join(PERMISSION_STATE_FILE);
-            let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            stored["version"] = Value::from(old_version);
-            fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
-
-            let mut restored = PermissionState::open(&state_dir).unwrap();
-            assert_eq!(restored.records().len(), 1);
-            assert_eq!(restored.records()[0].id, record.id);
-            assert!(restored.revoke(&record.id).unwrap());
-
-            let rewritten: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-            assert_eq!(rewritten["version"], PERMISSION_STATE_VERSION);
-            assert_eq!(rewritten["records"][0]["id"], record.id);
-        }
-    }
-
-    #[test]
-    fn legacy_versions_reject_version_three_command_patterns() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = StateDir::from_path(temp.path().join("state"));
         let mut state = PermissionState::open(&state_dir).unwrap();
-        state
-            .insert(
-                None,
-                command_pattern_rule(PermissionLifetime::Global, "git status *"),
-            )
-            .unwrap();
-        drop(state);
-        let path = state_dir.path().join(PERMISSION_STATE_FILE);
-        let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        stored["version"] = Value::from(PREVIOUS_PERMISSION_STATE_VERSION);
-        fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
-
-        let error = match PermissionState::open(&state_dir) {
-            Ok(_) => panic!("legacy permission state accepted a command pattern"),
-            Err(error) => error,
+        let invalid = PermissionRuleRecord {
+            id: crate::id::CaudraId::generate().to_string(),
+            project: None,
+            rule: rule(PermissionLifetime::Project),
+            review: None,
+            created_at: now_epoch(),
+            revoked_at: None,
         };
+        state::set(
+            &state_dir,
+            SCOPE_GLOBAL,
+            PERMISSION_RULES,
+            &vec![invalid.clone()],
+        )
+        .unwrap();
+
         assert!(
-            error
-                .to_string()
-                .contains("contains a version 3 command pattern")
+            state
+                .insert(None, rule(PermissionLifetime::Global))
+                .is_err()
+        );
+        assert_eq!(
+            state::get::<Vec<PermissionRuleRecord>>(&state_dir, SCOPE_GLOBAL, PERMISSION_RULES,)
+                .unwrap(),
+            Some(vec![invalid])
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn state_file_is_owner_only() {
+    fn independent_handles_do_not_clobber_each_other() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
-        let mut state = PermissionState::open(&state_dir).unwrap();
-        state
+        let mut first = PermissionState::open(&state_dir).unwrap();
+        let mut second = PermissionState::open(&state_dir).unwrap();
+
+        first
+            .insert(None, rule(PermissionLifetime::Global))
+            .unwrap();
+        second
             .insert(None, rule(PermissionLifetime::Global))
             .unwrap();
 
-        let mode = fs::metadata(state.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, PERMISSION_STATE_MODE);
+        assert_eq!(
+            PermissionState::open(&state_dir).unwrap().records().len(),
+            2
+        );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn permissive_or_symlinked_permission_state_fails_closed() {
-        use std::os::unix::fs::symlink;
-
+    fn ephemeral_access_uses_the_persistent_root() {
         let temp = tempfile::tempdir().unwrap();
-        let state_dir = StateDir::from_path(temp.path().join("state"));
-        let mut state = PermissionState::open(&state_dir).unwrap();
-        state
+        let persistent = StateDir::from_path(temp.path().join("persistent"));
+        let state_dir = StateDir::split(temp.path().join("volatile"), persistent.path().into());
+
+        PermissionState::open(&state_dir)
+            .unwrap()
             .insert(None, rule(PermissionLifetime::Global))
             .unwrap();
-        let path = state.path().to_path_buf();
-        let data = fs::read(&path).unwrap();
-        drop(state);
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(PermissionState::open(&state_dir).is_err());
-
-        fs::remove_file(&path).unwrap();
-        let target = temp.path().join("permission-state-target.json");
-        fs::write(&target, data).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(PERMISSION_STATE_MODE)).unwrap();
-        symlink(target, path).unwrap();
-        assert!(PermissionState::open(&state_dir).is_err());
+        assert_eq!(
+            PermissionState::open(&persistent).unwrap().records().len(),
+            1
+        );
+        assert!(!state_dir.path().join("sessions.sqlite3").exists());
     }
 
     #[test]
