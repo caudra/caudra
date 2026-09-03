@@ -1300,8 +1300,8 @@ impl ToolOutputLines {
             "code_execution" => self.code_execution,
             "task" => self.task,
             "index" => self.index,
-            "grep" | "glob" => self.grep,
-            "read" => self.read,
+            "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
+            "file_read" | "read" => self.read,
             "memory" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
@@ -4414,4 +4414,71 @@ mod tests {
             ToolKey::parse("github.delete").unwrap()
         );
     }
+    const BUDGET_DRIFT: &str = "a first-party tool must resolve to its own \
+         ui.tool_output_lines budget; falling through to `other` silently \
+         ignores what the user configured";
+
+    /// Every field distinct, so an arm reading the wrong one cannot pass by
+    /// coinciding with the right value.
+    const DISTINCT_BUDGETS: ToolOutputLines = ToolOutputLines {
+        bash: 1,
+        code_execution: 2,
+        task: 3,
+        index: 4,
+        grep: 5,
+        read: 6,
+        write: 7,
+        web: 8,
+        other: 9,
+    };
+
+    /// The registered name of every first-party tool, against the budget it
+    /// has to land on. `file_grep` and friends were renamed once already and
+    /// went on reading `other` for it.
+    const FIRST_PARTY_BUDGETS: &[(&str, usize)] = &[
+        ("batch", 9),
+        ("code_execution", 2),
+        ("execution_environment", 9),
+        ("file_apply_patch", 7),
+        ("file_edit", 7),
+        ("file_glob", 5),
+        ("file_grep", 5),
+        ("file_read", 6),
+        ("file_write", 7),
+        ("index", 4),
+        ("memory", 7),
+        ("question", 9),
+        ("shell", 1),
+        ("skill", 9),
+        ("task", 3),
+        ("todo_write", 9),
+        ("tool_output_grep", 9),
+        ("tool_output_read", 9),
+        ("view_image", 9),
+        ("webfetch", 8),
+        ("websearch", 8),
+    ];
+
+    #[test]
+    fn every_first_party_tool_resolves_to_its_own_budget() {
+        for (name, want) in FIRST_PARTY_BUDGETS {
+            assert_eq!(DISTINCT_BUDGETS.get(name), *want, "{BUDGET_DRIFT}: {name}");
+        }
+    }
+
+    /// Adding or renaming a tool has to be a decision about its budget, not a
+    /// silent fall-through nobody notices.
+    #[test]
+    fn every_registered_tool_is_pinned_to_a_budget() {
+        for name in WORKCELL_NATIVE_TOOL_NAMES
+            .iter()
+            .chain(CAUDRA_NATIVE_TOOL_NAMES)
+        {
+            assert!(
+                FIRST_PARTY_BUDGETS.iter().any(|(pinned, _)| pinned == name),
+                "{BUDGET_DRIFT}: {name} is not pinned"
+            );
+        }
+    }
+
 }

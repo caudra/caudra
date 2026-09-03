@@ -423,7 +423,6 @@ fn render_batch(
     limits: &RenderLimits,
 ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
     let t = theme::current();
-    let child_limits = limits.for_child();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -445,18 +444,22 @@ fn render_batch(
         if let Some(annotation) = &entry.annotation {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        let folded = limits.folds.holds(index);
-        if folded {
+        let view = limits.views.get(index);
+        if view == ChildView::Folded {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
         rows.push(Some(RowTarget::BatchChild(index)));
-        if folded {
+        if view == ChildView::Folded {
             continue;
         }
-        let body = indent_all(child_body(entry, highlight, &child_limits));
-        rows.resize(rows.len() + body.len(), None);
-        lines.extend(body);
+        let (body, truncated) = child_body(entry, highlight, &limits.for_child(view));
+        // A body only answers to a click when there is something behind it to
+        // show, or something already shown to put back.
+        let target =
+            (truncated || view == ChildView::Expanded).then_some(RowTarget::BatchBody(index));
+        rows.resize(rows.len() + body.len(), target);
+        lines.extend(indent_all(body));
     }
     (lines, rows)
 }
@@ -468,7 +471,7 @@ fn child_body(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, bool) {
     let output = entry.output.as_ref();
     if entry.status == BatchToolStatus::Error {
         return text_lines(
@@ -481,13 +484,17 @@ fn child_body(
             text_lines(text.text.clone(), limits.output)
         }
         Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text(), limits.output),
-        other => render_tool_content(entry.input.as_ref(), other, highlight, limits.clone()).lines,
+        other => {
+            let content =
+                render_tool_content(entry.input.as_ref(), other, highlight, limits.clone());
+            (content.lines, content.truncation.any())
+        }
     }
 }
 
 /// Hiding a single line costs the same row as the notice that says so, so the
 /// line itself is shown instead and nothing is truncated.
-fn text_lines(text: String, max: usize) -> Vec<Line<'static>> {
+fn text_lines(text: String, max: usize) -> (Vec<Line<'static>>, bool) {
     let total = text.lines().count();
     let hidden = total.saturating_sub(max);
     let truncated = should_truncate(hidden);
@@ -499,7 +506,7 @@ fn text_lines(text: String, max: usize) -> Vec<Line<'static>> {
     if truncated {
         lines.push(truncation_line(hidden));
     }
-    lines
+    (lines, truncated)
 }
 
 fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -790,35 +797,57 @@ impl SectionFlags {
     }
 }
 
-/// The batch children the reader has folded away, by their index in the
-/// roster. Children draw in full until one is clicked, so a card nobody has
-/// touched looks exactly as it always did.
+/// How much of one batch child the reader has asked to see.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum ChildView {
+    /// Summary row only, body put away.
+    Folded,
+    /// Body drawn within the child's own line budget.
+    #[default]
+    Budgeted,
+    /// Body drawn whole, however long it runs.
+    Expanded,
+}
+
+/// The batch children the reader has moved off `Budgeted`, by their index in
+/// the roster. Children draw budgeted until one is clicked, so a card nobody
+/// has touched looks exactly as it always did.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct BatchFolds(Arc<[usize]>);
+pub struct BatchViews(Arc<[(usize, ChildView)]>);
 
-impl BatchFolds {
-    pub fn new(indices: impl IntoIterator<Item = usize>) -> Self {
-        let mut folds: Vec<usize> = indices.into_iter().collect();
-        folds.sort_unstable();
-        folds.dedup();
-        Self(folds.into())
+impl BatchViews {
+    pub fn new(views: impl IntoIterator<Item = (usize, ChildView)>) -> Self {
+        let mut views: Vec<(usize, ChildView)> = views
+            .into_iter()
+            .filter(|(_, view)| *view != ChildView::Budgeted)
+            .collect();
+        views.sort_unstable_by_key(|(index, _)| *index);
+        views.dedup_by_key(|(index, _)| *index);
+        Self(views.into())
     }
 
-    fn holds(&self, index: usize) -> bool {
-        self.0.contains(&index)
+    fn get(&self, index: usize) -> ChildView {
+        self.0
+            .iter()
+            .find(|(held, _)| *held == index)
+            .map_or(ChildView::Budgeted, |(_, view)| *view)
     }
 
-    pub fn toggled(&self, index: usize) -> Self {
-        match self.0.iter().position(|held| *held == index) {
-            Some(at) => Self::new(
-                self.0
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != at)
-                    .map(|(_, held)| *held),
-            ),
-            None => Self::new(self.0.iter().copied().chain([index])),
-        }
+    /// Clicking the control that asked for a view a second time puts the child
+    /// back to budgeted, so every control undoes itself.
+    pub fn toggled(&self, index: usize, view: ChildView) -> Self {
+        let next = if self.get(index) == view {
+            ChildView::Budgeted
+        } else {
+            view
+        };
+        Self::new(
+            self.0
+                .iter()
+                .copied()
+                .filter(|(held, _)| *held != index)
+                .chain([(index, next)]),
+        )
     }
 }
 
@@ -826,11 +855,11 @@ impl BatchFolds {
 pub struct RenderLimits {
     pub script: usize,
     pub output: usize,
-    pub folds: BatchFolds,
+    pub views: BatchViews,
 }
 
 impl RenderLimits {
-    pub fn new(expanded: SectionFlags, output_limit: usize, folds: BatchFolds) -> Self {
+    pub fn new(expanded: SectionFlags, output_limit: usize, views: BatchViews) -> Self {
         Self {
             script: if expanded.script {
                 usize::MAX
@@ -842,7 +871,7 @@ impl RenderLimits {
             } else {
                 output_limit
             },
-            folds,
+            views,
         }
     }
 
@@ -850,18 +879,25 @@ impl RenderLimits {
         self.output == usize::MAX
     }
 
-    /// A child renders on its own terms. Folds name this card's children, so
-    /// carrying them inward would fold a nested batch by the wrong roster.
-    fn for_child(&self) -> Self {
-        Self {
-            folds: BatchFolds::default(),
-            ..self.clone()
+    /// A child renders on its own terms. The views name this card's children,
+    /// so carrying them inward would fold a nested batch by the wrong roster.
+    fn for_child(&self, view: ChildView) -> Self {
+        match view {
+            ChildView::Expanded => Self {
+                script: usize::MAX,
+                output: usize::MAX,
+                views: BatchViews::default(),
+            },
+            _ => Self {
+                views: BatchViews::default(),
+                ..self.clone()
+            },
         }
     }
 }
 
-/// The folded children of every card that has any, by parent tool id.
-pub type BatchFoldMap = HashMap<String, BatchFolds>;
+/// The child views of every card that has any, by parent tool id.
+pub type BatchViewMap = HashMap<String, BatchViews>;
 
 /// What a body line belongs to, so a click can name a row after the async
 /// highlight has replaced the spans under it.
@@ -869,6 +905,8 @@ pub type BatchFoldMap = HashMap<String, BatchFolds>;
 pub enum RowTarget {
     /// The `tool> summary` line of a batch child, by its roster index.
     BatchChild(usize),
+    /// A body line of a batch child whose body can be opened or put back.
+    BatchBody(usize),
 }
 
 pub struct ToolContent {
@@ -959,6 +997,8 @@ pub fn render_tool_content(
         }
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
         Some(ToolOutput::Answers(answers)) => (render_answers(answers), false),
+        // Each child owns how much of itself it shows, so the card reports no
+        // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {
             let (batch_lines, rows) = render_batch(entries, highlight, &limits);
             output_rows = rows;
@@ -1487,8 +1527,9 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = text_lines(text, TEXT_MAX_LINES);
+        let (lines, truncated) = text_lines(text, TEXT_MAX_LINES);
         assert_eq!(lines.len(), expected);
+        assert_eq!(truncated, notice);
         assert_eq!(
             lines
                 .iter()
@@ -1500,6 +1541,8 @@ mod tests {
 
     const CHILD_BODY: &str = "child body line";
     const EXPECT_ROW: &str = "the summary row has to name its child";
+    const CHILD_BUDGET: usize = 2;
+    const SIBLING_KEPT: usize = 2;
 
     fn batch_entry(tool: &str, body_lines: usize) -> BatchToolEntry {
         let text = (0..body_lines)
@@ -1521,13 +1564,21 @@ mod tests {
         }
     }
 
-    fn batch(folds: BatchFolds) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
-        let entries = [batch_entry("read", 2), batch_entry("grep", 3)];
+    fn batch_of(
+        sizes: [usize; 2],
+        budget: usize,
+        views: BatchViews,
+    ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
+        let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
         render_batch(
             &entries,
             false,
-            &RenderLimits::new(SectionFlags::default(), usize::MAX, folds),
+            &RenderLimits::new(SectionFlags::default(), budget, views),
         )
+    }
+
+    fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
+        batch_of([2, 3], usize::MAX, views)
     }
 
     fn body_count(lines: &[Line<'static>]) -> usize {
@@ -1545,10 +1596,20 @@ mod tests {
         rows.iter().flatten().copied().collect()
     }
 
+    fn unique_targets(rows: &[Option<RowTarget>]) -> Vec<RowTarget> {
+        let mut seen: Vec<RowTarget> = Vec::new();
+        for target in rows.iter().flatten() {
+            if seen.last() != Some(target) {
+                seen.push(*target);
+            }
+        }
+        seen
+    }
+
     /// A card nobody has clicked has to look exactly as it always did.
     #[test]
-    fn an_unfolded_batch_draws_every_child_body() {
-        let (lines, rows) = batch(BatchFolds::default());
+    fn an_untouched_batch_draws_every_child_body() {
+        let (lines, rows) = batch(BatchViews::default());
         assert_eq!(body_count(&lines), 5);
         assert_eq!(
             lines.len(),
@@ -1564,7 +1625,7 @@ mod tests {
 
     #[test]
     fn folding_a_child_hides_only_its_body() {
-        let (lines, rows) = batch(BatchFolds::new([0]));
+        let (lines, rows) = batch(BatchViews::new([(0, ChildView::Folded)]));
         assert_eq!(body_count(&lines), 3, "the other child is untouched");
         assert_eq!(lines.len(), rows.len());
         assert_eq!(
@@ -1578,7 +1639,7 @@ mod tests {
     /// was put away.
     #[test]
     fn a_folded_child_says_so() {
-        let (folded, _) = batch(BatchFolds::new([0]));
+        let (folded, _) = batch(BatchViews::new([(0, ChildView::Folded)]));
         let marked = |lines: &[Line<'static>]| {
             lines
                 .iter()
@@ -1590,35 +1651,92 @@ mod tests {
                 .count()
         };
         assert_eq!(marked(&folded), 1);
-        assert_eq!(marked(&batch(BatchFolds::default()).0), 0);
+        assert_eq!(marked(&batch(BatchViews::default()).0), 0);
     }
 
     /// The target names the child, so a click after a fold above it still
     /// reaches the one the reader aimed at.
     #[test]
     fn a_summary_row_names_its_own_child() {
-        let (_, rows) = batch(BatchFolds::new([0]));
-        let named: Vec<RowTarget> = rows.iter().flatten().copied().collect();
+        let (_, rows) = batch(BatchViews::new([(0, ChildView::Folded)]));
         assert_eq!(
-            named,
+            targets(&rows),
             vec![RowTarget::BatchChild(0), RowTarget::BatchChild(1)]
         );
     }
 
-    #[test_case(&[],     1, &[1]    ; "adds_the_first")]
-    #[test_case(&[1],    1, &[]     ; "removes_the_only_one")]
-    #[test_case(&[0, 2], 1, &[0, 1, 2] ; "adds_between")]
-    #[test_case(&[0, 1], 0, &[1]    ; "removes_the_first")]
-    fn toggled_folds(start: &[usize], index: usize, expected: &[usize]) {
-        let folds = BatchFolds::new(start.iter().copied()).toggled(index);
-        assert_eq!(folds.0.as_ref(), expected);
+    /// The reported bug: the notice offered to expand and no row would take
+    /// the click, so the affordance was unreachable by any input.
+    #[test]
+    fn a_truncated_child_body_takes_a_click() {
+        let (lines, rows) = batch_of([1, 6], CHILD_BUDGET, BatchViews::default());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains(TRUNCATION_PREFIX)),
+            "the child that ran past the budget says so"
+        );
+        assert_eq!(
+            unique_targets(&rows),
+            vec![
+                RowTarget::BatchChild(0),
+                RowTarget::BatchChild(1),
+                RowTarget::BatchBody(1),
+            ],
+            "only the child with something left to show answers a click"
+        );
     }
 
-    /// A nested batch has its own roster, so the parent's folds must not
+    /// Expanding names one child, so its siblings keep the budget they had.
+    #[test]
+    fn expanding_a_child_leaves_its_siblings_budgeted() {
+        let whole = 6;
+        let (lines, rows) = batch_of(
+            [5, whole],
+            CHILD_BUDGET,
+            BatchViews::new([(1, ChildView::Expanded)]),
+        );
+        assert_eq!(
+            body_count(&lines),
+            SIBLING_KEPT + whole,
+            "the expanded child is whole and the other is still capped"
+        );
+        assert!(
+            unique_targets(&rows).contains(&RowTarget::BatchBody(0)),
+            "the sibling still has something left to show"
+        );
+        assert!(
+            unique_targets(&rows).contains(&RowTarget::BatchBody(1)),
+            "an expanded body stays clickable so the reader can put it back"
+        );
+    }
+
+    #[test_case(&[], 1, ChildView::Folded, &[(1, ChildView::Folded)] ; "records_the_first")]
+    #[test_case(&[(1, ChildView::Folded)], 1, ChildView::Folded, &[] ; "same_control_undoes_itself")]
+    #[test_case(&[(1, ChildView::Folded)], 1, ChildView::Expanded, &[(1, ChildView::Expanded)] ; "other_control_takes_over")]
+    #[test_case(&[(0, ChildView::Folded)], 1, ChildView::Expanded, &[(0, ChildView::Folded), (1, ChildView::Expanded)] ; "leaves_the_others")]
+    fn toggled_views(
+        start: &[(usize, ChildView)],
+        index: usize,
+        view: ChildView,
+        expected: &[(usize, ChildView)],
+    ) {
+        let views = BatchViews::new(start.iter().copied()).toggled(index, view);
+        assert_eq!(views.0.as_ref(), expected);
+    }
+
+    /// A nested batch has its own roster, so the parent's views must not
     /// reach it.
     #[test]
-    fn folds_do_not_reach_a_nested_batch() {
-        let limits = RenderLimits::new(SectionFlags::default(), usize::MAX, BatchFolds::new([0]));
-        assert_eq!(limits.for_child().folds, BatchFolds::default());
+    fn views_do_not_reach_a_nested_batch() {
+        let limits = RenderLimits::new(
+            SectionFlags::default(),
+            usize::MAX,
+            BatchViews::new([(0, ChildView::Folded)]),
+        );
+        assert_eq!(
+            limits.for_child(ChildView::Budgeted).views,
+            BatchViews::default()
+        );
     }
 }

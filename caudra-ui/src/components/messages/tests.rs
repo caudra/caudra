@@ -4240,8 +4240,8 @@ fn panel_with_batch() -> MessagesPanel {
     panel
 }
 
-/// The row a child's summary was drawn on, as the panel counts rows.
-fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
+/// The first row drawn for a given batch control, as the panel counts rows.
+fn batch_row(panel: &MessagesPanel, target: RowTarget) -> u16 {
     let segment = panel
         .cache
         .segments()
@@ -4252,8 +4252,12 @@ fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
     let start = segment.chrome(80).content_start();
     (0..segment.content_height(80))
         .map(|row| start + row)
-        .find(|row| segment.row_target_at(*row, width) == Some(RowTarget::BatchChild(index)))
-        .expect("the child was drawn")
+        .find(|row| segment.row_target_at(*row, width) == Some(target))
+        .expect("the control was drawn")
+}
+
+fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
+    batch_row(panel, RowTarget::BatchChild(index))
 }
 
 #[test]
@@ -4301,6 +4305,84 @@ fn a_fold_above_does_not_move_the_click_off_the_child_below() {
     let both = seg_text(&panel, "t1");
     assert!(!both.contains("child_body_line_a"), "{EXPECT_BODY_HIDDEN}");
     assert!(!both.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
+}
+
+const TALL_CHILD_LINES: usize = 6;
+const EXPECT_WHOLE_CHILD: &str = "expanding a child shows the body it was hiding";
+const EXPECT_STILL_CAPPED: &str = "the sibling keeps the budget it had";
+
+fn tall_batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
+    let text = (0..TALL_CHILD_LINES)
+        .map(|i| format!("{BATCH_CHILD_BODY}_{marker}{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    caudra_agent::BatchToolEntry {
+        tool: tool.into(),
+        summary: format!("{tool} ran"),
+        status: caudra_agent::BatchToolStatus::Success,
+        input: None,
+        output: Some(ToolOutput::Plain(text.into())),
+        annotation: None,
+    }
+}
+
+fn panel_with_tall_batch() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![tall_batch_child("read", "a"), tall_batch_child("grep", "b")],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+    panel
+}
+
+fn last_line_of(marker: &str) -> String {
+    format!("{BATCH_CHILD_BODY}_{marker}{}", TALL_CHILD_LINES - 1)
+}
+
+/// The reported bug: a child said "click to expand" and no click reached it,
+/// so the body it was hiding could not be opened by any input.
+#[test]
+fn clicking_a_truncated_batch_child_expands_only_that_child() {
+    let mut panel = panel_with_tall_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    let before = seg_text(&panel, "t1");
+    assert!(
+        !before.contains(&last_line_of("a")),
+        "the child starts budgeted"
+    );
+
+    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
+    render(&mut panel, 80, 24);
+
+    let expanded = seg_text(&panel, "t1");
+    assert!(
+        expanded.contains(&last_line_of("a")),
+        "{EXPECT_WHOLE_CHILD}"
+    );
+    assert!(
+        !expanded.contains(&last_line_of("b")),
+        "{EXPECT_STILL_CAPPED}"
+    );
+}
+
+#[test]
+fn clicking_an_expanded_batch_child_puts_it_back() {
+    let mut panel = panel_with_tall_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
+    render(&mut panel, 80, 24);
+
+    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
+    render(&mut panel, 80, 24);
+    assert!(
+        !seg_text(&panel, "t1").contains(&last_line_of("a")),
+        "a second click on the same control undoes it"
+    );
 }
 
 /// A batch child is a control, so the pointer has to say so before the press.
@@ -4359,10 +4441,10 @@ fn loading_a_session_forgets_the_folds() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
-    assert!(!panel.batch_folds.is_empty());
+    assert!(!panel.batch_views.is_empty());
 
     panel.load_messages(Vec::new());
-    assert!(panel.batch_folds.is_empty());
+    assert!(panel.batch_views.is_empty());
 }
 
 /// Folding is a choice about the body, like the raw/filtered switch, so the

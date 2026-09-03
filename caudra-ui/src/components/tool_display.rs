@@ -5,7 +5,7 @@ use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
 use code_view::SectionFlags;
-use code_view::{BatchFoldMap, BatchFolds, RenderLimits, RowTarget};
+use code_view::{BatchViewMap, BatchViews, RenderLimits, RowTarget};
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -35,16 +35,16 @@ pub struct RenderCtx<'a> {
     pub width: u16,
     pub tool_output_lines: &'a ToolOutputLines,
     pub compact: bool,
-    /// Which batch children the reader has folded, by parent tool id. Looked
-    /// up here rather than passed in, so every path that builds a card reads
-    /// the same folds the click that set them named.
-    pub batch_folds: &'a BatchFoldMap,
+    /// How much of each batch child the reader has asked to see, by parent
+    /// tool id. Looked up here rather than passed in, so every path that
+    /// builds a card reads the same views the click that set them named.
+    pub batch_views: &'a BatchViewMap,
 }
 
 impl RenderCtx<'_> {
-    fn folds_for(&self, tool_id: Option<&str>) -> BatchFolds {
+    fn views_for(&self, tool_id: Option<&str>) -> BatchViews {
         tool_id
-            .and_then(|id| self.batch_folds.get(id))
+            .and_then(|id| self.batch_views.get(id))
             .cloned()
             .unwrap_or_default()
     }
@@ -471,9 +471,9 @@ impl ToolLineBuilder {
         expanded: SectionFlags,
         max_output_lines: usize,
         indicator: Indicator,
-        folds: BatchFolds,
+        views: BatchViews,
     ) -> Self {
-        let limits = RenderLimits::new(expanded, max_output_lines, folds);
+        let limits = RenderLimits::new(expanded, max_output_lines, views);
         Self {
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -953,7 +953,7 @@ pub fn build_tool_lines(
         expanded,
         rctx.tool_output_lines.get(tool_name),
         status.into(),
-        rctx.folds_for(msg.role.tool_id()),
+        rctx.views_for(msg.role.tool_id()),
     );
     b.apply_output_format(msg.tool_output.as_deref());
     if rctx.compact {
@@ -1096,7 +1096,7 @@ pub fn build_instructions_lines(
         exp,
         code_view::instruction_limit(expanded),
         Indicator::Success,
-        BatchFolds::default(),
+        BatchViews::default(),
     );
     b.push_header("load", header, annotation.as_deref(), None, None);
     b.prepend_indicator(Instant::now());
@@ -1172,8 +1172,8 @@ mod tests {
     use std::time::Duration;
     use test_case::test_case;
 
-    static NO_FOLDS: std::sync::LazyLock<BatchFoldMap> =
-        std::sync::LazyLock::new(BatchFoldMap::new);
+    static NO_VIEWS: std::sync::LazyLock<BatchViewMap> =
+        std::sync::LazyLock::new(BatchViewMap::new);
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
@@ -1181,7 +1181,7 @@ mod tests {
             width,
             tool_output_lines: &TOL,
             compact: false,
-            batch_folds: &NO_FOLDS,
+            batch_views: &NO_VIEWS,
         }
     }
 
@@ -1996,7 +1996,7 @@ mod tests {
         let limits = RenderLimits::new(
             SectionFlags::default(),
             TOL.get(tool),
-            BatchFolds::default(),
+            BatchViews::default(),
         );
         let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
@@ -2007,7 +2007,7 @@ mod tests {
         let limits = RenderLimits::new(
             SectionFlags::default(),
             TOL.get("bash"),
-            BatchFolds::default(),
+            BatchViews::default(),
         );
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
@@ -2019,7 +2019,7 @@ mod tests {
         let limits = RenderLimits::new(
             SectionFlags::default(),
             TOL.get("bash"),
-            BatchFolds::default(),
+            BatchViews::default(),
         );
         let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);

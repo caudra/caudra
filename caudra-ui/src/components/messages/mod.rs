@@ -17,7 +17,7 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_delta,
-    code_view::{BatchFoldMap, RowTarget, SectionFlags},
+    code_view::{BatchViewMap, ChildView, RowTarget, SectionFlags},
     review,
 };
 use crate::animation::spinner_str;
@@ -138,7 +138,7 @@ pub struct MessagesPanel {
     shell_raw: HashSet<String>,
     /// Which batch children the reader folded away, by parent tool id. Empty
     /// for every card nobody has clicked, which is nearly all of them.
-    batch_folds: BatchFoldMap,
+    batch_views: BatchViewMap,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
     diagram_pans: HashMap<DiagramKey, u16>,
@@ -212,7 +212,7 @@ impl MessagesPanel {
             accent: ColorTransition::new(theme::current().mode_build),
             disclosure: HashMap::new(),
             shell_raw: HashSet::new(),
-            batch_folds: BatchFoldMap::new(),
+            batch_views: BatchViewMap::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
@@ -494,7 +494,7 @@ impl MessagesPanel {
         self.auto_open = None;
         self.disclosure.clear();
         self.shell_raw.clear();
-        self.batch_folds.clear();
+        self.batch_views.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
@@ -1181,15 +1181,15 @@ impl MessagesPanel {
         let shell_toggle = segment
             .shell_toggle_line
             .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
-        let batch_child = segment
+        let batch_row = segment
             .row_target_at(rel, width)
             .and_then(|_| segment.source_line_at(rel, width));
-        if !native_toggle && !shell_toggle && batch_child.is_none() && !known_task_target {
+        if !native_toggle && !shell_toggle && batch_row.is_none() && !known_task_target {
             return None;
         }
         let feedback = if shell_toggle {
             HoverFeedback::ShellToggle
-        } else if let Some(line) = batch_child {
+        } else if let Some(line) = batch_row {
             HoverFeedback::Row(line)
         } else if native_toggle
             && segment.lines().iter().any(|line| {
@@ -1492,11 +1492,15 @@ impl MessagesPanel {
             self.rebuild_expanded_tool(&tool_id);
             return true;
         }
-        // A batch child folds on its own, before the card-wide expansion the
+        // A batch child answers for itself, before the card-wide expansion the
         // rest of the body falls back to.
-        if let Some(RowTarget::BatchChild(index)) = seg.row_target_at(rel, width) {
+        if let Some(target) = seg.row_target_at(rel, width) {
+            let (index, view) = match target {
+                RowTarget::BatchChild(index) => (index, ChildView::Folded),
+                RowTarget::BatchBody(index) => (index, ChildView::Expanded),
+            };
             let tool_id = tool_id.to_owned();
-            self.toggle_batch_fold(&tool_id, index);
+            self.set_batch_view(&tool_id, index, view);
             return true;
         }
         let nothing_to_open = !seg.truncation.any() && !exp.any();
@@ -1541,16 +1545,16 @@ impl MessagesPanel {
         self.handle_click(row, area)
     }
 
-    /// Folding hides a child's body, which is what the reader asked for, and
-    /// leaves every other child exactly as it was.
-    fn toggle_batch_fold(&mut self, tool_id: &str, index: usize) {
-        let folds = self
-            .batch_folds
+    /// One child changes how much of itself it shows, which is what the reader
+    /// asked for, and every other child stays exactly as it was.
+    fn set_batch_view(&mut self, tool_id: &str, index: usize, view: ChildView) {
+        let views = self
+            .batch_views
             .get(tool_id)
             .cloned()
             .unwrap_or_default()
-            .toggled(index);
-        self.batch_folds.insert(tool_id.to_owned(), folds);
+            .toggled(index, view);
+        self.batch_views.insert(tool_id.to_owned(), views);
         self.rebuild_tool_segment(tool_id);
     }
 
@@ -2150,7 +2154,7 @@ impl MessagesPanel {
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
             compact: self.compact(),
-            batch_folds: &self.batch_folds,
+            batch_views: &self.batch_views,
         }
     }
 

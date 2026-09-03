@@ -3,7 +3,7 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::{BatchFolds, RowTarget, SectionFlags};
+use super::super::code_view::{BatchViews, ChildView, RowTarget, SectionFlags};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use ratatui::text::{Line, Span};
@@ -34,9 +34,9 @@ struct CachedHeight {
 struct HighlightKey {
     has_output: bool,
     theme_gen: u64,
-    /// Folding changes which lines the range holds, so reusing across a fold
-    /// would splice back the body the reader just put away.
-    folds: BatchFolds,
+    /// A child view changes which lines the range holds, so reusing across a
+    /// fold would splice back the body the reader just put away.
+    views: BatchViews,
 }
 
 impl HighlightKey {
@@ -47,7 +47,7 @@ impl HighlightKey {
         Self {
             has_output: hl.is_some_and(|h| h.output.is_some()),
             theme_gen: theme::generation(),
-            folds: hl.map(|h| h.limits.folds.clone()).unwrap_or_default(),
+            views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
         }
     }
 }
@@ -841,26 +841,27 @@ mod tests {
     fn a_fold_forces_a_fresh_highlight() {
         use crate::components::code_view::RenderLimits;
 
-        let request = |folds: BatchFolds| HighlightRequest {
+        let request = |views: BatchViews| HighlightRequest {
             range: (1, 3),
             input: None,
             output: None,
             limits: RenderLimits {
                 script: 0,
                 output: 0,
-                folds,
+                views,
             },
         };
         let seg = Segment {
-            highlight_key: HighlightKey::from_request(Some(&request(BatchFolds::default()))),
+            highlight_key: HighlightKey::from_request(Some(&request(BatchViews::default()))),
             highlight_range: Some((1, 3)),
             lines: vec![Line::raw("h"), Line::raw("a"), Line::raw("b")],
             ..Segment::default()
         };
 
-        let folded = HighlightKey::from_request(Some(&request(BatchFolds::new([0]))));
+        let folded =
+            HighlightKey::from_request(Some(&request(BatchViews::new([(0, ChildView::Folded)]))));
         assert!(seg.reuse_highlight(&folded, (1, 3)).is_none());
-        let same = HighlightKey::from_request(Some(&request(BatchFolds::default())));
+        let same = HighlightKey::from_request(Some(&request(BatchViews::default())));
         assert!(seg.reuse_highlight(&same, (1, 3)).is_some());
     }
 }
