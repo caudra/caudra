@@ -18,6 +18,8 @@ use ratatui::text::{Line, Span};
 use url::Url;
 
 pub const TRUNCATION_PREFIX: &str = "...";
+/// The words that make a truncation notice a control rather than a remark.
+pub const EXPAND_AFFORDANCE: &str = "click to expand";
 const MIN_TRUNCATABLE_LINES: usize = 2;
 
 /// Add `over`'s modifiers on top of `base`, keeping `base`'s colors.
@@ -163,7 +165,15 @@ pub fn truncation_notice(count: usize) -> String {
         should_truncate(count),
         "truncation_notice called with count={count} below threshold"
     );
-    format!("{TRUNCATION_PREFIX} ({count} lines) click to expand")
+    expand_notice(&format!("{count} lines"))
+}
+
+/// The affordance itself, over whatever it is that expanding would add. Takes
+/// the phrase already built: a condensed view hides files or matches rather
+/// than lines, and saying "lines" for those was how the count came to be
+/// reported in a unit it was never measured in.
+pub fn expand_notice(gained: &str) -> String {
+    format!("{TRUNCATION_PREFIX} ({gained}) {EXPAND_AFFORDANCE}")
 }
 
 pub struct Truncated<'a> {

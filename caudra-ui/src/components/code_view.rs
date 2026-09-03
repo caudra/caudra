@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::highlight::{fallback_span, highlight_line};
-use crate::markdown::{should_truncate, truncation_notice};
+use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
@@ -30,6 +30,8 @@ const BATCH_DONE_MARKER: &str = "\u{25cf} ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
+const GREP_COUNT_SEP: &str = " \u{b7} ";
+const GREP_SUMMARY_INDENT: &str = "  ";
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -541,16 +543,79 @@ fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_grep_results(
-    entries: &[GrepFileEntry],
-    max_lines: usize,
-    highlight: bool,
-) -> (Vec<Line<'static>>, bool) {
-    let mut out = Vec::new();
-    let mut budget = max_lines;
-    let total_matches: usize = entries.iter().map(|e| e.match_count()).sum();
-    let mut rendered_matches: usize = 0;
+/// How many rows the full rendering would take. Counted rather than rendered,
+/// so deciding to condense never costs the highlighting of results nobody is
+/// going to see.
+fn grep_height(entries: &[GrepFileEntry], multi: bool) -> usize {
+    entries
+        .iter()
+        .map(|entry| {
+            let has_context = entry.groups.iter().any(|group| group.lines.len() > 1);
+            let separators = if has_context {
+                entry.groups.len().saturating_sub(1)
+            } else {
+                0
+            };
+            let lines: usize = entry.groups.iter().map(|group| group.lines.len()).sum();
+            usize::from(multi) + separators + lines
+        })
+        .sum()
+}
 
+/// A notice costs the row it saves, so hiding exactly one of anything is
+/// never worth it. Answers with how many to show and how many that hides.
+fn within(total: usize, room: usize) -> (usize, usize) {
+    let shown = total.min(room);
+    if total - shown == 1 {
+        (total, 0)
+    } else {
+        (shown, total - shown)
+    }
+}
+
+/// What a reader wants first from a grep they cannot see all of is its shape:
+/// how much matched and where. Match text answers a different question, and
+/// is a click away.
+fn render_grep_summary(entries: &[GrepFileEntry], max_lines: usize) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let matches: usize = entries.iter().map(GrepFileEntry::match_count).sum();
+    let mut out = vec![Line::from(vec![
+        Span::styled(format!("{} files", entries.len()), theme.tool),
+        Span::styled(GREP_COUNT_SEP, theme.tool_dim),
+        Span::styled(format!("{matches} matches"), theme.tool),
+    ])];
+
+    // The affordance keeps the last row, so the shape never crowds out the way
+    // back to the detail.
+    let (shown, hidden) = within(entries.len(), max_lines.saturating_sub(2));
+    out.extend(entries.iter().take(shown).map(|entry| {
+        Line::from(vec![
+            Span::raw(GREP_SUMMARY_INDENT),
+            Span::styled(entry.path.clone(), theme.tool_path),
+            Span::styled(GREP_COUNT_SEP, theme.tool_dim),
+            Span::styled(entry.match_count().to_string(), theme.tool_dim),
+        ])
+    }));
+
+    let gained = if hidden > 0 {
+        format!("{hidden} files")
+    } else {
+        format!("{matches} matches")
+    };
+    out.push(Line::from(Span::styled(
+        expand_notice(&gained),
+        theme.tool_dim,
+    )));
+    out
+}
+
+fn render_grep_lines(
+    entries: &[GrepFileEntry],
+    mut budget: usize,
+    highlight: bool,
+    multi: bool,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
     let global_max_nr = entries
         .iter()
         .flat_map(|e| {
@@ -561,7 +626,6 @@ fn render_grep_results(
         .max()
         .unwrap_or(1);
     let w = nr_width(global_max_nr);
-    let multi = entries.len() > 1;
     let dim = theme::current().tool_dim;
 
     for entry in entries {
@@ -574,6 +638,7 @@ fn render_grep_results(
                 entry.path.clone(),
                 theme::current().tool_path,
             )));
+            budget -= 1;
         }
 
         let syntax = highlight.then(|| caudra_highlight::syntax_for_path(&entry.path));
@@ -604,7 +669,6 @@ fn render_grep_results(
                 };
                 if line.is_match {
                     spans.extend(text_spans);
-                    rendered_matches += 1;
                 } else {
                     spans.extend(
                         text_spans
@@ -617,16 +681,39 @@ fn render_grep_results(
             }
         }
     }
-    let hidden = if budget == 0 {
-        total_matches - rendered_matches
-    } else {
-        0
-    };
-    let truncated = should_truncate(hidden);
-    if truncated {
-        out.push(truncation_line(hidden));
+    out
+}
+
+fn render_grep_results(
+    entries: &[GrepFileEntry],
+    max_lines: usize,
+    highlight: bool,
+) -> (Vec<Line<'static>>, bool) {
+    let multi = entries.len() > 1;
+    let height = grep_height(entries, multi);
+    if height <= max_lines {
+        return (render_grep_lines(entries, height, highlight, multi), false);
     }
-    (out, truncated)
+    if multi {
+        return (render_grep_summary(entries, max_lines), true);
+    }
+
+    // One file has no distribution to summarise, so the count leads and the
+    // matches themselves take what room is left.
+    let theme = theme::current();
+    let matches: usize = entries.iter().map(GrepFileEntry::match_count).sum();
+    let path = entries.first().map(|e| e.path.clone()).unwrap_or_default();
+    let mut out = vec![Line::from(vec![
+        Span::styled(format!("{matches} matches in "), theme.tool),
+        Span::styled(path, theme.tool_path),
+    ])];
+    let (shown, hidden) = within(height, max_lines.saturating_sub(2));
+    out.extend(render_grep_lines(entries, shown, highlight, false));
+    out.push(Line::from(Span::styled(
+        expand_notice(&format!("{hidden} lines")),
+        theme.tool_dim,
+    )));
+    (out, true)
 }
 
 fn index_range(range: IndexSourceRange) -> String {
@@ -1084,7 +1171,7 @@ fn merge_syntax_with_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::TRUNCATION_PREFIX;
+    use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::GrepMatchGroup;
     use test_case::test_case;
 
@@ -1300,13 +1387,79 @@ mod tests {
             .collect()
     }
 
-    #[test_case(&[("a.rs", &[1,2,3,4,5,6,7,8,9,10_usize] as &[usize])], 3, 4  ; "truncates_with_ellipsis")]
-    #[test_case(&[("a.rs", &[1_usize,2])],                                5, 2  ; "no_truncation_when_fits")]
-    #[test_case(&[("a.rs", &[1_usize,2,3]), ("b.rs", &[10,20])],          4, 6  ; "multi_file_budget_one_hidden")]
-    #[test_case(&[("a.rs", &[1_usize,2])],                                1, 1  ; "one_hidden_match_no_truncation")]
+    const GREP_SHAPE: &str = "a grep too big to show has to say how much matched and where";
+
+    #[test_case(&[("a.rs", &[1,2,3,4,5,6,7,8,9,10_usize] as &[usize])], 3, 3 ; "one_file_condenses_to_its_budget")]
+    #[test_case(&[("a.rs", &[1_usize,2])],                              5, 2 ; "no_truncation_when_fits")]
+    #[test_case(&[("a.rs", &[1_usize,2,3]), ("b.rs", &[10,20])],        4, 4 ; "two_files_headline_each_file_then_notice")]
+    #[test_case(&[("a.rs", &[1_usize,2])],                              1, 2 ; "the_way_back_outranks_a_single_row")]
     fn render_grep_line_count(files: &[(&str, &[usize])], max: usize, expected: usize) {
         let entries = grep_entries(files);
         assert_eq!(render_grep_results(&entries, max, true).0.len(), expected);
+    }
+
+    fn grep_text(files: &[(&str, &[usize])], max: usize) -> Vec<String> {
+        render_grep_results(&grep_entries(files), max, false)
+            .0
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    /// The question a grep answers is how much matched and where, which the
+    /// first few matches in document order cannot say.
+    #[test]
+    fn a_condensed_grep_leads_with_its_shape() {
+        let rendered = grep_text(
+            &[
+                ("a.rs", &[1, 2, 3, 4_usize] as &[usize]),
+                ("b.rs", &[10_usize]),
+                ("c.rs", &[20_usize, 30]),
+            ],
+            4,
+        );
+        assert_eq!(rendered[0], "3 files \u{b7} 7 matches", "{GREP_SHAPE}");
+        assert_eq!(rendered[1], "  a.rs \u{b7} 4", "{GREP_SHAPE}");
+        assert!(
+            rendered.last().unwrap().contains(EXPAND_AFFORDANCE),
+            "the detail stays one click away"
+        );
+    }
+
+    /// The count used to be of matches and the word was always "lines".
+    #[test_case(4, "2 files" ; "names_the_files_it_left_out")]
+    #[test_case(8, "8 matches" ; "names_the_matches_when_every_file_fits")]
+    fn a_condensed_grep_counts_what_expanding_would_add(max: usize, gained: &str) {
+        let rendered = grep_text(
+            &[
+                ("a.rs", &[1, 2, 3, 4_usize] as &[usize]),
+                ("b.rs", &[10_usize]),
+                ("c.rs", &[20_usize, 30]),
+                ("d.rs", &[40_usize]),
+            ],
+            max,
+        );
+        assert_eq!(rendered.last().unwrap(), &expand_notice(gained));
+    }
+
+    /// One file has no distribution to summarise, so the matches keep the room.
+    #[test]
+    fn a_condensed_single_file_grep_still_shows_matches() {
+        let rendered = grep_text(&[("a.rs", &[1, 2, 3, 4, 5_usize] as &[usize])], 4);
+        assert_eq!(rendered[0], "5 matches in a.rs");
+        assert!(rendered[1].contains("code at a.rs:1"));
+        assert_eq!(rendered.last().unwrap(), &expand_notice("3 lines"));
+    }
+
+    /// Expanding is what the affordance promised, so it has to give the match
+    /// text back rather than a roomier summary.
+    #[test]
+    fn expanding_a_grep_returns_the_matches_themselves() {
+        let files: &[(&str, &[usize])] = &[("a.rs", &[1, 2, 3_usize]), ("b.rs", &[10_usize, 20])];
+        let rendered = grep_text(files, usize::MAX);
+        assert!(rendered.iter().any(|l| l.contains("code at a.rs:3")));
+        assert!(rendered.iter().any(|l| l.contains("code at b.rs:20")));
+        assert!(!rendered.iter().any(|l| l.contains(EXPAND_AFFORDANCE)));
     }
 
     fn spans_text(spans: &[Span]) -> String {

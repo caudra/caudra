@@ -10,7 +10,7 @@ use crate::markdown::{LinkMap, TerminalLink};
 
 use super::layout::SegmentChrome;
 
-pub(super) const EXPAND_AFFORDANCE: &str = "click to expand";
+pub(super) use crate::markdown::EXPAND_AFFORDANCE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HoverFeedback {
