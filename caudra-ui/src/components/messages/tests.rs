@@ -4381,3 +4381,86 @@ fn changing_mode_keeps_a_batch_child_folded() {
     assert!(!seg_text(&panel, "t1").contains("child_body_line_a"));
     assert!(seg_text(&panel, "t1").contains("child_body_line_b"));
 }
+
+const SPACER_HOLD_MSG: &str = "a card that closes itself must not move what is above it";
+const SPACER_BLANK_MSG: &str = "the rows a closed card holds must draw nothing";
+const SPACER_RECLAIM_MSG: &str = "held rows must go back once they are off screen";
+const SPACER_REOPEN_MSG: &str = "opening a held card by hand must reuse the rows it held";
+const SPACER_SETUP_MSG: &str = "the test must start from a card with a body to give up";
+const HELD_BODY_LINES: usize = 5;
+const REPLIES_PAST_THE_VIEWPORT: usize = 40;
+
+fn auto_panel_with_body(lines: usize) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.tool_done(long_done("t1", lines));
+    rebuild(&mut panel);
+    panel
+}
+
+fn supersede(panel: &mut MessagesPanel) {
+    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t2"));
+    rebuild(panel);
+}
+
+/// The whole point of the held rows: auto closes the card, and the reader,
+/// who may be reading something else entirely, sees nothing move.
+#[test]
+fn a_card_that_closes_itself_holds_the_rows_it_gave_up() {
+    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
+    let open = panel.segment_heights()[0];
+    assert!(open > 1, "{SPACER_SETUP_MSG}");
+
+    supersede(&mut panel);
+
+    assert!(panel.card_closed("t1"), "{AUTO_HANDOFF_MSG}");
+    assert_eq!(panel.segment_heights()[0], open, "{SPACER_HOLD_MSG}");
+}
+
+#[test]
+fn the_rows_a_closed_card_holds_draw_nothing() {
+    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
+    let body = "line 0";
+    assert!(seg_text(&panel, "t1").contains(body), "{SPACER_SETUP_MSG}");
+
+    supersede(&mut panel);
+    let terminal = render(&mut panel, 80, 24);
+
+    assert!(!buffer_text(&terminal).contains(body), "{SPACER_BLANK_MSG}");
+}
+
+/// Held rows are a courtesy to the reader's eyes, not a permanent cost. Once
+/// they are above the viewport, giving them back moves nothing they can see.
+#[test]
+fn held_rows_go_back_once_they_are_off_screen() {
+    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
+    supersede(&mut panel);
+    assert!(panel.segment_heights()[0] > 1, "{SPACER_HOLD_MSG}");
+
+    for i in 0..REPLIES_PAST_THE_VIEWPORT {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("reply {i}"),
+        ));
+    }
+    rebuild(&mut panel);
+
+    assert_eq!(panel.segment_heights()[0], 1, "{SPACER_RECLAIM_MSG}");
+}
+
+/// Reopening has to spend the held rows rather than add to them, or the card
+/// comes back taller than it ever was.
+#[test]
+fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
+    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
+    let open = panel.segment_heights()[0];
+    supersede(&mut panel);
+
+    assert!(
+        panel.handle_click(0, Rect::new(0, 0, 80, 24)),
+        "{COMPACT_CLICK_MSG}"
+    );
+    rebuild(&mut panel);
+
+    assert_eq!(panel.segment_heights()[0], open, "{SPACER_REOPEN_MSG}");
+}

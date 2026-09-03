@@ -343,9 +343,68 @@ impl MessagesPanel {
             return;
         }
         let previous = mem::replace(&mut self.auto_open, latest);
-        for idx in [previous, latest].into_iter().flatten() {
+        if let Some(idx) = previous {
+            self.close_and_hold_the_space(idx);
+        }
+        if let Some(idx) = latest {
             self.rebuild_card(idx);
         }
+    }
+
+    /// Closing a card the reader may be mid-sentence in would pull everything
+    /// below it upward. The rows it gives up stay in the layout as blank ones
+    /// until they are off screen, so the card changes and nothing else moves.
+    /// Measured across the whole cache because a card can carry an
+    /// instruction segment that shrinks with it.
+    fn close_and_hold_the_space(&mut self, msg_index: usize) {
+        let width = self.viewport_width;
+        let before = self.cache.total_height(width);
+        self.rebuild_card(msg_index);
+        let freed = before.saturating_sub(self.cache.total_height(width));
+        let Ok(freed) = u16::try_from(freed) else {
+            return;
+        };
+        if let Some(seg) = self
+            .card_segment(msg_index)
+            .and_then(|idx| self.cache.get_mut(idx))
+        {
+            seg.reserve(freed);
+        }
+    }
+
+    fn card_segment(&self, msg_index: usize) -> Option<usize> {
+        match &self.messages.get(msg_index)?.role {
+            DisplayRole::Tool(t) => self.cache.find_by_tool_id(&t.id),
+            _ => self
+                .cache
+                .segments()
+                .iter()
+                .position(|seg| seg.msg_index == Some(msg_index)),
+        }
+    }
+
+    /// Hands back blank rows once they are off screen. Reclaiming above the
+    /// viewport takes rows out from under the text the reader is looking at,
+    /// so the scroll offset gives up exactly the same ones.
+    fn reclaim_spacers(&mut self, width: u16, viewport_height: u16) {
+        let top = self.scroll_top as u32;
+        let bottom = top + viewport_height as u32;
+        let mut above: u32 = 0;
+        let mut done: Vec<usize> = Vec::new();
+        for (idx, start, rows) in self.cache.spacers(width) {
+            if start + rows as u32 <= top {
+                above += rows as u32;
+                done.push(idx);
+            } else if start >= bottom {
+                done.push(idx);
+            }
+        }
+        for idx in done {
+            self.cache.release(idx);
+        }
+        self.scroll_top = self
+            .scroll_top
+            .saturating_sub(above.min(u16::MAX as u32) as u16);
     }
 
     /// The last card, when the mode is the only thing deciding whether it is
@@ -855,6 +914,7 @@ impl MessagesPanel {
             ..exp
         };
         self.disclosure.insert(tool_id.clone(), Some(flags));
+        self.release_spacer(&tool_id);
         self.rebuild_expanded_tool(&tool_id);
         true
     }
@@ -1377,6 +1437,7 @@ impl MessagesPanel {
             let tool_id = tool_id.to_owned();
             self.disclosure
                 .insert(tool_id.clone(), Some(SectionFlags::default()));
+            self.release_spacer(&tool_id);
             self.rebuild_expanded_tool(&tool_id);
             return true;
         }
@@ -1457,6 +1518,7 @@ impl MessagesPanel {
             return self.close_card(&tool_id);
         }
         self.disclosure.insert(tool_id.clone(), Some(flags));
+        self.release_spacer(&tool_id);
         self.rebuild_expanded_tool(&tool_id);
         true
     }
@@ -1469,6 +1531,7 @@ impl MessagesPanel {
             return false;
         }
         self.disclosure.insert(tool_id.to_owned(), None);
+        self.release_spacer(tool_id);
         self.rebuild_expanded_tool(tool_id);
         true
     }
@@ -1489,6 +1552,12 @@ impl MessagesPanel {
             .toggled(index);
         self.batch_folds.insert(tool_id.to_owned(), folds);
         self.rebuild_tool_segment(tool_id);
+    }
+
+    fn release_spacer(&mut self, tool_id: &str) {
+        if let Some(idx) = self.cache.find_by_tool_id(tool_id) {
+            self.cache.release(idx);
+        }
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
@@ -1704,6 +1773,9 @@ impl MessagesPanel {
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
         self.cache.update_margins(width, self.compact());
+        if !has_selection {
+            self.reclaim_spacers(width, area.height);
+        }
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
         if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
             self.clear_hover();
@@ -1721,19 +1793,19 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
-            let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
             let hover = self
                 .hover_feedback_for_segment(seg)
                 .map(|feedback| (feedback, accent));
             cursor.render(
                 (seg.lines(), Some(seg.links())),
-                h,
+                seg.height(width).saturating_sub(seg.reserved()),
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent),
                 RenderFeedback { highlight, hover },
                 frame,
             );
+            cursor.skip_rows(seg.reserved());
         }
 
         let mut height_idx = 0usize;
