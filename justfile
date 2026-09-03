@@ -2,12 +2,8 @@ monty_worker_name := if os_family() == "windows" { "monty.exe" } else { "monty" 
 monty_worker := justfile_directory() + "/target/code-worker/bin/" + monty_worker_name
 monty_version := "0.0.21"
 workcell_root := justfile_directory() + "/../workcell-mcp/crates"
-# Preserve the Git-pinned lockfile while resolving the sibling Workcell workspace locally.
-local_workcell := if shell("test -f '" + workcell_root + "/workcell/Cargo.toml' && printf yes || true") == "yes" {
-    "--config 'paths=[\"" + workcell_root + "/workcell\"]'"
-} else {
-    ""
-}
+cargo_cmd := justfile_directory() + "/scripts/dev-cargo.sh"
+export WORKCELL_LOCAL := workcell_root + "/workcell"
 export WORKCELL_BUNDLED_MONTY_WORKER := monty_worker
 
 default:
@@ -19,23 +15,23 @@ code-worker:
     "{{ monty_worker }}" --version
 
 build *ARGS:
-    cargo {{local_workcell}} build {{ARGS}}
+    "{{ cargo_cmd }}" build {{ ARGS }}
 
 # Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
 check *ARGS:
-    cargo {{local_workcell}} check --workspace --tests {{ARGS}}
+    "{{ cargo_cmd }}" check --workspace --tests {{ ARGS }}
 
 run *ARGS:
-    cargo {{local_workcell}} run {{ARGS}}
+    "{{ cargo_cmd }}" run {{ ARGS }}
 
 test *ARGS:
-    cargo nextest run {{local_workcell}} --workspace {{ARGS}}
+    "{{ cargo_cmd }}" nextest run --workspace {{ ARGS }}
 
 lint:
-    cargo clippy {{local_workcell}} --all --tests -- -D warnings
+    "{{ cargo_cmd }}" clippy --all --tests -- -D warnings
 
 lint-fix:
-    cargo clippy {{local_workcell}} --all --tests --fix
+    "{{ cargo_cmd }}" clippy --all --tests --fix
 
 fmt-check:
     cargo fmt --all -- --check
@@ -50,10 +46,10 @@ pylint:
     ty check scripts/
 
 gen-docs:
-    cargo {{local_workcell}} run -p caudra-docgen
+    "{{ cargo_cmd }}" run -p caudra-docgen
 
 gen-docs-check:
-    cargo {{local_workcell}} run -p caudra-docgen -- --check
+    "{{ cargo_cmd }}" run -p caudra-docgen -- --check
 
 machete:
     cargo machete

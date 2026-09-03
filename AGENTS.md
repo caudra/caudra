@@ -72,7 +72,8 @@ never persist it or silently fall back when it is invalid. Workcell's `CodeToolG
 extracted worker lease for the complete pool lifetime.
 
 Release builds use the Workcell Git revision pinned in `Cargo.toml`. Development recipes in `justfile`
-override its packages with the sibling `../workcell-mcp` checkout when that repository is present.
+patch its packages from the sibling `../workcell-mcp` checkout when that repository is present and use
+a temporary lockfile seeded from `Cargo.lock`. Use plain Cargo when intentionally updating dependencies.
 
 For worker or release changes, run the production bundled-worker execution test with a real pinned
 worker, not only a catalog check. Release smoke tests must fail when `code_execution` is reserved but
