@@ -17,18 +17,20 @@ Caudra resolves a tool call in this order:
 
 1. Plan-mode and executor restrictions reject prohibited operations.
 2. A matching deny blocks the call.
-3. A single structured allow must cover every unresolved resource in the call.
-4. Builtin and trusted-plugin policy can allow known operations.
-5. YOLO mode can skip a prompt, but cannot override a deny.
-6. The effective default allows, denies, or prompts.
+3. A matching configured ask requires confirmation.
+4. Stored and configured allows cover resources independently. Every unresolved resource needs coverage.
+5. Builtin command-family asks apply when no stored or configured allow covers the command.
+6. Builtin and trusted-plugin policy can allow known operations.
+7. YOLO mode can skip an ask or prompt, but cannot override a deny.
+8. The effective default allows, denies, or prompts.
 
-Partial structured grants are not combined. A call that affects two resources needs one rule that covers the complete reviewed call.
+Allows can combine across resources. A shell chain can use separate grants for `git diff *` and `git status *`. Exact-input rules still apply only to their original complete input.
 
 ## Lifetimes and authorities
 
 Authority controls what a rule covers. Lifetime controls how long the rule remains active. The prompt selects them independently.
 
-Exact call is the default authority. Trusted tool profiles can also offer a URL path, URL origin, filesystem subtree, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
+Exact call is the default authority. Trusted tool profiles can also offer a URL path, URL origin, filesystem subtree, shell command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
 
 Prompt decisions use four lifetimes:
 
@@ -45,7 +47,7 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Permission prompts
 
-The prompt shows the action, risk, selected authority, typed resources, and complete validated JSON before its controls. It expands when the terminal has room and reserves space for chat. The body scrolls on smaller terminals while the controls remain visible. Likely secret values and URL query values are masked.
+The prompt shows the action, risk, selected authority, typed resources, and complete validated JSON before its controls. Resources already covered by another rule appear after unresolved resources with an `already allowed` marker. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible. Likely secret values and URL query values are masked.
 
 | Key | Action |
 |---|---|
@@ -60,7 +62,7 @@ The prompt shows the action, risk, selected authority, typed resources, and comp
 | `f` | Show technical identity and digest details |
 | `Esc` or `Ctrl-C` | Deny once |
 
-Reusable approvals are exact by default. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
+Reusable approvals are exact by default. A parsed shell command can offer a token-bound command pattern such as `git diff *` before the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
 
 Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask. Confirming a reusable authority also approves every pending request it already covers. Conversation, project, and global lifetimes limit which pending conversations or projects can share that approval. Allow once and deny decisions resolve only the selected request.
 
@@ -68,7 +70,7 @@ Multiple requests are queued by request ID. The prompt identifies the requesting
 
 Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker distinguishes exact, selected-input, filesystem subtree, URL subtree, URL origin, and unrestricted authority. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
 
-Project and global prompt decisions are stored in `permission-rules.json` under Caudra's user state directory. The file and its update lock are owner-only. Exact input and resource values are stored as SHA-256 digests. Review metadata keeps only anonymous field positions and value types. Selected-input authorities store their JSON pointers and a digest, but never the selected values.
+Project and global prompt decisions are stored in `permission-rules.json` under Caudra's user state directory. The file and its update lock are owner-only. Exact input and resource values are stored as SHA-256 digests. Host-derived command patterns are stored as clear-text policy, such as `git diff *`. Review metadata keeps only anonymous field positions and value types. Selected-input authorities store their JSON pointers and a digest, but never the selected values.
 
 Conversation rules are stored with the session. A persistent write must finish before Caudra executes the approved call. If storage fails, the durable approval fails and the prompt remains open in the TUI.
 
@@ -79,16 +81,32 @@ Caudra reads policy from:
 - Global: `~/.config/caudra/permissions.toml`
 - Project: `.caudra/permissions.toml`
 
-TOML deny rules and `default = "deny"` remain active. Existing allow rules, allow defaults, and legacy conversation allows are inactive review candidates. This prevents a repository from granting itself authority and prevents an old name-only rule from authorizing a replaced tool.
+TOML supports `deny`, `ask`, and `allow`. Deny and ask rules are active from global and project config. Only validated shell allow patterns can grant authority. Global shell allows are active immediately and bind to Caudra's native Workcell shell contract. Other name-only allows remain inactive review candidates.
+
+Project shell allows require trust before they become active. On startup, the TUI opens `/permissions` and offers to trust the project policy digest for the canonical project. The digest covers project shell allows and every project deny or ask rule. Editing any of them invalidates trust, and `/permissions` can revoke trust explicitly. Non-interactive modes leave untrusted project allows inactive. Project deny and ask rules remain active without trust because they only restrict access. Changing projects with `/cd` reloads the destination policy before further tool calls.
+
+An unreadable or malformed permissions file fails closed. Caudra disables inherited allows and denies tool calls until the file is fixed.
 
 A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
 
-`/permissions` lists these entries as `needs review`. Remove an old config entry or approve a new exact request when it appears. Legacy conversation allows can be removed directly from the picker.
+`/permissions` lists inactive entries as `needs review`, shows trusted config policy, and can revoke remembered prompt decisions. Legacy conversation allows can be removed directly from the picker.
 
 ```toml
 default = "prompt"
 
 [shell]
+allow = [
+    "rg *",
+    "git status *",
+    "git diff *",
+    "git log *",
+]
+ask = [
+    "*",
+    "git commit *",
+    "git push *",
+    "git reset *",
+]
 deny = [
     "sudo *",
     "rm -rf *",
@@ -97,6 +115,14 @@ deny = [
 [mcp.github]
 deny = ["admin_delete"]
 ```
+
+Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
+
+Command patterns never authorize shell redirects. A command containing `<` or `>` outside quotes becomes a protected exact request that includes the complete original command. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
+
+For shell allow and ask rules, the most specific matching pattern wins and ask wins a tie. Any matching deny still blocks the complete call. Rule order in the file has no effect. A catch-all `ask = ["*"]` can therefore coexist with more specific read-only allows.
+
+Caudra also asks by default for these command families unless a configured or remembered allow covers them: `rm`, destructive Git operations, `chmod`, `chown`, `dd`, `mkfs`, network transfer and remote-login commands, and process termination commands.
 
 Legacy deny matching remains glob-like for compatibility:
 
@@ -108,7 +134,7 @@ Legacy deny matching remains glob-like for compatibility:
 | `dir/**` | The directory and descendants, using path components |
 | Other | Exact text |
 
-New remembered decisions use structured matching rather than these strings.
+New remembered decisions use structured matching. Shell command authorities use the strict token pattern grammar above.
 
 ## Typed resources
 
@@ -137,9 +163,11 @@ The TUI can select broad whole-tool MCP authority for the current conversation. 
 
 ## Shell parsing
 
-Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, functions, and redirects so nested commands and redirect targets remain visible to deny rules.
+Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, and functions so each command in `&&`, `||`, `;`, and pipeline expressions is authorized independently. Shell redirects keep the complete original command as protected exact authority.
 
-Command substitution, process substitution, subshells, arithmetic expansion, unresolved redirect targets, and parse failures force exact review.
+The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments rather than arbitrary text.
+
+Command substitution, process substitution, subshells, arithmetic expansion, redirects, and parse failures force exact review.
 
 Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 

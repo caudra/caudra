@@ -545,13 +545,17 @@ fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
 fn rules_to_stored(rules: &[PermissionRule]) -> Vec<StoredRule> {
     rules
         .iter()
-        .map(|rule| StoredRule {
-            tool: rule.tool.to_string(),
-            scope: rule.scope.clone(),
-            effect: match rule.effect {
+        .filter_map(|rule| {
+            let effect = match rule.effect {
                 Effect::Allow => StoredEffect::Allow,
                 Effect::Deny => StoredEffect::Deny,
-            },
+                Effect::Ask => return None,
+            };
+            Some(StoredRule {
+                tool: rule.tool.to_string(),
+                scope: rule.scope.clone(),
+                effect,
+            })
         })
         .collect()
 }

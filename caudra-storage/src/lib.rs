@@ -9,6 +9,7 @@ pub mod log;
 pub mod mcp_trust;
 pub mod model;
 pub mod paths;
+pub mod permission_config_trust;
 pub mod permission_state;
 pub mod plans;
 pub mod prompt_stash;

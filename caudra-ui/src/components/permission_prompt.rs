@@ -717,24 +717,41 @@ impl PermissionPrompt {
         if request.presentation.resources.is_empty() {
             lines.push(Line::from(Span::styled("    none declared", t.tool_dim)));
         } else {
-            lines.extend(request.presentation.resources.iter().map(|resource| {
-                let access = resource
-                    .access
-                    .as_ref()
-                    .map(|access| format!("{:?} ", access).to_lowercase())
-                    .unwrap_or_default();
-                let kind = format!("{:?}", resource.kind).to_lowercase();
-                let protected = if resource.protected {
-                    " [protected]"
-                } else {
-                    ""
-                };
-                Line::from(vec![
-                    Span::styled("    - ", t.tool_dim),
-                    Span::styled(format!("{access}{kind}: "), label),
-                    Span::styled(format!("{}{protected}", safe(&resource.summary)), value),
-                ])
-            }));
+            for covered in [false, true] {
+                lines.extend(
+                    request
+                        .presentation
+                        .resources
+                        .iter()
+                        .filter(|resource| resource.covered == covered)
+                        .map(|resource| {
+                            let access = resource
+                                .access
+                                .as_ref()
+                                .map(|access| format!("{:?} ", access).to_lowercase())
+                                .unwrap_or_default();
+                            let kind = format!("{:?}", resource.kind).to_lowercase();
+                            let protected = if resource.protected {
+                                " [protected]"
+                            } else {
+                                ""
+                            };
+                            let summary_style = if resource.covered { t.tool_dim } else { value };
+                            let mut spans = vec![
+                                Span::styled("    - ", t.tool_dim),
+                                Span::styled(format!("{access}{kind}: "), label),
+                                Span::styled(
+                                    format!("{}{protected}", safe(&resource.summary)),
+                                    summary_style,
+                                ),
+                            ];
+                            if resource.covered {
+                                spans.push(Span::styled(" [already allowed]", t.tool_dim));
+                            }
+                            Line::from(spans)
+                        }),
+                );
+            }
         }
         let options: Vec<_> = authorities(request).collect();
         if !options.is_empty() {
@@ -1221,6 +1238,77 @@ mod tests {
         let controls = screen.find("Allow once").unwrap();
         assert!(action < input && input < controls);
         assert!(screen.contains("Not sent to tool until approved"));
+    }
+
+    fn prompt_with_mixed_resource_coverage() -> PermissionPrompt {
+        let mut structured = request("coverage", json!({"command": "cargo test"}));
+        let resource = structured.presentation.resources[0].clone();
+        let mut covered_first = resource.clone();
+        covered_first.summary = "covered\u{1b}[31m-first".into();
+        covered_first.protected = false;
+        covered_first.covered = true;
+        let mut uncovered = resource.clone();
+        uncovered.summary = "needs-approval".into();
+        uncovered.protected = false;
+        let mut covered_last = resource;
+        covered_last.summary = "covered-last".into();
+        covered_last.covered = true;
+        structured.presentation.resources = vec![covered_first, uncovered, covered_last];
+
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(structured, None);
+        prompt
+    }
+
+    #[test]
+    fn covered_resources_render_after_uncovered_with_marker() {
+        let mut prompt = prompt_with_mixed_resource_coverage();
+        let screen = render(&mut prompt, 120, 60);
+        let uncovered = screen.find("needs-approval").unwrap();
+        let covered_first = screen.find(r"covered\u{1b}[31m-first").unwrap();
+        let covered_last = screen.find("covered-last").unwrap();
+
+        assert!(uncovered < covered_first && covered_first < covered_last);
+        assert_eq!(screen.matches("[already allowed]").count(), 2);
+        assert!(screen.contains("execute command: needs-approval"));
+        assert!(screen.contains("covered-last [protected] [already allowed]"));
+        assert!(!screen.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn covered_resource_rows_are_dimmed() {
+        let prompt = prompt_with_mixed_resource_coverage();
+        let body = prompt.body(prompt.current().unwrap());
+        let covered = body
+            .lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("covered-last"))
+            })
+            .unwrap();
+        let uncovered = body
+            .lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("needs-approval"))
+            })
+            .unwrap();
+
+        assert!(
+            covered
+                .spans
+                .iter()
+                .all(|span| span.style == theme::current().tool_dim)
+        );
+        assert_eq!(
+            uncovered.spans[2].style,
+            Style::new().fg(theme::current().foreground)
+        );
+        assert_eq!(uncovered.spans.len(), 3);
     }
 
     #[test]

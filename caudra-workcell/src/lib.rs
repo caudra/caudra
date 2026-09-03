@@ -73,6 +73,7 @@ const CODE_WORKER_UNAVAILABLE: &str =
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
+const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -1343,9 +1344,9 @@ fn file_permissions(
 }
 
 fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvocation {
-    let opaque = shell.analysis().opaque;
+    let opaque = shell.analysis().opaque || shell_command_has_redirection(shell.command());
     let workdir = shell.workdir().to_string_lossy().into_owned();
-    let scopes = if shell.analysis().scopes.is_empty() {
+    let scopes = if opaque || shell.analysis().scopes.is_empty() {
         vec![shell_permission_scope(shell.command(), shell.workdir())]
     } else {
         shell
@@ -1355,25 +1356,31 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
             .map(|scope| shell_permission_scope(&scope.source, shell.workdir()))
             .collect()
     };
-    let commands: Vec<String> = if shell.analysis().scopes.is_empty() {
-        vec![shell.command().into()]
+    let commands: Vec<(String, Option<String>)> = if opaque || shell.analysis().scopes.is_empty() {
+        vec![(shell.command().into(), None)]
     } else {
         shell
             .analysis()
             .scopes
             .iter()
-            .map(|scope| scope.normalized.clone())
+            .map(|scope| (scope.source.clone(), Some(scope.normalized.clone())))
             .collect()
     };
     let resources = commands
         .into_iter()
-        .map(|command| PermissionResource {
-            kind: PermissionResourceKind::Command,
-            value: command,
-            access: Some(PermissionResourceAccess::Execute),
-            protected: opaque,
-            requires_prompt: opaque,
-            attributes: BTreeMap::from([("workdir".into(), workdir.clone())]),
+        .map(|(command, normalized)| {
+            let mut attributes = BTreeMap::from([("workdir".into(), workdir.clone())]);
+            if let Some(normalized) = normalized {
+                attributes.insert(NORMALIZED_COMMAND_ATTRIBUTE.into(), normalized);
+            }
+            PermissionResource {
+                kind: PermissionResourceKind::Command,
+                value: command,
+                access: Some(PermissionResourceAccess::Execute),
+                protected: opaque,
+                requires_prompt: opaque,
+                attributes,
+            }
         })
         .collect();
     let authority = if opaque {
@@ -1398,6 +1405,51 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
         execution: PreparedExecution::Shell(group, shell),
         mutation_targets: Vec::new(),
     }
+}
+
+fn shell_command_has_redirection(command: &str) -> bool {
+    if command.contains("$'") || command.contains("$\"") {
+        return true;
+    }
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut comment_eligible = true;
+    let mut chars = command.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' if !single_quoted => {
+                chars.next();
+                comment_eligible = false;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                comment_eligible = false;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                comment_eligible = false;
+            }
+            '#' if !single_quoted && !double_quoted && comment_eligible => {
+                for character in chars.by_ref() {
+                    if character == '\n' {
+                        comment_eligible = true;
+                        break;
+                    }
+                }
+            }
+            '<' | '>' if !single_quoted && !double_quoted => return true,
+            '\n' if !single_quoted && !double_quoted => comment_eligible = true,
+            character if !single_quoted && !double_quoted && character.is_whitespace() => {
+                comment_eligible = true;
+            }
+            ';' | '|' | '&' | '(' | ')' if !single_quoted && !double_quoted => {
+                comment_eligible = true;
+            }
+            _ if !single_quoted && !double_quoted => comment_eligible = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn exact_custom_prepared(
@@ -1981,6 +2033,77 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         host.register(&registry).expect("Workcell registration");
         (host, registry)
+    }
+
+    #[test_case("git status > /tmp/status", true; "output_redirect")]
+    #[test_case("> /tmp/status git status", true; "leading_redirect")]
+    #[test_case("cat 2>>errors", true; "fd_redirect")]
+    #[test_case("cat <input", true; "input_redirect")]
+    #[test_case("cat <<EOF\nvalue\nEOF", true; "heredoc")]
+    #[test_case("cat <<<value", true; "here_string")]
+    #[test_case("git status # '\n> victim", true; "quote_in_comment_before_redirect")]
+    #[test_case("printf foo#bar > output", true; "hash_inside_word_before_redirect")]
+    #[test_case("printf ok # > ignored", false; "redirect_inside_comment")]
+    #[test_case("printf '%s > %s' left right", false; "single_quoted_literal")]
+    #[test_case(r#"printf ">""#, false; "double_quoted_literal")]
+    #[test_case(r"printf \>", false; "escaped_literal")]
+    #[test_case(r"printf $'a\'b'", true; "ansi_c_quoted_command")]
+    fn shell_redirections_require_exact_authority(command: &str, expected: bool) {
+        assert_eq!(shell_command_has_redirection(command), expected);
+    }
+
+    #[test_case("/usr/bin/git status"; "absolute_executable")]
+    #[test_case("./git status"; "relative_executable")]
+    fn shell_preflight_preserves_the_executable_path(command: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("shell preflight")
+            .expect("shell permission intent");
+
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(intent.resources[0].value, command);
+        assert_eq!(
+            intent.resources[0]
+                .attributes
+                .get(NORMALIZED_COMMAND_ATTRIBUTE)
+                .map(String::as_str),
+            Some("git status")
+        );
+    }
+
+    #[test_case("git status > status.txt"; "trailing_redirect")]
+    #[test_case("> status.txt git status"; "leading_redirect")]
+    #[test_case("git status # '\n> victim"; "quote_in_comment")]
+    fn shell_redirect_preflight_preserves_the_full_protected_command(command: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("shell preflight")
+            .expect("shell permission intent");
+
+        assert!(intent.scopes.force_prompt);
+        assert_eq!(intent.authority, PermissionAuthorityProfile::ExactOnly);
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(intent.resources[0].value, command);
+        assert!(intent.resources[0].protected);
+        assert!(intent.resources[0].requires_prompt);
     }
 
     fn shell_output(exit_code: i32) -> WorkcellShellOutput {

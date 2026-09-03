@@ -23,6 +23,7 @@ const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
+const NORMALIZED_COMMAND_ATTRIBUTE: &str = super::NORMALIZED_COMMAND_ATTRIBUTE;
 const FILE_READ_TOOLS: &[&str] = &["file_read", "index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
@@ -85,6 +86,8 @@ pub struct PermissionResourcePresentation {
     pub access: Option<PermissionResourceAccess>,
     pub summary: String,
     pub protected: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub covered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +575,32 @@ pub fn permission_rule_covers_request(
         })
 }
 
+pub fn permission_rule_covers_resource(
+    rule: &StructuredPermissionRule,
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> bool {
+    rule.effect == StructuredPermissionEffect::Allow
+        && rule_context_matches(rule, request)
+        && rule
+            .resources
+            .iter()
+            .any(|constraint| resource_constraint_matches(constraint, resource))
+}
+
+pub fn permission_rules_cover_request(
+    rules: &[StructuredPermissionRule],
+    request: &PermissionRequest,
+) -> bool {
+    rules.iter().any(|rule| {
+        rule.effect == StructuredPermissionEffect::Allow && rule_context_matches(rule, request)
+    }) && request.resources.iter().all(|resource| {
+        rules
+            .iter()
+            .any(|rule| permission_rule_covers_resource(rule, request, resource))
+    })
+}
+
 pub fn permission_rule_intersects_request(
     rule: &StructuredPermissionRule,
     request: &PermissionRequest,
@@ -596,10 +625,7 @@ pub fn evaluate_structured_permission_rules(
     {
         return StructuredPermissionDecision::Deny;
     }
-    if rules
-        .iter()
-        .any(|rule| permission_rule_covers_request(rule, request))
-    {
+    if permission_rules_cover_request(rules, request) {
         StructuredPermissionDecision::Allow
     } else {
         StructuredPermissionDecision::NoMatch
@@ -635,6 +661,10 @@ fn selector_matches(
         PermissionResourceSelector::UrlOriginDigest { digest } => {
             matches!(kind, PermissionResourceKind::Url)
                 && url_origin_digest(value).is_some_and(|actual| actual == *digest)
+        }
+        PermissionResourceSelector::CommandPattern { pattern } => {
+            matches!(kind, PermissionResourceKind::Command)
+                && super::command_pattern::matches(pattern, value)
         }
         PermissionResourceSelector::Exact { value: expected } => match kind {
             PermissionResourceKind::File | PermissionResourceKind::Directory => {
@@ -1188,6 +1218,7 @@ fn exact_resource_constraints(
             attributes: resource
                 .attributes
                 .iter()
+                .filter(|(name, _)| name.as_str() != NORMALIZED_COMMAND_ATTRIBUTE)
                 .map(|(name, value)| {
                     let kind = if name == "workdir" {
                         PermissionResourceKind::Directory
@@ -1431,6 +1462,58 @@ fn rule_options(
             false,
             None,
         ));
+        let mut patterns = Vec::new();
+        let mut exact_fallbacks = 0;
+        let pattern_constraints = exact_resource_constraints(resources)
+            .into_iter()
+            .zip(resources)
+            .map(|(mut constraint, resource)| {
+                if let Some(pattern) = super::command_pattern::reusable_prefix(&resource.value) {
+                    if !patterns.contains(&pattern) {
+                        patterns.push(pattern.clone());
+                    }
+                    constraint.selector = PermissionResourceSelector::CommandPattern { pattern };
+                } else {
+                    exact_fallbacks += 1;
+                }
+                constraint
+            })
+            .collect();
+        if !patterns.is_empty() {
+            let label = if patterns.len() == 1 && exact_fallbacks == 0 {
+                format!(
+                    "Any `{}` command in this workdir",
+                    patterns[0].strip_suffix(" *").unwrap_or(&patterns[0])
+                )
+            } else {
+                "These command patterns in this workdir".into()
+            };
+            let summaries = patterns
+                .iter()
+                .map(|pattern| safe_summary(pattern))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let description = if exact_fallbacks == 0 {
+                format!("Allow commands matching these patterns in this workdir: {summaries}.")
+            } else {
+                format!(
+                    "Allow commands matching these patterns in this workdir: {summaries}. Keep {exact_fallbacks} exact fallback command{}.",
+                    if exact_fallbacks == 1 { "" } else { "s" }
+                )
+            };
+            options.push(option(
+                "allow_command_patterns",
+                &label,
+                &description,
+                StructuredPermissionEffect::Allow,
+                pattern_constraints,
+                PermissionArgumentConstraint::Unconstrained,
+                reusable.clone(),
+                true,
+                false,
+                None,
+            ));
+        }
         if let Some(workdir) = resources
             .first()
             .and_then(|resource| resource.attributes.get("workdir"))
@@ -1727,10 +1810,24 @@ fn presentation_for(
                     access: resource.access.clone(),
                     summary,
                     protected: resource.protected,
+                    covered: false,
                 }
             })
             .collect(),
     }
+}
+
+pub fn update_presentation_coverage(
+    presentation: &mut PermissionPresentation,
+    covered: &[bool],
+) -> bool {
+    if presentation.resources.len() != covered.len() {
+        return false;
+    }
+    for (resource, covered) in presentation.resources.iter_mut().zip(covered) {
+        resource.covered = *covered;
+    }
+    true
 }
 
 fn redacted_url_summary(value: &str) -> String {
@@ -1823,6 +1920,17 @@ mod tests {
             protected: false,
             requires_prompt: false,
             attributes: BTreeMap::new(),
+        }
+    }
+
+    fn command_resource(value: &str, workdir: &str) -> PermissionResource {
+        PermissionResource {
+            kind: PermissionResourceKind::Command,
+            value: value.into(),
+            access: Some(PermissionResourceAccess::Execute),
+            protected: false,
+            requires_prompt: false,
+            attributes: BTreeMap::from([("workdir".into(), workdir.into())]),
         }
     }
 
@@ -2192,11 +2300,11 @@ mod tests {
     }
 
     #[test]
-    fn one_allow_rule_must_cover_the_complete_request() {
-        let first = custom_resource("first");
-        let second = custom_resource("second");
+    fn separate_allow_rules_union_to_cover_a_multi_command_request() {
+        let first = command_resource("cargo test", "/project");
+        let second = command_resource("git status", "/project");
         let request = request(vec![first.clone(), second.clone()]);
-        let partial_rules = vec![
+        let allow_rules = vec![
             rule(
                 &request,
                 StructuredPermissionEffect::Allow,
@@ -2208,18 +2316,73 @@ mod tests {
                 vec![exact_constraint(&second)],
             ),
         ];
+
+        assert!(permission_rule_covers_resource(
+            &allow_rules[0],
+            &request,
+            &first
+        ));
+        assert!(permission_rule_covers_resource(
+            &allow_rules[1],
+            &request,
+            &second
+        ));
+        assert!(permission_rules_cover_request(&allow_rules, &request));
         assert_eq!(
-            evaluate_structured_permission_rules(&partial_rules, &request),
-            StructuredPermissionDecision::NoMatch
+            evaluate_structured_permission_rules(&allow_rules, &request),
+            StructuredPermissionDecision::Allow
         );
-        let complete = rule(
+        assert!(!permission_rule_covers_request(&allow_rules[0], &request));
+    }
+
+    #[test]
+    fn missing_resource_keeps_union_coverage_at_no_match() {
+        let first = command_resource("cargo test", "/project");
+        let second = command_resource("git status", "/project");
+        let request = request(vec![first.clone(), second]);
+        let allow = rule(
             &request,
             StructuredPermissionEffect::Allow,
-            vec![exact_constraint(&first), exact_constraint(&second)],
+            vec![exact_constraint(&first)],
         );
+
+        assert!(!permission_rules_cover_request(
+            std::slice::from_ref(&allow),
+            &request
+        ));
         assert_eq!(
-            evaluate_structured_permission_rules(&[complete], &request),
-            StructuredPermissionDecision::Allow
+            evaluate_structured_permission_rules(&[allow], &request),
+            StructuredPermissionDecision::NoMatch
+        );
+    }
+
+    #[test]
+    fn exact_input_rule_cannot_contribute_to_a_different_input() {
+        let first = command_resource("cargo test", "/project");
+        let second = command_resource("git status", "/project");
+        let request = request(vec![first.clone(), second.clone()]);
+        let mut wrong_input = rule(
+            &request,
+            StructuredPermissionEffect::Allow,
+            vec![exact_constraint(&first)],
+        );
+        wrong_input.arguments = PermissionArgumentConstraint::Exact {
+            digest: canonical_json_sha256(&json!({"branch": "other"})),
+        };
+        let second_allow = rule(
+            &request,
+            StructuredPermissionEffect::Allow,
+            vec![exact_constraint(&second)],
+        );
+
+        assert!(!permission_rule_covers_resource(
+            &wrong_input,
+            &request,
+            &first
+        ));
+        assert_eq!(
+            evaluate_structured_permission_rules(&[wrong_input, second_allow], &request),
+            StructuredPermissionDecision::NoMatch
         );
     }
 
@@ -2227,11 +2390,16 @@ mod tests {
     fn deny_intersection_blocks_if_any_resource_matches() {
         let first = custom_resource("first");
         let second = custom_resource("second");
-        let request = request(vec![first, second.clone()]);
-        let allow = rule(
+        let request = request(vec![first.clone(), second.clone()]);
+        let first_allow = rule(
             &request,
             StructuredPermissionEffect::Allow,
-            request.resources.iter().map(exact_constraint).collect(),
+            vec![exact_constraint(&first)],
+        );
+        let second_allow = rule(
+            &request,
+            StructuredPermissionEffect::Allow,
+            vec![exact_constraint(&second)],
         );
         let deny = rule(
             &request,
@@ -2239,7 +2407,7 @@ mod tests {
             vec![exact_constraint(&second)],
         );
         assert_eq!(
-            evaluate_structured_permission_rules(&[allow, deny], &request),
+            evaluate_structured_permission_rules(&[first_allow, second_allow, deny], &request),
             StructuredPermissionDecision::Deny
         );
     }
@@ -2281,6 +2449,38 @@ mod tests {
         assert!(resource_constraint_matches(
             &exact_constraint(&resource),
             &resource
+        ));
+    }
+
+    #[test]
+    fn protected_command_does_not_treat_a_command_pattern_as_exact() {
+        let mut resource = command_resource("git diff --stat", "/project");
+        resource.protected = true;
+        let mut pattern = exact_resource_constraints(std::slice::from_ref(&resource))
+            .pop()
+            .unwrap();
+        pattern.selector = PermissionResourceSelector::CommandPattern {
+            pattern: "git diff *".into(),
+        };
+
+        assert!(!resource_constraint_matches(&pattern, &resource));
+    }
+
+    #[test]
+    fn command_pattern_matches_quoted_command_tokens_only_for_commands() {
+        let selector = PermissionResourceSelector::CommandPattern {
+            pattern: "git diff *".into(),
+        };
+
+        assert!(selector_matches(
+            &selector,
+            r#"git "diff" -- "src/file name.rs""#,
+            &PermissionResourceKind::Command
+        ));
+        assert!(!selector_matches(
+            &selector,
+            r#"git "diff" -- "src/file name.rs""#,
+            &PermissionResourceKind::Query
         ));
     }
 
@@ -2411,6 +2611,163 @@ mod tests {
         let persisted = serde_json::to_string(&any).unwrap();
         assert!(!persisted.contains("example.com"));
         assert!(!persisted.contains("secret"));
+    }
+
+    #[test]
+    fn shell_pattern_option_preserves_exact_fallbacks_and_resource_context() {
+        let resources = vec![
+            command_resource("git diff --stat", "/project"),
+            command_resource("git status --short", "/project"),
+            command_resource(r#"printf "%s\n" done"#, "/project"),
+        ];
+        let exact_constraints = exact_resource_constraints(&resources);
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            resources,
+            json!({"command": "multiple", "timeout": 30}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_command_patterns")
+            .unwrap();
+
+        assert_eq!(option.label, "These command patterns in this workdir");
+        assert_eq!(
+            option.description,
+            "Allow commands matching these patterns in this workdir: git diff *, git status *. Keep 1 exact fallback command."
+        );
+        assert!(option.broad);
+        assert!(!option.is_default);
+        assert_eq!(option.confirmation, None);
+        assert_eq!(
+            option.allowed_lifetimes,
+            [
+                PermissionLifetime::Conversation,
+                PermissionLifetime::Project,
+                PermissionLifetime::Global,
+            ]
+        );
+        assert!(matches!(
+            option.rule.arguments,
+            PermissionArgumentConstraint::Unconstrained
+        ));
+        assert!(matches!(
+            &option.rule.resources[0].selector,
+            PermissionResourceSelector::CommandPattern { pattern } if pattern == "git diff *"
+        ));
+        assert!(matches!(
+            &option.rule.resources[1].selector,
+            PermissionResourceSelector::CommandPattern { pattern } if pattern == "git status *"
+        ));
+        assert_eq!(
+            option.rule.resources[2].selector,
+            exact_constraints[2].selector
+        );
+        for (constraint, exact) in option.rule.resources.iter().zip(&exact_constraints) {
+            assert_eq!(constraint.kind, exact.kind);
+            assert_eq!(constraint.access, exact.access);
+            assert_eq!(constraint.protected, exact.protected);
+            assert_eq!(constraint.attributes, exact.attributes);
+        }
+        assert!(!option.description.contains("printf"));
+        assert!(!option.description.contains("/project"));
+    }
+
+    #[test]
+    fn shell_pattern_option_uses_a_single_prefix_label() {
+        let mut resource = command_resource("/usr/bin/git diff --stat", "/project");
+        resource.attributes.insert(
+            super::NORMALIZED_COMMAND_ATTRIBUTE.into(),
+            "git diff --stat".into(),
+        );
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![resource],
+            json!({"command": "/usr/bin/git diff --stat"}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_command_patterns")
+            .unwrap();
+
+        assert_eq!(
+            option.label,
+            "Any `/usr/bin/git diff` command in this workdir"
+        );
+        assert!(
+            !option.rule.resources[0]
+                .attributes
+                .contains_key(super::NORMALIZED_COMMAND_ATTRIBUTE)
+        );
+
+        let mut next_resource = command_resource("/usr/bin/git diff --check", "/project");
+        next_resource.attributes.insert(
+            super::NORMALIZED_COMMAND_ATTRIBUTE.into(),
+            "git diff --check".into(),
+        );
+        let next = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![next_resource],
+            json!({"command": "/usr/bin/git diff --check"}),
+        );
+        assert!(permission_rule_covers_request(&option.rule, &next));
+    }
+
+    #[test]
+    fn shell_pattern_option_is_absent_without_a_reusable_prefix() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![
+                command_resource("rm -rf /tmp/build", "/project"),
+                command_resource(r#"printf "%s\n" done"#, "/project"),
+            ],
+            json!({"command": "multiple"}),
+        );
+
+        assert!(
+            request
+                .options
+                .iter()
+                .all(|option| option.id != "allow_command_patterns")
+        );
+    }
+
+    #[test]
+    fn presentation_coverage_defaults_false_and_updates_atomically() {
+        let resource = PermissionResourcePresentation {
+            kind: PermissionResourceKind::Command,
+            access: Some(PermissionResourceAccess::Execute),
+            summary: "git status".into(),
+            protected: false,
+            covered: false,
+        };
+        let serialized = serde_json::to_value(&resource).unwrap();
+        assert!(serialized.get("covered").is_none());
+        let restored: PermissionResourcePresentation = serde_json::from_value(serialized).unwrap();
+        assert!(!restored.covered);
+
+        let mut presentation = PermissionPresentation {
+            action: "Run commands".into(),
+            risk: PermissionRisk::High,
+            risk_summary: "Shell execution".into(),
+            resources: vec![resource.clone(), resource],
+        };
+        assert!(update_presentation_coverage(
+            &mut presentation,
+            &[true, false]
+        ));
+        assert!(presentation.resources[0].covered);
+        assert!(!presentation.resources[1].covered);
+
+        let unchanged = presentation.clone();
+        assert!(!update_presentation_coverage(&mut presentation, &[false]));
+        assert_eq!(presentation, unchanged);
+        assert_eq!(
+            serde_json::to_value(&presentation.resources[0]).unwrap()["covered"],
+            true
+        );
     }
 
     #[test]

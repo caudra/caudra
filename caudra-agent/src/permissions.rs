@@ -1,26 +1,35 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 
 use caudra_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionReviewCandidate, PermissionRule,
     PermissionsConfig, ToolKey,
 };
+use caudra_storage::permission_config_trust::{
+    is_project_trusted as is_permission_config_trusted,
+    revoke_project_trust as revoke_project_permission_config,
+    trust_project as trust_project_permission_config,
+};
 use caudra_storage::permission_state::{
     PERMISSION_STATE_FILE, PermissionState, validate_conversation_record,
 };
 use caudra_storage::{StateDir, now_epoch};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::{AgentEvent, EventSender};
 
+#[allow(dead_code)]
+pub(crate) mod command_pattern;
 mod structured;
 pub use structured::*;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
+const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
 
 /// Tests assert on this exact prefix; a wording tweak here updates them in one place.
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
@@ -293,8 +302,7 @@ pub struct PermissionManager {
     structured_conversation_rules: Mutex<Vec<PermissionRuleRecord>>,
     conversation_policy_error: Mutex<Option<String>>,
     broker: Arc<PermissionBroker>,
-    config_rules: Vec<PermissionRule>,
-    review_candidates: Vec<PermissionReviewCandidate>,
+    configured: RwLock<ConfiguredPolicy>,
     yolo: AtomicBool,
     /// Whether the user set yolo for this session themselves, which is what
     /// makes it worth persisting.
@@ -302,11 +310,20 @@ pub struct PermissionManager {
     /// What `--yolo` / `always_yolo` seeded `yolo` with, so a session with no
     /// stored intent falls back to the flag instead of to off.
     seed_yolo: bool,
-    default: DefaultEffect,
-    tool_defaults: HashMap<ToolKey, DefaultEffect>,
     project: Mutex<ProjectContext>,
     policy: Option<Arc<SharedPermissionState>>,
     plugin_rules: Arc<PluginRuleStore>,
+}
+
+#[derive(Clone)]
+struct ConfiguredPolicy {
+    rules: Vec<PermissionRule>,
+    project_allow_rules: Vec<PermissionRule>,
+    project_config_digest: Option<String>,
+    project_config_root: Option<PathBuf>,
+    review_candidates: Vec<PermissionReviewCandidate>,
+    default: DefaultEffect,
+    tool_defaults: HashMap<ToolKey, DefaultEffect>,
 }
 
 #[derive(Clone)]
@@ -326,12 +343,14 @@ struct SharedPolicy {
 struct PermissionBroker(Mutex<HashMap<u64, HashMap<String, PendingPermission>>>);
 
 struct SharedPermissionState {
+    state_dir: StateDir,
     policy: Mutex<SharedPolicy>,
     broker: Arc<PermissionBroker>,
 }
 
 struct PendingPermission {
     request: PermissionRequest,
+    prompt_required: Vec<bool>,
     project: Option<PathBuf>,
     event_tx: EventSender,
     sender: flume::Sender<PendingDecision>,
@@ -378,6 +397,7 @@ fn shared_policy(state_dir: StateDir) -> Arc<SharedPermissionState> {
     }
     policies.retain(|_, policy| policy.strong_count() > 0);
     let policy = Arc::new(SharedPermissionState {
+        state_dir: state_dir.clone(),
         policy: Mutex::new(match PermissionState::open(&state_dir) {
             Ok(state) => SharedPolicy {
                 state: Some(state),
@@ -442,6 +462,144 @@ fn reusable_rule_scope_matches(
             source_project.is_some() && source_project == candidate_project
         }
         PermissionLifetime::Global => true,
+    }
+}
+
+fn project_permission_config_digest(
+    allow_rules: &[PermissionRule],
+    restrictive_rules: &[PermissionRule],
+) -> Option<String> {
+    if allow_rules.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<_> = allow_rules
+        .iter()
+        .chain(restrictive_rules)
+        .map(|rule| {
+            (
+                rule.tool.to_string(),
+                rule.scope.as_deref().unwrap_or("*").to_owned(),
+                command_policy_priority(rule.effect),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries.dedup();
+
+    let mut hasher = Sha256::new();
+    hash_permission_config_field(&mut hasher, b"caudra-permission-config-v1");
+    hash_permission_config_field(&mut hasher, &(entries.len() as u64).to_be_bytes());
+    for (tool, pattern, effect) in entries {
+        hash_permission_config_field(&mut hasher, tool.as_bytes());
+        hash_permission_config_field(&mut hasher, pattern.as_bytes());
+        hash_permission_config_field(&mut hasher, &[effect]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_permission_config_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn configured_policy(
+    config: PermissionsConfig,
+    project_config_root: Option<PathBuf>,
+) -> ConfiguredPolicy {
+    let project_config_digest = project_permission_config_digest(
+        &config.project_allow_rules,
+        &config.project_restrictive_rules,
+    );
+    ConfiguredPolicy {
+        rules: config.rules,
+        project_allow_rules: config.project_allow_rules,
+        project_config_digest,
+        project_config_root,
+        review_candidates: config.review_candidates,
+        default: config.default,
+        tool_defaults: config.tool_defaults,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandPolicyDecision {
+    Allow,
+    Ask,
+    Deny,
+    NoMatch,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScopeRuleDecision {
+    allowed: bool,
+    must_prompt: bool,
+    denied: bool,
+}
+
+fn command_policy_priority(effect: Effect) -> u8 {
+    match effect {
+        Effect::Allow => 0,
+        Effect::Ask => 1,
+        Effect::Deny => 2,
+    }
+}
+
+fn configured_command_decision<'a>(
+    rules: impl IntoIterator<Item = &'a PermissionRule>,
+    tool: &ToolKey,
+    command: &str,
+    normalized_command: Option<&str>,
+    requires_exact: bool,
+) -> CommandPolicyDecision {
+    let mut best = None;
+    for rule in rules {
+        if !command_rule_tool_matches(&rule.tool, tool) {
+            continue;
+        }
+        if requires_exact && rule.effect == Effect::Deny {
+            return CommandPolicyDecision::Deny;
+        }
+        let matches = match (&rule.scope, rule.effect) {
+            (None, _) => true,
+            (Some(pattern), Effect::Deny) => {
+                scope_matches(pattern, command)
+                    || command_pattern::matches(pattern, command)
+                    || normalized_command.is_some_and(|normalized| {
+                        scope_matches(pattern, normalized)
+                            || command_pattern::matches(pattern, normalized)
+                    })
+            }
+            (Some(pattern), Effect::Allow | Effect::Ask) => {
+                command_pattern::matches(pattern, command)
+                    || rule.effect == Effect::Ask
+                        && normalized_command
+                            .is_some_and(|normalized| command_pattern::matches(pattern, normalized))
+            }
+        };
+        if !matches || requires_exact && rule.effect == Effect::Allow {
+            continue;
+        }
+        if rule.effect == Effect::Deny {
+            return CommandPolicyDecision::Deny;
+        }
+        let specificity = rule
+            .scope
+            .as_deref()
+            .and_then(command_pattern::specificity)
+            .unwrap_or((0, 0));
+        if best.is_none_or(|(best_specificity, best_effect)| {
+            specificity > best_specificity
+                || specificity == best_specificity
+                    && command_policy_priority(rule.effect) > command_policy_priority(best_effect)
+        }) {
+            best = Some((specificity, rule.effect));
+        }
+    }
+    match best.map(|(_, effect)| effect) {
+        Some(Effect::Allow) => CommandPolicyDecision::Allow,
+        Some(Effect::Ask) => CommandPolicyDecision::Ask,
+        Some(Effect::Deny) => CommandPolicyDecision::Deny,
+        None => CommandPolicyDecision::NoMatch,
     }
 }
 
@@ -514,12 +672,13 @@ impl PermissionManager {
         policy: Option<Arc<SharedPermissionState>>,
         policy_context_error: Option<String>,
     ) -> Self {
-        let config_rules = config.rules;
-        let review_candidates = config.review_candidates;
+        let seed_yolo = config.yolo;
+        let configured = configured_policy(config, None);
         let builtin_rules = builtin_rules(&cwd);
 
         // Warn if wildcard deny is present — it blocks ALL tools including builtins.
-        let has_wildcard_deny = config_rules
+        let has_wildcard_deny = configured
+            .rules
             .iter()
             .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Deny);
         if has_wildcard_deny {
@@ -530,7 +689,8 @@ impl PermissionManager {
             );
         }
         // Warn if wildcard allow is present — it permits ALL tools including write/edit/task.
-        let has_wildcard_allow = config_rules
+        let has_wildcard_allow = configured
+            .rules
             .iter()
             .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Allow);
         if has_wildcard_allow {
@@ -551,13 +711,10 @@ impl PermissionManager {
                 .as_ref()
                 .map(|state| Arc::clone(&state.broker))
                 .unwrap_or_default(),
-            config_rules,
-            review_candidates,
-            yolo: AtomicBool::new(config.yolo),
+            configured: RwLock::new(configured),
+            yolo: AtomicBool::new(seed_yolo),
             yolo_explicit: AtomicBool::new(false),
-            seed_yolo: config.yolo,
-            default: config.default,
-            tool_defaults: config.tool_defaults,
+            seed_yolo,
             project: Mutex::new(ProjectContext {
                 cwd,
                 canonical_project: None,
@@ -570,6 +727,10 @@ impl PermissionManager {
     }
 
     fn with_canonical_project(mut self, canonical_project: Option<PathBuf>) -> Self {
+        self.configured
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .project_config_root = canonical_project.clone();
         self.project
             .get_mut()
             .unwrap_or_else(|error| error.into_inner())
@@ -580,6 +741,13 @@ impl PermissionManager {
     fn project(&self) -> std::sync::MutexGuard<'_, ProjectContext> {
         self.project.lock().unwrap_or_else(|error| {
             warn!("permission project mutex was poisoned, recovering");
+            error.into_inner()
+        })
+    }
+
+    fn configured(&self) -> RwLockReadGuard<'_, ConfiguredPolicy> {
+        self.configured.read().unwrap_or_else(|error| {
+            warn!("permission config lock was poisoned, recovering");
             error.into_inner()
         })
     }
@@ -602,6 +770,26 @@ impl PermissionManager {
         };
         *self.project() = ProjectContext {
             cwd: cwd.to_path_buf(),
+            canonical_project: canonical_project.clone(),
+            policy_context_error,
+            builtin_rules: builtin_rules(cwd),
+        };
+    }
+
+    pub fn set_project_with_config(&self, cwd: &Path, config: PermissionsConfig) {
+        let canonical_project = std::fs::canonicalize(cwd)
+            .map_err(|error| format!("cannot canonicalize project {}: {error}", cwd.display()));
+        let (canonical_project, policy_context_error) = match canonical_project {
+            Ok(project) => (Some(project), None),
+            Err(error) => (None, Some(error)),
+        };
+        let configured = configured_policy(config, canonical_project.clone());
+        *self
+            .configured
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = configured;
+        *self.project() = ProjectContext {
+            cwd: cwd.to_path_buf(),
             canonical_project,
             policy_context_error,
             builtin_rules: builtin_rules(cwd),
@@ -613,6 +801,7 @@ impl PermissionManager {
     /// restoring one session never clobbers another's grants.
     pub fn fork(&self) -> Self {
         let project = self.project().clone();
+        let configured = self.configured().clone();
         Self {
             id: NEXT_PERMISSION_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
             session_rules: Mutex::new(Vec::new()),
@@ -620,13 +809,10 @@ impl PermissionManager {
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
             broker: Arc::clone(&self.broker),
-            config_rules: self.config_rules.clone(),
-            review_candidates: self.review_candidates.clone(),
+            configured: RwLock::new(configured),
             yolo: AtomicBool::new(self.is_yolo()),
             yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
             seed_yolo: self.seed_yolo,
-            default: self.default,
-            tool_defaults: self.tool_defaults.clone(),
             project: Mutex::new(project),
             policy: self.policy.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
@@ -691,7 +877,14 @@ impl PermissionManager {
                         project.as_deref(),
                         manager_id,
                         candidate.project.as_deref(),
-                    ) && permission_rule_covers_request(&rule, &candidate.request)
+                    ) && candidate.prompt_required.len() == candidate.request.resources.len()
+                        && candidate
+                            .prompt_required
+                            .iter()
+                            .all(|prompt_required| !prompt_required)
+                        && candidate.request.resources.iter().all(|resource| {
+                            permission_rule_covers_resource(&rule, &candidate.request, resource)
+                        })
                     {
                         matches.push((manager_id, candidate_id.clone()));
                     }
@@ -745,6 +938,184 @@ impl PermissionManager {
         remove_pending(&mut self.pending(), self.id, request_id);
     }
 
+    fn command_policy_decisions(
+        &self,
+        request: &PermissionRequest,
+        shell_policy_eligible: bool,
+    ) -> Option<Vec<CommandPolicyDecision>> {
+        if !shell_policy_eligible || !is_bound_shell_request(request) {
+            return None;
+        }
+
+        let active_config_rules = self.active_config_rules();
+        let requires_exact = request.resources.iter().any(|resource| resource.protected);
+        Some(
+            request
+                .resources
+                .iter()
+                .map(|resource| {
+                    configured_command_decision(
+                        active_config_rules.iter(),
+                        &request.tool,
+                        &resource.value,
+                        resource
+                            .attributes
+                            .get(NORMALIZED_COMMAND_ATTRIBUTE)
+                            .map(String::as_str),
+                        requires_exact,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn builtin_command_ask(resource: &PermissionResource) -> bool {
+        resource.kind == PermissionResourceKind::Command
+            && command_pattern::BUILTIN_ASK_PATTERNS.iter().any(|pattern| {
+                command_pattern::matches(pattern, &resource.value)
+                    || resource
+                        .attributes
+                        .get(NORMALIZED_COMMAND_ATTRIBUTE)
+                        .is_some_and(|normalized| command_pattern::matches(pattern, normalized))
+            })
+    }
+
+    fn request_coverage(
+        &self,
+        request: &PermissionRequest,
+        structured_rules: &[StructuredPermissionRule],
+        shell_policy_eligible: bool,
+    ) -> Result<(Vec<bool>, bool, Vec<bool>), CommandPolicyDecision> {
+        let command_decisions = self.command_policy_decisions(request, shell_policy_eligible);
+        if command_decisions
+            .as_ref()
+            .is_some_and(|decisions| decisions.contains(&CommandPolicyDecision::Deny))
+        {
+            return Err(CommandPolicyDecision::Deny);
+        }
+
+        let resource_scopes: Vec<_> = request
+            .resources
+            .iter()
+            .map(|resource| resource.value.clone())
+            .collect();
+        let resource_decisions = self.scope_rule_decisions(
+            &request.tool,
+            &resource_scopes,
+            shell_policy_eligible,
+            false,
+        );
+        if resource_decisions.iter().any(|decision| decision.denied) {
+            return Err(CommandPolicyDecision::Deny);
+        }
+
+        let mut must_prompt = false;
+        let mut prompt_required = vec![false; request.resources.len()];
+        let non_shell_config_ask = command_decisions.is_none()
+            && self
+                .scope_rule_decisions(&request.tool, &request.scopes, true, true)
+                .iter()
+                .any(|decision| decision.must_prompt);
+        let covered = request
+            .resources
+            .iter()
+            .enumerate()
+            .map(|(index, resource)| {
+                let structured = structured_rules
+                    .iter()
+                    .any(|rule| permission_rule_covers_resource(rule, request, resource));
+                let legacy = resource_decisions.get(index).copied().unwrap_or_default();
+                if legacy.must_prompt {
+                    must_prompt = true;
+                    prompt_required[index] = true;
+                }
+                let mut covered = structured || legacy.allowed && !resource.requires_prompt;
+                match command_decisions
+                    .as_ref()
+                    .and_then(|decisions| decisions.get(index))
+                    .copied()
+                    .unwrap_or(CommandPolicyDecision::NoMatch)
+                {
+                    CommandPolicyDecision::Allow => {
+                        covered |= !resource.requires_prompt;
+                        covered
+                    }
+                    CommandPolicyDecision::Ask => {
+                        must_prompt = true;
+                        prompt_required[index] = true;
+                        covered
+                    }
+                    CommandPolicyDecision::Deny => false,
+                    CommandPolicyDecision::NoMatch => {
+                        if !covered && Self::builtin_command_ask(resource) {
+                            must_prompt = true;
+                            prompt_required[index] = true;
+                        }
+                        covered
+                    }
+                }
+            })
+            .collect();
+        if non_shell_config_ask {
+            must_prompt = true;
+            prompt_required.fill(true);
+        }
+        Ok((covered, must_prompt, prompt_required))
+    }
+
+    fn scope_rule_decisions(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        include_builtin_allows: bool,
+        include_config_shell_policy: bool,
+    ) -> Vec<ScopeRuleDecision> {
+        let session = self.session_rules().clone();
+        let config = self.active_config_rules();
+        let builtin = self.project().builtin_rules.clone();
+        let plugin = self.plugin_rules.snapshot();
+        let shell_tool = is_shell_tool(tool);
+
+        scopes
+            .iter()
+            .map(|scope| {
+                let mut decision = ScopeRuleDecision::default();
+                for rule in session
+                    .iter()
+                    .chain(config.iter().filter(|_| !shell_tool))
+                    .chain(builtin.iter().filter(|_| include_builtin_allows))
+                    .chain(&plugin)
+                {
+                    if !matches_rule(&rule.tool, tool) || !rule_matches_scope(rule, tool, scope) {
+                        continue;
+                    }
+                    match rule.effect {
+                        Effect::Allow => decision.allowed = true,
+                        Effect::Ask => decision.must_prompt = true,
+                        Effect::Deny => decision.denied = true,
+                    }
+                }
+                if shell_tool {
+                    match configured_command_decision(
+                        config.iter().filter(|rule| {
+                            include_config_shell_policy || rule.effect == Effect::Deny
+                        }),
+                        tool,
+                        bash_command_scope(scope).unwrap_or(scope),
+                        None,
+                        false,
+                    ) {
+                        CommandPolicyDecision::Allow => decision.allowed = true,
+                        CommandPolicyDecision::Ask => decision.must_prompt = true,
+                        CommandPolicyDecision::Deny => decision.denied = true,
+                        CommandPolicyDecision::NoMatch => {}
+                    }
+                }
+                decision
+            })
+            .collect()
+    }
+
     fn check_inner(
         &self,
         tool: &ToolKey,
@@ -752,63 +1123,36 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
         include_builtin_allows: bool,
+        include_config_shell_policy: bool,
     ) -> PermissionCheck {
-        let session = self.session_rules();
-        let plugin = self.plugin_rules.snapshot();
-        let project = self.project();
-
-        // Any matching deny wins. No specificity hierarchy — a Wildcard
-        // deny blocks everything, a tool-specific deny blocks that tool.
-        let mut unclaimed_scopes: Vec<&str> = if force_prompt {
-            Vec::new()
-        } else {
-            Vec::with_capacity(scopes.len())
-        };
-
-        for scope in scopes {
-            let mut has_allow = false;
-            for r in session
-                .iter()
-                .chain(&self.config_rules)
-                .chain(
-                    project
-                        .builtin_rules
-                        .iter()
-                        .filter(|_| include_builtin_allows),
-                )
-                .chain(&plugin)
-            {
-                if !matches_rule(&r.tool, tool) || !rule_matches_scope(r, tool, scope) {
-                    continue;
-                }
-                match r.effect {
-                    Effect::Deny => {
-                        info!(tool = %tool, scope = %scope, "permission denied");
-                        return PermissionCheck::Denied;
-                    }
-                    Effect::Allow => {
-                        has_allow = true;
-                    }
-                }
-            }
-
-            if has_allow {
-                // allow wins for this scope (no deny matched)
-            } else if !force_prompt {
-                unclaimed_scopes.push(scope);
-            }
-            // force_prompt: all scopes will be prompted anyway
+        let owned_scopes: Vec<_> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+        let decisions = self.scope_rule_decisions(
+            tool,
+            &owned_scopes,
+            include_builtin_allows,
+            include_config_shell_policy,
+        );
+        if let Some((index, _)) = decisions
+            .iter()
+            .enumerate()
+            .find(|(_, decision)| decision.denied)
+        {
+            info!(tool = %tool, scope = %scopes[index], "permission denied");
+            return PermissionCheck::Denied;
         }
 
         if self.yolo.load(Ordering::Relaxed) {
             return PermissionCheck::Allowed;
         }
 
-        let pending: Vec<&str> = if force_prompt {
-            scopes.to_vec()
-        } else {
-            unclaimed_scopes
-        };
+        let pending: Vec<_> = scopes
+            .iter()
+            .zip(&decisions)
+            .filter_map(|(scope, decision)| {
+                (force_prompt || !decision.allowed || decision.must_prompt)
+                    .then_some((*scope, force_prompt || decision.must_prompt))
+            })
+            .collect();
 
         if pending.is_empty() {
             return PermissionCheck::Allowed;
@@ -817,14 +1161,14 @@ impl PermissionManager {
         // Plan file auto-allow: fires AFTER deny rules have been evaluated.
         // Only triggers if ALL pending scopes match the plan file path.
         // A single non-plan scope means we must prompt for the rest.
-        if !force_prompt && !pending.is_empty() {
+        if !force_prompt && pending.iter().all(|(_, must_prompt)| !must_prompt) {
             let is_plan_write = plan_path.is_some_and(|pp| {
                 matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                     && {
                         let normalized_plan = normalize_scope_path(&pp.display().to_string());
                         pending
                             .iter()
-                            .all(|s| normalize_scope_path(s) == normalized_plan)
+                            .all(|(scope, _)| normalize_scope_path(scope) == normalized_plan)
                     }
             });
             if is_plan_write {
@@ -832,39 +1176,53 @@ impl PermissionManager {
             }
         }
 
-        let eff = self
+        let eff = self.default_effect(tool);
+        let has_unclaimed = pending.iter().any(|(_, must_prompt)| !must_prompt);
+        let prompt_scopes = |include_unclaimed: bool| PermissionCheck::NeedsPrompt {
+            tool: tool.clone(),
+            scopes: pending
+                .iter()
+                .filter(|(_, must_prompt)| include_unclaimed || *must_prompt)
+                .map(|(scope, _)| (*scope).to_owned())
+                .collect(),
+            force_prompt,
+        };
+        match eff {
+            DefaultEffect::Deny if has_unclaimed => {
+                info!(tool = %tool, "denied by default");
+                PermissionCheck::Denied
+            }
+            DefaultEffect::Allow if !pending.iter().any(|(_, must_prompt)| *must_prompt) => {
+                PermissionCheck::Allowed
+            }
+            DefaultEffect::Allow | DefaultEffect::Deny => prompt_scopes(false),
+            DefaultEffect::Prompt => prompt_scopes(true),
+        }
+    }
+
+    fn default_effect(&self, tool: &ToolKey) -> DefaultEffect {
+        let configured = self.configured();
+        configured
             .tool_defaults
             .get(tool)
             .copied()
             .or_else(|| {
-                // McpTool falls back to McpServer-level default (Arc clone, ~2ns)
                 let server = match tool {
                     ToolKey::McpTool { server, .. } => server,
                     _ => return None,
                 };
-                self.tool_defaults
+                configured
+                    .tool_defaults
                     .get(&ToolKey::McpServer {
                         server: server.clone(),
                     })
                     .copied()
             })
-            .unwrap_or(self.default);
-        match eff {
-            DefaultEffect::Deny => {
-                info!(tool = %tool, "denied by default");
-                PermissionCheck::Denied
-            }
-            DefaultEffect::Allow => PermissionCheck::Allowed,
-            DefaultEffect::Prompt => PermissionCheck::NeedsPrompt {
-                tool: tool.clone(),
-                scopes: pending.into_iter().map(|s| s.to_string()).collect(),
-                force_prompt,
-            },
-        }
+            .unwrap_or(configured.default)
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path, true)
+        self.check_inner(tool, &[scope], false, plan_path, true, true)
     }
 
     pub fn check_multi(
@@ -874,10 +1232,14 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path, true)
+        self.check_inner(tool, scopes, force_prompt, plan_path, true, true)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
+        if rule.effect == Effect::Ask {
+            warn!(tool = %rule.tool, "session ask rules are not supported");
+            return;
+        }
         let mut rules = self.session_rules();
         let exists = rules
             .iter()
@@ -946,6 +1308,14 @@ impl PermissionManager {
     pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
         let (inactive_allows, active_denies): (Vec<_>, Vec<_>) = rules
             .into_iter()
+            .filter(|rule| {
+                if rule.effect == Effect::Ask {
+                    warn!(tool = %rule.tool, "restored session ask rules are not supported");
+                    false
+                } else {
+                    true
+                }
+            })
             .partition(|rule| rule.effect == Effect::Allow);
         *self.session_rules() = active_denies;
         *self
@@ -1000,8 +1370,115 @@ impl PermissionManager {
         Ok(inventory)
     }
 
+    fn project_allows_active(&self) -> bool {
+        let canonical_project = self.project().canonical_project.clone();
+        let configured = self.configured();
+        configured
+            .project_config_digest
+            .as_deref()
+            .zip(configured.project_config_root.as_deref())
+            .zip(canonical_project.as_deref())
+            .zip(self.policy.as_ref())
+            .is_some_and(|(((digest, config_root), project), policy)| {
+                config_root == project
+                    && is_permission_config_trusted(&policy.state_dir, project, digest)
+                        .unwrap_or_else(|error| {
+                            warn!(%error, "could not read project permission config trust");
+                            false
+                        })
+            })
+    }
+
+    fn active_config_rules(&self) -> Vec<PermissionRule> {
+        let project_allows_active = self.project_allows_active();
+        let configured = self.configured();
+        configured
+            .rules
+            .iter()
+            .chain(
+                configured
+                    .project_allow_rules
+                    .iter()
+                    .filter(move |_| project_allows_active),
+            )
+            .cloned()
+            .collect()
+    }
+
+    pub fn needs_project_permission_config_trust(&self) -> bool {
+        let project_allows_active = self.project_allows_active();
+        let configured = self.configured();
+        configured.project_config_digest.is_some()
+            && configured.project_config_root.is_some()
+            && !project_allows_active
+            && self.project().canonical_project.as_ref() == configured.project_config_root.as_ref()
+    }
+
+    pub fn project_permission_config_trusted(&self) -> bool {
+        let project_allows_active = self.project_allows_active();
+        let configured = self.configured();
+        configured.project_config_digest.is_some()
+            && configured.project_config_root.is_some()
+            && self.project().canonical_project.as_ref() == configured.project_config_root.as_ref()
+            && project_allows_active
+    }
+
+    pub fn trust_project_permission_config(&self) -> Result<(), PermissionPolicyError> {
+        let configured = self.configured();
+        let digest = configured
+            .project_config_digest
+            .clone()
+            .ok_or_else(|| PermissionPolicyError("project config has no allow rules".into()))?;
+        let project_config_root = configured.project_config_root.clone();
+        drop(configured);
+        let project = self.project();
+        let canonical_project = project
+            .canonical_project
+            .as_deref()
+            .filter(|project| Some(*project) == project_config_root.as_deref())
+            .ok_or_else(|| {
+                PermissionPolicyError("project permission config is not active here".into())
+            })?;
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
+        trust_project_permission_config(&policy.state_dir, canonical_project, &digest)
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn revoke_project_permission_config_trust(&self) -> Result<(), PermissionPolicyError> {
+        let project_config_root = self.configured().project_config_root.clone();
+        let project = self.project();
+        let canonical_project = project
+            .canonical_project
+            .as_deref()
+            .filter(|project| Some(*project) == project_config_root.as_deref())
+            .ok_or_else(|| {
+                PermissionPolicyError("project permission config is not active here".into())
+            })?;
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
+        revoke_project_permission_config(&policy.state_dir, canonical_project)
+            .map_err(|error| PermissionPolicyError(error.to_string()))
+    }
+
     pub fn review_candidates(&self) -> Vec<PermissionReviewCandidate> {
-        let mut candidates = self.review_candidates.clone();
+        let project_allows_active = self.project_allows_active();
+        let configured = self.configured();
+        let mut candidates = configured.review_candidates.clone();
+        if project_allows_active {
+            candidates.retain(|candidate| {
+                candidate.source != caudra_config::PermissionSource::Project
+                    || candidate.kind != caudra_config::PermissionReviewKind::Rule
+                    || !configured.project_allow_rules.iter().any(|rule| {
+                        candidate.tool.as_ref() == Some(&rule.tool) && candidate.scope == rule.scope
+                    })
+            });
+        }
         candidates.extend(
             self.inactive_session_allows
                 .lock()
@@ -1029,17 +1506,13 @@ impl PermissionManager {
                 removable: true,
             })
             .collect();
-        entries.extend(
-            self.config_rules
-                .iter()
-                .filter(|rule| rule.effect == Effect::Deny)
-                .cloned()
-                .map(|rule| EffectivePermissionRule {
-                    source: "configuration",
-                    rule,
-                    removable: false,
-                }),
-        );
+        entries.extend(self.active_config_rules().into_iter().map(|rule| {
+            EffectivePermissionRule {
+                source: "configuration",
+                rule,
+                removable: false,
+            }
+        }));
         entries.extend(
             builtin_rules
                 .iter()
@@ -1483,7 +1956,6 @@ impl PermissionManager {
         let make_request = |tool: ToolKey, request_scopes: Vec<String>, force_prompt: bool| {
             if let Some(intent) = intent {
                 let mut intent = intent.clone();
-                intent.scopes.scopes = request_scopes;
                 intent.scopes.force_prompt = force_prompt;
                 return match &identity {
                     Some((subject, executor)) => PermissionRequest::from_intent_with_identity(
@@ -1547,6 +2019,13 @@ impl PermissionManager {
         } else {
             make_request(tool.clone(), scopes.scopes.clone(), force_prompt)
         };
+        if intent.is_some() && full_request.resources.is_empty() {
+            warn!(tool = %tool, "explicit permission intent has no resources");
+            return Err(deny(
+                DECISION_SOURCE_RULE,
+                Some("tool permission intent did not identify any resources".into()),
+            ));
+        }
         let structured_rules = self.applicable_structured_rules().map_err(|error| {
             warn!(%error, "structured permission policy failed closed");
             deny(DECISION_SOURCE_RULE, Some(error.to_string()))
@@ -1557,43 +2036,107 @@ impl PermissionManager {
         {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
-
-        let (pt, ps, force_prompt) = match self.check_inner(
-            tool,
-            &scope_refs,
-            force_prompt,
-            plan_path,
-            include_builtin_allows,
-        ) {
-            PermissionCheck::Allowed => return allowed(by_rule()),
-            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-            PermissionCheck::NeedsPrompt {
+        let (full_coverage, full_must_prompt, full_prompt_required) = self
+            .request_coverage(&full_request, &structured_rules, include_builtin_allows)
+            .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
+        let scope_decisions =
+            self.scope_rule_decisions(tool, &scopes.scopes, include_builtin_allows, false);
+        if scope_decisions.iter().any(|decision| decision.denied) {
+            return Err(deny(DECISION_SOURCE_RULE, None));
+        }
+        if self.is_yolo() {
+            return allowed(by_rule());
+        }
+        let all_resources_resolved = full_coverage
+            .iter()
+            .zip(&full_prompt_required)
+            .all(|(covered, must_prompt)| *covered || *must_prompt);
+        let legacy_must_prompt = scope_decisions.iter().any(|decision| decision.must_prompt);
+        let (t2, s2, force_prompt) = if all_resources_resolved {
+            if !scopes.force_prompt && !full_must_prompt && !legacy_must_prompt {
+                return allowed(DECISION_SOURCE_RULE);
+            }
+            (tool.clone(), scopes.scopes.clone(), force_prompt)
+        } else if intent.is_some() {
+            if exact_plan_write && !force_prompt && !full_must_prompt && !legacy_must_prompt {
+                return allowed(DECISION_SOURCE_RULE);
+            }
+            match self.default_effect(tool) {
+                DefaultEffect::Allow
+                    if !force_prompt && !full_must_prompt && !legacy_must_prompt =>
+                {
+                    return allowed(by_rule());
+                }
+                DefaultEffect::Deny if !force_prompt => {
+                    return Err(deny(DECISION_SOURCE_RULE, None));
+                }
+                DefaultEffect::Allow | DefaultEffect::Deny | DefaultEffect::Prompt => {
+                    (tool.clone(), scopes.scopes.clone(), force_prompt)
+                }
+            }
+        } else {
+            match self.check_inner(
                 tool,
-                scopes,
+                &scope_refs,
                 force_prompt,
-            } => (tool, scopes, force_prompt),
-        };
-
-        let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) =
-            match self.check_inner(&pt, &refs, force_prompt, plan_path, include_builtin_allows) {
+                plan_path,
+                include_builtin_allows,
+                false,
+            ) {
+                PermissionCheck::Allowed if full_must_prompt || legacy_must_prompt => {
+                    (tool.clone(), scopes.scopes.clone(), force_prompt)
+                }
                 PermissionCheck::Allowed => return allowed(by_rule()),
                 PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-                PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
-            };
+                PermissionCheck::NeedsPrompt {
+                    tool,
+                    scopes: _,
+                    force_prompt,
+                } if full_must_prompt => (tool, full_request.scopes.clone(), force_prompt),
+                PermissionCheck::NeedsPrompt {
+                    tool,
+                    scopes,
+                    force_prompt,
+                } => (tool, scopes, force_prompt),
+            }
+        };
 
-        let request = make_request(t2.clone(), s2.clone(), force_prompt);
+        let mut request = make_request(t2.clone(), s2.clone(), force_prompt);
         let structured_rules = self.applicable_structured_rules().map_err(|error| {
             warn!(%error, "structured permission policy failed closed");
             deny(DECISION_SOURCE_RULE, Some(error.to_string()))
         })?;
-        match evaluate_structured_permission_rules(&structured_rules, &request) {
-            StructuredPermissionDecision::Deny => {
-                return Err(deny(DECISION_SOURCE_RULE, None));
-            }
-            StructuredPermissionDecision::Allow => return allowed(DECISION_SOURCE_RULE),
-            StructuredPermissionDecision::NoMatch => {}
+        if structured_rules
+            .iter()
+            .any(|rule| permission_rule_intersects_request(rule, &request))
+        {
+            return Err(deny(DECISION_SOURCE_RULE, None));
         }
+        let current_scope_decisions = self.scope_rule_decisions(
+            &request.tool,
+            &request.scopes,
+            include_builtin_allows,
+            false,
+        );
+        if current_scope_decisions
+            .iter()
+            .any(|decision| decision.denied)
+        {
+            return Err(deny(DECISION_SOURCE_RULE, None));
+        }
+        let (coverage, must_prompt, _) = self
+            .request_coverage(&request, &structured_rules, include_builtin_allows)
+            .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
+        if !scopes.force_prompt
+            && coverage.iter().all(|covered| *covered)
+            && !must_prompt
+            && !current_scope_decisions
+                .iter()
+                .any(|decision| decision.must_prompt)
+        {
+            return allowed(DECISION_SOURCE_RULE);
+        }
+        update_presentation_coverage(&mut request.presentation, &coverage);
 
         let Some(_) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -1607,13 +2150,44 @@ impl PermissionManager {
                 warn!(%error, "structured permission policy failed closed");
                 deny(DECISION_SOURCE_RULE, Some(error.to_string()))
             })?;
-            match evaluate_structured_permission_rules(&current_rules, &request) {
-                StructuredPermissionDecision::Deny => {
-                    return Err(deny(DECISION_SOURCE_RULE, None));
-                }
-                StructuredPermissionDecision::Allow => return allowed(DECISION_SOURCE_RULE),
-                StructuredPermissionDecision::NoMatch => {}
+            if current_rules
+                .iter()
+                .any(|rule| permission_rule_intersects_request(rule, &request))
+            {
+                return Err(deny(DECISION_SOURCE_RULE, None));
             }
+            let current_scope_decisions = self.scope_rule_decisions(
+                &request.tool,
+                &request.scopes,
+                include_builtin_allows,
+                false,
+            );
+            if current_scope_decisions
+                .iter()
+                .any(|decision| decision.denied)
+            {
+                return Err(deny(DECISION_SOURCE_RULE, None));
+            }
+            let (coverage, must_prompt, mut prompt_required) = self
+                .request_coverage(&request, &current_rules, include_builtin_allows)
+                .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
+            if !scopes.force_prompt
+                && coverage.iter().all(|covered| *covered)
+                && !must_prompt
+                && !current_scope_decisions
+                    .iter()
+                    .any(|decision| decision.must_prompt)
+            {
+                return allowed(DECISION_SOURCE_RULE);
+            }
+            if scopes.force_prompt
+                || current_scope_decisions
+                    .iter()
+                    .any(|decision| decision.must_prompt)
+            {
+                prompt_required.fill(true);
+            }
+            update_presentation_coverage(&mut request.presentation, &coverage);
             let requests = pending.entry(self.id).or_default();
             if requests.contains_key(request_id) {
                 warn!(request_id, "duplicate permission request id");
@@ -1623,6 +2197,7 @@ impl PermissionManager {
                 request_id.to_owned(),
                 PendingPermission {
                     request: request.clone(),
+                    prompt_required,
                     project: canonical_project,
                     event_tx: event_tx.clone(),
                     sender: answer_tx,
@@ -1663,6 +2238,29 @@ impl PermissionManager {
             {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
+            let current_scope_decisions = self.scope_rule_decisions(
+                &request.tool,
+                &request.scopes,
+                include_builtin_allows,
+                false,
+            );
+            if current_scope_decisions.iter().any(|scope| scope.denied) {
+                return Err(deny(DECISION_SOURCE_RULE, None));
+            }
+            if matches!(decision, PendingDecision::MatchedRule) {
+                let (coverage, must_prompt, _) = self
+                    .request_coverage(&request, &current_rules, include_builtin_allows)
+                    .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
+                if scopes.force_prompt
+                    || must_prompt
+                    || current_scope_decisions
+                        .iter()
+                        .any(|scope| scope.must_prompt)
+                    || !coverage.iter().all(|covered| *covered)
+                {
+                    return Err(deny(DECISION_SOURCE_RULE, None));
+                }
+            }
         }
         let source = match &decision {
             PendingDecision::Explicit(answer) => answer.decision_source(),
@@ -1700,6 +2298,37 @@ fn matches_rule(rule_key: &ToolKey, actual: &ToolKey) -> bool {
     }
 }
 
+fn is_shell_tool(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if matches!(name.as_ref(), "bash" | "shell"))
+}
+
+fn command_rule_tool_matches(rule: &ToolKey, actual: &ToolKey) -> bool {
+    matches!(rule, ToolKey::Wildcard)
+        || is_shell_tool(rule) && is_shell_tool(actual)
+        || matches_rule(rule, actual)
+}
+
+fn is_bound_shell_request(request: &PermissionRequest) -> bool {
+    if !is_shell_tool(&request.tool)
+        || request.executor != PermissionExecutorKind::Native
+        || request.resources.is_empty()
+        || !request
+            .resources
+            .iter()
+            .all(|resource| resource.kind == PermissionResourceKind::Command)
+    {
+        return false;
+    }
+    match &request.subject {
+        PermissionSubject::Native { owner, contract } => {
+            owner == "workcell" && contract == "shell.execution.v1"
+        }
+        PermissionSubject::Lua { .. }
+        | PermissionSubject::Mcp { .. }
+        | PermissionSubject::UnknownLegacy { .. } => false,
+    }
+}
+
 fn rule_matches_scope(rule: &PermissionRule, tool: &ToolKey, scope: &str) -> bool {
     match &rule.scope {
         None => true,
@@ -1710,8 +2339,10 @@ fn rule_matches_scope(rule: &PermissionRule, tool: &ToolKey, scope: &str) -> boo
         Some(pattern) => {
             scope_matches(pattern, scope)
                 || matches!(tool, ToolKey::Native(name) if matches!(name.as_ref(), "bash" | "shell"))
-                    && bash_command_scope(scope)
-                        .is_some_and(|command| scope_matches(pattern, command))
+                    && bash_command_scope(scope).is_some_and(|command| {
+                        scope_matches(pattern, command)
+                            || command_pattern::matches(pattern, command)
+                    })
         }
     }
 }
@@ -1841,12 +2472,671 @@ mod tests {
         }
     }
 
+    fn shell_policy_rule(scope: &str, effect: Effect) -> PermissionRule {
+        PermissionRule {
+            tool: ToolKey::native("shell"),
+            scope: Some(scope.into()),
+            effect,
+        }
+    }
+
+    fn shell_intent(commands: &[&str]) -> crate::tools::PermissionIntent {
+        let workdir = "/tmp";
+        crate::tools::PermissionIntent::new(
+            crate::tools::PermissionScopes {
+                scopes: commands.iter().map(|command| (*command).into()).collect(),
+                force_prompt: false,
+            },
+            commands
+                .iter()
+                .map(|command| PermissionResource {
+                    kind: PermissionResourceKind::Command,
+                    value: (*command).into(),
+                    access: Some(PermissionResourceAccess::Execute),
+                    protected: false,
+                    requires_prompt: false,
+                    attributes: BTreeMap::from([("workdir".into(), workdir.into())]),
+                })
+                .collect(),
+            PermissionRisk::High,
+        )
+        .with_authority(PermissionAuthorityProfile::Shell)
+    }
+
+    fn shell_request(commands: &[&str], subject: PermissionSubject) -> PermissionRequest {
+        let workdir = "/tmp";
+        let intent = shell_intent(commands);
+        PermissionRequest::from_intent_with_identity(
+            "shell-request".into(),
+            ToolKey::native("shell"),
+            &intent,
+            serde_json::json!({"command": commands.join(" && "), "workdir": workdir}),
+            Path::new(workdir),
+            subject,
+            PermissionExecutorKind::Native,
+        )
+    }
+
+    fn workcell_shell_subject() -> PermissionSubject {
+        PermissionSubject::Native {
+            owner: "workcell".into(),
+            contract: "shell.execution.v1".into(),
+        }
+    }
+
     fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
         PermissionManager::new_nonpersistent(config, cwd, Arc::default())
     }
 
     fn default_mgr() -> PermissionManager {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn shell_config_uses_specificity_and_ask_wins_ties() {
+        let manager = mgr_with(
+            make_config(vec![
+                shell_policy_rule("*", Effect::Ask),
+                shell_policy_rule("git status *", Effect::Allow),
+            ]),
+            PathBuf::from("/tmp"),
+        );
+        let status = shell_request(&["git status --short"], workcell_shell_subject());
+        let commit = shell_request(&["git commit -m message"], workcell_shell_subject());
+
+        assert_eq!(
+            manager.command_policy_decisions(&status, true),
+            Some(vec![CommandPolicyDecision::Allow])
+        );
+        assert_eq!(
+            manager.command_policy_decisions(&commit, true),
+            Some(vec![CommandPolicyDecision::Ask])
+        );
+        assert!(matches!(
+            manager.check(&ToolKey::native("shell"), "git status --short", None),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("shell"), "git commit -m message", None),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+
+        let tied = mgr_with(
+            make_config(vec![
+                shell_policy_rule("git status *", Effect::Allow),
+                shell_policy_rule("git status *", Effect::Ask),
+            ]),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            tied.command_policy_decisions(&status, true),
+            Some(vec![CommandPolicyDecision::Ask])
+        );
+    }
+
+    #[test]
+    fn shell_config_allow_requires_the_workcell_contract() {
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule("git status *", Effect::Allow)]),
+            PathBuf::from("/tmp"),
+        );
+        let spoofed = shell_request(
+            &["git status --short"],
+            PermissionSubject::Lua {
+                plugin: "untrusted".into(),
+                tool: "shell".into(),
+                contract: "shell.execution.v1".into(),
+            },
+        );
+
+        assert_eq!(manager.command_policy_decisions(&spoofed, true), None);
+        let workcell = shell_request(&["git status --short"], workcell_shell_subject());
+        assert_eq!(manager.command_policy_decisions(&workcell, false), None);
+    }
+
+    #[test]
+    fn command_denies_match_static_quoted_tokens_and_fail_closed_for_opaque_commands() {
+        let manager = mgr_with(
+            PermissionsConfig {
+                yolo: true,
+                rules: vec![shell_policy_rule("git commit *", Effect::Deny)],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        let quoted = shell_request(&[r#"git "commit" -m message"#], workcell_shell_subject());
+        assert_eq!(
+            manager.command_policy_decisions(&quoted, true),
+            Some(vec![CommandPolicyDecision::Deny])
+        );
+
+        let mut opaque = shell_request(&["eval command"], workcell_shell_subject());
+        opaque.resources[0].protected = true;
+        assert_eq!(
+            manager.command_policy_decisions(&opaque, true),
+            Some(vec![CommandPolicyDecision::Deny])
+        );
+    }
+
+    #[test]
+    fn normalized_executable_names_apply_only_to_restrictive_shell_policy() {
+        let manager = mgr_with(
+            make_config(vec![
+                shell_policy_rule("git status *", Effect::Allow),
+                shell_policy_rule("rm *", Effect::Deny),
+                shell_policy_rule("curl *", Effect::Ask),
+            ]),
+            PathBuf::from("/tmp"),
+        );
+        let request = |source: &str, normalized: &str| {
+            let mut request = shell_request(&[source], workcell_shell_subject());
+            request.resources[0]
+                .attributes
+                .insert(NORMALIZED_COMMAND_ATTRIBUTE.into(), normalized.into());
+            request
+        };
+
+        assert_eq!(
+            manager.command_policy_decisions(
+                &request("/tmp/git status --short", "git status --short"),
+                true,
+            ),
+            Some(vec![CommandPolicyDecision::NoMatch])
+        );
+        assert_eq!(
+            manager.command_policy_decisions(&request("/bin/rm -rf build", "rm -rf build"), true),
+            Some(vec![CommandPolicyDecision::Deny])
+        );
+        assert_eq!(
+            manager.command_policy_decisions(
+                &request("/usr/bin/curl example.com", "curl example.com"),
+                true,
+            ),
+            Some(vec![CommandPolicyDecision::Ask])
+        );
+
+        let builtin_manager = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
+        let request = request("/bin/rm -rf build", "rm -rf build");
+        let (_, must_prompt, prompt_required) = builtin_manager
+            .request_coverage(&request, &[], true)
+            .unwrap();
+        assert!(must_prompt);
+        assert_eq!(prompt_required, vec![true]);
+    }
+
+    #[test]
+    fn explicit_allow_overrides_the_builtin_ask_fallback() {
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule("rm *", Effect::Allow)]),
+            PathBuf::from("/tmp"),
+        );
+        let request = shell_request(&["rm build.log"], workcell_shell_subject());
+        let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
+
+        assert_eq!(covered, vec![true]);
+        assert!(!must_prompt);
+    }
+
+    #[test]
+    fn configured_patterns_cover_repetitive_shell_chains_per_command() {
+        let manager = mgr_with(
+            make_config(vec![
+                shell_policy_rule("git diff *", Effect::Allow),
+                shell_policy_rule("git status *", Effect::Allow),
+                shell_policy_rule("printf *", Effect::Allow),
+                shell_policy_rule("pgrep *", Effect::Allow),
+                shell_policy_rule("true", Effect::Allow),
+            ]),
+            PathBuf::from("/tmp"),
+        );
+        for commands in [
+            vec![
+                "git diff --check -- site/docs/content/cli/_index.md",
+                "git diff -- site/docs/content/cli/_index.md",
+                r#"printf '\n-- status --\n'"#,
+                "git status --short",
+            ],
+            vec![
+                "pgrep -af '(^|/)(caudra|maki)( |$)'",
+                "true",
+                "git status --short",
+                "git diff --check",
+            ],
+        ] {
+            let request = shell_request(&commands, workcell_shell_subject());
+            let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
+            assert!(covered.iter().all(|covered| *covered));
+            assert!(!must_prompt);
+        }
+    }
+
+    #[test]
+    fn project_shell_allows_require_exact_config_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let config = PermissionsConfig {
+            project_allow_rules: vec![shell_policy_rule("git diff *", Effect::Allow)],
+            ..Default::default()
+        };
+        let manager = PermissionManager::new_persistent_in(
+            config,
+            project.clone(),
+            Arc::default(),
+            state_dir.clone(),
+        );
+        let request = shell_request(&["git diff --check"], workcell_shell_subject());
+
+        assert!(manager.needs_project_permission_config_trust());
+        assert_eq!(
+            manager.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::NoMatch])
+        );
+        manager.trust_project_permission_config().unwrap();
+        assert!(!manager.needs_project_permission_config_trust());
+        assert!(manager.project_permission_config_trusted());
+        assert!(matches!(
+            manager.check(&ToolKey::native("shell"), "git diff --check", None),
+            PermissionCheck::Allowed
+        ));
+        assert_eq!(
+            manager.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::Allow])
+        );
+        let fork = manager.fork();
+        assert_eq!(
+            fork.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::Allow])
+        );
+        manager.revoke_project_permission_config_trust().unwrap();
+        assert!(!manager.project_permission_config_trusted());
+        assert_eq!(
+            manager.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::NoMatch])
+        );
+        manager.trust_project_permission_config().unwrap();
+
+        let changed = PermissionManager::new_persistent_in(
+            PermissionsConfig {
+                project_allow_rules: vec![shell_policy_rule("git log *", Effect::Allow)],
+                ..Default::default()
+            },
+            project,
+            Arc::default(),
+            state_dir,
+        );
+        assert!(changed.needs_project_permission_config_trust());
+    }
+
+    #[test]
+    fn changing_projects_replaces_configured_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule("git status *", Effect::Allow)]),
+            source,
+        );
+        let request = shell_request(&["git status --short"], workcell_shell_subject());
+        assert_eq!(
+            manager.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::Allow])
+        );
+
+        manager.set_project_with_config(
+            &destination,
+            make_config(vec![shell_policy_rule("git status *", Effect::Deny)]),
+        );
+
+        assert_eq!(
+            manager.command_policy_decisions(&request, true),
+            Some(vec![CommandPolicyDecision::Deny])
+        );
+        assert_eq!(manager.project_cwd(), destination);
+    }
+
+    #[test]
+    fn restrictive_project_policy_changes_invalidate_allow_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let allow = shell_policy_rule("git *", Effect::Allow);
+        let manager = PermissionManager::new_persistent_in(
+            PermissionsConfig {
+                project_allow_rules: vec![allow.clone()],
+                project_restrictive_rules: vec![shell_policy_rule("git push *", Effect::Ask)],
+                ..Default::default()
+            },
+            project.clone(),
+            Arc::default(),
+            state_dir.clone(),
+        );
+        manager.trust_project_permission_config().unwrap();
+
+        let changed = PermissionManager::new_persistent_in(
+            PermissionsConfig {
+                project_allow_rules: vec![allow],
+                ..Default::default()
+            },
+            project,
+            Arc::default(),
+            state_dir,
+        );
+        assert!(changed.needs_project_permission_config_trust());
+    }
+
+    #[test]
+    fn explicit_ask_beats_default_allow_and_structured_authority() {
+        let tool = ToolKey::native("platform_tool");
+        let manager = mgr_with(
+            PermissionsConfig {
+                default: DefaultEffect::Allow,
+                rules: vec![PermissionRule {
+                    tool: tool.clone(),
+                    scope: Some("resource".into()),
+                    effect: Effect::Ask,
+                }],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            manager.check(&tool, "resource", None),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+
+        let intent = crate::tools::PermissionIntent::new(
+            crate::tools::PermissionScopes::single("resource".into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Custom {
+                    name: "platform".into(),
+                },
+                value: "resource".into(),
+                access: Some(PermissionResourceAccess::Execute),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::High,
+        );
+        let request = PermissionRequest::from_intent(
+            "ask".into(),
+            tool,
+            &intent,
+            serde_json::json!({"value": "resource"}),
+            Path::new("/tmp"),
+        );
+        let allow = request
+            .option_rule("allow_exact", PermissionLifetime::Conversation)
+            .unwrap();
+        let (coverage, must_prompt, prompt_required) =
+            manager.request_coverage(&request, &[allow], false).unwrap();
+        assert_eq!(coverage, [true]);
+        assert!(must_prompt);
+        assert_eq!(prompt_required, [true]);
+    }
+
+    #[test]
+    fn shell_config_allow_beats_default_deny_in_production_enforcement() {
+        smol::block_on(async {
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    rules: vec![
+                        shell_policy_rule("*", Effect::Ask),
+                        shell_policy_rule("git status *", Effect::Allow),
+                    ],
+                    ..Default::default()
+                },
+                PathBuf::from("/tmp"),
+            );
+            let intent = shell_intent(&["git status --short"]);
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let result = manager
+                .enforce_with_intent(
+                    &ToolKey::native("shell"),
+                    &intent,
+                    &serde_json::json!({"command": "git status --short", "workdir": "/tmp"}),
+                    &event_tx,
+                    None,
+                    "allow-under-deny-default",
+                    &crate::CancelToken::none(),
+                    None,
+                    Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                    true,
+                )
+                .await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn shell_config_ask_beats_default_deny_in_production_enforcement() {
+        smol::block_on(async {
+            let manager = Arc::new(mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    rules: vec![shell_policy_rule("git status *", Effect::Ask)],
+                    ..Default::default()
+                },
+                PathBuf::from("/tmp"),
+            ));
+            let intent = shell_intent(&["git status --short"]);
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let (_response_tx, response_rx) = flume::unbounded();
+            let response_rx = Arc::new(async_lock::Mutex::new(response_rx));
+            let task = smol::spawn({
+                let manager = Arc::clone(&manager);
+                let response_rx = Arc::clone(&response_rx);
+                async move {
+                    manager
+                        .enforce_with_intent(
+                            &ToolKey::native("shell"),
+                            &intent,
+                            &serde_json::json!({
+                                "command": "git status --short",
+                                "workdir": "/tmp"
+                            }),
+                            &event_tx,
+                            Some(&response_rx),
+                            "ask-under-deny-default",
+                            &crate::CancelToken::none(),
+                            None,
+                            Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                            true,
+                        )
+                        .await
+                }
+            });
+
+            let event = event_rx.recv_async().await.unwrap().event;
+            assert!(matches!(event, AgentEvent::PermissionRequest(_)));
+            assert!(manager.answer("ask-under-deny-default", PermissionAnswer::AllowOnce));
+            assert!(task.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn empty_explicit_intent_fails_closed() {
+        smol::block_on(async {
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    ..Default::default()
+                },
+                PathBuf::from("/tmp"),
+            );
+            let intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes::single("missing".into()),
+                Vec::new(),
+                PermissionRisk::High,
+            );
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            assert!(
+                manager
+                    .enforce_with_intent(
+                        &ToolKey::native("broken"),
+                        &intent,
+                        &serde_json::json!({}),
+                        &event_tx,
+                        None,
+                        "empty-intent",
+                        &crate::CancelToken::none(),
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_intent_does_not_authorize_resources_from_unrelated_scopes() {
+        smol::block_on(async {
+            let tool = ToolKey::native("platform_tool");
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    rules: vec![PermissionRule {
+                        tool: tool.clone(),
+                        scope: Some("safe".into()),
+                        effect: Effect::Allow,
+                    }],
+                    ..Default::default()
+                },
+                PathBuf::from("/tmp"),
+            );
+            let intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes::single("safe".into()),
+                vec![PermissionResource {
+                    kind: PermissionResourceKind::Custom {
+                        name: "platform".into(),
+                    },
+                    value: "unrelated".into(),
+                    access: Some(PermissionResourceAccess::Execute),
+                    protected: false,
+                    requires_prompt: false,
+                    attributes: BTreeMap::new(),
+                }],
+                PermissionRisk::High,
+            );
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+
+            assert!(
+                manager
+                    .enforce_with_intent(
+                        &tool,
+                        &intent,
+                        &serde_json::json!({}),
+                        &event_tx,
+                        None,
+                        "scope-resource-drift",
+                        &crate::CancelToken::none(),
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn structured_and_builtin_authority_combine_per_resource() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let external = temp.path().join("external.txt");
+            std::fs::create_dir(&project).unwrap();
+            let project_file = project.join("project.txt");
+            let tool = ToolKey::native("file_apply_patch");
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    ..Default::default()
+                },
+                project.clone(),
+            );
+            let external_resource = filesystem_permission_resource(
+                PermissionResourceKind::File,
+                &external,
+                PermissionResourceAccess::Write,
+                &project,
+            );
+            let external_intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes::single(external.to_string_lossy().into_owned()),
+                vec![external_resource.clone()],
+                PermissionRisk::High,
+            )
+            .with_authority(PermissionAuthorityProfile::Filesystem {
+                input_pointers: Vec::new(),
+            });
+            let seed = PermissionRequest::from_intent(
+                "seed".into(),
+                tool.clone(),
+                &external_intent,
+                serde_json::json!({}),
+                &project,
+            );
+            let rule = seed
+                .option_rule("allow_exact_resources", PermissionLifetime::Conversation)
+                .unwrap();
+            manager.load_structured_conversation_rules(vec![
+                PermissionRuleRecord::conversation(rule).unwrap(),
+            ]);
+
+            let project_resource = filesystem_permission_resource(
+                PermissionResourceKind::File,
+                &project_file,
+                PermissionResourceAccess::Write,
+                &project,
+            );
+            let intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes {
+                    scopes: vec![
+                        project_file.to_string_lossy().into_owned(),
+                        external.to_string_lossy().into_owned(),
+                    ],
+                    force_prompt: false,
+                },
+                vec![project_resource, external_resource],
+                PermissionRisk::High,
+            )
+            .with_authority(PermissionAuthorityProfile::Filesystem {
+                input_pointers: Vec::new(),
+            });
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+
+            assert!(
+                manager
+                    .enforce_with_intent(
+                        &tool,
+                        &intent,
+                        &serde_json::json!({}),
+                        &event_tx,
+                        None,
+                        "mixed-authority",
+                        &crate::CancelToken::none(),
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+                    .is_ok()
+            );
+        });
     }
 
     #[test]
@@ -2042,11 +3332,11 @@ mod tests {
         let manager = default_mgr();
         let tool = ToolKey::native("task");
         assert!(matches!(
-            manager.check_inner(&tool, &["{}"], false, None, true),
+            manager.check_inner(&tool, &["{}"], false, None, true, true),
             PermissionCheck::Allowed
         ));
         assert!(matches!(
-            manager.check_inner(&tool, &["{}"], false, None, false),
+            manager.check_inner(&tool, &["{}"], false, None, false, true),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -2581,6 +3871,58 @@ mod tests {
     }
 
     #[test]
+    fn reusable_approval_does_not_resolve_configured_ask_prompts() {
+        smol::block_on(async {
+            let manager = Arc::new(mgr_with(
+                make_config(vec![PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some("cargo test".into()),
+                    effect: Effect::Ask,
+                }]),
+                PathBuf::from("/tmp"),
+            ));
+            let input = serde_json::json!({"command": "cargo test"});
+            let seed = PermissionRequest::from_legacy(
+                "seed".into(),
+                ToolKey::native("bash"),
+                vec!["cargo test".into()],
+                input.clone(),
+                Path::new("/tmp"),
+                false,
+            );
+            let rule = seed
+                .option_rule("allow_exact", PermissionLifetime::Conversation)
+                .unwrap();
+            manager.load_structured_conversation_rules(vec![
+                PermissionRuleRecord::conversation(rule).unwrap(),
+            ]);
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                input.clone(),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                "cargo test".into(),
+                input,
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", PermissionAnswer::AllowSession));
+            assert!(first.await.is_ok());
+            assert_eq!(manager.pending_count(), 1);
+            assert!(second_events.is_empty());
+            assert!(manager.answer("second", PermissionAnswer::AllowOnce));
+            assert!(second.await.is_ok());
+        });
+    }
+
+    #[test]
     fn allow_once_resolves_only_the_selected_parallel_request() {
         smol::block_on(async {
             let manager = Arc::new(default_mgr());
@@ -2863,12 +4205,26 @@ mod tests {
         mgr.add_session_rule(rule.clone());
         mgr.add_session_rule(rule);
         assert_eq!(mgr.session_rules_snapshot().len(), 1);
+        mgr.add_session_rule(PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: Some("git push *".into()),
+            effect: Effect::Ask,
+        });
+        assert_eq!(mgr.session_rules_snapshot().len(), 1);
     }
 
     #[test]
     fn restored_legacy_allows_are_inactive_review_candidates() {
         let mgr = default_mgr();
-        mgr.load_session_rules(vec![allow_rule("cargo *"), deny_rule("rm *")]);
+        mgr.load_session_rules(vec![
+            allow_rule("cargo *"),
+            deny_rule("rm *"),
+            PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("git push *".into()),
+                effect: Effect::Ask,
+            },
+        ]);
 
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),

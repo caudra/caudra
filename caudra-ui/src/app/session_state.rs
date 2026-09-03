@@ -162,16 +162,17 @@ impl From<Mode> for StoredMode {
 pub(crate) fn rules_to_stored(rules: &[caudra_config::PermissionRule]) -> Vec<StoredRule> {
     rules
         .iter()
-        .map(|r| {
+        .filter_map(|r| {
             let effect = match r.effect {
                 Effect::Allow => StoredEffect::Allow,
                 Effect::Deny => StoredEffect::Deny,
+                Effect::Ask => return None,
             };
-            StoredRule {
+            Some(StoredRule {
                 tool: r.tool.to_string(),
                 scope: r.scope.clone(),
                 effect,
-            }
+            })
         })
         .collect()
 }

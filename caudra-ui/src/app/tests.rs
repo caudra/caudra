@@ -22,7 +22,10 @@ use caudra_agent::{
     SubagentActivity, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
-use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
+use caudra_config::{
+    Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
+    PermissionsConfig, ToolKey, UiConfig,
+};
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use caudra_providers::{
@@ -6797,6 +6800,33 @@ fn permissions_command_lists_current_conversation_rules() {
     assert!(app.permissions_picker.is_open());
 }
 
+fn app_awaiting_permission_config_trust() -> App {
+    let mut app = test_app();
+    let project = PathBuf::from(&app.state.session.cwd);
+    let rule = PermissionRule {
+        tool: ToolKey::native("bash"),
+        scope: Some("cargo check -p caudra-ui".into()),
+        effect: Effect::Allow,
+    };
+    app.permissions = Arc::new(PermissionManager::new_persistent_in(
+        PermissionsConfig {
+            project_allow_rules: vec![rule.clone()],
+            review_candidates: vec![PermissionReviewCandidate {
+                source: PermissionSource::Project,
+                kind: PermissionReviewKind::Rule,
+                tool: Some(rule.tool),
+                scope: rule.scope,
+            }],
+            ..Default::default()
+        },
+        project,
+        Arc::default(),
+        app.storage.clone(),
+    ));
+    assert!(app.permissions.needs_project_permission_config_trust());
+    app
+}
+
 fn awaiting_mcp_picker() -> McpPicker {
     McpPicker::new(
         McpSnapshotReader::from_snapshot(McpSnapshot {
@@ -6849,6 +6879,189 @@ fn awaiting_mcp_trust_startup_behavior(needs_login: bool, opens: bool) {
     app.open_awaiting_mcp_trust(needs_login);
 
     assert_eq!(app.mcp_picker.is_open(), opens);
+}
+
+#[test_case(false, false, true  ; "opens_when_unblocked")]
+#[test_case(true,  false, false ; "does_not_disrupt_login")]
+#[test_case(false, true,  false ; "does_not_stack_over_mcp_trust")]
+fn awaiting_permission_config_trust_startup_behavior(
+    needs_login: bool,
+    open_mcp_trust: bool,
+    opens: bool,
+) {
+    let mut app = app_awaiting_permission_config_trust();
+    if open_mcp_trust {
+        app.mcp_picker = awaiting_mcp_picker();
+        app.open_awaiting_mcp_trust(false);
+    }
+
+    app.open_awaiting_permission_config_trust(needs_login);
+
+    assert_eq!(app.permissions_picker.is_open(), opens);
+}
+
+#[test]
+fn deferred_permission_config_trust_opens_after_mcp_trust_settles() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.open_awaiting_mcp_trust(false);
+    app.open_awaiting_permission_config_trust(false);
+    assert!(!app.permissions_picker.is_open());
+
+    app.mcp_picker = McpPicker::new(
+        McpSnapshotReader::empty(),
+        McpConfigErrors::new(PathBuf::new()),
+    );
+    let _ = app.tick();
+
+    assert!(app.permissions_picker.is_open());
+}
+
+#[test]
+fn deferred_permission_config_trust_does_not_close_a_manual_mcp_picker() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.open_awaiting_mcp_trust(false);
+    app.open_awaiting_permission_config_trust(false);
+    app.mcp_picker = McpPicker::new(
+        McpSnapshotReader::empty(),
+        McpConfigErrors::new(PathBuf::new()),
+    );
+    app.mcp_picker.open();
+
+    let _ = app.tick();
+
+    assert!(app.mcp_picker.is_open());
+    assert!(!app.permissions_picker.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.mcp_picker.is_open());
+    assert!(app.permissions_picker.is_open());
+}
+
+#[test]
+fn closing_login_advances_mcp_then_project_trust() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.login_picker.open(app.storage.clone());
+    app.open_awaiting_mcp_trust(true);
+    app.open_awaiting_permission_config_trust(true);
+
+    let actions = app.handle_login_picker_action(LoginPickerAction::Close);
+
+    assert!(actions.is_empty());
+    assert!(!app.login_picker.is_open());
+    assert!(app.mcp_picker.is_open());
+    assert!(!app.permissions_picker.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.permissions_picker.is_open());
+}
+
+#[test]
+fn permission_request_suspends_and_then_restores_project_trust() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.open_awaiting_permission_config_trust(false);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    assert!(app.permissions_picker.is_open());
+
+    app.update(agent_msg(permission_event("request", "cargo check")));
+
+    assert!(!app.permissions_picker.is_open());
+    assert!(app.permission_prompt.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.permissions_picker.is_open());
+}
+
+#[test]
+fn changing_projects_closes_stale_permission_config_actions() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.open_awaiting_permission_config_trust(false);
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("destination");
+    std::fs::create_dir(&project).unwrap();
+    let snapshot_store =
+        App::snapshot_store_for(&app.storage, app.state.session.id, &project).unwrap();
+    assert!(app.permissions_picker.is_open());
+
+    app.install_working_directory(&project, snapshot_store, PermissionsConfig::default());
+
+    assert!(!app.permissions_picker.is_open());
+    assert!(!app.permission_config_trust_deferred);
+}
+
+#[test]
+fn closing_mcp_trust_opens_deferred_permission_config_trust() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.mcp_picker = awaiting_mcp_picker();
+    app.open_awaiting_mcp_trust(false);
+    app.open_awaiting_permission_config_trust(false);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(actions.is_empty());
+    assert!(!app.mcp_picker.is_open());
+    assert!(app.permissions_picker.is_open());
+}
+
+#[test]
+fn trusting_project_permission_config_refreshes_picker() {
+    let mut app = app_awaiting_permission_config_trust();
+    app.execute_command(cmd("/permissions"), 0);
+    assert_eq!(
+        app.lifecycle_blocker(),
+        Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
+    );
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+
+    assert!(!app.permissions.needs_project_permission_config_trust());
+    assert!(app.permissions_picker.is_open());
+    assert_eq!(app.lifecycle_blocker(), None);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some("Project permission config trusted")
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 18);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.permissions_picker.view(frame, frame.area());
+        })
+        .unwrap();
+    let screen = buffer_text(terminal.backend().buffer());
+    assert!(!screen.contains("no authority has been granted"));
+    assert!(screen.contains("shell allow patterns are active"));
+    assert!(screen.contains("Trust or revoke"));
+    assert!(!screen.contains("needs review"));
+    assert!(screen.contains("bash"));
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(app.permissions.needs_project_permission_config_trust());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some("Project permission config trust revoked")
+    );
+}
+
+#[test]
+fn project_permission_config_trust_blocks_only_while_picker_is_open() {
+    let mut app = app_awaiting_permission_config_trust();
+    assert_eq!(app.lifecycle_blocker(), None);
+
+    app.execute_command(cmd("/permissions"), 0);
+    assert_eq!(
+        app.lifecycle_blocker(),
+        Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
+    );
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.permissions_picker.is_open());
+    assert!(app.permissions.needs_project_permission_config_trust());
+    assert_eq!(app.lifecycle_blocker(), None);
 }
 
 #[test_case(

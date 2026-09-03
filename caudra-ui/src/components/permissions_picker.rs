@@ -22,15 +22,24 @@ pub(crate) enum PermissionsPickerAction {
     Close,
     Revoke(String),
     RemoveLegacy(PermissionRule),
+    TrustProjectConfig,
+    RevokeProjectConfigTrust,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectConfigAction {
+    Trust,
+    RevokeTrust,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct PermissionEntry {
     id: Option<String>,
     tool: String,
     detail: String,
     legacy_rule: Option<PermissionRule>,
     read_only: bool,
+    project_config_action: Option<ProjectConfigAction>,
 }
 
 impl PickerItem for PermissionEntry {
@@ -45,8 +54,10 @@ impl PickerItem for PermissionEntry {
 
 pub(crate) struct PermissionsPicker {
     picker: ListPicker<PermissionEntry>,
+    entries: Vec<PermissionEntry>,
     pending_revoke: Option<String>,
     pending_legacy_removal: Option<PermissionRule>,
+    pending_project_config_action: Option<ProjectConfigAction>,
 }
 
 impl PermissionsPicker {
@@ -56,8 +67,10 @@ impl PermissionsPicker {
         picker.set_footer_builder(footer);
         Self {
             picker,
+            entries: Vec::new(),
             pending_revoke: None,
             pending_legacy_removal: None,
+            pending_project_config_action: None,
         }
     }
 
@@ -66,17 +79,31 @@ impl PermissionsPicker {
         rules: Vec<PermissionRuleRecord>,
         review_candidates: &[PermissionReviewCandidate],
         effective_policy: &[EffectivePermissionRule],
+        needs_project_config_trust: bool,
+        project_config_trusted: bool,
     ) {
-        let entries = rules
+        self.entries = needs_project_config_trust
+            .then(|| project_config_entry(ProjectConfigAction::Trust))
+            .or_else(|| {
+                project_config_trusted
+                    .then(|| project_config_entry(ProjectConfigAction::RevokeTrust))
+            })
             .into_iter()
-            .map(entry)
+            .chain(rules.into_iter().map(entry))
             .chain(review_candidates.iter().map(review_entry))
             .chain(effective_policy.iter().map(policy_entry))
             .collect();
         self.pending_revoke = None;
         self.pending_legacy_removal = None;
+        self.pending_project_config_action = None;
         self.picker.set_info_text(None);
-        self.picker.open(entries, TITLE);
+        self.picker
+            .set_footer_builder(if needs_project_config_trust || project_config_trusted {
+                trust_footer
+            } else {
+                footer
+            });
+        self.picker.open(self.entries.clone(), TITLE);
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -84,6 +111,25 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PermissionsPickerAction {
+        if let Some(action) = self.pending_project_config_action {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.pending_project_config_action = None;
+                    match action {
+                        ProjectConfigAction::Trust => PermissionsPickerAction::TrustProjectConfig,
+                        ProjectConfigAction::RevokeTrust => {
+                            PermissionsPickerAction::RevokeProjectConfigTrust
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.pending_project_config_action = None;
+                    self.picker.set_info_text(None);
+                    PermissionsPickerAction::Consumed
+                }
+                _ => PermissionsPickerAction::Consumed,
+            };
+        }
         if let Some(rule) = self.pending_legacy_removal.clone() {
             return match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
@@ -114,7 +160,9 @@ impl PermissionsPicker {
         }
         if key.code == KeyCode::Enter {
             if let Some(entry) = self.picker.selected_item() {
-                if let Some(id) = entry.id.clone() {
+                if let Some(action) = entry.project_config_action {
+                    self.confirm_project_config_action(action);
+                } else if let Some(id) = entry.id.clone() {
                     self.confirm_revoke(id);
                 } else if let Some(rule) = entry.legacy_rule.clone()
                     && !entry.read_only
@@ -132,15 +180,24 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> PermissionsPickerAction {
+        if self.has_pending_confirmation() {
+            return PermissionsPickerAction::Consumed;
+        }
         let action = self.picker.handle_mouse(event);
         self.map_action(action)
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) -> bool {
+        if self.has_pending_confirmation() {
+            return true;
+        }
         self.picker.handle_paste(text)
     }
 
     pub(crate) fn scroll(&mut self, delta: i32) {
+        if self.has_pending_confirmation() {
+            return;
+        }
         self.picker.scroll(delta);
     }
 
@@ -156,7 +213,11 @@ impl PermissionsPicker {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => PermissionsPickerAction::Consumed,
             PickerAction::Select(entry) => {
-                if let Some(id) = entry.id {
+                self.picker.open(self.entries.clone(), TITLE);
+                self.picker.select_item_by(|candidate| candidate == &entry);
+                if let Some(action) = entry.project_config_action {
+                    self.confirm_project_config_action(action);
+                } else if let Some(id) = entry.id {
                     self.confirm_revoke(id);
                 } else if let Some(rule) = entry.legacy_rule
                     && !entry.read_only
@@ -171,6 +232,19 @@ impl PermissionsPicker {
             }
             PickerAction::Close => PermissionsPickerAction::Close,
         }
+    }
+
+    fn confirm_project_config_action(&mut self, action: ProjectConfigAction) {
+        self.pending_project_config_action = Some(action);
+        let message = match action {
+            ProjectConfigAction::Trust => {
+                "Trust the exact project shell allow configuration? Edits invalidate trust. Press Enter/y to confirm or Esc to cancel."
+            }
+            ProjectConfigAction::RevokeTrust => {
+                "Revoke trust in this project permission config? Its shell allows will become inactive. Press Enter/y to confirm or Esc to cancel."
+            }
+        };
+        self.picker.set_info_text(Some(message.into()));
     }
 
     fn confirm_revoke(&mut self, id: String) {
@@ -196,6 +270,12 @@ impl PermissionsPicker {
         };
         self.picker.set_info_text(Some(message.into()));
     }
+
+    fn has_pending_confirmation(&self) -> bool {
+        self.pending_revoke.is_some()
+            || self.pending_legacy_removal.is_some()
+            || self.pending_project_config_action.is_some()
+    }
 }
 
 impl Overlay for PermissionsPicker {
@@ -206,7 +286,25 @@ impl Overlay for PermissionsPicker {
     fn close(&mut self) {
         self.pending_revoke = None;
         self.pending_legacy_removal = None;
+        self.pending_project_config_action = None;
         self.picker.close();
+    }
+}
+
+fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
+    let trusted = action == ProjectConfigAction::RevokeTrust;
+    PermissionEntry {
+        id: None,
+        tool: "Project permissions.toml".into(),
+        detail: if trusted {
+            "shell allow patterns are active · trust can be revoked"
+        } else {
+            "shell allow patterns are inactive · no authority has been granted"
+        }
+        .into(),
+        legacy_rule: None,
+        read_only: false,
+        project_config_action: Some(action),
     }
 }
 
@@ -217,7 +315,24 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         PermissionSubject::Mcp { server, tool, .. } => format!("{server}.{tool}"),
         PermissionSubject::UnknownLegacy { identity } => identity.clone(),
     };
+    let command_patterns: Vec<_> = record
+        .rule
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.selector {
+            PermissionResourceSelector::CommandPattern { pattern } => Some(pattern.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut tool = tool;
+    let pattern_detail = if command_patterns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "patterns {} · ",
+            escape_terminal_controls(&command_patterns.join(", "))
+        )
+    };
     if let PermissionArgumentConstraint::Exact { digest } = &record.rule.arguments {
         tool.push_str(&format!(" · input {}", &digest[..digest.len().min(10)]));
     }
@@ -233,7 +348,7 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         _ => format!(" · id {}", &record.id[..record.id.len().min(10)]),
     };
     let detail = format!(
-        "[{}] {} · {}{}",
+        "{pattern_detail}[{}] {} · {}{}",
         authority_badge(&record),
         effect_name(&record.rule.effect),
         lifetime_name(&record.rule.lifetime),
@@ -245,6 +360,7 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         detail,
         legacy_rule: None,
         read_only: false,
+        project_config_action: None,
     }
 }
 
@@ -281,6 +397,7 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
             effect: Effect::Allow,
         }),
         read_only: candidate.source != PermissionSource::Conversation,
+        project_config_action: None,
     }
 }
 
@@ -293,6 +410,7 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
             "[legacy] {} · {} · scope {}{}",
             match entry.rule.effect {
                 Effect::Allow => "allow",
+                Effect::Ask => "ask",
                 Effect::Deny => "deny",
             },
             entry.source,
@@ -305,6 +423,7 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
         ),
         legacy_rule: Some(entry.rule.clone()),
         read_only: !entry.removable,
+        project_config_action: None,
     }
 }
 
@@ -330,6 +449,13 @@ fn authority_badge(record: &PermissionRuleRecord) -> String {
         )
     }) {
         "origin/**"
+    } else if record.rule.resources.iter().any(|resource| {
+        matches!(
+            resource.selector,
+            PermissionResourceSelector::CommandPattern { .. }
+        )
+    }) {
+        "command-pattern"
     } else if record.rule.resources.iter().any(|resource| {
         matches!(
             resource.selector,
@@ -375,6 +501,10 @@ fn lifetime_name(lifetime: &PermissionLifetime) -> &'static str {
 
 fn footer() -> Line<'static> {
     hint_line(&[("Enter", "Revoke"), ("Esc", "Close")])
+}
+
+fn trust_footer() -> Line<'static> {
+    hint_line(&[("Enter", "Trust or revoke"), ("Esc", "Close")])
 }
 
 #[cfg(test)]
@@ -430,7 +560,7 @@ mod tests {
         let record = record();
         let id = record.id.clone();
         let mut picker = PermissionsPicker::new();
-        picker.open(vec![record], &[], &[]);
+        picker.open(vec![record], &[], &[], false, false);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -468,6 +598,8 @@ mod tests {
                 scope: Some("cargo *".into()),
             }],
             &[],
+            false,
+            false,
         );
         let backend = TestBackend::new(100, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -480,5 +612,134 @@ mod tests {
         assert!(screen.contains("needs review"));
         assert!(screen.contains("inactive allow rule"));
         assert!(screen.contains("project config"));
+    }
+
+    #[test]
+    fn project_config_trust_requires_confirmation_and_can_be_cancelled() {
+        let mut picker = PermissionsPicker::new();
+        picker.open(Vec::new(), &[], &[], true, false);
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("Project permissions.toml"));
+        assert!(screen.contains("shell allow patterns are inactive"));
+        assert!(screen.contains("no authority has been granted"));
+        assert!(screen.contains("Trust or revoke"));
+
+        let enter = KeyEvent::from(KeyCode::Enter);
+        assert!(matches!(
+            picker.handle_key(enter),
+            PermissionsPickerAction::Consumed
+        ));
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("Trust the exact project shell allow configuration"));
+        assert!(screen.contains("Edits invalidate trust"));
+
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Esc)),
+            PermissionsPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(enter),
+            PermissionsPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Char('y'))),
+            PermissionsPickerAction::TrustProjectConfig
+        ));
+    }
+
+    #[test]
+    fn mouse_selection_keeps_project_trust_confirmation_open() {
+        let mut picker = PermissionsPicker::new();
+        picker.open(Vec::new(), &[], &[], true, false);
+        picker.picker.close();
+
+        assert!(matches!(
+            picker.map_action(PickerAction::Select(project_config_entry(
+                ProjectConfigAction::Trust
+            ))),
+            PermissionsPickerAction::Consumed
+        ));
+        assert!(picker.is_open());
+        assert_eq!(
+            picker.pending_project_config_action,
+            Some(ProjectConfigAction::Trust)
+        );
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            PermissionsPickerAction::TrustProjectConfig
+        ));
+    }
+
+    #[test]
+    fn command_pattern_is_visible_before_redacted_metadata() {
+        let mut record = record();
+        record.rule.resources[0].selector = PermissionResourceSelector::CommandPattern {
+            pattern: "git status *".into(),
+        };
+        let mut picker = PermissionsPicker::new();
+        picker.open(vec![record], &[], &[], false, false);
+        let backend = TestBackend::new(70, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("patterns git status *"));
+    }
+
+    #[test]
+    fn trusted_project_config_can_be_revoked() {
+        let mut picker = PermissionsPicker::new();
+        picker.open(Vec::new(), &[], &[], false, true);
+
+        let enter = KeyEvent::from(KeyCode::Enter);
+        assert!(matches!(
+            picker.handle_key(enter),
+            PermissionsPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(enter),
+            PermissionsPickerAction::RevokeProjectConfigTrust
+        ));
+    }
+
+    #[test]
+    fn mouse_selection_restores_the_selected_entry() {
+        let record = record();
+        let selected_id = record.id.clone();
+        let selected = entry(record.clone());
+        let mut picker = PermissionsPicker::new();
+        picker.open(vec![record], &[], &[], true, false);
+
+        assert!(matches!(
+            picker.map_action(PickerAction::Select(selected)),
+            PermissionsPickerAction::Consumed
+        ));
+        assert_eq!(
+            picker
+                .picker
+                .selected_item()
+                .and_then(|entry| entry.id.as_ref()),
+            Some(&selected_id)
+        );
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            PermissionsPickerAction::Revoke(id) if id == selected_id
+        ));
     }
 }

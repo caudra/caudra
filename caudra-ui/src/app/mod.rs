@@ -71,14 +71,16 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use caudra_agent::permissions::{PermissionAnswer, PermissionManager, RevokedRuleScope};
+use caudra_agent::permissions::{
+    PermissionAnswer, PermissionManager, PermissionPolicyError, RevokedRuleScope,
+};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
     McpPromptInfo, McpSnapshotReader, QueueItemId, SharedHistory, SteeringQueue, SubagentInfo,
 };
-use caudra_config::{ModelPolicy, UiConfig};
+use caudra_config::{ModelPolicy, PermissionsConfig, UiConfig};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
@@ -139,6 +141,7 @@ const QUESTION_BLOCKER: &str = "Question requested";
 const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
 const MCP_TRUST_BLOCKER: &str = "MCP trust required";
+const PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER: &str = "Project permission config trust required";
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
@@ -261,6 +264,7 @@ pub struct App {
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
+    permission_config_trust_deferred: bool,
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
     pub(super) question_form: QuestionForm,
@@ -417,6 +421,7 @@ impl App {
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
+            permission_config_trust_deferred: false,
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
             question_form: QuestionForm::new(),
@@ -1369,6 +1374,7 @@ impl App {
     }
 
     fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
+        let closed = !matches!(&action, LoginPickerAction::Consumed);
         let actions = match action {
             LoginPickerAction::Consumed | LoginPickerAction::Close => Vec::new(),
             LoginPickerAction::Authenticated { model_spec } => {
@@ -1378,17 +1384,17 @@ impl App {
                 vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
         };
-        if !actions.is_empty() {
+        if closed {
             self.login_picker.close();
-            if self.mcp_picker.has_awaiting_trust() {
-                self.mcp_picker.open();
-            }
+            self.open_awaiting_mcp_trust(false);
+            self.open_awaiting_permission_config_trust(false);
         }
         actions
     }
 
-    fn handle_mcp_picker_action(&self, action: McpPickerAction) -> Vec<Action> {
-        match action {
+    fn handle_mcp_picker_action(&mut self, action: McpPickerAction) -> Vec<Action> {
+        let closed = matches!(&action, McpPickerAction::Close);
+        let actions = match action {
             McpPickerAction::Consumed | McpPickerAction::Close => Vec::new(),
             McpPickerAction::Toggle {
                 server_name,
@@ -1401,7 +1407,12 @@ impl App {
                 vec![Action::TrustMcpProject(server_name)]
             }
             McpPickerAction::Reject { server_name } => vec![Action::RejectMcp(server_name)],
+        };
+        if closed {
+            self.mcp_picker.close();
+            self.open_awaiting_permission_config_trust(false);
         }
+        actions
     }
 
     pub(crate) fn open_awaiting_mcp_trust(&mut self, needs_login: bool) {
@@ -1410,10 +1421,76 @@ impl App {
         }
     }
 
+    pub(crate) fn open_awaiting_permission_config_trust(&mut self, needs_login: bool) {
+        let needs_trust = self.permissions.needs_project_permission_config_trust();
+        if needs_login || self.mcp_picker.is_open() || self.permission_prompt.is_open() {
+            self.permission_config_trust_deferred = needs_trust;
+            return;
+        }
+        self.permission_config_trust_deferred = false;
+        if needs_trust && let Err(error) = self.open_permissions_picker() {
+            self.flash(error.to_string());
+        }
+    }
+
+    fn open_permissions_picker(&mut self) -> Result<(), PermissionPolicyError> {
+        let rules = self.permissions.structured_rule_inventory()?;
+        let candidates = self.permissions.review_candidates();
+        let policy = self.permissions.effective_legacy_policy();
+        let needs_project_config_trust = self.permissions.needs_project_permission_config_trust();
+        let project_config_trusted = self.permissions.project_permission_config_trusted();
+        self.permissions_picker.open(
+            rules,
+            &candidates,
+            &policy,
+            needs_project_config_trust,
+            project_config_trusted,
+        );
+        Ok(())
+    }
+
     fn handle_permissions_picker_action(&mut self, action: PermissionsPickerAction) -> Vec<Action> {
         match action {
             PermissionsPickerAction::Consumed => {}
             PermissionsPickerAction::Close => self.permissions_picker.close(),
+            PermissionsPickerAction::TrustProjectConfig => {
+                match self.permissions.trust_project_permission_config() {
+                    Ok(()) => match self.open_permissions_picker() {
+                        Ok(()) => self.flash("Project permission config trusted".into()),
+                        Err(error) => {
+                            self.permissions_picker.close();
+                            self.flash(format!(
+                                    "Project permission config trusted, but permissions could not be refreshed: {error}"
+                                ));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = self.open_permissions_picker();
+                        self.flash(format!(
+                            "Failed to trust project permission config: {error}"
+                        ));
+                    }
+                }
+            }
+            PermissionsPickerAction::RevokeProjectConfigTrust => {
+                match self.permissions.revoke_project_permission_config_trust() {
+                    Ok(()) => match self.open_permissions_picker() {
+                        Ok(()) => self.flash("Project permission config trust revoked".into()),
+                        Err(error) => {
+                            self.permissions_picker.close();
+                            self.flash(format!(
+                                "Project permission config trust revoked, but permissions could not be refreshed: {error}"
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = self.open_permissions_picker();
+                        self.flash(format!(
+                            "Failed to revoke project permission config trust: {error}"
+                        ));
+                    }
+                }
+            }
             PermissionsPickerAction::RemoveLegacy(rule) => {
                 if self.permissions.remove_conversation_legacy_rule(
                     &rule.tool,
@@ -1421,11 +1498,7 @@ impl App {
                     rule.effect,
                 ) {
                     self.checkpoint_now();
-                    if let Ok(rules) = self.permissions.structured_rule_inventory() {
-                        let candidates = self.permissions.review_candidates();
-                        let policy = self.permissions.effective_legacy_policy();
-                        self.permissions_picker.open(rules, &candidates, &policy);
-                    }
+                    let _ = self.open_permissions_picker();
                     self.flash("Legacy conversation rule removed".into());
                 }
             }
@@ -1435,12 +1508,8 @@ impl App {
                         if scope == RevokedRuleScope::Conversation {
                             self.checkpoint_now();
                         }
-                        match self.permissions.structured_rule_inventory() {
-                            Ok(rules) => {
-                                let candidates = self.permissions.review_candidates();
-                                let policy = self.permissions.effective_legacy_policy();
-                                self.permissions_picker.open(rules, &candidates, &policy);
-                            }
+                        match self.open_permissions_picker() {
+                            Ok(()) => {}
                             Err(error) => {
                                 self.permissions_picker.close();
                                 self.flash(error.to_string());
@@ -2417,6 +2486,11 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest(request) = result {
+            if self.permissions_picker.is_open() {
+                self.permissions_picker.close();
+                self.permission_config_trust_deferred =
+                    self.permissions.needs_project_permission_config_trust();
+            }
             self.permission_prompt.enqueue(request, subagent_id);
             return vec![];
         }
@@ -2663,12 +2737,8 @@ impl App {
                 vec![]
             }
             "/permissions" => {
-                match self.permissions.structured_rule_inventory() {
-                    Ok(rules) => {
-                        let candidates = self.permissions.review_candidates();
-                        let policy = self.permissions.effective_legacy_policy();
-                        self.permissions_picker.open(rules, &candidates, &policy);
-                    }
+                match self.open_permissions_picker() {
+                    Ok(()) => {}
                     Err(error) => self.flash(error.to_string()),
                 }
                 vec![]
@@ -2903,8 +2973,11 @@ impl App {
         &mut self,
         cwd: &std::path::Path,
         snapshot_store: Arc<SnapshotStore>,
+        permissions: PermissionsConfig,
     ) {
-        self.permissions.set_project(cwd);
+        self.permissions_picker.close();
+        self.permission_config_trust_deferred = false;
+        self.permissions.set_project_with_config(cwd, permissions);
         self.state
             .session_mut()
             .set_cwd(cwd.to_string_lossy().into_owned());
@@ -3003,6 +3076,11 @@ impl App {
                 self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
                 MCP_TRUST_BLOCKER,
             ),
+            (
+                self.permissions_picker.is_open()
+                    && self.permissions.needs_project_permission_config_trust(),
+                PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER,
+            ),
         ]
         .into_iter()
         .find_map(|(blocked, message)| blocked.then_some(message))
@@ -3084,6 +3162,7 @@ impl App {
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
+            | self.tick_permission_config_trust()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
@@ -3091,6 +3170,18 @@ impl App {
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_permission_config_trust(&mut self) -> Dirty {
+        if !self.permission_config_trust_deferred
+            || self.login_picker.is_open()
+            || self.mcp_picker.is_open()
+            || self.permission_prompt.is_open()
+        {
+            return Dirty::NO;
+        }
+        self.open_awaiting_permission_config_trust(false);
+        Dirty::YES
     }
 
     fn tick_file_picker(&mut self) -> Dirty {

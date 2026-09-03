@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -10,10 +13,13 @@ use crate::{StateDir, atomic_write_permissions, exclusive_state_lock, now_epoch}
 
 pub const PERMISSION_STATE_FILE: &str = "permission-rules.json";
 
-const PERMISSION_STATE_VERSION: u32 = 2;
+const PERMISSION_STATE_VERSION: u32 = 3;
 const LEGACY_PERMISSION_STATE_VERSION: u32 = 1;
+const PREVIOUS_PERMISSION_STATE_VERSION: u32 = 2;
 const PERMISSION_STATE_MODE: u32 = 0o600;
 const PERMISSION_STATE_LOCK_FILE: &str = "permission-rules.lock";
+pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
+pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +84,7 @@ pub enum PermissionResourceSelector {
     FilesystemSubtreeDigest { digest: String },
     UrlSubtreeDigest { digest: String },
     UrlOriginDigest { digest: String },
+    CommandPattern { pattern: String },
     Subtree { root: String },
     Any,
 }
@@ -318,7 +325,8 @@ impl PermissionState {
         Ok(true)
     }
 
-    fn write(&mut self, next: PermissionStateFile) -> Result<(), PermissionStateError> {
+    fn write(&mut self, mut next: PermissionStateFile) -> Result<(), PermissionStateError> {
+        next.version = PERMISSION_STATE_VERSION;
         validate_file(&next)?;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
@@ -343,13 +351,65 @@ pub fn validate_conversation_record(
 }
 
 fn load_file(path: &Path) -> Result<Option<PermissionStateFile>, PermissionStateError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(PermissionStateError::Invalid(format!(
+                "permission state path {} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(PermissionStateError::Invalid(format!(
+            "permission state path {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(PermissionStateError::Invalid(format!(
+            "permission state file {} must be owned by the current user and inaccessible to other users",
+            path.display()
+        )));
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
     let mut file: PermissionStateFile = serde_json::from_slice(&data)?;
-    if file.version == LEGACY_PERMISSION_STATE_VERSION {
+    let stored_version = file.version;
+    if matches!(
+        stored_version,
+        LEGACY_PERMISSION_STATE_VERSION | PREVIOUS_PERMISSION_STATE_VERSION
+    ) {
+        if file.records.iter().any(|record| {
+            record.rule.resources.iter().any(|resource| {
+                matches!(
+                    &resource.selector,
+                    PermissionResourceSelector::CommandPattern { .. }
+                ) || resource.attributes.values().any(|selector| {
+                    matches!(selector, PermissionResourceSelector::CommandPattern { .. })
+                })
+            })
+        }) {
+            return Err(PermissionStateError::Invalid(format!(
+                "permission state version {stored_version} contains a version 3 command pattern"
+            )));
+        }
         file.version = PERMISSION_STATE_VERSION;
     }
     validate_file(&file)?;
@@ -426,8 +486,13 @@ fn validate_record(
         PermissionArgumentConstraint::Unconstrained => {}
     }
     for resource in &record.rule.resources {
-        validate_selector(&resource.selector)?;
-        for selector in resource.attributes.values() {
+        validate_resource_selector(&resource.kind, &resource.selector)?;
+        for (attribute, selector) in &resource.attributes {
+            if matches!(selector, PermissionResourceSelector::CommandPattern { .. }) {
+                return Err(PermissionStateError::Invalid(format!(
+                    "command pattern selector cannot be used for resource attribute {attribute:?}"
+                )));
+            }
             validate_selector(selector)?;
         }
     }
@@ -454,6 +519,21 @@ fn validate_review(value: &Value) -> Result<(), PermissionStateError> {
     }
 }
 
+fn validate_resource_selector(
+    kind: &PermissionResourceKind,
+    selector: &PermissionResourceSelector,
+) -> Result<(), PermissionStateError> {
+    if let PermissionResourceSelector::CommandPattern { pattern } = selector {
+        if !matches!(kind, PermissionResourceKind::Command) {
+            return Err(PermissionStateError::Invalid(
+                "command pattern selector requires a command resource".into(),
+            ));
+        }
+        return validate_command_pattern(pattern).map_err(PermissionStateError::Invalid);
+    }
+    validate_selector(selector)
+}
+
 fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), PermissionStateError> {
     match selector {
         PermissionResourceSelector::Digest { digest }
@@ -461,6 +541,9 @@ fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), Permis
         | PermissionResourceSelector::UrlSubtreeDigest { digest }
         | PermissionResourceSelector::UrlOriginDigest { digest } => validate_digest(digest),
         PermissionResourceSelector::Any => Ok(()),
+        PermissionResourceSelector::CommandPattern { .. } => Err(PermissionStateError::Invalid(
+            "command pattern selector is only valid as a primary command resource selector".into(),
+        )),
         PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Subtree { .. } => {
             Err(PermissionStateError::Invalid(
                 "raw resource values cannot be stored durably".into(),
@@ -469,8 +552,53 @@ fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), Permis
     }
 }
 
+pub fn validate_command_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.len() > COMMAND_PATTERN_MAX_BYTES {
+        return Err(format!(
+            "command pattern exceeds {COMMAND_PATTERN_MAX_BYTES} UTF-8 bytes"
+        ));
+    }
+    if pattern.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("command pattern contains a control character".into());
+    }
+    if !pattern.is_ascii() {
+        return Err("command pattern must contain only ASCII characters".into());
+    }
+
+    let tokens: Vec<_> = pattern.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() > COMMAND_PATTERN_MAX_TOKENS {
+        return Err(format!(
+            "command pattern must contain 1 to {COMMAND_PATTERN_MAX_TOKENS} tokens"
+        ));
+    }
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == "*" {
+            if index + 1 != tokens.len() {
+                return Err("command pattern wildcard must be the final token".into());
+            }
+            continue;
+        }
+        if token.contains('*') {
+            return Err(
+                "command pattern wildcard must be a bare final token separated by a space".into(),
+            );
+        }
+        if !token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'/' | b'@' | b':' | b'=' | b'+' | b'-')
+        }) {
+            return Err("command pattern literal token contains an invalid character".into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_digest(digest: &str) -> Result<(), PermissionStateError> {
-    if digest.len() == SHA256_HEX_LEN && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if digest.len() == SHA256_HEX_LEN
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
         Ok(())
     } else {
         Err(PermissionStateError::Invalid(
@@ -481,11 +609,23 @@ fn validate_digest(digest: &str) -> Result<(), PermissionStateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    use super::{
+        COMMAND_PATTERN_MAX_BYTES, LEGACY_PERMISSION_STATE_VERSION, PERMISSION_STATE_FILE,
+        PERMISSION_STATE_MODE, PERMISSION_STATE_VERSION, PREVIOUS_PERMISSION_STATE_VERSION,
+        PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
+        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRuleRecord, PermissionState, PermissionStateError,
+        PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
+        validate_command_pattern,
+    };
+    use crate::StateDir;
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -511,6 +651,125 @@ mod tests {
             lifetime,
             effect: StructuredPermissionEffect::Allow,
         }
+    }
+
+    fn command_pattern_rule(
+        lifetime: PermissionLifetime,
+        pattern: &str,
+    ) -> StructuredPermissionRule {
+        let mut rule = rule(lifetime);
+        rule.resources[0].selector = PermissionResourceSelector::CommandPattern {
+            pattern: pattern.into(),
+        };
+        rule
+    }
+
+    fn invalid_message(error: PermissionStateError) -> String {
+        match error {
+            PermissionStateError::Invalid(message) => message,
+            other => panic!("expected invalid permission state, got {other}"),
+        }
+    }
+
+    #[test]
+    fn command_patterns_accept_conservative_tokens_and_final_wildcard() {
+        let maximum_length = "a".repeat(COMMAND_PATTERN_MAX_BYTES);
+        for pattern in [
+            "git",
+            "git status",
+            "git status *",
+            "cargo-test_1 ./src /tmp/foo user@host key=value +flag foo:bar",
+            "one two three four five six seven *",
+            maximum_length.as_str(),
+        ] {
+            assert!(
+                validate_command_pattern(pattern).is_ok(),
+                "pattern should be accepted: {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_patterns_reject_unsafe_or_ambiguous_syntax() {
+        let too_long = "a".repeat(COMMAND_PATTERN_MAX_BYTES + 1);
+        for pattern in [
+            "",
+            "   ",
+            "one two three four five six seven eight nine",
+            "git status*",
+            "git * status",
+            "git **",
+            "git \"status\"",
+            "git\tstatus",
+            "git\nstatus",
+            "git café",
+            "git $(pwd)",
+            too_long.as_str(),
+        ] {
+            assert!(
+                validate_command_pattern(pattern).is_err(),
+                "pattern should be rejected: {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_digests_require_canonical_lowercase_hex() {
+        assert!(super::validate_digest(&"a".repeat(SHA256_HEX_LEN)).is_ok());
+        assert!(super::validate_digest(&"A".repeat(SHA256_HEX_LEN)).is_err());
+    }
+
+    #[test]
+    fn command_pattern_requires_command_resource_kind() {
+        let mut rule = command_pattern_rule(PermissionLifetime::Conversation, "git status *");
+        rule.resources[0].kind = PermissionResourceKind::File;
+
+        let message = invalid_message(PermissionRuleRecord::conversation(rule).unwrap_err());
+
+        assert_eq!(
+            message,
+            "command pattern selector requires a command resource"
+        );
+    }
+
+    #[test]
+    fn command_pattern_cannot_be_an_attribute_selector() {
+        let mut rule = rule(PermissionLifetime::Conversation);
+        rule.resources[0].attributes.insert(
+            "working_directory".into(),
+            PermissionResourceSelector::CommandPattern {
+                pattern: "git status *".into(),
+            },
+        );
+
+        let message = invalid_message(PermissionRuleRecord::conversation(rule).unwrap_err());
+
+        assert_eq!(
+            message,
+            "command pattern selector cannot be used for resource attribute \"working_directory\""
+        );
+    }
+
+    #[test]
+    fn version_three_command_pattern_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let mut state = PermissionState::open(&state_dir).unwrap();
+        let rule = command_pattern_rule(PermissionLifetime::Global, "git status *");
+
+        let inserted = state.insert(None, rule.clone()).unwrap();
+        let stored: Value = serde_json::from_slice(&fs::read(state.path()).unwrap()).unwrap();
+        assert_eq!(stored["version"], PERMISSION_STATE_VERSION);
+        assert_eq!(
+            stored["records"][0]["rule"]["resources"][0]["selector"],
+            json!({"match": "command_pattern", "pattern": "git status *"})
+        );
+        drop(state);
+
+        let restored = PermissionState::open(&state_dir).unwrap();
+        assert_eq!(restored.records().len(), 1);
+        assert_eq!(restored.records()[0].id, inserted.id);
+        assert_eq!(restored.records()[0].rule, rule);
     }
 
     #[test]
@@ -554,24 +813,60 @@ mod tests {
     }
 
     #[test]
-    fn version_one_exact_rules_migrate_in_memory() {
+    fn version_one_and_two_rules_migrate_and_are_rewritten_as_version_three() {
+        for old_version in [
+            LEGACY_PERMISSION_STATE_VERSION,
+            PREVIOUS_PERMISSION_STATE_VERSION,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::from_path(temp.path().join("state"));
+            let mut state = PermissionState::open(&state_dir).unwrap();
+            let record = state
+                .insert(None, rule(PermissionLifetime::Global))
+                .unwrap();
+            drop(state);
+            let path = state_dir.path().join(PERMISSION_STATE_FILE);
+            let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            stored["version"] = Value::from(old_version);
+            fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+
+            let mut restored = PermissionState::open(&state_dir).unwrap();
+            assert_eq!(restored.records().len(), 1);
+            assert_eq!(restored.records()[0].id, record.id);
+            assert!(restored.revoke(&record.id).unwrap());
+
+            let rewritten: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(rewritten["version"], PERMISSION_STATE_VERSION);
+            assert_eq!(rewritten["records"][0]["id"], record.id);
+        }
+    }
+
+    #[test]
+    fn legacy_versions_reject_version_three_command_patterns() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
-        let project = temp.path().join("project");
-        fs::create_dir_all(&project).unwrap();
-        let project = project.canonicalize().unwrap();
         let mut state = PermissionState::open(&state_dir).unwrap();
         state
-            .insert(Some(project), rule(PermissionLifetime::Project))
+            .insert(
+                None,
+                command_pattern_rule(PermissionLifetime::Global, "git status *"),
+            )
             .unwrap();
         drop(state);
         let path = state_dir.path().join(PERMISSION_STATE_FILE);
         let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        stored["version"] = Value::from(LEGACY_PERMISSION_STATE_VERSION);
+        stored["version"] = Value::from(PREVIOUS_PERMISSION_STATE_VERSION);
         fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
 
-        let restored = PermissionState::open(&state_dir).unwrap();
-        assert_eq!(restored.records().len(), 1);
+        let error = match PermissionState::open(&state_dir) {
+            Ok(_) => panic!("legacy permission state accepted a command pattern"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("contains a version 3 command pattern")
+        );
     }
 
     #[cfg(unix)]
@@ -586,6 +881,32 @@ mod tests {
 
         let mode = fs::metadata(state.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, PERMISSION_STATE_MODE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_or_symlinked_permission_state_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let mut state = PermissionState::open(&state_dir).unwrap();
+        state
+            .insert(None, rule(PermissionLifetime::Global))
+            .unwrap();
+        let path = state.path().to_path_buf();
+        let data = fs::read(&path).unwrap();
+        drop(state);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PermissionState::open(&state_dir).is_err());
+
+        fs::remove_file(&path).unwrap();
+        let target = temp.path().join("permission-state-target.json");
+        fs::write(&target, data).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(PERMISSION_STATE_MODE)).unwrap();
+        symlink(target, path).unwrap();
+        assert!(PermissionState::open(&state_dir).is_err());
     }
 
     #[test]

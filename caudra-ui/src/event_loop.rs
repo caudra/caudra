@@ -23,7 +23,7 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use caudra_config::{ModelPolicy, UiConfig};
+use caudra_config::{ModelPolicy, UiConfig, load_permissions};
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
     TaskRequest, UiAction, UiReply,
@@ -928,6 +928,7 @@ impl<'t> EventLoop<'t> {
             app.login_picker.open(app.storage.clone());
         }
         app.open_awaiting_mcp_trust(needs_login);
+        app.open_awaiting_permission_config_trust(needs_login);
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
@@ -958,12 +959,7 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
-        if let Some(prompt) = initial_prompt {
-            let sub = Submission::from_text(prompt);
-            let actions = self.focused_app().handle_submit(sub);
-            self.dispatch(self.focused, actions);
-        }
+    pub(crate) fn run(mut self, mut initial_prompt: Option<String>) -> Result<ShutdownReport> {
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
@@ -972,6 +968,14 @@ impl<'t> EventLoop<'t> {
             match self.drain_channels() {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
+            }
+            if self.focused_app().lifecycle_blocker().is_none()
+                && let Some(prompt) = initial_prompt.take()
+            {
+                let sub = Submission::from_text(prompt);
+                let actions = self.focused_app().handle_submit(sub);
+                self.dispatch(self.focused, actions);
+                dirty = Dirty::YES;
             }
             self.checkpoint_all();
             if dirty.take() {
@@ -1978,11 +1982,19 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].app.flash(format!("cd: {error}"));
             return;
         }
-        self.ctx.permissions.set_project(&cwd);
+        let permissions = load_permissions(&cwd);
+        self.ctx
+            .permissions
+            .set_project_with_config(&cwd, permissions.clone());
         for (runtime, store) in self.sessions.iter_mut().zip(stores) {
-            runtime.app.install_working_directory(&cwd, store);
+            runtime
+                .app
+                .install_working_directory(&cwd, store, permissions.clone());
             runtime.app.checkpoint_now();
         }
+        self.sessions[idx]
+            .app
+            .open_awaiting_permission_config_trust(false);
         let mut save_error = None;
         for runtime in &self.sessions {
             if runtime.app.has_content()
