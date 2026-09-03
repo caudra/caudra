@@ -242,14 +242,14 @@ impl BatchCall {
                 publish(&entries, index, &ctx, |entry| {
                     entry.status = BatchToolStatus::Running;
                 });
-                let done = tool_dispatch::run(
+                let (done, start) = tool_dispatch::run_capturing(
                     &registry,
                     mcp.as_ref(),
                     ctx.tool_use_id.clone().unwrap_or_default(),
                     &child.tool,
                     &child.params,
                     &ctx,
-                    Emit::Silent,
+                    Emit::Capture,
                 )
                 .await;
                 publish(&entries, index, &ctx, |entry| {
@@ -260,6 +260,13 @@ impl BatchCall {
                     };
                     entry.annotation = done.annotation.clone();
                     entry.output = Some(done.output.clone());
+                    // The roster shows a child the way a standalone card
+                    // would, which is the header the call introduced itself
+                    // with rather than a bare tool name.
+                    if let Some(start) = start {
+                        entry.summary = start.summary;
+                        entry.input = start.input;
+                    }
                 });
             });
         }
@@ -686,6 +693,75 @@ mod tests {
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(BarrierCall(Arc::clone(&self.gate))))
         }
+    }
+
+    const HEADER_TOOL: &str = "header_tool";
+    const HEADER_PATH: &str = "src/lib.rs";
+    const EXPECT_SUMMARY: &str =
+        "the roster shows the header the child introduced itself with, not a bare tool name";
+
+    /// Derives its header from the input, so a summary that merely echoed the
+    /// tool name could not pass.
+    struct HeaderTool;
+
+    struct HeaderCall(String);
+
+    impl ToolInvocation for HeaderCall {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(self.0.clone()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move { ToolExecResult::from(Ok(ToolOutput::Plain(BODY.into()))) })
+        }
+    }
+
+    impl Tool for HeaderTool {
+        fn name(&self) -> &str {
+            HEADER_TOOL
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(HeaderCall(
+                input["path"].as_str().unwrap_or_default().to_owned(),
+            )))
+        }
+    }
+
+    /// `BatchToolEntry::summary` is documented as the child's header line and
+    /// was left empty at every construction site, so the roster drew a bare
+    /// `tool>` where a standalone card names what it acted on.
+    #[test]
+    fn a_child_carries_the_header_it_introduced_itself_with() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+
+        let result = smol::block_on(async {
+            parsed(calls(json!([{ "tool": HEADER_TOOL, "path": HEADER_PATH }])))
+                .unwrap()
+                .execute(&ctx)
+                .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, .. }) = result.output else {
+            panic!("expected a batch result");
+        };
+        assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
     }
 
     /// Two children that can only both finish if they ran at the same time, so

@@ -22,6 +22,9 @@ use caudra_config::ToolKey;
 pub enum Emit {
     Notify,
     Silent,
+    /// Build the start presentation but keep it off the transcript: the batch
+    /// roster shows its children itself and would otherwise draw them twice.
+    Capture,
 }
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -92,16 +95,70 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
+    run_capturing(registry, mcp, id, name, input, ctx, emit)
+        .await
+        .0
+}
+
+/// Runs a tool and also hands back how it introduced itself, which `Emit`
+/// decides. Only a caller that draws the call itself, rather than letting the
+/// transcript draw it, has any use for the second half.
+pub async fn run_capturing(
+    registry: &ToolRegistry,
+    mcp: Option<&McpSession>,
+    id: String,
+    name: &str,
+    input: &Value,
+    ctx: &ToolContext,
+    emit: Emit,
+) -> (ToolDoneEvent, Option<Box<ToolStartEvent>>) {
     let telemetry = caudra_otel::enabled();
     let canonical = telemetry.then(|| canonical_tool_name(name, ctx));
     let source = canonical.map(|name| tool_source(registry, ctx, name));
     let started = Instant::now();
-    let mut done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
+    let mut start = None;
+    let mut done = run_inner(
+        registry,
+        mcp,
+        id,
+        name,
+        input,
+        ctx,
+        &mut StartSink {
+            emit,
+            captured: &mut start,
+        },
+    )
+    .await;
     crate::tool_output::limit(&mut done, ctx).await;
     if let (Some(canonical), Some(source)) = (canonical, source) {
         report(&done, canonical, &source, input, started.elapsed());
     }
-    done
+    (done, start)
+}
+
+/// Where a tool's start presentation goes: the transcript, the caller that
+/// asked for it, or nowhere. Carried together because a start event is only
+/// worth building when one of them wants it.
+struct StartSink<'a> {
+    emit: Emit,
+    captured: &'a mut Option<Box<ToolStartEvent>>,
+}
+
+impl StartSink<'_> {
+    fn wanted(&self) -> bool {
+        !matches!(self.emit, Emit::Silent)
+    }
+
+    fn deliver(&mut self, ctx: &ToolContext, start: ToolStartEvent) {
+        match self.emit {
+            Emit::Notify => {
+                let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+            }
+            Emit::Capture => *self.captured = Some(Box::new(start)),
+            Emit::Silent => {}
+        }
+    }
 }
 
 /// Parse errors and unknown tools skip the start event so the UI never
@@ -113,7 +170,7 @@ async fn run_inner(
     name: &str,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    sink: &mut StartSink<'_>,
 ) -> ToolDoneEvent {
     // Covers names re-entering from model JSON (batch children, `call_tool`,
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
@@ -177,7 +234,7 @@ async fn run_inner(
         return done_error(format!("tool {name} is disabled for the current agent"));
     }
     if let Some(local) = local {
-        return run_local_tool(local, id, name, input, ctx, emit).await;
+        return run_local_tool(local, id, name, input, ctx, sink).await;
     }
 
     if let Some(ref entry) = entry {
@@ -272,9 +329,7 @@ async fn run_inner(
             raw_input: Some(input.clone()),
             output: invocation.start_output(ctx),
         };
-        if matches!(emit, Emit::Notify) {
-            let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
-        }
+        sink.deliver(ctx, start);
 
         invocation.start(ctx).await;
 
@@ -326,11 +381,11 @@ async fn run_inner(
             }
         }
     } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
-        run_tool_search(mcp, id, input, ctx, emit)
+        run_tool_search(mcp, id, input, ctx, sink)
     } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
         emit_raw_start(
             ctx,
-            emit,
+            sink,
             &id,
             &tool_id,
             ToolEffect::Unknown,
@@ -371,14 +426,14 @@ fn set_lua_provenance(
 /// so there is no parsed input to show; the UI gets the raw JSON instead.
 fn emit_raw_start(
     ctx: &ToolContext,
-    emit: Emit,
+    sink: &mut StartSink<'_>,
     id: &str,
     tool: &Arc<str>,
     effect: ToolEffect,
     summary: String,
     input: &Value,
 ) {
-    if !matches!(emit, Emit::Notify) {
+    if !sink.wanted() {
         return;
     }
     let start = ToolStartEvent {
@@ -392,7 +447,7 @@ fn emit_raw_start(
         raw_input: Some(input.clone()),
         output: None,
     };
-    let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+    sink.deliver(ctx, start);
 }
 
 /// Runs without a permission gate: search only reveals names the deferred
@@ -402,13 +457,13 @@ fn run_tool_search(
     id: String,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    sink: &mut StartSink<'_>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(
         ctx,
-        emit,
+        sink,
         &id,
         &tool_id,
         ToolEffect::ReadOnly,
@@ -441,12 +496,12 @@ async fn run_local_tool(
     name: &str,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    sink: &mut StartSink<'_>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
     emit_raw_start(
         ctx,
-        emit,
+        sink,
         &id,
         &tool_id,
         local.effect,
