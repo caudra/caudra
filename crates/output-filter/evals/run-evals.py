@@ -62,6 +62,7 @@ CASES = [
     ("/work/rustdemo", "cargo build", "cargo clean"),
     ("/work/rustdemo", "cargo build", None),
     ("/work/rustdemo", "cargo test", "cargo clean"),
+    ("/work/rustdemo", "cargo nextest run", "cargo clean"),
     ("/work/godemo", "go build ./...", None),
     ("/work/godemo", "go vet ./...", None),
     ("/work/pydemo", "pytest", None),

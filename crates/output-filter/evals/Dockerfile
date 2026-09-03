@@ -52,6 +52,17 @@ RUN npm install --global --no-fund --no-audit typescript eslint jest vitest \
 # reports that as a measurement rather than assuming it either way.
 RUN python3 -m pip install --break-system-packages --no-cache-dir pytest tqdm rich
 
+# cargo-nextest is not packaged by the distribution, and `cargo install` would
+# rebuild it from source on every image build. A pinned upstream tarball is used
+# for the same reason as Node above. Its report format differs from `cargo test`
+# in every respect except Cargo's build preamble, which is why the corpus gives
+# it a rule of its own and why that rule needs its own measured case.
+ARG NEXTEST_VERSION=0.9.143
+RUN curl -fsSLo /tmp/nextest.tar.gz "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
+    && tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest \
+    && rm /tmp/nextest.tar.gz \
+    && cargo nextest --version
+
 # The harness is baked in rather than bind-mounted: an eval run may target a
 # remote daemon, where a bind mount would resolve on the daemon's filesystem
 # instead of the caller's.

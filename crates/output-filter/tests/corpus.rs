@@ -5,7 +5,7 @@
 //! running the suite proves the engine still reproduces the authored behavior,
 //! without anyone re-deriving what each rule is supposed to do.
 
-use workcell_output_filter::builtin;
+use workcell_output_filter::{Rule, builtin};
 
 #[test]
 fn every_inline_expectation_holds() {
@@ -56,6 +56,65 @@ fn rules_match_normalized_scopes_rather_than_raw_command_strings() {
     assert!(corpus.find("df -h").is_some());
     // A different program with a matching prefix must not be captured.
     assert!(corpus.find("dfu-util --list").is_none());
+}
+
+#[test]
+fn nextest_run_is_filtered_and_its_listing_subcommands_are_not() {
+    let corpus = builtin();
+    // `cargo test` and `cargo nextest run` produce unrelated formats, so each
+    // must reach its own rule rather than whichever sorts first.
+    assert_eq!(
+        corpus.find("cargo test --workspace").map(Rule::name),
+        Some("cargo-test")
+    );
+    assert_eq!(
+        corpus.find("cargo nextest run --workspace").map(Rule::name),
+        Some("cargo-nextest")
+    );
+    // Listing test names is the result the caller asked for, not progress, so
+    // no rule may claim it. The same holds for the other nextest subcommands,
+    // none of which report a test run.
+    assert!(corpus.find("cargo nextest list").is_none());
+    assert!(
+        corpus
+            .find("cargo nextest list --list-type binaries-only")
+            .is_none()
+    );
+    assert!(
+        corpus
+            .find("cargo nextest archive --archive-file a.tar.zst")
+            .is_none()
+    );
+    assert!(
+        corpus
+            .find("cargo nextest show-config test-groups")
+            .is_none()
+    );
+}
+
+#[test]
+fn nextest_is_reduced_on_the_stream_it_actually_writes_to() {
+    // nextest writes its whole report to stderr, but inline expectations are fed
+    // through stdout. Without this, dropping `filter_stderr` would keep every
+    // inline case green while leaving real runs entirely unfiltered.
+    let rule = builtin().rule("cargo-nextest").expect("cargo-nextest rule");
+    let stderr = concat!(
+        "────────────\n",
+        " Nextest run ID 965dcdd4-7746-4611-8ab8-f72410730bd6 with nextest profile: default\n",
+        "    Starting 4 tests across 1 binary (1 test skipped)\n",
+        "        PASS [   0.028s] (1/4) rustdemo tests::adds\n",
+        "        PASS [   1.537s] (4/4) rustdemo tests::slow_one\n",
+        "────────────\n",
+        "     Summary [   1.541s] 4 tests run: 4 passed, 1 skipped\n",
+    );
+
+    let filtered = rule.apply("", stderr, Some(0));
+
+    assert!(filtered.consumed_stderr);
+    assert_eq!(
+        filtered.text,
+        "     Summary [   1.541s] 4 tests run: 4 passed, 1 skipped"
+    );
 }
 
 #[test]

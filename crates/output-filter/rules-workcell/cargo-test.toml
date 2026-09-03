@@ -1,6 +1,9 @@
 [filters.cargo-test]
 description = "Compact cargo test output, dropping passing test rows and empty test-binary sections"
-match_command = "^cargo\\s+(test|nextest)\\b"
+# nextest has its own rule: it shares nothing with libtest's format beyond
+# Cargo's build preamble, and matching `nextest` as a whole here also claimed
+# `nextest list`, whose output is the listing the caller asked for.
+match_command = "^cargo\\s+test\\b"
 filter_stderr = true
 strip_lines_matching = [
   "^\\s*Updating (crates\\.io index|git repository)",
@@ -14,7 +17,6 @@ strip_lines_matching = [
   "^\\s*Doc-tests ",
   "^running [0-9]+ tests?$",
   "^\\s*test .+ \\.\\.\\. (ok|ignored)$",
-  "^\\s*PASS\\s+\\[[^]]+\\]\\s+.+$",
   "^test result: ok\\. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
   "^\\s*$",
 ]
@@ -68,19 +70,4 @@ failures:
 ---- tests::adds stdout ----
 assertion `left == right` failed
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
-"""
-
-[[tests.cargo-test]]
-name = "nextest passing rows collapse to the summary"
-input = """
-    PASS [   0.012s] caudra sdk_mode::tests::wire_init_serializes_correctly
-    PASS [   0.013s] caudra sdk_mode::tests::wire_result_serializes_correctly
-    FAIL [   0.014s] caudra sdk_mode::tests::broken
-────────────
-     Summary [   0.020s] 3 tests run: 2 passed, 1 failed
-"""
-expected = """
-    FAIL [   0.014s] caudra sdk_mode::tests::broken
-────────────
-     Summary [   0.020s] 3 tests run: 2 passed, 1 failed
 """

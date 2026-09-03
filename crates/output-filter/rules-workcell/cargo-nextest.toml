@@ -1,0 +1,151 @@
+[filters.cargo-nextest]
+description = "Compact cargo nextest run output, dropping the run header and passing test rows"
+# Only `run` is matched. `list` prints the test names the caller asked for, and
+# `archive` and `show-config` are not progress either, so they stay unfiltered.
+# nextest is separate from `cargo test` because the two share no output format
+# beyond Cargo's build preamble: nextest reports one row per test with a
+# completion counter and ends with a Summary rather than a test result line.
+match_command = "^cargo\\s+nextest\\s+run\\b"
+# nextest writes its whole report to stderr. Only test output forwarded by
+# --no-capture reaches stdout.
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*Updating (crates\\.io index|git repository)",
+  "^\\s*Downloading crates",
+  "^\\s*Downloaded ",
+  "^\\s*Compiling ",
+  "^\\s*Fresh ",
+  "^\\s*Blocking waiting for file lock",
+  "^\\s*Finished ",
+  # The run ID serves only `--rerun`; the profile was selected by the caller or
+  # config, and the test count is restated by the Summary line that survives.
+  "^\\s*Nextest run ID \\S+ with nextest profile: ",
+  "^\\s*Starting [0-9]+ tests? across [0-9]+ binar(y|ies)",
+  # The rules bracketing the report. Requiring the whole line to be dashes keeps
+  # the `(───)` that an in-progress SLOW or a SKIP row carries in its counter
+  # column, which is why this is anchored at both ends.
+  "^\\s*─+\\s*$",
+  # A passing row. The bracketed duration is blank for some statuses and the
+  # parenthesised counter appears only when nextest is not drawing a progress
+  # bar, so neither is required in order to match. Every status carrying a
+  # diagnosis (FAIL, SLOW, LEAK, TIMEOUT, SKIP, and `TRY n PASS`) begins with
+  # something other than PASS and so survives.
+  "^\\s*PASS\\s+\\[[^]]*\\]\\s+.+$",
+  "^\\s*$",
+]
+# Reachable: `--no-run` builds without reporting, so every line it emits is
+# Cargo build noise.
+on_empty = "cargo nextest run: ok"
+
+[[tests.cargo-nextest]]
+name = "a passing run collapses to its summary"
+input = """
+   Compiling rustdemo v0.1.0 (/tmp/opencode/rustdemo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s
+────────────
+ Nextest run ID 965dcdd4-7746-4611-8ab8-f72410730bd6 with nextest profile: default
+    Starting 4 tests across 1 binary (1 test skipped)
+        PASS [   0.028s] (1/4) rustdemo tests::adds
+        PASS [   0.032s] (2/4) rustdemo tests::subtracts_too
+        PASS [   0.039s] (3/4) rustdemo tests::also_adds
+        PASS [   1.537s] (4/4) rustdemo tests::slow_one
+────────────
+     Summary [   1.541s] 4 tests run: 4 passed, 1 skipped
+"""
+expected = """
+     Summary [   1.541s] 4 tests run: 4 passed, 1 skipped
+"""
+
+[[tests.cargo-nextest]]
+name = "a failure keeps its captured output and the cancellation notice"
+input = """
+   Compiling rustdemo v0.1.0 (/tmp/opencode/rustdemo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+────────────
+ Nextest run ID 024aeb0a-b959-4b69-a013-1871caab5239 with nextest profile: default
+    Starting 6 tests across 2 binaries (1 test skipped)
+        PASS [   0.014s] (1/6) rustdemo tests::adds
+        PASS [   0.020s] (2/6) rustdemo::failing healthy
+        PASS [   0.034s] (3/6) rustdemo tests::also_adds
+        PASS [   0.034s] (4/6) rustdemo tests::subtracts_too
+        FAIL [   0.037s] (5/6) rustdemo::failing broken
+  stdout ───
+
+    running 1 test
+    some captured stdout before the failure
+    test broken ... FAILED
+
+    failures:
+
+    failures:
+        broken
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s
+
+  stderr ───
+    some captured stderr before the failure
+
+    thread 'broken' (3586886) panicked at tests/failing.rs:5:5:
+    assertion `left == right` failed: arithmetic is broken
+      left: 4
+     right: 5
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 1 test still running
+        PASS [   1.534s] (6/6) rustdemo tests::slow_one
+────────────
+     Summary [   1.536s] 6 tests run: 5 passed, 1 failed, 1 skipped
+        FAIL [   0.037s] (5/6) rustdemo::failing broken
+error: test run failed
+"""
+expected = """
+        FAIL [   0.037s] (5/6) rustdemo::failing broken
+  stdout ───
+    running 1 test
+    some captured stdout before the failure
+    test broken ... FAILED
+    failures:
+    failures:
+        broken
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s
+  stderr ───
+    some captured stderr before the failure
+    thread 'broken' (3586886) panicked at tests/failing.rs:5:5:
+    assertion `left == right` failed: arithmetic is broken
+      left: 4
+     right: 5
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  Cancelling due to test failure: 1 test still running
+     Summary [   1.536s] 6 tests run: 5 passed, 1 failed, 1 skipped
+        FAIL [   0.037s] (5/6) rustdemo::failing broken
+error: test run failed
+"""
+
+[[tests.cargo-nextest]]
+name = "slow and skipped rows survive with their dashed counters"
+input = """
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+────────────
+ Nextest run ID 54180b91-a912-4648-ab5a-24a5d5cc7549 with nextest profile: slowdemo
+    Starting 4 tests across 1 binary (1 test skipped)
+        SKIP [         ] (───) rustdemo tests::ignored_for_now
+        PASS [   0.015s] (1/4) rustdemo tests::also_adds
+        PASS [   0.023s] (2/4) rustdemo tests::adds
+        PASS [   0.031s] (3/4) rustdemo tests::subtracts_too
+        SLOW [>  1.000s] (───) rustdemo tests::slow_one
+        PASS [   1.528s] (4/4) rustdemo tests::slow_one
+────────────
+     Summary [   1.535s] 4 tests run: 4 passed (1 slow), 1 skipped
+"""
+expected = """
+        SKIP [         ] (───) rustdemo tests::ignored_for_now
+        SLOW [>  1.000s] (───) rustdemo tests::slow_one
+     Summary [   1.535s] 4 tests run: 4 passed (1 slow), 1 skipped
+"""
+
+[[tests.cargo-nextest]]
+name = "a build-only run reduces to the success line"
+input = """
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+"""
+expected = "cargo nextest run: ok"
