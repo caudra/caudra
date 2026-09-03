@@ -422,9 +422,9 @@ mod tests {
     use crate::components::key as key_event;
     use test_case::test_case;
 
-    const FIRST: &str = "01965087-4c71-7f00-8000-000000000001";
-    const SECOND: &str = "01965087-4c71-7f00-8000-000000000002";
-    const THIRD: &str = "01965087-4c71-7f00-8000-000000000003";
+    const FIRST: &str = "CNK1hV6GWoysH3KQMm5wv";
+    const SECOND: &str = "CNK1hV6GWoysH3KQMm5ww";
+    const THIRD: &str = "CNK1hV6GWoysH3KQMm5wx";
     const NOW: u64 = 1_000_000;
     const TITLE_A: &str = "refactor the parser";
     const TITLE_B: &str = "fix the tests";

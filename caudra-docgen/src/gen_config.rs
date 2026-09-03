@@ -424,9 +424,7 @@ All fields are optional. Typos in field names cause an error right away.
          type, or an unknown plugin name gives you a clear error right \
          away.\n\n\
          The edit plugin's extra tools are options too: \
-         `plugins.edit = {{ multiedit = false, insert_lines = true }}`. \
-         The old `tools` table is gone. If your config still uses it, \
-         Caudra stops at startup and shows you the new form.\n\n\
+         `plugins.edit = {{ multiedit = false, insert_lines = true }}`.\n\n\
          This table is for bundled plugins only. Your own plugins go in \
          `~/.config/caudra/lua/`, see [Plugins](/docs/plugins/).\n"
     )
@@ -472,19 +470,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
 
-`~/.caudra/` (or `%USERPROFILE%\\.caudra\\`) is checked as a legacy fallback. If that directory still exists, caudra uses it for everything until you migrate.
-
-Development builds compiled with debug assertions use `caudra-debug` for every platform directory and `~/.caudra-debug/` for the legacy fallback. This keeps global config, sessions, auth, logs, and caches separate from release builds. Per-project `.caudra/` directories remain shared.
-
-### Migrating from ~/.caudra/
-
-```
-caudra migrate xdg
-```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
+Development builds compiled with debug assertions use `caudra-debug` for every platform directory. This keeps global config, sessions, auth, logs, and caches separate from release builds. Per-project `.caudra/` directories remain shared.
 
 ## Personal Instructions
 

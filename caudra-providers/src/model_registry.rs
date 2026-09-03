@@ -415,6 +415,26 @@ mod tests {
         reg
     }
 
+    const LEGACY_TIERS_FILE: &str = "model-tiers";
+    const LEGACY_ROLES_FILE: &str = "model-roles";
+    const IGNORED: &str = "a file from before consolidation must not be read";
+
+    #[test]
+    fn tier_and_role_files_from_before_consolidation_are_ignored() {
+        let (_temp, dir) = state_dir();
+        std::fs::write(dir.path().join(LEGACY_TIERS_FILE), "legacy/model=weak").unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_ROLES_FILE),
+            "goal_evaluator=legacy/model",
+        )
+        .unwrap();
+
+        assert!(read_overrides(&dir).is_empty(), "{IGNORED}");
+        let roles = read_roles(&dir);
+        assert!(roles.goal_evaluator.is_none(), "{IGNORED}");
+        assert!(roles.compaction.is_none(), "{IGNORED}");
+    }
+
     #[test]
     fn tier_for_resolution_priority() {
         let mut reg = make_map(&[], &["pos0", "pos1", "pos2"]);

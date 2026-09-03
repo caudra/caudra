@@ -171,8 +171,6 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the caudra repo holds the plugins that ship with caudra, compiled into the
   binary, so a file dropped there does nothing until caudra is rebuilt. That
   holds even when the project you have open is a caudra checkout.
-- The platform config and active legacy directories can both exist. The legacy
-  directory returned by `caudra.env.legacy_dir()` wins, so look before you write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with `file_write` and `file_edit`.
 - You cannot run slash commands or restart caudra, so ask the user to run

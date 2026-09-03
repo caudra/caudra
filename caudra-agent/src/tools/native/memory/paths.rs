@@ -55,24 +55,8 @@ pub fn suffix(cwd: &Path) -> PathBuf {
         .join(MEMORIES_DIR)
 }
 
-/// Notes written before the XDG cutover. Reads fall back to it; writes never
-/// go there, so a migration is never half-applied.
-pub fn legacy_dir(cwd: &Path) -> Option<PathBuf> {
-    let dir = caudra_storage::paths::legacy_home_dir()?.join(suffix(cwd));
-    dir.is_dir().then_some(dir)
-}
-
 pub fn state_dir(cwd: &Path) -> Option<PathBuf> {
     Some(caudra_storage::paths::state_dir().ok()?.join(suffix(cwd)))
-}
-
-/// `list` and `read` prefer the legacy directory when it exists so old notes
-/// stay reachable; `write` and `delete` always target the state directory.
-pub fn resolve(cwd: &Path, allow_legacy: bool) -> Option<PathBuf> {
-    if allow_legacy && let Some(dir) = legacy_dir(cwd) {
-        return Some(dir);
-    }
-    state_dir(cwd)
 }
 
 /// Rejects anything that could escape the notes directory. Absolute paths and

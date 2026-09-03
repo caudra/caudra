@@ -206,11 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_canonical_ids_address_the_same_mailbox() {
-        let legacy: CaudraId = "01965087-4c71-7f00-8000-000000000001".parse().unwrap();
-        let canonical: CaudraId = legacy.to_string().parse().unwrap();
-        let mailbox = SessionMailbox::register(legacy);
-        SessionMailbox::notify(canonical, "built".into(), false).unwrap();
+    fn a_reparsed_id_addresses_the_same_mailbox() {
+        let id = CaudraId::generate();
+        let reparsed: CaudraId = id.to_string().parse().unwrap();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(reparsed, "built".into(), false).unwrap();
 
         assert_eq!(mailbox.drain().len(), 1);
     }

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -480,7 +481,7 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     }
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let persistent_storage = StateDir::resolve().context("resolve data directory")?;
     caudra_providers::model_registry::load_from_storage(&persistent_storage);
 
@@ -488,7 +489,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     load_env_files(&cwd);
     let _workcell_host = super::register_builtin_tools(&cwd)?;
-    warn_stale_config_toml(&cwd);
 
     let (mut stack, _) = build_stack(&cli, &cwd, &persistent_storage, None)?;
     let ephemeral = cli.ephemeral || stack.config.storage.ephemeral;
@@ -527,7 +527,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             plugin_rules: stack.plugin_host.plugin_rules(),
         })
         .context("run sdk mode")?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if cli.print {
         let fast = stack.config.always_fast && stack.model.supports_fast();
@@ -557,7 +557,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.plugin_rules(),
         )
         .context("run print mode")?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
@@ -654,11 +654,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if let Some(reporter) = herdr_reporter.take() {
                     reporter.shutdown();
                 }
-                if code != 0 {
-                    caudra_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
-                    std::process::exit(code);
-                }
-                return Ok(());
+                // Returning the code instead of exiting here keeps every guard
+                // alive to its scope end, including the ephemeral state root
+                // whose `Drop` erases the volatile directory.
+                return Ok(code);
             }
             RunOutcome::Reload {
                 tabs: reloaded,
@@ -699,21 +698,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "reload: rebuilt plugins and config"
                 );
             }
-        }
-    }
-}
-
-fn warn_stale_config_toml(cwd: &std::path::Path) {
-    let stale_paths = [
-        caudra_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(cwd.join(".caudra/config.toml")),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://caudra.ai/docs/configuration/"
-            );
         }
     }
 }

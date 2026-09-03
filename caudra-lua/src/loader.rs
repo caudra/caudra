@@ -235,16 +235,13 @@ impl PluginHost {
     pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in caudra_config::global_config_dirs() {
+        if let Some(global_dir) = caudra_config::global_config_dir() {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 "global/init.lua",
                 PermissionRulePolicy::Trusted,
                 &mut merged,
             )?;
-            if merged.is_some() {
-                break;
-            }
         }
         self.run_init_file(
             &cwd.join(".caudra/init.lua"),

@@ -25,35 +25,6 @@ fn flock_exclusive(file: &File) -> io::Result<()> {
     file.lock()
 }
 
-/// Logs used to live in the state dir. Move any leftover `caudra.*.log` files
-/// to the logs dir once. Never overwrites: on any conflict or rename failure
-/// the source file stays where it is.
-fn migrate_stale_logs(old_dir: &Path, new_dir: &Path) {
-    if old_dir == new_dir {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(old_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name == LOCK_FILE_NAME {
-            fs::remove_file(entry.path()).ok();
-            continue;
-        }
-        if !name.starts_with("caudra.") || !name.ends_with(".log") {
-            continue;
-        }
-        let dst = new_dir.join(name);
-        if !dst.exists() {
-            fs::rename(entry.path(), &dst).ok();
-        }
-    }
-}
-
 pub struct RotatingFileWriter {
     dir: PathBuf,
     file: File,
@@ -64,11 +35,7 @@ pub struct RotatingFileWriter {
 
 impl RotatingFileWriter {
     pub fn new(max_bytes: u64, max_files: u32) -> io::Result<Self> {
-        let logs = paths::logs_dir()?;
-        if let Ok(state) = paths::state_dir() {
-            migrate_stale_logs(&state, &logs);
-        }
-        Self::with_limits(&logs, max_bytes, max_files)
+        Self::with_limits(&paths::logs_dir()?, max_bytes, max_files)
     }
 
     fn with_limits(dir: &Path, max_bytes: u64, max_files: u32) -> io::Result<Self> {
@@ -230,60 +197,6 @@ mod tests {
             file_path(tmp.path(), 1).exists(),
             "should have rotated on first write since pre-existing data exceeded threshold"
         );
-    }
-
-    #[test]
-    fn migrates_only_log_files_and_removes_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("state");
-        let new = tmp.path().join("logs");
-        fs::create_dir_all(&old).unwrap();
-        fs::create_dir_all(&new).unwrap();
-        for name in [
-            LOG_FILE_NAME,
-            "caudra.1.log",
-            LOCK_FILE_NAME,
-            "cwd_latest.json",
-        ] {
-            fs::write(old.join(name), "").unwrap();
-        }
-
-        migrate_stale_logs(&old, &new);
-
-        assert!(new.join(LOG_FILE_NAME).exists());
-        assert!(new.join("caudra.1.log").exists());
-        assert!(!old.join(LOG_FILE_NAME).exists());
-        assert!(!old.join(LOCK_FILE_NAME).exists());
-        assert!(old.join("cwd_latest.json").exists());
-    }
-
-    #[test]
-    fn migration_never_overwrites_destination() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("state");
-        let new = tmp.path().join("logs");
-        fs::create_dir_all(&old).unwrap();
-        fs::create_dir_all(&new).unwrap();
-        fs::write(old.join(LOG_FILE_NAME), "old").unwrap();
-        fs::write(new.join(LOG_FILE_NAME), "existing").unwrap();
-
-        migrate_stale_logs(&old, &new);
-
-        assert_eq!(
-            fs::read_to_string(new.join(LOG_FILE_NAME)).unwrap(),
-            "existing"
-        );
-        assert_eq!(fs::read_to_string(old.join(LOG_FILE_NAME)).unwrap(), "old");
-    }
-
-    #[test]
-    fn migration_keeps_live_lock_when_dirs_are_same() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(LOCK_FILE_NAME), "").unwrap();
-
-        migrate_stale_logs(tmp.path(), tmp.path());
-
-        assert!(tmp.path().join(LOCK_FILE_NAME).exists());
     }
 
     #[test]

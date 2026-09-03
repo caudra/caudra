@@ -177,35 +177,19 @@ pub(crate) fn rules_to_stored(rules: &[caudra_config::PermissionRule]) -> Vec<St
         .collect()
 }
 
-/// Migrate old stored tool key formats to `ToolKey`.
-/// Handles `"mcp:server__tool"` (pre-PR1 format) -> `McpTool`.
-/// All other formats go through `ToolKey::parse` (current format: `server.tool`).
-fn migrate_stored_tool_key(s: &str) -> Option<caudra_config::ToolKey> {
-    // Pre-PR1 format: "mcp:server__tool" — rewrite to new format and parse.
-    if let Some(rest) = s.strip_prefix("mcp:")
-        && let Some((server, tool)) = rest.split_once("__")
-    {
-        let new_form = format!("{server}.{tool}");
-        return caudra_config::ToolKey::parse(&new_form)
-            .map_err(
-                |e| tracing::warn!(key = s, error = %e, "malformed stored tool key — skipping"),
-            )
-            .ok();
-    }
-    match caudra_config::ToolKey::parse(s) {
-        Ok(key) => Some(key),
-        Err(e) => {
+fn parse_stored_tool_key(s: &str) -> Option<caudra_config::ToolKey> {
+    caudra_config::ToolKey::parse(s)
+        .map_err(|e| {
             tracing::error!(key = s, error = %e, "malformed stored tool key — rule DROPPED; a deny rule may have been lost");
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<caudra_config::PermissionRule> {
     stored
         .iter()
         .filter_map(|r| {
-            let tool = match migrate_stored_tool_key(&r.tool) {
+            let tool = match parse_stored_tool_key(&r.tool) {
                 Some(t) => t,
                 None => {
                     if matches!(r.effect, StoredEffect::Deny) {

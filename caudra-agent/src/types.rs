@@ -8,7 +8,6 @@ use std::time::Duration;
 use caudra_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use caudra_storage::tool_outputs::ToolOutputRef;
 use flume::Sender;
-use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
@@ -225,7 +224,7 @@ fn append_instructions(out: &mut String, blocks: &[InstructionBlock]) {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextOutput {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -387,39 +386,6 @@ impl From<&str> for TextOutput {
             instructions: None,
             state: None,
             lua_provenance: None,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for TextOutput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Legacy(String),
-            Full {
-                text: String,
-                #[serde(default)]
-                instructions: Option<Vec<InstructionBlock>>,
-                #[serde(default)]
-                state: Option<serde_json::Value>,
-                #[serde(default)]
-                lua_provenance: Option<LuaToolProvenance>,
-            },
-        }
-        match Raw::deserialize(deserializer)? {
-            Raw::Legacy(text) => Ok(text.into()),
-            Raw::Full {
-                text,
-                instructions,
-                state,
-                lua_provenance,
-            } => Ok(Self {
-                text,
-                instructions,
-                state,
-                lua_provenance,
-            }),
         }
     }
 }
@@ -2273,20 +2239,6 @@ mod tests {
         let json_without = r#"{"id":"t1"}"#;
         let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
         assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
-    }
-
-    #[test]
-    fn text_output_serde_legacy_bare_string() {
-        const MSG: &str = "old sessions store Plain as a bare string";
-        let json = r#"{"Plain":"hello world"}"#;
-        let output: ToolOutput = serde_json::from_str(json).unwrap();
-        match &output {
-            ToolOutput::Plain(t) => {
-                assert_eq!(t.text, "hello world", "{MSG}");
-                assert!(t.instructions.is_none(), "{MSG}");
-            }
-            _ => panic!("wrong variant"),
-        }
     }
 
     #[test]

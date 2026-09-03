@@ -17,9 +17,7 @@ use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
 use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
-    AgentEvent, BufferSnapshot, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind,
-    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock,
-    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BufferSnapshot, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -37,76 +35,6 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
-const LEGACY_INDEX_MAX_BYTES: usize = 50 * 1024;
-const LEGACY_INDEX_MAX_LINES: usize = 10_000;
-const LEGACY_INSTRUCTION_SEPARATOR: &str = "\n\n---\nInstructions from: ";
-const LEGACY_INDEX_EXTENSIONS: &[(&str, &str)] = &[
-    ("rs", "rust"),
-    ("py", "python"),
-    ("pyi", "python"),
-    ("ts", "typescript"),
-    ("tsx", "typescript"),
-    ("js", "javascript"),
-    ("jsx", "javascript"),
-    ("mjs", "javascript"),
-    ("cjs", "javascript"),
-    ("gleam", "gleam"),
-    ("go", "go"),
-    ("htm", "html"),
-    ("html", "html"),
-    ("java", "java"),
-    ("c", "c"),
-    ("h", "c"),
-    ("cpp", "cpp"),
-    ("cc", "cpp"),
-    ("cxx", "cpp"),
-    ("hpp", "cpp"),
-    ("hxx", "cpp"),
-    ("hh", "cpp"),
-    ("ixx", "cpp"),
-    ("cs", "c_sharp"),
-    ("rb", "ruby"),
-    ("rake", "ruby"),
-    ("gemspec", "ruby"),
-    ("php", "php"),
-    ("swift", "swift"),
-    ("kt", "kotlin"),
-    ("kts", "kotlin"),
-    ("scala", "scala"),
-    ("sc", "scala"),
-    ("sh", "bash"),
-    ("bash", "bash"),
-    ("zsh", "bash"),
-    ("lua", "lua_lang"),
-    ("ex", "elixir"),
-    ("exs", "elixir"),
-    ("md", "markdown"),
-    ("markdown", "markdown"),
-    ("bzl", "bazel_bzl"),
-    ("zig", "zig"),
-    ("nix", "nix"),
-    ("dart", "dart"),
-    ("toml", "toml"),
-    ("yaml", "yaml"),
-    ("yml", "yaml"),
-    ("sql", "sql"),
-    ("css", "css"),
-    ("json", "json"),
-    ("hcl", "hcl"),
-    ("tf", "hcl"),
-    ("tfvars", "hcl"),
-    ("dockerfile", "containerfile"),
-    ("mk", "make"),
-];
-const LEGACY_INDEX_FILENAMES: &[(&str, &str)] = &[
-    ("MODULE.bazel", "bazel_module"),
-    ("BUILD", "bazel_build"),
-    ("BUILD.bazel", "bazel_build"),
-    ("Containerfile", "containerfile"),
-    ("Dockerfile", "containerfile"),
-    ("GNUmakefile", "make"),
-    ("Makefile", "make"),
-];
 
 pub enum ChatEventResult {
     Continue,
@@ -662,24 +590,6 @@ pub fn history_to_display(
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
-    history_to_display_with_project(items, tool_outputs, tool_output_lines, None)
-}
-
-pub(crate) fn history_to_display_in_project(
-    items: &[HistoryItem],
-    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
-    tool_output_lines: &ToolOutputLines,
-    project_root: &Path,
-) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
-    history_to_display_with_project(items, tool_outputs, tool_output_lines, Some(project_root))
-}
-
-fn history_to_display_with_project(
-    items: &[HistoryItem],
-    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
-    tool_output_lines: &ToolOutputLines,
-    project_root: Option<&Path>,
-) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
     let results = build_tool_results_map(items);
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
@@ -736,13 +646,7 @@ fn history_to_display_with_project(
                         (status, Some(result.content))
                     })
                     .unwrap_or((ToolStatus::Success, None));
-                let stored = tool_outputs.get(call_id.as_str()).map(Arc::as_ref);
-                let migrated = (status == ToolStatus::Success)
-                    .then(|| {
-                        migrate_legacy_index(static_name, input, stored, result_text, project_root)
-                    })
-                    .flatten();
-                let reconstructed = migrated.or_else(|| stored.cloned());
+                let reconstructed = tool_outputs.get(call_id.as_str()).cloned();
                 let (text, truncated_lines, tool_output, mut annotation) = build_loaded_tool(
                     static_name,
                     &summary,
@@ -823,188 +727,6 @@ fn history_to_display_with_project(
     (display, restore_items)
 }
 
-fn migrate_legacy_index(
-    tool: &str,
-    input: &serde_json::Value,
-    stored: Option<&ToolOutput>,
-    result: Option<&str>,
-    project_root: Option<&Path>,
-) -> Option<ToolOutput> {
-    if tool != "index" || matches!(stored, Some(ToolOutput::Index(_))) {
-        return None;
-    }
-    if let Some(provenance) = stored.and_then(ToolOutput::lua_provenance)
-        && provenance.plugin != "index"
-    {
-        return None;
-    }
-    let path = input.get("path")?.as_str()?.to_owned();
-    let (text, instructions) = match stored {
-        Some(ToolOutput::Plain(text)) => (text.text.as_str(), text.instructions.clone()),
-        Some(_) => return None,
-        None => (result?, None),
-    };
-    if text.len() > LEGACY_INDEX_MAX_BYTES || text.lines().count() > LEGACY_INDEX_MAX_LINES {
-        return None;
-    }
-    let (text, instructions) = split_legacy_index_instructions(text, instructions);
-    let relative_path = path.clone();
-    let path_is_directory = instructions
-        .as_ref()
-        .is_some_and(|blocks| !blocks.is_empty())
-        .then_some(true)
-        .or_else(|| legacy_index_path_is_directory(&path, project_root));
-    if path_is_directory != Some(true)
-        && let Some(language) = legacy_index_language(&path)
-    {
-        let lines = text
-            .split('\n')
-            .enumerate()
-            .map(|(index, line)| legacy_index_line(index + 1, line))
-            .collect::<Vec<_>>();
-        let source_line_count = lines
-            .iter()
-            .filter_map(|line| line.source_range.map(|range| range.end_line))
-            .max()
-            .unwrap_or(0);
-        let truncated = lines
-            .iter()
-            .any(|line| line.semantic == IndexLineSemantic::Dimmed);
-        Some(ToolOutput::Index(IndexOutput::File {
-            path,
-            relative_path,
-            language: language.into(),
-            skeleton: text,
-            lines,
-            source_line_count,
-            parse_error: false,
-            truncated,
-            instructions,
-            state: None,
-        }))
-    } else {
-        if path_is_directory == Some(false) {
-            return None;
-        }
-        let entries = text
-            .lines()
-            .filter(|line| !line.is_empty() && *line != INDEX_TRUNCATED)
-            .map(|line| IndexDirectoryEntry {
-                name: line.trim_end_matches('/').to_owned(),
-                kind: if line.ends_with('/') {
-                    IndexDirectoryEntryKind::Directory
-                } else {
-                    IndexDirectoryEntryKind::File
-                },
-            })
-            .collect::<Vec<_>>();
-        let total_count = entries.len();
-        Some(ToolOutput::Index(IndexOutput::Directory {
-            path,
-            relative_path,
-            entries,
-            total_count,
-            truncated: text.lines().any(|line| line == INDEX_TRUNCATED),
-            listing: text,
-            instructions,
-            state: None,
-        }))
-    }
-}
-
-fn split_legacy_index_instructions(
-    text: &str,
-    instructions: Option<Vec<InstructionBlock>>,
-) -> (String, Option<Vec<InstructionBlock>>) {
-    if instructions.is_some() {
-        return (text.to_owned(), instructions);
-    }
-    let Some((body, encoded)) = text.split_once(LEGACY_INSTRUCTION_SEPARATOR) else {
-        return (text.to_owned(), None);
-    };
-    let blocks = encoded
-        .split(LEGACY_INSTRUCTION_SEPARATOR)
-        .map(|block| {
-            let (path, content) = block.split_once('\n')?;
-            (!path.is_empty()).then(|| InstructionBlock {
-                path: path.to_owned(),
-                content: content.to_owned(),
-            })
-        })
-        .collect::<Option<Vec<_>>>();
-    (body.to_owned(), blocks.filter(|blocks| !blocks.is_empty()))
-}
-
-fn legacy_index_path_is_directory(path: &str, project_root: Option<&Path>) -> Option<bool> {
-    let path = Path::new(path);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root?.join(path)
-    };
-    let metadata = std::fs::metadata(resolved).ok()?;
-    if metadata.is_dir() {
-        Some(true)
-    } else if metadata.is_file() {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn legacy_index_line(output_line: usize, text: &str) -> IndexLine {
-    let (body, source_range) = text
-        .rfind(" [")
-        .and_then(|separator| {
-            parse_legacy_index_range(&text[separator + 1..])
-                .map(|range| (&text[..separator], range))
-        })
-        .map_or((None, None), |(body, range)| {
-            (Some(body.to_owned()), Some(range))
-        });
-    let semantic = if text.ends_with(INDEX_TRUNCATED) || text.ends_with(" more truncated]") {
-        IndexLineSemantic::Dimmed
-    } else if !text.starts_with(' ') && body.as_deref().unwrap_or(text).trim_end().ends_with(':') {
-        IndexLineSemantic::Section
-    } else if source_range.is_some() {
-        IndexLineSemantic::Item
-    } else {
-        IndexLineSemantic::Plain
-    };
-    IndexLine {
-        output_line,
-        text: text.to_owned(),
-        semantic,
-        body,
-        source_range,
-    }
-}
-
-fn parse_legacy_index_range(text: &str) -> Option<IndexSourceRange> {
-    let range = text.strip_prefix('[')?.strip_suffix(']')?;
-    let (start, end) = range.split_once('-').unwrap_or((range, range));
-    let start_line = start.parse().ok()?;
-    let end_line = end.parse().ok()?;
-    (start_line > 0 && end_line >= start_line).then_some(IndexSourceRange {
-        start_line,
-        end_line,
-    })
-}
-
-fn legacy_index_language(path: &str) -> Option<&'static str> {
-    let filename = Path::new(path).file_name()?.to_str()?;
-    if let Some((_, language)) = LEGACY_INDEX_FILENAMES
-        .iter()
-        .find(|(candidate, _)| *candidate == filename)
-    {
-        return Some(language);
-    }
-    let extension = Path::new(filename).extension()?.to_str()?;
-    LEGACY_INDEX_EXTENSIONS
-        .iter()
-        .find_map(|(candidate, language)| (*candidate == extension).then_some(*language))
-}
-
 fn visible_user_text(items: &[HistoryItem], group_id: CaudraId) -> Option<(CaudraId, &str)> {
     let mut users = items.iter().filter(|item| item.group_id == group_id);
     let first = users
@@ -1064,14 +786,14 @@ pub(crate) fn restore_item_for(
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
-    reconstructed: Option<ToolOutput>,
+    reconstructed: Option<Arc<ToolOutput>>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
     match reconstructed {
         Some(output) => {
             let annotation = output.annotation();
-            (summary.to_owned(), 0, Some(Arc::new(output)), annotation)
+            (summary.to_owned(), 0, Some(output), annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
@@ -1127,7 +849,10 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::{AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use caudra_agent::{
+        AgentEvent, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, ToolDoneEvent,
+        ToolOutput, ToolStartEvent,
+    };
     use caudra_config::UiConfig;
     use caudra_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
@@ -1208,6 +933,8 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const INDEX_SKELETON: &str = "fns:\n  pub run() [2]";
+    const INDEX_ANNOTATION: &str = "2 lines";
 
     fn chat() -> Chat {
         Chat::new(
@@ -1426,17 +1153,32 @@ mod tests {
         let messages = tool_use_pair(
             "index",
             serde_json::json!({"path": "src/lib.rs"}),
-            "fns:\n  pub run() [2]",
+            INDEX_SKELETON,
             false,
         );
         let output = ToolOutput::Index(IndexOutput::File {
             path: "/project/src/lib.rs".into(),
             relative_path: "src/lib.rs".into(),
             language: "rust".into(),
-            skeleton: "fns:\n  pub run() [2]".into(),
+            skeleton: INDEX_SKELETON.into(),
             lines: vec![
-                legacy_index_line(1, "fns:"),
-                legacy_index_line(2, "  pub run() [2]"),
+                IndexLine {
+                    output_line: 1,
+                    text: "fns:".into(),
+                    semantic: IndexLineSemantic::Section,
+                    body: None,
+                    source_range: None,
+                },
+                IndexLine {
+                    output_line: 2,
+                    text: "  pub run() [2]".into(),
+                    semantic: IndexLineSemantic::Item,
+                    body: Some("  pub run()".into()),
+                    source_range: Some(IndexSourceRange {
+                        start_line: 2,
+                        end_line: 2,
+                    }),
+                },
             ],
             source_line_count: 2,
             parse_error: false,
@@ -1453,236 +1195,24 @@ mod tests {
             display[0].tool_output.as_deref(),
             Some(ToolOutput::Index(_))
         ));
-        assert_eq!(display[0].annotation.as_deref(), Some("2 lines"));
+        assert_eq!(display[0].annotation.as_deref(), Some(INDEX_ANNOTATION));
     }
 
     #[test]
-    fn legacy_lua_index_file_migrates_to_native_metadata() {
+    fn index_without_stored_output_falls_back_to_plain_text_and_a_lua_restore() {
         let messages = tool_use_pair(
             "index",
             serde_json::json!({"path": "src/lib.rs"}),
-            "fns:\n  pub run() [7-9]",
-            false,
-        );
-        let mut old = ToolOutput::Plain("fns:\n  pub run() [7-9]".into());
-        old.set_lua_provenance(LuaToolProvenance {
-            plugin: "index".into(),
-            contract: "legacy".into(),
-            error_restore_allowed: false,
-        });
-        let outputs = HashMap::from([("t1".into(), Arc::new(old))]);
-
-        let (display, restores) = display_messages(&messages, &outputs);
-
-        assert!(restores.is_empty());
-        let Some(ToolOutput::Index(IndexOutput::File {
-            language,
-            lines,
-            source_line_count,
-            ..
-        })) = display[0].tool_output.as_deref()
-        else {
-            panic!("legacy file was not migrated")
-        };
-        assert_eq!(language, "rust");
-        assert_eq!(*source_line_count, 9);
-        assert_eq!(lines[1].semantic, IndexLineSemantic::Item);
-        assert_eq!(lines[1].source_range.unwrap().start_line, 7);
-    }
-
-    #[test]
-    fn legacy_index_language_mapping_matches_retained_index_contract() {
-        const CASES: &[(&str, &str)] = &[
-            ("source.rs", "rust"),
-            ("source.py", "python"),
-            ("source.pyi", "python"),
-            ("source.ts", "typescript"),
-            ("source.tsx", "typescript"),
-            ("source.js", "javascript"),
-            ("source.jsx", "javascript"),
-            ("source.mjs", "javascript"),
-            ("source.cjs", "javascript"),
-            ("source.gleam", "gleam"),
-            ("source.go", "go"),
-            ("source.htm", "html"),
-            ("source.html", "html"),
-            ("source.java", "java"),
-            ("source.c", "c"),
-            ("source.h", "c"),
-            ("source.cpp", "cpp"),
-            ("source.cc", "cpp"),
-            ("source.cxx", "cpp"),
-            ("source.hpp", "cpp"),
-            ("source.hxx", "cpp"),
-            ("source.hh", "cpp"),
-            ("source.ixx", "cpp"),
-            ("source.cs", "c_sharp"),
-            ("source.rb", "ruby"),
-            ("source.rake", "ruby"),
-            ("source.gemspec", "ruby"),
-            ("source.php", "php"),
-            ("source.swift", "swift"),
-            ("source.kt", "kotlin"),
-            ("source.kts", "kotlin"),
-            ("source.scala", "scala"),
-            ("source.sc", "scala"),
-            ("source.sh", "bash"),
-            ("source.bash", "bash"),
-            ("source.zsh", "bash"),
-            ("source.lua", "lua_lang"),
-            ("source.ex", "elixir"),
-            ("source.exs", "elixir"),
-            ("source.md", "markdown"),
-            ("source.markdown", "markdown"),
-            ("source.bzl", "bazel_bzl"),
-            ("source.zig", "zig"),
-            ("source.nix", "nix"),
-            ("source.dart", "dart"),
-            ("source.toml", "toml"),
-            ("source.yaml", "yaml"),
-            ("source.yml", "yaml"),
-            ("source.sql", "sql"),
-            ("source.css", "css"),
-            ("source.json", "json"),
-            ("source.hcl", "hcl"),
-            ("source.tf", "hcl"),
-            ("source.tfvars", "hcl"),
-            ("source.dockerfile", "containerfile"),
-            ("source.mk", "make"),
-            ("MODULE.bazel", "bazel_module"),
-            ("BUILD", "bazel_build"),
-            ("BUILD.bazel", "bazel_build"),
-            ("Containerfile", "containerfile"),
-            ("Dockerfile", "containerfile"),
-            ("GNUmakefile", "make"),
-            ("Makefile", "make"),
-        ];
-        assert_eq!(
-            CASES.len(),
-            LEGACY_INDEX_EXTENSIONS.len() + LEGACY_INDEX_FILENAMES.len()
-        );
-        for (path, expected) in CASES {
-            assert_eq!(legacy_index_language(path), Some(*expected), "{path}");
-        }
-        assert_eq!(legacy_index_language("source.jsonc"), None);
-    }
-
-    #[test]
-    fn legacy_lua_index_directory_migrates_without_loading_plugin() {
-        let messages = tool_use_pair(
-            "index",
-            serde_json::json!({"path": "src"}),
-            "nested/\nlib.rs",
-            false,
-        );
-
-        let (display, restores) = display_messages(&messages, &empty_outputs());
-
-        assert!(restores.is_empty());
-        let Some(ToolOutput::Index(IndexOutput::Directory {
-            entries,
-            total_count,
-            ..
-        })) = display[0].tool_output.as_deref()
-        else {
-            panic!("legacy directory was not migrated")
-        };
-        assert_eq!(*total_count, 2);
-        assert_eq!(entries[0].kind, IndexDirectoryEntryKind::Directory);
-        assert_eq!(entries[1].name, "lib.rs");
-    }
-
-    #[test]
-    fn legacy_dotted_directory_uses_project_metadata_instead_of_extension() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("generated.rs");
-        std::fs::create_dir(&directory).unwrap();
-
-        for path in [
-            "generated.rs".to_owned(),
-            directory.to_string_lossy().into_owned(),
-        ] {
-            let input = serde_json::json!({"path": path});
-            let migrated = migrate_legacy_index(
-                "index",
-                &input,
-                None,
-                Some("nested/\nlib.rs"),
-                Some(root.path()),
-            )
-            .unwrap();
-
-            assert!(matches!(
-                migrated,
-                ToolOutput::Index(IndexOutput::Directory { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn legacy_directory_instructions_survive_serde_migration_and_render() {
-        let instructions = vec![InstructionBlock {
-            path: "/project/AGENTS.md".into(),
-            content: "Keep the stored rule.".into(),
-        }];
-        let mut old = ToolOutput::Plain(caudra_agent::TextOutput {
-            text: "nested/\nlib.rs".into(),
-            instructions: Some(instructions.clone()),
-            state: None,
-            lua_provenance: None,
-        });
-        old.set_lua_provenance(LuaToolProvenance {
-            plugin: "index".into(),
-            contract: "legacy".into(),
-            error_restore_allowed: false,
-        });
-        let old: ToolOutput = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
-        let messages = tool_use_pair(
-            "index",
-            serde_json::json!({"path": "src"}),
-            &old.as_text(),
-            false,
-        );
-        let outputs = HashMap::from([("t1".into(), Arc::new(old))]);
-
-        let (display, restores) = display_messages(&messages, &outputs);
-
-        assert!(restores.is_empty());
-        let migrated = display[0].tool_output.as_deref().unwrap();
-        let restored: ToolOutput =
-            serde_json::from_str(&serde_json::to_string(migrated).unwrap()).unwrap();
-        assert_eq!(restored.instructions(), Some(instructions.as_slice()));
-        assert!(restored.as_text().contains("Keep the stored rule."));
-        let mut rendered = Vec::new();
-        let truncated = crate::components::code_view::render_instructions(
-            restored.instructions().unwrap(),
-            &mut rendered,
-            usize::MAX,
-            false,
-        );
-        let rendered = rendered
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(!truncated);
-        assert!(rendered.contains("Keep the stored rule."));
-    }
-
-    #[test]
-    fn oversized_legacy_index_fallback_stays_bounded_plain_output() {
-        let text = "x".repeat(LEGACY_INDEX_MAX_BYTES + 1);
-        let messages = tool_use_pair(
-            "index",
-            serde_json::json!({"path": "src/lib.rs"}),
-            &text,
+            INDEX_SKELETON,
             false,
         );
 
         let (display, restores) = display_messages(&messages, &empty_outputs());
 
         assert!(display[0].tool_output.is_none());
+        assert!(display[0].text.contains(INDEX_SKELETON));
         assert_eq!(restores.len(), 1);
+        assert_eq!(restores[0].output, INDEX_SKELETON);
     }
 
     #[test]

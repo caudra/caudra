@@ -34,10 +34,10 @@ use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
 };
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
-    StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput, ToolOutputLines,
-    open_stored_session,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig,
+    SessionMailbox, StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput,
+    ToolOutputLines, open_stored_session,
 };
 
 struct SessionStore {
@@ -315,6 +315,23 @@ impl SessionStore {
         self.save()?;
         self.persisted_subagent_history = snapshot;
         Ok(())
+    }
+
+    /// A cancelled turn never delivers the `ToolDone` that resolves a running
+    /// task, so its children would persist as `Unknown` forever. Mirrors the
+    /// TUI, which kills unfinished subagents on cancel.
+    fn kill_unfinished_subagents(&mut self) {
+        let mut subagents = self.session.subagents().to_vec();
+        let mut killed = false;
+        for subagent in &mut subagents {
+            if subagent.outcome == StoredSubagentOutcome::Unknown {
+                subagent.outcome = StoredSubagentOutcome::Killed;
+                killed = true;
+            }
+        }
+        if killed {
+            self.session.set_subagents(subagents);
+        }
     }
 
     fn record_event(
@@ -1183,12 +1200,15 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                     });
                 }
 
-                if let Some(store) = &mut *store.lock().await
-                    && let Err(error) = store.record_turn(&history, model.spec(), &permissions)
-                {
-                    let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
-                        message: format!("Failed to persist session: {error}"),
-                    });
+                if let Some(store) = &mut *store.lock().await {
+                    if matches!(result, Ok(DoneReason::Cancelled)) {
+                        store.kill_unfinished_subagents();
+                    }
+                    if let Err(error) = store.record_turn(&history, model.spec(), &permissions) {
+                        let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
+                            message: format!("Failed to persist session: {error}"),
+                        });
+                    }
                 }
                 run_id += 1;
             }
@@ -1252,7 +1272,7 @@ mod tests {
 
     use super::*;
 
-    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
     const SESSION_SCOPE: &str = "cargo *";
@@ -1562,6 +1582,56 @@ mod tests {
                 && subagent.root_tool_use_id.as_deref() == Some("batch-call")
                 && subagent.outcome == StoredSubagentOutcome::Done
         }));
+    }
+
+    #[test]
+    fn cancelling_a_turn_kills_only_the_unresolved_subagents() {
+        const RESOLVED: &str = "resolved-task";
+        const RUNNING: &str = "running-task";
+
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        for (task_id, call_id) in [(RESOLVED, "resolved-call"), (RUNNING, "running-call")] {
+            store
+                .record_event(&Envelope {
+                    event: AgentEvent::SubagentHistory {
+                        task_id: task_id.into(),
+                        parent_tool_use_id: call_id.into(),
+                        root_tool_use_id: call_id.into(),
+                        name: "researcher".into(),
+                        model: MODEL_SPEC.into(),
+                        messages: vec![Message::user("investigate".into())],
+                        spec: Some(crate::SubagentTaskSpec::default()),
+                    },
+                    subagent: None,
+                    run_id: 0,
+                })
+                .unwrap();
+        }
+        let mut done = crate::ToolDoneEvent::error("resolved-call".into(), "answer");
+        done.is_error = false;
+        store
+            .record_event(&Envelope {
+                event: AgentEvent::ToolDone(Box::new(done)),
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+
+        store.kill_unfinished_subagents();
+        store.save().unwrap();
+
+        let outcome = |session: &StoredSession, task_id: &str| {
+            session
+                .subagents()
+                .iter()
+                .find(|subagent| subagent.tool_use_id == task_id)
+                .expect("subagent recorded")
+                .outcome
+        };
+        let loaded = load(&tmp);
+        assert_eq!(outcome(&loaded, RESOLVED), StoredSubagentOutcome::Done);
+        assert_eq!(outcome(&loaded, RUNNING), StoredSubagentOutcome::Killed);
     }
 
     #[test]

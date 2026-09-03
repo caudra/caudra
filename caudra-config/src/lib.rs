@@ -138,11 +138,6 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "execution_environment",
 ];
 
-/// These used to be their own `tools.<name>` tables and are now edit plugin
-/// options; the config layer uses this list to reject the old form with a
-/// pointer to the new one.
-pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
-
 pub const FILE_WRITE_TOOLS: &[&str] = &[
     "file_apply_patch",
     "file_edit",
@@ -228,11 +223,6 @@ pub enum ConfigError {
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
     #[error(
-        "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
-         set plugins.edit = {{ {tool} = true|false }} instead"
-    )]
-    RemovedEditSubTool { tool: &'static str },
-    #[error(
         "invalid config: plugins.{plugin}: no bundled plugin is named \"{plugin}\" \
          (bundled plugins: {valid})"
     )]
@@ -245,15 +235,6 @@ pub enum ConfigError {
         field: String,
         message: String,
     },
-    #[error(
-        "invalid config: the `tools` table in caudra.setup was renamed to `plugins` \
-         (plugins can provide more than tools).\n\n\
-         Fix your config with:\n\n    \
-         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/caudra/init.lua\n\n\
-         Run it on .caudra/init.lua too if you keep a project config. \
-         A .bak backup is left next to the file."
-    )]
-    RenamedToolsTable,
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -319,9 +300,6 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
-    /// Renamed to `plugins`; kept so old configs fail with a pointer to the
-    /// new name instead of a generic unknown-field error.
-    tools: HashMap<String, PluginFileConfig>,
 }
 
 impl RawConfig {
@@ -346,7 +324,6 @@ impl RawConfig {
             }
             entry.opts.extend(plugin.opts);
         }
-        self.tools.extend(overlay.tools);
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
@@ -388,14 +365,6 @@ impl RawConfig {
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
     fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
-        if !self.tools.is_empty() {
-            return Err(ConfigError::RenamedToolsTable);
-        }
-        for &name in EDIT_SUB_TOOLS {
-            if self.plugins.contains_key(name) {
-                return Err(ConfigError::RemovedEditSubTool { tool: name });
-            }
-        }
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
@@ -792,14 +761,12 @@ impl RetentionFileConfig {
 #[derive(Debug, Clone)]
 struct ParsedPermissionRule {
     tool: ToolKey,
-    scope: Option<String>,
     effect: Effect,
 }
 
 #[derive(Default)]
 struct PermissionsFileConfig {
     default: Option<DefaultEffect>,
-    legacy_allow_all: bool,
     tools: HashMap<String, ToolPermissions>,
     mcp_rules: Vec<ParsedPermissionRule>,
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
@@ -814,24 +781,20 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
                 DefaultEffect::deserialize(value.clone()).map_err(serde::de::Error::custom)
             })
             .transpose()?;
-        let legacy_allow_all = table.get("allow_all").and_then(toml::Value::as_bool) == Some(true);
 
         let mut tools = HashMap::new();
         let mut mcp_rules = Vec::new();
         let mut mcp_defaults = HashMap::new();
 
         for (k, v) in table.iter() {
-            if k == "allow_all" || k == "default" {
+            if k == "default" {
                 continue;
             }
             if k == "mcp" {
                 // TOML [mcp.server] creates nested table: mcp → {server → {...}}
                 if let Some(mcp_table) = v.as_table() {
                     for (server_name, server_value) in mcp_table {
-                        if let Some((server, tool)) = server_name.split_once("__") {
-                            parse_legacy_mcp_entry(server, tool, server_value, &mut mcp_rules)
-                                .map_err(serde::de::Error::custom)?;
-                        } else if let Some(server_table) = server_value.as_table() {
+                        if let Some(server_table) = server_value.as_table() {
                             parse_mcp_server_table(
                                 server_name,
                                 server_table,
@@ -848,15 +811,6 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
                 } else {
                     return Err(serde::de::Error::custom("[mcp] is not a table"));
                 }
-            } else if let Some(qualified) = k.strip_prefix("mcp:") {
-                if let Some((server, tool)) = qualified.split_once("__") {
-                    parse_legacy_mcp_entry(server, tool, v, &mut mcp_rules)
-                        .map_err(serde::de::Error::custom)?;
-                } else {
-                    return Err(serde::de::Error::custom(format!(
-                        "malformed legacy MCP permission key {k}"
-                    )));
-                }
             } else {
                 if k != "*" && !is_valid_wire_name(k) {
                     return Err(serde::de::Error::custom(format!(
@@ -872,7 +826,6 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
 
         Ok(Self {
             default,
-            legacy_allow_all,
             tools,
             mcp_rules,
             mcp_defaults,
@@ -1087,7 +1040,6 @@ pub enum PermissionSource {
 pub enum PermissionReviewKind {
     Rule,
     Default,
-    AllowAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2078,106 +2030,8 @@ fn push_mcp_tool_rule(
 ) -> Result<(), String> {
     let qualified = format!("{server_name}.{tool_name}");
     match ToolKey::parse(&qualified) {
-        Ok(key) => rules.push(ParsedPermissionRule {
-            tool: key,
-            scope: None,
-            effect,
-        }),
+        Ok(key) => rules.push(ParsedPermissionRule { tool: key, effect }),
         Err(error) => return Err(format!("invalid MCP tool name: {error}")),
-    }
-    Ok(())
-}
-
-fn parse_legacy_mcp_entry(
-    server_name: &str,
-    tool_name: &str,
-    value: &toml::Value,
-    rules: &mut Vec<ParsedPermissionRule>,
-) -> Result<(), String> {
-    let tool = ToolKey::parse(&format!("{server_name}.{tool_name}"))
-        .map_err(|error| format!("invalid legacy MCP permission key: {error}"))?;
-
-    if value.as_bool() == Some(true) {
-        rules.push(ParsedPermissionRule {
-            tool,
-            scope: None,
-            effect: Effect::Allow,
-        });
-        return Ok(());
-    }
-
-    if value.as_bool() == Some(false) {
-        return Ok(());
-    }
-
-    let table = value
-        .as_table()
-        .ok_or_else(|| "legacy MCP permission entry must be a boolean or table".to_string())?;
-    for (key, value) in table {
-        let effect = match key.as_str() {
-            "allow" => Effect::Allow,
-            "ask" => Effect::Ask,
-            "deny" => Effect::Deny,
-            _ => return Err(format!("unknown legacy MCP permission key {key}")),
-        };
-        match value {
-            toml::Value::Boolean(true) => rules.push(ParsedPermissionRule {
-                tool: tool.clone(),
-                scope: None,
-                effect,
-            }),
-            toml::Value::Array(scopes) => {
-                for scope in scopes {
-                    let scope = scope.as_str().ok_or_else(|| {
-                        "legacy MCP permission scopes must be strings".to_string()
-                    })?;
-                    if effect != Effect::Deny {
-                        rules.push(ParsedPermissionRule {
-                            tool: tool.clone(),
-                            scope: Some(scope.to_string()),
-                            effect,
-                        });
-                    }
-                }
-                if effect == Effect::Deny {
-                    rules.push(ParsedPermissionRule {
-                        tool: tool.clone(),
-                        scope: None,
-                        effect,
-                    });
-                }
-            }
-            toml::Value::Boolean(false) => {}
-            _ => return Err(format!("invalid legacy MCP permission value for {key}")),
-        }
-    }
-    Ok(())
-}
-
-fn child_table<'a>(
-    table: &'a mut toml_edit::Table,
-    key: &str,
-) -> Result<&'a mut toml_edit::Table, String> {
-    table
-        .entry(key)
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| format!("[{key}] is not a table"))
-}
-
-fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(), String> {
-    let arr = table
-        .entry(key)
-        .or_insert_with(|| toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())))
-        .as_array_mut()
-        .ok_or_else(|| format!("{key} is not an array"))?;
-    if !arr.iter().any(|v| v.as_str() == Some(value)) {
-        arr.push(value);
-        arr.set_trailing("\n");
-        arr.set_trailing_comma(true);
-        for item in arr.iter_mut() {
-            item.decor_mut().set_prefix("\n    ");
-        }
     }
     Ok(())
 }
@@ -2214,7 +2068,6 @@ fn parse_mcp_server_table(
                                     tool: ToolKey::McpServer {
                                         server: server_name.into(),
                                     },
-                                    scope: None,
                                     effect,
                                 });
                                 continue;
@@ -2227,7 +2080,6 @@ fn parse_mcp_server_table(
                             tool: ToolKey::McpServer {
                                 server: server_name.into(),
                             },
-                            scope: None,
                             effect,
                         });
                     }
@@ -2243,7 +2095,6 @@ fn parse_mcp_server_table(
                                 tool: ToolKey::McpServer {
                                     server: server_name.into(),
                                 },
-                                scope: None,
                                 effect,
                             });
                         } else {
@@ -2419,7 +2270,7 @@ fn push_parsed_rules(
             .filter(|rule| rule.effect == effect)
             .map(|rule| PermissionRule {
                 tool: rule.tool.clone(),
-                scope: rule.scope.clone(),
+                scope: None,
                 effect,
             }),
     );
@@ -2430,14 +2281,6 @@ fn push_review_candidates(
     source: PermissionSource,
     config: &PermissionsFileConfig,
 ) {
-    if config.legacy_allow_all {
-        candidates.push(PermissionReviewCandidate {
-            source,
-            kind: PermissionReviewKind::AllowAll,
-            tool: None,
-            scope: None,
-        });
-    }
     if config.default == Some(DefaultEffect::Allow) {
         candidates.push(PermissionReviewCandidate {
             source,
@@ -2513,7 +2356,7 @@ fn push_review_candidates(
                 source,
                 kind: PermissionReviewKind::Rule,
                 tool: Some(rule.tool.clone()),
-                scope: rule.scope.clone(),
+                scope: None,
             });
         }
     }
@@ -2521,19 +2364,6 @@ fn push_review_candidates(
 
 fn global_dir() -> Option<PathBuf> {
     paths::config_dir().ok()
-}
-
-fn config_search_dirs(global: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(d) = global {
-        dirs.push(d.to_path_buf());
-    }
-    if let Ok(xdg) = paths::xdg_config_dir()
-        && dirs.first() != Some(&xdg)
-    {
-        dirs.push(xdg);
-    }
-    dirs
 }
 
 fn env_file_var_is_allowed(key: &str) -> bool {
@@ -2569,13 +2399,12 @@ pub fn load_env_files(cwd: &Path) {
 }
 
 pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
-    let global_dirs = config_search_dirs(global_dir().as_deref());
-    load_permissions_inner(cwd, &global_dirs)
+    load_permissions_inner(cwd, global_dir().as_deref())
 }
 
-fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
+fn load_permissions_inner(cwd: &Path, global_dir: Option<&Path>) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
-    for dir in global_dirs {
+    if let Some(dir) = global_dir {
         let path = dir.join(PERMISSIONS_FILE);
         match read_permissions_file(&path) {
             Ok(Some(permissions)) => global_perms = permissions,
@@ -2625,125 +2454,6 @@ fn fail_closed_permissions() -> PermissionsConfig {
 
 pub fn global_config_dir() -> Option<PathBuf> {
     global_dir()
-}
-
-pub fn global_config_dirs() -> Vec<PathBuf> {
-    config_search_dirs(global_dir().as_deref())
-}
-
-#[deprecated(note = "prompt decisions should be stored outside permissions.toml")]
-pub fn append_permission_rule(
-    tool: &ToolKey,
-    scope: Option<&str>,
-    effect: Effect,
-    target: &PermissionTarget,
-) -> Result<(), String> {
-    let dir = config_search_dirs(global_dir().as_deref())
-        .into_iter()
-        .last();
-    append_permission_rule_with_global(tool, scope, effect, target, dir)
-}
-
-fn append_permission_rule_with_global(
-    tool: &ToolKey,
-    scope: Option<&str>,
-    effect: Effect,
-    target: &PermissionTarget,
-    global: Option<PathBuf>,
-) -> Result<(), String> {
-    match target {
-        PermissionTarget::Global => append_global_permission(tool, scope, effect, global),
-        PermissionTarget::Project(cwd) => append_project_permission(tool, scope, effect, cwd),
-    }
-}
-
-fn append_global_permission(
-    tool: &ToolKey,
-    scope: Option<&str>,
-    effect: Effect,
-    global: Option<PathBuf>,
-) -> Result<(), String> {
-    let path = global
-        .ok_or_else(|| "cannot determine home directory".to_string())?
-        .join(PERMISSIONS_FILE);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse permissions: {e}"))?;
-
-    insert_permission_entry(&mut doc, tool, scope, effect)?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
-    }
-    caudra_storage::atomic_write(&path, doc.to_string().as_bytes())
-        .map_err(|e| format!("cannot write permissions: {e}"))?;
-    Ok(())
-}
-
-fn append_project_permission(
-    tool: &ToolKey,
-    scope: Option<&str>,
-    effect: Effect,
-    cwd: &Path,
-) -> Result<(), String> {
-    let path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| format!("failed to parse .caudra/{PERMISSIONS_FILE}: {e}"))?;
-
-    insert_permission_entry(&mut doc, tool, scope, effect)?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create .caudra dir: {e}"))?;
-    }
-    caudra_storage::atomic_write(&path, doc.to_string().as_bytes())
-        .map_err(|e| format!("cannot write .caudra/{PERMISSIONS_FILE}: {e}"))?;
-    Ok(())
-}
-
-fn insert_permission_entry(
-    doc: &mut toml_edit::DocumentMut,
-    tool_key: &ToolKey,
-    scope: Option<&str>,
-    effect: Effect,
-) -> Result<(), String> {
-    let key = match effect {
-        Effect::Allow => "allow",
-        Effect::Ask => "ask",
-        Effect::Deny => "deny",
-    };
-
-    match tool_key {
-        // MCP scopes are always wildcarded, so `scope` is ignored for MCP keys.
-        ToolKey::McpTool { server, tool } => {
-            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
-            push_unique(server_table, key, tool)?;
-        }
-        ToolKey::McpServer { server } => {
-            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
-            if effect == Effect::Ask {
-                server_table.insert(key, toml_edit::value(true));
-            } else {
-                server_table.insert("default", toml_edit::value(key));
-            }
-        }
-        ToolKey::Wildcard => {
-            // Wildcard rules are config-only; runtime never writes them.
-            return Err("cannot write wildcard permission rule to config".to_string());
-        }
-        ToolKey::Native(name) => {
-            let tool_table = child_table(doc.as_table_mut(), name)?;
-            match scope {
-                Some(s) => push_unique(tool_table, key, s)?,
-                None => {
-                    tool_table.insert(key, toml_edit::value(true));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3161,6 +2871,33 @@ mod tests {
     }
 
     #[test]
+    fn permissions_load_from_a_read_only_global_config_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(
+            global.join("permissions.toml"),
+            "[mcp.github]\ndeny = [\"delete\"]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(global.join("probe"), b"x").is_ok() {
+            return;
+        }
+
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::parse("github.delete").unwrap()
+        );
+    }
+
+    #[test]
     fn permissions_loaded_from_permissions_file() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3170,7 +2907,7 @@ mod tests {
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.contains(&PermissionRule {
@@ -3215,7 +2952,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 3);
         assert!(perms.rules.contains(&PermissionRule {
@@ -3282,7 +3019,7 @@ mod tests {
         )
         .unwrap();
 
-        let permissions = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
 
         assert_eq!(permissions.rules.len(), 4);
         assert!(permissions.rules.contains(&PermissionRule {
@@ -3359,7 +3096,7 @@ mod tests {
         )
         .unwrap();
 
-        let permissions = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
 
         assert_eq!(
             permissions.rules,
@@ -3382,7 +3119,7 @@ mod tests {
         fs::create_dir_all(&caudra_dir).unwrap();
         fs::write(caudra_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(
             perms.review_candidates,
@@ -3408,7 +3145,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert!(perms.rules.is_empty());
         assert!(perms.project_allow_rules.is_empty());
@@ -3438,7 +3175,7 @@ mod tests {
              [mcp.github]\nallow = [\"search\", \"*\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.contains(&PermissionRule {
@@ -3509,14 +3246,13 @@ mod tests {
              [bash]\ndeny = [\"rm *\"]\ndefault = \"prompt\"\n\
              [write]\ndeny = true\ndefault = \"deny\"\n\
              [mcp.server]\ndeny = true\ndefault = \"prompt\"\n\
-             [mcp.github]\ndeny = [\"delete\", \"*\"]\ndefault = \"deny\"\n\
-             [\"mcp:legacy__remove\"]\ndeny = [\"old-scope\"]\n",
+             [mcp.github]\ndeny = [\"delete\", \"*\"]\ndefault = \"deny\"\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert!(perms.review_candidates.is_empty());
-        assert_eq!(perms.rules.len(), 7);
+        assert_eq!(perms.rules.len(), 6);
         assert!(perms.rules.iter().all(|rule| rule.effect == Effect::Deny));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")),
@@ -3544,9 +3280,6 @@ mod tests {
                 .iter()
                 .any(|rule| rule.tool == ToolKey::Wildcard)
         );
-        assert!(perms.rules.iter().any(|rule| {
-            rule.tool == ToolKey::parse("legacy.remove").unwrap() && rule.scope.is_none()
-        }));
     }
 
     #[test]
@@ -3562,7 +3295,7 @@ mod tests {
         )
         .unwrap();
 
-        let permissions = load_permissions_inner(dir.path(), &[global]);
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
 
         assert_eq!(permissions.default, DefaultEffect::Deny);
         assert_eq!(
@@ -3602,62 +3335,10 @@ mod tests {
     }
 
     #[test]
-    fn append_permission_rule_writes_to_permissions_file() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-
-        append_permission_rule_with_global(
-            &ToolKey::native("bash"),
-            Some("cargo *"),
-            Effect::Allow,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-        append_permission_rule_with_global(
-            &ToolKey::native("bash"),
-            Some("rm -rf *"),
-            Effect::Deny,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[bash]"));
-        assert!(content.contains("cargo *"));
-        assert!(content.contains("rm -rf *"));
-        assert!(!content.contains("[permissions]"));
-    }
-
-    #[test]
-    fn append_permission_rule_writes_mcp_nested_form() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-
-        append_permission_rule_with_global(
-            &ToolKey::parse("deepwiki.search").unwrap(),
-            Some("*"),
-            Effect::Allow,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[mcp.deepwiki]"), "nested table present");
-        assert!(content.contains("\"search\""), "tool name in array");
-        assert!(!content.contains("deepwiki.search"), "no flat key");
-        assert!(!content.contains("__"), "no __ separator");
-    }
-
-    #[test]
     fn no_permissions_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
         assert!(perms.project_allow_rules.is_empty());
@@ -3672,7 +3353,7 @@ mod tests {
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.iter().any(|rule| rule.effect == Effect::Allow));
         assert!(perms.rules.iter().any(|rule| rule.effect == Effect::Deny));
@@ -3686,7 +3367,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "default = \"deny\"\n");
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -3699,7 +3380,7 @@ mod tests {
             "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert!(!perms.tool_defaults.contains_key(&ToolKey::native("bash")));
         assert_eq!(perms.review_candidates.len(), 1);
@@ -3733,7 +3414,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
@@ -3756,7 +3437,7 @@ mod tests {
         )
         .unwrap();
 
-        let permissions = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(permissions.default, DefaultEffect::Deny);
         assert_eq!(
             permissions
@@ -3768,48 +3449,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_allow_all_is_review_only_without_rewrite() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        let original = "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n";
-        write_global_permissions(dir.path(), original);
-
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert_eq!(perms.default, DefaultEffect::Prompt);
-        assert_eq!(perms.rules.len(), 1);
-        assert_eq!(perms.rules[0].effect, Effect::Allow);
-        assert!(perms.project_allow_rules.is_empty());
-        assert!(
-            perms
-                .review_candidates
-                .contains(&PermissionReviewCandidate {
-                    source: PermissionSource::Global,
-                    kind: PermissionReviewKind::AllowAll,
-                    tool: None,
-                    scope: None,
-                })
-        );
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert_eq!(content, original);
-    }
-
-    #[test]
-    fn permissions_allow_all_false_is_ignored_without_rewrite() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        let original = "allow_all = false\n";
-        write_global_permissions(dir.path(), original);
-
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert_eq!(perms.default, DefaultEffect::Prompt);
-        assert!(perms.review_candidates.is_empty());
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert_eq!(content, original);
-    }
-
-    #[test]
     fn project_default_deny_allowed() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3817,43 +3456,8 @@ mod tests {
         fs::create_dir_all(&caudra_dir).unwrap();
         fs::write(caudra_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
-    }
-
-    #[test]
-    fn append_permission_rule_deduplicates() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-
-        append_permission_rule_with_global(
-            &ToolKey::native("bash"),
-            Some("cargo *"),
-            Effect::Allow,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-        append_permission_rule_with_global(
-            &ToolKey::native("bash"),
-            Some("cargo *"),
-            Effect::Allow,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-        append_permission_rule_with_global(
-            &ToolKey::native("bash"),
-            Some("cargo *"),
-            Effect::Allow,
-            &PermissionTarget::Global,
-            Some(global.clone()),
-        )
-        .unwrap();
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert_eq!(content.matches("cargo *").count(), 1);
     }
 
     #[test]
@@ -4081,6 +3685,7 @@ mod tests {
     #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
     #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
     #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("[tools.bash]\nenabled = true\n" ; "removed_tools_table")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(
@@ -4264,22 +3869,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn removed_sub_tool_tables_error() {
-        for &tool in EDIT_SUB_TOOLS {
-            let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
-            let Err(err) = raw.into_config(false) else {
-                panic!("plugins.{tool} should be rejected");
-            };
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&format!("plugins.{tool} was removed"))
-                    && msg.contains("plugins.edit = {"),
-                "error should point at plugins.edit, got: {msg}"
-            );
-        }
-    }
-
     #[test_case("enabled = false" ; "enabled_false")]
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
@@ -4304,18 +3893,6 @@ mod tests {
             config.plugins.opts["bash"]["timeout_secs"],
             serde_json::json!(180),
             "opts survive for when the plugin is re-enabled"
-        );
-    }
-
-    #[test]
-    fn renamed_tools_table_errors() {
-        let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config(false) else {
-            panic!("old tools table should be rejected");
-        };
-        assert!(
-            err.to_string().contains("renamed to `plugins`"),
-            "got: {err}"
         );
     }
 
@@ -4351,7 +3928,7 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert!(perms.rules.is_empty());
         assert!(perms.project_allow_rules.is_empty());
         assert_eq!(perms.review_candidates.len(), 4);
@@ -4384,7 +3961,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert!(perms.rules.is_empty());
         assert!(perms.project_allow_rules.is_empty());
         assert_eq!(
@@ -4405,7 +3982,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(
             perms.rules[0].tool,
             ToolKey::McpServer {
@@ -4423,7 +4000,7 @@ mod tests {
             dir.path(),
             "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert!(!perms.tool_defaults.contains_key(&ToolKey::McpServer {
             server: "server".into()
         }));
@@ -4447,7 +4024,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(
             perms.rules[0].tool,
@@ -4464,7 +4041,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(perms.rules.len(), 1);
         assert!(matches!(perms.rules[0].tool, ToolKey::Wildcard));
@@ -4477,7 +4054,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = 1\n");
 
-        let permissions = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
 
         assert_eq!(permissions.default, DefaultEffect::Deny);
         assert_eq!(permissions.rules.len(), 1);
@@ -4493,7 +4070,7 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert!(!perms.tool_defaults.contains_key(&ToolKey::McpServer {
             server: "exa".into()
         }));
@@ -4519,7 +4096,7 @@ mod tests {
             dir.path(),
             "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -4544,57 +4121,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mcp_flat_global_allows_are_review_only_without_rewrite() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        let original = "[\"mcp:deepwiki__search\"]\nallow = true\n\
-                        [\"mcp:github__issue\"]\nallow = [\"read\"]\n";
-        fs::write(global.join("permissions.toml"), original).unwrap();
-
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert_eq!(content, original);
-        assert!(perms.rules.is_empty());
-        assert!(perms.project_allow_rules.is_empty());
-        assert_eq!(perms.review_candidates.len(), 2);
-        assert!(perms.review_candidates.iter().all(|candidate| {
-            candidate.source == PermissionSource::Global
-                && candidate.kind == PermissionReviewKind::Rule
-        }));
-    }
-
-    #[test]
-    fn legacy_mcp_nested_global_allows_are_review_only_without_rewrite() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        let original = "[mcp]\n\
-                        deepwiki__search = true\n\
-                        github__issue = true\n";
-        fs::write(global.join("permissions.toml"), original).unwrap();
-
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert_eq!(content, original);
-        assert!(perms.rules.is_empty());
-        assert!(perms.project_allow_rules.is_empty());
-        assert_eq!(perms.review_candidates.len(), 2);
-        assert!(perms.review_candidates.iter().all(|candidate| {
-            candidate.source == PermissionSource::Global
-                && candidate.kind == PermissionReviewKind::Rule
-        }));
-    }
-
-    #[test]
     fn invalid_native_tool_sections_fail_closed() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         for section in ["", "shell "] {
             write_global_permissions(dir.path(), &format!("[\"{section}\"]\ndeny = true\n"));
-            let permissions = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+            let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
             assert_eq!(permissions.default, DefaultEffect::Deny);
             assert_eq!(permissions.rules.len(), 1);
             assert!(matches!(permissions.rules[0].tool, ToolKey::Wildcard));
@@ -4602,33 +4134,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn legacy_mcp_deny_applies_from_read_only_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        fs::write(
-            global.join("permissions.toml"),
-            "[\"mcp:github__delete\"]\ndeny = true\n",
-        )
-        .unwrap();
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
-        if fs::write(global.join("probe"), b"x").is_ok() {
-            return; // running as root, cannot simulate a read-only dir
-        }
-
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(perms.rules.len(), 1);
-        assert_eq!(perms.rules[0].effect, Effect::Deny);
-        assert_eq!(
-            perms.rules[0].tool,
-            ToolKey::parse("github.delete").unwrap()
-        );
-    }
     const BUDGET_DRIFT: &str = "a first-party tool must resolve to its own \
          ui.tool_output_lines budget; falling through to `other` silently \
          ignores what the user configured";

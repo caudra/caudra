@@ -194,7 +194,6 @@ impl From<caudra_config::providers::Tier> for ModelTier {
             Tier::Weak => Self::Weak,
             Tier::Medium => Self::Medium,
             Tier::Strong => Self::Strong,
-            Tier::LegacyCompaction => Self::Medium,
         }
     }
 }

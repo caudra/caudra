@@ -459,7 +459,6 @@ fn retryable(error: &SessionError) -> bool {
             | SessionError::LimitExceeded { .. }
             | SessionError::LoadBudgetExceeded { .. }
             | SessionError::VersionMismatch { .. }
-            | SessionError::CorruptHeaderId { .. }
             | SessionError::IdMismatch { .. }
     )
 }

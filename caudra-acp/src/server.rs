@@ -1608,40 +1608,6 @@ mod tests {
         assert_eq!(restored.history, [root, branch]);
     }
 
-    #[test]
-    fn load_history_expands_legacy_messages_into_one_item_chain() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let messages = vec![
-            Message::user("rename foo to bar".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![MsgBlock::Text {
-                    text: "done".into(),
-                }],
-                ..Default::default()
-            },
-        ];
-        let mut session: Session<Message, TokenUsage, ToolOutput> =
-            Session::new("anthropic/test-model", "/project");
-        session.replace_messages(messages.clone());
-        session.save(&dir).unwrap();
-
-        let restored = load_history_from(&dir, session.id).unwrap();
-
-        assert!(
-            restored
-                .history
-                .windows(2)
-                .all(|pair| pair[1].parent_id == Some(pair[0].id))
-        );
-        assert_eq!(
-            serde_json::to_value(History::restored(restored.history).unwrap().into_vec()).unwrap(),
-            serde_json::to_value(messages).unwrap()
-        );
-        assert!(Session::<HistoryItem, TokenUsage, ToolOutput>::load(session.id, &dir).is_ok());
-    }
-
     /// Resuming must bill what the session actually paid. If `by_model` came
     /// back empty or lost its recorded costs, ACP would re-price the restored
     /// total against today's table and disagree with the TUI.

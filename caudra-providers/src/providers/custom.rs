@@ -210,7 +210,6 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     match def
         .models
         .iter()
-        .filter(|model| model.tier != caudra_config::providers::Tier::LegacyCompaction)
         .find(|model| ModelTier::from(model.tier) == tier)
     {
         Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
@@ -267,8 +266,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
 fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     for model in models {
         if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
-            model.tier = (declared.tier != caudra_config::providers::Tier::LegacyCompaction)
-                .then(|| ModelTier::from(declared.tier));
+            model.tier = Some(ModelTier::from(declared.tier));
         }
     }
 }

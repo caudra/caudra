@@ -188,11 +188,7 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "1. User config: `~/.config/caudra/commands/` (and legacy `~/.caudra/commands/` if present)"
-    )
-    .unwrap();
+    writeln!(out, "1. User config: `~/.config/caudra/commands/`").unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
     writeln!(
         out,

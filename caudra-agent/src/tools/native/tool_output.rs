@@ -409,8 +409,8 @@ mod tests {
     use caudra_storage::id::SessionRef;
     use serde_json::json;
 
-    const SESSION: &str = "01965087-4c71-7f00-8000-000000000001";
-    const OTHER_SESSION: &str = "01965087-4c71-7f00-8000-000000000002";
+    const SESSION: &str = "CNK1hV6GWoysH3KQMm5wv";
+    const OTHER_SESSION: &str = "CNK1hV6GWoysH3KQMm5ww";
     const NO_MATCHES: &str = "No matches.";
 
     struct Fixture {

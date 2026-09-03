@@ -2190,9 +2190,7 @@ mod tests {
         let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
         assert_eq!(agent.tool_context().session_id, None);
 
-        let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
-            .parse()
-            .expect("valid session id");
+        let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context().session_id, Some(session));
     }

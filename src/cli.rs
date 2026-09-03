@@ -265,11 +265,6 @@ pub enum Command {
         #[arg(long, requires = "tools")]
         names: bool,
     },
-    /// Data migration utilities
-    Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
-    },
     /// Inspect and maintain session storage
     Storage {
         #[command(subcommand)]
@@ -446,12 +441,6 @@ pub struct PolicyScopeArgs {
     /// Allow an empty policy to act on every session matched by --directory
     #[arg(long, requires = "directory")]
     pub unsafe_allow_remove_all: bool,
-}
-
-#[derive(Subcommand)]
-pub enum MigrateAction {
-    /// Migrate files from the active legacy directory to platform directories
-    Xdg,
 }
 
 #[derive(Subcommand)]

@@ -4,18 +4,17 @@ use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
-const fn directory_names(debug_assertions: bool) -> (&'static str, &'static str) {
+/// Debug builds get their own directory so a development run never shares
+/// config, sessions, auth, logs, or caches with an installed release.
+const fn app_dir_name(debug_assertions: bool) -> &'static str {
     if debug_assertions {
-        ("caudra-debug", ".caudra-debug")
+        "caudra-debug"
     } else {
-        ("caudra", ".caudra")
+        "caudra"
     }
 }
 
-const DIRECTORY_NAMES: (&str, &str) = directory_names(cfg!(debug_assertions));
-const APP_DIR_NAME: &str = DIRECTORY_NAMES.0;
-const LEGACY_DIR_NAME: &str = DIRECTORY_NAMES.1;
-pub const XDG_MIGRATED_MARKER: &str = ".xdg-migrated";
+const APP_DIR_NAME: &str = app_dir_name(cfg!(debug_assertions));
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
@@ -25,7 +24,6 @@ struct Paths {
     state: PathBuf,
     logs: PathBuf,
     cache: PathBuf,
-    xdg_config: PathBuf,
 }
 
 /// Lexical path normalization that never hits the filesystem.
@@ -175,48 +173,25 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path, app_dir_name: &str) -> (Pa
     (state, logs)
 }
 
-fn paths_for(
-    strategy: &impl BaseStrategy,
-    fallback_dir: Option<&Path>,
-    app_dir_name: &str,
-) -> Paths {
-    let xdg_config = strategy.config_dir().join(app_dir_name);
-    let (data, cache, config) = match fallback_dir {
-        Some(dir) => (dir.to_path_buf(), dir.to_path_buf(), dir.to_path_buf()),
-        None => (
-            strategy.data_dir().join(app_dir_name),
-            strategy.cache_dir().join(app_dir_name),
-            xdg_config.clone(),
-        ),
-    };
-    let (state, logs) = if fallback_dir.is_some() {
-        (data.clone(), data.clone())
-    } else {
-        state_logs(strategy, &data, app_dir_name)
-    };
+fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str) -> Paths {
+    let config = strategy.config_dir().join(app_dir_name);
+    let data = strategy.data_dir().join(app_dir_name);
+    let cache = strategy.cache_dir().join(app_dir_name);
+    let (state, logs) = state_logs(strategy, &data, app_dir_name);
     Paths {
         config,
         data,
         state,
         logs,
         cache,
-        xdg_config,
     }
-}
-
-fn existing_legacy_dir(home: Option<PathBuf>, legacy_dir_name: &str) -> Option<PathBuf> {
-    home.map(|path| path.join(legacy_dir_name))
-        // XDG cutover leaves a durable marker so cached legacy paths cannot
-        // recreate state while new processes select XDG.
-        .filter(|path| path.is_dir() && !path.join(XDG_MIGRATED_MARKER).is_file())
 }
 
 fn resolve() -> Option<&'static Paths> {
     STRATEGY
         .get_or_init(|| {
-            let s = etcetera::choose_base_strategy().ok()?;
-            let fallback_dir = existing_legacy_dir(etcetera::home_dir().ok(), LEGACY_DIR_NAME);
-            Some(paths_for(&s, fallback_dir.as_deref(), APP_DIR_NAME))
+            let strategy = etcetera::choose_base_strategy().ok()?;
+            Some(paths_for(&strategy, APP_DIR_NAME))
         })
         .as_ref()
 }
@@ -233,27 +208,12 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
     Ok(path.to_path_buf())
 }
 
-fn xdg_only_paths() -> Result<Paths, std::io::Error> {
-    let strategy = etcetera::choose_base_strategy().map_err(|_| err())?;
-    Ok(paths_for(&strategy, None, APP_DIR_NAME))
-}
-
 fn active_path(field: fn(&Paths) -> &Path) -> Result<PathBuf, std::io::Error> {
-    let cached = resolve().ok_or_else(err)?;
-    if cached.state.join(XDG_MIGRATED_MARKER).is_file() {
-        let xdg = xdg_only_paths()?;
-        return ensure(field(&xdg));
-    }
-    ensure(field(cached))
+    ensure(field(resolve().ok_or_else(err)?))
 }
 
 pub fn config_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.config)
-}
-
-pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.xdg_config)
 }
 
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
@@ -272,43 +232,16 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.cache)
 }
 
-pub struct XdgPaths {
-    pub config: PathBuf,
-    pub state: PathBuf,
-    pub logs: PathBuf,
-}
-
-pub fn xdg_paths() -> Result<XdgPaths, std::io::Error> {
-    let s = etcetera::choose_base_strategy().map_err(|_| err())?;
-    let paths = paths_for(&s, None, APP_DIR_NAME);
-    Ok(XdgPaths {
-        config: paths.config,
-        state: paths.state,
-        logs: paths.logs,
-    })
-}
-
 pub fn home() -> Option<PathBuf> {
     etcetera::home_dir().ok()
 }
 
-pub fn legacy_home_dir() -> Option<PathBuf> {
-    existing_legacy_dir(etcetera::home_dir().ok(), LEGACY_DIR_NAME)
-}
-
-/// Candidate config directories for `subdir` from `home` and `xdg_config`.
-/// Pure: no env reads, no process-home fallback. Production callers pass
-/// `config_dir().ok()` as `xdg_config` (which honors `XDG_CONFIG_HOME`, the
-/// active legacy fallback, and the Windows `AppData\Roaming` strategy via
-/// `resolve()`); tests pass tempdirs.
-pub fn user_config_dirs(
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-    subdir: &str,
-) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(LEGACY_DIR_NAME).join(subdir));
-    let xdg = xdg_config.map(|d| d.join(subdir));
-    [legacy, xdg].into_iter().flatten().collect()
+/// The user-level config directory for `subdir`. Pure: no env reads, no
+/// process-home fallback. Production callers pass `config_dir().ok()`, which
+/// honors `XDG_CONFIG_HOME` and the Windows `AppData\Roaming` strategy via
+/// `resolve()`; tests pass tempdirs.
+pub fn user_config_dir(config: Option<&Path>, subdir: &str) -> Option<PathBuf> {
+    config.map(|dir| dir.join(subdir))
 }
 
 #[cfg(test)]
@@ -362,9 +295,9 @@ mod tests {
     }
 
     #[test]
-    fn directory_names_are_isolated_by_build_profile() {
-        assert_eq!(directory_names(false), ("caudra", ".caudra"));
-        assert_eq!(directory_names(true), ("caudra-debug", ".caudra-debug"));
+    fn app_directory_name_is_isolated_by_build_profile() {
+        assert_eq!(app_dir_name(false), "caudra");
+        assert_eq!(app_dir_name(true), "caudra-debug");
     }
 
     #[test]
@@ -372,14 +305,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let strategy = TestStrategy::new(root.path(), true);
 
-        let paths = paths_for(&strategy, None, "caudra-debug");
+        let paths = paths_for(&strategy, "caudra-debug");
 
         assert_eq!(paths.config, root.path().join("config/caudra-debug"));
         assert_eq!(paths.data, root.path().join("data/caudra-debug"));
         assert_eq!(paths.state, root.path().join("state/caudra-debug"));
         assert_eq!(paths.logs, root.path().join("logs/caudra-debug"));
         assert_eq!(paths.cache, root.path().join("cache/caudra-debug"));
-        assert_eq!(paths.xdg_config, root.path().join("config/caudra-debug"));
     }
 
     #[test]
@@ -387,45 +319,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let strategy = TestStrategy::new(root.path(), false);
 
-        let paths = paths_for(&strategy, None, "caudra-debug");
+        let paths = paths_for(&strategy, "caudra-debug");
         let data = root.path().join("data/caudra-debug");
 
         assert_eq!(paths.state, data);
         assert_eq!(paths.logs, data);
-    }
-
-    #[test]
-    fn debug_legacy_directory_does_not_select_release_directory() {
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir(home.path().join(".caudra")).unwrap();
-
-        assert_eq!(
-            existing_legacy_dir(Some(home.path().into()), ".caudra-debug"),
-            None
-        );
-
-        let debug = home.path().join(".caudra-debug");
-        fs::create_dir(&debug).unwrap();
-        assert_eq!(
-            existing_legacy_dir(Some(home.path().into()), ".caudra-debug"),
-            Some(debug)
-        );
-    }
-
-    #[test]
-    fn legacy_directory_collapses_all_active_paths() {
-        let root = tempfile::tempdir().unwrap();
-        let strategy = TestStrategy::new(root.path(), true);
-        let legacy = root.path().join("home/.caudra-debug");
-
-        let paths = paths_for(&strategy, Some(&legacy), "caudra-debug");
-
-        assert_eq!(paths.config, legacy);
-        assert_eq!(paths.data, legacy);
-        assert_eq!(paths.state, legacy);
-        assert_eq!(paths.logs, legacy);
-        assert_eq!(paths.cache, legacy);
-        assert_eq!(paths.xdg_config, root.path().join("config/caudra-debug"));
     }
 
     #[test]
@@ -490,51 +388,26 @@ mod tests {
     }
 
     #[test]
-    fn user_config_dirs_returns_legacy_and_xdg() {
-        let home = tempfile::tempdir().unwrap();
-        let xdg = home.path().join(".config").join(APP_DIR_NAME);
+    fn user_config_dir_joins_the_given_config_root() {
+        let config = tempfile::tempdir().unwrap();
 
-        let dirs = user_config_dirs(Some(home.path()), Some(&xdg), "AGENTS.md");
         assert_eq!(
-            dirs,
-            vec![
-                home.path().join(LEGACY_DIR_NAME).join("AGENTS.md"),
-                xdg.join("AGENTS.md"),
-            ]
+            user_config_dir(Some(config.path()), "AGENTS.md"),
+            Some(config.path().join("AGENTS.md"))
         );
+        assert_eq!(user_config_dir(None, "AGENTS.md"), None);
     }
 
     #[test]
-    fn user_config_dirs_omits_legacy_when_home_none() {
-        let xdg = tempfile::tempdir().unwrap();
-
-        let dirs = user_config_dirs(None, Some(xdg.path()), "AGENTS.md");
-        assert_eq!(dirs, vec![xdg.path().join("AGENTS.md")]);
-    }
-
-    #[test]
-    fn user_config_dirs_omits_xdg_when_xdg_none() {
-        let home = tempfile::tempdir().unwrap();
-
-        let dirs = user_config_dirs(Some(home.path()), None, "AGENTS.md");
-        assert_eq!(
-            dirs,
-            vec![home.path().join(LEGACY_DIR_NAME).join("AGENTS.md")]
-        );
-    }
-
-    #[test]
-    fn user_config_dirs_neither_depends_on_process_env() {
-        let home_a = tempfile::tempdir().unwrap();
-        let xdg_a = home_a.path().join(".config").join(APP_DIR_NAME);
-
+    fn user_config_dir_does_not_depend_on_process_env() {
+        let config = tempfile::tempdir().unwrap();
         let hostile = tempfile::tempdir().unwrap();
 
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         // SAFETY: tests run single-threaded within a process nextest invokes once.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", hostile.path()) };
 
-        let dirs = user_config_dirs(Some(home_a.path()), Some(&xdg_a), "AGENTS.md");
+        let dir = user_config_dir(Some(config.path()), "AGENTS.md");
 
         // SAFETY: same single-threaded assumption as above.
         unsafe {
@@ -544,9 +417,6 @@ mod tests {
             }
         }
 
-        assert!(
-            !dirs.iter().any(|p| p.starts_with(hostile.path())),
-            "combiner read XDG_CONFIG_HOME: {dirs:?}"
-        );
+        assert_eq!(dir, Some(config.path().join("AGENTS.md")));
     }
 }

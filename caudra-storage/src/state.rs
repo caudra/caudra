@@ -236,6 +236,92 @@ mod tests {
         );
     }
 
+    /// Every former standalone file, with the name and lock name it had
+    /// before consolidation and a payload the old reader would have accepted.
+    const LEGACY_STATE_FILES: [(&str, &str); 13] = [
+        ("model", "legacy/model"),
+        ("recent-models", "legacy/one\nlegacy/two"),
+        ("model-tiers", "legacy/model=fast"),
+        ("model-roles", "legacy/model=plan"),
+        ("view", "compact"),
+        ("theme", "legacy-theme"),
+        ("provider-scripts.json", r#"{"legacy":{"models":[]}}"#),
+        ("input_history.json", r#"["legacy prompt"]"#),
+        (
+            "prompt-stash.json",
+            r#"[{"id":"legacy","text":"stashed","created_at":1}]"#,
+        ),
+        ("prompt-stash.lock", ""),
+        ("permission-rules.json", "[]"),
+        ("permission-rules.lock", ""),
+        ("mcp-trust.json", r#"{"legacy-server":"0123456789abcdef"}"#),
+    ];
+    const IGNORED: &str = "a file from before consolidation must not be read";
+    const UNTOUCHED: &str = "a file from before consolidation must not be rewritten";
+    const LEGACY_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn state_files_from_before_consolidation_are_neither_read_nor_written() {
+        let (temp, dir) = state_dir();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        for (name, content) in LEGACY_STATE_FILES {
+            fs::write(dir.path().join(name), content).unwrap();
+        }
+        fs::write(
+            dir.path().join("permission-config-trust.json"),
+            format!(r#"{{"{}":"{LEGACY_DIGEST}"}}"#, project.display()),
+        )
+        .unwrap();
+
+        assert_eq!(crate::model::read_model(&dir), None, "{IGNORED}");
+        assert!(crate::model::read_recents(&dir).is_empty(), "{IGNORED}");
+        assert_eq!(crate::theme::read_theme_name(&dir), None, "{IGNORED}");
+        assert_eq!(crate::view::read(&dir), None, "{IGNORED}");
+        assert!(
+            crate::input_history::InputHistory::load(&dir, 100).is_empty(),
+            "{IGNORED}"
+        );
+        assert!(
+            crate::prompt_stash::PromptStash::open(&dir)
+                .unwrap()
+                .is_empty(),
+            "{IGNORED}"
+        );
+        assert!(
+            crate::permission_state::PermissionState::open(&dir)
+                .unwrap()
+                .records()
+                .is_empty(),
+            "{IGNORED}"
+        );
+        assert!(
+            !crate::mcp_trust::is_project_trusted(&dir, &project, "legacy-server", LEGACY_DIGEST)
+                .unwrap(),
+            "{IGNORED}"
+        );
+        assert!(
+            !crate::permission_config_trust::is_project_trusted(&dir, &project, LEGACY_DIGEST)
+                .unwrap(),
+            "{IGNORED}"
+        );
+
+        crate::model::persist_model(&dir, "current/model");
+        crate::theme::persist_theme_name(&dir, "current-theme");
+        crate::mcp_trust::trust_project(&dir, &project, "legacy-server", LEGACY_DIGEST).unwrap();
+        assert_eq!(
+            crate::model::read_model(&dir).as_deref(),
+            Some("current/model")
+        );
+        for (name, content) in LEGACY_STATE_FILES {
+            assert_eq!(
+                fs::read_to_string(dir.path().join(name)).unwrap(),
+                content,
+                "{UNTOUCHED}: {name}"
+            );
+        }
+    }
+
     #[test]
     fn workspace_tabs_round_trip_per_directory_and_skip_ephemeral() {
         let (temp, dir) = state_dir();

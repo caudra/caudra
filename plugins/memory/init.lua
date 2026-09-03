@@ -10,56 +10,32 @@ local function memories_path_suffix()
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
-local function legacy_dir_if_exists(suffix)
-  local legacy = caudra.env.legacy_dir()
-  if not legacy then
-    return nil
-  end
-  local dir = caudra.fs.joinpath(legacy, suffix)
-  local meta = caudra.fs.metadata(dir)
-  if meta and meta.is_dir then
-    return dir
-  end
-end
-
--- Notes live outside cwd, where effectful tools normally prompt. Reads may
--- come from the legacy dir while writes go to the state dir, so cover both.
+-- Notes live outside cwd, where effectful tools normally prompt.
 local function register_memory_rules()
-  local suffix = memories_path_suffix()
-  local dirs = { legacy_dir_if_exists(suffix) }
   local state = caudra.env.state_dir()
-  if state then
-    dirs[#dirs + 1] = caudra.fs.joinpath(state, suffix)
+  if not state then
+    return
   end
-  for _, dir in ipairs(dirs) do
-    dir = caudra.fs.normalize(dir)
-    for _, tool in ipairs(MEMORY_POLICY_TOOLS) do
-      caudra.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
-    end
+  local dir = caudra.fs.normalize(caudra.fs.joinpath(state, memories_path_suffix()))
+  for _, tool in ipairs(MEMORY_POLICY_TOOLS) do
+    caudra.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
   end
 end
 register_memory_rules()
 
-local function resolve_dir(check_legacy)
-  local suffix = memories_path_suffix()
-  if check_legacy then
-    local dir = legacy_dir_if_exists(suffix)
-    if dir then
-      return dir
-    end
-  end
+local function resolve_dir()
   local state = caudra.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
-  return caudra.fs.joinpath(state, suffix)
+  return caudra.fs.joinpath(state, memories_path_suffix())
 end
 
 caudra.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
   content = function()
-    local dir = resolve_dir(true)
+    local dir = resolve_dir()
     if not dir then
       return nil
     end
@@ -170,7 +146,7 @@ end
 
 local function memory_permission_scopes(input)
   local command = input.command
-  local dir = resolve_dir(command == "list" or command == "read")
+  local dir = resolve_dir()
   if not dir then
     return nil
   end
@@ -242,7 +218,7 @@ caudra.api.register_tool({
       return { llm_output = "error: " .. verr, is_error = true }
     end
     local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd == "list" or cmd == "read")
+    local dir, dir_err = resolve_dir()
     if not dir then
       return { llm_output = "error: " .. dir_err, is_error = true }
     end
@@ -291,7 +267,7 @@ caudra.api.register_command({
   name = "/memory",
   description = "View, edit, and delete memory files",
   handler = function()
-    local dir = resolve_dir(true)
+    local dir = resolve_dir()
     if not dir then
       caudra.ui.flash("Cannot resolve memory directory")
       return

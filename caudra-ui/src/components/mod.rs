@@ -40,6 +40,7 @@ pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -444,10 +445,10 @@ pub enum ExitRequest {
 }
 
 impl ExitRequest {
-    pub fn code(&self) -> i32 {
+    pub fn code(&self) -> ExitCode {
         match self {
-            Self::None | Self::Success | Self::Reload => 0,
-            Self::Error => 1,
+            Self::None | Self::Success | Self::Reload => ExitCode::SUCCESS,
+            Self::Error => ExitCode::FAILURE,
         }
     }
 }

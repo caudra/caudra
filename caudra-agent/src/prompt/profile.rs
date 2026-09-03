@@ -149,15 +149,12 @@ impl TaskProfileBindings {
 
 impl PromptProfileCatalog {
     pub fn discover_user() -> Self {
-        Self::discover_with(
-            caudra_storage::paths::home().as_deref(),
-            caudra_storage::paths::config_dir().ok().as_deref(),
-        )
+        Self::discover_with(caudra_storage::paths::config_dir().ok().as_deref())
     }
 
-    fn discover_with(home: Option<&Path>, config_dir: Option<&Path>) -> Self {
+    fn discover_with(config_dir: Option<&Path>) -> Self {
         let mut catalog = Self::default();
-        for dir in caudra_storage::paths::user_config_dirs(home, config_dir, PROFILE_DIR) {
+        if let Some(dir) = caudra_storage::paths::user_config_dir(config_dir, PROFILE_DIR) {
             catalog.load_dir(&dir);
         }
         catalog
@@ -578,7 +575,7 @@ mod tests {
     use super::*;
 
     fn discover(dir: &Path) -> PromptProfileCatalog {
-        PromptProfileCatalog::discover_with(None, Some(dir))
+        PromptProfileCatalog::discover_with(Some(dir))
     }
 
     fn profile_dir(dir: &TempDir) -> std::path::PathBuf {

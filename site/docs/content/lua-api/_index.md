@@ -91,7 +91,7 @@ The rules:
 | [`caudra.async.Semaphore`](#caudra-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`caudra.async.Permit`](#caudra-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`caudra.base64`](#caudra-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`caudra.env`](#caudra-env) | Paths to caudra's own directories (config, state, logs, legacy). |
+| [`caudra.env`](#caudra-env) | Paths to caudra's own directories (config, state, logs). |
 | [`caudra.fn`](#caudra-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`caudra.fs`](#caudra-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`caudra.image`](#caudra-image) | Small building blocks for working with images: probe metadata, decode |
@@ -1406,7 +1406,7 @@ caudra.base64.decode("aGVsbG8=") -- "hello"
 
 ## caudra.env {#caudra-env}
 
-Paths to caudra's own directories (config, state, logs, legacy).
+Paths to caudra's own directories (config, state, logs).
 
 Use these to locate config files or persistent state without hard-coding paths.
 
@@ -1476,22 +1476,6 @@ Requires the `env` [plugin permission](#plugin-permissions).
 ```lua
 local dir = caudra.env.logs_dir()
 ```
-
----
-
-### `caudra.env.legacy_dir()` {#caudra-env-legacy_dir}
-
-```lua
-caudra.env.legacy_dir()
-```
-
-Return the active build's legacy config path, if it exists on disk.
-This is `~/.caudra` in release builds and `~/.caudra-debug` in debug builds.
-Useful for migration logic. Returns nil when there is no legacy directory.
-
-Requires the `env` [plugin permission](#plugin-permissions).
-
-**Returns:** (`string?`) Legacy directory path, or nil if not present.
 
 
 ## caudra.fn {#caudra-fn}

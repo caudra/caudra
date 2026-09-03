@@ -23,16 +23,11 @@ pub enum CaudraIdParseError {
 /// nodes once history is a tree): time-ordered, base58-encoded, backed by a
 /// UUIDv7.
 ///
-/// Serializes as base58. Accepts legacy v4-hex-uuid strings on parse
-/// (either hyphenated 8-4-4-4-12 or the unhyphenated 32 hex variant)
-/// so existing on-disk sessions resume; the canonical form is base58.
-///
-/// Note: base58 encoding is variable-length (21-22 chars for 16 bytes).
-/// New v7 ids encode to a stable 21 chars, so lexical sort orders them
-/// chronologically; legacy v4 ids (no embedded timestamp) mix 21-22 chars
-/// and don't sort by time regardless. Nothing in caudra sorts by the string
-/// form today; storage uses the embedded timestamp directly. See issue
-/// #264 for future tree-ordered history work.
+/// Serializes as base58, which is variable-length (21-22 chars for 16 bytes).
+/// v7 ids encode to a stable 21 chars, so lexical sort orders them
+/// chronologically. Nothing in caudra sorts by the string form today; storage
+/// uses the embedded timestamp directly. See issue #264 for future
+/// tree-ordered history work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CaudraId([u8; UUID_BYTES]);
 
@@ -63,9 +58,6 @@ impl FromStr for CaudraId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
             return Err(CaudraIdParseError::Empty);
-        }
-        if let Ok(u) = Uuid::parse_str(s) {
-            return Ok(Self(u.into_bytes()));
         }
         decode_base58(s)
     }
@@ -178,8 +170,6 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const SAMPLE_HEX: &str = "01965087-4c71-7f00-8000-000000000000";
-
     fn parse(s: &str) -> CaudraId {
         s.parse().unwrap()
     }
@@ -199,18 +189,17 @@ mod tests {
         assert_eq!(s.parse::<CaudraId>().unwrap(), id);
     }
 
-    #[test_case("00000000-0000-7000-8000-000000000000")]
-    #[test_case("00000001-0002-7000-8000-000000000000")]
-    fn roundtrips_leading_zero_bytes(hex: &str) {
-        let id: CaudraId = hex.parse().unwrap();
-        assert_eq!(id.to_string().parse::<CaudraId>().unwrap(), id);
+    #[test_case([0; UUID_BYTES] ; "all zero bytes")]
+    #[test_case([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1] ; "leading zero bytes")]
+    fn roundtrips_leading_zero_bytes(bytes: [u8; UUID_BYTES]) {
+        let id = CaudraId::from_bytes(bytes);
+        assert_eq!(parse(&id.to_string()), id);
     }
 
-    #[test_case(SAMPLE_HEX)]
+    #[test_case("01965087-4c71-7f00-8000-000000000000")]
     #[test_case("019650874c717f008000000000000000")]
-    fn parses_legacy_and_canonical(s: &str) {
-        let expected = CaudraId(Uuid::parse_str(SAMPLE_HEX).unwrap().into_bytes());
-        assert_eq!(parse(s), expected);
+    fn rejects_uuid_hex(s: &str) {
+        assert!(s.parse::<CaudraId>().is_err());
     }
 
     #[test_case("" => matches Err(CaudraIdParseError::Empty))]
@@ -229,12 +218,13 @@ mod tests {
         assert_eq!(back, id);
     }
 
-    #[test_case(SAMPLE_HEX)]
-    #[test_case("019650874c717f008000000000000000")]
-    fn ref_preserves_caller_string(s: &str) {
-        let session_ref: SessionRef = s.parse().unwrap();
-        assert_eq!(session_ref.as_str(), s);
-        assert_eq!(session_ref.id(), parse(s));
+    #[test]
+    fn ref_round_trips_through_its_string_form() {
+        let session_ref = SessionRef::generate();
+        assert_eq!(
+            session_ref.as_str().parse::<SessionRef>().unwrap(),
+            session_ref
+        );
     }
 
     #[test]

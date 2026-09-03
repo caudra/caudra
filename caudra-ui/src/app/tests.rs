@@ -36,7 +36,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    Session, StoredImage, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
+    StoredImage, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
     StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::thinking::StoredThinking;
@@ -1243,27 +1243,6 @@ fn load_session_clears_plan() {
     app.load_session(id);
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
-}
-
-#[test]
-fn load_session_from_picker_migrates_legacy_messages() {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    let mut legacy: Session<Message, TokenUsage, ToolOutput> =
-        Session::new("test-model", &app.state.session.cwd);
-    legacy.replace_messages(vec![Message::user("legacy prompt".into())]);
-    legacy.save(&app.storage).unwrap();
-
-    let actions = app.load_session(legacy.id);
-
-    let Action::LoadSession(loaded) = &actions[0] else {
-        panic!("expected LoadSession");
-    };
-    assert_eq!(loaded.messages.len(), 1);
-    assert_eq!(
-        project_messages(&loaded.messages).unwrap()[0].user_text(),
-        Some("legacy prompt")
-    );
-    assert!(AppSession::load(legacy.id, &app.storage).is_ok());
 }
 
 #[test]
@@ -8312,6 +8291,32 @@ fn thinking_restored_from_session_meta() {
         &caudra_config::ModelPolicy::default(),
     );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+}
+
+const VOLATILE_SNAPSHOTS: &str = "an ephemeral run must snapshot into the volatile root";
+const PERSISTENT_TRACE: &str = "an ephemeral run must leave no snapshot in the persistent root";
+
+#[test]
+fn ephemeral_snapshots_are_written_to_the_volatile_root() {
+    let tmp = TempDir::new().unwrap();
+    let persistent = tmp.path().join("persistent");
+    let volatile = tmp.path().join("volatile");
+    let cwd = tmp.path().join("workspace");
+    std::fs::create_dir_all(&persistent).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "before").unwrap();
+    let storage = StateDir::split(volatile.clone(), persistent.clone());
+    let session_id = CaudraId::generate();
+
+    let store = App::snapshot_store_for(&storage, session_id, &cwd).unwrap();
+    store.snapshot_session_start(&cwd).unwrap();
+
+    let snapshots = |root: &Path| root.join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR);
+    assert!(
+        snapshots(&volatile).join(session_id.to_string()).is_dir(),
+        "{VOLATILE_SNAPSHOTS}"
+    );
+    assert!(!snapshots(&persistent).exists(), "{PERSISTENT_TRACE}");
 }
 
 fn set_opus_model(app: &mut App) {

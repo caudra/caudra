@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use rusqlite::backup::Backup;
 use rusqlite::limits::Limit;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -49,14 +48,11 @@ use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::{
-    StateDir, StorageError, atomic_write_permissions, exclusive_state_lock, lock_session_artifacts,
-    shared_existing_state_lock, shared_state_lock,
+    StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
 };
 
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
-const SESSIONS_DB_MIGRATION_FILE: &str = "sessions.sqlite3.migrating";
-const SESSIONS_DB_CUTOVER_PENDING_FILE: &str = "sessions.sqlite3.cutover-pending";
 
 const SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
@@ -237,20 +233,6 @@ pub struct SessionDatabase {
     _migration_lock: File,
 }
 
-/// Holds source and target exclusion while XDG migration moves the remaining
-/// state. Dropping before `finish` removes the staged target and preserves the
-/// source; `finish` atomically publishes a durable retirement marker.
-pub struct SessionMigration {
-    source: StateDir,
-    target: StateDir,
-    _source_lock: File,
-    _target_lock: File,
-    temporary_path: PathBuf,
-    pending_path: PathBuf,
-    copied_database: bool,
-    finished: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStorageStats {
     pub database_bytes: u64,
@@ -343,17 +325,10 @@ struct RootRow {
 
 impl SessionDatabase {
     pub fn open(state_dir: &StateDir) -> Result<Self, SessionError> {
-        reject_retired_state_dir(state_dir)?;
         let migration_lock = shared_state_lock(
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        reject_retired_state_dir(state_dir)?;
-        let cutover_pending = state_dir.path().join(SESSIONS_DB_CUTOVER_PENDING_FILE);
-        if cutover_pending.exists() && state_dir.path().join(SESSIONS_DB_FILE).exists() {
-            let _ = fs::remove_file(&cutover_pending);
-            crate::sync_parent_dir(&cutover_pending);
-        }
         let connection = open_writable_connection(state_dir)?;
         let mut database = Self {
             connection,
@@ -374,105 +349,15 @@ impl SessionDatabase {
     /// cleanup and archive reconciliation so a preference read never does
     /// filesystem maintenance on the caller's thread.
     pub fn open_state(state_dir: &StateDir) -> Result<Self, SessionError> {
-        reject_retired_state_dir(state_dir)?;
         let migration_lock = shared_state_lock(
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        reject_retired_state_dir(state_dir)?;
         let connection = open_writable_connection(state_dir)?;
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
             _migration_lock: migration_lock,
-        })
-    }
-
-    pub fn migrate(source: &StateDir, target: &StateDir) -> Result<SessionMigration, SessionError> {
-        reject_retired_state_dir(source)?;
-        // Every repository holds its shared lock for the connection lifetime.
-        // Exclusive cutover therefore drains writers and blocks new ones until
-        // target verification and durable source retirement are complete.
-        let source_lock =
-            exclusive_state_lock(&source.path().join(SESSIONS_DB_LOCK_FILE), OWNER_FILE_MODE)?;
-        let target_lock =
-            exclusive_state_lock(&target.path().join(SESSIONS_DB_LOCK_FILE), OWNER_FILE_MODE)?;
-        // The first check can precede a long wait behind another migrator.
-        // Recheck under both exclusive locks so a completed cutover cannot be
-        // republished from its retained rollback source.
-        reject_retired_state_dir(source)?;
-        let source_path = source.path().join(SESSIONS_DB_FILE);
-        let target_path = target.path().join(SESSIONS_DB_FILE);
-        let temporary_path = target.path().join(SESSIONS_DB_MIGRATION_FILE);
-        let pending_path = target.path().join(SESSIONS_DB_CUTOVER_PENDING_FILE);
-        if pending_path.exists() {
-            remove_database_files(&target_path)?;
-            fs::remove_file(&pending_path).map_err(StorageError::from)?;
-        }
-        remove_database_files(&temporary_path)?;
-        // A target database can contain canonical rows or tombstones. Refuse
-        // the whole cutover rather than silently replacing either generation.
-        if target_path.exists() {
-            return Err(StorageError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "session database already exists at {}",
-                    target_path.display()
-                ),
-            ))
-            .into());
-        }
-        if !source_path.exists() {
-            return Ok(SessionMigration {
-                source: source.clone(),
-                target: target.clone(),
-                _source_lock: source_lock,
-                _target_lock: target_lock,
-                temporary_path,
-                pending_path,
-                copied_database: false,
-                finished: false,
-            });
-        }
-        fs::create_dir_all(target.path()).map_err(StorageError::from)?;
-        // Copying only the main file can omit committed WAL frames. The online
-        // backup API reads one consistent logical database instead.
-        let backup_result = (|| -> Result<(), SessionError> {
-            let source_connection = open_migration_source_connection(source)?;
-            create_owner_only(&temporary_path)?;
-            let mut destination = Connection::open_with_flags(
-                &temporary_path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?;
-            let backup = Backup::new(&source_connection, &mut destination)?;
-            backup.run_to_completion(256, Duration::from_millis(10), None)?;
-            drop(backup);
-            drop(destination);
-            drop(source_connection);
-            let migrated = Connection::open_with_flags(
-                &temporary_path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?;
-            quick_check_on(&migrated)
-        })();
-        if let Err(error) = backup_result {
-            let _ = remove_database_files(&temporary_path);
-            return Err(error);
-        }
-        crate::sync_parent_dir_durable(&temporary_path)?;
-        Ok(SessionMigration {
-            source: source.clone(),
-            target: target.clone(),
-            _source_lock: source_lock,
-            _target_lock: target_lock,
-            temporary_path,
-            pending_path,
-            copied_database: true,
-            finished: false,
         })
     }
 
@@ -1738,56 +1623,6 @@ impl SessionDatabase {
     }
 }
 
-impl SessionMigration {
-    pub fn copied_database(&self) -> bool {
-        self.copied_database
-    }
-
-    pub fn finish(mut self) -> Result<bool, SessionError> {
-        let target_path = self.target.path().join(SESSIONS_DB_FILE);
-        if self.copied_database {
-            atomic_write_permissions(&self.pending_path, b"pending", OWNER_FILE_MODE)?;
-            crate::durable_rename(&self.temporary_path, &target_path)
-                .map_err(StorageError::from)?;
-            crate::sync_parent_dir_durable(&target_path)?;
-        }
-        // The marker is the durable cutover point. Cached legacy StateDirs
-        // reject future opens once it exists, even after these locks are gone.
-        if let Err(error) = write_cutover_marker(&self.source, &self.target) {
-            // Once marker publication is visible, dropping the migration must
-            // not remove its target and leave the process pointed at nothing.
-            self.finished = self
-                .source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists();
-            return Err(error);
-        }
-        self.finished = true;
-        if self.copied_database {
-            // The retired source remains intact as rollback data. The durable
-            // marker prevents it from becoming canonical again.
-            let _ = fs::remove_file(&self.pending_path);
-            crate::sync_parent_dir(&self.pending_path);
-        }
-        Ok(self.copied_database)
-    }
-}
-
-impl Drop for SessionMigration {
-    fn drop(&mut self) {
-        if self.copied_database && !self.finished {
-            let _ = remove_database_files(&self.temporary_path);
-            if self.pending_path.exists() {
-                let target_path = self.target.path().join(SESSIONS_DB_FILE);
-                let _ = remove_database_files(&target_path);
-                let _ = fs::remove_file(&self.pending_path);
-            }
-            crate::sync_parent_dir(&self.temporary_path);
-        }
-    }
-}
-
 impl Drop for PreparedArchive {
     fn drop(&mut self) {
         if self.cleanup_on_drop && fs::remove_file(&self.pending_path).is_ok() {
@@ -2166,31 +2001,6 @@ fn create_owner_only(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn reject_retired_state_dir(state_dir: &StateDir) -> Result<(), SessionError> {
-    let marker = state_dir.path().join(crate::paths::XDG_MIGRATED_MARKER);
-    if !marker.is_file() {
-        return Ok(());
-    }
-    let target = fs::read_to_string(&marker).unwrap_or_else(|_| "the XDG state directory".into());
-    Err(StorageError::Io(io::Error::other(format!(
-        "state directory {} was retired; use {}",
-        state_dir.path().display(),
-        target.trim()
-    )))
-    .into())
-}
-
-fn write_cutover_marker(source: &StateDir, target: &StateDir) -> Result<(), SessionError> {
-    let marker = source.path().join(crate::paths::XDG_MIGRATED_MARKER);
-    atomic_write_permissions(
-        &marker,
-        target.path().as_os_str().as_encoded_bytes(),
-        OWNER_FILE_MODE,
-    )?;
-    crate::sync_parent_dir_durable(&marker)?;
-    Ok(())
-}
-
 fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionError> {
     fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
     ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
@@ -2207,20 +2017,6 @@ fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionE
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
     initialize(&mut connection, state_dir)?;
     configure(&connection)?;
-    Ok(connection)
-}
-
-fn open_migration_source_connection(state_dir: &StateDir) -> Result<Connection, SessionError> {
-    let path = state_dir.path().join(SESSIONS_DB_FILE);
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
-    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-    verify_current_schema(&connection)?;
     Ok(connection)
 }
 
@@ -2287,22 +2083,6 @@ fn quick_check_on(connection: &Connection) -> Result<(), SessionError> {
             field: "PRAGMA foreign_key_check",
             reason: format!("{foreign_key_errors} violations"),
         });
-    }
-    Ok(())
-}
-
-fn remove_database_files(path: &Path) -> Result<(), SessionError> {
-    let mut wal = path.as_os_str().to_os_string();
-    wal.push("-wal");
-    let mut shm = path.as_os_str().to_os_string();
-    shm.push("-shm");
-    for path in [path.to_path_buf(), wal.into(), shm.into()] {
-        if let Err(error) = fs::remove_file(&path) {
-            if error.kind() == io::ErrorKind::NotFound {
-                continue;
-            }
-            return Err(StorageError::from(error).into());
-        }
     }
     Ok(())
 }
@@ -3416,17 +3196,31 @@ mod tests {
     fn state_dir_apis_ignore_jsonl_sessions() {
         let (_temp, state_dir) = state_dir();
         let sessions_dir = state_dir.ensure_subdir(super::super::SESSIONS_DIR).unwrap();
-        let mut session = TestSession::new(MODEL, CWD);
-        session.push_message(TestMessage("legacy".into()));
-        session.save_to(&sessions_dir).unwrap();
-        let source = sessions_dir.join(format!("{}.jsonl", session.id));
+        let id = CaudraId::generate();
+        let source = sessions_dir.join(format!("{id}.jsonl"));
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "t": "header",
+                    "v": super::super::LOG_FORMAT_VERSION,
+                    "id": id,
+                    "model": MODEL,
+                    "cwd": CWD,
+                    "created_at": 0,
+                }),
+                json!({"t": "msg", "d": TestMessage("legacy".into())}),
+            ),
+        )
+        .unwrap();
 
-        assert!(source.exists());
         assert!(matches!(
-            TestSession::load(session.id, &state_dir),
+            TestSession::load(id, &state_dir),
             Err(SessionError::Storage(StorageError::NotFound(_)))
         ));
         assert!(TestSession::list(CWD, &state_dir).unwrap().is_empty());
+        assert!(source.exists(), "a stray log is ignored, not consumed");
     }
 
     #[test]
@@ -3689,218 +3483,6 @@ mod tests {
             .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(jobs, 0);
-    }
-
-    #[test]
-    fn database_migration_backs_up_wal_state() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        let mut database = SessionDatabase::open(&source).unwrap();
-        let mut session = TestSession::new(MODEL, CWD);
-        session.push_message(TestMessage("in wal".into()));
-        database.save(&session, None).unwrap();
-        drop(database);
-
-        assert!(
-            SessionDatabase::migrate(&source, &target)
-                .unwrap()
-                .finish()
-                .unwrap()
-        );
-
-        assert!(source.path().join(SESSIONS_DB_FILE).exists());
-        assert!(
-            source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists()
-        );
-        assert!(SessionDatabase::open(&source).is_err());
-        let migrated = SessionDatabase::open(&target).unwrap();
-        assert_eq!(
-            migrated
-                .load::<TestMessage, Value, Value>(session.id)
-                .unwrap()
-                .messages(),
-            session.messages()
-        );
-    }
-
-    #[test]
-    fn database_migration_never_overwrites_existing_target() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        let source_database = SessionDatabase::open(&source).unwrap();
-        let target_database = SessionDatabase::open(&target).unwrap();
-        drop((source_database, target_database));
-
-        let Err(error) = SessionDatabase::migrate(&source, &target) else {
-            panic!("migration unexpectedly overwrote the target");
-        };
-
-        assert!(matches!(error, SessionError::Storage(StorageError::Io(_))));
-        assert!(source.path().join(SESSIONS_DB_FILE).exists());
-        assert!(target.path().join(SESSIONS_DB_FILE).exists());
-    }
-
-    #[test]
-    fn database_migration_rejects_an_incompatible_v1_source() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        fs::create_dir_all(source.path()).unwrap();
-        let source_path = source.path().join(SESSIONS_DB_FILE);
-        create_owner_only(&source_path).unwrap();
-        let connection = Connection::open(source_path).unwrap();
-        connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .unwrap();
-        drop(connection);
-
-        let error = SessionDatabase::migrate(&source, &target).err().unwrap();
-
-        assert!(matches!(
-            error,
-            SessionError::CorruptDatabaseValue {
-                field: "PRAGMA application_id",
-                ..
-            }
-        ));
-        assert!(!target.path().join(SESSIONS_DB_FILE).exists());
-        assert!(
-            !source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn database_absent_migration_rejects_existing_target_database() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        fs::create_dir_all(source.path().join(super::super::SESSIONS_DIR)).unwrap();
-        drop(SessionDatabase::open(&target).unwrap());
-
-        assert!(SessionDatabase::migrate(&source, &target).is_err());
-        assert!(
-            !source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists()
-        );
-        assert!(target.path().join(SESSIONS_DB_FILE).exists());
-    }
-
-    #[test]
-    fn abandoned_database_migration_preserves_source_and_removes_partial_target() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        drop(SessionDatabase::open(&source).unwrap());
-
-        let migration = SessionDatabase::migrate(&source, &target).unwrap();
-        assert!(source.path().join(SESSIONS_DB_FILE).exists());
-        assert!(!target.path().join(SESSIONS_DB_FILE).exists());
-        assert!(target.path().join(SESSIONS_DB_MIGRATION_FILE).exists());
-        drop(migration);
-
-        assert!(source.path().join(SESSIONS_DB_FILE).exists());
-        assert!(!target.path().join(SESSIONS_DB_FILE).exists());
-        assert!(!target.path().join(SESSIONS_DB_MIGRATION_FILE).exists());
-        assert!(
-            !source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn interrupted_cutover_is_rebuilt_from_the_retained_source() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        let mut database = SessionDatabase::open(&source).unwrap();
-        let session = TestSession::new(MODEL, CWD);
-        database.save(&session, None).unwrap();
-        drop(database);
-        fs::create_dir_all(target.path()).unwrap();
-        fs::write(target.path().join(SESSIONS_DB_FILE), b"partial target").unwrap();
-        fs::write(
-            target.path().join(SESSIONS_DB_CUTOVER_PENDING_FILE),
-            b"pending",
-        )
-        .unwrap();
-
-        SessionDatabase::migrate(&source, &target)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        assert!(
-            SessionDatabase::open(&target)
-                .unwrap()
-                .load::<TestMessage, Value, Value>(session.id)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn cutover_marker_retires_legacy_state_without_a_database() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-
-        assert!(
-            !SessionDatabase::migrate(&source, &target)
-                .unwrap()
-                .finish()
-                .unwrap()
-        );
-
-        assert!(
-            source
-                .path()
-                .join(crate::paths::XDG_MIGRATED_MARKER)
-                .exists()
-        );
-        assert!(SessionDatabase::open(&source).is_err());
-    }
-
-    #[test]
-    fn database_migration_waits_for_open_repositories() {
-        let temp = TempDir::new().unwrap();
-        let source = StateDir::from_path(temp.path().join("source"));
-        let target = StateDir::from_path(temp.path().join("target"));
-        let database = SessionDatabase::open(&source).unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let migrate_source = source.clone();
-        let migrate_target = target.clone();
-        let handle = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            done_tx
-                .send(
-                    SessionDatabase::migrate(&migrate_source, &migrate_target)
-                        .and_then(SessionMigration::finish),
-                )
-                .unwrap();
-        });
-        started_rx.recv().unwrap();
-
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(database);
-        assert!(
-            done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-        );
-        handle.join().unwrap();
     }
 
     #[test]

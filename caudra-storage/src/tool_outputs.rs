@@ -3112,10 +3112,14 @@ mod tests {
         let stale = store.put(session.id, "stale").unwrap();
         session.push_message(serde_json::json!({"output_ref": current}));
         session.save(&state_dir).unwrap();
-        let mut standalone: Session<Value, Value, Value> = Session::new("model", "/project");
-        standalone.id = session.id;
-        standalone.push_message(serde_json::json!({"output_ref": stale}));
-        standalone.save_to(&sessions_dir).unwrap();
+        fs::write(
+            sessions_dir.join(format!("{}.jsonl", session.id)),
+            format!(
+                "{}\n",
+                serde_json::json!({"t": "msg", "d": {"output_ref": stale}})
+            ),
+        )
+        .unwrap();
         let database = state_dir.path().join(crate::sessions::SESSIONS_DB_FILE);
         fs::write(&database, b"corrupt").unwrap();
         let _ = fs::remove_file(format!("{}-wal", database.display()));

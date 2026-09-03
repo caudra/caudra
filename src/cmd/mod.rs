@@ -1,17 +1,17 @@
 mod acp;
-mod migrate;
 mod storage;
 mod subcmd;
 mod tui;
 
 use std::path::Path;
+use std::process::ExitCode;
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use caudra_storage::{EphemeralRoot, StateDir};
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction};
 use crate::update;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
@@ -71,7 +71,7 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }
 
-pub fn dispatch(cli: Cli) -> Result<()> {
+pub fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -110,9 +110,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.system_prompt_profile,
             )?;
         }
-        Some(Command::Migrate { action }) => match action {
-            MigrateAction::Xdg => migrate::xdg()?,
-        },
         Some(Command::Storage { action }) => {
             storage::run(action, cli.no_plugins, cli.no_jit)?;
         }
@@ -134,9 +131,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.system_prompt_profile.as_deref(),
             )?;
         }
-        None => {
-            tui::run(cli)?;
-        }
+        None => return tui::run(cli),
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

@@ -37,6 +37,7 @@ mod event_loop;
 mod input;
 mod terminal;
 
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -105,7 +106,7 @@ pub struct SessionTab {
 pub enum RunOutcome {
     Exit {
         session_id: Option<CaudraId>,
-        code: i32,
+        code: ExitCode,
     },
     Reload {
         tabs: Vec<SessionTab>,

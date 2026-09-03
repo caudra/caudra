@@ -47,12 +47,9 @@ const POLICY_TOOLS: &[&str] = &[
 /// stacking duplicates.
 pub const RULE_OWNER: &str = "native:memory";
 
-/// Both directories are covered: a read may come from the legacy location
-/// while writes go to the state directory.
 pub fn permission_rules(cwd: &Path) -> Vec<caudra_config::PermissionRule> {
-    [paths::legacy_dir(cwd), paths::state_dir(cwd)]
+    paths::state_dir(cwd)
         .into_iter()
-        .flatten()
         .flat_map(|dir| {
             let scope = format!("{}/**", dir.display());
             POLICY_TOOLS
@@ -132,12 +129,6 @@ impl Command {
             Self::Delete => "delete",
         }
     }
-
-    /// Only the read paths consult the pre-XDG directory. A write there would
-    /// leave the project's notes split across two places.
-    fn reads_legacy(self) -> bool {
-        matches!(self, Self::List | Self::Read)
-    }
 }
 
 pub struct MemoryTool;
@@ -174,7 +165,7 @@ impl Tool for MemoryTool {
             // `current_dir` calls need not.
             dir: std::env::current_dir()
                 .ok()
-                .and_then(|cwd| paths::resolve(&cwd, command.reads_legacy())),
+                .and_then(|cwd| paths::state_dir(&cwd)),
             path: string_field(&input, "path"),
             content: string_field(&input, "content"),
             tags: input
@@ -212,7 +203,7 @@ pub struct BrowseEntry {
 /// `None` when the notes directory cannot be resolved at all, which is a
 /// different failure from having no notes.
 pub fn browse(cwd: &Path) -> Option<(PathBuf, Vec<BrowseEntry>, usize)> {
-    let dir = paths::resolve(cwd, true)?;
+    let dir = paths::state_dir(cwd)?;
     let (entries, unreadable) = browse_dir(&dir, &TAG_CACHE);
     Some((dir, entries, unreadable))
 }
@@ -252,7 +243,7 @@ pub fn prompt_tag_line_for_cwd() -> Option<String> {
 /// The tag index shown in the system prompt. Absent when there is nothing to
 /// say, so a project without notes spends no tokens on the feature.
 fn prompt_tag_line(cwd: &Path, cache: &Mutex<notes::TagCache>) -> Option<String> {
-    let dir = paths::resolve(cwd, true)?;
+    let dir = paths::state_dir(cwd)?;
     let (found, warnings) = scan(&dir, cache);
     let groups = notes::group_by_tag(&found);
     if groups.is_empty() && warnings.is_empty() {

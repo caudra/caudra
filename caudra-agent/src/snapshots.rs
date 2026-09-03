@@ -1790,9 +1790,9 @@ mod tests {
     }
 
     fn checkpoint(sequence: u32) -> CaudraId {
-        format!("00000000-0000-7000-8000-{sequence:012x}")
-            .parse()
-            .unwrap()
+        let mut bytes = [0u8; 16];
+        bytes[12..].copy_from_slice(&sequence.to_be_bytes());
+        CaudraId::from_bytes(bytes)
     }
 
     fn setup() -> (TempDir, PathBuf, PathBuf) {

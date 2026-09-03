@@ -29,8 +29,8 @@ const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
 const TOOL_OUTPUT_PLUGIN: &str = include_str!("../../plugins/tool_output/init.lua");
 const BASH_PLUGIN: &str = include_str!("../../plugins/bash/init.lua");
-const TOOL_OUTPUT_SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000001";
-const OTHER_TOOL_OUTPUT_SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000002";
+const TOOL_OUTPUT_SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
+const OTHER_TOOL_OUTPUT_SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5ww";
 const MANAGED_OUTPUT_PLUGIN: &str = r#"
 caudra.api.register_tool({
     name = "managed_output_probe",
@@ -60,7 +60,7 @@ caudra.api.register_tool({
     handler = function()
         return {
             llm_output = "spoof",
-            managed_output = { id = "01965087-4c71-7f00-8000-000000000003" },
+            managed_output = { id = "CNK1hV6GWoysH3KQMm5wx" },
         }
     end,
 })
@@ -443,9 +443,7 @@ fn handler_reads_the_calling_session() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
 
-    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
-        .parse()
-        .expect("valid session id");
+    let session = SessionRef::generate();
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.session_id = Some(session.clone());
 
@@ -453,12 +451,7 @@ fn handler_reads_the_calling_session() {
     assert_eq!(
         out,
         format!("id:{}", session.id()),
-        "lua sees the canonical form, so it compares equal to caudra.session.current()"
-    );
-    assert_ne!(
-        out,
-        format!("id:{}", session.as_str()),
-        "the verbatim form would not match ids from caudra.session.live()"
+        "lua must see the calling session, not whoever is focused"
     );
 }
 

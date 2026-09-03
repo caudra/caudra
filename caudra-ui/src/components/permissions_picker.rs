@@ -373,7 +373,6 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
     let kind = match candidate.kind {
         PermissionReviewKind::Rule => "allow rule",
         PermissionReviewKind::Default => "allow default",
-        PermissionReviewKind::AllowAll => "allow all",
     };
     let tool = candidate
         .tool

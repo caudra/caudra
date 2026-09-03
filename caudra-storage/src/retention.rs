@@ -555,12 +555,16 @@ mod tests {
         TimeZone::UTC
     }
 
-    fn at(year: i16, month: i8, day: i8, hour: i8) -> u64 {
+    fn at_minute(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> u64 {
         let moment = date(year, month, day)
-            .at(hour, 0, 0, 0)
+            .at(hour, minute, 0, 0)
             .to_zoned(utc())
             .unwrap();
         u64::try_from(moment.timestamp().as_second()).unwrap()
+    }
+
+    fn at(year: i16, month: i8, day: i8, hour: i8) -> u64 {
+        at_minute(year, month, day, hour, 0)
     }
 
     fn facts(index: u8, cwd: &str, active_at: u64) -> SessionFacts {
@@ -721,6 +725,98 @@ mod tests {
             .map(|d| d.session.id.as_bytes()[0])
             .collect();
         assert_eq!(kept, [11, 9, 8, 7, 6], "{REASONS}");
+    }
+
+    fn kept_ids(decisions: &[Decision]) -> Vec<u8> {
+        decisions
+            .iter()
+            .filter(|decision| decision.keep())
+            .map(|decision| decision.session.id.as_bytes()[0])
+            .collect()
+    }
+
+    #[test]
+    fn hourly_keeps_the_newest_session_of_each_recent_hour() {
+        let policy = KeepPolicy {
+            keep_hourly: Some(3),
+            ..KeepPolicy::default()
+        };
+        let sessions = vec![
+            facts(1, "/a", at_minute(2025, 5, 3, 11, 45)),
+            facts(2, "/a", at_minute(2025, 5, 3, 11, 5)),
+            facts(3, "/a", at_minute(2025, 5, 3, 10, 30)),
+            facts(4, "/a", at_minute(2025, 5, 3, 8, 0)),
+            facts(5, "/a", at_minute(2025, 5, 3, 7, 0)),
+        ];
+        assert_eq!(
+            kept_ids(&decisions(policy, sessions)),
+            [1, 3, 4],
+            "{REASONS}"
+        );
+    }
+
+    #[test]
+    fn within_hourly_keeps_one_session_per_hour_inside_the_cutoff() {
+        let duration = "3h".parse::<Duration>().unwrap();
+        let policy = KeepPolicy {
+            keep_within_hourly: Some(duration),
+            ..KeepPolicy::default()
+        };
+        let sessions = vec![
+            facts(1, "/a", at_minute(2025, 5, 3, 11, 45)),
+            facts(2, "/a", at_minute(2025, 5, 3, 11, 5)),
+            facts(3, "/a", at_minute(2025, 5, 3, 9, 30)),
+            facts(4, "/a", at_minute(2025, 5, 3, 8, 30)),
+        ];
+        let decisions = decisions(policy, sessions);
+        assert_eq!(kept_ids(&decisions), [1, 3], "{REASONS}");
+        assert_eq!(
+            decisions[0].reasons,
+            [KeepReason::PeriodWithin {
+                period: Period::Hour,
+                duration
+            }]
+        );
+    }
+
+    /// Sessions 1 and 2 share ISO week 2025-W18, 2 and 3 share April, and
+    /// 1 through 4 share 2025, so one fixture exercises every bucket width.
+    #[test_case(Period::Week, "1m", vec![1, 3] ; "weekly")]
+    #[test_case(Period::Month, "2m", vec![1, 2, 4] ; "monthly")]
+    #[test_case(Period::Year, "1y", vec![1, 5] ; "yearly")]
+    fn within_period_keeps_one_session_per_bucket_inside_the_cutoff(
+        period: Period,
+        within: &str,
+        expected: Vec<u8>,
+    ) {
+        let duration = within.parse::<Duration>().unwrap();
+        let policy = match period {
+            Period::Week => KeepPolicy {
+                keep_within_weekly: Some(duration),
+                ..KeepPolicy::default()
+            },
+            Period::Month => KeepPolicy {
+                keep_within_monthly: Some(duration),
+                ..KeepPolicy::default()
+            },
+            _ => KeepPolicy {
+                keep_within_yearly: Some(duration),
+                ..KeepPolicy::default()
+            },
+        };
+        let sessions = vec![
+            facts(1, "/a", at(2025, 5, 2, 10)),
+            facts(2, "/a", at(2025, 4, 30, 10)),
+            facts(3, "/a", at(2025, 4, 20, 10)),
+            facts(4, "/a", at(2025, 3, 10, 10)),
+            facts(5, "/a", at(2024, 11, 10, 10)),
+        ];
+        let decisions = decisions(policy, sessions);
+        assert_eq!(kept_ids(&decisions), expected, "{REASONS}");
+        assert_eq!(
+            decisions[0].reasons,
+            [KeepReason::PeriodWithin { period, duration }]
+        );
     }
 
     #[test]

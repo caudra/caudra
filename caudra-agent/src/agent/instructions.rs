@@ -91,7 +91,6 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
 
 fn collect_instruction_files(
     cwd: &str,
-    home: Option<&Path>,
     xdg_config: Option<&Path>,
     loaded: &LoadedInstructions,
 ) -> Vec<(String, String)> {
@@ -127,32 +126,23 @@ fn collect_instruction_files(
         }
     }
 
-    for path in caudra_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
-        if let Some((canonical, content)) = read_instruction(&path, loaded) {
-            let label = format!("Global instructions ({})", canonical.display());
-            out.push((label, content));
-            break;
-        }
+    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
+        && let Some((canonical, content)) = read_instruction(&path, loaded)
+    {
+        let label = format!("Global instructions ({})", canonical.display());
+        out.push((label, content));
     }
 
     out
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
-    load_instruction_text_with_home(
-        cwd,
-        caudra_storage::paths::home().as_deref(),
-        caudra_storage::paths::config_dir().ok().as_deref(),
-    )
+    load_instruction_text_in(cwd, caudra_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instruction_text_with_home(
-    cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-) -> String {
+pub(crate) fn load_instruction_text_in(cwd: &str, xdg_config: Option<&Path>) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+    let files = collect_instruction_files(cwd, xdg_config, &loaded);
 
     let mut text = String::new();
     for (label, content) in files {
@@ -162,20 +152,12 @@ pub(crate) fn load_instruction_text_with_home(
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
-    load_instructions_with_home(
-        cwd,
-        caudra_storage::paths::home().as_deref(),
-        caudra_storage::paths::config_dir().ok().as_deref(),
-    )
+    load_instructions_in(cwd, caudra_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instructions_with_home(
-    cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-) -> Instructions {
+pub(crate) fn load_instructions_in(cwd: &str, xdg_config: Option<&Path>) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
+    let files = collect_instruction_files(cwd, xdg_config, &instr.loaded);
 
     for (label, content) in files {
         instr.text.push_str(&format!("\n\n{label}:\n{content}"));
@@ -297,7 +279,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
 
-        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
+        let text = &load_instructions_in(dir.path().to_str().unwrap(), None).text;
         assert!(text.contains("team rules"));
         assert!(text.contains("my preferences"));
         assert!(
@@ -311,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_in(dir.path().to_str().unwrap(), None)
                 .text
                 .contains("solo preferences")
         );
@@ -321,35 +303,30 @@ mod tests {
     fn load_instructions_empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_in(dir.path().to_str().unwrap(), None)
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_empty_when_home_has_no_global_file() {
+    fn load_instructions_empty_when_config_dir_has_no_global_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None)
+            load_instructions_in(cwd.path().to_str().unwrap(), Some(config.path()))
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_includes_global_from_home() {
+    fn load_instructions_includes_the_global_config_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let global = caudra_storage::paths::user_config_dirs(Some(home.path()), None, "AGENTS.md")
-            .pop()
-            .unwrap();
-        fs::create_dir_all(global.parent().unwrap()).unwrap();
-        fs::write(global, "global rules").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        fs::write(config.path().join("AGENTS.md"), "global rules").unwrap();
 
-        let text =
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
+        let text = load_instructions_in(cwd.path().to_str().unwrap(), Some(config.path())).text;
         assert!(text.contains("global rules"));
     }
 
@@ -364,7 +341,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
         fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
 
-        let text = load_instructions_with_home(sub.to_str().unwrap(), None, None).text;
+        let text = load_instructions_in(sub.to_str().unwrap(), None).text;
         assert!(
             text.contains("crate rules"),
             "should load instructions from cwd"
@@ -434,7 +411,7 @@ mod tests {
         let agents_path = dir.path().join("AGENTS.md");
         fs::write(&agents_path, "content").unwrap();
 
-        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None, None);
+        let instr = load_instructions_in(dir.path().to_str().unwrap(), None);
         assert!(
             instr
                 .loaded

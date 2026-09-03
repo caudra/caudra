@@ -191,17 +191,14 @@ pub fn init_logging(storage_config: &caudra_config::StorageConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::{History, ToolOutput};
-    use caudra_providers::{ContentBlock, Message, Role, TokenUsage, project_messages};
-    use caudra_storage::sessions::Session;
+    use caudra_agent::History;
+    use caudra_providers::{ContentBlock, Message, Role, project_messages};
 
     const CWD: &str = "/repo";
     const MAIN_PROMPT: &str = "main prompt";
     const MODEL_SPEC: &str = "anthropic/test-model";
     const SUBAGENT_PROMPT: &str = "subagent prompt";
-    const TITLE: &str = "Migrated session";
-
-    type LegacySession = Session<Message, TokenUsage, ToolOutput>;
+    const TITLE: &str = "Restored session";
 
     fn messages() -> Vec<Message> {
         vec![
@@ -235,16 +232,18 @@ mod tests {
     }
 
     #[test]
-    fn stored_message_payloads_expand_all_message_collections() {
+    fn load_session_restores_the_title_and_every_subagent_stream() {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
-        let messages = messages();
-        let expected = serde_json::to_value(&messages).unwrap();
-        let mut session = LegacySession::new(MODEL_SPEC, CWD);
+        let items = History::new(messages()).into_items();
+        let mut session = StoredSession::new(MODEL_SPEC, CWD);
         let id = session.id;
         session.set_title(TITLE.into());
-        session.replace_messages(messages);
-        session.set_subagent_messages("task-1".into(), vec![Message::user(SUBAGENT_PROMPT.into())]);
+        session.replace_messages(items);
+        session.set_subagent_messages(
+            "task-1".into(),
+            History::new(vec![Message::user(SUBAGENT_PROMPT.into())]).into_items(),
+        );
         session.save(&storage).unwrap();
 
         let loaded = load_session(id, &storage).unwrap();
@@ -252,7 +251,7 @@ mod tests {
         assert_eq!(loaded.title, TITLE);
         assert_eq!(
             serde_json::to_value(project_messages(loaded.messages()).unwrap()).unwrap(),
-            expected
+            serde_json::to_value(messages()).unwrap()
         );
         let subagent = project_messages(&loaded.subagent_messages()["task-1"]).unwrap();
         assert_eq!(subagent[0].user_text(), Some(SUBAGENT_PROMPT));
@@ -262,6 +261,5 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[1].parent_id == Some(pair[0].id))
         );
-        assert!(StoredSession::load(id, &storage).is_ok());
     }
 }

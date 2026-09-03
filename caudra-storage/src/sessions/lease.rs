@@ -5,7 +5,6 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::exclusive_state_lock;
 use crate::id::CaudraId;
-use crate::paths::XDG_MIGRATED_MARKER;
 use crate::{StateDir, StorageError, shared_state_lock, try_exclusive_state_lock};
 
 use super::{SESSIONS_DB_LOCK_FILE, SessionError};
@@ -29,12 +28,10 @@ pub struct SessionLease {
 
 impl SessionLease {
     pub fn acquire(state_dir: &StateDir, id: CaudraId) -> Result<Self, SessionError> {
-        reject_retired_state_dir(state_dir)?;
         let migration_lock = shared_state_lock(
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        reject_retired_state_dir(state_dir)?;
 
         let state_path = fs::canonicalize(state_dir.path()).map_err(StorageError::from)?;
         let process_key = (state_path, id);
@@ -165,20 +162,6 @@ fn cleanup_inactive_leases(
         }
     }
     Ok(())
-}
-
-fn reject_retired_state_dir(state_dir: &StateDir) -> Result<(), SessionError> {
-    let marker = state_dir.path().join(XDG_MIGRATED_MARKER);
-    if !marker.is_file() {
-        return Ok(());
-    }
-    let target = fs::read_to_string(&marker).unwrap_or_else(|_| "the XDG state directory".into());
-    Err(StorageError::Io(std::io::Error::other(format!(
-        "state directory {} was retired; use {}",
-        state_dir.path().display(),
-        target.trim()
-    )))
-    .into())
 }
 
 #[cfg(test)]

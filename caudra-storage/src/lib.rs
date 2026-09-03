@@ -347,22 +347,7 @@ fn validate_lock_path(path: &Path) -> Result<(), StorageError> {
 }
 
 pub fn lock_session_artifacts(state_dir: &StateDir) -> Result<SessionArtifactLock, StorageError> {
-    let marker = state_dir.path().join(paths::XDG_MIGRATED_MARKER);
-    if marker.is_file() {
-        return Err(StorageError::Io(io::Error::other(format!(
-            "state directory {} was retired",
-            state_dir.path().display()
-        ))));
-    }
     let file = exclusive_state_lock(&state_dir.path().join(SESSION_ARTIFACT_LOCK_FILE), 0o600)?;
-    // A cutover may have completed while this caller waited for an in-flight
-    // artifact operation. Never publish into the retained rollback tree.
-    if marker.is_file() {
-        return Err(StorageError::Io(io::Error::other(format!(
-            "state directory {} was retired",
-            state_dir.path().display()
-        ))));
-    }
     Ok(SessionArtifactLock { _file: file })
 }
 

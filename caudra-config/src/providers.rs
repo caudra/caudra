@@ -25,10 +25,6 @@ pub enum Tier {
     #[default]
     Medium,
     Strong,
-    /// Accepted only so existing provider files continue to load. Compaction
-    /// model selection now lives in the global model-role configuration.
-    #[serde(rename = "compaction")]
-    LegacyCompaction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +408,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const UNKNOWN_TIER: &str = "unknown variant `compaction`";
     const DECLARED_LEVELS_TOML: &str = r#"
 [local]
 protocol = "openai"
@@ -509,7 +506,6 @@ tier = "mediums"
     #[test_case("weak", Tier::Weak ; "weak")]
     #[test_case("medium", Tier::Medium ; "medium")]
     #[test_case("strong", Tier::Strong ; "strong")]
-    #[test_case("compaction", Tier::LegacyCompaction ; "legacy_compaction")]
     fn model_def_tier_roundtrip(input: &str, expected: Tier) {
         let toml = format!(
             r#"id = "x"
@@ -518,6 +514,12 @@ tier = "{input}"
         );
         let m: ModelDef = toml::from_str(&toml).unwrap();
         assert_eq!(m.tier, expected);
+    }
+
+    #[test]
+    fn model_def_rejects_the_removed_compaction_tier() {
+        let error = toml::from_str::<ModelDef>("id = \"x\"\ntier = \"compaction\"\n").unwrap_err();
+        assert!(error.to_string().contains(UNKNOWN_TIER), "{error}");
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]

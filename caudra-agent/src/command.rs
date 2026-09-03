@@ -95,7 +95,7 @@ fn discover_commands_inner(
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in caudra_storage::paths::user_config_dirs(home, xdg_config, "commands") {
+    if let Some(dir) = caudra_storage::paths::user_config_dir(xdg_config, "commands") {
         scan_command_dir(&dir, CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
@@ -237,23 +237,26 @@ mod tests {
         )
         .unwrap();
 
-        let global = TempDir::new().unwrap();
+        let config = TempDir::new().unwrap();
         let global_cmd_dir =
-            caudra_storage::paths::user_config_dirs(Some(global.path()), None, "commands")
-                .pop()
-                .unwrap();
+            caudra_storage::paths::user_config_dir(Some(config.path()), "commands").unwrap();
         fs::create_dir_all(&global_cmd_dir).unwrap();
-        fs::write(
-            global_cmd_dir.join("overlap.md"),
-            "---\ndescription: Global version\n---\nGlobal content",
-        )
-        .unwrap();
+        for name in ["overlap.md", "global-only.md"] {
+            fs::write(
+                global_cmd_dir.join(name),
+                "---\ndescription: Global version\n---\nGlobal content",
+            )
+            .unwrap();
+        }
 
-        let commands = discover_commands_inner(project.path(), Some(global.path()), None);
+        let commands = discover_commands_inner(project.path(), None, Some(config.path()));
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
         assert_eq!(overlap[0].scope, CommandScope::Project);
+
+        let global_only = commands.iter().find(|c| c.name == "global-only").unwrap();
+        assert_eq!(global_only.scope, CommandScope::User);
     }
 
     #[test]
