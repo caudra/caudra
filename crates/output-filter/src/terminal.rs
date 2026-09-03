@@ -174,6 +174,23 @@ impl RowRenderer {
         self.reset_row();
     }
 
+    /// Appends the row under construction without consuming it.
+    ///
+    /// A live view has to show a bar while it is still redrawing, which
+    /// [`RowRenderer::finish`] cannot do: it ends the row, so the next frame is
+    /// appended beside the previous one instead of overwriting it. Nothing is
+    /// counted here, because no row has been emitted.
+    ///
+    /// Bytes held for an incomplete sequence are not applied. A trailing `\r`
+    /// means the writer is about to overwrite this row and has not yet, so the
+    /// row a reader should see is still the one already drawn.
+    pub fn row(&self, out: &mut String) {
+        if self.canvas.is_empty() && !self.row_dirty {
+            return;
+        }
+        self.render_row(out);
+    }
+
     fn carriage_return(&mut self) {
         if !self.canvas.is_empty() {
             self.row_redraws = self.row_redraws.saturating_add(1);
@@ -224,20 +241,23 @@ impl RowRenderer {
 
     fn flush_row(&mut self, out: &mut String) {
         self.redraws = self.redraws.saturating_add(self.row_redraws);
+        self.render_row(out);
+    }
+
+    /// Writes the row as a terminal would show it, leaving the renderer alone so
+    /// the same row can be shown again before it ends.
+    fn render_row(&self, out: &mut String) {
+        let mut end = self.canvas.len();
         if self.row_dirty {
             // Padding a shorter frame over a longer one is an artifact of
             // redrawing. Rows never redrawn are reproduced exactly, trailing
             // blanks included, because there the blanks are the output.
-            while self.canvas.last() == Some(&' ') {
-                self.canvas.pop();
+            while end > 0 && self.canvas[end - 1] == ' ' {
+                end -= 1;
             }
         }
-        // Backward cursor motion can anchor a later sequence to an earlier
-        // column, so order by column rather than by arrival. The sort is stable,
-        // which keeps sequences at one column in the order they were written.
-        self.marks.sort_by_key(|(column, _)| *column);
         let mut mark = 0;
-        for (column, character) in self.canvas.iter().enumerate() {
+        for (column, character) in self.canvas[..end].iter().enumerate() {
             while mark < self.marks.len() && self.marks[mark].0 <= column {
                 out.push_str(&self.marks[mark].1);
                 mark += 1;
@@ -254,7 +274,15 @@ impl RowRenderer {
             return;
         }
         self.mark_bytes += raw.len();
-        self.marks.push((self.column, raw));
+        // Backward cursor motion can anchor a later sequence to an earlier
+        // column, so marks are held in column order rather than arrival order.
+        // Ordering on insert rather than at flush is what lets a row be
+        // rendered through `&self`; inserting after every equal column keeps
+        // arrival order within one column, exactly as a stable sort did.
+        let at = self
+            .marks
+            .partition_point(|(column, _)| *column <= self.column);
+        self.marks.insert(at, (self.column, raw));
     }
 
     /// Applies one complete escape sequence.

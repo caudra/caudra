@@ -30,3 +30,7 @@ pub use workcell_mcp_shell::{PreparedShell, ShellToolGroup};
 pub use workcell_mcp_web as web;
 #[cfg(feature = "web")]
 pub use workcell_mcp_web::{PreparedWebfetch, PreparedWebsearch, WebToolGroup};
+// Progress chunks are byte-exact by contract, so a host that displays a redraw
+// stream rather than replaying it has to render one itself.
+#[cfg(feature = "shell")]
+pub use workcell_output_filter as output_filter;

@@ -27,5 +27,6 @@ pub use error::FilesystemError;
 pub use group::{FileToolGroup, PreparedFilePatch};
 #[cfg(feature = "index")]
 pub use index::*;
+pub use model_text::ModelText;
 pub use types::*;
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

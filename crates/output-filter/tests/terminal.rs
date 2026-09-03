@@ -403,3 +403,81 @@ fn finishing_twice_neither_repeats_a_row_nor_recounts_it() {
     assert_eq!(after_first.0, "step 2/2");
     assert_eq!(after_first.1, 1);
 }
+
+// -- The row under construction -------------------------------------------
+
+#[test]
+fn a_bar_that_has_drawn_no_newline_is_still_visible() {
+    // What a live view needs and `push` alone cannot give: a bar emits no
+    // newline until it ends, so waiting for a completed row shows nothing at
+    // all for the length of the run.
+    let mut renderer = RowRenderer::new();
+    let mut completed = String::new();
+    renderer.push("  0% |          | 0/200", &mut completed);
+    renderer.push("\r 50% |#####     | 100/200", &mut completed);
+    assert!(completed.is_empty(), "no row completed: {completed}");
+
+    let mut row = String::new();
+    renderer.row(&mut row);
+    assert_eq!(row, " 50% |#####     | 100/200");
+}
+
+#[test]
+fn showing_the_row_neither_ends_it_nor_counts_its_redraws() {
+    let mut renderer = RowRenderer::new();
+    let mut completed = String::new();
+    renderer.push("working 1/3", &mut completed);
+
+    let mut first = String::new();
+    renderer.row(&mut first);
+    let mut second = String::new();
+    renderer.row(&mut second);
+    assert_eq!(first, second);
+    assert_eq!(renderer.redraws(), 0);
+
+    // The row is still open, so the next frame overwrites it rather than
+    // landing beside it.
+    renderer.push("\rworking 3/3\n", &mut completed);
+    assert_eq!(completed, "working 3/3\n");
+    assert_eq!(renderer.redraws(), 1);
+}
+
+#[test]
+fn the_row_shown_is_the_row_that_is_later_emitted() {
+    for source in [
+        "\rdone 9/9",
+        "a\u{8}b",
+        "wide\u{1b}[2K\rnarrow",
+        "\u{1b}[32mok",
+    ] {
+        let mut renderer = RowRenderer::new();
+        let mut completed = String::new();
+        renderer.push(source, &mut completed);
+        let mut shown = String::new();
+        renderer.row(&mut shown);
+        renderer.finish(&mut completed);
+        assert_eq!(shown, completed, "{source:?}");
+    }
+}
+
+#[test]
+fn a_row_that_has_not_started_shows_nothing() {
+    let mut renderer = RowRenderer::new();
+    let mut completed = String::new();
+    renderer.push("first\n", &mut completed);
+    let mut row = String::new();
+    renderer.row(&mut row);
+    assert!(row.is_empty(), "row already emitted: {row}");
+}
+
+#[test]
+fn an_incomplete_sequence_leaves_the_drawn_row_standing() {
+    // A trailing return is not yet classifiable, and until it is, the row a
+    // reader should see is the one the writer has already drawn.
+    let mut renderer = RowRenderer::new();
+    let mut completed = String::new();
+    renderer.push("downloading 40%\r", &mut completed);
+    let mut row = String::new();
+    renderer.row(&mut row);
+    assert_eq!(row, "downloading 40%");
+}

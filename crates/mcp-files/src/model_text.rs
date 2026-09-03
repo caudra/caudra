@@ -18,7 +18,11 @@ use crate::types::{
 };
 
 /// Renders the content block for a tool result.
-pub(crate) trait ModelText {
+///
+/// Public because a native host renders the same content block the MCP adapter
+/// does. A host that re-derived it would carry the payload twice for exactly the
+/// reason above, and would have to restate every truncation notice.
+pub trait ModelText {
     fn model_text(&self) -> Cow<'_, str>;
 }
 

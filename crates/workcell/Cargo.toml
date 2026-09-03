@@ -12,7 +12,7 @@ default = []
 files = ["dep:workcell-mcp-files"]
 files-index = ["files", "workcell-mcp-files/index"]
 web = ["dep:workcell-mcp-web"]
-shell = ["dep:workcell-mcp-shell"]
+shell = ["dep:workcell-mcp-shell", "dep:workcell-output-filter"]
 code = ["dep:workcell-mcp-code"]
 code-bundled = ["code", "workcell-mcp-code/bundled-worker"]
 environment = ["dep:workcell-environment"]
@@ -23,6 +23,7 @@ workcell-mcp-code = { workspace = true, optional = true }
 workcell-mcp-files = { workspace = true, optional = true }
 workcell-mcp-shell = { workspace = true, optional = true }
 workcell-mcp-web = { workspace = true, optional = true }
+workcell-output-filter = { path = "../output-filter", optional = true }
 workcell-tool-contract.workspace = true
 
 [lints]

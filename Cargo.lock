@@ -4653,6 +4653,7 @@ dependencies = [
  "workcell-mcp-files",
  "workcell-mcp-shell",
  "workcell-mcp-web",
+ "workcell-output-filter",
  "workcell-tool-contract",
 ]
 

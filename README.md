@@ -476,13 +476,15 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
 | `files-index` | `files` plus `index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
-| `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis and progress streaming |
+| `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
 | `environment` | `ExecutionEnvironment` inspection |
 
 `ToolSpec` carries the protocol-neutral contract: name, description, input and output schemas,
 annotations, presentation profile, and a stable contract identity. A host registers those directly.
+`files::ModelText` renders the content block a result carries, including the notice a truncated
+search reports, so a host presents the same text the MCP adapter does instead of restating it.
 Enabling a group's `mcp` feature additionally projects the same spec into an MCP `Tool`, which is how
 the standalone server builds its catalog; without it, `rmcp` is not in the dependency graph at all.
 
@@ -494,12 +496,17 @@ policy, then commit with the matching `execute_*` method.
 
 A shell execution returns both renderings on one value. `ShellExecution::model_text` is the filtered,
 model-facing form and `ShellExecution::output` is the unfiltered capture with the complete byte
-accounting. `ShellExecution::filter` identifies the applied rule and the unfiltered and filtered
-rendering sizes when filtering reduced the result, so hosts do not need to parse presentation text.
-A host that keeps a transcript or builds its own presentation never has to disable filtering to
-obtain the real bytes. Live output is independent of both: chunks delivered to a
-`ShellProgressSink` are published while the process runs, before an exit code exists, and are never
-filtered. Filtering therefore changes only what a model reads, never what a host can observe.
+accounting. `ShellExecution::filter` names every reduction that ran, in order, along with the
+unfiltered and filtered rendering sizes, so hosts do not need to parse presentation text. A host that
+keeps a transcript or builds its own presentation never has to disable filtering to obtain the real
+bytes. Filtering therefore changes only what a model reads, never what a host can observe.
+
+Live output is independent of both: chunks delivered to a `ShellProgressSink` are published while the
+process runs, before an exit code exists, and are byte-exact. A bar that redraws is a control stream
+rather than lines, so a host that displays those chunks renders them itself with
+`output_filter::RowRenderer`: `push` emits the rows a terminal would have completed, `row` shows the
+one still being drawn, and `redraws` reports how many frames were absorbed. The capture already
+arrives rendered, and `ShellOutput::{stdout,stderr}_redraws_collapsed` say by how much.
 
 ### Confinement is a host decision
 
