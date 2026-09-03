@@ -434,6 +434,7 @@ impl MessagesPanel {
         self.cache.clear();
         self.auto_open = None;
         self.disclosure.clear();
+        self.shell_raw.clear();
         self.batch_folds.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();

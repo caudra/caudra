@@ -4328,6 +4328,30 @@ fn hovering_a_batch_child_marks_that_row() {
     );
 }
 
+const EXPECT_FILTERED: &str = "a card the reader never switched shows the filtered view";
+
+/// The raw/filtered switch names a tool id from the session that is going
+/// away. The panel outlives the session, so carrying the choice over opens
+/// whatever inherits the id in a view nobody asked for.
+#[test]
+fn loading_a_session_forgets_the_raw_view() {
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
+    panel.tool_done(shell_done("t1", true));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.toggle_expansion_at(shell_toggle_row(&panel), area));
+    render(&mut panel, 80, 24);
+    assert!(seg_text(&panel, "t1").contains("raw_8"));
+
+    panel.load_messages(Vec::new());
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
+    panel.tool_done(shell_done("t1", true));
+    render(&mut panel, 80, 24);
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("model_8"), "{EXPECT_FILTERED}");
+    assert!(!text.contains("raw_8"), "{EXPECT_FILTERED}");
+}
+
 /// A fold names a tool id from the session that is going away, so carrying it
 /// into the next one would fold whatever inherits the id.
 #[test]
