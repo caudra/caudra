@@ -472,8 +472,9 @@ impl ToolLineBuilder {
         max_output_lines: usize,
         indicator: Indicator,
         views: BatchViews,
+        budgets: ToolOutputLines,
     ) -> Self {
-        let limits = RenderLimits::new(expanded, max_output_lines, views);
+        let limits = RenderLimits::new(expanded, max_output_lines, views, budgets);
         Self {
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -954,6 +955,7 @@ pub fn build_tool_lines(
         rctx.tool_output_lines.get(tool_name),
         status.into(),
         rctx.views_for(msg.role.tool_id()),
+        *rctx.tool_output_lines,
     );
     b.apply_output_format(msg.tool_output.as_deref());
     if rctx.compact {
@@ -1097,6 +1099,8 @@ pub fn build_instructions_lines(
         code_view::instruction_limit(expanded),
         Indicator::Success,
         BatchViews::default(),
+        // A loaded instruction card has no children to look themselves up.
+        ToolOutputLines::default(),
     );
     b.push_header("load", header, annotation.as_deref(), None, None);
     b.prepend_indicator(Instant::now());
@@ -1997,6 +2001,7 @@ mod tests {
             SectionFlags::default(),
             TOL.get(tool),
             BatchViews::default(),
+            TOL,
         );
         let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
@@ -2008,6 +2013,7 @@ mod tests {
             SectionFlags::default(),
             TOL.get("bash"),
             BatchViews::default(),
+            TOL,
         );
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
@@ -2020,6 +2026,7 @@ mod tests {
             SectionFlags::default(),
             TOL.get("bash"),
             BatchViews::default(),
+            TOL,
         );
         let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);

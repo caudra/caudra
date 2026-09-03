@@ -116,17 +116,17 @@ It is off by default, so a normal run reaches only the model provider you config
 
 How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
 
-| Field | Default |
-|-------|---------|
-| `bash` | 5 |
-| `code_execution` | 5 |
-| `task` | 5 |
-| `index` | 3 |
-| `grep` | 3 |
-| `read` | 3 |
-| `write` | 7 |
-| `web` | 3 |
-| `other` | 3 |
+| Field | Default | Tools |
+|-------|---------|-------|
+| `bash` | 5 | `shell` |
+| `code_execution` | 5 | `code_execution` |
+| `task` | 5 | `task` |
+| `index` | 3 | `index` |
+| `grep` | 3 | `file_grep`, `file_glob` |
+| `read` | 3 | `file_read` |
+| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `memory` |
+| `web` | 3 | `webfetch`, `websearch` |
+| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output_grep`, `tool_output_read`, `view_image` |
 
 ### `agent`
 

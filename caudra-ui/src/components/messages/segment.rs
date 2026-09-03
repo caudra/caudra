@@ -3,7 +3,7 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::{BatchViews, ChildView, RowTarget, SectionFlags};
+use super::super::code_view::{BatchViews, RowTarget, SectionFlags};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use ratatui::text::{Line, Span};
@@ -647,6 +647,7 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::code_view::ChildView;
     use super::*;
     use test_case::test_case;
 
@@ -845,11 +846,7 @@ mod tests {
             range: (1, 3),
             input: None,
             output: None,
-            limits: RenderLimits {
-                script: 0,
-                output: 0,
-                views,
-            },
+            limits: RenderLimits::new(SectionFlags::default(), 0, views, Default::default()),
         };
         let seg = Segment {
             highlight_key: HighlightKey::from_request(Some(&request(BatchViews::default()))),

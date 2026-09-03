@@ -13,6 +13,7 @@ use caudra_agent::{
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
     ToolInput, ToolOutput,
 };
+use caudra_config::ToolOutputLines;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -453,7 +454,7 @@ fn render_batch(
         if view == ChildView::Folded {
             continue;
         }
-        let (body, truncated) = child_body(entry, highlight, &limits.for_child(view));
+        let (body, truncated) = child_body(entry, highlight, &limits.for_child(view, &entry.tool));
         // A body only answers to a click when there is something behind it to
         // show, or something already shown to put back.
         let target =
@@ -856,10 +857,18 @@ pub struct RenderLimits {
     pub script: usize,
     pub output: usize,
     pub views: BatchViews,
+    /// What a batch child looks itself up in. A card without children never
+    /// reads it.
+    budgets: ToolOutputLines,
 }
 
 impl RenderLimits {
-    pub fn new(expanded: SectionFlags, output_limit: usize, views: BatchViews) -> Self {
+    pub fn new(
+        expanded: SectionFlags,
+        output_limit: usize,
+        views: BatchViews,
+        budgets: ToolOutputLines,
+    ) -> Self {
         Self {
             script: if expanded.script {
                 usize::MAX
@@ -872,6 +881,7 @@ impl RenderLimits {
                 output_limit
             },
             views,
+            budgets,
         }
     }
 
@@ -879,19 +889,21 @@ impl RenderLimits {
         self.output == usize::MAX
     }
 
-    /// A child renders on its own terms. The views name this card's children,
-    /// so carrying them inward would fold a nested batch by the wrong roster.
-    fn for_child(&self, view: ChildView) -> Self {
-        match view {
-            ChildView::Expanded => Self {
-                script: usize::MAX,
-                output: usize::MAX,
-                views: BatchViews::default(),
-            },
-            _ => Self {
-                views: BatchViews::default(),
-                ..self.clone()
-            },
+    /// A child renders on its own terms: its own tool's budget, unless the
+    /// reader named it or opened the whole card. The views name this card's
+    /// children, so carrying them inward would fold a nested batch by the
+    /// wrong roster.
+    fn for_child(&self, view: ChildView, tool: &str) -> Self {
+        let budget = if view == ChildView::Expanded || self.is_output_expanded() {
+            usize::MAX
+        } else {
+            self.budgets.get(tool)
+        };
+        Self {
+            script: budget,
+            output: budget,
+            views: BatchViews::default(),
+            budgets: self.budgets,
         }
     }
 }
@@ -1543,6 +1555,9 @@ mod tests {
     const EXPECT_ROW: &str = "the summary row has to name its child";
     const CHILD_BUDGET: usize = 2;
     const SIBLING_KEPT: usize = 2;
+    /// What `batch` itself resolves to, which is what children used to inherit.
+    const PARENT_BUDGET: usize = 3;
+    const ROOMY: usize = 32;
 
     fn batch_entry(tool: &str, body_lines: usize) -> BatchToolEntry {
         let text = (0..body_lines)
@@ -1564,21 +1579,29 @@ mod tests {
         }
     }
 
+    fn budgets(read: usize, grep: usize) -> ToolOutputLines {
+        ToolOutputLines {
+            read,
+            grep,
+            ..ToolOutputLines::DEFAULT
+        }
+    }
+
     fn batch_of(
         sizes: [usize; 2],
-        budget: usize,
+        budgets: ToolOutputLines,
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
         let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
         render_batch(
             &entries,
             false,
-            &RenderLimits::new(SectionFlags::default(), budget, views),
+            &RenderLimits::new(SectionFlags::default(), PARENT_BUDGET, views, budgets),
         )
     }
 
     fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
-        batch_of([2, 3], usize::MAX, views)
+        batch_of([2, 3], budgets(ROOMY, ROOMY), views)
     }
 
     fn body_count(lines: &[Line<'static>]) -> usize {
@@ -1669,7 +1692,7 @@ mod tests {
     /// the click, so the affordance was unreachable by any input.
     #[test]
     fn a_truncated_child_body_takes_a_click() {
-        let (lines, rows) = batch_of([1, 6], CHILD_BUDGET, BatchViews::default());
+        let (lines, rows) = batch_of([1, 6], budgets(ROOMY, CHILD_BUDGET), BatchViews::default());
         assert!(
             lines
                 .iter()
@@ -1693,7 +1716,7 @@ mod tests {
         let whole = 6;
         let (lines, rows) = batch_of(
             [5, whole],
-            CHILD_BUDGET,
+            budgets(SIBLING_KEPT, CHILD_BUDGET),
             BatchViews::new([(1, ChildView::Expanded)]),
         );
         assert_eq!(
@@ -1731,12 +1754,50 @@ mod tests {
     fn views_do_not_reach_a_nested_batch() {
         let limits = RenderLimits::new(
             SectionFlags::default(),
-            usize::MAX,
+            PARENT_BUDGET,
             BatchViews::new([(0, ChildView::Folded)]),
+            ToolOutputLines::DEFAULT,
         );
         assert_eq!(
-            limits.for_child(ChildView::Budgeted).views,
+            limits.for_child(ChildView::Budgeted, "read").views,
             BatchViews::default()
         );
+    }
+
+    /// Children used to inherit whatever `batch` resolved to, so a grep and a
+    /// read in one card were capped the same however they were configured.
+    #[test]
+    fn each_child_is_capped_by_its_own_tool() {
+        // Deliberately not summing to twice the parent budget, which is what
+        // inheriting it would have produced.
+        let (read_budget, grep_budget) = (1, 4);
+        let (lines, _) = batch_of(
+            [6, 6],
+            budgets(read_budget, grep_budget),
+            BatchViews::default(),
+        );
+        assert_eq!(
+            body_count(&lines),
+            read_budget + grep_budget,
+            "each child spends its own tool's budget, not the parent's"
+        );
+    }
+
+    /// Opening the card is a statement about everything in it.
+    #[test]
+    fn an_opened_card_opens_every_child() {
+        let whole = 6;
+        let limits = RenderLimits::new(
+            SectionFlags {
+                output: true,
+                ..SectionFlags::default()
+            },
+            PARENT_BUDGET,
+            BatchViews::default(),
+            budgets(1, 1),
+        );
+        let entries = [batch_entry("read", whole), batch_entry("grep", whole)];
+        let (lines, _) = render_batch(&entries, false, &limits);
+        assert_eq!(body_count(&lines), whole * 2);
     }
 }

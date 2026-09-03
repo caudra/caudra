@@ -294,10 +294,21 @@ fn write_tool_output_section(out: &mut String) {
          All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
     )
     .unwrap();
-    writeln!(out, "| Field | Default |").unwrap();
-    writeln!(out, "|-------|---------|").unwrap();
+    writeln!(out, "| Field | Default | Tools |").unwrap();
+    writeln!(out, "|-------|---------|-------|").unwrap();
     for (name, default) in ToolOutputLines::FIELD_DEFAULTS {
-        writeln!(out, "| `{name}` | {default} |",).unwrap();
+        let tools = ToolOutputLines::FIELD_TOOLS
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, tools)| {
+                tools
+                    .iter()
+                    .map(|tool| format!("`{tool}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        writeln!(out, "| `{name}` | {default} | {tools} |").unwrap();
     }
     writeln!(out).unwrap();
 }

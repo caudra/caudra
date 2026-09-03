@@ -1252,6 +1252,36 @@ impl ToolOutputLines {
         ("other", Self::DEFAULT.other),
     ];
 
+    /// Which tools each budget covers, named as they are registered. The docs
+    /// read it and the tests hold `get` to it, so a renamed tool cannot go on
+    /// quietly falling through to `other` the way `file_grep` once did.
+    pub const FIELD_TOOLS: &[(&'static str, &'static [&'static str])] = &[
+        ("bash", &["shell"]),
+        ("code_execution", &["code_execution"]),
+        ("task", &["task"]),
+        ("index", &["index"]),
+        ("grep", &["file_grep", "file_glob"]),
+        ("read", &["file_read"]),
+        (
+            "write",
+            &["file_write", "file_edit", "file_apply_patch", "memory"],
+        ),
+        ("web", &["webfetch", "websearch"]),
+        (
+            "other",
+            &[
+                "batch",
+                "execution_environment",
+                "question",
+                "skill",
+                "todo_write",
+                "tool_output_grep",
+                "tool_output_read",
+                "view_image",
+            ],
+        ),
+    ];
+
     fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
         let d = Self::DEFAULT;
         let f = f.unwrap_or_default();
@@ -4432,53 +4462,34 @@ mod tests {
         other: 9,
     };
 
-    /// The registered name of every first-party tool, against the budget it
-    /// has to land on. `file_grep` and friends were renamed once already and
-    /// went on reading `other` for it.
-    const FIRST_PARTY_BUDGETS: &[(&str, usize)] = &[
-        ("batch", 9),
-        ("code_execution", 2),
-        ("execution_environment", 9),
-        ("file_apply_patch", 7),
-        ("file_edit", 7),
-        ("file_glob", 5),
-        ("file_grep", 5),
-        ("file_read", 6),
-        ("file_write", 7),
-        ("index", 4),
-        ("memory", 7),
-        ("question", 9),
-        ("shell", 1),
-        ("skill", 9),
-        ("task", 3),
-        ("todo_write", 9),
-        ("tool_output_grep", 9),
-        ("tool_output_read", 9),
-        ("view_image", 9),
-        ("webfetch", 8),
-        ("websearch", 8),
-    ];
-
     #[test]
-    fn every_first_party_tool_resolves_to_its_own_budget() {
-        for (name, want) in FIRST_PARTY_BUDGETS {
-            assert_eq!(DISTINCT_BUDGETS.get(name), *want, "{BUDGET_DRIFT}: {name}");
+    fn every_tool_resolves_to_the_budget_it_is_documented_under() {
+        for (field, tools) in ToolOutputLines::FIELD_TOOLS {
+            let (_, want) = DISTINCT_BUDGETS
+                .fields()
+                .into_iter()
+                .find(|(name, _)| name == field)
+                .expect("every documented budget is a real field");
+            for tool in *tools {
+                assert_eq!(DISTINCT_BUDGETS.get(tool), want, "{BUDGET_DRIFT}: {tool}");
+            }
         }
     }
 
     /// Adding or renaming a tool has to be a decision about its budget, not a
     /// silent fall-through nobody notices.
     #[test]
-    fn every_registered_tool_is_pinned_to_a_budget() {
+    fn every_registered_tool_is_documented_under_a_budget() {
         for name in WORKCELL_NATIVE_TOOL_NAMES
             .iter()
             .chain(CAUDRA_NATIVE_TOOL_NAMES)
         {
             assert!(
-                FIRST_PARTY_BUDGETS.iter().any(|(pinned, _)| pinned == name),
-                "{BUDGET_DRIFT}: {name} is not pinned"
+                ToolOutputLines::FIELD_TOOLS
+                    .iter()
+                    .any(|(_, tools)| tools.contains(name)),
+                "{BUDGET_DRIFT}: {name} is not listed"
             );
         }
     }
-
 }
