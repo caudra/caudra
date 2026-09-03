@@ -1409,6 +1409,519 @@ fn extract_partial_last_line_truncated() {
     assert_eq!(text.lines().last().unwrap(), "ABCD");
 }
 
+fn extract_entire_document(panel: &mut MessagesPanel) -> String {
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 40;
+
+    render(panel, WIDTH, HEIGHT);
+    let area = Rect::new(0, 0, WIDTH, HEIGHT);
+    let selection = make_sel(
+        area,
+        (0, 0),
+        (
+            u32::from(panel.last_total_lines.saturating_sub(1)),
+            WIDTH - 1,
+        ),
+    );
+    panel.extract_selection_text(&selection, area)
+}
+
+#[test]
+fn selection_across_messages_becomes_a_markdown_document() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "Please use **care**.".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "# Result\n\nUsed `care`.".into(),
+    ));
+
+    assert_eq!(
+        extract_entire_document(&mut panel),
+        "## User\n\nPlease use **care**.\n\n---\n\n## Assistant\n\n# Result\n\nUsed `care`."
+    );
+}
+
+#[test]
+fn open_thinking_copies_its_visible_markdown_body() {
+    const BODY: &str = "Check **both** branches.";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "Investigate".into()));
+    let mut thought = DisplayMessage::new(
+        DisplayRole::Thinking,
+        format!("**Tracing selection**\n\n{BODY}"),
+    );
+    thought.reasoning_open = Some(true);
+    panel.push(thought);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(
+        copied.contains("## Thinking: Tracing selection"),
+        "{copied}"
+    );
+    assert!(copied.contains("_View: open_"), "{copied}");
+    assert!(copied.contains(BODY), "{copied}");
+    assert!(!copied.contains("**Tracing selection**"), "{copied}");
+}
+
+#[test]
+fn collapsed_thinking_copies_its_summary_without_hidden_body() {
+    const HIDDEN: &str = "hidden reasoning must stay hidden";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "Investigate".into()));
+    let mut thought = DisplayMessage::new(
+        DisplayRole::Thinking,
+        format!("**Tracing selection**\n\n{HIDDEN}"),
+    );
+    thought.reasoning_open = Some(false);
+    panel.push(thought);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(
+        copied.contains("## Thinking: Tracing selection"),
+        "{copied}"
+    );
+    assert!(copied.contains("_View: collapsed_"), "{copied}");
+    assert!(!copied.contains(HIDDEN), "{copied}");
+}
+
+#[test]
+fn settled_thinking_does_not_borrow_the_streaming_duration() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "Investigate".into()));
+    let mut settled = DisplayMessage::new(DisplayRole::Thinking, "**Old trace**".into());
+    settled.reasoning_open = Some(false);
+    panel.push(settled);
+    panel.thinking_started = Some(Instant::now() - Duration::from_millis(100));
+    panel.streaming_thinking.set_buffer("**Live trace**");
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert_eq!(copied.matches("Duration:").count(), 1, "{copied}");
+    assert!(!copied.contains("ms"), "{copied}");
+}
+
+#[test]
+fn selected_open_thinking_header_still_marks_a_card_boundary() {
+    const HIDDEN: &str = "body outside the selection";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "Investigate".into()));
+    let mut thought = DisplayMessage::new(
+        DisplayRole::Thinking,
+        format!("**Tracing selection**\n\n{HIDDEN}"),
+    );
+    thought.reasoning_open = Some(true);
+    panel.push(thought);
+    render(&mut panel, 80, 20);
+    let area = Rect::new(0, 0, 80, 20);
+    let heights = panel.segment_heights();
+    let thinking_header =
+        u32::from(heights[0] + panel.cache.segments()[1].chrome(79).content_start());
+    let selection = make_sel(area, (0, 0), (thinking_header, 79));
+
+    let copied = panel.extract_selection_text(&selection, area);
+
+    assert!(copied.contains("## User"), "{copied}");
+    assert!(
+        copied.contains("## Thinking: Tracing selection"),
+        "{copied}"
+    );
+    assert!(!copied.contains(HIDDEN), "{copied}");
+}
+
+fn panel_with_read_tool(view: ViewMode) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", FILE_READ_TOOL_NAME)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: FILE_READ_TOOL_NAME.into(),
+        output: ToolOutput::Plain("hidden tool output".into()),
+        ..done("t1")
+    });
+    panel.set_view(view);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+    panel
+}
+
+#[test]
+fn collapsed_tool_copies_only_its_visible_header() {
+    let mut panel = panel_with_read_tool(ViewMode::Compact);
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Tool: `file_read`"), "{copied}");
+    assert!(
+        copied.contains("Status: success | View: collapsed"),
+        "{copied}"
+    );
+    assert!(!copied.contains("hidden tool output"), "{copied}");
+}
+
+#[test]
+fn open_tool_copies_its_visible_body() {
+    let mut panel = panel_with_read_tool(ViewMode::Expanded);
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Tool: `file_read`"), "{copied}");
+    assert!(copied.contains("Status: success | View: open"), "{copied}");
+    assert!(copied.contains("hidden tool output"), "{copied}");
+}
+
+#[test]
+fn compact_instruction_copy_keeps_its_semantic_label() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: read_code_with_instructions(instruction_blocks()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    });
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Instructions: `read`"), "{copied}");
+}
+
+#[test]
+fn plan_selection_keeps_body_markdown_and_drops_visual_footer() {
+    const PLAN: &str = "# Plan\n\nKeep **source Markdown**.";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::plan(PLAN.into(), "/tmp/plan.md".into()));
+    render(&mut panel, 80, 20);
+    let area = Rect::new(0, 0, 80, 20);
+    let rows = panel.segment_heights()[0];
+    let selection = make_sel(area, (0, 0), (u32::from(rows - 1), 79));
+
+    assert_eq!(panel.extract_selection_text(&selection, area), PLAN);
+}
+
+#[test]
+fn streaming_assistant_participates_in_cross_message_copy() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
+    panel
+        .streaming_text
+        .set_buffer("# Live\n\nStill **writing**.");
+
+    assert_eq!(
+        extract_entire_document(&mut panel),
+        "## User\n\nQuestion\n\n---\n\n## Assistant\n\n# Live\n\nStill **writing**."
+    );
+}
+
+#[test]
+fn collapsed_streaming_thinking_does_not_leak_its_body() {
+    const HIDDEN: &str = "live hidden reasoning";
+
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
+    panel
+        .streaming_thinking
+        .set_buffer(&format!("**Live trace**\n\n{HIDDEN}"));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Thinking: Live trace"), "{copied}");
+    assert!(copied.contains("View: collapsed"), "{copied}");
+    assert!(!copied.contains(HIDDEN), "{copied}");
+}
+
+#[test]
+fn collapsed_streaming_thinking_uses_the_displayed_buffer_title() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
+    panel.thinking_delta("**Buffered trace**\n\nnot yet revealed");
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Thinking: Buffered trace"), "{copied}");
+    assert!(!copied.contains("not yet revealed"), "{copied}");
+}
+
+#[test]
+fn open_streaming_thinking_copies_raw_visible_markdown() {
+    const BODY: &str = "Still **checking**.";
+
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
+    panel.streaming_reasoning_open = Some(true);
+    panel
+        .streaming_thinking
+        .set_buffer(&format!("**Live trace**\n\n{BODY}"));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Thinking: Live trace"), "{copied}");
+    assert!(copied.contains("View: open"), "{copied}");
+    assert!(copied.contains(BODY), "{copied}");
+    assert!(!copied.contains("**Live trace**"), "{copied}");
+}
+
+#[test]
+fn title_only_open_streaming_thinking_still_copies_its_header() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.streaming_reasoning_open = Some(true);
+    panel.streaming_thinking.set_buffer("**Solo trace**");
+    render(&mut panel, 80, 20);
+    let area = Rect::new(0, 0, 80, 20);
+    let selection = make_sel(
+        area,
+        (0, 0),
+        (u32::from(panel.last_total_lines.saturating_sub(1)), 79),
+    );
+
+    assert_eq!(
+        panel.extract_selection_text(&selection, area),
+        "Thinking: Solo trace"
+    );
+}
+
+#[test]
+fn cross_message_copy_does_not_restore_truncated_tool_output() {
+    let mut panel = panel_with_long_tool(200);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Tool: `shell`"), "{copied}");
+    assert!(copied.contains("line 0"), "{copied}");
+    assert!(!copied.contains("line 50"), "{copied}");
+}
+
+#[test]
+fn tool_fence_outgrows_backticks_in_visible_content() {
+    let fenced = fenced_text("before\n```\nafter");
+
+    assert!(fenced.starts_with("````text\n"), "{fenced}");
+    assert!(fenced.ends_with("\n````"), "{fenced}");
+}
+
+#[test]
+fn rendered_markdown_fallback_keeps_table_cells_separate() {
+    let rendered = rendered_markdown_text("| left | right |\n| --- | --- |\n| one | two |", 80);
+
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.contains("left") && line.contains('│') && line.contains("right")),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn incomplete_message_fence_cannot_swallow_the_next_card() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "```rust\nfn unfinished() {}".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Visible reply".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(
+        copied.contains("fn unfinished() {}\n```\n\n---\n\n## Assistant"),
+        "{copied}"
+    );
+}
+
+fn assert_generated_document_closed(copied: &str) {
+    assert!(unclosed_markdown_block(copied).is_none(), "{copied}");
+    assert!(unclosed_caudra_fenced_block(copied).is_none(), "{copied}");
+    assert!(copied.contains("## Assistant\n\nVisible reply"), "{copied}");
+}
+
+#[test_case("$$\nx + y"; "dollars")]
+#[test_case("\\[\nx + y"; "brackets")]
+#[test_case("<div>\n$$\nx + y"; "math_inside_html")]
+#[test_case("    $$\nx + y"; "indented_math")]
+fn incomplete_message_math_cannot_swallow_the_next_card(body: &str) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, body.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Visible reply".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert_generated_document_closed(&copied);
+}
+
+#[test]
+fn blank_line_html_context_does_not_hide_a_later_open_fence() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "<div>\n```\n\ntext\n````".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Visible reply".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert_generated_document_closed(&copied);
+}
+
+#[test_case("```\nx\n````"; "caudra_fence_left_open")]
+#[test_case("   ```\n````rust\nx"; "distinct_open_fences")]
+fn divergent_fence_closures_leave_the_generated_document_closed(body: &str) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, body.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Visible reply".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    let rendered_body = rendered_markdown_text(body, 80);
+    let rendered_document = rendered_markdown_text(&copied, 80);
+    assert!(rendered_document.contains(&rendered_body), "{copied}");
+    assert!(!copied.contains(" \\`"), "{copied}");
+    assert_generated_document_closed(&copied);
+}
+
+#[test_case("<script>\nwindow.alert('x')"; "script")]
+#[test_case("<script>\n```\nlooks like a fence"; "fence_inside_script")]
+#[test_case("<!-- unfinished"; "comment")]
+#[test_case("<pre>\nraw"; "preformatted")]
+fn incomplete_raw_html_cannot_swallow_the_next_card(body: &str) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, body.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Visible reply".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert_generated_document_closed(&copied);
+}
+
+#[test]
+fn inline_metadata_cannot_inject_markdown_blocks() {
+    assert_eq!(
+        markdown_inline("model\n## forged &copy;"),
+        "model \\#\\# forged \\&copy;"
+    );
+    assert_eq!(markdown_code_span("`odd`"), "<code>`odd`</code>");
+    assert_eq!(markdown_code_span("a&b "), "<code>a&amp;b </code>");
+    assert_eq!(markdown_code_span("foo\n## forged"), "`foo ## forged`");
+    assert!(unclosed_markdown_block("<![cdata[").is_none());
+}
+
+#[test]
+fn markdown_block_scanner_matches_commonmark_boundaries() {
+    assert!(matches!(
+        unclosed_markdown_block("<script>\n</style>\n~~~"),
+        Some(MarkdownBlock::Fence('~', 3))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("```\nbody\n```\u{a0}"),
+        Some(MarkdownBlock::Fence('`', 3))
+    ));
+    assert!(unclosed_markdown_block("~~~\rbody\r~~~").is_none());
+    assert!(matches!(
+        unclosed_markdown_block("<div>\n```\n\ntext\n````"),
+        Some(MarkdownBlock::Fence('`', 4))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("<widget data-label=\"a > b\">\n```\n\ntext\n~~~~"),
+        Some(MarkdownBlock::Fence('~', 4))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("</widget   >\n```\n\ntext\n~~~~"),
+        Some(MarkdownBlock::Fence('~', 4))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("<widget data-label=x   >\n```\n\ntext\n~~~~"),
+        Some(MarkdownBlock::Fence('~', 4))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("<widget !>\n```"),
+        Some(MarkdownBlock::Fence('`', 3))
+    ));
+    assert!(matches!(
+        unclosed_markdown_block("paragraph\n<widget>\n```"),
+        Some(MarkdownBlock::Fence('`', 3))
+    ));
+    assert!(matches!(
+        unclosed_caudra_fenced_block("<div>\n    $$\nx"),
+        Some(MarkdownBlock::Math("$$"))
+    ));
+}
+
 fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     let body = (0..line_count)
         .map(|i| format!("line {i}"))

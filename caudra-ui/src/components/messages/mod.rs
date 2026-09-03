@@ -33,6 +33,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use crate::update;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
+use caudra_markdown::render::SpanSource;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
@@ -63,6 +64,74 @@ const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 const SHELL_LIVE_OUTPUT_LINES: usize = 12;
+const RAW_HTML_CLOSINGS: [&str; 4] = ["</script>", "</pre>", "</style>", "</textarea>"];
+const COMMONMARK_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+const MATH_FENCE: &str = "$$";
+const MATH_BRACKET_CLOSE: &str = "\\]";
+const MATH_BRACKET_OPEN: &str = "\\[";
 
 #[derive(Debug, PartialEq, Eq)]
 enum HoverTarget {
@@ -101,6 +170,455 @@ fn review_label(source: DisplaySource) -> &'static str {
         DisplaySource::Reasoning(_) => "thinking",
         DisplaySource::ToolCall { .. } => "tool call",
         DisplaySource::ToolResult(_) => "tool result",
+    }
+}
+
+fn markdown_inline(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '\n' | '\r') {
+            if !escaped.ends_with(' ') {
+                escaped.push(' ');
+            }
+            continue;
+        }
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|' | '&'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn markdown_code_span(text: &str) -> String {
+    if text.contains(['\n', '\r']) {
+        let mut single_line = String::with_capacity(text.len());
+        for character in text.chars() {
+            if matches!(character, '\n' | '\r') {
+                if !single_line.ends_with(' ') {
+                    single_line.push(' ');
+                }
+            } else {
+                single_line.push(character);
+            }
+        }
+        return markdown_code_span(&single_line);
+    }
+    if text.is_empty()
+        || text.starts_with('`')
+        || text.starts_with(' ')
+        || text.ends_with('`')
+        || text.ends_with(' ')
+    {
+        return format!("<code>{}</code>", html_text(text));
+    }
+    let longest_run = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let delimiter = "`".repeat(longest_run.saturating_add(1).max(1));
+    format!("{delimiter}{text}{delimiter}")
+}
+
+fn html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn raw_html_closing(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    if line.starts_with("<!--") {
+        return Some("-->");
+    }
+    if line.starts_with("<?") {
+        return Some("?>");
+    }
+    if line.starts_with("<![CDATA[") {
+        return Some("]]>");
+    }
+    if line
+        .strip_prefix("<!")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|character| character.is_ascii_uppercase())
+    {
+        return Some(">");
+    }
+    for (opening, closing) in [
+        ("<script", "</script>"),
+        ("<pre", "</pre>"),
+        ("<style", "</style>"),
+        ("<textarea", "</textarea>"),
+    ] {
+        let Some(rest) = lower.strip_prefix(opening) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with([' ', '\t', '>']) {
+            return Some(closing);
+        }
+    }
+    None
+}
+
+fn skip_html_whitespace(bytes: &[u8], mut offset: usize) -> usize {
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        offset += 1;
+    }
+    offset
+}
+
+fn has_complete_html_tag_suffix(suffix: &str, closing: bool) -> bool {
+    let bytes = suffix.as_bytes();
+    if closing {
+        let offset = skip_html_whitespace(bytes, 0);
+        return bytes.get(offset) == Some(&b'>') && offset + 1 == bytes.len();
+    }
+
+    let mut offset = 0;
+    loop {
+        if bytes.get(offset) == Some(&b'>') {
+            return offset + 1 == bytes.len();
+        }
+        if bytes.get(offset..offset + 2) == Some(b"/>") {
+            return offset + 2 == bytes.len();
+        }
+
+        let separator_start = offset;
+        offset = skip_html_whitespace(bytes, offset);
+        if bytes.get(offset) == Some(&b'>') {
+            return offset + 1 == bytes.len();
+        }
+        if bytes.get(offset..offset + 2) == Some(b"/>") {
+            return offset + 2 == bytes.len();
+        }
+        if offset == separator_start {
+            return false;
+        }
+        if !bytes
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':'))
+        {
+            return false;
+        }
+        offset += 1;
+        while bytes.get(offset).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
+        }) {
+            offset += 1;
+        }
+
+        let equals = skip_html_whitespace(bytes, offset);
+        if bytes.get(equals) != Some(&b'=') {
+            continue;
+        }
+        offset = skip_html_whitespace(bytes, equals + 1);
+        match bytes.get(offset).copied() {
+            Some(quote @ (b'\'' | b'"')) => {
+                offset += 1;
+                let Some(end) = bytes[offset..].iter().position(|byte| *byte == quote) else {
+                    return false;
+                };
+                offset += end + 1;
+            }
+            Some(_) => {
+                let start = offset;
+                while bytes.get(offset).is_some_and(|byte| {
+                    !byte.is_ascii_whitespace()
+                        && !matches!(byte, b'\'' | b'"' | b'=' | b'<' | b'>' | b'`')
+                }) {
+                    offset += 1;
+                }
+                if offset == start {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+}
+
+fn starts_blank_line_html_block(line: &str, paragraph_open: bool) -> bool {
+    let line = line.trim_end_matches([' ', '\t']);
+    let lower = line.to_ascii_lowercase();
+    let (closing, rest) = lower
+        .strip_prefix("</")
+        .map(|rest| (true, rest))
+        .or_else(|| lower.strip_prefix('<').map(|rest| (false, rest)))
+        .unwrap_or((false, ""));
+    let name_end = rest
+        .find(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .unwrap_or(rest.len());
+    let Some(name) = rest
+        .get(..name_end)
+        .filter(|name| name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+    else {
+        return false;
+    };
+    let suffix = &rest[name_end..];
+    let tag_boundary =
+        suffix.is_empty() || suffix.starts_with([' ', '\t', '>']) || suffix.starts_with("/>");
+    if tag_boundary && COMMONMARK_BLOCK_TAGS.contains(&name) {
+        return true;
+    }
+    !paragraph_open && has_complete_html_tag_suffix(suffix, closing)
+}
+
+fn math_block_closing(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim();
+    for (opening, closing) in [
+        (MATH_FENCE, MATH_FENCE),
+        (MATH_BRACKET_OPEN, MATH_BRACKET_CLOSE),
+    ] {
+        let Some(rest) = trimmed.strip_prefix(opening) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return Some(closing);
+        }
+        if rest
+            .strip_suffix(closing)
+            .is_some_and(|inner| !inner.trim().is_empty())
+        {
+            return None;
+        }
+    }
+    None
+}
+
+fn starts_commonmark_leaf_block(line: &str, paragraph_open: bool) -> bool {
+    let bytes = line.as_bytes();
+    let marker_run = bytes.iter().take_while(|byte| **byte == b'#').count();
+    if (1..=6).contains(&marker_run)
+        && bytes
+            .get(marker_run)
+            .is_none_or(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return true;
+    }
+    if bytes.first() == Some(&b'>')
+        || bytes.get(1).is_some_and(|byte| {
+            matches!(bytes[0], b'-' | b'+' | b'*') && matches!(byte, b' ' | b'\t')
+        })
+    {
+        return true;
+    }
+    let ordered_marker = bytes
+        .iter()
+        .take(9)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if ordered_marker > 0
+        && bytes
+            .get(ordered_marker)
+            .is_some_and(|byte| matches!(byte, b'.' | b')'))
+        && bytes
+            .get(ordered_marker + 1)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return true;
+    }
+
+    let compact = line
+        .bytes()
+        .filter(|byte| !matches!(byte, b' ' | b'\t'))
+        .collect::<Vec<_>>();
+    if compact.len() >= 3
+        && matches!(compact[0], b'-' | b'_' | b'*')
+        && compact.iter().all(|byte| *byte == compact[0])
+    {
+        return true;
+    }
+    paragraph_open
+        && !compact.is_empty()
+        && matches!(compact[0], b'-' | b'=')
+        && compact.iter().all(|byte| *byte == compact[0])
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkdownBlock {
+    Fence(char, usize),
+    Html(&'static str),
+    HtmlBlankLine,
+    Math(&'static str),
+}
+
+fn closes_html_block(line: &str, closing: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if RAW_HTML_CLOSINGS.contains(&closing) {
+        RAW_HTML_CLOSINGS
+            .iter()
+            .any(|candidate| lower.contains(candidate))
+    } else {
+        lower.contains(closing)
+    }
+}
+
+fn is_fence_closing_suffix(text: &str) -> bool {
+    text.chars()
+        .all(|character| matches!(character, ' ' | '\t'))
+}
+
+fn unclosed_markdown_block(text: &str) -> Option<MarkdownBlock> {
+    let mut open = None;
+    let mut paragraph_open = false;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    for line in normalized.split('\n') {
+        if let Some(MarkdownBlock::Html(closing)) = open {
+            if closes_html_block(line, closing) {
+                open = None;
+            }
+            continue;
+        }
+        if open.is_some_and(|block| matches!(block, MarkdownBlock::HtmlBlankLine)) {
+            if line.trim().is_empty() {
+                open = None;
+                paragraph_open = false;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        if trimmed.trim().is_empty() {
+            paragraph_open = false;
+            continue;
+        }
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        if let Some(MarkdownBlock::Fence(marker, run)) = open {
+            let marker_run = trimmed
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            if marker_run >= run && is_fence_closing_suffix(&trimmed[marker_run..]) {
+                open = None;
+            }
+            continue;
+        }
+        if let Some(marker) = trimmed
+            .chars()
+            .next()
+            .filter(|marker| matches!(marker, '`' | '~'))
+        {
+            let run = trimmed
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            if run >= 3 && (marker != '`' || !trimmed[run..].contains('`')) {
+                open = Some(MarkdownBlock::Fence(marker, run));
+                paragraph_open = false;
+                continue;
+            }
+        }
+        if let Some(closing) = raw_html_closing(trimmed) {
+            if !closes_html_block(trimmed, closing) {
+                open = Some(MarkdownBlock::Html(closing));
+            }
+            paragraph_open = false;
+            continue;
+        }
+        if starts_blank_line_html_block(trimmed, paragraph_open) {
+            open = Some(MarkdownBlock::HtmlBlankLine);
+            paragraph_open = false;
+            continue;
+        }
+        paragraph_open = !starts_commonmark_leaf_block(trimmed, paragraph_open);
+    }
+    open.filter(|block| !matches!(block, MarkdownBlock::HtmlBlankLine))
+}
+
+fn unclosed_caudra_fenced_block(text: &str) -> Option<MarkdownBlock> {
+    let mut open = None;
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        match open {
+            Some(MarkdownBlock::Fence('`', run)) => {
+                let trimmed = line.trim_end();
+                if trimmed.starts_with(&"`".repeat(run))
+                    && trimmed.as_bytes().get(run) != Some(&b'`')
+                {
+                    open = None;
+                }
+                continue;
+            }
+            Some(MarkdownBlock::Math(closing)) => {
+                if line.trim() == closing {
+                    open = None;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        let run = line.bytes().take_while(|byte| *byte == b'`').count();
+        if run >= 3 && lines.peek().is_some() && !line[run..].contains('`') {
+            open = Some(MarkdownBlock::Fence('`', run));
+            continue;
+        }
+        if let Some(closing) = math_block_closing(line) {
+            open = Some(MarkdownBlock::Math(closing));
+        }
+    }
+    open
+}
+
+fn fenced_text(text: &str) -> String {
+    let longest_run = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let delimiter = "`".repeat(longest_run.saturating_add(1).max(3));
+    let newline = if text.ends_with('\n') { "" } else { "\n" };
+    format!("{delimiter}text\n{text}{newline}{delimiter}")
+}
+
+fn rendered_markdown_text(text: &str, width: u16) -> String {
+    let (painted, _) = text_to_painted(
+        text,
+        "",
+        Style::default(),
+        Style::default(),
+        width,
+        None,
+        Vec::new(),
+    );
+    painted
+        .lines
+        .iter()
+        .zip(&painted.provenance)
+        .map(|(line, provenance)| {
+            let first = provenance
+                .spans
+                .iter()
+                .position(|source| !matches!(source, SpanSource::Chrome));
+            let last = provenance
+                .spans
+                .iter()
+                .rposition(|source| !matches!(source, SpanSource::Chrome));
+            match (first, last) {
+                (Some(first), Some(last)) => line.spans[first..=last]
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect(),
+                _ => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::InProgress => "in progress",
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
     }
 }
 
@@ -1989,7 +2507,251 @@ impl MessagesPanel {
     }
 
     pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
-        selection::extract_selection_text(&self.cache, self.viewport_width, sel, msg_area)
+        let mut fragments =
+            selection::extract_selection_fragments(&self.cache, self.viewport_width, sel, msg_area);
+        self.append_streaming_selection_fragments(&mut fragments, sel, msg_area);
+        if fragments.len() <= 1 {
+            return selection::join_fragments(&fragments);
+        }
+        self.format_selection_markdown(&fragments)
+    }
+
+    fn append_streaming_selection_fragments(
+        &self,
+        fragments: &mut Vec<selection::SelectionFragment>,
+        sel: &Selection,
+        msg_area: Rect,
+    ) {
+        let width = self.viewport_width;
+        let cached_count = self.cache.len();
+        let mut segment_start = self.cache.total_height(width);
+
+        if !self.streaming_thinking.is_empty() {
+            let collapsed = self.streaming_thinking_collapsed();
+            let (lines, provenance) = if collapsed {
+                (self.build_streaming_collapsed_lines(), None)
+            } else {
+                let (lines, _) = self.build_streaming_expanded_lines();
+                let mut provenance = if reasoning_summary(self.streaming_thinking.visible())
+                    .body
+                    .is_empty()
+                {
+                    None
+                } else {
+                    self.streaming_thinking.provenance().cloned()
+                };
+                if let Some(provenance) = provenance.as_mut() {
+                    provenance.prepend_chrome_line(0);
+                    provenance.prepend_chrome_line(lines[0].spans.len());
+                }
+                (lines, provenance)
+            };
+            let mut segment = Segment::with_lines(lines, String::new(), None);
+            segment.set_kind(SegmentKind::Thinking);
+            segment.set_margin_top(u16::from(
+                self.streaming_spacer(SegmentKind::Thinking, cached_count > 0),
+            ));
+            segment.set_provenance(provenance);
+            if let Some(fragment) =
+                selection::extract_segment_fragment(&segment, segment_start, width, sel, msg_area)
+            {
+                fragments.push(fragment);
+            }
+            segment_start += u32::from(segment.height(width));
+        }
+
+        if self.streaming_text.is_empty() {
+            return;
+        }
+        let mut segment = Segment::with_lines(
+            self.streaming_text.cached_lines().to_vec(),
+            String::new(),
+            None,
+        );
+        segment.set_kind(SegmentKind::Assistant);
+        segment.set_margin_top(u16::from(self.streaming_spacer(
+            SegmentKind::Assistant,
+            cached_count > 0 || !self.streaming_thinking.is_empty(),
+        )));
+        segment.set_provenance(self.streaming_text.provenance().cloned());
+        if let Some(fragment) =
+            selection::extract_segment_fragment(&segment, segment_start, width, sel, msg_area)
+        {
+            fragments.push(fragment);
+        }
+    }
+
+    fn format_selection_markdown(&self, fragments: &[selection::SelectionFragment]) -> String {
+        let mut document = String::new();
+        for fragment in fragments {
+            let message = fragment
+                .msg_index
+                .and_then(|index| self.messages.get(index));
+            let (heading, metadata, body, fenced) = match fragment.kind {
+                SegmentKind::User => ("User".to_owned(), None, fragment.text.as_str(), false),
+                SegmentKind::Assistant => {
+                    match message.and_then(|message| message.plan_path.as_deref()) {
+                        Some(plan_path) => (
+                            "Assistant Plan".to_owned(),
+                            Some(format!("Path: {}", markdown_code_span(plan_path))),
+                            fragment.text.as_str(),
+                            false,
+                        ),
+                        None => ("Assistant".to_owned(), None, fragment.text.as_str(), false),
+                    }
+                }
+                SegmentKind::Thinking => {
+                    let open = message.map_or_else(
+                        || self.streaming_reasoning_open(),
+                        |message| {
+                            fragment
+                                .msg_index
+                                .is_some_and(|index| self.reasoning_open(message, index))
+                        },
+                    );
+                    let reasoning = message.map_or_else(
+                        || {
+                            if open {
+                                self.streaming_thinking.visible()
+                            } else {
+                                self.streaming_thinking.buffer()
+                            }
+                        },
+                        |message| message.text.as_str(),
+                    );
+                    let summary = reasoning_summary(reasoning);
+                    let heading = summary.title.map_or_else(
+                        || "Thinking".to_owned(),
+                        |title| format!("Thinking: {}", markdown_inline(title)),
+                    );
+                    let duration = match message {
+                        Some(message) => message.thinking_duration.map(format_thought_duration),
+                        None => self
+                            .thinking_started
+                            .map(|started| format_live_duration(started.elapsed())),
+                    };
+                    let mut metadata = format!("View: {}", if open { "open" } else { "collapsed" });
+                    if let Some(duration) = duration {
+                        metadata.push_str(" | Duration: ");
+                        metadata.push_str(&duration);
+                    }
+                    (
+                        heading,
+                        Some(metadata),
+                        if open && !summary.body.is_empty() {
+                            fragment.text.as_str()
+                        } else {
+                            ""
+                        },
+                        false,
+                    )
+                }
+                SegmentKind::ToolInline | SegmentKind::ToolBlock | SegmentKind::Instruction => {
+                    let segment_tool_id = fragment.tool_id.as_deref().unwrap_or("unknown");
+                    let instruction = segment::is_instruction_segment(segment_tool_id);
+                    let parent_id =
+                        segment::instruction_parent(segment_tool_id).unwrap_or(segment_tool_id);
+                    let tool_message = self.tool_card(parent_id).and_then(|(index, tool)| {
+                        self.messages.get(index).map(|message| (message, tool))
+                    });
+                    let tool_name = tool_message.map_or(parent_id, |(_, tool)| tool.name.as_ref());
+                    let heading = if instruction {
+                        format!("Instructions: {}", markdown_code_span(tool_name))
+                    } else {
+                        format!("Tool: {}", markdown_code_span(tool_name))
+                    };
+                    let open = self
+                        .tool_expansion(segment_tool_id, self.card_opens_by_default(parent_id))
+                        .is_some();
+                    let mut metadata = if instruction {
+                        format!("View: {}", if open { "open" } else { "collapsed" })
+                    } else {
+                        let status = tool_message
+                            .map_or("unknown", |(_, tool)| tool_status_label(tool.status));
+                        format!(
+                            "Status: {status} | View: {}",
+                            if open { "open" } else { "collapsed" }
+                        )
+                    };
+                    if let Some(annotation) =
+                        tool_message.and_then(|(message, _)| message.annotation.as_deref())
+                    {
+                        metadata.push_str(" | Annotation: ");
+                        metadata.push_str(&markdown_inline(annotation));
+                    }
+                    self.append_selection_section(
+                        &mut document,
+                        &heading,
+                        Some(&metadata),
+                        fragment.text.as_str(),
+                        true,
+                    );
+                    continue;
+                }
+                SegmentKind::Error => ("Error".to_owned(), None, fragment.text.as_str(), true),
+                SegmentKind::Done => ("Done".to_owned(), None, fragment.text.as_str(), true),
+            };
+            self.append_selection_section(
+                &mut document,
+                &heading,
+                metadata.as_deref(),
+                body,
+                fenced,
+            );
+        }
+        document
+    }
+
+    fn append_selection_section(
+        &self,
+        document: &mut String,
+        heading: &str,
+        metadata: Option<&str>,
+        body: &str,
+        fenced: bool,
+    ) {
+        if !document.is_empty() {
+            document.push_str("\n\n---\n\n");
+        }
+        document.push_str("## ");
+        document.push_str(heading);
+        if let Some(metadata) = metadata {
+            document.push_str("\n\n_");
+            document.push_str(metadata);
+            document.push('_');
+        }
+        if body.is_empty() {
+            return;
+        }
+        document.push_str("\n\n");
+        if fenced {
+            document.push_str(&fenced_text(body));
+        } else {
+            let caudra_block = unclosed_caudra_fenced_block(body);
+            let commonmark_block = unclosed_markdown_block(body);
+            if caudra_block != commonmark_block {
+                // Conflicting parser states have no shared invisible closer.
+                document.push_str(&fenced_text(&rendered_markdown_text(
+                    body,
+                    self.viewport_width,
+                )));
+            } else {
+                document.push_str(body);
+            }
+            if let Some(block) = caudra_block.filter(|_| caudra_block == commonmark_block) {
+                if !document.ends_with('\n') {
+                    document.push('\n');
+                }
+                match block {
+                    MarkdownBlock::Fence(marker, run) => {
+                        document.extend(std::iter::repeat_n(marker, run));
+                    }
+                    MarkdownBlock::Html(closing) => document.push_str(closing),
+                    MarkdownBlock::Math(closing) => document.push_str(closing),
+                    MarkdownBlock::HtmlBlankLine => {}
+                }
+            }
+        }
     }
 
     fn tool_in_progress(&self, tool_id: &str) -> bool {
@@ -2774,14 +3536,19 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         (lines, None, Vec::new(), links)
     };
     if let Some(pp) = &msg.plan_path {
-        // Plan messages splice in rules and a footer, so the recorded line
-        // indices no longer match and provenance is dropped.
-        provenance = None;
-        diagrams.clear();
         if !msg.text.is_empty() {
             let rule = hr_line(width, theme::current().plan_rule);
+            if let Some(provenance) = provenance.as_mut() {
+                provenance.prepend_chrome_line(rule.spans.len());
+            }
+            for diagram in &mut diagrams {
+                diagram.rows = diagram.rows.start + 1..diagram.rows.end + 1;
+            }
             lines.insert(0, rule.clone());
             links.rows.insert(0, vec![None; rule.spans.len()]);
+            if let Some(provenance) = provenance.as_mut() {
+                provenance.push_chrome_line(rule.spans.len());
+            }
             lines.push(rule);
             links
                 .rows
@@ -2789,12 +3556,17 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         } else {
             lines.clear();
             links.rows.clear();
+            provenance = None;
+            diagrams.clear();
         }
         if !msg.text.is_empty() {
             lines.push(Line::from(""));
             links
                 .rows
                 .push(vec![None; lines.last().unwrap().spans.len()]);
+            if let Some(provenance) = provenance.as_mut() {
+                provenance.push_chrome_line(0);
+            }
         }
         lines.push(Line::from(Span::styled(
             pp.to_owned(),
@@ -2803,6 +3575,9 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         links
             .rows
             .push(vec![None; lines.last().unwrap().spans.len()]);
+        if let Some(provenance) = provenance.as_mut() {
+            provenance.push_chrome_line(lines.last().unwrap().spans.len());
+        }
         lines.push(Line::from(Span::styled(
             format!(
                 "{} to open in editor ($VISUAL / $EDITOR)",
@@ -2813,6 +3588,9 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         links
             .rows
             .push(vec![None; lines.last().unwrap().spans.len()]);
+        if let Some(provenance) = provenance.as_mut() {
+            provenance.push_chrome_line(lines.last().unwrap().spans.len());
+        }
     }
     let search_text = format!("{prefix}{}", msg.text);
     BuiltMessage {

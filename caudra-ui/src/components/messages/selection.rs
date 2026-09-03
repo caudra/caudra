@@ -1,22 +1,31 @@
-use super::segment::SegmentCache;
+use super::layout::SegmentKind;
+use super::segment::{Segment, SegmentCache};
 use crate::selection::{self, LineBreaks, ScreenSelection, Selection};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
-pub(super) fn extract_selection_text(
+pub(super) struct SelectionFragment {
+    pub kind: SegmentKind,
+    pub msg_index: Option<usize>,
+    pub tool_id: Option<String>,
+    pub text: String,
+}
+
+pub(super) fn extract_selection_fragments(
     cache: &SegmentCache,
     viewport_width: u16,
     sel: &Selection,
     msg_area: Rect,
-) -> String {
+) -> Vec<SelectionFragment> {
     let (doc_start, doc_end) = sel.normalized();
-    let width = viewport_width;
-
-    let heights: Vec<u16> = cache.segments().iter().map(|s| s.height(width)).collect();
-
-    let mut out = String::new();
+    let heights: Vec<u16> = cache
+        .segments()
+        .iter()
+        .map(|segment| segment.height(viewport_width))
+        .collect();
+    let mut fragments = Vec::new();
     let mut doc_row: u32 = 0;
 
     for (i, &h) in heights.iter().enumerate() {
@@ -28,83 +37,124 @@ pub(super) fn extract_selection_text(
             continue;
         }
 
-        let Some(seg) = cache.get(i) else { continue };
-
-        if seg.lines().is_empty() {
+        let Some(segment) = cache.get(i) else {
             continue;
-        }
-
-        // `h` is the document layout height, which can predate a resize (see
-        // `Segment::height`), while the wrap below happens at the real width.
-        // The rows we copy come from that wrap, so measure and clamp against
-        // it, and take the whole segment whenever the selection covers it.
-        let drawn = seg.drawn_height(width);
-        let chrome = seg.chrome(width);
-        let content_width = chrome.content_width(width);
-        let content_height = seg.content_height(width);
-        if content_width == 0 || content_height == 0 {
-            continue;
-        }
-        let content_start = chrome.content_start();
-        let content_end = content_start.saturating_add(content_height);
-        let selected_start = (doc_start.row.saturating_sub(seg_start) as u16).min(drawn);
-        let selected_end = if doc_end.row + 1 >= seg_end {
-            drawn
-        } else {
-            ((doc_end.row + 1 - seg_start) as u16).min(drawn)
         };
-        let selected_start = selected_start.max(content_start);
-        let selected_end = selected_end.min(content_end);
-        if selected_start >= selected_end {
-            continue;
-        }
-        let rel_start = selected_start - content_start;
-        let rel_end = selected_end - content_start;
-        let content_doc_start = seg_start + content_start as u32;
-        let content_doc_end = seg_start + content_end as u32;
-
-        let start_col = if content_doc_start > doc_start.row {
-            0
-        } else {
-            doc_start
-                .col
-                .saturating_sub(msg_area.x.saturating_add(chrome.left))
-        };
-        let end_col = if content_doc_end < doc_end.row + 1 {
-            content_width.saturating_sub(1)
-        } else {
-            doc_end
-                .col
-                .saturating_sub(msg_area.x.saturating_add(chrome.left))
-        };
-
-        let ss = ScreenSelection {
-            start_row: rel_start,
-            start_col,
-            end_row: rel_end.saturating_sub(1),
-            end_col,
-        };
-
-        // Markdown segments copy their source. Everything else (tool buffers,
-        // images, plain text) has no ranges to read, so it scrapes cells.
-        if let Some(text) = seg
-            .provenance()
-            .and_then(|p| p.extract(seg.lines(), content_width, &ss, rel_start, rel_end))
+        if let Some(fragment) =
+            extract_segment_fragment(segment, seg_start, viewport_width, sel, msg_area)
         {
-            append_segment(&mut out, &text);
-            continue;
+            fragments.push(fragment);
         }
+    }
+    fragments
+}
 
-        let tmp_area = Rect::new(0, 0, content_width, content_height);
-        let mut tmp = Buffer::empty(tmp_area);
-        Paragraph::new(seg.lines().to_vec())
-            .wrap(Wrap { trim: false })
-            .render(tmp_area, &mut tmp);
+pub(super) fn extract_segment_fragment(
+    segment: &Segment,
+    segment_start: u32,
+    viewport_width: u16,
+    sel: &Selection,
+    msg_area: Rect,
+) -> Option<SelectionFragment> {
+    let (doc_start, doc_end) = sel.normalized();
+    let segment_height = segment.height(viewport_width);
+    let segment_end = segment_start + u32::from(segment_height);
+    if segment_end <= doc_start.row || segment_start > doc_end.row || segment.lines().is_empty() {
+        return None;
+    }
 
-        let breaks = LineBreaks::from_lines(seg.lines(), content_width);
-        let mut text = String::new();
-        selection::append_rows(&tmp, tmp_area, &ss, rel_start, rel_end, &mut text, &breaks);
-        append_segment(&mut out, &text);
+    // The document layout height can predate a resize, while extraction wraps
+    // at the real width. Clamp against the rows that would actually be drawn.
+    let drawn = segment.drawn_height(viewport_width);
+    let chrome = segment.chrome(viewport_width);
+    let content_width = chrome.content_width(viewport_width);
+    let content_height = segment.content_height(viewport_width);
+    if content_width == 0 || content_height == 0 {
+        return None;
+    }
+    let content_start = chrome.content_start();
+    let content_end = content_start.saturating_add(content_height);
+    let selected_start = (doc_start.row.saturating_sub(segment_start) as u16).min(drawn);
+    let selected_end = if doc_end.row + 1 >= segment_end {
+        drawn
+    } else {
+        ((doc_end.row + 1 - segment_start) as u16).min(drawn)
+    };
+    let selected_start = selected_start.max(content_start);
+    let selected_end = selected_end.min(content_end);
+    if selected_start >= selected_end {
+        return None;
+    }
+    let rel_start = selected_start - content_start;
+    let rel_end = selected_end - content_start;
+    let content_doc_start = segment_start + u32::from(content_start);
+    let content_doc_end = segment_start + u32::from(content_end);
+
+    let start_col = if content_doc_start > doc_start.row {
+        0
+    } else {
+        doc_start
+            .col
+            .saturating_sub(msg_area.x.saturating_add(chrome.left))
+    };
+    let end_col = if content_doc_end < doc_end.row + 1 {
+        content_width.saturating_sub(1)
+    } else {
+        doc_end
+            .col
+            .saturating_sub(msg_area.x.saturating_add(chrome.left))
+    };
+
+    let screen_selection = ScreenSelection {
+        start_row: rel_start,
+        start_col,
+        end_row: rel_end.saturating_sub(1),
+        end_col,
+    };
+
+    let text = segment
+        .provenance()
+        .and_then(|provenance| {
+            provenance.extract(
+                segment.lines(),
+                content_width,
+                &screen_selection,
+                rel_start,
+                rel_end,
+            )
+        })
+        .unwrap_or_else(|| {
+            let area = Rect::new(0, 0, content_width, content_height);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(segment.lines().to_vec())
+                .wrap(Wrap { trim: false })
+                .render(area, &mut buffer);
+
+            let breaks = LineBreaks::from_lines(segment.lines(), content_width);
+            let mut text = String::new();
+            selection::append_rows(
+                &buffer,
+                area,
+                &screen_selection,
+                rel_start,
+                rel_end,
+                &mut text,
+                &breaks,
+            );
+            text
+        });
+    Some(SelectionFragment {
+        kind: segment.kind(),
+        msg_index: segment.msg_index,
+        tool_id: segment.tool_id.clone(),
+        text,
+    })
+}
+
+pub(super) fn join_fragments(fragments: &[SelectionFragment]) -> String {
+    let mut out = String::new();
+    for fragment in fragments {
+        append_segment(&mut out, &fragment.text);
     }
     out
 }

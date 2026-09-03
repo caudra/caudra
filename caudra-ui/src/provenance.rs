@@ -49,6 +49,14 @@ impl Provenance {
         Self { source, lines }
     }
 
+    pub fn prepend_chrome_line(&mut self, span_count: usize) {
+        self.lines.insert(0, LineProvenance::chrome(span_count));
+    }
+
+    pub fn push_chrome_line(&mut self, span_count: usize) {
+        self.lines.push(LineProvenance::chrome(span_count));
+    }
+
     /// Source text for the rows `from..to` of `lines`, clipped horizontally
     /// by `sel`. Returns `None` when any covered span lacks provenance, so
     /// the caller can fall back to scraping cells.

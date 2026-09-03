@@ -1,11 +1,13 @@
 use crate::animation::Typewriter;
 use crate::markdown::{LinkMap, paint_semantic};
+use crate::provenance::Provenance;
 use crate::theme;
 
 use caudra_markdown::render::Renderer;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 
@@ -18,14 +20,12 @@ const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 /// alongside the hash because hashing alone could in principle collide;
 /// requiring both makes accidental reuse on different buffers
 /// astronomically unlikely.
-/// Streaming rows are painted outside the segment cache and are not
-/// selectable, so no provenance is kept here. It appears once the message
-/// is flushed into a segment.
 #[derive(Default)]
 struct StreamingCache {
     key: Option<CacheKey>,
     lines: Vec<Line<'static>>,
     links: LinkMap,
+    provenance: Option<Provenance>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,7 @@ impl StreamingCache {
         self.key = None;
         self.lines.clear();
         self.links.rows.clear();
+        self.provenance = None;
     }
 
     /// Returns `true` when the cache was repopulated. The caller passes a
@@ -95,7 +96,8 @@ impl StreamingCache {
         }
         let text =
             caudra_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let semantic = renderer.render(text.as_ref(), width, theme_gen);
+        let source: Arc<str> = text.as_ref().into();
+        let semantic = renderer.render(&source, width, theme_gen);
         let mut painted = paint_semantic(&semantic, prefix, styles.0, styles.1);
         if !interactive_links {
             for (line, links) in painted.lines.iter_mut().zip(&mut painted.links.rows) {
@@ -106,6 +108,7 @@ impl StreamingCache {
                 }
             }
         }
+        self.provenance = Some(Provenance::new(source, painted.provenance));
         self.lines = painted.lines;
         self.links = painted.links;
         self.key = Some(key);
@@ -226,6 +229,10 @@ impl StreamingContent {
 
     pub fn cached_lines(&self) -> &[Line<'static>] {
         &self.cache.lines
+    }
+
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.cache.provenance.as_ref()
     }
 
     pub fn links(&self) -> &LinkMap {
