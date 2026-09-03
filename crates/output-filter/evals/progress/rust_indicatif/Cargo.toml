@@ -1,0 +1,14 @@
+# Measurement generator, excluded from the workspace. See the note in the root
+# Cargo.toml: this exists to capture what indicatif writes to a pipe.
+[package]
+name = "indicatif-generator"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+indicatif = "0.17"
+
+# Its own workspace root. Without this cargo tries to join the repository
+# workspace, which deliberately excludes this directory.
+[workspace]

@@ -1,11 +1,11 @@
 {
-  "caseID": "shell.filter.single-scope",
+  "caseID": "shell.progress.redraw-rendered-at-capture",
   "configuration": {
     "shellOutputFilter": true,
     "shellPolicy": "yolo"
   },
   "expected": {
-    "contentText": "cc -O2 alpha.c\ncc -O2 beta.c\n[filtered: make]",
+    "contentText": "stdout tail:\nLoading weights: 100%|##########| 851/851\n\nstderr tail:\n\n[2 progress redraws collapsed]",
     "structuredContent": {
       "durationMs": "{{DURATION_MS}}",
       "exitCode": 0,
@@ -19,11 +19,11 @@
       "stderrPreviewTruncated": false,
       "stderrRedrawsCollapsed": 0,
       "stderrUtf8Bytes": 0,
-      "stdout": "make[1]: Entering directory '/workspace'\ncc -O2 alpha.c\n\ncc -O2 beta.c\nmake[1]: Leaving directory '/workspace'\n",
+      "stdout": "Loading weights: 100%|##########| 851/851\n",
       "stdoutCaptureTruncated": false,
       "stdoutPreviewTruncated": false,
-      "stdoutRedrawsCollapsed": 0,
-      "stdoutUtf8Bytes": 111,
+      "stdoutRedrawsCollapsed": 2,
+      "stdoutUtf8Bytes": 124,
       "timedOut": false,
       "timeoutMs": 60000,
       "version": 1
@@ -31,7 +31,7 @@
   },
   "fixtureVersion": 1,
   "input": {
-    "command": "make all",
+    "command": "printf 'Loading weights:   0%%|          | 0/851\\rLoading weights:  50%%|#####     | 425/851\\rLoading weights: 100%%|##########| 851/851\\n'",
     "timeout": 60000
   },
   "normalization": {
@@ -46,18 +46,17 @@
       }
     ]
   },
+  "notes": [
+    "A redraw stream is decoded rather than filtered, so the structured capture holds the rendered row and not the control stream. The exact bytes the command wrote remain reported in stdoutUtf8Bytes, and progress notifications are published before this point.",
+    "The command matches no corpus rule, which is the point: bars are emitted overwhelmingly by programs no rule names."
+  ],
   "provenance": [
-    "rust/crates/mcp-shell/src/group.rs",
-    "rust/crates/output-filter/src/pipeline.rs",
+    "rust/crates/mcp-shell/src/output.rs",
+    "rust/crates/output-filter/src/terminal.rs",
     "rust/crates/mcp-shell/tests/conformance_fixtures.rs"
   ],
   "setup": {
-    "files": [
-      {
-        "asset": "assets/shell/Makefile",
-        "path": "Makefile"
-      }
-    ]
+    "files": []
   },
   "tool": "shell"
 }

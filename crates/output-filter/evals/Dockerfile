@@ -46,12 +46,23 @@ RUN curl -fsSLo /tmp/node.tar.xz \
 # `pip install`, still reach the network when they run.
 RUN npm install --global --no-fund --no-audit typescript eslint jest vitest \
     && npm cache clean --force
-RUN python3 -m pip install --break-system-packages --no-cache-dir pytest
+# `tqdm` and `rich` are the progress libraries the reduction is measured
+# against. `tqdm` does not consult isatty, so it redraws into a pipe and is the
+# dominant real source of redraw noise; `rich` does consult it, and the harness
+# reports that as a measurement rather than assuming it either way.
+RUN python3 -m pip install --break-system-packages --no-cache-dir pytest tqdm rich
 
 # The harness is baked in rather than bind-mounted: an eval run may target a
 # remote daemon, where a bind mount would resolve on the daemon's filesystem
 # instead of the caller's.
 COPY setup-workspace.sh /usr/local/bin/setup-workspace
+COPY capture-progress.py /usr/local/bin/capture-progress
+
+# Progress generators, including the Go, Rust, and Node libraries. These take
+# real third-party dependencies so the harness measures what each one writes to
+# a pipe instead of assuming. Most go quiet there; `schollz/progressbar` does
+# not, which is why assuming is not safe.
+COPY progress /usr/local/share/workcell-progress
 
 # Sample projects and their dependency caches are baked in for the same reason,
 # and so a run captures warm output instead of first-resolution noise.

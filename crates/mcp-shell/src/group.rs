@@ -36,7 +36,10 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use workcell_output_filter::Rule as FilterRule;
+use workcell_output_filter::{Rule as FilterRule, collapse_progress_lines};
+
+/// Name reported for the command-independent progress reduction.
+const PROGRESS_STAGE: &str = "progress";
 
 const SHELL_CONCURRENCY: usize = 4;
 // After child completion, allow trailing pipe data to reset this grace window before treating open
@@ -302,8 +305,8 @@ impl ShellToolGroup {
                          stdout_task.abort(); stderr_task.abort(); p.task.abort(); return Err(e);
                      }
                      match event.stream {
-                         ShellStream::Stdout=>stdout_tail.push(event.text.as_bytes()),
-                         ShellStream::Stderr=>stderr_tail.push(event.text.as_bytes())
+                         ShellStream::Stdout=>stdout_tail.push(&event.text),
+                         ShellStream::Stderr=>stderr_tail.push(&event.text)
                      }
                  },
                  None=>pipes_closed=true
@@ -320,6 +323,10 @@ impl ShellToolGroup {
             // Drain accepted progress before exposing the final result to preserve observable order.
             progress.finish().await?;
         }
+        // A stream can end mid-row, either without a trailing newline or with a
+        // bar still redrawing when the command exited.
+        stdout_tail.finish();
+        stderr_tail.finish();
         let (stdout, stdout_preview_truncated) = stdout_tail.preview(FALLBACK_PREVIEW_BYTES / 2);
         let (stderr, stderr_preview_truncated) = stderr_tail.preview(FALLBACK_PREVIEW_BYTES / 2);
         let output = ShellOutput {
@@ -341,6 +348,8 @@ impl ShellToolGroup {
             stderr_capture_truncated: stderr_tail.truncated,
             stdout_preview_truncated,
             stderr_preview_truncated,
+            stdout_redraws_collapsed: stdout_tail.redraws(),
+            stderr_redraws_collapsed: stderr_tail.redraws(),
         };
         let (model_text, filter) =
             self.render_with_filter(&output, &analysis, &stdout_tail, &stderr_tail);
@@ -369,6 +378,13 @@ impl ShellToolGroup {
             .0
     }
 
+    /// Builds the model-facing rendering from the retained tails.
+    ///
+    /// Two reductions can apply. A corpus rule is selected by command and knows
+    /// the format it is reading. The progress collapse is command-independent,
+    /// because the commands that emit bars are overwhelmingly ones no rule names
+    /// — a training script or an ad-hoc program — and a rule cannot be written
+    /// for a program that does not exist yet.
     fn render_with_filter(
         &self,
         output: &ShellOutput,
@@ -377,27 +393,50 @@ impl ShellToolGroup {
         stderr_tail: &Tail,
     ) -> (String, Option<ShellFilterInfo>) {
         let unfiltered = model_text(output);
-        let Some(rule) = self.matching_rule(analysis) else {
-            return (unfiltered, None);
-        };
-        let filtered = rule.apply(&stdout_tail.text(), &stderr_tail.text(), output.exit_code);
-        if !filtered.lossy {
-            // The rule matched but removed nothing. Announcing a filter that did
-            // not filter would tell a reader to go looking for output that was
-            // never dropped.
+        if !self.output_filter {
             return (unfiltered, None);
         }
-        let mut rendered = filtered.text;
-        if !filtered.consumed_stderr && !output.stderr.is_empty() {
+        let mut stages: Vec<String> = Vec::new();
+
+        // Both reductions read the full retained window rather than the preview
+        // already in the structured result, so the preview budget is spent on
+        // what survived instead of on the raw end of the stream.
+        let stdout = stdout_tail.text();
+        let stderr = stderr_tail.text();
+        let mut consumed_stderr = false;
+        let mut body = stdout;
+        if let Some(rule) = self.matching_rule(analysis) {
+            let filtered = rule.apply(&body, &stderr, output.exit_code);
+            // A rule that matched but removed nothing is not announced.
+            // Announcing a filter that did not filter would tell a reader to go
+            // looking for output that was never dropped.
+            if filtered.lossy {
+                body = filtered.text;
+                consumed_stderr = filtered.consumed_stderr;
+                stages.push(rule.name().to_owned());
+            }
+        }
+
+        let mut rendered = body;
+        if !consumed_stderr && !stderr.is_empty() {
             // A rule that describes stdout must not make a diagnostic written to
             // stderr disappear from the rendering.
             if !rendered.is_empty() {
                 rendered.push('\n');
             }
             rendered.push_str("stderr tail:\n");
-            rendered.push_str(&output.stderr);
+            rendered.push_str(&stderr);
         }
-        if rendered.trim().is_empty() {
+
+        // Runs last so a rule that already knows the format gets first refusal,
+        // and so the collapse sees whatever that rule left behind.
+        let (collapsed, removed) = collapse_progress_lines(&rendered);
+        if removed > 0 {
+            rendered = collapsed;
+            stages.push(PROGRESS_STAGE.to_owned());
+        }
+
+        if stages.is_empty() || rendered.trim().is_empty() {
             return (unfiltered, None);
         }
         // The notice is deliberately terse. It is paid on every filtered result
@@ -406,7 +445,7 @@ impl ShellToolGroup {
         let candidate = format!(
             "{}\n[filtered: {}]",
             bound_rendering(&rendered),
-            rule.name()
+            stages.join(", ")
         );
         // Filtering exists to reduce what a model reads, and the notice is not
         // free. A rendering that is not smaller than the complete capture is
@@ -415,7 +454,7 @@ impl ShellToolGroup {
             return (unfiltered, None);
         }
         let filter = ShellFilterInfo {
-            rule: rule.name().to_owned(),
+            stages,
             unfiltered_utf8_bytes: unfiltered.len(),
             filtered_utf8_bytes: candidate.len(),
         };
@@ -473,16 +512,27 @@ fn bound_rendering(rendered: &str) -> &str {
 }
 
 fn model_text(output: &ShellOutput) -> String {
+    let redraws = output
+        .stdout_redraws_collapsed
+        .saturating_add(output.stderr_redraws_collapsed);
+    // Rendering a redraw stream is faithful but not lossless: the intermediate
+    // frames are gone. Saying so costs one line and stops a reader from assuming
+    // the command only ever printed the frame it can see.
+    let note = if redraws == 0 {
+        String::new()
+    } else {
+        format!("\n[{redraws} progress redraws collapsed]")
+    };
     if output.stdout.is_empty() && output.stderr.is_empty() {
         format!(
-            "Command exited with code {} and produced no output.",
+            "Command exited with code {} and produced no output.{note}",
             output
                 .exit_code
                 .map_or_else(|| "unknown".into(), |v| v.to_string())
         )
     } else {
         format!(
-            "stdout tail:\n{}\nstderr tail:\n{}",
+            "stdout tail:\n{}\nstderr tail:\n{}{note}",
             output.stdout, output.stderr
         )
     }
@@ -528,12 +578,15 @@ mod tests {
             stderr_capture_truncated: false,
             stdout_preview_truncated: false,
             stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 0,
+            stderr_redraws_collapsed: 0,
         }
     }
 
-    fn tail(bytes: &str) -> Tail {
+    fn tail(text: &str) -> Tail {
         let mut tail = Tail::default();
-        tail.push(bytes.as_bytes());
+        tail.push(text);
+        tail.finish();
         tail
     }
 
@@ -678,7 +731,7 @@ mod tests {
             &rendered_output(MAKE_OUTPUT, "warning: deprecated", Some(0)),
             &analysis,
             &tail(MAKE_OUTPUT),
-            &Tail::default(),
+            &tail("warning: deprecated"),
         );
         assert!(rendered.contains("gcc -O2 foo.c"), "{rendered}");
         assert!(rendered.contains("warning: deprecated"), "{rendered}");

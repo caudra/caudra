@@ -395,15 +395,50 @@ instead. A filtered rendering is therefore always smaller than the unfiltered on
 
 Filtering affects only the rendering:
 
-- The structured result always carries the unfiltered bounded tails and the complete byte accounting.
+- The structured result always carries the bounded tails and the complete byte accounting.
 - `notifications/progress` chunks are streamed unfiltered as the process produces them, because
   filtering requires the whole output and an exit code.
-- Filtered renderings are annotated with the rule that produced them.
+- Filtered renderings are annotated with the stages that produced them.
 
 Disable filtering with `--no-shell-output-filter` or `WORKCELL_MCP_SHELL_OUTPUT_FILTER=false` to
-return raw command output. Rules in `crates/output-filter/rules/` are vendored from
+return unfiltered command output. Rules in `crates/output-filter/rules/` are vendored from
 [RTK](https://github.com/rtk-ai/rtk) under Apache-2.0; rules in `crates/output-filter/rules-workcell/`
 are original to this project. See `crates/output-filter/NOTICE`.
+
+### Progress Bars
+
+A progress bar is not filtered, because it is not lines. `tqdm`, `curl`, and `dpkg` do not consult
+`isatty`, so they redraw into a pipe exactly as they would into a terminal: a carriage return, a new
+frame over the old one, and no newline until the end. A ten-minute training run therefore arrives as
+a single row hundreds of kilobytes wide, and every line-oriented rule is defeated by it — a per-line
+cap keeps the opening frame and discards the completed one.
+
+Workcell decodes that stream into the rows a terminal would display, as the capture ring is filled:
+
+```
+Loading weights: 100%|██████████| 851/851 [07:12<00:00,  1.97it/s]
+[4218 progress redraws collapsed]
+```
+
+This is decoding, not policy, so it is unconditional and is not affected by `--no-shell-output-filter`.
+It applies to every command, including the ones that matter most here: a bar is usually emitted by a
+training script or an ad-hoc program that no rule names.
+
+Rendering happens on the way into the capture ring rather than on the way out. Frames from a long run
+far exceed the per-stream ring, so rendering afterwards would find the frames intact and everything
+printed before them evicted. Three things preserve fidelity:
+
+- `stdoutUtf8Bytes` and `stderrUtf8Bytes` still report what the process wrote.
+- `stdoutRedrawsCollapsed` and `stderrRedrawsCollapsed` report how many frames were absorbed.
+- `notifications/progress` chunks are published before the ring and remain byte-exact, so a client
+  that wants to render the bar itself receives every frame.
+
+Frames that arrive one per line instead — from a logger, a CI log collector, or a container runtime
+that has already converted the stream — are collapsed separately, and that reduction *is* filtering:
+it is announced as `[filtered: progress]` and is disabled with `--no-shell-output-filter`. Its gates
+are deliberately narrow, requiring a shared line shape, two independent progress signals, and a
+counter that advances against a fixed total or a percentage. A numeric table and a run of repeated
+warnings both survive it, and both are pinned by fixtures.
 
 Clients may negotiate `ai.workcell/execution-environment` version `v1` to receive a sanitized startup
 snapshot during discovery. The `execution_environment` tool returns the same descriptor shape from a
@@ -785,8 +820,12 @@ where possible so icon discovery does not refetch the page body.
   safely and only bounded tails are returned.
 - The final structured result reports relative workdir, timeout, duration, exit code or signal,
   timeout/output-limit state, final progress sequence, per-stream byte accounting, bounded stdout and
-  stderr tails, and truncation flags. Non-zero exits are completed tool results rather than transport
-  failures.
+  stderr tails, truncation flags, and per-stream redraw counts. Non-zero exits are completed tool
+  results rather than transport failures.
+- Captured output is decoded as a terminal would render it, so a command that redraws a progress bar
+  with carriage returns is retained as its completed frame rather than as every frame it drew. Byte
+  accounting and streamed progress chunks still describe what the process wrote. See
+  [Progress Bars](#progress-bars).
 - The model-facing rendering is filtered by a built-in rule corpus so that a successful build, test, or
   package-manager run returns its diagnostics rather than its progress noise. The structured result
   always carries the unfiltered capture. See [Shell Output Filtering](#shell-output-filtering).

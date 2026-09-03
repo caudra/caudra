@@ -27,6 +27,8 @@ const CASES: &[&str] = &[
     "unfiltered-pipeline.json",
     "filter-disabled.json",
     "failure-suppresses-success-summary.json",
+    "redraw-rendered-at-capture.json",
+    "progress-lines-collapsed.json",
 ];
 
 #[tokio::test]

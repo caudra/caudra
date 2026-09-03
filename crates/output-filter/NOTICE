@@ -46,3 +46,9 @@ editing the vendored rules:
     tree-sitter Bash parsing rather than the raw command string.
   * Only the built-in rule set is loaded. Project-local and user-global rule
     files are deliberately unsupported.
+  * Two reductions are command-independent and have no counterpart upstream:
+    terminal redraw rendering, which decodes a carriage-return control stream
+    into the rows a terminal would show, and progress line collapse, which
+    reduces runs of frames that arrive one per line. Neither is selected by
+    `match_command`, because the programs that emit progress bars are
+    overwhelmingly ones the corpus does not name.

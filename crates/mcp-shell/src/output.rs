@@ -10,6 +10,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
 };
+use workcell_output_filter::RowRenderer;
 
 pub(crate) const STREAM_CAPTURE_BYTES: usize = 1_048_576;
 pub(crate) const FALLBACK_PREVIEW_BYTES: usize = 24 * 1024;
@@ -22,13 +23,49 @@ pub(crate) const COMBINED_OUTPUT_BYTES: u64 = 100 * 1024 * 1024;
 pub(crate) const COMBINED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 
+/// The retained window of one stream, rendered as a terminal would show it.
+///
+/// Rendering happens on the way in rather than on the way out. A bar that
+/// redraws for the length of a build writes hundreds of kilobytes into a ring
+/// that only holds one megabyte, so a reader that rendered afterwards would find
+/// the frames intact and the output printed before them evicted. Rendering first
+/// costs the ring the width of one row instead.
+///
+/// Exact byte counts are still reported, from `raw_bytes`, and progress
+/// notifications are published before this point, so a host that wants every
+/// frame still receives every frame.
 #[derive(Default)]
 pub(crate) struct Tail {
     bytes: VecDeque<u8>,
+    renderer: RowRenderer,
     pub(crate) truncated: bool,
 }
 impl Tail {
-    pub(crate) fn push(&mut self, bytes: &[u8]) {
+    pub(crate) fn push(&mut self, text: &str) {
+        let mut rendered = String::new();
+        self.renderer.push(text, &mut rendered);
+        self.append(rendered.as_bytes());
+    }
+
+    /// Flushes the row still being rendered.
+    ///
+    /// A command that ends without a trailing newline always has one, and so
+    /// does one whose bar was still redrawing when it exited.
+    pub(crate) fn finish(&mut self) {
+        let mut rendered = String::new();
+        self.renderer.finish(&mut rendered);
+        self.append(rendered.as_bytes());
+    }
+
+    /// Redraw frames absorbed by rendering, for disclosure to the caller.
+    pub(crate) const fn redraws(&self) -> u64 {
+        self.renderer.redraws()
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         // Retain the newest bytes because command failures and summaries conventionally appear last.
         if bytes.len() >= STREAM_CAPTURE_BYTES {
             self.bytes = bytes[bytes.len() - STREAM_CAPTURE_BYTES..]

@@ -219,6 +219,23 @@ git commit -qm "first commit"
 echo two >> a.txt
 echo untracked > b.txt
 cd ..
+cd "$root"
+# Progress generators. These are the same programs the fixture capture runs, so a
+# live eval measures exactly what the committed fixtures were taken from. They
+# are copied in by the image rather than written here, because a reduction
+# written against a remembered bar format is not evidence of anything.
+#
+# The set deliberately includes libraries that emit nothing into a pipe. A
+# measurement that a library is silent is only worth having if it is re-checked,
+# and the wrong assumption there is what leaves a real case unhandled.
+if [ -d /usr/local/share/workcell-progress ]; then
+  cp -r /usr/local/share/workcell-progress progressdemo
+  (cd progressdemo && npm install --no-fund --no-audit --silent) || true
+  (cd progressdemo/rust_indicatif && cargo build --quiet --release) || true
+  (cd progressdemo/go_progressbar && go build -o generator .) || true
+  (cd progressdemo/go_mpb && go build -o generator .) || true
+fi
+
 # Point the docker CLI at the daemon through a context rather than DOCKER_HOST.
 # The shell tool gives its child a cleaned environment, and an inline
 # `DOCKER_HOST=` assignment would make the command opaque and therefore exempt

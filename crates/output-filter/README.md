@@ -1,8 +1,10 @@
 # workcell-output-filter
 
-`workcell-output-filter` applies a declarative rule set to captured command output so a bounded
-model-facing window carries proportionally more signal. It performs no I/O, spawns no processes, and
-reads no configuration from disk.
+`workcell-output-filter` renders captured command output so a bounded model-facing window carries
+proportionally more signal. It does three things: it decodes a terminal redraw stream into the rows a
+terminal would show, it applies a declarative rule set selected by command, and it collapses progress
+frames that arrive one per line. It performs no I/O, spawns no processes, and reads no configuration
+from disk.
 
 ## Corpus
 
@@ -75,10 +77,82 @@ Stages run in a fixed order; later stages assume earlier ones have run.
 7. `max_lines` — absolute cap, applied after windowing so markers are counted
 8. `on_empty` — message when nothing survived
 
+## Progress
+
+Two reductions are command-independent, because the programs that emit progress
+bars are overwhelmingly ones no rule names — a training script, an ad-hoc
+downloader — and a rule cannot be written for a program that does not exist yet.
+Neither is selected by `match_command`.
+
+`render_terminal` and `RowRenderer` decode a redraw stream. A bar that redraws
+does not emit lines; it emits `\r`, overwriting text, and erase sequences, so
+`str::lines` sees one row that can be hundreds of kilobytes wide. Every stage
+above is defeated by that: `truncate_lines_at` keeps the opening frame and
+discards the final one, and `max_lines` counts the whole bar as one line. The
+rendered row is what a terminal would display, which is what the writer intended
+a reader to see, so this is decoding rather than filtering and is not gated on a
+rule or on the filter being enabled. Scope is one row; sequences that move
+between rows are consumed, and sequences with no cursor meaning are treated as
+zero width so they never shift a coloured frame's overwrite alignment.
+
+`collapse_progress_lines` handles frames that already arrive one per line, which
+is what a logger or a CI log collector produces from the same stream. A run is
+collapsed only when all three of shape, signal, and advance agree — see the
+module documentation. Each gate removes a distinct false positive, and each has
+a fixture: `numeric-table` survives because of the signal count, and
+`repeated-diagnostic` because of the advance requirement.
+
+Both are measured by the same harness as the rules, and the progress cases run
+commands the corpus deliberately does not name.
+
+## Fixtures
+
+`tests/fixtures/progress/*.raw` are the exact bytes real tools wrote to a pipe.
+Regenerate them with:
+
+```bash
+python3 crates/output-filter/evals/capture-progress.py
+```
+
+The script builds and runs each library rather than describing it, and reports
+what came out. That report is the measurement. As captured, for a 200- to
+400-step bar:
+
+| generator | language | form on a pipe |
+| --- | --- | --- |
+| `schollz/progressbar` v3 | Go | **redraws** — 18,578 B, 298 CR, **no newline at all** |
+| `tqdm` | Python | **redraws** — 1,415 B, 18 CR, one trailing newline |
+| `curl` | C | **redraws** — header rows, then one rewritten summary row |
+| `tqdm` nested | Python | **redraws**, plus `CSI A` between rows |
+| `rich` | Python | one final line; consults `isatty` |
+| `ora` | Node | first and last frame only; consults `isatty` |
+| `indicatif` | Rust | silent |
+| `vbauerster/mpb` v8 | Go | silent |
+| `cli-progress` | Node | silent |
+
+Most progress libraries go quiet on a pipe, which makes it tempting to assume
+they all do. `schollz/progressbar` is why that assumption is not safe, and it is
+the worst case of the set: no newline anywhere, so the entire run is one row and
+every line-oriented stage sees exactly one line.
+
+The silent libraries are kept as generators even though they produce no fixture.
+A measurement that something is silent is only worth having if it is re-checked;
+a release that starts emitting would otherwise go unnoticed.
+
+A generator whose library, toolchain, or network is unavailable is reported and
+skipped, and its fixture is left alone. A generator that exits non-zero is also
+skipped rather than captured, so a stack trace can never be committed as though
+it were a library's output.
+
 ## Invariants
 
 - Filtering is a rendering step. It is not a substitute for retaining the raw capture, and callers
   are expected to keep one.
+- Terminal rendering is faithful but not lossless: the overwritten frames are gone. It reports how
+  many it absorbed so a caller can disclose that, and it is applied where the caller still holds the
+  exact byte count and, in the shell tool, the untouched progress stream.
+- Row rendering is bounded to one row's width, so a bar that redraws for an hour costs the width of
+  its final frame rather than the length of the stream.
 - A command that exited non-zero never has its output replaced by a success message. Stages 3 and 8
   are gated on a zero exit status, because a caller cannot distinguish a synthetic `ok` from a real
   one. This diverges deliberately from upstream.
@@ -104,3 +178,8 @@ silently dropping a transformation.
 cargo clippy -p workcell-output-filter --all-targets -- -D warnings
 cargo test -p workcell-output-filter
 ```
+
+`tests/terminal.rs` and `tests/progress_collapse.rs` run against the captured fixtures. The former
+also pins that rendering is independent of how the stream is chunked, which matters because a capture
+ring receives reads that split rows, carriage returns, and escape sequences wherever the kernel filled
+the buffer.

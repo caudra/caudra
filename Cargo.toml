@@ -23,6 +23,10 @@ members = [
   "crates/tool-contract",
   "crates/workcell",
 ]
+# Eval generators are third-party progress libraries built only to capture what
+# they emit to a pipe. They are measurement fixtures, not workspace crates, and
+# must not join the build, the lockfile, or the dependency audit.
+exclude = ["crates/output-filter/evals"]
 resolver = "3"
 
 [workspace.package]

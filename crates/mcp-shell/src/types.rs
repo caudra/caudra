@@ -44,6 +44,12 @@ pub struct ShellOutput {
     pub stderr_capture_truncated: bool,
     pub stdout_preview_truncated: bool,
     pub stderr_preview_truncated: bool,
+    /// Redraw frames absorbed while rendering stdout as a terminal would show
+    /// it. Non-zero means the capture held a progress bar that overwrote itself;
+    /// `stdout_utf8_bytes` still reports what the command actually wrote.
+    pub stdout_redraws_collapsed: u64,
+    /// The same for stderr, where bars are more commonly written.
+    pub stderr_redraws_collapsed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -155,7 +161,10 @@ impl PreparedShell {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellFilterInfo {
-    pub rule: String,
+    /// The reductions that were applied, in the order they ran. A corpus rule
+    /// appears under its own name; the command-independent progress collapse
+    /// appears as `progress`.
+    pub stages: Vec<String>,
     pub unfiltered_utf8_bytes: usize,
     pub filtered_utf8_bytes: usize,
 }

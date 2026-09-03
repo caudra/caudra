@@ -1,11 +1,11 @@
 {
-  "caseID": "shell.filter.single-scope",
+  "caseID": "shell.progress.lines-collapsed",
   "configuration": {
     "shellOutputFilter": true,
     "shellPolicy": "yolo"
   },
   "expected": {
-    "contentText": "cc -O2 alpha.c\ncc -O2 beta.c\n[filtered: make]",
+    "contentText": "shard 1\n... (3 progress updates collapsed)\nLoading: 100%|##########| 300/300 [00:30<00:00, 10.0it/s]\ndone\n\n[filtered: progress]",
     "structuredContent": {
       "durationMs": "{{DURATION_MS}}",
       "exitCode": 0,
@@ -19,11 +19,11 @@
       "stderrPreviewTruncated": false,
       "stderrRedrawsCollapsed": 0,
       "stderrUtf8Bytes": 0,
-      "stdout": "make[1]: Entering directory '/workspace'\ncc -O2 alpha.c\n\ncc -O2 beta.c\nmake[1]: Leaving directory '/workspace'\n",
+      "stdout": "shard 1\nLoading:   0%|          | 0/300 [00:00<00:30, 10.0it/s]\nLoading:  33%|###       | 100/300 [00:10<00:20, 10.0it/s]\nLoading:  66%|######    | 200/300 [00:20<00:10, 10.0it/s]\nLoading: 100%|##########| 300/300 [00:30<00:00, 10.0it/s]\ndone\n",
       "stdoutCaptureTruncated": false,
       "stdoutPreviewTruncated": false,
       "stdoutRedrawsCollapsed": 0,
-      "stdoutUtf8Bytes": 111,
+      "stdoutUtf8Bytes": 243,
       "timedOut": false,
       "timeoutMs": 60000,
       "version": 1
@@ -31,7 +31,7 @@
   },
   "fixtureVersion": 1,
   "input": {
-    "command": "make all",
+    "command": "printf 'shard 1\\nLoading:   0%%|          | 0/300 [00:00<00:30, 10.0it/s]\\nLoading:  33%%|###       | 100/300 [00:10<00:20, 10.0it/s]\\nLoading:  66%%|######    | 200/300 [00:20<00:10, 10.0it/s]\\nLoading: 100%%|##########| 300/300 [00:30<00:00, 10.0it/s]\\ndone\\n'",
     "timeout": 60000
   },
   "normalization": {
@@ -46,18 +46,17 @@
       }
     ]
   },
+  "notes": [
+    "Frames that already arrive as separate lines cannot be reduced by row rendering, so the command-independent collapse stage handles them and is announced in the notice.",
+    "The structured capture is untouched: collapsing is a rendering judgement, not decoding, so the raw lines remain available."
+  ],
   "provenance": [
     "rust/crates/mcp-shell/src/group.rs",
-    "rust/crates/output-filter/src/pipeline.rs",
+    "rust/crates/output-filter/src/progress.rs",
     "rust/crates/mcp-shell/tests/conformance_fixtures.rs"
   ],
   "setup": {
-    "files": [
-      {
-        "asset": "assets/shell/Makefile",
-        "path": "Makefile"
-      }
-    ]
+    "files": []
   },
   "tool": "shell"
 }

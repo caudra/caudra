@@ -97,7 +97,7 @@ async fn native_hosts_see_the_filtered_rendering_and_the_raw_capture() {
     assert!(execution.output.stdout.contains("real build line"));
     assert_eq!(execution.output.exit_code, Some(0));
     let filter = execution.filter.as_ref().expect("make output is filtered");
-    assert_eq!(filter.rule, "make");
+    assert_eq!(filter.stages, ["make"]);
     let unfiltered = format!(
         "stdout tail:\n{}\nstderr tail:\n{}",
         execution.output.stdout, execution.output.stderr
