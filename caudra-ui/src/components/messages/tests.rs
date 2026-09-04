@@ -4199,6 +4199,82 @@ fn compact_rows_stack_without_separator_lines() {
     assert_eq!(panel.segment_heights(), vec![1, 1], "{COMPACT_GAPLESS_MSG}");
 }
 
+const DENSE_CARD_BG_MSG: &str = "a dense row is still a card and keeps the card background";
+const FLAT_PROSE_MSG: &str = "prose the model wrote is not a card and takes no background";
+const EXPANDED_INLINE_FLAT_MSG: &str =
+    "expanded reaches inline only for a call that reads as prose, which stays flat";
+const CALL_SUMMARY: &str = "needle";
+const REPLY_TEXT: &str = "here is what I found";
+
+/// Reads the leftmost column of the row, which is card fill rather than
+/// content, so the assertion sees the band and not a span's own styling.
+fn card_bg(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Option<Color> {
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+            .collect();
+        if row.contains(text) {
+            return buf.cell((0, y)).unwrap().style().bg;
+        }
+    }
+    panic!("{text} was never rendered");
+}
+
+fn call_with_summary(id: &str, tool: &'static str) -> ToolStartEvent {
+    let mut call = start(id, tool);
+    call.summary = CALL_SUMMARY.into();
+    call
+}
+
+/// The dense modes drop the rail and the padding to keep the list tight,
+/// which left a call with nothing at all to separate it from the prose
+/// around it. The background is the one piece of card chrome the list can
+/// still afford, so it is the piece it keeps.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_dense_call_keeps_the_card_background(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(call_with_summary("t1", FILE_GREP_TOOL_NAME));
+    finished(&mut panel, &["t1"]);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        REPLY_TEXT.into(),
+    ));
+    let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+
+    let panel_bg = theme::current().panel_style().bg;
+    assert_eq!(
+        card_bg(&terminal, CALL_SUMMARY),
+        panel_bg,
+        "{DENSE_CARD_BG_MSG}"
+    );
+    assert_ne!(card_bg(&terminal, REPLY_TEXT), panel_bg, "{FLAT_PROSE_MSG}");
+}
+
+/// Expanded classifies a one-line call as inline too, but there it means the
+/// call is trivial enough to read as prose rather than that the mode is
+/// dense. Giving that row a band would put a stripe on every pending call.
+#[test]
+fn an_expanded_one_line_call_stays_flat() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_start(call_with_summary("t1", FILE_GREP_TOOL_NAME));
+    let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+
+    assert_eq!(
+        panel.segment_heights(),
+        vec![1],
+        "{EXPANDED_INLINE_FLAT_MSG}"
+    );
+    assert_ne!(
+        card_bg(&terminal, CALL_SUMMARY),
+        theme::current().panel_style().bg,
+        "{EXPANDED_INLINE_FLAT_MSG}"
+    );
+}
+
 fn margins(panel: &MessagesPanel, width: u16) -> Vec<u16> {
     (0..panel.cache.len())
         .map(|i| panel.cache.get(i).unwrap().chrome(width).margin_top)

@@ -2298,6 +2298,7 @@ impl MessagesPanel {
         );
 
         let accent = self.accent.resolve();
+        let compact = self.compact();
         for (i, seg) in self.cache.segments().iter().enumerate() {
             if cursor.past_bottom() {
                 break;
@@ -2310,7 +2311,7 @@ impl MessagesPanel {
                 (seg.lines(), Some(seg.links())),
                 seg.height(width).saturating_sub(seg.reserved()),
                 seg.chrome(width),
-                segment_styles(seg.kind(), accent),
+                segment_styles(seg.kind(), accent, compact),
                 RenderFeedback { highlight, hover },
                 frame,
             );
@@ -3439,7 +3440,16 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
     }
 }
 
-fn segment_styles(kind: SegmentKind, accent: Color) -> (Option<Style>, Option<Style>) {
+/// A call is a card in every mode; only its chrome changes. Compact and auto
+/// strip the rail and the padding to keep the list dense, which left the rows
+/// with nothing to separate them from the prose around them, so they keep the
+/// panel background the expanded card already has. Expanded reaches this arm
+/// only for a trivial one-line call, which reads as prose and stays flat.
+fn segment_styles(
+    kind: SegmentKind,
+    accent: Color,
+    compact: bool,
+) -> (Option<Style>, Option<Style>) {
     let theme = theme::current();
     match kind {
         SegmentKind::User => (
@@ -3450,10 +3460,8 @@ fn segment_styles(kind: SegmentKind, accent: Color) -> (Option<Style>, Option<St
             (Some(theme.panel_style()), Some(theme.subtle_border_style()))
         }
         SegmentKind::Error => (Some(theme.panel_style()), Some(theme.error)),
-        SegmentKind::Assistant
-        | SegmentKind::Thinking
-        | SegmentKind::ToolInline
-        | SegmentKind::Done => (None, None),
+        SegmentKind::ToolInline => (compact.then(|| theme.panel_style()), None),
+        SegmentKind::Assistant | SegmentKind::Thinking | SegmentKind::Done => (None, None),
     }
 }
 
