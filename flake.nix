@@ -91,7 +91,7 @@
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=b4bbaf5d10996d6c77a07511f7dbf8c5d6e2e8ac#b4bbaf5d10996d6c77a07511f7dbf8c5d6e2e8ac" =
+        "git+https://github.com/tensorninja/workcell-mcp?rev=5e796545f84ad26206e52eb0982fc0a883570ec7#5e796545f84ad26206e52eb0982fc0a883570ec7" =
           "";
       };
 
