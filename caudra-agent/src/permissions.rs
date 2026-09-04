@@ -494,7 +494,7 @@ fn project_permission_config_digest(
         hash_permission_config_field(&mut hasher, pattern.as_bytes());
         hash_permission_config_field(&mut hasher, &[effect]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex_encode(&hasher.finalize()))
 }
 
 fn hash_permission_config_field(hasher: &mut Sha256, value: &[u8]) {

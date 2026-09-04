@@ -275,13 +275,16 @@ pub fn canonical_json(value: &Value) -> String {
     output
 }
 
-pub fn canonical_json_sha256(value: &Value) -> String {
-    let digest = Sha256::digest(canonical_json(value).as_bytes());
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+pub fn canonical_json_sha256(value: &Value) -> String {
+    hex_encode(&Sha256::digest(canonical_json(value).as_bytes()))
 }
 
 pub fn redacted_review_shape(value: &Value) -> Value {

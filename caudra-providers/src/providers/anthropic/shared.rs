@@ -345,16 +345,24 @@ fn first_user_text(body: &Value) -> Option<&str> {
     })
 }
 
+pub(super) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn billing_header(first_user_text: &str, version: &str) -> String {
     let chars: Vec<char> = first_user_text.chars().collect();
     let sampled: String = [4, 7, 20]
         .into_iter()
         .map(|index| chars.get(index).copied().unwrap_or('0'))
         .collect();
-    let version_hash = format!(
-        "{:x}",
-        Sha256::digest(format!("{BILLING_PREFIX}{sampled}{version}").as_bytes())
-    );
+    let version_hash = hex_encode(&Sha256::digest(
+        format!("{BILLING_PREFIX}{sampled}{version}").as_bytes(),
+    ));
     format!(
         "x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=cli; cch=00000;",
         &version_hash[..3]
@@ -375,7 +383,7 @@ fn mapped_oauth_tool_name(name: &str, names: &mut HashMap<String, String>) -> St
     }
     let mut wire = oauth_tool_name(name);
     if wire.len() > 64 || names.contains_key(&wire) {
-        let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+        let digest = hex_encode(&Sha256::digest(name.as_bytes()));
         let suffix = format!("_{}", &digest[..12]);
         let max_prefix = 64 - suffix.len();
         let mut truncate_at = max_prefix.min(wire.len());

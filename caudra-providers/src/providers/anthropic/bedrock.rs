@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use caudra_storage::id::SessionRef;
 use flume::Sender;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
 use serde_json::{Value, json};
@@ -19,6 +19,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
+use super::shared::hex_encode;
 
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
@@ -378,15 +379,6 @@ fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str)
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), AgentError> {
