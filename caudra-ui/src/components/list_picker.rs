@@ -6,12 +6,11 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
-use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
+use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -397,6 +396,12 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
+    pub fn set_search_cursor(&mut self, offset: usize) {
+        if let Some(state) = self.state.as_mut() {
+            state.search.set_cursor_offset(offset);
+        }
+    }
+
     pub fn replace_items(&mut self, items: Vec<T>) {
         if let Some(s) = self.state.as_mut() {
             s.replace_items(items);
@@ -522,20 +527,12 @@ impl<T: PickerItem> ListPicker<T> {
             self.state = None;
             return PickerAction::Close;
         }
-        if key::DELETE_WORD.matches(key) {
-            s.search.remove_word_before_cursor();
-            s.update_search_and_clamp();
-            return PickerAction::Consumed;
-        }
         if key::SCROLL_HALF_UP.matches(key) {
             s.page_up();
             return PickerAction::Consumed;
         }
         if key::SCROLL_HALF_DOWN.matches(key) {
             s.page_down();
-            return PickerAction::Consumed;
-        }
-        if is_ctrl(&key) {
             return PickerAction::Consumed;
         }
         match key.code {
@@ -582,33 +579,14 @@ impl<T: PickerItem> ListPicker<T> {
                 self.state = None;
                 PickerAction::Close
             }
-            KeyCode::Char(c) => {
-                s.search.push_char(c);
-                s.update_search_and_clamp();
+            // Everything the list itself does not claim edits the search
+            // line, which owns the whole editing keymap.
+            _ => {
+                if s.search.handle_key(key) == EditResult::Changed {
+                    s.update_search_and_clamp();
+                }
                 PickerAction::Consumed
             }
-            KeyCode::Backspace => {
-                s.search.remove_char();
-                s.update_search_and_clamp();
-                PickerAction::Consumed
-            }
-            KeyCode::Left => {
-                s.search.move_left();
-                PickerAction::Consumed
-            }
-            KeyCode::Right => {
-                s.search.move_right();
-                PickerAction::Consumed
-            }
-            KeyCode::Home => {
-                s.search.move_home();
-                PickerAction::Consumed
-            }
-            KeyCode::End => {
-                s.search.move_end();
-                PickerAction::Consumed
-            }
-            _ => PickerAction::Consumed,
         }
     }
 
@@ -1237,6 +1215,33 @@ mod tests {
 
         p.handle_key(key(KeyCode::Char('l')));
         assert_eq!(ready_state(&p).filtered, vec![0]);
+    }
+
+    /// Search lines used to hand-roll a keymap that dropped every control
+    /// chord, so the editing keys advertised elsewhere did nothing here.
+    #[test]
+    fn ctrl_w_deletes_the_search_word_and_refilters() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["Alpha", "Beta"]), " Test ");
+        for c in "alx".chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(ready_state(&p).filtered.is_empty());
+
+        p.handle_key(kb::DELETE_WORD.to_key_event());
+        assert_eq!(ready_state(&p).search.value(), "");
+        assert_eq!(ready_state(&p).filtered, vec![0, 1]);
+    }
+
+    #[test]
+    fn ctrl_left_moves_the_search_caret_by_word() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["Alpha"]), " Test ");
+        for c in "alpha beta".chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+        p.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(ready_state(&p).search.x(), "alpha ".len());
     }
 
     #[test]

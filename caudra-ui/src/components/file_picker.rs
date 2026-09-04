@@ -24,7 +24,7 @@ use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::repaint::{Cadence, Dirty};
-use crate::text_buffer::TextBuffer;
+use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
 
 const TITLE: &str = " Files ";
@@ -253,18 +253,6 @@ impl FilePickerModal {
             }
             KeyCode::Up => move_selection(s, -1),
             KeyCode::Down => move_selection(s, 1),
-            KeyCode::Backspace => {
-                s.search.remove_char();
-                reparse_pattern(s);
-            }
-            KeyCode::Left => s.search.move_left(),
-            KeyCode::Right => s.search.move_right(),
-            KeyCode::Home => s.search.move_home(),
-            KeyCode::End => s.search.move_end(),
-            _ if key::DELETE_WORD.matches(key) => {
-                s.search.remove_word_before_cursor();
-                reparse_pattern(s);
-            }
             _ if key::SCROLL_HALF_UP.matches(key) => {
                 move_selection(s, -((s.viewport_height / 2).max(1) as isize))
             }
@@ -273,12 +261,13 @@ impl FilePickerModal {
             }
             _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),
             _ if key::SCROLL_LINE_DOWN.matches(key) => move_selection(s, 1),
-            _ if super::is_ctrl(&key) => {}
-            KeyCode::Char(c) => {
-                s.search.push_char(c);
-                reparse_pattern(s);
+            // Everything the list itself does not claim edits the search
+            // line, which owns the whole editing keymap.
+            _ => {
+                if s.search.handle_key(key) == EditResult::Changed {
+                    reparse_pattern(s);
+                }
             }
-            _ => {}
         }
         FilePickerModalAction::Consumed
     }
@@ -671,6 +660,7 @@ fn build_highlighted_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::keybindings::key as kb;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::time::Duration;
@@ -1122,6 +1112,16 @@ mod tests {
         picker.handle_key(key(KeyCode::Char('b')));
         picker.handle_key(key(KeyCode::Backspace));
         assert_eq!(picker.session.as_ref().unwrap().search.value(), "a");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_search_word_and_reparses() {
+        let (mut picker, _done_tx) = pending_picker();
+        for c in "src main".chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+        picker.handle_key(kb::DELETE_WORD.to_key_event());
+        assert_eq!(picker.session.as_ref().unwrap().search.value(), "src ");
     }
 
     #[test_case(10, 0, 6 ; "scrolls_down_when_below")]

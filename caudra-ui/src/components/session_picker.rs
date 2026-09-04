@@ -266,12 +266,15 @@ impl SessionPicker {
     }
 
     /// The rename box is the picker's own search line, so what the user types
-    /// is echoed there rather than in a second widget.
+    /// is echoed there rather than in a second widget. The caret is mirrored
+    /// too, because `set_search_text` parks it at the end of the line.
     fn sync_rename_text(&mut self) {
-        if let Some((_, buffer)) = &self.rename {
-            let text = buffer.value();
-            self.picker.set_search_text(&text);
-        }
+        let Some((_, buffer)) = &self.rename else {
+            return;
+        };
+        let (text, cursor) = (buffer.value(), buffer.cursor_offset());
+        self.picker.set_search_text(&text);
+        self.picker.set_search_cursor(cursor);
     }
 
     fn key_renaming(&mut self, key: KeyEvent) -> SessionPickerAction {
@@ -292,25 +295,11 @@ impl SessionPicker {
                 self.end_rename();
                 SessionPickerAction::Consumed
             }
-            KeyCode::Char(c) => {
-                buffer.push_char(c);
+            _ => {
+                buffer.handle_key(key);
                 self.sync_rename_text();
                 SessionPickerAction::Consumed
             }
-            KeyCode::Backspace => {
-                buffer.remove_char();
-                self.sync_rename_text();
-                SessionPickerAction::Consumed
-            }
-            KeyCode::Left => {
-                buffer.move_left();
-                SessionPickerAction::Consumed
-            }
-            KeyCode::Right => {
-                buffer.move_right();
-                SessionPickerAction::Consumed
-            }
-            _ => SessionPickerAction::Consumed,
         }
     }
 
@@ -613,6 +602,22 @@ mod tests {
         assert!(matches!(
             picker.handle_key(key_event(KeyCode::Enter)),
             SessionPickerAction::Consumed
+        ));
+    }
+
+    /// The rename box delegates to the shared editing keymap, and the echo in
+    /// the picker's search line has to follow the caret, not park at the end.
+    #[test]
+    fn ctrl_w_deletes_a_word_of_the_rename_and_moves_the_echoed_caret() {
+        let mut picker = opened(vec![row(FIRST, TITLE_A, 10, None)]);
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        picker.handle_key(key::DELETE_WORD.to_key_event());
+
+        let kept = TITLE_A.rsplit_once(' ').expect("a multi-word title").0;
+        assert_eq!(picker.picker.search_text(), format!("{kept} "));
+        assert!(matches!(
+            picker.handle_key(key_event(KeyCode::Enter)),
+            SessionPickerAction::Rename { title, .. } if title == kept
         ));
     }
 
