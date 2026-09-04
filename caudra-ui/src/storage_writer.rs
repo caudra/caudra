@@ -94,13 +94,9 @@ impl StorageWriter {
                     checkpoint_stalls: 0,
                 };
                 while wake_rx.recv().is_ok() {
-                    writer.flush(&writer_pending);
-                    writer.flush_workspace_tabs(&writer_workspace_tabs);
-                    writer.flush_usage(&writer_usage);
+                    writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
                 }
-                writer.flush(&writer_pending);
-                writer.flush_workspace_tabs(&writer_workspace_tabs);
-                writer.flush_usage(&writer_usage);
+                writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
                 if let Some(database) = &writer.database
                     && let Err(error) = database.checkpoint(false)
                 {
@@ -313,10 +309,22 @@ impl Writer {
         }
     }
 
-    fn flush_workspace_tabs(&mut self, pending: &PendingWorkspaceTabs) {
-        let Some(request) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-            return;
-        };
+    /// One pass over everything queued. The tabs request is claimed before the
+    /// snapshots are written, because `write_workspace_tabs` keeps only the ids
+    /// the database still holds and the slot is emptied by the claim. Reading
+    /// it afterwards let a delete queued ahead of the request land behind it,
+    /// leaving a tab pointing at a session that was on its way out and no
+    /// second request to correct it.
+    fn drain(&mut self, pending: &Pending, tabs: &PendingWorkspaceTabs, usage: &PendingUsage) {
+        let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.flush(pending);
+        if let Some(request) = request {
+            self.flush_workspace_tabs(request);
+        }
+        self.flush_usage(usage);
+    }
+
+    fn flush_workspace_tabs(&mut self, request: WorkspaceTabsRequest) {
         let cwd = request.cwd.clone();
         if let Err(error) = self.write_workspace_tabs(request) {
             warn!(cwd = %cwd.display(), %error, "workspace tabs write failed");
