@@ -1315,8 +1315,7 @@ impl MessagesPanel {
             seg.apply_highlight(tl, &self.hl_worker, compact);
             self.cache.insert(parent_idx + 1, seg);
         }
-        self.cache
-            .update_margins(self.viewport_width, self.compact());
+        self.cache.update_margins(self.viewport_width);
     }
 
     fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
@@ -1762,7 +1761,7 @@ impl MessagesPanel {
             if stream.is_empty() {
                 continue;
             }
-            if self.streaming_spacer(kind, has_previous) {
+            if has_previous {
                 block_start = block_start.saturating_add(1);
             }
             let chrome = SegmentChrome::for_kind(kind, width, 0);
@@ -1897,7 +1896,7 @@ impl MessagesPanel {
             _ => self.diagram_pans.insert(key, next),
         };
         self.reflow_text_segment(seg_idx, width);
-        self.cache.update_margins(width, self.compact());
+        self.cache.update_margins(width);
         true
     }
 
@@ -2155,34 +2154,10 @@ impl MessagesPanel {
         !self.streaming_reasoning_open() && !self.streaming_thinking.is_empty()
     }
 
-    /// Streaming content lives outside the cache, so it misses the margin pass
-    /// and needs the same rule applied by hand. A compact collapsed thought is
-    /// a list row like the calls above it, and a gap that vanished the instant
-    /// the block settled would be the only thing announcing the difference.
-    /// Both heights are checked for the same reason `stacks_flush` checks
-    /// them: a wrapped row is no longer a list entry.
-    fn streaming_thinking_stacks_flush(&self) -> bool {
-        if !self.compact() || !self.streaming_thinking_collapsed() {
-            return false;
-        }
-        let width = self.viewport_width;
-        self.cache.segments().last().is_some_and(|previous| {
-            segment::dense_kind(previous.kind(), true) && previous.content_height(width) <= 1
-        }) && self.streaming_collapsed_height(width) <= 1
-    }
-
     fn streaming_collapsed_height(&self, width: u16) -> u16 {
         let content_width =
             SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
         wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width)
-    }
-
-    /// Whether a blank line separates this streaming block from what precedes
-    /// it. Measuring, painting, and hit-testing all walk the same list of
-    /// heights in order, so one extra entry in any of them shifts every row
-    /// below it.
-    fn streaming_spacer(&self, kind: SegmentKind, has_previous: bool) -> bool {
-        has_previous && !(kind == SegmentKind::Thinking && self.streaming_thinking_stacks_flush())
     }
 
     fn show_idle_splash(&self) -> bool {
@@ -2255,8 +2230,12 @@ impl MessagesPanel {
         };
         let mut expanded_thinking = None;
 
+        // Streaming blocks live outside the cache and miss the margin pass,
+        // so they take their blank row by hand. Measuring, painting,
+        // selection, and hit-testing all walk these heights in order: one
+        // extra entry in any of them shifts every row below it.
         if thinking_collapsed {
-            if self.streaming_spacer(SegmentKind::Thinking, cached_count > 0) {
+            if cached_count > 0 {
                 streaming_heights.push(1);
             }
             let content_width =
@@ -2276,7 +2255,7 @@ impl MessagesPanel {
             }
             expanded_thinking = Some(self.build_streaming_expanded_lines());
             let lines = &expanded_thinking.as_ref().unwrap().0;
-            if self.streaming_spacer(SegmentKind::Thinking, cached_count > 0) {
+            if cached_count > 0 {
                 streaming_heights.push(1);
             }
             streaming_heights.push(wrapped_line_count(lines, content_width));
@@ -2290,7 +2269,7 @@ impl MessagesPanel {
             }
             let lines = self.streaming_text.cached_lines();
             let has_previous = cached_count > 0 || !streaming_heights.is_empty();
-            if self.streaming_spacer(SegmentKind::Assistant, has_previous) {
+            if has_previous {
                 streaming_heights.push(1);
             }
             streaming_heights.push(wrapped_line_count(lines, content_width));
@@ -2300,10 +2279,10 @@ impl MessagesPanel {
         // The reflow window is picked from `scroll_top` and the bottom pin,
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
-        self.cache.update_margins(width, self.compact());
+        self.cache.update_margins(width);
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
-        self.cache.update_margins(width, self.compact());
+        self.cache.update_margins(width);
         if !has_selection {
             self.reclaim_spacers(width, area.height);
         }
@@ -2352,7 +2331,7 @@ impl MessagesPanel {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
                 continue;
             }
-            if self.streaming_spacer(kind, cached_count > 0 || height_idx > 0) {
+            if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 cursor.render(
@@ -2557,9 +2536,7 @@ impl MessagesPanel {
             };
             let mut segment = Segment::with_lines(lines, String::new(), None);
             segment.set_kind(SegmentKind::Thinking);
-            segment.set_margin_top(u16::from(
-                self.streaming_spacer(SegmentKind::Thinking, cached_count > 0),
-            ));
+            segment.set_margin_top(u16::from(cached_count > 0));
             segment.set_provenance(provenance);
             if let Some(fragment) =
                 selection::extract_segment_fragment(&segment, segment_start, width, sel, msg_area)
@@ -2578,10 +2555,9 @@ impl MessagesPanel {
             None,
         );
         segment.set_kind(SegmentKind::Assistant);
-        segment.set_margin_top(u16::from(self.streaming_spacer(
-            SegmentKind::Assistant,
+        segment.set_margin_top(u16::from(
             cached_count > 0 || !self.streaming_thinking.is_empty(),
-        )));
+        ));
         segment.set_provenance(self.streaming_text.provenance().cloned());
         if let Some(fragment) =
             selection::extract_segment_fragment(&segment, segment_start, width, sel, msg_area)
@@ -3032,10 +3008,7 @@ impl MessagesPanel {
         if !self.streaming_thinking_collapsed() {
             return false;
         }
-        // Rendering only draws this spacer when `streaming_spacer` asks for
-        // it, so assuming one here aimed every click a row past the thought
-        // it was meant to open.
-        let spacer = u32::from(self.streaming_spacer(SegmentKind::Thinking, self.cache.len() > 0));
+        let spacer = u32::from(self.cache.len() > 0);
         let thinking_start = self.cache.total_height(width) + spacer;
         let height = self.streaming_collapsed_height(width) as u32;
         doc_row >= thinking_start && doc_row < thinking_start + height
@@ -3179,8 +3152,7 @@ impl MessagesPanel {
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
-        self.cache
-            .update_margins(self.viewport_width, self.compact());
+        self.cache.update_margins(self.viewport_width);
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -3230,8 +3202,7 @@ impl MessagesPanel {
                 self.cache.push(segment);
             }
         }
-        self.cache
-            .update_margins(self.viewport_width, self.compact());
+        self.cache.update_margins(self.viewport_width);
         self.cache.mark_built(self.messages.len());
     }
 

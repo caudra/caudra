@@ -4145,6 +4145,7 @@ const SHELL_VIEW_STICKY_MSG: &str =
     "re-opening a shell card must restore the last raw/filtered view";
 const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
 const WRAPPED_AIR_MSG: &str = "a row taller than one line must be separated from its neighbours";
+const THOUGHT_AIR_MSG: &str = "reasoning must be separated from the call list around it";
 const MAX_COMPACT_CLICK_CYCLE: usize = 4;
 const TRUNCATING_LINES: usize = 200;
 const WIDE_ENOUGH_TO_NOT_WRAP: u16 = 80;
@@ -4194,11 +4195,12 @@ fn margins(panel: &MessagesPanel, width: u16) -> Vec<u16> {
         .collect()
 }
 
-/// A collapsed thought is one entry in the list, so it sits against the calls
-/// it interleaves with rather than announcing itself as a block.
+/// Reasoning is prose the model wrote, not a call it made. Even collapsed to
+/// a single line it is a block, and running it flush into the call list made
+/// it read as one more tool row.
 #[test_case(ViewMode::Compact ; "compact")]
 #[test_case(ViewMode::Auto ; "auto")]
-fn a_one_line_thought_joins_the_row_above_it(view: ViewMode) {
+fn a_thought_takes_air_from_the_rows_around_it(view: ViewMode) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(view);
     panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
@@ -4206,12 +4208,14 @@ fn a_one_line_thought_joins_the_row_above_it(view: ViewMode) {
     let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
     thought.reasoning_open = Some(false);
     panel.push(thought);
+    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t2"));
     render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
     assert_eq!(
         margins(&panel, WIDE_ENOUGH_TO_NOT_WRAP),
-        vec![0, 0],
-        "{COMPACT_GAPLESS_MSG}"
+        vec![0, 1, 1],
+        "{THOUGHT_AIR_MSG}"
     );
 }
 
@@ -5166,8 +5170,8 @@ fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
     assert_eq!(panel.segment_heights()[0], open, "{SPACER_REOPEN_MSG}");
 }
 
-const STREAMING_FLUSH_CLICK_MSG: &str =
-    "a live thought sitting flush must open on the row it is drawn at";
+const STREAMING_FLUSH_CLICK_MSG: &str = "a live thought must open on the row it is drawn at";
+const LIVE_THOUGHT_LABEL: &str = "Thinking";
 const STREAMING_WRAPPED_GAP_MSG: &str =
     "a live thought must take the same air after a wrapped row as a settled one";
 
@@ -5178,23 +5182,26 @@ fn wrapping_tool(panel: &mut MessagesPanel, id: &'static str) {
     panel.tool_done(done(id));
 }
 
-/// Hit testing assumed the separator was always there, while rendering only
-/// draws it when the thought is not flush. Every click on a flush thought
-/// landed a row below it and did nothing.
+/// Hit testing counted the separator itself instead of asking what was
+/// drawn, so a thought that sat anywhere but where it guessed swallowed every
+/// click. Locating the row in the rendered buffer is the only assertion that
+/// cannot drift from the spacing rule.
 #[test_case(ViewMode::Compact ; "compact")]
 #[test_case(ViewMode::Auto ; "auto")]
-fn a_live_thought_stacked_flush_opens_where_it_is_drawn(view: ViewMode) {
+fn a_live_thought_opens_on_the_row_it_is_drawn_at(view: ViewMode) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(view);
     panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t1"));
     panel.thinking_delta("weighing options");
-    render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+    let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+    let drawn = buffer_text(&terminal)
+        .lines()
+        .position(|line| line.contains(LIVE_THOUGHT_LABEL))
+        .expect("the live thought must be drawn") as u16;
 
-    let thought_row = panel.cache.total_height(WIDE_ENOUGH_TO_NOT_WRAP - 1) as u16;
-    assert_eq!(thought_row, 1, "{COMPACT_GAPLESS_MSG}");
     assert!(
-        panel.handle_click(thought_row, Rect::new(0, 0, WIDE_ENOUGH_TO_NOT_WRAP, 24)),
+        panel.handle_click(drawn, Rect::new(0, 0, WIDE_ENOUGH_TO_NOT_WRAP, 24)),
         "{STREAMING_FLUSH_CLICK_MSG}"
     );
     assert!(

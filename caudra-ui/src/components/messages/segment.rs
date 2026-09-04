@@ -469,21 +469,18 @@ fn tool_kind(current: SegmentKind, lines: &ToolLines, compact: bool) -> SegmentK
 }
 
 /// A row that reads as one entry in a list rather than as its own block.
-/// Compact folds reasoning in, which is what lets a thought sit against the
-/// tool calls it interleaves with.
-pub(super) fn dense_kind(kind: SegmentKind, compact: bool) -> bool {
-    kind == SegmentKind::ToolInline || (compact && kind == SegmentKind::Thinking)
+/// Reasoning is prose the model wrote, not a call it made, so it stays a
+/// block in every mode and never joins the list.
+fn dense_kind(kind: SegmentKind) -> bool {
+    kind == SegmentKind::ToolInline
 }
 
 /// Single-line tool rows read as a list, so they sit flush against each other.
 /// A row that wraps or carries a body has stopped being a list entry and is
 /// given air on both sides, or it runs into its neighbours and the eye cannot
 /// tell where one call ends and the next begins.
-fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16), compact: bool) -> bool {
-    dense_kind(previous.0, compact)
-        && dense_kind(current.0, compact)
-        && previous.1 <= 1
-        && current.1 <= 1
+fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16)) -> bool {
+    dense_kind(previous.0) && dense_kind(current.0) && previous.1 <= 1 && current.1 <= 1
 }
 
 pub(super) struct SegmentCache {
@@ -607,13 +604,11 @@ impl SegmentCache {
         self.segments.len()
     }
 
-    pub fn update_margins(&mut self, width: u16, compact: bool) {
+    pub fn update_margins(&mut self, width: u16) {
         let mut previous = None;
         for segment in &mut self.segments {
             let current = (segment.kind(), segment.content_height(width));
-            let margin = previous.map_or(0, |previous| {
-                u16::from(!stacks_flush(previous, current, compact))
-            });
+            let margin = previous.map_or(0, |previous| u16::from(!stacks_flush(previous, current)));
             segment.set_margin_top(margin);
             previous = Some(current);
         }
@@ -672,7 +667,7 @@ mod tests {
         cache.push(inline_tool("first".into()));
         cache.push(inline_tool("second".into()));
 
-        cache.update_margins(80, false);
+        cache.update_margins(80);
 
         assert_eq!(cache.segments[0].margin_top, 0);
         assert_eq!(cache.segments[1].margin_top, 0);
@@ -684,7 +679,7 @@ mod tests {
         cache.push(inline_tool("x".repeat(80)));
         cache.push(inline_tool("next".into()));
 
-        cache.update_margins(40, false);
+        cache.update_margins(40);
 
         assert_eq!(cache.segments[1].margin_top, 1);
     }
@@ -695,7 +690,7 @@ mod tests {
         cache.push(inline_tool("first".into()));
         cache.push(inline_tool("x".repeat(80)));
 
-        cache.update_margins(40, false);
+        cache.update_margins(40);
 
         assert_eq!(cache.segments[1].margin_top, 1);
     }
