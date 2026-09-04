@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::{AgentEvent, EventSender};
 
+mod command_arity;
 #[allow(dead_code)]
 pub(crate) mod command_pattern;
 mod structured;

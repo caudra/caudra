@@ -1,4 +1,4 @@
-const MAX_PATTERN_TOKENS: usize = 8;
+pub(super) const MAX_PATTERN_TOKENS: usize = 8;
 const MAX_PREFIX_LITERALS: usize = 3;
 
 pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
@@ -120,24 +120,60 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
         .into_iter()
         .map(decode_static_token)
         .collect::<Option<_>>()?;
-    let executable = decoded.first()?;
-    let first_argument = decoded.get(1)?;
-    if !is_pattern_literal(executable) || first_argument.starts_with('-') {
+    if !is_pattern_literal(decoded.first()?) {
         return None;
     }
 
-    let literal_count = decoded
+    let literals = match super::command_arity::curated_literals(&decoded) {
+        Some(curated) => curated_literals(&decoded, curated)?,
+        None => heuristic_literals(&decoded)?,
+    };
+    if overlaps_builtin_ask(literals) {
+        return None;
+    }
+
+    Some(format!("{} *", literals.join(" ")))
+}
+
+/// A curated entry is a deliberate decision, so it may keep a bare executable or
+/// the whole command where the heuristic may not. It still refuses to reach past
+/// a flag, because `git -C /repo commit` would otherwise yield `git -C *`.
+fn curated_literals(decoded: &[String], literals: usize) -> Option<&[String]> {
+    (literals <= decoded.len()
+        && decoded[1..literals]
+            .iter()
+            .all(|token| is_subcommand_word(token)))
+    .then(|| &decoded[..literals])
+}
+
+/// Without curation the leading tokens are only guessed to be subcommands, so a
+/// guess that degenerates to the bare executable or swallows every operand is
+/// discarded rather than offered.
+fn heuristic_literals(decoded: &[String]) -> Option<&[String]> {
+    if decoded.get(1)?.starts_with('-') {
+        return None;
+    }
+    let literals = decoded
         .iter()
         .skip(1)
         .take(MAX_PREFIX_LITERALS - 1)
         .take_while(|token| is_subcommand_word(token))
         .count()
         + 1;
-    if literal_count == 1 || literal_count == decoded.len() {
-        return None;
-    }
+    (literals > 1 && literals < decoded.len()).then(|| &decoded[..literals])
+}
 
-    Some(format!("{} *", decoded[..literal_count].join(" ")))
+/// A pattern that shares a prefix with an ask family in either direction covers
+/// or is covered by it, and a stored rule silences the ask entirely.
+fn overlaps_builtin_ask(literals: &[String]) -> bool {
+    BUILTIN_ASK_PATTERNS.iter().any(|pattern| {
+        pattern
+            .strip_suffix(" *")
+            .unwrap_or(pattern)
+            .split_whitespace()
+            .zip(literals)
+            .all(|(ask, literal)| ask == literal.as_str())
+    })
 }
 
 pub(crate) fn specificity(pattern: &str) -> Option<(usize, usize)> {
@@ -184,8 +220,9 @@ fn is_subcommand_word(token: &str) -> bool {
 
 fn contains_unquoted_shell_operator(token: &str) -> bool {
     let mut quote = None;
-    let mut chars = token.chars();
+    let mut chars = token.chars().peekable();
     while let Some(character) = chars.next() {
+        let substitutes = character == '`' || (character == '$' && chars.peek() == Some(&'('));
         match quote {
             None => match character {
                 '\'' => quote = Some(Quote::Single),
@@ -194,6 +231,7 @@ fn contains_unquoted_shell_operator(token: &str) -> bool {
                     chars.next();
                 }
                 '<' | '>' | '|' | '&' | ';' => return true,
+                _ if substitutes => return true,
                 _ => {}
             },
             Some(Quote::Single) if character == '\'' => quote = None,
@@ -201,6 +239,7 @@ fn contains_unquoted_shell_operator(token: &str) -> bool {
             Some(Quote::Double) if character == '\\' => {
                 chars.next();
             }
+            Some(Quote::Double) if substitutes => return true,
             Some(Quote::Single | Quote::Double) => {}
         }
     }
@@ -308,6 +347,10 @@ mod tests {
     #[test_case("git status *", "git status\nrm -rf /"; "command separator newline")]
     #[test_case("git status *", r"git status $'a\'b' > victim"; "ansi c quote")]
     #[test_case("git status *", "/tmp/git status"; "path qualified executable")]
+    #[test_case("git status *", "git status $(id)"; "command substitution")]
+    #[test_case("git status *", r#"git status "$(id)""#; "quoted command substitution")]
+    #[test_case("git status *", "git status `id`"; "backtick substitution")]
+    #[test_case("git status *", r#"git status "`id`""#; "quoted backtick substitution")]
     fn patterns_reject_invalid_or_nonliteral_matches(pattern: &str, command: &str) {
         assert!(!matches(pattern, command));
     }
@@ -324,8 +367,33 @@ mod tests {
     #[test_case("git status $(format)", None; "command substitution")]
     #[test_case("git status *.rs", None; "glob expansion")]
     #[test_case(r#"git status "unterminated"#, None; "malformed input")]
+    #[test_case("rg foo src/", Some("rg *"); "curated tool keeps its operand out")]
+    #[test_case("rg -n foo", Some("rg *"); "curated tool reaches past a leading flag")]
+    #[test_case("wc -l src/lib.rs", Some("wc *"))]
+    #[test_case("ls -la", Some("ls *"))]
+    #[test_case("npm run build", Some("npm run build *"); "curated prefix takes every operand")]
+    #[test_case("npm install react", Some("npm install *"))]
+    #[test_case("uv run pytest tests/", Some("uv run pytest *"))]
+    #[test_case("just check", Some("just check *"); "curated prefix is the whole command")]
+    #[test_case("make lint", Some("make lint *"))]
+    #[test_case("docker run nginx", Some("docker run *"); "curated prefix caps the heuristic")]
+    #[test_case("docker compose up -d", Some("docker compose up *"))]
+    #[test_case("git stash pop", Some("git stash pop *"))]
+    #[test_case("go build ./...", Some("go build *"))]
+    #[test_case("go run ./cmd/app", None; "curated prefix stops at a path operand")]
+    #[test_case("docker -H tcp://host run nginx", None; "curated prefix stops at a flag")]
+    #[test_case("git checkout main --force", None; "prefix of a builtin ask family")]
+    #[test_case("ssh host run backup", None; "extends a builtin ask family")]
     fn derives_only_reusable_static_prefixes(command: &str, expected: Option<&str>) {
-        assert_eq!(reusable_prefix(command).as_deref(), expected);
+        let derived = reusable_prefix(command);
+        assert_eq!(derived.as_deref(), expected);
+        if let Some(pattern) = derived {
+            assert!(
+                specificity(&pattern).is_some(),
+                "{pattern} is not a pattern"
+            );
+            assert!(matches(&pattern, command), "{pattern} misses {command}");
+        }
     }
 
     #[test]

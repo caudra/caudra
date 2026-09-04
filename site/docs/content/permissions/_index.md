@@ -172,6 +172,10 @@ Bash scopes include the normalized initial working directory. Tree-sitter walks 
 
 The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments rather than arbitrary text.
 
+A shell prompt offers a reusable pattern derived from the reviewed command. A curated table names the families whose first operand is data rather than a subcommand, so `rg needle src/` offers `rg *` and keeps the search term out of the rule. The table also names the families whose subcommand sits behind a namespace token, so `npm run build` offers `npm run build *`. Outside the table the leading lowercase words become the prefix, so `git commit -m "message"` offers `git commit *`.
+
+A prefix never reaches past a flag, so `docker -H tcp://host run nginx` offers no pattern. A prefix taken from outside the table must name more than the executable and must leave at least one operand behind, which is why `git status` offers no pattern. Caudra also offers no pattern that shares a prefix with a default ask family, because storing `git checkout main *` would silence the `git checkout *` ask.
+
 Command substitution, process substitution, subshells, arithmetic expansion, wrappers such as `eval` and `sudo`, file redirects, heredocs, and parse failures all mark the command protected. A protected command is reviewed as one whole command line.
 
 Configured allows, scope allows, and command patterns never cover a protected command. The two unrestricted shell authorities do, because they already authorize any command the user can write, including `tee` and an interpreter reading a script from standard input. Selecting one requires the `ALLOW BROAD SHELL ACCESS` phrase. Deny rules still apply. Builtin command-family asks do not reach protected commands, so a broad grant also silences those asks for them.

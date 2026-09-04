@@ -2782,6 +2782,68 @@ mod tests {
     }
 
     #[test]
+    fn shell_pattern_option_reuses_a_reviewed_subcommand() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource(r#"git commit -m "first""#, "/project")],
+            json!({"command": r#"git commit -m "first""#}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_command_patterns")
+            .unwrap();
+
+        assert_eq!(option.label, "Any `git commit` command in this workdir");
+
+        let next = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource(r#"git commit -m "second""#, "/project")],
+            json!({"command": r#"git commit -m "second""#}),
+        );
+        assert!(permission_rule_covers_request(&option.rule, &next));
+    }
+
+    #[test]
+    fn shell_pattern_option_keeps_a_curated_search_term_out_of_the_rule() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("rg needle src/", "/project")],
+            json!({"command": "rg needle src/"}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_command_patterns")
+            .unwrap();
+
+        assert_eq!(option.label, "Any `rg` command in this workdir");
+
+        let next = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("rg other tests/", "/project")],
+            json!({"command": "rg other tests/"}),
+        );
+        assert!(permission_rule_covers_request(&option.rule, &next));
+    }
+
+    #[test]
+    fn shell_pattern_option_is_absent_for_builtin_ask_families() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("git checkout main --force", "/project")],
+            json!({"command": "git checkout main --force"}),
+        );
+
+        assert!(
+            request
+                .options
+                .iter()
+                .all(|option| option.id != "allow_command_patterns")
+        );
+    }
+
+    #[test]
     fn shell_pattern_option_is_absent_without_a_reusable_prefix() {
         let request = explicit_request(
             PermissionAuthorityProfile::Shell,
