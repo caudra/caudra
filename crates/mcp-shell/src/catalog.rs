@@ -30,6 +30,8 @@ Usage notes:
 - Always quote file paths that contain spaces.
 - Non-zero exits are completed results with an exit code so the caller can inspect and continue.
 - Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.
+- The result is already bounded per stream and, by default, reduced by a built-in filter that keeps errors, warnings, and summaries. Run the command directly instead of piping into head or tail: blind truncation defeats that filter entirely, because it applies only to a single-program command, and it withholds live output until the process exits. Piping into rg or grep to search output is fine.
+- Prefer separate streams to 2>&1. Merged output is filtered as stdout, so stderr diagnostics become subject to stdout line caps instead of being carried in full.
 - Background execution is unsupported; descendants that retain output pipes are terminated."#;
 
 #[must_use]
@@ -99,6 +101,14 @@ mod tests {
         assert!(description.contains("unsafe and unsandboxed"));
         // Cross-tool steering only works when both descriptions agree on the preference.
         assert!(description.contains("prefer the code execution tool for pure computation"));
+        // A caller that truncates before the server sees the output defeats the rule corpus, which
+        // applies only to a single-program command, and suppresses live progress. The exemption for
+        // rg and grep keeps this consistent with the filesystem catalog's guidance to search command
+        // output with a pipeline; that agreement cannot be asserted here because this crate does not
+        // depend on mcp-files.
+        assert!(description.contains("instead of piping into head or tail"));
+        assert!(description.contains("Piping into rg or grep to search output is fine"));
+        assert!(description.contains("Prefer separate streams to 2>&1"));
         assert_eq!(
             tools[0].input_schema["properties"]["timeout"]["description"],
             "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."
