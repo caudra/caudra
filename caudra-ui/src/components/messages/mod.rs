@@ -2159,13 +2159,22 @@ impl MessagesPanel {
     /// and needs the same rule applied by hand. A compact collapsed thought is
     /// a list row like the calls above it, and a gap that vanished the instant
     /// the block settled would be the only thing announcing the difference.
+    /// Both heights are checked for the same reason `stacks_flush` checks
+    /// them: a wrapped row is no longer a list entry.
     fn streaming_thinking_stacks_flush(&self) -> bool {
-        self.compact()
-            && self.streaming_thinking_collapsed()
-            && self
-                .cache
-                .last_kind()
-                .is_some_and(|kind| segment::dense_kind(kind, self.compact()))
+        if !self.compact() || !self.streaming_thinking_collapsed() {
+            return false;
+        }
+        let width = self.viewport_width;
+        self.cache.segments().last().is_some_and(|previous| {
+            segment::dense_kind(previous.kind(), true) && previous.content_height(width) <= 1
+        }) && self.streaming_collapsed_height(width) <= 1
+    }
+
+    fn streaming_collapsed_height(&self, width: u16) -> u16 {
+        let content_width =
+            SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
+        wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width)
     }
 
     /// Whether a blank line separates this streaming block from what precedes
@@ -3023,13 +3032,12 @@ impl MessagesPanel {
         if !self.streaming_thinking_collapsed() {
             return false;
         }
-        let cached_height = self.cache.total_height(width);
-        let spacer = if self.cache.len() > 0 { 1 } else { 0 };
-        let thinking_start = cached_height + spacer;
-        let content_width =
-            SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
-        let height =
-            wrapped_line_count(&self.build_streaming_collapsed_lines(), content_width) as u32;
+        // Rendering only draws this spacer when `streaming_spacer` asks for
+        // it, so assuming one here aimed every click a row past the thought
+        // it was meant to open.
+        let spacer = u32::from(self.streaming_spacer(SegmentKind::Thinking, self.cache.len() > 0));
+        let thinking_start = self.cache.total_height(width) + spacer;
+        let height = self.streaming_collapsed_height(width) as u32;
         doc_row >= thinking_start && doc_row < thinking_start + height
     }
 

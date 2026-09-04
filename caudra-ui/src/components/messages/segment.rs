@@ -476,12 +476,14 @@ pub(super) fn dense_kind(kind: SegmentKind, compact: bool) -> bool {
 }
 
 /// Single-line tool rows read as a list, so they sit flush against each other.
-/// Compact drops the height condition: every row there is one entry, and a
-/// wrapped one is still one entry.
+/// A row that wraps or carries a body has stopped being a list entry and is
+/// given air on both sides, or it runs into its neighbours and the eye cannot
+/// tell where one call ends and the next begins.
 fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16), compact: bool) -> bool {
     dense_kind(previous.0, compact)
         && dense_kind(current.0, compact)
-        && (compact || (previous.1 <= 1 && current.1 <= 1))
+        && previous.1 <= 1
+        && current.1 <= 1
 }
 
 pub(super) struct SegmentCache {
@@ -603,11 +605,6 @@ impl SegmentCache {
 
     pub fn len(&self) -> usize {
         self.segments.len()
-    }
-
-    /// What the streaming block below the cache would be following.
-    pub fn last_kind(&self) -> Option<SegmentKind> {
-        self.segments.last().map(Segment::kind)
     }
 
     pub fn update_margins(&mut self, width: u16, compact: bool) {

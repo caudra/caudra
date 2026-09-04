@@ -4144,8 +4144,11 @@ const CONTAINER_BODY_MSG: &str = "a container must keep its child rows in compac
 const SHELL_VIEW_STICKY_MSG: &str =
     "re-opening a shell card must restore the last raw/filtered view";
 const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
+const WRAPPED_AIR_MSG: &str = "a row taller than one line must be separated from its neighbours";
 const MAX_COMPACT_CLICK_CYCLE: usize = 4;
 const TRUNCATING_LINES: usize = 200;
+const WIDE_ENOUGH_TO_NOT_WRAP: u16 = 80;
+const NARROW_ENOUGH_TO_WRAP: u16 = 40;
 
 fn compact_panel(ids: &[(&str, &'static str)]) -> MessagesPanel {
     let mut panel = panel_with_tools(ids);
@@ -4185,10 +4188,41 @@ fn compact_rows_stack_without_separator_lines() {
     assert_eq!(panel.segment_heights(), vec![1, 1], "{COMPACT_GAPLESS_MSG}");
 }
 
-#[test]
-fn reasoning_and_wrapped_rows_join_the_compact_list() {
+fn margins(panel: &MessagesPanel, width: u16) -> Vec<u16> {
+    (0..panel.cache.len())
+        .map(|i| panel.cache.get(i).unwrap().chrome(width).margin_top)
+        .collect()
+}
+
+/// A collapsed thought is one entry in the list, so it sits against the calls
+/// it interleaves with rather than announcing itself as a block.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_one_line_thought_joins_the_row_above_it(view: ViewMode) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_view(ViewMode::Compact);
+    panel.set_view(view);
+    panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
+    thought.reasoning_open = Some(false);
+    panel.push(thought);
+    render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+
+    assert_eq!(
+        margins(&panel, WIDE_ENOUGH_TO_NOT_WRAP),
+        vec![0, 0],
+        "{COMPACT_GAPLESS_MSG}"
+    );
+}
+
+/// The reason the mode felt cramped: a row that wraps is no longer a list
+/// entry, and running it flush into its neighbours hides where it starts and
+/// ends. It takes a blank row on both sides.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
     let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
     thought.reasoning_open = Some(false);
     panel.push(thought);
@@ -4198,17 +4232,40 @@ fn reasoning_and_wrapped_rows_join_the_compact_list() {
     panel.tool_done(done("t1"));
     panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t2"));
-    render(&mut panel, 40, 24);
+    render(&mut panel, NARROW_ENOUGH_TO_WRAP, 24);
 
     assert!(
-        panel.segment_heights()[1] > 1,
+        panel.segment_heights()[1] > 2,
         "the long row must wrap: {:?}",
         panel.segment_heights()
     );
-    let margins: Vec<u16> = (0..panel.cache.len())
-        .map(|i| panel.cache.get(i).unwrap().chrome(40).margin_top)
-        .collect();
-    assert_eq!(margins, vec![0, 0, 0], "{COMPACT_GAPLESS_MSG}");
+    assert_eq!(
+        margins(&panel, NARROW_ENOUGH_TO_WRAP),
+        vec![0, 1, 1],
+        "{WRAPPED_AIR_MSG}"
+    );
+}
+
+/// Auto opens the newest read-only call, and an open body is a block. It must
+/// not run into the dense rows above it.
+#[test]
+fn the_card_auto_opens_separates_from_the_list_above_it() {
+    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.tool_done(done("t1"));
+    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_done(long_done("t2", HELD_BODY_LINES));
+    render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+
+    assert!(
+        panel.segment_heights()[1] > 1,
+        "auto must open the newest call: {:?}",
+        panel.segment_heights()
+    );
+    assert_eq!(
+        margins(&panel, WIDE_ENOUGH_TO_NOT_WRAP),
+        vec![0, 1],
+        "{WRAPPED_AIR_MSG}"
+    );
 }
 
 #[test]
@@ -5107,4 +5164,59 @@ fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
     rebuild(&mut panel);
 
     assert_eq!(panel.segment_heights()[0], open, "{SPACER_REOPEN_MSG}");
+}
+
+const STREAMING_FLUSH_CLICK_MSG: &str =
+    "a live thought sitting flush must open on the row it is drawn at";
+const STREAMING_WRAPPED_GAP_MSG: &str =
+    "a live thought must take the same air after a wrapped row as a settled one";
+
+fn wrapping_tool(panel: &mut MessagesPanel, id: &'static str) {
+    let mut long = start(id, FILE_READ_TOOL_NAME);
+    long.summary = "a/very/deeply/nested/path/that/has/to/wrap/at/this/width.md".into();
+    panel.tool_start(long);
+    panel.tool_done(done(id));
+}
+
+/// Hit testing assumed the separator was always there, while rendering only
+/// draws it when the thought is not flush. Every click on a flush thought
+/// landed a row below it and did nothing.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_live_thought_stacked_flush_opens_where_it_is_drawn(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    panel.thinking_delta("weighing options");
+    render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
+
+    let thought_row = panel.cache.total_height(WIDE_ENOUGH_TO_NOT_WRAP - 1) as u16;
+    assert_eq!(thought_row, 1, "{COMPACT_GAPLESS_MSG}");
+    assert!(
+        panel.handle_click(thought_row, Rect::new(0, 0, WIDE_ENOUGH_TO_NOT_WRAP, 24)),
+        "{STREAMING_FLUSH_CLICK_MSG}"
+    );
+    assert!(
+        panel.streaming_reasoning_open(),
+        "{STREAMING_FLUSH_CLICK_MSG}"
+    );
+}
+
+#[test]
+fn a_live_thought_after_a_wrapped_row_keeps_its_separator() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    wrapping_tool(&mut panel, "t1");
+    render(&mut panel, NARROW_ENOUGH_TO_WRAP, 24);
+    let settled = panel.last_total_lines;
+
+    panel.thinking_delta("weighing options");
+    render(&mut panel, NARROW_ENOUGH_TO_WRAP, 24);
+
+    assert!(
+        panel.last_total_lines > settled + 1,
+        "{STREAMING_WRAPPED_GAP_MSG} (settled: {settled}, now: {})",
+        panel.last_total_lines
+    );
 }
