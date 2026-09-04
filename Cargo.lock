@@ -830,7 +830,7 @@ dependencies = [
  "async-io",
  "async-lock",
  "async-process",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bitflags 2.13.1",
  "caudra-config",
  "caudra-otel",
@@ -939,7 +939,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-lock",
- "base64 0.22.1",
+ "base64 0.23.1",
  "caudra-agent",
  "caudra-config",
  "caudra-highlight",
@@ -1052,7 +1052,7 @@ dependencies = [
 name = "caudra-providers"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "caudra-config",
  "caudra-storage",
  "fastrand",
@@ -1111,7 +1111,7 @@ dependencies = [
  "arc-swap",
  "async-lock",
  "async-process",
- "base64 0.22.1",
+ "base64 0.23.1",
  "caudra-agent",
  "caudra-config",
  "caudra-highlight",
