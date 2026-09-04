@@ -114,7 +114,7 @@ It is off by default, so a normal run reaches only the model provider you config
 
 ### `ui.tool_output_lines`
 
-How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
+How many lines of output an open card shows per tool before it says how many it is holding back. Clicking the card shows all of it regardless. All values are `usize` with a minimum of 1.
 
 | Field | Default | Tools |
 |-------|---------|-------|

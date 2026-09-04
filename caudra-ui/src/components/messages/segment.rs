@@ -3,7 +3,7 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::{BatchViews, RowTarget, SectionFlags};
+use super::super::code_view::{BatchViews, RowTarget};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use caudra_agent::{ToolInput, ToolOutput};
@@ -100,7 +100,7 @@ pub(super) struct Segment {
     pub msg_index: Option<usize>,
     kind: SegmentKind,
     margin_top: u16,
-    pub truncation: SectionFlags,
+    pub truncation: bool,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
@@ -504,7 +504,7 @@ fn tool_kind(current: SegmentKind, lines: &ToolLines, compact: bool) -> SegmentK
     if lines.lines.len() == 1
         && lines.highlight.is_none()
         && lines.snapshot_base.is_none()
-        && !lines.truncation.any()
+        && !lines.truncation
     {
         SegmentKind::ToolInline
     } else {
@@ -683,7 +683,6 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::code_view::ChildView;
     use super::*;
     use test_case::test_case;
 
@@ -837,10 +836,9 @@ mod tests {
         let mut seg = seg_with_base(8, None);
         seg.highlight_range = Some((1, 3));
         seg.rows = vec![None; 8];
-        seg.rows[7] = Some(RowTarget::BatchChild(9));
-        let hl_rows: Vec<Option<RowTarget>> = (0..replacement_lines)
-            .map(|i| Some(RowTarget::BatchChild(i)))
-            .collect();
+        seg.rows[7] = Some(RowTarget(9));
+        let hl_rows: Vec<Option<RowTarget>> =
+            (0..replacement_lines).map(|i| Some(RowTarget(i))).collect();
 
         seg.apply_highlight_result(
             (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
@@ -851,7 +849,7 @@ mod tests {
         assert_eq!(&seg.rows[1..1 + replacement_lines], hl_rows.as_slice());
         assert_eq!(
             seg.rows.last().copied().flatten(),
-            Some(RowTarget::BatchChild(9)),
+            Some(RowTarget(9)),
             "a row after the splice moves with its line"
         );
     }
@@ -866,7 +864,7 @@ mod tests {
 
         seg.apply_highlight_result(
             (0..3).map(|_| Line::raw("hl")).collect(),
-            vec![Some(RowTarget::BatchChild(0))],
+            vec![Some(RowTarget(0))],
         );
 
         assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");
@@ -882,7 +880,7 @@ mod tests {
             range: (1, 3),
             input: None,
             output: None,
-            limits: RenderLimits::new(SectionFlags::default(), 0, views, Default::default()),
+            limits: RenderLimits::new(false, 0, views),
         };
         let seg = Segment {
             highlight_key: HighlightKey::from_request(Some(&request(BatchViews::default()))),
@@ -891,8 +889,7 @@ mod tests {
             ..Segment::default()
         };
 
-        let opened =
-            HighlightKey::from_request(Some(&request(BatchViews::new([(0, ChildView::Budgeted)]))));
+        let opened = HighlightKey::from_request(Some(&request(BatchViews::new([0]))));
         assert!(seg.reuse_highlight(&opened, (1, 3)).is_none());
         let same = HighlightKey::from_request(Some(&request(BatchViews::default())));
         assert!(seg.reuse_highlight(&same, (1, 3)).is_some());

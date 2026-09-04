@@ -305,7 +305,8 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
         out,
-        "How many lines of output to show per tool in the UI. \
+        "How many lines of output an open card shows per tool before it says how many it \
+         is holding back. Clicking the card shows all of it regardless. \
          All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
     )
     .unwrap();

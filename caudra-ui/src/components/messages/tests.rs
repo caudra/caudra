@@ -4821,6 +4821,94 @@ fn the_mode_only_decides_cards_that_changed_nothing(
     assert_eq!(!panel.card_closed("t1"), open, "{MODE_EFFECT_MSG}");
 }
 
+const ONE_CLICK_MSG: &str = "one click must show the whole body, whatever the mode drew before";
+const REST_MSG: &str = "a transcript that gives every call a card has no header to close to, so a full card falls \
+     back to the budget it rested at";
+const BODY_TAIL: &str = "line 7";
+const CLICKED_BODY_LINES: usize = 8;
+
+/// The budget is where a card rests, never where a click lands. Walking a
+/// reader through it cost a second click to answer the question the first one
+/// asked, and cost a different number of clicks per mode.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+fn one_click_opens_the_whole_body(view: ViewMode) {
+    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.set_view(view);
+    panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
+    rebuild(&mut panel);
+    assert!(
+        !seg_text(&panel, "t1").contains(BODY_TAIL),
+        "{MODE_EFFECT_MSG}"
+    );
+
+    assert!(
+        panel.handle_click(0, Rect::new(0, 0, 80, 24)),
+        "{COMPACT_CLICK_MSG}"
+    );
+    rebuild(&mut panel);
+
+    assert!(
+        seg_text(&panel, "t1").contains(BODY_TAIL),
+        "{ONE_CLICK_MSG}"
+    );
+}
+
+/// Expanded draws every call as its own card, so `close_card` refuses and the
+/// way back out of a full body is the resting budget.
+#[test]
+fn a_full_card_in_expanded_falls_back_to_the_budget() {
+    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    rebuild(&mut panel);
+    assert!(
+        seg_text(&panel, "t1").contains(BODY_TAIL),
+        "{ONE_CLICK_MSG}"
+    );
+
+    assert!(panel.handle_click(0, area), "{REST_MSG}");
+    rebuild(&mut panel);
+
+    assert!(!panel.card_closed("t1"), "{REST_MSG}");
+    assert!(!seg_text(&panel, "t1").contains(BODY_TAIL), "{REST_MSG}");
+}
+
+/// `code_execution` draws a script and an output, which used to be separately
+/// disclosed and so took two clicks past the first to open.
+#[test]
+fn a_script_and_its_output_open_together() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    panel.tool_start(ToolStartEvent {
+        input: Some(ToolInput::Code {
+            language: "python".into(),
+            code: (0..CLICKED_BODY_LINES)
+                .map(|i| format!("script {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }),
+        ..start("t1", "code_execution")
+    });
+    panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
+    rebuild(&mut panel);
+
+    assert!(
+        panel.handle_click(0, Rect::new(0, 0, 80, 24)),
+        "{COMPACT_CLICK_MSG}"
+    );
+    rebuild(&mut panel);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("script 7"), "{ONE_CLICK_MSG}");
+    assert!(text.contains(BODY_TAIL), "{ONE_CLICK_MSG}");
+}
+
 /// The point of auto: the call being worked on reads in full, and the ones
 /// behind it fall back to a row without the reader touching anything.
 #[test]
@@ -4969,7 +5057,7 @@ fn batch_row(panel: &MessagesPanel, target: RowTarget) -> u16 {
 }
 
 fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
-    batch_row(panel, RowTarget::BatchChild(index))
+    batch_row(panel, RowTarget(index))
 }
 
 /// The bug: a batch dumped every child body into the transcript, which is
@@ -5187,17 +5275,22 @@ fn held_rows_go_back_once_they_are_off_screen() {
 /// comes back taller than it ever was.
 #[test]
 fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
-    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
-    let open = panel.segment_heights()[0];
-    supersede(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+    // A click opens the whole body, so the height to match is a card that
+    // opened the same way without ever holding rows.
+    let mut fresh = auto_panel_with_body(HELD_BODY_LINES);
+    assert!(fresh.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    rebuild(&mut fresh);
+    let opened = fresh.segment_heights()[0];
 
-    assert!(
-        panel.handle_click(0, Rect::new(0, 0, 80, 24)),
-        "{COMPACT_CLICK_MSG}"
-    );
+    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
+    supersede(&mut panel);
+    assert!(panel.segment_heights()[0] > 1, "{SPACER_HOLD_MSG}");
+
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
     rebuild(&mut panel);
 
-    assert_eq!(panel.segment_heights()[0], open, "{SPACER_REOPEN_MSG}");
+    assert_eq!(panel.segment_heights()[0], opened, "{SPACER_REOPEN_MSG}");
 }
 
 const STREAMING_FLUSH_CLICK_MSG: &str = "a live thought must open on the row it is drawn at";

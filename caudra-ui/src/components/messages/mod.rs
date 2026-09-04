@@ -17,7 +17,7 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_delta,
-    code_view::{BatchViewMap, ChildView, RowTarget, SectionFlags},
+    code_view::{BatchViewMap, Disclosure, RowTarget},
     review,
 };
 use crate::animation::spinner_str;
@@ -622,6 +622,15 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+/// What the reader asked of one card, overriding whatever the view mode would
+/// have drawn. There is no entry for the budgeted middle: that is where a card
+/// rests, never where a click lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardState {
+    Closed,
+    Full,
+}
+
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
     pub processed: u32,
@@ -647,9 +656,8 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     /// What the reader asked of a card, keyed by tool id. Absent leaves the
-    /// disclosure to the view mode. `None` inside is an explicit close, which
-    /// only matters where the mode would have opened it.
-    disclosure: HashMap<String, Option<SectionFlags>>,
+    /// disclosure to the view mode.
+    disclosure: HashMap<String, CardState>,
     /// Which shell cards the reader put into raw view. Kept apart from
     /// `disclosure` because it is a choice about the body rather than an
     /// expansion of it, so closing the card must not forget it.
@@ -839,16 +847,27 @@ impl MessagesPanel {
                 .is_some_and(|(_, role)| role.is_collapsible())
     }
 
-    /// `None` means header-only. The flags inside say how much of the body an
-    /// open card shows past the point it would be cut off.
-    fn tool_expansion(&self, tool_id: &str, open_by_default: bool) -> Option<SectionFlags> {
-        let mut flags = match self.disclosure.get(tool_id) {
-            Some(asked) => (*asked)?,
-            None if open_by_default => SectionFlags::default(),
+    /// `None` means header-only. A card the reader has not spoken about rests
+    /// within the tool's row budget; the budget is never what a click opens to,
+    /// so an asked-for card is always whole.
+    fn tool_expansion(&self, tool_id: &str, open_by_default: bool) -> Option<Disclosure> {
+        let full = match self.disclosure.get(tool_id) {
+            Some(CardState::Closed) => return None,
+            Some(CardState::Full) => true,
+            None if open_by_default => false,
             None => return None,
         };
-        flags.shell_raw = self.shell_raw.contains(tool_id);
-        Some(flags)
+        Some(Disclosure {
+            full,
+            shell_raw: self.shell_raw.contains(tool_id),
+        })
+    }
+
+    /// Shows the whole body, since that is the only thing a click opens to.
+    fn open_card(&mut self, tool_id: &str) {
+        self.disclosure.insert(tool_id.to_owned(), CardState::Full);
+        self.release_spacer(tool_id);
+        self.rebuild_expanded_tool(tool_id);
     }
 
     /// Auto keeps the card being written open and closes the one it replaced.
@@ -967,11 +986,9 @@ impl MessagesPanel {
 
     /// Whether a click on the row would change anything. Hover feedback and
     /// the click share this, or a row highlights and then ignores the press.
-    fn tool_click_acts(&self, tool_id: &str, truncation: SectionFlags) -> bool {
+    fn tool_click_acts(&self, tool_id: &str, truncation: bool) -> bool {
         let exp = self.tool_expansion(tool_id, self.card_opens_by_default(tool_id));
-        (exp.is_some() && self.card_can_close(tool_id))
-            || truncation.any()
-            || exp.is_some_and(SectionFlags::any)
+        (exp.is_some() && self.card_can_close(tool_id)) || truncation || exp.is_some_and(|d| d.full)
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -1297,7 +1314,7 @@ impl MessagesPanel {
         let inst_id = segment::instruction_id(parent_id);
         let exp = self
             .tool_expansion(&inst_id, self.card_opens_by_default(parent_id))
-            .map(|flags| flags.output);
+            .map(|d| d.full);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
         let tl = build_instructions_lines(blocks, width, exp);
@@ -1414,24 +1431,16 @@ impl MessagesPanel {
         else {
             return false;
         };
-        let exp = self
-            .disclosure
-            .get(tool_id)
-            .copied()
-            .flatten()
-            .unwrap_or_default();
-        if !seg.truncation.any() && !exp.any() {
+        let full = self.disclosure.get(tool_id) == Some(&CardState::Full);
+        if !seg.truncation && !full {
             return false;
         }
         let tool_id = tool_id.to_owned();
-        let flags = SectionFlags {
-            script: !exp.script,
-            output: !exp.output,
-            ..exp
-        };
-        self.disclosure.insert(tool_id.clone(), Some(flags));
-        self.release_spacer(&tool_id);
-        self.rebuild_expanded_tool(&tool_id);
+        if full {
+            self.rest_card(&tool_id);
+        } else {
+            self.open_card(&tool_id);
+        }
         true
     }
 
@@ -1942,19 +1951,16 @@ impl MessagesPanel {
             return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
-        // The first click on a compact row only reveals the body, which is
-        // what an expanded row shows unopened. Lua-rendered tools included:
-        // their snapshot is already here, so the runtime stays out of it
-        // until the reader asks for more.
+        // A click asks a question the row budget rarely answers, so the first
+        // one on a closed card shows all of the body. Lua-rendered tools
+        // included: their snapshot is already here, so the runtime stays out
+        // of it until the reader asks for more.
         if self.card_closed(tool_id) {
-            if !seg.truncation.any() {
+            if !seg.truncation {
                 return false;
             }
             let tool_id = tool_id.to_owned();
-            self.disclosure
-                .insert(tool_id.clone(), Some(SectionFlags::default()));
-            self.release_spacer(&tool_id);
-            self.rebuild_expanded_tool(&tool_id);
+            self.open_card(&tool_id);
             return true;
         }
 
@@ -2010,36 +2016,23 @@ impl MessagesPanel {
         }
         // A batch child answers for itself, before the card-wide expansion the
         // rest of the body falls back to.
-        if let Some(target) = seg.row_target_at(rel, width) {
-            let (index, view) = match target {
-                RowTarget::BatchChild(index) => (index, ChildView::Folded),
-                RowTarget::BatchBody(index) => (index, ChildView::Expanded),
-            };
+        if let Some(RowTarget(index)) = seg.row_target_at(rel, width) {
             let tool_id = tool_id.to_owned();
-            self.set_batch_view(&tool_id, index, view);
+            self.toggle_batch_child(&tool_id, index);
             return true;
         }
-        let nothing_to_open = !seg.truncation.any() && !exp.any();
         let tool_id = tool_id.to_owned();
-        let truncation = seg.truncation;
-        if nothing_to_open {
-            // An open card is already at rest, unless the mode left it a
-            // header to fall back to.
+        // The whole body is already on screen, so the only move left is the
+        // way back: to the header where the mode left one, and to the resting
+        // budget where it did not.
+        if exp.full {
+            return self.close_card(&tool_id) || self.rest_card(&tool_id);
+        }
+        // Resting and already complete, so there is nothing behind it to show.
+        if !seg.truncation {
             return self.close_card(&tool_id);
         }
-
-        let mut flags = exp;
-        if truncation.output || flags.output {
-            flags.output = !flags.output;
-        } else if truncation.script || flags.script {
-            flags.script = !flags.script;
-        }
-        if !flags.any() && self.card_can_close(&tool_id) {
-            return self.close_card(&tool_id);
-        }
-        self.disclosure.insert(tool_id.clone(), Some(flags));
-        self.release_spacer(&tool_id);
-        self.rebuild_expanded_tool(&tool_id);
+        self.open_card(&tool_id);
         true
     }
 
@@ -2050,7 +2043,20 @@ impl MessagesPanel {
         if !self.card_can_close(tool_id) || self.card_closed(tool_id) {
             return false;
         }
-        self.disclosure.insert(tool_id.to_owned(), None);
+        self.disclosure
+            .insert(tool_id.to_owned(), CardState::Closed);
+        self.release_spacer(tool_id);
+        self.rebuild_expanded_tool(tool_id);
+        true
+    }
+
+    /// Hands a card back to the view mode, which is the only way out of a full
+    /// body in a transcript that gives every call a card and so has no header
+    /// to close to.
+    fn rest_card(&mut self, tool_id: &str) -> bool {
+        if self.disclosure.remove(tool_id).is_none() {
+            return false;
+        }
         self.release_spacer(tool_id);
         self.rebuild_expanded_tool(tool_id);
         true
@@ -2061,15 +2067,15 @@ impl MessagesPanel {
         self.handle_click(row, area)
     }
 
-    /// One child changes how much of itself it shows, which is what the reader
-    /// asked for, and every other child stays exactly as it was.
-    fn set_batch_view(&mut self, tool_id: &str, index: usize, view: ChildView) {
+    /// One child opens or folds, which is what the reader asked for, and every
+    /// other child stays exactly as it was.
+    fn toggle_batch_child(&mut self, tool_id: &str, index: usize) {
         let views = self
             .batch_views
             .get(tool_id)
             .cloned()
             .unwrap_or_default()
-            .toggled(index, view);
+            .toggled(index);
         self.batch_views.insert(tool_id.to_owned(), views);
         self.rebuild_tool_segment(tool_id);
     }
@@ -2930,7 +2936,7 @@ impl MessagesPanel {
         msg: &DisplayMessage,
         status: ToolStatus,
         rctx: &RenderCtx,
-        exp: Option<SectionFlags>,
+        exp: Option<Disclosure>,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
         // A compact row is meant to be scannable, and a right-aligned clock

@@ -14,7 +14,6 @@ use caudra_agent::{
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
     SearchCap, ToolInput, ToolOutput,
 };
-use caudra_config::ToolOutputLines;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -442,12 +441,11 @@ fn render_batch(
     let mut rows = Vec::new();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
-        let view = limits.child_view(index);
+        let open = limits.child_open(index);
         // Resolved before the summary row so the separator below knows whether
         // this child is a list entry or a block.
-        let body = (view != ChildView::Folded)
-            .then(|| child_body(entry, highlight, &limits.for_child(view, &entry.tool)));
-        let has_body = body.as_ref().is_some_and(|(body, _)| !body.is_empty());
+        let body = open.then(|| child_body(entry, highlight, &limits.for_child()));
+        let has_body = body.as_ref().is_some_and(|body| !body.is_empty());
         if !lines.is_empty() && (previous_has_body || has_body) {
             lines.push(Line::default());
             rows.push(None);
@@ -469,23 +467,20 @@ fn render_batch(
             Style::default(),
             entry.raw_input.as_ref(),
         ));
-        if let Some(args) = compact_args_for(&entry.tool, entry.raw_input.as_ref()) {
+        if let Some(args) = compact_args_for(&entry.tool, &entry.summary, entry.raw_input.as_ref())
+        {
             spans.push(Span::styled(args, t.tool_dim));
         }
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        if view == ChildView::Folded {
+        if !open {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
-        rows.push(Some(RowTarget::BatchChild(index)));
-        if let Some((body, truncated)) = body {
-            // A body only answers to a click when there is something behind it
-            // to show, or something already shown to put back.
-            let target =
-                (truncated || view == ChildView::Expanded).then_some(RowTarget::BatchBody(index));
-            rows.resize(rows.len() + body.len(), target);
+        rows.push(Some(RowTarget(index)));
+        if let Some(body) = body {
+            rows.resize(rows.len() + body.len(), Some(RowTarget(index)));
             lines.extend(indent_all(body));
         }
     }
@@ -509,47 +504,30 @@ fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
 
 /// A child's own rendering, structured where the tool produced structure and
 /// its text otherwise. Errors read as plain text: a failed call has no
-/// structured result to draw.
+/// structured result to draw. An opened child draws whole, so nothing here
+/// truncates.
 fn child_body(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
-) -> (Vec<Line<'static>>, bool) {
+) -> Vec<Line<'static>> {
     let output = entry.output.as_ref();
     if entry.status == BatchToolStatus::Error {
-        return text_lines(
-            output.map_or(String::new(), ToolOutput::as_text),
-            limits.output,
-        );
+        return text_lines(output.map_or(String::new(), ToolOutput::as_text));
     }
     match output {
         Some(ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)) => {
-            text_lines(text.text.clone(), limits.output)
+            text_lines(text.text.clone())
         }
-        Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text(), limits.output),
-        other => {
-            let content =
-                render_tool_content(entry.input.as_ref(), other, highlight, limits.clone());
-            (content.lines, content.truncation.any())
-        }
+        Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text()),
+        other => render_tool_content(entry.input.as_ref(), other, highlight, limits.clone()).lines,
     }
 }
 
-/// Hiding a single line costs the same row as the notice that says so, so the
-/// line itself is shown instead and nothing is truncated.
-fn text_lines(text: String, max: usize) -> (Vec<Line<'static>>, bool) {
-    let total = text.lines().count();
-    let hidden = total.saturating_sub(max);
-    let truncated = should_truncate(hidden);
-    let mut lines: Vec<Line<'static>> = text
-        .lines()
-        .take(if truncated { max } else { total })
+fn text_lines(text: String) -> Vec<Line<'static>> {
+    text.lines()
         .map(|line| Line::from(line.to_owned()))
-        .collect();
-    if truncated {
-        lines.push(truncation_line(hidden));
-    }
-    (lines, truncated)
+        .collect()
 }
 
 fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -615,27 +593,27 @@ fn within(total: usize, room: usize) -> (usize, usize) {
 
 /// What a reader wants first from a grep they cannot see all of is its shape:
 /// how much matched and where. Match text answers a different question, and
-/// is a click away.
+/// is a click away. The totals are left to the card header, which already
+/// annotates itself with them.
 fn render_grep_summary(entries: &[GrepFileEntry], max_lines: usize) -> Vec<Line<'static>> {
     let theme = theme::current();
     let matches: usize = entries.iter().map(GrepFileEntry::match_count).sum();
-    let mut out = vec![Line::from(vec![
-        Span::styled(format!("{} files", entries.len()), theme.tool),
-        Span::styled(GREP_COUNT_SEP, theme.tool_dim),
-        Span::styled(format!("{matches} matches"), theme.tool),
-    ])];
 
     // The affordance keeps the last row, so the shape never crowds out the way
     // back to the detail.
-    let (shown, hidden) = within(entries.len(), max_lines.saturating_sub(2));
-    out.extend(entries.iter().take(shown).map(|entry| {
-        Line::from(vec![
-            Span::raw(GREP_SUMMARY_INDENT),
-            Span::styled(entry.path.clone(), theme.tool_path),
-            Span::styled(GREP_COUNT_SEP, theme.tool_dim),
-            Span::styled(entry.match_count().to_string(), theme.tool_dim),
-        ])
-    }));
+    let (shown, hidden) = within(entries.len(), max_lines.saturating_sub(1));
+    let mut out: Vec<Line<'static>> = entries
+        .iter()
+        .take(shown)
+        .map(|entry| {
+            Line::from(vec![
+                Span::raw(GREP_SUMMARY_INDENT),
+                Span::styled(entry.path.clone(), theme.tool_path),
+                Span::styled(GREP_COUNT_SEP, theme.tool_dim),
+                Span::styled(entry.match_count().to_string(), theme.tool_dim),
+            ])
+        })
+        .collect();
 
     let gained = if hidden > 0 {
         format!("{hidden} files")
@@ -759,15 +737,11 @@ fn render_grep_matches(
         return (render_grep_summary(entries, max_lines), true);
     }
 
-    // One file has no distribution to summarise, so the count leads and the
-    // matches themselves take what room is left.
+    // One file has no distribution to summarise, so it names itself and the
+    // matches take what room is left. The count is left to the card header.
     let theme = theme::current();
-    let matches: usize = entries.iter().map(GrepFileEntry::match_count).sum();
     let path = entries.first().map(|e| e.path.clone()).unwrap_or_default();
-    let mut out = vec![Line::from(vec![
-        Span::styled(format!("{matches} matches in "), theme.tool),
-        Span::styled(path, theme.tool_path),
-    ])];
+    let mut out = vec![Line::from(Span::styled(path, theme.tool_path))];
     let (shown, hidden) = within(height, max_lines.saturating_sub(2));
     out.extend(render_grep_lines(entries, shown, highlight, false));
     out.push(Line::from(Span::styled(
@@ -933,140 +907,79 @@ pub(crate) fn render_instructions(
     truncated
 }
 
+/// What the reader has asked of one card. Held as `Option`: `None` draws the
+/// header alone, `full: false` draws the body within the tool's row budget,
+/// and `full: true` draws all of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SectionFlags {
-    pub script: bool,
-    pub output: bool,
+pub struct Disclosure {
+    /// The whole body rather than the tool's row budget.
+    pub full: bool,
+    /// Shell only: the raw capture instead of the filtered text.
     pub shell_raw: bool,
-}
-
-impl SectionFlags {
-    pub fn any(self) -> bool {
-        self.script || self.output
-    }
-}
-
-/// How much of one batch child the reader has asked to see.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub enum ChildView {
-    /// Summary row only, body put away.
-    #[default]
-    Folded,
-    /// Body drawn within the child's own line budget.
-    Budgeted,
-    /// Body drawn whole, however long it runs.
-    Expanded,
 }
 
 /// The batch children the reader has opened, by their index in the roster.
 /// Children start folded, so a card nobody has touched reads as the list of
 /// what it ran rather than every result at once.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct BatchViews(Arc<[(usize, ChildView)]>);
+pub struct BatchViews(Arc<[usize]>);
 
 impl BatchViews {
-    pub fn new(views: impl IntoIterator<Item = (usize, ChildView)>) -> Self {
-        let mut views: Vec<(usize, ChildView)> = views
-            .into_iter()
-            .filter(|(_, view)| *view != ChildView::Folded)
-            .collect();
-        views.sort_unstable_by_key(|(index, _)| *index);
-        views.dedup_by_key(|(index, _)| *index);
-        Self(views.into())
+    pub fn new(open: impl IntoIterator<Item = usize>) -> Self {
+        let mut open: Vec<usize> = open.into_iter().collect();
+        open.sort_unstable();
+        open.dedup();
+        Self(open.into())
     }
 
-    /// `None` is a child the reader has not spoken about, which the card
-    /// resolves: folding is the default but an opened card overrides it.
-    fn get(&self, index: usize) -> Option<ChildView> {
-        self.0
-            .iter()
-            .find(|(held, _)| *held == index)
-            .map(|(_, view)| *view)
+    fn is_open(&self, index: usize) -> bool {
+        self.0.contains(&index)
     }
 
-    /// Clicking the control that asked for a view a second time puts the child
-    /// back to budgeted, so every control undoes itself.
-    pub fn toggled(&self, index: usize, view: ChildView) -> Self {
-        let next = if self.get(index).unwrap_or_default() == view {
-            ChildView::Budgeted
-        } else {
-            view
-        };
+    /// Every control undoes itself: the click that opened a child folds it
+    /// again.
+    pub fn toggled(&self, index: usize) -> Self {
         Self::new(
             self.0
                 .iter()
                 .copied()
-                .filter(|(held, _)| *held != index)
-                .chain([(index, next)]),
+                .filter(|held| *held != index)
+                .chain((!self.is_open(index)).then_some(index)),
         )
     }
 }
 
 #[derive(Clone, Default)]
 pub struct RenderLimits {
-    pub script: usize,
-    pub output: usize,
+    pub budget: usize,
     pub views: BatchViews,
-    /// What a batch child looks itself up in. A card without children never
-    /// reads it.
-    budgets: ToolOutputLines,
 }
 
 impl RenderLimits {
-    pub fn new(
-        expanded: SectionFlags,
-        output_limit: usize,
-        views: BatchViews,
-        budgets: ToolOutputLines,
-    ) -> Self {
+    pub fn new(full: bool, budget: usize, views: BatchViews) -> Self {
         Self {
-            script: if expanded.script {
-                usize::MAX
-            } else {
-                output_limit
-            },
-            output: if expanded.output {
-                usize::MAX
-            } else {
-                output_limit
-            },
+            budget: if full { usize::MAX } else { budget },
             views,
-            budgets,
         }
     }
 
-    pub fn is_output_expanded(&self) -> bool {
-        self.output == usize::MAX
+    pub fn is_expanded(&self) -> bool {
+        self.budget == usize::MAX
     }
 
-    /// What a child draws as. Children the reader has not spoken about are
-    /// folded, so the card is the list of what ran; opening the card is a
-    /// statement about everything in it and shows them all.
-    fn child_view(&self, index: usize) -> ChildView {
-        self.views
-            .get(index)
-            .unwrap_or(if self.is_output_expanded() {
-                ChildView::Budgeted
-            } else {
-                ChildView::Folded
-            })
+    /// A child the reader has opened draws whole. Opening the parent says
+    /// nothing about its children: the card's own body is the list of what
+    /// ran, and each child answers for itself.
+    fn child_open(&self, index: usize) -> bool {
+        self.views.is_open(index)
     }
 
-    /// A child renders on its own terms: its own tool's budget, unless the
-    /// reader named it or opened the whole card. The views name this card's
-    /// children, so carrying them inward would fold a nested batch by the
-    /// wrong roster.
-    fn for_child(&self, view: ChildView, tool: &str) -> Self {
-        let budget = if view == ChildView::Expanded || self.is_output_expanded() {
-            usize::MAX
-        } else {
-            self.budgets.get(tool)
-        };
+    /// A child renders on its own terms. The views name this card's children,
+    /// so carrying them inward would fold a nested batch by the wrong roster.
+    fn for_child(&self) -> Self {
         Self {
-            script: budget,
-            output: budget,
+            budget: usize::MAX,
             views: BatchViews::default(),
-            budgets: self.budgets,
         }
     }
 }
@@ -1074,22 +987,18 @@ impl RenderLimits {
 /// The child views of every card that has any, by parent tool id.
 pub type BatchViewMap = HashMap<String, BatchViews>;
 
-/// What a body line belongs to, so a click can name a row after the async
-/// highlight has replaced the spans under it.
+/// The batch child a body line belongs to, by its roster index, so a click can
+/// name a row after the async highlight has replaced the spans under it. A
+/// child is folded or whole, so its summary row and its body are one control.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RowTarget {
-    /// The `tool> summary` line of a batch child, by its roster index.
-    BatchChild(usize),
-    /// A body line of a batch child whose body can be opened or put back.
-    BatchBody(usize),
-}
+pub struct RowTarget(pub usize);
 
 pub struct ToolContent {
     pub lines: Vec<Line<'static>>,
     /// Parallel to `lines`. Both render paths build it the same way, so the
     /// highlighted lines carry the same rows as the ones they replace.
     pub rows: Vec<Option<RowTarget>>,
-    pub truncation: SectionFlags,
+    pub truncation: bool,
 }
 
 pub fn render_tool_content(
@@ -1099,7 +1008,7 @@ pub fn render_tool_content(
     limits: RenderLimits,
 ) -> ToolContent {
     let mut lines = Vec::new();
-    let mut truncation = SectionFlags::default();
+    let mut truncation = false;
     let mut output_rows: Vec<Option<RowTarget>> = Vec::new();
     if let Some((language, code)) = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
@@ -1113,8 +1022,8 @@ pub fn render_tool_content(
             .collect();
         let total = code_lines.len();
         let hl = highlight.then(|| caudra_highlight::Highlighter::for_token(language));
-        let (code_result, trunc) = render_code(hl, 1, &code_lines, total, limits.script);
-        truncation.script = trunc;
+        let (code_result, trunc) = render_code(hl, 1, &code_lines, total, limits.budget);
+        truncation = trunc;
         lines.extend(code_result);
     }
     let (output_lines, output_trunc) = match output {
@@ -1128,7 +1037,7 @@ pub fn render_tool_content(
             *start_line,
             code_lines,
             code_lines.len(),
-            limits.output,
+            limits.budget,
         ),
         Some(ToolOutput::WriteCode {
             path,
@@ -1139,7 +1048,7 @@ pub fn render_tool_content(
             1,
             code_lines,
             code_lines.len(),
-            limits.output,
+            limits.budget,
         ),
         Some(ToolOutput::Diff {
             path,
@@ -1156,18 +1065,18 @@ pub fn render_tool_content(
         ),
         Some(ToolOutput::Patch { files }) => (render_patch(files), false),
         Some(ToolOutput::GrepResult { entries, capped }) => {
-            render_grep_results(entries, capped.as_ref(), limits.output, highlight)
+            render_grep_results(entries, capped.as_ref(), limits.budget, highlight)
         }
         Some(ToolOutput::Index(IndexOutput::File {
             language, lines, ..
-        })) => render_index_file(language, lines, limits.output, highlight),
+        })) => render_index_file(language, lines, limits.budget, highlight),
         Some(ToolOutput::Index(output @ IndexOutput::Directory { .. })) => {
-            render_index_directory(output, limits.output)
+            render_index_directory(output, limits.budget)
         }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();
             let trunc =
-                render_instructions(blocks, &mut instruction_lines, limits.output, highlight);
+                render_instructions(blocks, &mut instruction_lines, limits.budget, highlight);
             (instruction_lines, trunc)
         }
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
@@ -1182,7 +1091,7 @@ pub fn render_tool_content(
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
         _ => (Vec::new(), false),
     };
-    truncation.output = output_trunc;
+    truncation |= output_trunc;
     if !lines.is_empty() && !output_lines.is_empty() {
         lines.push(Line::default());
     }
@@ -1467,7 +1376,7 @@ mod tests {
 
     #[test_case(&[("a.rs", &[1,2,3,4,5,6,7,8,9,10_usize] as &[usize])], 3, 3 ; "one_file_condenses_to_its_budget")]
     #[test_case(&[("a.rs", &[1_usize,2])],                              5, 2 ; "no_truncation_when_fits")]
-    #[test_case(&[("a.rs", &[1_usize,2,3]), ("b.rs", &[10,20])],        4, 4 ; "two_files_headline_each_file_then_notice")]
+    #[test_case(&[("a.rs", &[1_usize,2,3]), ("b.rs", &[10,20])],        4, 3 ; "two_files_name_themselves_then_notice")]
     #[test_case(&[("a.rs", &[1_usize,2])],                              1, 2 ; "the_way_back_outranks_a_single_row")]
     fn render_grep_line_count(files: &[(&str, &[usize])], max: usize, expected: usize) {
         let entries = grep_entries(files);
@@ -1510,7 +1419,9 @@ mod tests {
     }
 
     /// The question a grep answers is how much matched and where, which the
-    /// first few matches in document order cannot say.
+    /// first few matches in document order cannot say. The totals belong to
+    /// the card header, which already annotates itself with them, so spending
+    /// a row repeating them buys nothing.
     #[test]
     fn a_condensed_grep_leads_with_its_shape() {
         let rendered = grep_text(
@@ -1521,8 +1432,9 @@ mod tests {
             ],
             4,
         );
-        assert_eq!(rendered[0], "3 files \u{b7} 7 matches", "{GREP_SHAPE}");
-        assert_eq!(rendered[1], "  a.rs \u{b7} 4", "{GREP_SHAPE}");
+        assert_eq!(rendered[0], "  a.rs \u{b7} 4", "{GREP_SHAPE}");
+        assert_eq!(rendered[1], "  b.rs \u{b7} 1", "{GREP_SHAPE}");
+        assert_eq!(rendered[2], "  c.rs \u{b7} 2", "{GREP_SHAPE}");
         assert!(
             rendered.last().unwrap().contains(EXPAND_AFFORDANCE),
             "the detail stays one click away"
@@ -1530,8 +1442,8 @@ mod tests {
     }
 
     /// The count used to be of matches and the word was always "lines".
-    #[test_case(4, "2 files" ; "names_the_files_it_left_out")]
-    #[test_case(8, "8 matches" ; "names_the_matches_when_every_file_fits")]
+    #[test_case(4,  "3 files"   ; "names_the_files_it_left_out")]
+    #[test_case(10, "10 matches" ; "names_the_matches_when_every_file_fits")]
     fn a_condensed_grep_counts_what_expanding_would_add(max: usize, gained: &str) {
         let rendered = grep_text(
             &[
@@ -1539,17 +1451,20 @@ mod tests {
                 ("b.rs", &[10_usize]),
                 ("c.rs", &[20_usize, 30]),
                 ("d.rs", &[40_usize]),
+                ("e.rs", &[50_usize]),
+                ("f.rs", &[60_usize]),
             ],
             max,
         );
         assert_eq!(rendered.last().unwrap(), &expand_notice(gained));
     }
 
-    /// One file has no distribution to summarise, so the matches keep the room.
+    /// One file has no distribution to summarise, so it names itself and the
+    /// matches keep the room.
     #[test]
     fn a_condensed_single_file_grep_still_shows_matches() {
         let rendered = grep_text(&[("a.rs", &[1, 2, 3, 4, 5_usize] as &[usize])], 4);
-        assert_eq!(rendered[0], "5 matches in a.rs");
+        assert_eq!(rendered[0], "a.rs");
         assert!(rendered[1].contains("code at a.rs:1"));
         assert_eq!(rendered.last().unwrap(), &expand_notice("3 lines"));
     }
@@ -1783,37 +1698,11 @@ mod tests {
         let result = merge_syntax_with_diff(&syn, &diff, base, emph);
         assert_eq!(spans_text(&result), input);
     }
-    const TEXT_MAX_LINES: usize = 5;
-    const NOTICE_EARNED: &str = "a line is only hidden when hiding it saves a row";
-
-    #[test_case(3, 3, false ; "short_output_is_whole")]
-    #[test_case(5, 5, false ; "exactly_the_budget")]
-    #[test_case(6, 6, false ; "one_hidden_shows_all")]
-    #[test_case(7, TEXT_MAX_LINES + 1, true ; "two_hidden_truncate")]
-    fn text_lines_line_count(total: usize, expected: usize, notice: bool) {
-        let text = (0..total)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (lines, truncated) = text_lines(text, TEXT_MAX_LINES);
-        assert_eq!(lines.len(), expected);
-        assert_eq!(truncated, notice);
-        assert_eq!(
-            lines
-                .iter()
-                .any(|line| line_text(line).contains(TRUNCATION_PREFIX)),
-            notice,
-            "{NOTICE_EARNED}"
-        );
-    }
-
     const CHILD_BODY: &str = "child body line";
     const EXPECT_ROW: &str = "the summary row has to name its child";
-    const CHILD_BUDGET: usize = 2;
-    const SIBLING_KEPT: usize = 2;
-    /// What `batch` itself resolves to, which is what children used to inherit.
+    /// What `batch` itself resolves to. A child never reads it: opened, it
+    /// draws whole.
     const PARENT_BUDGET: usize = 3;
-    const ROOMY: usize = 32;
 
     fn batch_entry(tool: &str, body_lines: usize) -> BatchToolEntry {
         let text = (0..body_lines)
@@ -1836,29 +1725,20 @@ mod tests {
         }
     }
 
-    fn budgets(read: usize, grep: usize) -> ToolOutputLines {
-        ToolOutputLines {
-            read,
-            grep,
-            ..ToolOutputLines::DEFAULT
-        }
-    }
-
     fn batch_of(
         sizes: [usize; 2],
-        budgets: ToolOutputLines,
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
         let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
         render_batch(
             &entries,
             false,
-            &RenderLimits::new(SectionFlags::default(), PARENT_BUDGET, views, budgets),
+            &RenderLimits::new(false, PARENT_BUDGET, views),
         )
     }
 
     fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
-        batch_of([2, 3], budgets(ROOMY, ROOMY), views)
+        batch_of([2, 3], views)
     }
 
     fn body_count(lines: &[Line<'static>]) -> usize {
@@ -1899,20 +1779,20 @@ mod tests {
         );
         assert_eq!(
             targets(&rows),
-            vec![RowTarget::BatchChild(0), RowTarget::BatchChild(1)],
+            vec![RowTarget(0), RowTarget(1)],
             "{EXPECT_ROW}"
         );
     }
 
     #[test]
     fn opening_a_child_shows_only_its_body() {
-        let (lines, rows) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
+        let (lines, rows) = batch(BatchViews::new([0]));
         assert_eq!(body_count(&lines), 2, "the other child stays folded");
         assert_eq!(lines.len(), rows.len());
         assert_eq!(
             targets(&rows),
-            vec![RowTarget::BatchChild(0), RowTarget::BatchChild(1)],
-            "a folded child stays clickable"
+            vec![RowTarget(0), RowTarget(0), RowTarget(0), RowTarget(1)],
+            "every row of an open child answers for it, folded rows for theirs"
         );
     }
 
@@ -1931,7 +1811,7 @@ mod tests {
                 .count()
         };
         assert_eq!(marked(&batch(BatchViews::default()).0), 2);
-        let (one_open, _) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
+        let (one_open, _) = batch(BatchViews::new([0]));
         assert_eq!(marked(&one_open), 1);
     }
 
@@ -1939,75 +1819,51 @@ mod tests {
     /// reaches the one the reader aimed at.
     #[test]
     fn a_summary_row_names_its_own_child() {
-        let (_, rows) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
-        assert_eq!(
-            targets(&rows),
-            vec![RowTarget::BatchChild(0), RowTarget::BatchChild(1)]
-        );
+        let (_, rows) = batch(BatchViews::new([1]));
+        assert_eq!(unique_targets(&rows), vec![RowTarget(0), RowTarget(1)]);
     }
 
-    /// The reported bug: the notice offered to expand and no row would take
-    /// the click, so the affordance was unreachable by any input.
+    /// A child is folded or whole, so a click anywhere in an open one puts it
+    /// back rather than asking a question the body has already answered.
     #[test]
-    fn a_truncated_child_body_takes_a_click() {
-        let (lines, rows) = batch_of(
-            [1, 6],
-            budgets(ROOMY, CHILD_BUDGET),
-            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Budgeted)]),
-        );
+    fn every_row_of_an_open_child_takes_a_click() {
+        let (lines, rows) = batch_of([1, 6], BatchViews::new([1]));
         assert!(
-            lines
+            !lines
                 .iter()
                 .any(|line| line_text(line).contains(TRUNCATION_PREFIX)),
-            "the child that ran past the budget says so"
+            "an opened child draws whole, so it has nothing to announce"
         );
         assert_eq!(
-            unique_targets(&rows),
-            vec![
-                RowTarget::BatchChild(0),
-                RowTarget::BatchChild(1),
-                RowTarget::BatchBody(1),
-            ],
-            "only the child with something left to show answers a click"
+            rows.iter()
+                .filter(|row| **row == Some(RowTarget(1)))
+                .count(),
+            1 + 6,
+            "the summary row and every body row name the same child"
         );
     }
 
-    /// Expanding names one child, so its siblings keep the budget they had.
+    /// Opening names one child, and says nothing about the others.
     #[test]
-    fn expanding_a_child_leaves_its_siblings_budgeted() {
+    fn opening_a_child_leaves_its_siblings_folded() {
         let whole = 6;
-        let (lines, rows) = batch_of(
-            [5, whole],
-            budgets(SIBLING_KEPT, CHILD_BUDGET),
-            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Expanded)]),
-        );
+        let (lines, rows) = batch_of([5, whole], BatchViews::new([1]));
         assert_eq!(
             body_count(&lines),
-            SIBLING_KEPT + whole,
-            "the expanded child is whole and the other is still capped"
+            whole,
+            "the opened child is whole and the other is still put away"
         );
         assert!(
-            unique_targets(&rows).contains(&RowTarget::BatchBody(0)),
-            "the sibling still has something left to show"
-        );
-        assert!(
-            unique_targets(&rows).contains(&RowTarget::BatchBody(1)),
-            "an expanded body stays clickable so the reader can put it back"
+            unique_targets(&rows).contains(&RowTarget(0)),
+            "a folded sibling stays clickable"
         );
     }
 
-    #[test_case(&[], 1, ChildView::Folded, &[(1, ChildView::Budgeted)] ; "the_summary_opens_a_folded_child")]
-    #[test_case(&[(1, ChildView::Budgeted)], 1, ChildView::Folded, &[] ; "the_summary_folds_it_again")]
-    #[test_case(&[(1, ChildView::Budgeted)], 1, ChildView::Expanded, &[(1, ChildView::Expanded)] ; "the_body_expands_it")]
-    #[test_case(&[(1, ChildView::Expanded)], 1, ChildView::Expanded, &[(1, ChildView::Budgeted)] ; "the_body_puts_it_back")]
-    #[test_case(&[(0, ChildView::Budgeted)], 1, ChildView::Expanded, &[(0, ChildView::Budgeted), (1, ChildView::Expanded)] ; "leaves_the_others")]
-    fn toggled_views(
-        start: &[(usize, ChildView)],
-        index: usize,
-        view: ChildView,
-        expected: &[(usize, ChildView)],
-    ) {
-        let views = BatchViews::new(start.iter().copied()).toggled(index, view);
+    #[test_case(&[], 1, &[1] ; "a_folded_child_opens")]
+    #[test_case(&[1], 1, &[] ; "an_open_child_folds_again")]
+    #[test_case(&[0], 1, &[0, 1] ; "leaves_the_others")]
+    fn toggled_views(start: &[usize], index: usize, expected: &[usize]) {
+        let views = BatchViews::new(start.iter().copied()).toggled(index);
         assert_eq!(views.0.as_ref(), expected);
     }
 
@@ -2015,34 +1871,21 @@ mod tests {
     /// reach it.
     #[test]
     fn views_do_not_reach_a_nested_batch() {
-        let limits = RenderLimits::new(
-            SectionFlags::default(),
-            PARENT_BUDGET,
-            BatchViews::new([(0, ChildView::Budgeted)]),
-            ToolOutputLines::DEFAULT,
-        );
-        assert_eq!(
-            limits.for_child(ChildView::Budgeted, "read").views,
-            BatchViews::default()
-        );
+        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::new([0]));
+        assert_eq!(limits.for_child().views, BatchViews::default());
     }
 
-    /// Children used to inherit whatever `batch` resolved to, so a grep and a
-    /// read in one card were capped the same however they were configured.
+    /// A child used to draw within its own tool's budget, which made the card
+    /// a third state between folded and whole. Opening one now answers the
+    /// question the reader asked.
     #[test]
-    fn each_child_is_capped_by_its_own_tool() {
-        // Deliberately not summing to twice the parent budget, which is what
-        // inheriting it would have produced.
-        let (read_budget, grep_budget) = (1, 4);
-        let (lines, _) = batch_of(
-            [6, 6],
-            budgets(read_budget, grep_budget),
-            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Budgeted)]),
-        );
+    fn an_opened_child_draws_whole() {
+        let whole = 6;
+        let (lines, _) = batch_of([whole, whole], BatchViews::new([0, 1]));
         assert_eq!(
             body_count(&lines),
-            read_budget + grep_budget,
-            "each child spends its own tool's budget, not the parent's"
+            whole * 2,
+            "an opened child spends no budget at all"
         );
     }
 
@@ -2052,12 +1895,7 @@ mod tests {
         "a child row reports what its result holds, the way a standalone row does";
 
     fn child_row(entry: BatchToolEntry) -> String {
-        let limits = RenderLimits::new(
-            SectionFlags::default(),
-            PARENT_BUDGET,
-            BatchViews::default(),
-            ToolOutputLines::DEFAULT,
-        );
+        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::default());
         line_text(&render_batch(&[entry], false, &limits).0[0])
     }
 
@@ -2126,33 +1964,22 @@ mod tests {
         let (lines, rows) = render_batch(
             &entries,
             false,
-            &RenderLimits::new(
-                SectionFlags::default(),
-                PARENT_BUDGET,
-                BatchViews::new([(1, ChildView::Budgeted)]),
-                budgets(ROOMY, ROOMY),
-            ),
+            &RenderLimits::new(false, PARENT_BUDGET, BatchViews::new([1])),
         );
 
         assert_eq!(blank_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
     }
 
-    /// Opening the card is a statement about everything in it.
+    /// The card's own body is the list of what it ran, so opening it says
+    /// nothing about the children. Otherwise one click on a card of ten greps
+    /// would write ten whole greps into the transcript.
     #[test]
-    fn an_opened_card_opens_every_child() {
+    fn an_opened_card_leaves_its_children_folded() {
         let whole = 6;
-        let limits = RenderLimits::new(
-            SectionFlags {
-                output: true,
-                ..SectionFlags::default()
-            },
-            PARENT_BUDGET,
-            BatchViews::default(),
-            budgets(1, 1),
-        );
+        let limits = RenderLimits::new(true, PARENT_BUDGET, BatchViews::default());
         let entries = [batch_entry("read", whole), batch_entry("grep", whole)];
         let (lines, _) = render_batch(&entries, false, &limits);
-        assert_eq!(body_count(&lines), whole * 2);
+        assert_eq!(body_count(&lines), 0);
     }
 }

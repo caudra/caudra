@@ -146,7 +146,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. A row opens on click, and a card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout. The choice is remembered across restarts."
+        "- **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. An open card shows as much of its body as `ui.tool_output_lines` allows for that tool; clicking shows all of it, and clicking again puts it back. A card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout, and each child opens and folds on its own click. The choice is remembered across restarts."
     )
     .unwrap();
     writeln!(

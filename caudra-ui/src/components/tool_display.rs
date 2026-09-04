@@ -4,8 +4,7 @@ use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
-use code_view::SectionFlags;
-use code_view::{BatchViewMap, BatchViews, RenderLimits, RowTarget};
+use code_view::{BatchViewMap, BatchViews, Disclosure, RenderLimits, RowTarget};
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -67,6 +66,8 @@ const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 /// The tools whose header is built from a pattern the model wrote.
 const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
 const QUERY_KEY: &str = "pattern";
+/// What separates a server or namespace from the tool it qualifies.
+const QUALIFIER: [char; 3] = ['_', '.', '-'];
 
 /// How a tool names itself on a compact row. The `name> ` prefix is gone
 /// there, so `label` is what identifies the call, and `header_keys` are the
@@ -120,11 +121,30 @@ const fn tool_row(
     )
 }
 
+/// The row a tool answers to, with the name it is tabled under. A tool
+/// reaching the UI qualified still deserves its row: the same call wrapped by
+/// an MCP server arrives as `mcp_File_read`, and an exact match would hand it
+/// the fallback sigil, its own name in place of a label, and an empty
+/// `header_keys` that repeats the whole header back in brackets. Leading
+/// segments are dropped one at a time rather than the name matched as a bare
+/// suffix, so the qualifier has to end where the tool name begins and an
+/// unrelated `myfile_read` cannot pass for `file_read`.
+fn compact_row(name: &str) -> Option<(&'static str, &'static CompactTool)> {
+    let mut rest = name;
+    loop {
+        if let Some((tool, entry)) = COMPACT_TOOLS.iter().find(|(tool, _)| same_key(tool, rest)) {
+            return Some((tool, entry));
+        }
+        rest = rest.split_once(QUALIFIER)?.1;
+    }
+}
+
 fn compact_tool(name: &str) -> Option<&'static CompactTool> {
-    COMPACT_TOOLS
-        .iter()
-        .find(|(tool, _)| *tool == name)
-        .map(|(_, entry)| entry)
+    compact_row(name).map(|(_, entry)| entry)
+}
+
+fn is_query_tool(name: &str) -> bool {
+    compact_row(name).is_some_and(|(tool, _)| QUERY_TOOLS.contains(&tool))
 }
 
 fn same_key(left: &str, right: &str) -> bool {
@@ -150,8 +170,7 @@ pub(super) fn header_spans(
     base: Style,
     raw_input: Option<&serde_json::Value>,
 ) -> Vec<Span<'static>> {
-    let query = QUERY_TOOLS
-        .contains(&tool)
+    let query = is_query_tool(tool)
         .then(|| raw_input?.get(QUERY_KEY)?.as_str())
         .flatten()
         .filter(|query| !query.is_empty() && header.starts_with(query));
@@ -174,17 +193,30 @@ pub(super) fn header_spans(
 /// that tool would.
 pub(super) fn compact_args_for(
     tool: &str,
+    header: &str,
     raw_input: Option<&serde_json::Value>,
 ) -> Option<String> {
     compact_args(
         raw_input,
+        header,
         compact_tool(tool).map_or(&[], |entry| entry.header_keys),
     )
 }
 
 /// The primitive inputs a compact header does not already show, rendered the
 /// way opencode does: `[offset=1, limit=260]`.
-fn compact_args(raw_input: Option<&serde_json::Value>, header_keys: &[&str]) -> Option<String> {
+///
+/// `header_keys` names what a known tool folded into its header, and also the
+/// inputs too big to belong on one row at all. The header itself is the
+/// backstop for the rest: a tool the table has never heard of would otherwise
+/// print its whole header back as `[k=v]`. Only strings are checked against
+/// it, because a number is what the brackets exist to carry and `offset=1`
+/// must survive a header that happens to contain a `1`.
+fn compact_args(
+    raw_input: Option<&serde_json::Value>,
+    header: &str,
+    header_keys: &[&str],
+) -> Option<String> {
     let fields = raw_input?.as_object()?;
     let mut rendered = String::new();
     let mut shown = 0;
@@ -193,6 +225,7 @@ fn compact_args(raw_input: Option<&serde_json::Value>, header_keys: &[&str]) -> 
         .filter(|(key, _)| !header_keys.iter().any(|folded| same_key(folded, key)))
     {
         let scalar = match value {
+            serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
             serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
             serde_json::Value::Number(number) => Cow::Owned(number.to_string()),
             serde_json::Value::Bool(flag) => Cow::Owned(flag.to_string()),
@@ -281,7 +314,7 @@ pub struct ToolLines {
     pub snapshot_base: Option<usize>,
     pub shell_toggle_line: Option<usize>,
     pub content_indent: &'static str,
-    pub truncation: SectionFlags,
+    pub truncation: bool,
     /// What each line belongs to, parallel to `lines`, so a splice keeps the
     /// two in step and the async highlight cannot lose a click target.
     pub rows: Vec<Option<RowTarget>>,
@@ -438,7 +471,7 @@ fn resolve_output<'a>(
         _ => None,
     };
 
-    let expanded = limits.is_output_expanded();
+    let expanded = limits.is_expanded();
     let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if expanded {
         match &full_text {
             Some(t) => (Some(t.clone()), 0),
@@ -476,9 +509,9 @@ fn resolve_output<'a>(
     let (text, skipped) = match raw_text {
         Some(t) if !t.is_empty() => {
             let tr = if keep_tail {
-                truncate_output_tail(&t, limits.output)
+                truncate_output_tail(&t, limits.budget)
             } else {
-                truncate_output(&t, limits.output)
+                truncate_output(&t, limits.budget)
             };
             let s = if tr.skipped > 0 {
                 tr.skipped
@@ -507,7 +540,7 @@ struct ToolLineBuilder {
     content_range: (usize, usize),
     rows: Vec<Option<RowTarget>>,
     width: u16,
-    truncation: SectionFlags,
+    truncation: bool,
     limits: RenderLimits,
     markdown: bool,
     indicator: Indicator,
@@ -516,13 +549,11 @@ struct ToolLineBuilder {
 impl ToolLineBuilder {
     fn new(
         width: u16,
-        expanded: SectionFlags,
+        full: bool,
         max_output_lines: usize,
         indicator: Indicator,
         views: BatchViews,
-        budgets: ToolOutputLines,
     ) -> Self {
-        let limits = RenderLimits::new(expanded, max_output_lines, views, budgets);
         Self {
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -533,8 +564,8 @@ impl ToolLineBuilder {
             content_range: (0, 0),
             rows: Vec::new(),
             width,
-            truncation: SectionFlags::default(),
-            limits,
+            truncation: false,
+            limits: RenderLimits::new(full, max_output_lines, views),
             markdown: false,
             indicator,
         }
@@ -616,7 +647,11 @@ impl ToolLineBuilder {
             theme::current().tool,
             raw_input,
         ));
-        if let Some(args) = compact_args(raw_input, entry.map_or(&[], |entry| entry.header_keys)) {
+        if let Some(args) = compact_args(
+            raw_input,
+            header,
+            entry.map_or(&[], |entry| entry.header_keys),
+        ) {
             copy.push_str(&args);
             spans.push(Span::styled(args, theme::current().tool_dim));
         }
@@ -728,8 +763,7 @@ impl ToolLineBuilder {
 
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits.clone());
-        self.truncation.script |= content.truncation.script;
-        self.truncation.output |= content.truncation.output;
+        self.truncation |= content.truncation;
         let start = self.lines.len();
         for mut line in content.lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
@@ -840,7 +874,7 @@ impl ToolLineBuilder {
 
     fn push_truncation_count(&mut self, skipped: usize) {
         if should_truncate(skipped) {
-            self.truncation.output = true;
+            self.truncation = true;
             let text = truncation_notice(skipped);
             let mut line = Line::from(Span::styled(text, theme::current().tool_dim));
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
@@ -1014,7 +1048,7 @@ pub fn build_tool_lines(
     msg: &DisplayMessage,
     status: ToolStatus,
     rctx: &RenderCtx,
-    expansion: Option<SectionFlags>,
+    expansion: Option<Disclosure>,
 ) -> ToolLines {
     let tool_name = msg.role.tool_name().unwrap_or("?");
     let (header, body) = match msg.text.split_once('\n') {
@@ -1025,11 +1059,10 @@ pub fn build_tool_lines(
 
     let mut b = ToolLineBuilder::new(
         rctx.width,
-        expanded,
+        expanded.full,
         rctx.tool_output_lines.get(tool_name),
         status.into(),
         rctx.views_for(msg.role.tool_id()),
-        *rctx.tool_output_lines,
     );
     b.apply_output_format(msg.tool_output.as_deref());
     if rctx.compact {
@@ -1061,7 +1094,7 @@ pub fn build_tool_lines(
     if expansion.is_none() {
         // Nothing is drawn below the header, but the reader still needs a
         // click target whenever there is something to reveal.
-        b.truncation.output = msg.render_snapshot.is_some()
+        b.truncation = msg.render_snapshot.is_some()
             || msg.tool_input.is_some()
             || msg.tool_output.is_some()
             || body.is_some_and(|body| !body.trim().is_empty());
@@ -1163,27 +1196,18 @@ pub fn build_instructions_lines(
         None
     };
 
-    let exp = SectionFlags {
-        script: false,
-        output: expanded,
-        shell_raw: false,
-    };
     let mut b = ToolLineBuilder::new(
         width,
-        exp,
+        expanded,
         code_view::instruction_limit(expanded),
         Indicator::Success,
         BatchViews::default(),
-        // A loaded instruction card has no children to look themselves up.
-        ToolOutputLines::default(),
     );
     b.push_header("load", header, annotation.as_deref(), None, None, None);
     b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
-    let has_truncation =
-        code_view::render_instructions(blocks, &mut b.lines, b.limits.output, false);
-    b.truncation.output |= has_truncation;
+    b.truncation |= code_view::render_instructions(blocks, &mut b.lines, b.limits.budget, false);
     for line in &mut b.lines[start..] {
         line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
     }
@@ -1228,11 +1252,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         shell_toggle_line: None,
         content_indent: TOOL_BODY_INDENT,
         rows: Vec::new(),
-        truncation: SectionFlags {
-            script: false,
-            output: true,
-            shell_raw: false,
-        },
+        truncation: true,
     }
 }
 
@@ -1271,10 +1291,9 @@ mod tests {
         }
     }
 
-    fn exp(both: bool) -> SectionFlags {
-        SectionFlags {
-            script: both,
-            output: both,
+    fn exp(full: bool) -> Disclosure {
+        Disclosure {
+            full,
             shell_raw: false,
         }
     }
@@ -1386,7 +1405,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert_eq!(tl.highlight.is_some(), expect_highlight);
         if let Some(hl) = &tl.highlight {
@@ -1421,34 +1440,33 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let filtered_expanded = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags {
-                output: true,
-                ..SectionFlags::default()
+            Some(Disclosure {
+                full: true,
+                ..Disclosure::default()
             }),
         );
         let raw_collapsed = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags {
+            Some(Disclosure {
                 shell_raw: true,
-                ..SectionFlags::default()
+                ..Disclosure::default()
             }),
         );
         let raw_expanded = build_tool_lines(
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags {
-                output: true,
+            Some(Disclosure {
+                full: true,
                 shell_raw: true,
-                ..SectionFlags::default()
             }),
         );
         let collapsed_text = lines_text(&collapsed);
@@ -1459,7 +1477,7 @@ mod tests {
         assert!(
             collapsed_text.contains("filtered · cargo, progress · 80% smaller · click for raw")
         );
-        assert!(collapsed.truncation.output);
+        assert!(collapsed.truncation);
         assert!(collapsed.shell_toggle_line.is_some());
         assert!(lines_text(&filtered_expanded).contains("model_1"));
         assert!(lines_text(&raw_collapsed).contains("raw_8"));
@@ -1481,7 +1499,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&lines);
 
@@ -1506,7 +1524,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&lines);
 
@@ -1527,7 +1545,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&lines);
 
@@ -1544,7 +1562,7 @@ mod tests {
     #[test_case(ToolStatus::Success,    plain_output() ; "done_with_plain_output_shows_body")]
     fn bash_body_visible(status: ToolStatus, output: Option<ToolOutput>) {
         let msg = bash_msg("echo hi\nline1\nline2", status, code_input(), output);
-        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(SectionFlags::default()));
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(Disclosure::default()));
         let text = lines_text(&tl);
         assert!(text.contains("line1"));
         assert!(text.contains("line2"));
@@ -1576,7 +1594,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let span_count_before = tl.lines[0].spans.len();
         append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
@@ -1597,7 +1615,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
@@ -1610,7 +1628,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("bold"));
@@ -1624,7 +1642,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let (row, line) = tl
             .lines
@@ -1698,7 +1716,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         )
     }
 
@@ -1741,7 +1759,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(width),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert_hr_fits(&tl, width);
     }
@@ -1782,7 +1800,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line_0"));
@@ -1824,20 +1842,11 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
-        let expanded = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80),
-            Some(SectionFlags {
-                script: false,
-                output: true,
-                shell_raw: false,
-            }),
-        );
+        let expanded = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), Some(exp(true)));
 
-        assert!(collapsed.truncation.output);
+        assert!(collapsed.truncation);
         assert!(lines_text(&collapsed).contains("item_1"));
         assert!(!lines_text(&collapsed).contains("item_8"));
         assert!(lines_text(&expanded).contains("item_8"));
@@ -1897,7 +1906,7 @@ mod tests {
             &snapshot_msg(snapshot),
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert!(
             tl.search_text.contains("import asyncio"),
@@ -1922,7 +1931,7 @@ mod tests {
             &snapshot_msg(snapshot),
             ToolStatus::InProgress,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let base = tl.snapshot_base.expect("snapshot must record its base");
         let line_text = |i: usize| {
@@ -1946,7 +1955,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert_eq!(tl.snapshot_base, None);
     }
@@ -1972,7 +1981,7 @@ mod tests {
             &msg,
             ToolStatus::InProgress,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         // indicator + `tool> ` prefix + "3 tools " sit before the header spinner.
         assert_eq!(tl.spinner_lines, vec![(0, 3), (0, 0)]);
@@ -2028,7 +2037,7 @@ mod tests {
             &msg,
             ToolStatus::Error,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         let tail = output.lines().next_back().unwrap();
@@ -2065,7 +2074,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let t = theme::current();
         assert!(line_has_styled(&tl, "pub", t.index_keyword));
@@ -2083,7 +2092,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("from_snapshot"));
@@ -2129,24 +2138,14 @@ mod tests {
         tool: &str,
         expect_text: bool,
     ) {
-        let limits = RenderLimits::new(
-            SectionFlags::default(),
-            TOL.get(tool),
-            BatchViews::default(),
-            TOL,
-        );
+        let limits = RenderLimits::new(false, TOL.get(tool), BatchViews::default());
         let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
     }
 
     #[test]
     fn resolve_output_pre_truncated_forwarded() {
-        let limits = RenderLimits::new(
-            SectionFlags::default(),
-            TOL.get("bash"),
-            BatchViews::default(),
-            TOL,
-        );
+        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default());
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
     }
@@ -2154,12 +2153,7 @@ mod tests {
     #[test]
     fn resolve_output_truncation_overrides_pre_truncated() {
         let long = n_lines(200);
-        let limits = RenderLimits::new(
-            SectionFlags::default(),
-            TOL.get("bash"),
-            BatchViews::default(),
-            TOL,
-        );
+        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default());
         let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);
     }
@@ -2226,8 +2220,8 @@ mod tests {
         );
         let collapsed_text = lines_text(&collapsed);
         let expanded_text = lines_text(&expanded);
-        assert!(collapsed.truncation.any());
-        assert!(!expanded.truncation.any());
+        assert!(collapsed.truncation);
+        assert!(!expanded.truncation);
         assert!(expanded_text.contains("line 0"));
         assert!(expanded_text.contains("line 199"));
         assert!(collapsed_text.contains("line 0"));
@@ -2251,7 +2245,7 @@ mod tests {
             Some(exp(expanded)),
         );
         let text = lines_text(&tl);
-        assert_eq!(tl.truncation.any(), expect_truncation);
+        assert_eq!(tl.truncation, expect_truncation);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
     }
 
@@ -2275,7 +2269,7 @@ mod tests {
             &test_rctx(80),
             Some(exp(expanded)),
         );
-        assert_eq!(tl.truncation.any(), expect_truncation);
+        assert_eq!(tl.truncation, expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
     }
@@ -2341,7 +2335,7 @@ mod tests {
         let output = msg.tool_output.as_deref().unwrap();
         let blocks = output.instructions().unwrap();
         let tl = build_instructions_lines(blocks, 80, Some(expanded));
-        assert_eq!(tl.truncation.any(), expect_truncation);
+        assert_eq!(tl.truncation, expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("inst 29"), expect_all_visible);
     }
@@ -2353,7 +2347,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(
@@ -2385,7 +2379,7 @@ mod tests {
         let collapsed = build_tool_lines(&msg, ToolStatus::Success, &compact_rctx(80), None);
         assert_eq!(collapsed.lines.len(), 1);
         assert!(
-            collapsed.truncation.output,
+            collapsed.truncation,
             "a hidden snapshot has to leave a click target behind"
         );
         assert!(!lines_text(&collapsed).contains("rendered by lua"));
@@ -2394,7 +2388,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &compact_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert!(lines_text(&opened).contains("rendered by lua"));
     }
@@ -2405,7 +2399,7 @@ mod tests {
         let tl = build_tool_lines(&msg, ToolStatus::Success, &compact_rctx(80), None);
 
         assert_eq!(tl.lines.len(), 1);
-        assert!(!tl.truncation.any());
+        assert!(!tl.truncation);
     }
 
     const SUBAGENT_ELAPSED: Duration = Duration::from_millis(63_400);
@@ -2442,8 +2436,8 @@ mod tests {
     /// A collapsed row hides the body but not the progress: it is the only
     /// sign that the subagent behind it is alive.
     #[test_case(None                        ; "collapsed")]
-    #[test_case(Some(SectionFlags::default()) ; "expanded")]
-    fn a_running_subagent_reports_its_tool_under_the_header(expansion: Option<SectionFlags>) {
+    #[test_case(Some(Disclosure::default()) ; "expanded")]
+    fn a_running_subagent_reports_its_tool_under_the_header(expansion: Option<Disclosure>) {
         let msg = subagent_msg(ToolStatus::InProgress, Some(running_tool_report(3)));
 
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), expansion);
@@ -2466,7 +2460,7 @@ mod tests {
     fn a_settled_subagent_keeps_only_its_tally(status: ToolStatus) {
         let msg = subagent_msg(status, Some(running_tool_report(7)));
 
-        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(SectionFlags::default()));
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(Disclosure::default()));
 
         let text = lines_text(&tl);
         assert!(text.contains("├ 7 tools · 1m 3.4s"), "{text}");
@@ -2486,7 +2480,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
 
         assert!(
@@ -2504,7 +2498,7 @@ mod tests {
             &msg,
             ToolStatus::InProgress,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
 
         assert!(!lines_text(&tl).contains('├'));
@@ -2561,7 +2555,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert!(
             !lines_text(&tl).contains("plain fallback"),
@@ -2586,7 +2580,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         let text = lines_text(&tl);
         assert!(text.contains("row_0"));
@@ -2629,7 +2623,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert!(
             tl.search_text.contains("llm_output_here"),
@@ -2672,7 +2666,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert!(
             tl.search_text.contains("body_fallback"),
@@ -2789,7 +2783,7 @@ mod tests {
             &snapshot_msg(snapshot),
             status,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let body = tl.lines.get(1).expect("snapshot body line");
@@ -2818,7 +2812,7 @@ mod tests {
             &msg,
             ToolStatus::Success,
             &test_rctx(80),
-            Some(SectionFlags::default()),
+            Some(Disclosure::default()),
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let header_line = tl.lines.first().expect("header line");
@@ -2899,6 +2893,119 @@ mod tests {
             header_parts(tool, header, raw_input),
             vec![(false, header.to_owned())],
             "{QUERY_MARK_MSG}"
+        );
+    }
+
+    const QUALIFIED_MSG: &str =
+        "a tool wrapped by an MCP server is the same call and must draw the same row";
+    const READ_PATH: &str = "/home/u/run.rs";
+
+    /// The reported bug: wrapping Caudra's tools in an MCP server renamed them,
+    /// the exact-match lookup missed, and every row repeated its whole header
+    /// back as `[filePath=…]` under a `⚙` sigil.
+    #[test_case("file_read" ; "the tabled name")]
+    #[test_case("mcp_File_read" ; "a server prefix and a capital")]
+    #[test_case("srv.file_read" ; "a dotted qualifier")]
+    #[test_case("filePath.fileRead" ; "camel case on both sides")]
+    fn a_qualified_tool_resolves_to_its_own_row(tool: &str) {
+        let entry = compact_tool(tool).expect(QUALIFIED_MSG);
+        assert_eq!(entry.label, "Read", "{QUALIFIED_MSG}");
+        assert_eq!(entry.sigil, '→', "{QUALIFIED_MSG}");
+    }
+
+    /// Dropping whole segments is what keeps the qualifier honest: a bare
+    /// suffix match would let any name ending in the right letters through.
+    #[test_case("myfile_read" ; "a longer word ending in the tabled name")]
+    #[test_case("read" ; "a segment of the tabled name is not the tool")]
+    #[test_case("github.create_issue" ; "a foreign tool resolves to nothing")]
+    fn an_unrelated_tool_keeps_its_own_name(tool: &str) {
+        assert!(compact_tool(tool).is_none(), "{QUALIFIED_MSG}");
+    }
+
+    #[test]
+    fn a_qualified_search_still_marks_its_query() {
+        assert_eq!(
+            header_parts(
+                "mcp_File_grep",
+                "pub mod in src",
+                Some(serde_json::json!({ "pattern": "pub mod" })),
+            ),
+            vec![(true, "pub mod".to_owned()), (false, " in src".to_owned())],
+            "{QUERY_MARK_MSG}"
+        );
+    }
+
+    const ARGS_MSG: &str = "the brackets carry what the header does not already show";
+
+    /// `serde_json`'s object is a `BTreeMap` until something in the build turns
+    /// `preserve_order` on and makes it an `IndexMap`, so the brackets come out
+    /// sorted under `-p caudra-ui` and in call order under `--workspace`. Which
+    /// one a binary ships with is not this test's business; that the right
+    /// pairs survive is.
+    fn sorted_args(rendered: Option<String>) -> Option<String> {
+        let body = rendered?;
+        let mut pairs = body
+            .trim_start_matches(" [")
+            .trim_end_matches(']')
+            .split(", ")
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        Some(format!(" [{}]", pairs.join(", ")))
+    }
+
+    /// The header is the backstop for a tool the table has never heard of,
+    /// which has no `header_keys` to fold anything away with.
+    #[test_case(
+        READ_TOOL, READ_PATH, serde_json::json!({ "filePath": READ_PATH, "offset": 1, "limit": 200 }),
+        Some(" [limit=200, offset=1]")
+        ; "a tabled tool folds the path away by key"
+    )]
+    #[test_case(
+        "mcp_File_read", READ_PATH, serde_json::json!({ "filePath": READ_PATH, "offset": 1, "limit": 200 }),
+        Some(" [limit=200, offset=1]")
+        ; "a qualified tool folds it away the same"
+    )]
+    #[test_case(
+        "srv.unknown", READ_PATH, serde_json::json!({ "filePath": READ_PATH, "offset": 1 }),
+        Some(" [offset=1]")
+        ; "an untabled tool falls back to the header text"
+    )]
+    #[test_case(
+        "srv.unknown", READ_PATH, serde_json::json!({ "path": READ_PATH }),
+        None
+        ; "brackets holding only the header are not drawn at all"
+    )]
+    #[test_case(
+        "mcp_File_grep", "pub mod in src", serde_json::json!({ "pattern": "pub mod", "path": "src", "include": "*.rs" }),
+        Some(" [include=*.rs]")
+        ; "a search keeps only the filter its header omits"
+    )]
+    fn the_brackets_never_repeat_the_header(
+        tool: &str,
+        header: &str,
+        raw_input: serde_json::Value,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(
+            sorted_args(compact_args_for(tool, header, Some(&raw_input))).as_deref(),
+            expected,
+            "{ARGS_MSG}"
+        );
+    }
+
+    /// A number is what the brackets exist to carry, so one that happens to
+    /// read as part of the header still has to survive.
+    #[test]
+    fn a_number_is_never_taken_for_the_header() {
+        assert_eq!(
+            compact_args_for(
+                "srv.unknown",
+                "src/v1/mod.rs",
+                Some(&serde_json::json!({ "offset": 1 }))
+            )
+            .as_deref(),
+            Some(" [offset=1]"),
+            "{ARGS_MSG}"
         );
     }
 }
