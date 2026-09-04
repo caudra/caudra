@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use rusqlite::backup::Backup;
 use rusqlite::limits::Limit;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -54,8 +55,12 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
+/// Pages copied per step of the pre-migration backup. The whole file is copied
+/// under the initialization lock, so this only bounds how long the backup holds
+/// SQLite's read lock between steps.
+const BACKUP_PAGES_PER_STEP: std::ffi::c_int = 1024;
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,8 +87,51 @@ const TRIM_KEEP_OUTPUT_BYTES: i64 = 4096;
 const SESSION_OPEN_ELSEWHERE: &str = "session is open in another Caudra instance";
 const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
 
-// This schema stores canonical state only. Adding any second durable
-// representation requires bounded retention and explicit recovery semantics.
+/// Lifetime spend, aggregated into hourly buckets. Deliberately carries no
+/// `session_id` and no foreign key: forgetting a session must not erase what it
+/// cost. Growth is bounded by time, model, and project rather than by session
+/// count, and nothing reads it to decide whether a session is correct, so losing
+/// it costs reporting and nothing else.
+///
+/// `cost` is the priced sum rather than a nullable per-entry price: a bucket
+/// mixes priced and unpriced turns, so `SUM(cost)` alone would quietly
+/// understate. `unpriced_turns` is what makes the shortfall countable.
+const USAGE_LEDGER_TABLE: &str = r#"
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, model, cwd, ephemeral)
+) STRICT, WITHOUT ROWID;
+"#;
+
+/// One step of the schema chain. A fresh database gets [`SCHEMA`] at
+/// [`SCHEMA_VERSION`] directly; only an existing database replays these.
+struct Migration {
+    from: i64,
+    to: i64,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    to: 2,
+    sql: USAGE_LEDGER_TABLE,
+}];
+
+// Session state in this schema is canonical. The one exception is
+// `usage_ledger`, which is a second durable representation on purpose: its
+// retention is bounded by time rather than by session count, and its recovery
+// semantics are that it is never read to establish session correctness.
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
     id                  BLOB PRIMARY KEY CHECK(length(id) = 16),
@@ -198,6 +246,41 @@ CREATE TABLE pending_archives (
     PRIMARY KEY(session_id, pending_name)
 ) STRICT, WITHOUT ROWID;
 "#;
+
+/// What a fresh database gets: every migration already folded in.
+fn full_schema() -> String {
+    format!("{SCHEMA}{USAGE_LEDGER_TABLE}")
+}
+
+/// One turn on its way into [`usage_ledger`](USAGE_LEDGER_TABLE). Borrowed
+/// because the caller already owns every string and this runs per turn.
+pub struct LedgerEntry<'a> {
+    pub bucket_start: i64,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub cwd: &'a str,
+    pub ephemeral: bool,
+    pub usage: StoredTokenUsage,
+    pub cost: Option<f64>,
+}
+
+/// One accumulated hour of spend. Counters are `u64` because a lifetime total
+/// outgrows the `u32` a single session's counters use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageBucket {
+    pub bucket_start: i64,
+    pub provider: String,
+    pub model: String,
+    pub cwd: String,
+    pub ephemeral: bool,
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+    pub cost: f64,
+    pub priced_turns: u64,
+    pub unpriced_turns: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionCursor {
@@ -508,6 +591,79 @@ impl SessionDatabase {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
         Ok(())
+    }
+
+    /// Folds one turn into its hourly bucket. Accumulating rather than
+    /// inserting keeps the table bounded by time instead of by turn count.
+    pub fn record_usage(&self, entry: &LedgerEntry) -> Result<(), SessionError> {
+        let (cost, priced, unpriced) = match entry.cost {
+            Some(cost) => (cost, 1, 0),
+            None => (0.0, 0, 1),
+        };
+        self.connection.execute(
+            "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, ephemeral, \
+                 input_tokens, output_tokens, cache_creation, cache_read, cost, \
+                 priced_turns, unpriced_turns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             ON CONFLICT(bucket_start, provider, model, cwd, ephemeral) DO UPDATE SET \
+                 input_tokens = input_tokens + excluded.input_tokens, \
+                 output_tokens = output_tokens + excluded.output_tokens, \
+                 cache_creation = cache_creation + excluded.cache_creation, \
+                 cache_read = cache_read + excluded.cache_read, \
+                 cost = cost + excluded.cost, \
+                 priced_turns = priced_turns + excluded.priced_turns, \
+                 unpriced_turns = unpriced_turns + excluded.unpriced_turns",
+            params![
+                entry.bucket_start,
+                entry.provider,
+                entry.model,
+                entry.cwd,
+                i64::from(entry.ephemeral),
+                i64::from(entry.usage.input),
+                i64::from(entry.usage.output),
+                i64::from(entry.usage.cache_creation),
+                i64::from(entry.usage.cache_read),
+                cost,
+                priced,
+                unpriced,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn usage_buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT bucket_start, provider, model, cwd, ephemeral, input_tokens, output_tokens, \
+                    cache_creation, cache_read, cost, priced_turns, unpriced_turns  \
+             FROM usage_ledger WHERE ?1 IS NULL OR bucket_start >= ?1  \
+             ORDER BY bucket_start DESC, provider ASC, model ASC, cwd ASC",
+        )?;
+        let mut rows = statement.query(params![since])?;
+        let mut buckets = Vec::new();
+        while let Some(row) = rows.next()? {
+            buckets.push(UsageBucket {
+                bucket_start: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                cwd: row.get(3)?,
+                ephemeral: row.get::<_, i64>(4)? != 0,
+                input: from_i64(row.get(5)?, "usage_ledger.input_tokens")?,
+                output: from_i64(row.get(6)?, "usage_ledger.output_tokens")?,
+                cache_creation: from_i64(row.get(7)?, "usage_ledger.cache_creation")?,
+                cache_read: from_i64(row.get(8)?, "usage_ledger.cache_read")?,
+                cost: row.get(9)?,
+                priced_turns: from_i64(row.get(10)?, "usage_ledger.priced_turns")?,
+                unpriced_turns: from_i64(row.get(11)?, "usage_ledger.unpriced_turns")?,
+            });
+        }
+        Ok(buckets)
+    }
+
+    pub fn prune_usage_before(&self, bucket_start: i64) -> Result<usize, SessionError> {
+        Ok(self.connection.execute(
+            "DELETE FROM usage_ledger WHERE bucket_start < ?1",
+            params![bucket_start],
+        )?)
     }
 
     /// Scalar facts for every session, or for one working directory. Payload
@@ -2028,6 +2184,10 @@ fn verify_current_schema(connection: &Connection) -> Result<(), SessionError> {
             supported: SCHEMA_VERSION,
         });
     }
+    verify_application_id(connection)
+}
+
+fn verify_application_id(connection: &Connection) -> Result<(), SessionError> {
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     if application_id != APPLICATION_ID {
@@ -2206,17 +2366,81 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), SessionError> {
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION {
+/// A database newer than this binary is fatal on purpose: opening a schema we
+/// cannot read would corrupt it, and a downgrade is never a silent operation.
+fn reject_unmigratable(version: i64) -> Result<(), SessionError> {
+    if !(0..=SCHEMA_VERSION).contains(&version) {
         return Err(SessionError::UnsupportedSchemaVersion {
             found: version,
             supported: SCHEMA_VERSION,
         });
     }
+    Ok(())
+}
+
+/// Copies the database beside itself before the first migration step, so a
+/// failed upgrade leaves the original readable by the version that wrote it.
+fn back_up_before_migration(
+    connection: &Connection,
+    state_dir: &StateDir,
+    from: i64,
+) -> Result<PathBuf, SessionError> {
+    let path = state_dir
+        .path()
+        .join(format!("{SESSIONS_DB_FILE}.v{from}.bak"));
+    let mut destination = Connection::open(&path)?;
+    Backup::new(connection, &mut destination)?.run_to_completion(
+        BACKUP_PAGES_PER_STEP,
+        Duration::ZERO,
+        None,
+    )?;
+    destination.close().map_err(|(_, error)| error)?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(OWNER_FILE_MODE))
+        .map_err(StorageError::from)?;
+    Ok(path)
+}
+
+/// Replays [`MIGRATIONS`] from `version` up to [`SCHEMA_VERSION`]. Each step
+/// bumps `user_version` inside its own transaction, so an interrupted upgrade
+/// leaves the database at a version some binary can open rather than between
+/// two of them.
+fn migrate_to_current(
+    connection: &mut Connection,
+    state_dir: &StateDir,
+    version: i64,
+) -> Result<(), SessionError> {
+    verify_application_id(connection)?;
+    let backup = back_up_before_migration(connection, state_dir, version)?;
+    let mut current = version;
+    while current < SCHEMA_VERSION {
+        let Some(step) = MIGRATIONS.iter().find(|m| m.from == current) else {
+            return Err(SessionError::UnsupportedSchemaVersion {
+                found: current,
+                supported: SCHEMA_VERSION,
+            });
+        };
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        transaction.execute_batch(step.sql)?;
+        transaction.pragma_update(None, "user_version", step.to)?;
+        transaction.commit()?;
+        current = step.to;
+    }
+    tracing::info!(
+        from = version,
+        to = SCHEMA_VERSION,
+        backup = %backup.display(),
+        "migrated session database schema"
+    );
+    Ok(())
+}
+
+fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), SessionError> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == SCHEMA_VERSION {
         return configure_current_schema(connection);
     }
+    reject_unmigratable(version)?;
 
     // Caudra initializers serialize on the existing artifact lock, while the
     // SQLite exclusive mode below also excludes non-cooperating connections.
@@ -2225,11 +2449,10 @@ fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), S
     if version == SCHEMA_VERSION {
         return configure_current_schema(connection);
     }
+    reject_unmigratable(version)?;
     if version != 0 {
-        return Err(SessionError::UnsupportedSchemaVersion {
-            found: version,
-            supported: SCHEMA_VERSION,
-        });
+        migrate_to_current(connection, state_dir, version)?;
+        return configure_current_schema(connection);
     }
 
     // Retain SQLite's exclusive file lock across the empty-header pragmas and
@@ -2260,7 +2483,7 @@ fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), S
         connection.execute_batch("VACUUM")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
         verify_empty_database(&transaction)?;
-        transaction.execute_batch(SCHEMA)?;
+        transaction.execute_batch(&full_schema())?;
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -2995,6 +3218,12 @@ mod tests {
     const INITIALIZER_COUNT: usize = 2;
     const SMALL_OUTPUT_ID: &str = "small";
     const TOMBSTONES_TABLE: &str = "session_tombstones";
+    const LEDGER_TABLE: &str = "usage_ledger";
+    const BACKUP_KEEPS_ORIGIN: &str =
+        "the pre-migration backup must stay readable by the version that wrote it";
+    const PARTIAL_MIGRATION: &str = "a failed step must leave a version some binary can open";
+    const FRESH_IS_CURRENT: &str =
+        "a fresh database must get the current schema without replaying migrations";
     const OLDER_SCHEMA_VERSION: i64 = -1;
     const NEWER_SCHEMA_VERSION: i64 = SCHEMA_VERSION + 1;
     const TRIM_KEEPS_SMALL: &str = "trim must keep rich outputs at or below the threshold";
@@ -3752,7 +3981,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_uses_the_single_current_schema() {
+    fn a_fresh_database_gets_the_current_schema_without_migrating() {
         let (_temp, state_dir) = state_dir();
         let database = SessionDatabase::open(&state_dir).unwrap();
         let table_exists = |name| {
@@ -3767,13 +3996,13 @@ mod tests {
         };
 
         assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 1);
         let application_id: i64 = database
             .connection
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
         assert_eq!(application_id, APPLICATION_ID);
         assert!(table_exists(TOMBSTONES_TABLE));
+        assert!(table_exists(LEDGER_TABLE), "{FRESH_IS_CURRENT}");
     }
 
     #[test]
@@ -3884,6 +4113,113 @@ mod tests {
         ));
         assert!(foreign_table_exists);
         assert_eq!(version, 0);
+    }
+
+    /// A database as the previous release left it: schema 1, no ledger.
+    fn seed_v1_database(state_dir: &StateDir) -> CaudraId {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGE_SIZE)
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        let id = CaudraId::generate();
+        connection
+            .execute(
+                "INSERT INTO sessions (id, format_version, title, cwd, model, created_at,\
+                 updated_at, token_usage, metadata) \
+                 VALUES (?1, ?2, 'kept', '/repo', 'm', 1, 1, '{}', '{}')",
+                params![id.as_bytes().as_slice(), i64::from(SESSION_VERSION)],
+            )
+            .unwrap();
+        drop(connection);
+        id
+    }
+
+    #[test]
+    fn opening_a_v1_database_migrates_it_and_keeps_its_sessions() {
+        let (_temp, state_dir) = state_dir();
+        let id = seed_v1_database(&state_dir);
+
+        let database = SessionDatabase::open(&state_dir).unwrap();
+
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(database.persisted_session_ids().unwrap(), vec![id]);
+        assert_eq!(database.usage_buckets(None).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn migrating_leaves_the_original_readable_at_its_own_version() {
+        let (_temp, state_dir) = state_dir();
+        let id = seed_v1_database(&state_dir);
+
+        SessionDatabase::open(&state_dir).unwrap();
+
+        let backup = state_dir.path().join(format!("{SESSIONS_DB_FILE}.v1.bak"));
+        let connection = Connection::open(&backup).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let title: String = connection
+            .query_row(
+                "SELECT title FROM sessions WHERE id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(version, 1, "{BACKUP_KEEPS_ORIGIN}");
+        assert_eq!(title, "kept", "{BACKUP_KEEPS_ORIGIN}");
+    }
+
+    #[test]
+    fn a_failed_migration_step_leaves_the_version_it_started_from() {
+        let (_temp, state_dir) = state_dir();
+        seed_v1_database(&state_dir);
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::open(&state_dir).err().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert!(matches!(error, SessionError::Sqlite(_)), "{error}");
+        assert_eq!(version, 1, "{PARTIAL_MIGRATION}");
+    }
+
+    #[test]
+    fn a_foreign_database_is_not_migrated() {
+        let (_temp, state_dir) = state_dir();
+        seed_v1_database(&state_dir);
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID + 1)
+            .unwrap();
+        drop(connection);
+
+        let error = SessionDatabase::open(&state_dir).err().unwrap();
+
+        assert!(matches!(
+            error,
+            SessionError::CorruptDatabaseValue {
+                field: "PRAGMA application_id",
+                ..
+            }
+        ));
     }
 
     #[test_case(OLDER_SCHEMA_VERSION; "older")]

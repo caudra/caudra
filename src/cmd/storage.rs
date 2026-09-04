@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -7,17 +9,21 @@ use caudra_config::{RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::retention::{Decision, GroupBy, KeepPolicy, SessionFacts};
+use caudra_storage::retention::{
+    Decision, Duration as RetentionDuration, GroupBy, KeepPolicy, SessionFacts,
+};
 use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
-use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase};
+use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket};
+use caudra_storage::usage_ledger::UsageLedger;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, bail};
+use color_eyre::eyre::{Context, bail, eyre};
+use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use serde::Serialize;
 
-use crate::cli::{KeepPolicyArgs, PolicyScopeArgs, StorageAction};
+use crate::cli::{KeepPolicyArgs, PolicyScopeArgs, StorageAction, UsageGrouping};
 
 const ID_WIDTH: usize = 22;
 const ACTIVITY_WIDTH: usize = 16;
@@ -29,6 +35,30 @@ const UNGROUPED: &str = "all sessions";
 const EMPTY_POLICY: &str = "refusing to act on an empty policy; pass --keep-* rules, configure \
     storage.retention, or combine --unsafe-allow-remove-all with --directory";
 const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+const GROUP_WIDTH: usize = 34;
+const TOKEN_WIDTH: usize = 14;
+const COST_WIDTH: usize = 12;
+const DAY_FORMAT: &str = "%Y-%m-%d";
+const MONTH_FORMAT: &str = "%Y-%m";
+const USAGE_TOTAL: &str = "all recorded spend";
+const UNREPRESENTABLE_DURATION: &str = "duration does not land in the representable range";
+
+/// One aggregated line of `storage usage`.
+#[derive(Serialize, Default)]
+struct UsageRow {
+    group: String,
+    input: u64,
+    output: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    cost: f64,
+    /// Spend from `--ephemeral` runs, already counted in `cost`.
+    ephemeral_cost: f64,
+    priced_turns: u64,
+    /// Turns that spent tokens on a model with no price, so `cost` understates
+    /// by an unknown amount rather than by zero.
+    unpriced_turns: u64,
+}
 
 #[derive(Serialize)]
 struct SessionRow<'a> {
@@ -186,6 +216,29 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", render_prune(&report));
+            }
+        }
+        StorageAction::Usage {
+            since,
+            group_by,
+            json,
+            prune_older_than,
+        } => {
+            let ledger = UsageLedger::open(&state_dir).context("open usage ledger")?;
+            if let Some(duration) = prune_older_than {
+                let removed = ledger
+                    .prune_before(epoch_cutoff(duration)?)
+                    .context("prune recorded spend")?;
+                println!("pruned_buckets: {removed}");
+                return Ok(());
+            }
+            let since = since.map(epoch_cutoff).transpose()?;
+            let buckets = ledger.buckets(since).context("read recorded spend")?;
+            let rows = group_usage(&buckets, group_by);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                print!("{}", render_usage(&rows, group_by));
             }
         }
         StorageAction::Pin { ids } => set_pinned(&state_dir, &ids, true)?,
@@ -556,6 +609,114 @@ fn render_prune(report: &PruneReport) -> String {
     out
 }
 
+/// Folds hourly rows into whatever the caller asked to see. Ephemeral spend
+/// counts toward the total and is reported again on its own, because it is the
+/// same money either way.
+fn group_usage(buckets: &[UsageBucket], group_by: UsageGrouping) -> Vec<UsageRow> {
+    let mut grouped: BTreeMap<String, UsageRow> = BTreeMap::new();
+    for bucket in buckets {
+        let key = usage_key(bucket, group_by);
+        let row = grouped.entry(key.clone()).or_insert_with(|| UsageRow {
+            group: key,
+            ..UsageRow::default()
+        });
+        row.input += bucket.input;
+        row.output += bucket.output;
+        row.cache_creation += bucket.cache_creation;
+        row.cache_read += bucket.cache_read;
+        row.cost += bucket.cost;
+        row.priced_turns += bucket.priced_turns;
+        row.unpriced_turns += bucket.unpriced_turns;
+        if bucket.ephemeral {
+            row.ephemeral_cost += bucket.cost;
+        }
+    }
+    let mut rows: Vec<UsageRow> = grouped.into_values().collect();
+    rows.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.group.cmp(&b.group))
+    });
+    rows
+}
+
+fn usage_key(bucket: &UsageBucket, group_by: UsageGrouping) -> String {
+    match group_by {
+        UsageGrouping::Model => format!("{}/{}", bucket.provider, bucket.model),
+        UsageGrouping::Provider => bucket.provider.clone(),
+        UsageGrouping::Project => bucket.cwd.clone(),
+        UsageGrouping::Day => bucket_time(bucket, DAY_FORMAT),
+        UsageGrouping::Month => bucket_time(bucket, MONTH_FORMAT),
+        UsageGrouping::Total => USAGE_TOTAL.to_owned(),
+    }
+}
+
+fn bucket_time(bucket: &UsageBucket, format: &str) -> String {
+    Timestamp::from_second(bucket.bucket_start).map_or_else(
+        |_| bucket.bucket_start.to_string(),
+        |timestamp| {
+            timestamp
+                .to_zoned(Zoned::now().time_zone().clone())
+                .strftime(format)
+                .to_string()
+        },
+    )
+}
+
+fn epoch_cutoff(duration: RetentionDuration) -> Result<i64> {
+    duration
+        .epoch_cutoff(caudra_storage::now_epoch(), &TimeZone::system())
+        .ok_or_else(|| eyre!("{UNREPRESENTABLE_DURATION}: {duration}"))
+}
+
+fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
+    let mut out = String::new();
+    let heading = match group_by {
+        UsageGrouping::Model => "Provider / Model",
+        UsageGrouping::Provider => "Provider",
+        UsageGrouping::Project => "Project",
+        UsageGrouping::Day => "Day",
+        UsageGrouping::Month => "Month",
+        UsageGrouping::Total => "Total",
+    };
+    let _ = writeln!(
+        out,
+        "{heading:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>COST_WIDTH$} {:>8}",
+        "Input", "Output", "Cached", "Cost", "Turns"
+    );
+    let mut total = UsageRow::default();
+    for row in rows {
+        let _ = writeln!(
+            out,
+            "{:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>COST_WIDTH$} {:>8}",
+            truncate(&row.group, GROUP_WIDTH),
+            row.input,
+            row.output,
+            row.cache_read + row.cache_creation,
+            format!("${:.4}", row.cost),
+            row.priced_turns + row.unpriced_turns,
+        );
+        total.input += row.input;
+        total.output += row.output;
+        total.cost += row.cost;
+        total.unpriced_turns += row.unpriced_turns;
+        total.ephemeral_cost += row.ephemeral_cost;
+    }
+    let _ = writeln!(out, "\ntotal_cost: ${:.4}", total.cost);
+    if total.ephemeral_cost > 0.0 {
+        let _ = writeln!(out, "ephemeral_cost: ${:.4}", total.ephemeral_cost);
+    }
+    if total.unpriced_turns > 0 {
+        let _ = writeln!(
+            out,
+            "unpriced_turns: {} (tokens the total cannot price)",
+            total.unpriced_turns
+        );
+    }
+    out
+}
+
 fn render_sessions(rows: &[SessionRow<'_>]) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -634,6 +795,113 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+
+    const HOUR: i64 = 3600;
+    const UNPRICED_VISIBLE: &str = "a total that cannot price some of its tokens must say so";
+    const EPHEMERAL_COUNTED: &str = "ephemeral spend is real money and belongs in the total";
+
+    fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
+        UsageBucket {
+            bucket_start,
+            provider: provider.into(),
+            model: model.into(),
+            cwd: cwd.into(),
+            ephemeral: false,
+            input: 10,
+            output: 5,
+            cache_creation: 1,
+            cache_read: 2,
+            cost,
+            priced_turns: 1,
+            unpriced_turns: 0,
+        }
+    }
+
+    #[test_case(UsageGrouping::Model, 2 ; "model splits the two models")]
+    #[test_case(UsageGrouping::Provider, 1 ; "provider folds them together")]
+    #[test_case(UsageGrouping::Project, 2 ; "project splits the two directories")]
+    #[test_case(UsageGrouping::Total, 1 ; "total is one row")]
+    fn grouping_controls_how_many_rows_come_back(group_by: UsageGrouping, expected: usize) {
+        let buckets = [
+            bucket(0, "anthropic", "opus", "/a", 1.0),
+            bucket(HOUR, "anthropic", "haiku", "/b", 2.0),
+        ];
+
+        let rows = group_usage(&buckets, group_by);
+
+        assert_eq!(rows.len(), expected);
+        assert_eq!(rows.iter().map(|row| row.cost).sum::<f64>(), 3.0);
+    }
+
+    #[test]
+    fn rows_are_ordered_by_what_they_cost() {
+        let buckets = [
+            bucket(0, "anthropic", "cheap", "/a", 1.0),
+            bucket(0, "anthropic", "dear", "/a", 9.0),
+        ];
+
+        let rows = group_usage(&buckets, UsageGrouping::Model);
+
+        assert_eq!(rows[0].group, "anthropic/dear");
+    }
+
+    #[test]
+    fn unpriced_turns_are_reported_rather_than_folded_into_the_cost() {
+        let unpriced = UsageBucket {
+            cost: 0.0,
+            priced_turns: 0,
+            unpriced_turns: 4,
+            ..bucket(0, "local", "llama", "/a", 0.0)
+        };
+        let rows = group_usage(
+            &[bucket(0, "anthropic", "opus", "/a", 2.0), unpriced],
+            UsageGrouping::Total,
+        );
+
+        let rendered = render_usage(&rows, UsageGrouping::Total);
+
+        assert!(
+            rendered.contains("total_cost: $2.0000"),
+            "{UNPRICED_VISIBLE}"
+        );
+        assert!(rendered.contains("unpriced_turns: 4"), "{UNPRICED_VISIBLE}");
+    }
+
+    #[test]
+    fn ephemeral_spend_counts_toward_the_total_and_is_named_separately() {
+        let ephemeral = UsageBucket {
+            ephemeral: true,
+            ..bucket(0, "anthropic", "opus", "/a", 3.0)
+        };
+        let rows = group_usage(
+            &[bucket(0, "anthropic", "opus", "/a", 1.0), ephemeral],
+            UsageGrouping::Total,
+        );
+
+        let rendered = render_usage(&rows, UsageGrouping::Total);
+
+        assert!(
+            rendered.contains("total_cost: $4.0000"),
+            "{EPHEMERAL_COUNTED}"
+        );
+        assert!(
+            rendered.contains("ephemeral_cost: $3.0000"),
+            "{EPHEMERAL_COUNTED}"
+        );
+    }
+
+    #[test]
+    fn a_total_without_ephemeral_or_unpriced_spend_stays_quiet() {
+        let rows = group_usage(
+            &[bucket(0, "anthropic", "opus", "/a", 1.0)],
+            UsageGrouping::Total,
+        );
+
+        let rendered = render_usage(&rows, UsageGrouping::Total);
+
+        assert!(!rendered.contains("ephemeral_cost"));
+        assert!(!rendered.contains("unpriced_turns"));
+    }
 
     #[test_case(0, "0 B")]
     #[test_case(1023, "1023 B")]

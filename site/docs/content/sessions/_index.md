@@ -27,6 +27,8 @@ Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the sys
 
 Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run.
 
+What the run spends is still recorded in the persistent [usage ledger](/docs/token-economy/#lifetime-spend), labelled as ephemeral, so an ephemeral run stays visible in your spending totals.
+
 ## Message actions
 
 Right-click a message, or hold the left mouse button for half a second, to open Message Actions. Normal left clicks still select text, expand reasoning, and interact with tool output.
@@ -104,6 +106,8 @@ An empty `forget` policy disables automatic deletion. To delete sessions after t
 The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the write-ahead log is checkpointed, and free pages are returned to the filesystem. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
 
 `caudra storage trim --dry-run` and `caudra storage forget --dry-run` print the plan with the reason each session is kept. `caudra storage sessions` lists sessions with their tier. `caudra storage pin <ID>` keeps a session regardless of policy. See [CLI](/docs/cli/#caudra-storage) for every flag.
+
+Retention never removes spending records. What a session cost is written to a separate ledger that no session owns, so `caudra storage usage` still answers after the sessions are gone. See [Lifetime spend](/docs/token-economy/#lifetime-spend).
 
 ## Conversation revert
 

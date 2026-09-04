@@ -8,6 +8,7 @@ use crate::components::keybindings::{Bind, KeybindContext, key as kb};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
+use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -41,6 +42,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
+use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
@@ -51,6 +53,12 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LEDGER_PROVIDER: &str = "anthropic";
+const LEDGER_MODEL: &str = "claude-opus-5";
+const LEDGER_CWD: &str = "/home/dev/caudra";
+const LEDGER_COST: f64 = 0.25;
+const LIFETIME_IS_NOT_READ_UNTIL_ASKED_FOR: &str =
+    "opening the session view must not touch the ledger";
 const TASK_ID: &str = "task1";
 pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
@@ -4750,6 +4758,39 @@ fn resetting_the_session_clears_conversation_rules() {
 
     assert!(app.permissions.session_rules_snapshot().is_empty());
     assert!(app.state.session.meta.session_rules.is_empty());
+}
+
+#[test]
+fn the_lifetime_view_reads_spend_the_current_session_never_produced() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let ledger = UsageLedger::open(&dir).unwrap();
+    ledger
+        .record(&TurnUsage {
+            provider: LEDGER_PROVIDER.into(),
+            model: LEDGER_MODEL.into(),
+            cwd: LEDGER_CWD.into(),
+            input: 1,
+            output: 1,
+            cache_creation: 0,
+            cache_read: 0,
+            cost: Some(LEDGER_COST),
+        })
+        .unwrap();
+
+    app.execute_command(cmd("/usage"), 0);
+    assert!(
+        app.lifetime_usage.is_none(),
+        "{LIFETIME_IS_NOT_READ_UNTIL_ASKED_FOR}"
+    );
+
+    app.handle_key(SCOPE_KEY.to_key_event());
+
+    let lifetime = app.lifetime_usage.as_ref().expect("ledger should be read");
+    assert_eq!(lifetime.cost, LEDGER_COST);
+    assert_eq!(
+        lifetime.by_model[0].label,
+        format!("{LEDGER_PROVIDER}/{LEDGER_MODEL}")
+    );
 }
 
 #[test]

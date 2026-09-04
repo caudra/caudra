@@ -61,7 +61,7 @@ use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget}
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
-use crate::components::usage_modal::{UsageFetchState, UsageModal};
+use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
     is_ctrl,
@@ -84,10 +84,13 @@ use caudra_config::{ModelPolicy, PermissionsConfig, UiConfig};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use caudra_providers::{ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, add_cost};
+use caudra_providers::{
+    ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, TokenUsage, add_cost,
+};
 use caudra_storage::StateDir;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
+use caudra_storage::usage_ledger::{LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
@@ -256,6 +259,9 @@ pub struct App {
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
+    /// Read from the ledger when the modal asks for it, not on every frame:
+    /// the table outlives sessions and only grows.
+    pub(super) lifetime_usage: Option<LifetimeUsage>,
     pub(super) goal_modal: GoalModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -413,6 +419,7 @@ impl App {
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
+            lifetime_usage: None,
             goal_modal: GoalModal::default(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -1023,9 +1030,12 @@ impl App {
 
         if self.usage_modal.is_open() {
             if key::REFRESH.matches(key) {
+                self.lifetime_usage = None;
+                self.load_lifetime_usage();
                 return Some(vec![Action::RefreshUsage]);
             }
             self.usage_modal.handle_key(key);
+            self.load_lifetime_usage();
             return Some(vec![]);
         }
 
@@ -2300,9 +2310,7 @@ impl App {
             if subagent_id.is_some() {
                 self.state.goal.record_external_usage(tc.usage, tc.cost);
             }
-            self.state
-                .session_mut()
-                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
+            self.record_model_usage(&tc.model, tc.usage, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -2345,9 +2353,7 @@ impl App {
                 if usage.context_tokens() > 0 || cost.is_some() {
                     let usage_model =
                         goal_usage_model(&model, &self.state.model.provider).to_string();
-                    self.state
-                        .session_mut()
-                        .add_model_usage(&usage_model, usage.billed(cost));
+                    self.record_model_usage(&usage_model, usage, cost);
                 }
                 if applied && verdict == GoalVerdict::NotMet {
                     self.main_chat().push(DisplayMessage::new(
@@ -2414,9 +2420,7 @@ impl App {
                 if usage.context_tokens() > 0 || cost.is_some() {
                     let usage_model =
                         goal_usage_model(&model, &self.state.model.provider).to_string();
-                    self.state
-                        .session_mut()
-                        .add_model_usage(&usage_model, usage.billed(cost));
+                    self.record_model_usage(&usage_model, usage, cost);
                 }
                 if applied {
                     self.main_chat().push(DisplayMessage::new(
@@ -2691,6 +2695,7 @@ impl App {
             "/usage" => {
                 self.usage_modal.toggle();
                 if self.usage_modal.is_open() {
+                    self.load_lifetime_usage();
                     vec![Action::RefreshUsage]
                 } else {
                     vec![]
@@ -3197,6 +3202,38 @@ impl App {
         dirty
     }
 
+    /// Reads the ledger the first time the lifetime view is asked for. A
+    /// failure leaves `None`, which the modal renders as unavailable rather
+    /// than as zero spend.
+    fn load_lifetime_usage(&mut self) {
+        if self.usage_modal.scope() != UsageScope::Lifetime || self.lifetime_usage.is_some() {
+            return;
+        }
+        match UsageLedger::open(&self.storage).and_then(|ledger| ledger.lifetime()) {
+            Ok(lifetime) => self.lifetime_usage = Some(lifetime),
+            Err(error) => tracing::warn!(%error, "lifetime usage unavailable"),
+        }
+    }
+
+    /// The one place a turn's spend is recorded. The session keeps its own
+    /// per-model breakdown for `/usage`, and the ledger keeps the money: a
+    /// forgotten session must not take what it cost with it.
+    fn record_model_usage(&mut self, model: &str, usage: TokenUsage, cost: Option<f64>) {
+        self.state
+            .session_mut()
+            .add_model_usage(model, usage.billed(cost));
+        self.storage_writer.record_usage(TurnUsage {
+            provider: self.state.model.provider.to_string(),
+            model: model.to_owned(),
+            cwd: self.state.session.cwd.clone(),
+            input: usage.input,
+            output: usage.output,
+            cache_creation: usage.cache_creation,
+            cache_read: usage.cache_read,
+            cost,
+        });
+    }
+
     /// btw spends real tokens outside any turn, so it settles into the same
     /// ledger as compaction and the goal evaluator. It deliberately leaves
     /// `context_size` alone: the question never enters history.
@@ -3206,9 +3243,7 @@ impl App {
             self.state.token_usage += btw.usage;
             add_cost(&mut self.state.cost, btw.cost);
             add_cost(&mut self.main_chat().cost, btw.cost);
-            self.state
-                .session_mut()
-                .add_model_usage(&btw.model, btw.usage.billed(btw.cost));
+            self.record_model_usage(&btw.model, btw.usage, btw.cost);
             self.state.goal.record_external_usage(btw.usage, btw.cost);
         }
         dirty

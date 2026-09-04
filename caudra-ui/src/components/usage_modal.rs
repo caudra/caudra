@@ -6,7 +6,8 @@ use arc_swap::ArcSwapOption;
 use caudra_config::ClockFormat;
 use caudra_providers::{Model, ProviderUsage, TokenUsage, format_tokens, model_cost};
 use caudra_storage::sessions::StoredTokenUsage;
-use crossterm::event::{KeyCode, KeyEvent};
+use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -16,13 +17,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::ModalScroll;
-use crate::components::keybindings::key;
+use crate::components::keybindings::{Bind, key};
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Token usage ";
+const LIFETIME_TITLE: &str = " Token usage - lifetime ";
+const SLICE_LIMIT: usize = 8;
+const NO_LEDGER: &str = "no spend recorded yet";
+const LEDGER_UNAVAILABLE: &str = "lifetime spend unavailable";
+/// Switches the modal between this session and everything ever recorded.
+/// Bare, since `Ctrl+g` already scrolls to the top.
+pub(crate) const SCOPE_KEY: Bind = Bind {
+    code: KeyCode::Char('g'),
+    modifiers: KeyModifiers::NONE,
+    label: "g",
+};
 const PREFIX: &str = "  ";
 const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
@@ -41,6 +53,15 @@ pub enum UsageFetchState {
     Error(String),
 }
 
+/// Which of the two answers the modal is showing: what this session spent, or
+/// what every session ever spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageScope {
+    #[default]
+    Session,
+    Lifetime,
+}
+
 pub struct UsageModalContext<'a> {
     pub total: &'a TokenUsage,
     /// What the session billed, from [`caudra_providers::session_cost`]. `None`
@@ -50,10 +71,14 @@ pub struct UsageModalContext<'a> {
     pub model: &'a Model,
     pub fast: bool,
     pub clock_format: ClockFormat,
+    /// `None` when the ledger could not be read, which is different from an
+    /// empty ledger and says so.
+    pub lifetime: Option<&'a LifetimeUsage>,
 }
 
 pub struct UsageModal {
     open: bool,
+    scope: UsageScope,
     scroll: ModalScroll,
     quota: Watch<UsageFetchState>,
 }
@@ -62,6 +87,7 @@ impl UsageModal {
     pub fn new() -> Self {
         Self {
             open: false,
+            scope: UsageScope::default(),
             scroll: ModalScroll::new_top(),
             quota: Watch::default(),
         }
@@ -86,6 +112,18 @@ impl UsageModal {
         self.scroll.reset();
     }
 
+    pub fn scope(&self) -> UsageScope {
+        self.scope
+    }
+
+    fn toggle_scope(&mut self) {
+        self.scope = match self.scope {
+            UsageScope::Session => UsageScope::Lifetime,
+            UsageScope::Lifetime => UsageScope::Session,
+        };
+        self.scroll.reset();
+    }
+
     /// Keeps the last answer: `/usage` refetches on every open, and until that
     /// lands it beats a blank panel.
     pub fn close(&mut self) {
@@ -100,6 +138,11 @@ impl UsageModal {
     pub fn handle_key(&mut self, key_event: KeyEvent) {
         if key_event.code == KeyCode::Esc || key::QUIT.matches(key_event) {
             self.close();
+            return;
+        }
+        if SCOPE_KEY.matches(key_event) {
+            self.toggle_scope();
+            return;
         }
         self.scroll.handle_key(key_event);
     }
@@ -110,11 +153,17 @@ impl UsageModal {
         }
 
         let theme = theme::current();
-        let lines = build_lines(ctx, self.quota.get(), &theme);
+        let lines = match self.scope {
+            UsageScope::Session => build_lines(ctx, self.quota.get(), &theme),
+            UsageScope::Lifetime => build_lifetime_lines(ctx.lifetime, &theme),
+        };
 
         let total = lines.len() as u16;
         let modal = Modal {
-            title: TITLE,
+            title: match self.scope {
+                UsageScope::Session => TITLE,
+                UsageScope::Lifetime => LIFETIME_TITLE,
+            },
             width_percent: 60,
             max_height_percent: 70,
         };
@@ -133,6 +182,14 @@ impl UsageModal {
             Span::raw(" "),
             Span::styled("Ctrl+R", theme.keybind_key),
             Span::styled(" reload ", theme.tool_dim),
+            Span::styled(SCOPE_KEY.label, theme.keybind_key),
+            Span::styled(
+                match self.scope {
+                    UsageScope::Session => " lifetime ",
+                    UsageScope::Lifetime => " session ",
+                },
+                theme.tool_dim,
+            ),
         ]);
         let hint_w = hint.width() as u16;
         let hint_area = Rect {
@@ -205,6 +262,120 @@ fn build_lines(
     }
 
     lines
+}
+
+fn build_lifetime_lines(
+    lifetime: Option<&LifetimeUsage>,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
+    let fg = Style::new().fg(theme.foreground);
+    let Some(lifetime) = lifetime else {
+        return vec![Line::from(Span::styled(
+            format!("{PREFIX}{LEDGER_UNAVAILABLE}"),
+            theme.status_dim,
+        ))];
+    };
+    if lifetime.is_empty() {
+        return vec![Line::from(Span::styled(
+            format!("{PREFIX}{NO_LEDGER}"),
+            theme.status_dim,
+        ))];
+    }
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{PREFIX}All time"),
+            theme.keybind_section,
+        )),
+        Line::from(vec![
+            Span::raw(PREFIX),
+            Span::styled(
+                format!(
+                    "in {:<7} out {:<7} cache {:<7} total {:<7} turns {:<7}",
+                    format_tokens_u64(lifetime.input),
+                    format_tokens_u64(lifetime.output),
+                    format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
+                    format_tokens_u64(lifetime.total_tokens()),
+                    lifetime.turns(),
+                ),
+                fg,
+            ),
+            Span::styled(format!("  ${:.2}", lifetime.cost), theme.accent),
+        ]),
+    ];
+    if lifetime.ephemeral_cost > 0.0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{PREFIX}of which ephemeral runs: ${:.2}",
+                lifetime.ephemeral_cost
+            ),
+            theme.status_dim,
+        )));
+    }
+    if lifetime.unpriced_turns > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{PREFIX}{} turns had no price, so the total is a floor",
+                lifetime.unpriced_turns
+            ),
+            theme.status_dim,
+        )));
+    }
+
+    for (heading, slices) in [
+        ("Per model", &lifetime.by_model),
+        ("Per project", &lifetime.by_project),
+        ("Per month", &lifetime.by_month),
+    ] {
+        if slices.is_empty() {
+            continue;
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}{heading}"),
+            theme.keybind_section,
+        )));
+        lines.extend(slice_rows(slices, fg, theme.status_dim));
+    }
+    lines
+}
+
+fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>> {
+    let shown = slices.len().min(SLICE_LIMIT);
+    let label_w = slices[..shown]
+        .iter()
+        .map(|slice| slice.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MODEL_COL_MIN);
+    let mut lines: Vec<Line> = slices[..shown]
+        .iter()
+        .map(|slice| {
+            Line::from(vec![
+                Span::raw(PREFIX),
+                Span::styled(format!("{:<label_w$}", slice.label), fg),
+                Span::raw(" ".repeat(COL_GAP)),
+                Span::styled(format!("{:>NUM_COL$}", format_tokens_u64(slice.tokens)), fg),
+                Span::raw(" ".repeat(COL_GAP)),
+                Span::styled(format!("{:>6}", slice.turns), dim),
+                Span::raw(" ".repeat(COL_GAP)),
+                Span::styled(format!("{:>8.3}", slice.cost), fg),
+            ])
+        })
+        .collect();
+    if slices.len() > shown {
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}... and {} more", slices.len() - shown),
+            dim,
+        )));
+    }
+    lines
+}
+
+/// `format_tokens` takes the `u32` a session counts in; a lifetime total needs
+/// the wider one, and saturating keeps the display honest rather than wrapping.
+fn format_tokens_u64(value: u64) -> String {
+    format_tokens(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 fn totals_row(
@@ -399,12 +570,130 @@ mod tests {
     const ONE_MILLION_TEXT: &str = "1.0m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const NO_COST_TEXT: &str = "—";
+    const LIFETIME_MODEL: &str = "anthropic/claude-opus-5";
+    const LIFETIME_PROJECT: &str = "/home/dev/caudra";
+    const SCOPE_SURVIVES_CLOSE: &str =
+        "reopening should not silently change what is being measured";
+    const FLOOR_IS_STATED: &str =
+        "an unpriced turn makes the total a floor, and the modal must say so";
+    const CTRL_G_STILL_SCROLLS: &str =
+        "Ctrl+g is scroll-to-top and must not reach the bare-g scope key";
+
+    fn slice(label: &str, cost: f64) -> UsageSlice {
+        UsageSlice {
+            label: label.to_string(),
+            cost,
+            tokens: ONE_MILLION as u64,
+            turns: 1,
+        }
+    }
+
+    fn lifetime() -> LifetimeUsage {
+        LifetimeUsage {
+            input: ONE_MILLION as u64,
+            cost: RECORDED_COST,
+            priced_turns: 1,
+            by_model: vec![slice(LIFETIME_MODEL, RECORDED_COST)],
+            by_project: vec![slice(LIFETIME_PROJECT, RECORDED_COST)],
+            ..LifetimeUsage::default()
+        }
+    }
+
+    fn lifetime_texts(lifetime: Option<&LifetimeUsage>) -> Vec<String> {
+        line_texts(&build_lifetime_lines(lifetime, &crate::theme::current()))
+    }
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn the_scope_key_swaps_between_this_session_and_every_session() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        assert_eq!(modal.scope(), UsageScope::Session);
+
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        assert_eq!(modal.scope(), UsageScope::Lifetime);
+        assert!(modal.is_open(), "the scope key is not a close key");
+
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        assert_eq!(modal.scope(), UsageScope::Session);
+    }
+
+    #[test]
+    fn scrolling_to_the_top_is_not_a_scope_change() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        modal.handle_key(key::SCROLL_TOP.to_key_event());
+        assert_eq!(modal.scope(), UsageScope::Session, "{CTRL_G_STILL_SCROLLS}");
+    }
+
+    #[test]
+    fn the_chosen_scope_outlives_closing_the_modal() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        modal.close();
+        modal.toggle();
+        assert_eq!(
+            modal.scope(),
+            UsageScope::Lifetime,
+            "{SCOPE_SURVIVES_CLOSE}"
+        );
+    }
+
+    #[test]
+    fn a_lifetime_view_names_the_models_and_projects_that_cost_the_most() {
+        let texts = lifetime_texts(Some(&lifetime())).join("\n");
+        assert!(texts.contains(LIFETIME_MODEL), "{texts}");
+        assert!(texts.contains(LIFETIME_PROJECT), "{texts}");
+        assert!(texts.contains(RECORDED_TEXT), "{texts}");
+    }
+
+    #[test]
+    fn unpriced_turns_are_called_out_as_a_floor_on_the_lifetime_total() {
+        let usage = LifetimeUsage {
+            unpriced_turns: 3,
+            ..lifetime()
+        };
+        let texts = lifetime_texts(Some(&usage)).join("\n");
+        assert!(texts.contains("floor"), "{FLOOR_IS_STATED}: {texts}");
+    }
+
+    #[test]
+    fn ephemeral_spend_is_named_but_only_once_it_exists() {
+        let quiet = lifetime_texts(Some(&lifetime())).join("\n");
+        assert!(!quiet.contains("ephemeral"), "{quiet}");
+
+        let usage = LifetimeUsage {
+            ephemeral_cost: RECORDED_COST,
+            ..lifetime()
+        };
+        let loud = lifetime_texts(Some(&usage)).join("\n");
+        assert!(loud.contains("ephemeral"), "{loud}");
+    }
+
+    #[test_case(None, LEDGER_UNAVAILABLE ; "an_unreadable_ledger_says_so")]
+    #[test_case(Some(LifetimeUsage::default()), NO_LEDGER ; "an_empty_ledger_says_so")]
+    fn a_lifetime_view_without_numbers_explains_why(usage: Option<LifetimeUsage>, expected: &str) {
+        let texts = lifetime_texts(usage.as_ref()).join("\n");
+        assert!(texts.contains(expected), "{texts}");
+    }
+
+    #[test]
+    fn a_long_breakdown_is_capped_and_says_what_it_left_out() {
+        let usage = LifetimeUsage {
+            by_model: (0..SLICE_LIMIT + 2)
+                .map(|i| slice(&format!("model-{i}"), i as f64))
+                .collect(),
+            ..lifetime()
+        };
+        let texts = lifetime_texts(Some(&usage)).join("\n");
+        assert!(texts.contains("and 2 more"), "{texts}");
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -532,6 +821,7 @@ mod tests {
             model,
             fast: false,
             clock_format: ClockFormat::Hour24,
+            lifetime: None,
         };
         line_texts(&build_lines(&ctx, None, &crate::theme::current()))
     }
@@ -609,6 +899,7 @@ mod tests {
             model: &model,
             fast: false,
             clock_format: ClockFormat::Hour24,
+            lifetime: None,
         };
         terminal
             .draw(|f| {

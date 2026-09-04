@@ -778,13 +778,7 @@ impl Provider for Anthropic {
                 && self.refresh_oauth().await.is_ok()
             {
                 return self
-                    .do_stream_request(
-                        &body,
-                        event_tx,
-                        fast,
-                        session_id,
-                        oauth_tool_names.as_ref(),
-                    )
+                    .do_stream_request(&body, event_tx, fast, session_id, oauth_tool_names.as_ref())
                     .await;
             }
             result

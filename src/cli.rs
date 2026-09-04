@@ -355,6 +355,21 @@ pub enum StorageAction {
         #[arg(long)]
         json: bool,
     },
+    /// Report lifetime token spend, which outlives the sessions that produced it
+    Usage {
+        /// Only spend recorded within this duration, such as `30d`
+        #[arg(long, value_name = "DURATION")]
+        since: Option<RetentionDuration>,
+        /// How to aggregate the rows
+        #[arg(long, value_enum, default_value_t = UsageGrouping::Model)]
+        group_by: UsageGrouping,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+        /// Delete recorded spend older than this duration instead of reporting
+        #[arg(long, value_name = "DURATION", conflicts_with_all = ["since", "group_by"])]
+        prune_older_than: Option<RetentionDuration>,
+    },
     /// Keep sessions regardless of any policy
     Pin {
         #[arg(value_name = "ID", required = true)]
@@ -365,6 +380,17 @@ pub enum StorageAction {
         #[arg(value_name = "ID", required = true)]
         ids: Vec<String>,
     },
+}
+
+/// How `storage usage` folds the hourly ledger rows together.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGrouping {
+    Model,
+    Provider,
+    Project,
+    Day,
+    Month,
+    Total,
 }
 
 /// Which sessions to keep, in `restic forget` terms. A session is kept when

@@ -30,8 +30,8 @@ mod lease;
 pub mod sweep;
 
 pub use database::{
-    CheckpointResult, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor, SessionDatabase,
-    SessionRecreation, SessionStorageStats, TrimReport,
+    CheckpointResult, LedgerEntry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor,
+    SessionDatabase, SessionRecreation, SessionStorageStats, TrimReport, UsageBucket,
 };
 pub use lease::SessionLease;
 

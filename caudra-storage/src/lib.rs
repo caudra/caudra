@@ -19,6 +19,7 @@ pub mod state;
 pub mod theme;
 pub mod thinking;
 pub mod tool_outputs;
+pub mod usage_ledger;
 pub mod version;
 pub mod view;
 

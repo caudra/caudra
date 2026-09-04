@@ -50,6 +50,13 @@ impl Duration {
         self == Self::default()
     }
 
+    /// The instant `self` before `now` in epoch seconds, for callers that
+    /// filter on a stored timestamp rather than on [`SessionFacts`].
+    pub fn epoch_cutoff(self, now: u64, zone: &TimeZone) -> Option<i64> {
+        let cutoff = self.cutoff(&zoned(now, zone)?)?;
+        Some(cutoff.timestamp().as_second())
+    }
+
     /// The instant `self` before `now`, or `None` when the calendar
     /// arithmetic leaves the representable range.
     fn cutoff(self, now: &Zoned) -> Option<Zoned> {

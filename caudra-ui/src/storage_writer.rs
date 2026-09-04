@@ -20,6 +20,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::sessions::{SessionCursor, SessionDatabase, SessionError, SessionRecreation};
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
+use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
 use caudra_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -35,6 +36,9 @@ const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
 type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
+/// Turns accumulate rather than coalescing: the ledger sums spend, so a
+/// dropped turn is money the lifetime total never learns about.
+type PendingUsage = Arc<Mutex<Vec<TurnUsage>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -58,6 +62,7 @@ pub struct StorageWriter {
     pending: Pending,
     wake: flume::Sender<()>,
     workspace_tabs: PendingWorkspaceTabs,
+    usage: PendingUsage,
     done_rx: flume::Receiver<()>,
 }
 
@@ -67,6 +72,8 @@ impl StorageWriter {
         let writer_pending = Arc::clone(&pending);
         let workspace_tabs: PendingWorkspaceTabs = Arc::default();
         let writer_workspace_tabs = Arc::clone(&workspace_tabs);
+        let usage: PendingUsage = Arc::default();
+        let writer_usage = Arc::clone(&usage);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let (done_tx, done_rx) = flume::bounded::<()>(1);
 
@@ -77,6 +84,7 @@ impl StorageWriter {
                     dir,
                     warn_tx,
                     database: None,
+                    ledger: None,
                     cursors: HashMap::new(),
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
@@ -88,9 +96,11 @@ impl StorageWriter {
                 while wake_rx.recv().is_ok() {
                     writer.flush(&writer_pending);
                     writer.flush_workspace_tabs(&writer_workspace_tabs);
+                    writer.flush_usage(&writer_usage);
                 }
                 writer.flush(&writer_pending);
                 writer.flush_workspace_tabs(&writer_workspace_tabs);
+                writer.flush_usage(&writer_usage);
                 if let Some(database) = &writer.database
                     && let Err(error) = database.checkpoint(false)
                 {
@@ -104,7 +114,23 @@ impl StorageWriter {
             pending,
             wake,
             workspace_tabs,
+            usage,
             done_rx,
+        }
+    }
+
+    /// Records what a turn spent. Never coalesced and never dropped on a
+    /// superseding write: two turns in one bucket must both reach the sum.
+    pub fn record_usage(&self, turn: TurnUsage) {
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(turn);
+        match self.wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => {}
+            Err(flume::TrySendError::Disconnected(())) => {
+                warn!("storage writer unavailable; turn spend may not be recorded");
+            }
         }
     }
 
@@ -208,6 +234,7 @@ struct Writer {
     dir: StateDir,
     warn_tx: flume::Sender<String>,
     database: Option<SessionDatabase>,
+    ledger: Option<UsageLedger>,
     cursors: HashMap<CaudraId, SessionCursor>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
@@ -260,6 +287,28 @@ impl Writer {
                     }
                     done(session_result);
                 }
+            }
+        }
+    }
+
+    fn flush_usage(&mut self, pending: &PendingUsage) {
+        let turns = mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        if turns.is_empty() {
+            return;
+        }
+        let ledger = match &self.ledger {
+            Some(ledger) => ledger,
+            None => match UsageLedger::open(&self.dir) {
+                Ok(ledger) => self.ledger.insert(ledger),
+                Err(error) => {
+                    warn!(%error, turns = turns.len(), "usage ledger unavailable; spend not recorded");
+                    return;
+                }
+            },
+        };
+        for turn in &turns {
+            if let Err(error) = ledger.record(turn) {
+                warn!(%error, model = turn.model, "usage ledger write failed");
             }
         }
     }
@@ -475,6 +524,10 @@ mod tests {
     const RESUMED_MSG: &str = "resumed";
     const TOOL_ID: &str = "tool-1";
     const TOOL_TEXT: &str = "tool output";
+    const PROVIDER: &str = "anthropic";
+    const TURNS_ACCUMULATE: &str =
+        "each turn must reach the sum; the ledger is money, not a snapshot";
+    const SPEND_OUTLIVES: &str = "forgetting a session must not erase what it cost";
     const TITLE: &str = "renamed after reload";
 
     fn state_dir() -> (TempDir, StateDir) {
@@ -579,6 +632,57 @@ mod tests {
                 focused: None,
             })
         );
+    }
+
+    fn spend(model: &str, cost: Option<f64>) -> TurnUsage {
+        TurnUsage {
+            provider: PROVIDER.into(),
+            model: model.into(),
+            cwd: CWD.into(),
+            input: 1,
+            output: 2,
+            cache_creation: 0,
+            cache_read: 0,
+            cost,
+        }
+    }
+
+    #[test]
+    fn every_recorded_turn_reaches_the_ledger() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+
+        writer.record_usage(spend(MODEL, Some(1.0)));
+        writer.record_usage(spend(MODEL, Some(2.0)));
+        writer.record_usage(spend(MODEL, None));
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cost, 3.0, "{TURNS_ACCUMULATE}");
+        assert_eq!(rows[0].priced_turns, 2, "{TURNS_ACCUMULATE}");
+        assert_eq!(rows[0].unpriced_turns, 1, "{TURNS_ACCUMULATE}");
+        assert_eq!(rows[0].input, 3, "{TURNS_ACCUMULATE}");
+    }
+
+    #[test]
+    fn deleting_a_session_leaves_its_recorded_spend_behind() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let mut session = AppSession::new(MODEL, CWD);
+        crate::push_history_message(&mut session, user_message(0));
+        let id = session.id;
+        writer.save_sync(Arc::new(session)).unwrap();
+        writer.record_usage(spend(MODEL, Some(9.0)));
+        writer.record_usage(spend(MODEL, Some(1.0)));
+
+        writer.delete_sync(id).unwrap();
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        assert!(AppSession::load(id, &dir).is_err());
+        let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+        assert_eq!(rows.len(), 1, "{SPEND_OUTLIVES}");
+        assert_eq!(rows[0].cost, 10.0, "{SPEND_OUTLIVES}");
     }
 
     #[test]
@@ -824,6 +928,7 @@ mod tests {
             dir: dir.clone(),
             warn_tx,
             database: None,
+            ledger: None,
             cursors: HashMap::new(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
@@ -862,6 +967,7 @@ mod tests {
             dir: dir.clone(),
             warn_tx,
             database: None,
+            ledger: None,
             cursors: HashMap::new(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
@@ -891,6 +997,7 @@ mod tests {
             dir: dir.clone(),
             warn_tx,
             database: None,
+            ledger: None,
             cursors: HashMap::new(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),

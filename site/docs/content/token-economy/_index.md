@@ -75,3 +75,26 @@ more context and mistakes        one bounded result
 `/usage` shows the token breakdown of the current session, and `--output-format json` in [Headless Mode](/docs/headless/) reports `total_cost_usd` per run. Cheap is a feature you can measure.
 
 Each turn is priced when it happens and that number is stored with the session. Prices move (DeepSeek, for one, doubles every rate during peak UTC hours), so a total re-priced later would be a guess. What you see is what you were billed.
+
+## Lifetime spend
+
+Deleting a session deletes its transcript. The record of what it cost lives in a separate ledger that no session owns, so trimming and forgetting leave your spending history intact.
+
+Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the models and projects that cost the most, and a month by month breakdown. Press `g` again to go back.
+
+From the shell:
+
+```bash
+caudra storage usage                          # by model, all time
+caudra storage usage --group-by project       # where the money went
+caudra storage usage --group-by month --json  # for a spreadsheet
+caudra storage usage --since 30d
+caudra storage usage --prune-older-than 1y
+```
+
+Two things worth knowing about the numbers:
+
+- Runs started with `--ephemeral` leave no session behind, and their spend is still recorded and labelled, so the totals stay complete.
+- A model with no published price contributes tokens but no cost. Caudra reports how many turns those were rather than counting them as free, so the total is a floor.
+
+The ledger holds one row per hour, model, and project, so it stays small on its own. [Retention](/docs/sessions/#retention) never touches it, and `--prune-older-than` is how you trim it.

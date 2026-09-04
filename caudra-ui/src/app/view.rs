@@ -376,6 +376,7 @@ impl App {
                 model: &self.state.model,
                 fast: self.state.fast,
                 clock_format: self.ui_config.clock_format,
+                lifetime: self.lifetime_usage.as_ref(),
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {
