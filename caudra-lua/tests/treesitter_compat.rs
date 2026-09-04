@@ -380,3 +380,57 @@ assert(found["fn_name:processConfig"], "should find processConfig function")
 "#,
     );
 }
+
+// The indexer aliases javascript onto the typescript grammar, so the javascript
+// grammar is only reachable through an explicit get_parser call and nothing else
+// in the suite would notice it regressing.
+#[test]
+fn javascript_parse_and_query() {
+    let (_reg, host) = setup();
+    run_lua(
+        &host,
+        "javascript_parse",
+        r#"
+local source = [[
+import { readFile } from "node:fs/promises";
+
+export class Greeter {
+    constructor(prefix) {
+        this.prefix = prefix;
+    }
+
+    async greet(name) {
+        return `${this.prefix}, ${name}!`;
+    }
+}
+
+export function processConfig(config) {
+    return config.name;
+}
+
+const DEFAULT = { name: "default", value: 0 };
+]]
+
+local parser = caudra.treesitter.get_parser(source, "javascript")
+local root = parser:parse()[1]:root()
+assert(root:type() == "program")
+assert(not root:has_error(), "javascript source should parse without errors")
+
+local query = caudra.treesitter.query.parse("javascript", [[
+  (class_declaration name: (identifier) @class_name)
+  (function_declaration name: (identifier) @fn_name)
+  (method_definition name: (property_identifier) @method_name)
+]])
+
+local found = {}
+for id, node in query:iter_captures(root, source) do
+    local text = caudra.treesitter.get_node_text(node, source)
+    found[query.captures[id] .. ":" .. text] = true
+end
+
+assert(found["class_name:Greeter"], "should find Greeter class")
+assert(found["fn_name:processConfig"], "should find processConfig function")
+assert(found["method_name:greet"], "should find greet method")
+"#,
+    );
+}
