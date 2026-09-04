@@ -116,7 +116,7 @@ fastrand = "2"
 test-case = "3"
 ignore = "0.4"
 memchr = "2"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
