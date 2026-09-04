@@ -14,7 +14,8 @@ use caudra_storage::StateDir;
 use caudra_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use futures_lite::future;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::net::dns::ResolveMap;
 use tracing::{info, warn};
 use url::{Host, Url};
 

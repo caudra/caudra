@@ -44,7 +44,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 ## Nix
 
-`nix develop` (dev shell; exports `OPENSSL_NO_VENDOR`, saves ~80s cold build - export it yourself outside the shell if you have libssl-dev), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
+`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
 
 ## Architecture
 

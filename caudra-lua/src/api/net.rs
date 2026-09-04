@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use caudra_lua_macro::{lua_fn, lua_table};
 use futures_lite::io::AsyncReadExt;
-use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::net::dns::ResolveMap;
 use isahc::{AsyncBody, HttpClient, Request};
 use mlua::{Lua, Result as LuaResult, Table};
 use url::{Host, Url};

@@ -9,9 +9,10 @@ use async_lock::Mutex;
 use caudra_storage::StateDir;
 use caudra_storage::auth::load_mcp_auth;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
+use isahc::net::dns::ResolveMap;
 use serde_json::Value;
 use url::{Host, Url};
 
