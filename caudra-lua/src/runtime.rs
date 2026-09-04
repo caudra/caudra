@@ -25,10 +25,8 @@ use caudra_agent::tools::{
 };
 use caudra_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use include_dir::Dir;
-use mlua::{
-    Chunk, ChunkMode, Compiler, Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue,
-    ffi,
-};
+use mlua::chunk::{Chunk, ChunkMode, Compiler};
+use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::{Value, json};
 
 use caudra_config::{AgentConfig, RawConfig};
