@@ -1,11 +1,18 @@
 use crate::theme::Theme;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
+/// A blank row and the footer row itself, so scrolling content never reaches
+/// the line the footer is drawn on.
+const FOOTER_ROWS: u16 = 2;
+
+/// Draws the form's chrome and body, and returns where the footer landed so a
+/// caller that makes its footer clickable can hit test it. The rect is empty
+/// when there is no footer.
 pub(crate) fn render_form(
     t: &Theme,
     title: &str,
@@ -13,21 +20,39 @@ pub(crate) fn render_form(
     area: Rect,
     lines: Vec<Line<'static>>,
     scroll: (u16, u16),
-) {
+    footer: Option<Line<'static>>,
+) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(t.panel_border)
         .title_top(Line::from(title.to_string()).left_aligned())
         .title_style(t.panel_title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let reserved = if footer.is_some() { FOOTER_ROWS } else { 0 };
+    let [body, footer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(reserved.min(inner.height)),
+    ])
+    .areas(inner);
 
     let paragraph = Paragraph::new(lines)
         .style(Style::new().fg(t.foreground))
         .wrap(Wrap { trim: false })
-        .block(block)
         .scroll(scroll);
+    frame.render_widget(paragraph, body);
 
-    frame.render_widget(paragraph, area);
+    let line = Rect {
+        y: footer_area.bottom().saturating_sub(1),
+        height: footer_area.height.min(1),
+        ..footer_area
+    };
+    if let Some(footer) = footer {
+        frame.render_widget(Paragraph::new(footer), line);
+    }
+    line
 }
 
 pub(crate) fn selected_prefix(t: &Theme, is_selected: bool) -> (&'static str, Style) {

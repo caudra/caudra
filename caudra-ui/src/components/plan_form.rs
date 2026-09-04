@@ -265,7 +265,7 @@ impl PlanForm {
         lines.push(Line::default());
         lines.push(hint_line(HINT_PAIRS));
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0), None);
 
         self.row_hits.clear();
         let content_bottom = area.bottom().saturating_sub(1);

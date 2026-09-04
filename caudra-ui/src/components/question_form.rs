@@ -30,11 +30,12 @@ const MULTI_HINT: &str = "  (multiple answers)";
 const SINGLE_HINT: &str = "  (single answer)";
 const NO_ANSWER: &str = "(no answer)";
 const REVIEW_HEADING: &str = " Review your answers:";
-const DESC_SEPARATOR: &str = " — ";
+/// A description sits under its label, past the pointer and the mark.
+const DESC_INDENT: &str = "    ";
 const ANSWER_ARROW: &str = "    → ";
 const CUSTOM_PROMPT: &str = "  ❯ ";
-/// Two borders plus the hint row.
-const CHROME_ROWS: u16 = 3;
+/// Two borders, the blank row above the hint, and the hint row.
+const CHROME_ROWS: u16 = 4;
 const MAX_HEIGHT_PERCENT: u16 = 75;
 
 /// Hint labels, shared by the bar the form draws and the key a click on one
@@ -191,7 +192,7 @@ impl QuestionForm {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let width = area.width.saturating_sub(2);
-        let lines = self.lines(width);
+        let lines = self.lines();
         let rows = visual_rows(&lines, width);
         let height = (rows.total + CHROME_ROWS)
             .min(area.height * MAX_HEIGHT_PERCENT / 100)
@@ -220,17 +221,15 @@ impl QuestionForm {
         // showing through the gaps.
         frame.render_widget(Clear, form);
         frame.render_widget(Block::default().style(t.surface_style()), form);
-        render_form(&t, TITLE, frame, form, lines, (self.scroll, 0));
-        // `CHROME_ROWS` reserves the hint a content row of its own. Drawing it
-        // one lower puts it on the bottom border, which then carries on to the
-        // right of the text.
-        let hint = Rect {
-            x: form.x + 1,
-            y: form.y + form.height.saturating_sub(2),
-            width: form.width.saturating_sub(2),
-            height: 1,
-        };
-        frame.render_widget(ratatui::widgets::Paragraph::new(self.hint()), hint);
+        let hint = render_form(
+            &t,
+            TITLE,
+            frame,
+            form,
+            lines,
+            (self.scroll, 0),
+            Some(self.hint()),
+        );
         self.record_row_hits(&rows, form, visible, hint);
         form
     }
@@ -243,14 +242,15 @@ impl QuestionForm {
         self.push_tab_hits(rows, form, visible);
         match self.mode {
             Mode::Selecting => {
-                let first = self.first_option_line();
                 for index in 0..=self.custom_row() {
-                    let line = first + index as u16;
-                    self.push_line_hit(rows, form, visible, line, FormTarget::Option(index));
+                    let first = self.option_line_at(index);
+                    for line in first..first + self.option_rows(index) {
+                        self.push_line_hit(rows, form, visible, line, FormTarget::Option(index));
+                    }
                 }
             }
             Mode::EditingCustom => {
-                let first = self.first_option_line() + self.custom_row() as u16;
+                let first = self.option_line_at(self.custom_row());
                 for index in 0..self.custom.line_count() {
                     let line = first + index as u16;
                     self.push_line_hit(rows, form, visible, line, FormTarget::Editor(index));
@@ -545,7 +545,9 @@ impl QuestionForm {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return QuestionFormAction::Dismiss;
             }
-            _ => edit(&mut self.custom, key),
+            _ => {
+                self.custom.handle_key(key);
+            }
         }
         QuestionFormAction::Consumed
     }
@@ -655,10 +657,10 @@ impl QuestionForm {
         super::hint_line_hovered(self.hint_pairs(), hovered)
     }
 
-    fn lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn lines(&self) -> Vec<Line<'static>> {
         match self.mode {
             Mode::Confirming => self.review_lines(),
-            _ => self.selecting_lines(width),
+            _ => self.selecting_lines(),
         }
     }
 
@@ -671,12 +673,26 @@ impl QuestionForm {
         header + preamble
     }
 
+    /// Where an option starts in that same list, counting the description
+    /// lines the ones before it took.
+    fn option_line_at(&self, index: usize) -> u16 {
+        self.first_option_line()
+            + (0..index)
+                .map(|before| self.option_rows(before))
+                .sum::<u16>()
+    }
+
+    /// The lines an option occupies: its label, and its description under it.
+    fn option_rows(&self, index: usize) -> u16 {
+        1 + u16::from(self.option_description(index).is_some())
+    }
+
     /// Which line the viewport has to keep on screen.
     fn focus_line(&self) -> u16 {
         if self.mode == Mode::Confirming {
             return 0;
         }
-        self.first_option_line() + self.cursor as u16
+        self.option_line_at(self.cursor)
     }
 
     /// The tab bar's spans paired with what each one selects. Drawing and hit
@@ -722,7 +738,7 @@ impl QuestionForm {
         )
     }
 
-    fn selecting_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn selecting_lines(&self) -> Vec<Line<'static>> {
         let t = theme::current();
         let question = self.question();
         let mut lines = Vec::new();
@@ -742,35 +758,56 @@ impl QuestionForm {
             t.tool_dim,
         ));
         lines.push(Line::default());
-        for (index, option) in question.options.iter().enumerate() {
-            lines.push(self.option_line(
-                index == self.cursor,
-                self.is_picked(&option.label),
-                &option.label,
-                Some(&option.description),
-            ));
+        for index in 0..question.options.len() {
+            lines.extend(self.option_lines(index));
         }
-        let custom = self.custom_answer().cloned();
         if self.mode == Mode::EditingCustom {
-            lines.extend(self.custom_editor_lines(width));
+            lines.extend(self.custom_editor_lines());
         } else {
-            lines.push(self.option_line(
-                self.cursor == self.custom_row(),
-                custom.is_some(),
-                CUSTOM_OPTION,
-                custom.as_deref(),
+            lines.extend(self.option_lines(self.custom_row()));
+        }
+        lines
+    }
+
+    /// The label an option offers. The row past the last of them is the one
+    /// the user types their own answer on.
+    fn option_label(&self, index: usize) -> &str {
+        self.question()
+            .options
+            .get(index)
+            .map_or(CUSTOM_OPTION, |option| &option.label)
+    }
+
+    /// What is written under a label: the offered description, or the answer
+    /// the user typed on the custom row.
+    fn option_description(&self, index: usize) -> Option<&str> {
+        let described = match self.question().options.get(index) {
+            Some(option) => option.description.as_str(),
+            None => self.custom_answer().map_or("", String::as_str),
+        };
+        (!described.is_empty()).then_some(described)
+    }
+
+    /// An option's label, and its description on the line below so a long one
+    /// never crowds the labels the user is choosing between.
+    fn option_lines(&self, index: usize) -> Vec<Line<'static>> {
+        let t = theme::current();
+        let picked = match self.question().options.get(index) {
+            Some(option) => self.is_picked(&option.label),
+            None => self.custom_answer().is_some(),
+        };
+        let mut lines =
+            vec![self.option_line(index == self.cursor, picked, self.option_label(index))];
+        if let Some(description) = self.option_description(index) {
+            lines.push(Line::styled(
+                format!("{DESC_INDENT}{}", description.replace('\n', " ")),
+                t.tool_dim,
             ));
         }
         lines
     }
 
-    fn option_line(
-        &self,
-        focused: bool,
-        picked: bool,
-        label: &str,
-        description: Option<&str>,
-    ) -> Line<'static> {
+    fn option_line(&self, focused: bool, picked: bool, label: &str) -> Line<'static> {
         let t = theme::current();
         let pointer = if focused { "▸ " } else { "  " };
         let mark = match (picked, self.is_multi()) {
@@ -779,7 +816,7 @@ impl QuestionForm {
             (false, true) => "  ",
             (false, false) => "○ ",
         };
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(pointer, t.tool_dim),
             Span::styled(
                 mark,
@@ -794,41 +831,36 @@ impl QuestionForm {
                 if focused { t.active } else { Style::default() },
             ),
         ];
-        if let Some(description) = description.filter(|d| !d.is_empty()) {
-            spans.push(Span::styled(DESC_SEPARATOR, t.tool_dim));
-            spans.push(Span::styled(description.replace('\n', " "), t.tool_dim));
-        }
         Line::from(spans)
     }
 
-    fn custom_editor_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// The answer box, caret and all. A `TextBuffer` always keeps a line, so
+    /// an emptied box still draws its prompt row rather than losing a line as
+    /// the user clears what they typed.
+    fn custom_editor_lines(&self) -> Vec<Line<'static>> {
         let t = theme::current();
         let indent = " ".repeat(CUSTOM_PROMPT.chars().count());
-        let text = self.custom.value();
-        let mut lines: Vec<Line<'static>> = text
-            .split('\n')
+        self.custom
+            .lines()
+            .iter()
             .enumerate()
             .map(|(index, line)| {
-                Line::from(vec![
-                    Span::styled(
-                        if index == 0 {
-                            CUSTOM_PROMPT.to_owned()
-                        } else {
-                            indent.clone()
-                        },
-                        t.active,
-                    ),
-                    Span::raw(line.to_owned()),
-                ])
+                let mut spans = vec![Span::styled(
+                    if index == 0 {
+                        CUSTOM_PROMPT.to_owned()
+                    } else {
+                        indent.clone()
+                    },
+                    t.active,
+                )];
+                if index == self.custom.y() {
+                    spans.extend(caret_spans(line, self.custom.x()));
+                } else {
+                    spans.push(Span::raw(line.to_owned()));
+                }
+                Line::from(spans)
             })
-            .collect();
-        // An empty box still needs its prompt row, or the form silently loses
-        // a line as the user clears what they typed.
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(CUSTOM_PROMPT, t.active)));
-        }
-        let _ = width;
-        lines
+            .collect()
     }
 
     fn review_lines(&self) -> Vec<Line<'static>> {
@@ -878,23 +910,17 @@ fn ends_with_backslash(buffer: &TextBuffer) -> bool {
     buffer.cursor_offset() > 0 && value[..buffer.cursor_offset()].ends_with('\\')
 }
 
-/// The custom-answer box only needs what a one-line answer calls for; the
-/// modal editors own the rest of `TextBuffer`.
-fn edit(buffer: &mut TextBuffer, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            buffer.push_char(c);
-        }
-        KeyCode::Backspace => buffer.remove_char(),
-        KeyCode::Delete => buffer.delete_char(),
-        KeyCode::Left => buffer.move_left(),
-        KeyCode::Right => buffer.move_right(),
-        KeyCode::Up => buffer.move_up(),
-        KeyCode::Down => buffer.move_down(),
-        KeyCode::Home => buffer.move_home(),
-        KeyCode::End => buffer.move_end(),
-        _ => {}
-    }
+/// A line with the character under the caret reversed. Nothing places a
+/// terminal cursor over the form, so the caret is painted like the composer's.
+fn caret_spans(line: &str, caret: usize) -> [Span<'static>; 3] {
+    let before: String = line.chars().take(caret).collect();
+    let mut rest = line.chars().skip(caret);
+    let under = rest.next().unwrap_or(' ');
+    [
+        Span::raw(before),
+        Span::styled(under.to_string(), Style::new().reversed()),
+        Span::raw(rest.collect::<String>()),
+    ]
 }
 
 /// The key a hint label names. Every label `hint_pairs` offers has to resolve
@@ -947,7 +973,9 @@ mod tests {
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
     const YES: &str = "Yes";
+    const YES_DESC: &str = "affirmative";
     const NO: &str = "No";
+    const NO_DESC: &str = "negative";
     const TYPED: &str = "something else";
 
     fn question(header: &str, multiple: bool) -> AskedQuestion {
@@ -957,11 +985,11 @@ mod tests {
             options: vec![
                 QuestionOption {
                     label: YES.into(),
-                    description: "affirmative".into(),
+                    description: YES_DESC.into(),
                 },
                 QuestionOption {
                     label: NO.into(),
-                    description: "negative".into(),
+                    description: NO_DESC.into(),
                 },
             ],
             multiple,
@@ -982,6 +1010,25 @@ mod tests {
         for ch in text.chars() {
             form.handle_key(key_event(KeyCode::Char(ch)));
         }
+    }
+
+    fn chord(
+        form: &mut QuestionForm,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> QuestionFormAction {
+        form.handle_key(KeyEvent::new(code, modifiers))
+    }
+
+    /// A form sitting in the custom-answer box with `TYPED` already in it.
+    fn typing(multiple: bool) -> QuestionForm {
+        let mut form = opened(vec![question(HEADER, multiple)]);
+        for _ in 0..=form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        press(&mut form, KeyCode::Enter);
+        type_text(&mut form, TYPED);
+        form
     }
 
     const SCREEN: Rect = Rect {
@@ -1117,6 +1164,44 @@ mod tests {
     const BORDER_BOTTOM_RIGHT: &str = "\u{256f}";
     const SUBMIT_HINT: &str = "submit";
 
+    /// The row between the last answer and the legend, so the two do not read
+    /// as one block.
+    #[test]
+    fn the_hint_has_a_blank_row_above_it() {
+        let mut form = opened(vec![long_question()]);
+        for _ in 0..=form.custom_row() {
+            press(&mut form, KeyCode::Down);
+        }
+        let drawn = render(&mut form);
+        let rows = painted(&mut form);
+        let spacer = &rows[(drawn.bottom() - 3) as usize];
+        let inside: String = spacer
+            .chars()
+            .skip(drawn.x as usize + 1)
+            .take(drawn.width as usize - 2)
+            .collect();
+        assert!(
+            inside.trim().is_empty(),
+            "the legend needs a blank row above it: {inside:?}"
+        );
+    }
+
+    /// The body is confined to its own rows, so a list longer than the form
+    /// scrolls under the legend instead of printing next to it.
+    #[test]
+    fn content_never_reaches_the_hint_row() {
+        let mut form = opened(vec![long_question()]);
+        let drawn = render(&mut form);
+        let rows = painted(&mut form);
+        for y in [drawn.bottom() - 3, drawn.bottom() - 2] {
+            assert!(
+                !rows[y as usize].contains(OPTION_LABEL),
+                "row {y} carries body text into the footer: {:?}",
+                rows[y as usize]
+            );
+        }
+    }
+
     #[test]
     fn clicking_an_option_picks_it() {
         let mut form = opened(vec![question(HEADER, false)]);
@@ -1126,6 +1211,44 @@ mod tests {
         assert!(
             matches!(&action, QuestionFormAction::Submit(picks) if picks == &[vec![NO.to_owned()]]),
             "a click does what Enter on the same row does"
+        );
+    }
+
+    /// A description belongs under its label, not trailing off the end of it,
+    /// so the labels stay in one column the eye can run down.
+    #[test]
+    fn a_description_is_drawn_under_its_label() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let (_, row) = option_row(&form, 0);
+        let rows = painted(&mut form);
+        assert!(
+            rows[row as usize].contains(YES) && !rows[row as usize].contains(YES_DESC),
+            "the label row holds the label alone: {:?}",
+            rows[row as usize]
+        );
+        assert!(
+            rows[row as usize + 1].contains(YES_DESC),
+            "the description belongs on the row below: {:?}",
+            rows[row as usize + 1]
+        );
+    }
+
+    #[test]
+    fn clicking_a_description_picks_its_option() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let description = form
+            .row_hits
+            .iter()
+            .filter(|hit| hit.target == FormTarget::Option(1))
+            .nth(1)
+            .expect("a described option owns its description row")
+            .area;
+        let action = click(&mut form, description.x + 1, description.y);
+        assert!(
+            matches!(&action, QuestionFormAction::Submit(picks) if picks == &[vec![NO.to_owned()]]),
+            "a description belongs to the option above it"
         );
     }
 
@@ -1360,6 +1483,48 @@ mod tests {
         type_text(&mut form, TYPED);
         press(&mut form, KeyCode::Enter);
         assert_eq!(form.picked(), [YES.to_owned(), TYPED.to_owned()]);
+    }
+
+    /// The answer box is a `TextBuffer`, so it answers to the same editing
+    /// keys as the composer rather than a subset of them.
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let mut form = typing(false);
+        chord(&mut form, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(form.custom.value(), TYPED_HEAD);
+    }
+
+    #[test]
+    fn ctrl_left_moves_the_cursor_by_word() {
+        let mut form = typing(false);
+        chord(&mut form, KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(form.custom.cursor_offset(), TYPED_HEAD.chars().count());
+    }
+
+    /// `TYPED` up to the word `Ctrl+W` eats and `Ctrl+Left` jumps over.
+    const TYPED_HEAD: &str = "something ";
+
+    /// Nothing puts a terminal cursor over the form, so the box has to paint
+    /// its own caret or the user is typing blind.
+    #[test]
+    fn the_answer_box_paints_a_caret_where_the_next_character_lands() {
+        let mut form = typing(false);
+        render(&mut form);
+        let editor = hit_area(&form, FormTarget::Editor(0));
+        let caret = reversed_cells(&mut form);
+        assert_eq!(caret.len(), 1, "the caret is the only marked cell");
+        let typed_width = (CUSTOM_PROMPT.chars().count() + TYPED.chars().count()) as u16;
+        assert_eq!(caret[0], (editor.x + typed_width, editor.y));
+
+        chord(&mut form, KeyCode::Left, KeyModifiers::CONTROL);
+        render(&mut form);
+        let moved = reversed_cells(&mut form);
+        let head_width = (CUSTOM_PROMPT.chars().count() + TYPED_HEAD.chars().count()) as u16;
+        assert_eq!(
+            moved,
+            [(editor.x + head_width, editor.y)],
+            "the caret follows the cursor the keys move"
+        );
     }
 
     #[test]
@@ -1608,13 +1773,15 @@ mod tests {
         assert!(form.scroll >= followed.saturating_sub(1));
     }
 
+    const OPTION_LABEL: &str = "option";
+
     fn long_question() -> AskedQuestion {
         AskedQuestion {
             question: PICK.into(),
             header: HEADER.into(),
             options: (0..60)
                 .map(|index| QuestionOption {
-                    label: format!("option {index}"),
+                    label: format!("{OPTION_LABEL} {index}"),
                     description: String::new(),
                 })
                 .collect(),
