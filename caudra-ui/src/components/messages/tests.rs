@@ -1140,6 +1140,42 @@ fn tool_start_upgrades_pending_in_place() {
 }
 
 #[test]
+fn a_preview_fills_the_pending_header_until_the_real_summary_lands() {
+    const PREVIEW: &str = "src/app.rs";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending("t1".into(), "bash");
+    assert_eq!(panel.messages[0].text, "");
+
+    panel.tool_input_preview("t1", Some(PREVIEW.into()), None);
+    assert_eq!(panel.messages.len(), 1);
+    assert_eq!(panel.messages[0].text, PREVIEW);
+
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
+    assert_eq!(panel.messages.len(), 1);
+    assert_eq!(panel.messages[0].text, "t1");
+}
+
+#[test]
+fn a_streamed_size_lands_in_the_annotation_without_touching_the_header() {
+    const HEADER: &str = "src/app.rs";
+    const SIZE: &str = "20+ lines";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending("t1".into(), "file_write");
+    panel.tool_input_preview("t1", Some(HEADER.into()), None);
+
+    panel.tool_input_preview("t1", None, Some(SIZE.into()));
+    assert_eq!(panel.messages[0].text, HEADER);
+    assert_eq!(panel.messages[0].annotation.as_deref(), Some(SIZE));
+}
+
+#[test]
+fn a_preview_for_an_unknown_call_is_ignored() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_input_preview("t1", Some("src/app.rs".into()), None);
+    assert!(panel.messages.is_empty());
+}
+
+#[test]
 fn stream_reset_clears_streaming_and_fails_tools() {
     let mut panel = panel_with_tools(&[("t1", "bash")]);
     panel.streaming_thinking.set_buffer("partial thinking");
@@ -4453,7 +4489,27 @@ fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "✱ Grep t1 (1 lines)");
+    assert_eq!(first_line_text(&panel, 0), "✱ Grepped t1 (1 lines)");
+}
+
+/// The past tense asserts the call happened, so a failure has to fall back to
+/// the plain verb rather than claim it edited anything.
+#[test_case(None, "Grepping" ; "running")]
+#[test_case(Some(false), "Grepped" ; "succeeded")]
+#[test_case(Some(true), "Grep" ; "failed")]
+fn a_compact_label_is_inflected_by_what_the_call_is_doing(outcome: Option<bool>, expected: &str) {
+    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    if let Some(is_error) = outcome {
+        let mut event = done("t1");
+        event.is_error = is_error;
+        panel.tool_done(event);
+    }
+    rebuild(&mut panel);
+
+    // The leading glyph is a spinner while the call runs, so the label is
+    // read as the token after it rather than from the front of the row.
+    let row = first_line_text(&panel, 0);
+    assert_eq!(row.split_whitespace().nth(1), Some(expected), "{row:?}");
 }
 
 #[test]

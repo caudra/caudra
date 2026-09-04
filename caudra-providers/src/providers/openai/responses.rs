@@ -415,6 +415,13 @@ pub(crate) async fn parse_sse(
                     };
                     if let Some(acc) = acc {
                         acc.arguments.push_str(&delta);
+                        let id = acc.call_id.clone();
+                        event_tx
+                            .send_async(ProviderEvent::ToolInputDelta {
+                                id,
+                                delta: delta.into_owned(),
+                            })
+                            .await?;
                     }
                 }
             }

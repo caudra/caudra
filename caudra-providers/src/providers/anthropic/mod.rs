@@ -1324,14 +1324,32 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             assert_eq!(tools[0].0, "tu_1");
             assert_eq!(tools[0].1, "bash");
 
-            let starts: Vec<_> = rx
-                .drain()
+            let events: Vec<_> = rx.drain().collect();
+            let starts: Vec<_> = events
+                .iter()
                 .filter_map(|e| match e {
-                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    ProviderEvent::ToolUseStart { id, name } => Some((id.clone(), name.clone())),
                     _ => None,
                 })
                 .collect();
             assert_eq!(starts, vec![("tu_1".to_string(), "bash".to_string())]);
+
+            let fragments: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::ToolInputDelta { id, delta } => {
+                        Some((id.clone(), delta.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                fragments,
+                vec![
+                    ("tu_1".to_string(), r#"{"command":"#.to_string()),
+                    ("tu_1".to_string(), r#" "echo hi"}"#.to_string()),
+                ]
+            );
         })
     }
 

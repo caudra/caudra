@@ -1021,6 +1021,12 @@ fn start_event_pump(
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
+                AgentEvent::ToolInputDelta {
+                    id,
+                    preview: Some(preview),
+                    ..
+                } => translate::tool_input_preview(&id, preview),
+                AgentEvent::ToolInputDelta { .. } => continue,
                 AgentEvent::ToolStart(event) => {
                     translate::tool_start(&event, &cwd, home.as_deref())
                 }

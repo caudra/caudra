@@ -640,14 +640,18 @@ pub async fn parse_sse(
                     acc.id = id;
                 }
                 // GLM-5.2 via Mistral sends "" names in subsequent chunks; skip to keep the accumulated name.
+                let mut input_delta = None;
                 if let Some(func) = tc.function {
                     if let Some(name) = func.name
                         && !name.is_empty()
                     {
                         acc.name = name;
                     }
-                    if let Some(args) = func.arguments {
+                    if let Some(args) = func.arguments
+                        && !args.is_empty()
+                    {
                         acc.arguments.push_str(&args);
+                        input_delta = Some(args);
                     }
                 }
                 if was_unnamed && !acc.name.is_empty() {
@@ -655,6 +659,16 @@ pub async fn parse_sse(
                         .send_async(ProviderEvent::ToolUseStart {
                             id: acc.id.clone(),
                             name: acc.name.clone(),
+                        })
+                        .await?;
+                }
+                // After the start, since one chunk can carry both and the
+                // consumer keys deltas off the id the start announced.
+                if let Some(delta) = input_delta {
+                    event_tx
+                        .send_async(ProviderEvent::ToolInputDelta {
+                            id: acc.id.clone(),
+                            delta,
                         })
                         .await?;
                 }
@@ -828,6 +842,7 @@ data: [DONE]\n";
                     ProviderEvent::ThinkingDelta { text } => thinking.push(text),
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
+                    ProviderEvent::ToolInputDelta { .. } => {}
                     ProviderEvent::PromptProgress { .. } => {}
                     ProviderEvent::ThinkingBoundary => {}
                 }

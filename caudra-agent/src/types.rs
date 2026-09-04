@@ -970,6 +970,20 @@ pub enum AgentEvent {
         id: String,
         name: String,
     },
+    /// One fragment of a still-streaming tool call's arguments, with the one
+    /// scalar worth showing before the call is complete.
+    ToolInputDelta {
+        id: String,
+        name: String,
+        /// The raw JSON fragment, for consumers that replay the wire.
+        delta: String,
+        /// `Some` only when the preview changed, so every `Some` is a render
+        /// and a long argument does not repaint the row per token.
+        preview: Option<String>,
+        /// How much of a file body has arrived, e.g. `120+ lines`. `Some` only
+        /// when the floor moved, which is once per step rather than per token.
+        size: Option<String>,
+    },
     ToolStart(Box<ToolStartEvent>),
     /// `content` is the **full accumulated output** so far, not a delta.
     /// Producers must accumulate into a growing buffer and send the whole thing each flush.
@@ -1412,8 +1426,13 @@ impl SubagentActivity {
             // whoever accumulates the stream fills it in.
             AgentEvent::ThinkingDelta { .. } => Some(Self::Thinking { title: None }),
             AgentEvent::TextDelta { .. } => Some(Self::Responding),
-            // The input is still streaming, so there is no header to show yet.
+            // The input is still streaming, so the header is whatever the
+            // arguments have revealed so far: nothing at first, then the one
+            // scalar the preview pulled out of the fragments.
             AgentEvent::ToolPending { name, .. } => Some(Self::tool(Arc::from(name.as_str()), "")),
+            AgentEvent::ToolInputDelta { name, preview, .. } => preview
+                .as_deref()
+                .map(|preview| Self::tool(Arc::from(name.as_str()), preview)),
             AgentEvent::ToolStart(start) => {
                 Some(Self::tool(Arc::clone(&start.tool), &start.summary))
             }

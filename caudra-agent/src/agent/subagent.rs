@@ -73,6 +73,7 @@ async fn relay_session_events(
             }
             AgentEvent::Error { .. }
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolInputDelta { .. }
             | AgentEvent::ToolPending { .. } => continue,
             _ => {}
         }

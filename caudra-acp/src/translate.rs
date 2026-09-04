@@ -91,6 +91,15 @@ pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
     )
 }
 
+/// The call is still `Pending`: only its title has firmed up. `tool_pending`
+/// already created the call, so every preview is an update.
+pub fn tool_input_preview(id: &str, preview: String) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        ToolCallUpdateFields::new().title(preview),
+    ))
+}
+
 pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::InProgress)

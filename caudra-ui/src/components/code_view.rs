@@ -457,7 +457,7 @@ fn render_batch(
             BatchToolStatus::Success => (BATCH_DONE_MARKER, t.tool_success),
             BatchToolStatus::Error => (BATCH_DONE_MARKER, t.tool_error),
         };
-        let (sigil, label) = compact_sigil_label(&entry.tool);
+        let (sigil, label) = compact_sigil_label(&entry.tool, entry.status.into());
         let mut spans = vec![
             Span::styled(marker, style),
             Span::styled(format!("{sigil} {label} "), t.tool_prefix),
@@ -1930,7 +1930,7 @@ mod tests {
 
     const SHELL_CHILD: &str = "shell";
     const SHELL_WIRE_CHILD: &str = "mcp_Shell";
-    const SHELL_CHILD_ROW: &str = "$ Shell";
+    const SHELL_CHILD_ROW: &str = "$ Ran";
     const UNTABLED_CHILD: &str = "srv.custom";
     const UNTABLED_CHILD_ROW: &str = "⚙ srv.custom";
     const CHILD_LABEL_MSG: &str = "a child names its tool the way a standalone compact row does";

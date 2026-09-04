@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use caudra_providers::provider::Provider;
@@ -9,6 +10,7 @@ use caudra_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
+use super::tool_preview;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
@@ -36,6 +38,99 @@ struct ForwardedStream {
     reasoning: Vec<ForwardedReasoning>,
 }
 
+/// What one fragment changed on screen, if anything.
+#[derive(Default)]
+struct Changed {
+    preview: Option<String>,
+    size: Option<String>,
+}
+
+/// The argument JSON of one tool call as it arrives, kept only until the
+/// preview it feeds can no longer change.
+struct PendingInput {
+    name: String,
+    json: String,
+    preview: Option<String>,
+    /// The preview is final: either its value closed or the buffer outgrew
+    /// what is worth scanning. Nothing more is parsed after this.
+    settled: bool,
+    /// Present only for the tools whose argument is a file body, so nothing is
+    /// counted that will not be shown.
+    size: Option<SizeCounter>,
+}
+
+impl PendingInput {
+    fn new(name: String) -> Self {
+        Self {
+            size: tool_preview::counts_size(&name).then(SizeCounter::default),
+            name,
+            json: String::new(),
+            preview: None,
+            settled: false,
+        }
+    }
+
+    /// The headline settles long before a file body finishes arriving, so the
+    /// counter keeps reading fragments the preview has stopped caring about.
+    fn absorb(&mut self, delta: &str) -> Changed {
+        Changed {
+            preview: self.absorb_preview(delta),
+            size: self.size.as_mut().and_then(|size| size.absorb(delta)),
+        }
+    }
+
+    fn absorb_preview(&mut self, delta: &str) -> Option<String> {
+        if self.settled {
+            return None;
+        }
+        self.json.push_str(delta);
+        let Some(preview) = tool_preview::preview_for(&self.name, &self.json) else {
+            self.settled = tool_preview::past_scan_cap(self.json.len());
+            return None;
+        };
+        self.settled = preview.complete;
+        if self.settled {
+            self.json = String::new();
+        }
+        let changed = self.preview.as_deref() != Some(preview.text.as_str());
+        changed.then(|| {
+            self.preview = Some(preview.text.clone());
+            preview.text
+        })
+    }
+}
+
+/// Counts the newlines in a body as its fragments go past, retaining none of
+/// it. A content newline is the escape `\n`, but `\\n` is an escaped backslash
+/// followed by a literal `n` and is not one, so the escape state has to be
+/// tracked rather than the two characters counted.
+#[derive(Default)]
+struct SizeCounter {
+    newlines: usize,
+    /// An escape can straddle two fragments, so a fragment ending on a lone
+    /// backslash carries it to the next.
+    escaped: bool,
+    shown: Option<String>,
+}
+
+impl SizeCounter {
+    fn absorb(&mut self, delta: &str) -> Option<String> {
+        for c in delta.chars() {
+            if self.escaped {
+                self.newlines += usize::from(c == 'n');
+                self.escaped = false;
+            } else {
+                self.escaped = c == '\\';
+            }
+        }
+        let label = tool_preview::size_label(self.newlines)?;
+        (self.shown.as_deref() != Some(label.as_str())).then(|| {
+            self.shown = Some(label.clone());
+            label
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ForwardedReasoning {
     pub(crate) text: String,
@@ -54,6 +149,7 @@ async fn forward_provider_events(
     let mut reasoning = Vec::new();
     let mut reasoning_text = String::new();
     let mut run_started: Option<Instant> = None;
+    let mut pending_inputs: HashMap<String, PendingInput> = HashMap::new();
     while let Ok(pe) = prx.recv_async().await {
         if let ProviderEvent::ThinkingDelta { text } = &pe {
             run_started.get_or_insert_with(Instant::now);
@@ -71,10 +167,27 @@ async fn forward_provider_events(
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
             ProviderEvent::ThinkingBoundary => AgentEvent::ThinkingBoundary,
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
-                id,
-                name: canonical_tool_name(&name).to_owned(),
-            },
+            ProviderEvent::ToolUseStart { id, name } => {
+                let name = canonical_tool_name(&name).to_owned();
+                pending_inputs.insert(id.clone(), PendingInput::new(name.clone()));
+                AgentEvent::ToolPending { id, name }
+            }
+            ProviderEvent::ToolInputDelta { id, delta } => {
+                // A provider can emit a fragment before it has a name to
+                // announce, leaving nothing to preview and nothing to attach
+                // the preview to.
+                let Some(pending) = pending_inputs.get_mut(&id) else {
+                    continue;
+                };
+                let changed = pending.absorb(&delta);
+                AgentEvent::ToolInputDelta {
+                    id,
+                    name: pending.name.clone(),
+                    delta,
+                    preview: changed.preview,
+                    size: changed.size,
+                }
+            }
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -349,6 +462,170 @@ mod tests {
     use super::*;
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
+    const TOOL_ID: &str = "toolu_1";
+
+    const WRITE: &str = "file_write";
+    /// A body long enough to cross the first step and reach the second.
+    const STEPPED_LINES: usize = 29;
+    const THRESHOLD_LINES: usize = 19;
+    const SHORT_LINES: usize = 18;
+    const FIRST_STEP: &str = "20+ lines";
+    const SECOND_STEP: &str = "30+ lines";
+    /// The escape a body newline arrives as, and the pair that only looks like
+    /// one: a backslash that is itself escaped, then a literal `n`.
+    const NEWLINE: &str = r"\n";
+    const ESCAPED_BACKSLASH: &str = r"\\n";
+
+    /// Every tool-input event a run of provider events publishes, in order.
+    fn deltas(tool: &str, fragments: &[&str]) -> Vec<AgentEvent> {
+        let (ptx, prx) = flume::unbounded();
+        ptx.send(ProviderEvent::ToolUseStart {
+            id: TOOL_ID.into(),
+            name: tool.into(),
+        })
+        .unwrap();
+        for fragment in fragments {
+            ptx.send(ProviderEvent::ToolInputDelta {
+                id: TOOL_ID.into(),
+                delta: (*fragment).into(),
+            })
+            .unwrap();
+        }
+        drop(ptx);
+
+        let (etx, erx) = flume::unbounded();
+        let sender = crate::EventSender::new(etx, 0);
+        smol::block_on(forward_provider_events(prx, Some(&sender)));
+        drop(sender);
+        erx.drain()
+            .map(|envelope| envelope.event)
+            .filter(|event| matches!(event, AgentEvent::ToolInputDelta { .. }))
+            .collect()
+    }
+
+    /// Every preview published, in order. `None` fragments are dropped, so the
+    /// result is exactly what a reader repaints.
+    fn previews(tool: &str, fragments: &[&str]) -> Vec<String> {
+        deltas(tool, fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { preview, .. } => preview,
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sizes(tool: &str, fragments: &[&str]) -> Vec<String> {
+        deltas(tool, fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { size, .. } => size,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A named file followed by one body newline per fragment.
+    fn body(newlines: usize) -> Vec<&'static str> {
+        let mut fragments = vec![r#"{"filePath": "a.rs", "content": "first"#];
+        fragments.extend(std::iter::repeat_n(NEWLINE, newlines));
+        fragments
+    }
+
+    #[test]
+    fn a_preview_is_published_only_when_it_changes() {
+        let published = previews("shell", &[r#"{"comm"#, r#"and": "ec"#, "ho", r#" hi"}"#]);
+        assert_eq!(published, ["ec", "echo", "echo hi"]);
+    }
+
+    #[test]
+    fn a_settled_preview_ignores_the_rest_of_the_arguments() {
+        let published = previews(
+            "file_edit",
+            &[
+                r#"{"filePath": "a.rs""#,
+                r#", "oldString": "one""#,
+                r#", "newString": "two"}"#,
+            ],
+        );
+        assert_eq!(published, ["a.rs"]);
+    }
+
+    #[test]
+    fn a_tool_with_nothing_short_to_show_publishes_no_preview() {
+        assert!(previews("code_execution", &[r#"{"code": "print(1)"}"#]).is_empty());
+    }
+
+    #[test]
+    fn a_fragment_for_an_unannounced_call_is_dropped() {
+        let (ptx, prx) = flume::unbounded();
+        ptx.send(ProviderEvent::ToolInputDelta {
+            id: TOOL_ID.into(),
+            delta: r#"{"command": "ls"}"#.into(),
+        })
+        .unwrap();
+        drop(ptx);
+
+        let (etx, erx) = flume::unbounded();
+        let sender = crate::EventSender::new(etx, 0);
+        smol::block_on(forward_provider_events(prx, Some(&sender)));
+        drop(sender);
+        assert_eq!(erx.drain().count(), 0);
+    }
+
+    #[test]
+    fn every_fragment_is_forwarded_verbatim_even_without_a_preview() {
+        let fragments = [r#"{"code": ""#, "print(1)", r#""}"#];
+        let forwarded: Vec<String> = deltas("code_execution", &fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(forwarded, fragments);
+    }
+
+    #[test]
+    fn a_size_is_published_once_per_step() {
+        assert_eq!(
+            sizes(WRITE, &body(STEPPED_LINES)),
+            [FIRST_STEP, SECOND_STEP]
+        );
+    }
+
+    #[test]
+    fn a_body_below_the_threshold_publishes_no_size() {
+        assert!(sizes(WRITE, &body(SHORT_LINES)).is_empty());
+    }
+
+    #[test]
+    fn a_tool_with_no_body_to_count_publishes_no_size() {
+        assert!(sizes("file_edit", &body(STEPPED_LINES)).is_empty());
+    }
+
+    #[test]
+    fn an_escaped_backslash_is_not_a_newline() {
+        let mut fragments = body(THRESHOLD_LINES);
+        fragments.extend(std::iter::repeat_n(ESCAPED_BACKSLASH, STEPPED_LINES));
+        assert_eq!(sizes(WRITE, &fragments), [FIRST_STEP]);
+    }
+
+    #[test]
+    fn an_escape_split_across_two_fragments_is_still_counted() {
+        let mut fragments = vec![r#"{"filePath": "a.rs", "content": "first"#];
+        for _ in 0..THRESHOLD_LINES {
+            fragments.extend([r"\", "n"]);
+        }
+        assert_eq!(sizes(WRITE, &fragments), [FIRST_STEP]);
+    }
+
+    #[test]
+    fn the_headline_settles_while_the_counter_keeps_reading() {
+        let fragments = body(STEPPED_LINES);
+        assert_eq!(previews(WRITE, &fragments), ["a.rs"]);
+        assert_eq!(sizes(WRITE, &fragments), [FIRST_STEP, SECOND_STEP]);
+    }
 
     #[test]
     fn tool_use_names_canonicalized() {

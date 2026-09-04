@@ -639,6 +639,17 @@ async fn parse_sse(
                             name: func_call.name.clone(),
                         })
                         .await?;
+                    // Google has no argument deltas: the whole call arrives at
+                    // once. One delta carrying all of it keeps every provider
+                    // looking the same downstream.
+                    if input.is_object() {
+                        event_tx
+                            .send_async(ProviderEvent::ToolInputDelta {
+                                id: id.clone(),
+                                delta: input.to_string(),
+                            })
+                            .await?;
+                    }
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name: func_call.name,

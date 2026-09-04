@@ -271,6 +271,7 @@ pub fn run(
             }
             AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBoundary => {}
             AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolInputDelta { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)

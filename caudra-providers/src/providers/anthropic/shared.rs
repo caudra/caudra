@@ -522,6 +522,16 @@ impl EventParser {
                         }
                         Delta::InputJson { partial_json } => {
                             self.current_tool_json.push_str(&partial_json);
+                            if let Some(ContentBlock::ToolUse { id, .. }) = block
+                                && !partial_json.is_empty()
+                            {
+                                event_tx
+                                    .send_async(ProviderEvent::ToolInputDelta {
+                                        id: id.clone(),
+                                        delta: partial_json,
+                                    })
+                                    .await?;
+                            }
                         }
                     }
                 }

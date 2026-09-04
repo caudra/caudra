@@ -1024,6 +1024,31 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
+    /// What a still-streaming call has revealed so far: the header it has
+    /// earned, and how much of a file body has arrived. `ToolStart` replaces
+    /// both with the real summary, so this only ever fills the gap between the
+    /// call being announced and its arguments being complete.
+    pub fn tool_input_preview(
+        &mut self,
+        tool_id: &str,
+        header: Option<String>,
+        size: Option<String>,
+    ) {
+        if header.is_none() && size.is_none() {
+            return;
+        }
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        if let Some(header) = header {
+            msg.text = header;
+        }
+        if let Some(size) = size {
+            msg.annotation = Some(size);
+        }
+        self.rebuild_tool_segment(tool_id);
+    }
+
     pub fn tool_start(&mut self, event: ToolStartEvent) {
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {

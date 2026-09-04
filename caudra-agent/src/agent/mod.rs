@@ -6,6 +6,7 @@ mod provider_projection;
 mod run;
 mod streaming;
 mod title;
+mod tool_preview;
 pub mod subagent;
 pub mod tool_dispatch;
 

@@ -297,6 +297,13 @@ struct StreamSynth {
     block_index: i32,
     started: bool,
     current_block: Option<BlockKind>,
+    /// The tool call whose block is open, so its argument fragments land in
+    /// that block and nothing else can close it by accident.
+    open_tool: Option<String>,
+    /// Every tool call already opened from the pending phase of this message.
+    /// Its `ToolStart` arrives after dispatch, by which point the block may
+    /// have been closed by the next call, and must not be emitted twice.
+    streamed_tools: Vec<String>,
 }
 
 impl StreamSynth {
@@ -305,6 +312,8 @@ impl StreamSynth {
             block_index: -1,
             started: false,
             current_block: None,
+            open_tool: None,
+            streamed_tools: Vec::new(),
         }
     }
 
@@ -340,7 +349,43 @@ impl StreamSynth {
         }
     }
 
+    /// Opens the block the moment the call is announced, so the arguments can
+    /// stream into it the way the provider sent them.
+    fn tool_pending(&mut self, model: &str, id: &str, name: &str) -> Vec<Value> {
+        let mut events = self.ensure_started(model);
+        events.extend(self.close_block());
+        self.block_index += 1;
+        self.open_tool = Some(id.to_string());
+        self.streamed_tools.push(id.to_string());
+        events.push(serde_json::json!({
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }));
+        events
+    }
+
+    fn tool_input_delta(&mut self, id: &str, delta: &str) -> Vec<Value> {
+        if self.open_tool.as_deref() != Some(id) {
+            return Vec::new();
+        }
+        vec![serde_json::json!({
+            "type": "content_block_delta",
+            "index": self.block_index,
+            "delta": {"type": "input_json_delta", "partial_json": delta}
+        })]
+    }
+
+    /// A call whose arguments already streamed only needs its block closed.
+    /// One that never had a pending phase — a batch child, an MCP passthrough
+    /// — still gets the whole input as a single delta.
     fn tool_use(&mut self, model: &str, id: &str, name: &str, input_json: &str) -> Vec<Value> {
+        if self.streamed_tools.iter().any(|streamed| streamed == id) {
+            return match self.open_tool.as_deref() == Some(id) {
+                true => self.close_block().into_iter().collect(),
+                false => Vec::new(),
+            };
+        }
         let mut events = self.ensure_started(model);
         events.extend(self.close_block());
         self.block_index += 1;
@@ -413,7 +458,8 @@ impl StreamSynth {
     }
 
     fn close_block(&mut self) -> Option<Value> {
-        self.current_block.take().map(|_| self.block_stop())
+        let tool = self.open_tool.take().is_some();
+        (self.current_block.take().is_some() || tool).then(|| self.block_stop())
     }
 
     fn block_stop(&self) -> Value {
@@ -1641,6 +1687,21 @@ impl EventPump {
                     self.emit_stream(events)?;
                 }
             }
+            AgentEvent::ToolPending { id, name } => {
+                if self.include_partial_messages {
+                    let model = self.model_id();
+                    let events =
+                        self.synth
+                            .tool_pending(&model, id, caudra_to_claude_tool_name(name));
+                    self.emit_stream(events)?;
+                }
+            }
+            AgentEvent::ToolInputDelta { id, delta, .. } => {
+                if self.include_partial_messages {
+                    let events = self.synth.tool_input_delta(id, delta);
+                    self.emit_stream(events)?;
+                }
+            }
             AgentEvent::ToolStart(ts) => {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
@@ -1656,8 +1717,7 @@ impl EventPump {
                     self.emit_stream(events)?;
                 }
             }
-            AgentEvent::ToolPending { .. }
-            | AgentEvent::ToolOutput { .. }
+            AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
@@ -2382,6 +2442,72 @@ mod tests {
         assert_eq!(events[1]["content_block"]["type"], "tool_use");
         assert_eq!(events[1]["content_block"]["name"], "Read");
         assert_eq!(events[2]["delta"]["type"], "input_json_delta");
+    }
+
+    #[test]
+    fn a_pending_call_streams_its_arguments_and_closes_on_start() {
+        let mut synth = StreamSynth::new();
+        synth.text_delta(MODEL, "a");
+
+        let opened = synth.tool_pending(MODEL, "tool_1", "Read");
+        assert_eq!(
+            types(&opened),
+            ["content_block_stop", "content_block_start"]
+        );
+        assert_eq!(opened[1]["content_block"]["type"], "tool_use");
+
+        let first = synth.tool_input_delta("tool_1", r#"{"path":"#);
+        let second = synth.tool_input_delta("tool_1", r#""t"}"#);
+        assert_eq!(first[0]["delta"]["partial_json"], r#"{"path":"#);
+        assert_eq!(second[0]["delta"]["partial_json"], r#""t"}"#);
+        assert_eq!(second[0]["index"], opened[1]["index"]);
+
+        let closed = synth.tool_use(MODEL, "tool_1", "Read", r#"{"path":"t"}"#);
+        assert_eq!(types(&closed), ["content_block_stop"]);
+    }
+
+    #[test]
+    fn a_fragment_for_a_call_that_is_not_open_is_dropped() {
+        let mut synth = StreamSynth::new();
+        synth.tool_pending(MODEL, "tool_1", "Read");
+        assert!(synth.tool_input_delta("tool_2", "{}").is_empty());
+    }
+
+    /// Parallel calls close the previous block as the next opens, so the
+    /// trailing `ToolStart` for an earlier call must not reopen it.
+    #[test]
+    fn a_start_after_the_block_moved_on_emits_nothing() {
+        let mut synth = StreamSynth::new();
+        synth.tool_pending(MODEL, "t1", "Read");
+        synth.tool_input_delta("t1", "{}");
+        let reopened = synth.tool_pending(MODEL, "t2", "Write");
+        assert_eq!(
+            types(&reopened),
+            ["content_block_stop", "content_block_start"]
+        );
+
+        assert!(synth.tool_use(MODEL, "t1", "Read", "{}").is_empty());
+        assert_eq!(
+            types(&synth.tool_use(MODEL, "t2", "Write", "{}")),
+            ["content_block_stop"]
+        );
+    }
+
+    /// A call with no pending phase — a batch child, an MCP passthrough —
+    /// still gets the whole input in one delta.
+    #[test]
+    fn an_unannounced_call_still_emits_a_complete_block() {
+        let mut synth = StreamSynth::new();
+        let events = synth.tool_use(MODEL, "tool_1", "Read", r#"{"path":"t"}"#);
+        assert_eq!(
+            types(&events),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop"
+            ]
+        );
     }
 
     #[test]

@@ -150,6 +150,9 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
+            AgentEvent::ToolInputDelta {
+                id, preview, size, ..
+            } => self.messages_panel.tool_input_preview(&id, preview, size),
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)

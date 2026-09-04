@@ -21,8 +21,8 @@ use crate::markdown::{
     truncation_notice,
 };
 use caudra_agent::{
-    BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle, SubagentProgress,
-    ToolInput, ToolOutput,
+    BatchToolStatus, BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle,
+    SubagentProgress, ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -70,52 +70,127 @@ const QUERY_KEY: &str = "pattern";
 const QUALIFIER: [char; 3] = ['_', '.', '-'];
 
 /// How a tool names itself on a compact row. The `name> ` prefix is gone
-/// there, so `label` is what identifies the call, and `header_keys` are the
+/// there, so the label is what identifies the call, and `header_keys` are the
 /// inputs already folded into the header text so the `[k=v]` suffix can skip
 /// them. Tools missing from the table fall back to their registered name.
+///
+/// The label is inflected, so the row says what the call is doing rather than
+/// only what it is. `memory` and `sessions` keep a noun in all three slots:
+/// their verb is the sub-command, which the `[k=v]` suffix already shows.
 struct CompactTool {
     sigil: char,
-    label: &'static str,
+    plain: &'static str,
+    present: &'static str,
+    past: &'static str,
     header_keys: &'static [&'static str],
 }
+
+/// Which form of a tool's name a row wants. The past tense asserts the call
+/// happened, so anything that has not finished well uses the plain verb.
+#[derive(Clone, Copy)]
+pub(super) enum Tense {
+    Plain,
+    Present,
+    Past,
+}
+
+impl CompactTool {
+    fn label(&self, tense: Tense) -> &'static str {
+        match tense {
+            Tense::Plain => self.plain,
+            Tense::Present => self.present,
+            Tense::Past => self.past,
+        }
+    }
+}
+
+impl From<Indicator> for Tense {
+    fn from(indicator: Indicator) -> Self {
+        match indicator {
+            Indicator::InProgress => Self::Present,
+            Indicator::Success => Self::Past,
+            Indicator::Error => Self::Plain,
+        }
+    }
+}
+
+impl From<BatchToolStatus> for Tense {
+    fn from(status: BatchToolStatus) -> Self {
+        match status {
+            BatchToolStatus::Running => Self::Present,
+            BatchToolStatus::Success => Self::Past,
+            BatchToolStatus::Pending | BatchToolStatus::Error => Self::Plain,
+        }
+    }
+}
+
+/// Plain, present, past — the order a verb is usually taught in. Named rather
+/// than written into the table so each row stays one line, and because the
+/// irregular forms are the point: a suffix rule would say "Writed" and "Runned".
+type Inflection = (&'static str, &'static str, &'static str);
+
+const READ: Inflection = ("Read", "Reading", "Read");
+const FIND: Inflection = ("Find", "Finding", "Found");
+const GREP: Inflection = ("Grep", "Grepping", "Grepped");
+const WRITE: Inflection = ("Write", "Writing", "Wrote");
+const EDIT: Inflection = ("Edit", "Editing", "Edited");
+const PATCH: Inflection = ("Patch", "Patching", "Patched");
+const INDEX: Inflection = ("Index", "Indexing", "Indexed");
+const SEARCH: Inflection = ("Search", "Searching", "Searched");
+const FETCH: Inflection = ("Fetch", "Fetching", "Fetched");
+const RUN: Inflection = ("Run", "Running", "Ran");
+const COMPUTE: Inflection = ("Compute", "Computing", "Computed");
+const INSPECT: Inflection = ("Inspect", "Inspecting", "Inspected");
+const DELEGATE: Inflection = ("Delegate", "Delegating", "Delegated");
+const BATCH: Inflection = ("Batch", "Batching", "Batched");
+const UPDATE: Inflection = ("Update", "Updating", "Updated");
+const LOAD: Inflection = ("Load", "Loading", "Loaded");
+const ASK: Inflection = ("Ask", "Asking", "Asked");
+const VIEW: Inflection = ("View", "Viewing", "Viewed");
+/// A store reached by sub-command. The verb is the `command` argument, which
+/// the `[k=v]` suffix already shows, so the row names the store instead.
+const MEMORY: Inflection = ("Memory", "Memory", "Memory");
+const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 
 /// Header keys are matched ignoring case and underscores, so one spelling
 /// covers Workcell's camelCase wire names and the snake_case the legacy tools
 /// still carry in restored sessions.
 const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
-    tool_row("file_read", '→', "Read", &["file_path"]),
-    tool_row("file_glob", '✱', "Glob", &["pattern", "path"]),
-    tool_row("file_grep", '✱', "Grep", &["pattern", "path"]),
-    tool_row("file_write", '←', "Write", &["file_path", "content"]),
-    tool_row("file_edit", '←', "Edit", EDIT_KEYS),
-    tool_row("file_apply_patch", '%', "Patch", &["patch_text"]),
-    tool_row("index", '→', "Index", &["path"]),
-    tool_row("websearch", '◈', "Search", &["query"]),
-    tool_row("webfetch", '%', "Fetch", &["url"]),
-    tool_row("shell", '$', "Shell", &["command"]),
-    tool_row("code_execution", '$', "Code", &["code"]),
-    tool_row("execution_environment", '⚙', "Env", &[]),
-    tool_row("task", '#', "Task", &["prompt", "description"]),
-    tool_row("batch", '#', "Batch", &["invocations"]),
-    tool_row("todo_write", '⚙', "Todo", &["todos"]),
-    tool_row("skill", '→', "Skill", &["name"]),
-    tool_row("question", '→', "Ask", &["questions"]),
-    tool_row("memory", '⚙', "Memory", &[]),
-    tool_row("sessions", '⚙', "Sessions", &[]),
-    tool_row("view_image", '→', "Image", &["path"]),
+    tool_row("file_read", '→', READ, &["file_path"]),
+    tool_row("file_glob", '✱', FIND, &["pattern", "path"]),
+    tool_row("file_grep", '✱', GREP, &["pattern", "path"]),
+    tool_row("file_write", '←', WRITE, &["file_path", "content"]),
+    tool_row("file_edit", '←', EDIT, EDIT_KEYS),
+    tool_row("file_apply_patch", '%', PATCH, &["patch_text"]),
+    tool_row("index", '→', INDEX, &["path"]),
+    tool_row("websearch", '◈', SEARCH, &["query"]),
+    tool_row("webfetch", '%', FETCH, &["url"]),
+    tool_row("shell", '$', RUN, &["command"]),
+    tool_row("code_execution", '$', COMPUTE, &["code"]),
+    tool_row("execution_environment", '⚙', INSPECT, &[]),
+    tool_row("task", '#', DELEGATE, &["prompt", "description"]),
+    tool_row("batch", '#', BATCH, &["invocations"]),
+    tool_row("todo_write", '⚙', UPDATE, &["todos"]),
+    tool_row("skill", '→', LOAD, &["name"]),
+    tool_row("question", '→', ASK, &["questions"]),
+    tool_row("memory", '⚙', MEMORY, &[]),
+    tool_row("sessions", '⚙', SESSIONS, &[]),
+    tool_row("view_image", '→', VIEW, &["path"]),
 ];
 
 const fn tool_row(
     tool: &'static str,
     sigil: char,
-    label: &'static str,
+    (plain, present, past): Inflection,
     header_keys: &'static [&'static str],
 ) -> (&'static str, CompactTool) {
     (
         tool,
         CompactTool {
             sigil,
-            label,
+            plain,
+            present,
+            past,
             header_keys,
         },
     )
@@ -149,9 +224,9 @@ fn is_query_tool(name: &str) -> bool {
 
 /// How a tool introduces itself on a one-line row. A name the table has never
 /// heard of answers with itself, which is all there is to say about it.
-pub(super) fn compact_sigil_label(name: &str) -> (char, &str) {
+pub(super) fn compact_sigil_label(name: &str, tense: Tense) -> (char, &str) {
     compact_tool(name).map_or((COMPACT_FALLBACK_SIGIL, name), |entry| {
-        (entry.sigil, entry.label)
+        (entry.sigil, entry.label(tense))
     })
 }
 
@@ -642,7 +717,7 @@ impl ToolLineBuilder {
         raw_input: Option<&serde_json::Value>,
     ) {
         let entry = compact_tool(tool_name);
-        let label = entry.map_or(tool_name, |entry| entry.label);
+        let label = entry.map_or(tool_name, |entry| entry.label(self.indicator.into()));
 
         let mut copy = format!("{label} {header}");
         let mut spans = vec![Span::styled(
@@ -2917,7 +2992,7 @@ mod tests {
     #[test_case("filePath.fileRead" ; "camel case on both sides")]
     fn a_qualified_tool_resolves_to_its_own_row(tool: &str) {
         let entry = compact_tool(tool).expect(QUALIFIED_MSG);
-        assert_eq!(entry.label, "Read", "{QUALIFIED_MSG}");
+        assert_eq!(entry.label(Tense::Past), "Read", "{QUALIFIED_MSG}");
         assert_eq!(entry.sigil, '→', "{QUALIFIED_MSG}");
     }
 

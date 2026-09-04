@@ -453,6 +453,13 @@ pub enum ProviderEvent {
         id: String,
         name: String,
     },
+    /// One fragment of a tool call's argument JSON, in arrival order. Always
+    /// preceded by the `ToolUseStart` naming the same `id`. Providers that
+    /// deliver arguments whole send a single delta carrying all of them.
+    ToolInputDelta {
+        id: String,
+        delta: String,
+    },
     PromptProgress {
         processed: u32,
         total: u32,
