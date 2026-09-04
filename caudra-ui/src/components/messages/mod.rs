@@ -797,10 +797,11 @@ impl MessagesPanel {
             && msg_index + 1 == self.messages.len()
     }
 
-    /// Whether the mode alone draws this call's body. A call that changed
-    /// something stays open in every mode: closing it would hide the change.
-    fn opens_by_default(&self, effect: ToolEffect, msg_index: usize) -> bool {
-        if !effect.is_collapsible() {
+    /// Whether the mode alone draws this call's body. A call whose body is
+    /// the only record of what it did stays open in every mode: closing it
+    /// would hide the change.
+    fn opens_by_default(&self, role: &ToolRole, msg_index: usize) -> bool {
+        if !role.is_collapsible() {
             return true;
         }
         match self.view {
@@ -825,7 +826,7 @@ impl MessagesPanel {
 
     fn card_opens_by_default(&self, tool_id: &str) -> bool {
         self.tool_card(tool_id)
-            .is_some_and(|(idx, role)| self.opens_by_default(role.effect, idx))
+            .is_some_and(|(idx, role)| self.opens_by_default(role, idx))
     }
 
     /// Whether a click can take this card back to its header. An expanded
@@ -835,7 +836,7 @@ impl MessagesPanel {
         self.compact()
             && self
                 .tool_card(tool_id)
-                .is_some_and(|(_, role)| role.effect.is_collapsible())
+                .is_some_and(|(_, role)| role.is_collapsible())
     }
 
     /// `None` means header-only. The flags inside say how much of the body an
@@ -934,9 +935,7 @@ impl MessagesPanel {
             return None;
         }
         let governed = match &self.messages[idx].role {
-            DisplayRole::Tool(t) => {
-                t.effect.is_collapsible() && !self.disclosure.contains_key(&t.id)
-            }
+            DisplayRole::Tool(t) => t.is_collapsible() && !self.disclosure.contains_key(&t.id),
             DisplayRole::Thinking => {
                 self.show_thinking && self.messages[idx].reasoning_open.is_none()
             }
@@ -3129,13 +3128,13 @@ impl MessagesPanel {
         let Some((msg_idx, t)) = self.tool_card(tool_id) else {
             return;
         };
-        let (status, effect) = (t.status, t.effect);
+        let (status, opens) = (t.status, self.opens_by_default(t, msg_idx));
         let msg = &self.messages[msg_idx];
         let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
 
-        let exp = self.tool_expansion(tool_id, self.opens_by_default(effect, msg_idx));
+        let exp = self.tool_expansion(tool_id, opens);
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
@@ -3163,7 +3162,7 @@ impl MessagesPanel {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.tool_expansion(&t.id, self.opens_by_default(t.effect, i));
+                let exp = self.tool_expansion(&t.id, self.opens_by_default(t, i));
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
-use caudra_agent::tools::ToolEffect;
+use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
 use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
 use caudra_providers::{CaudraId, HistoryItem, ModelTier};
@@ -632,6 +632,22 @@ pub struct ToolRole {
     /// than looked up at render time, so a transcript reads the same however
     /// long after the run it is opened.
     pub effect: ToolEffect,
+}
+
+impl ToolRole {
+    /// Whether the card can be put away behind its header without losing the
+    /// record of what the call did.
+    ///
+    /// `ToolEffect` alone cannot answer this. It says whether a call may
+    /// change something, which is what permissions need, and a write and a
+    /// shell command are both `Mutating`. What matters here is where the
+    /// record lives. A write's diff exists nowhere but the body, so hiding it
+    /// loses the change. A shell command is named in full by its own header,
+    /// down to its exit status, and what its body holds is what the command
+    /// printed rather than what it did.
+    pub fn is_collapsible(&self) -> bool {
+        self.effect.is_collapsible() || self.name.as_ref() == SHELL_TOOL_NAME
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

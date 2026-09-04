@@ -1741,6 +1741,8 @@ fn title_only_open_streaming_thinking_still_copies_its_header() {
 #[test]
 fn cross_message_copy_does_not_restore_truncated_tool_output() {
     let mut panel = panel_with_long_tool(200);
+    panel.set_view(ViewMode::Expanded);
+    render(&mut panel, 80, 24);
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
         "Finished".into(),
@@ -1960,6 +1962,8 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
 #[test]
 fn toggle_expand_collapse_truncated_tool() {
     let mut panel = panel_with_long_tool(200);
+    panel.set_view(ViewMode::Expanded);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
@@ -2025,7 +2029,8 @@ fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
 #[test_case(true; "raw survives")]
 #[test_case(false; "filtered survives")]
 fn changing_mode_keeps_a_shell_card_on_its_raw_or_filtered_view(raw: bool) {
-    let mut panel = compact_panel(&[("t1", SHELL_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
     panel.tool_done(shell_done("t1", true));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
@@ -2036,6 +2041,8 @@ fn changing_mode_keeps_a_shell_card_on_its_raw_or_filtered_view(raw: bool) {
     let chosen = seg_text(&panel, "t1").contains("raw_8");
     assert_eq!(chosen, raw, "the test must set up the view it checks");
 
+    panel.set_view(ViewMode::Compact);
+    render(&mut panel, 80, 24);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
 
@@ -2231,6 +2238,8 @@ fn extract_selection_copies_visible_content_only() {
 #[test]
 fn toggle_returns_false_for_non_expandable() {
     let mut panel = panel_with_long_tool(3);
+    panel.set_view(ViewMode::Expanded);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(!panel.toggle_expansion_at(area.y, area));
 }
@@ -2622,6 +2631,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
     let (eh, probe) = caudra_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
+    panel.set_view(ViewMode::Expanded);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
 
@@ -5251,5 +5261,42 @@ fn a_batch_child_lists_the_inputs_its_header_omits() {
     assert!(
         !text.contains("file_path="),
         "the header already shows the path: {text:?}"
+    );
+}
+
+const SHELL_COLLAPSE_MSG: &str = "a shell card must obey the view like any other read";
+const SHELL_HEADER_KEPT_MSG: &str = "a closed shell card still names the command that ran";
+const WRITE_STAYS_OPEN_MSG: &str = "a write must stay open: its diff is the only record of it";
+
+/// Shell is `Mutating`, so it was exempt from every view rule and stayed open
+/// forever. It is the highest-volume tool there is, which made compact and
+/// auto worth very little in any session that ran commands.
+#[test_case(ViewMode::Compact ; "compact closes it")]
+#[test_case(ViewMode::Auto ; "auto closes the one behind")]
+fn a_shell_card_closes_like_any_other_read(view: ViewMode) {
+    let mut panel = panel_with_long_tool(TRUNCATING_LINES);
+    panel.set_view(view);
+    // Auto keeps the newest card open, so give it a newer one to fall behind.
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "done".into()));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(!text.contains("line 0"), "{SHELL_COLLAPSE_MSG}: {text:?}");
+    assert!(text.contains("cmd"), "{SHELL_HEADER_KEPT_MSG}: {text:?}");
+}
+
+/// The line the rule draws: a shell command is named by its own header, but a
+/// diff exists nowhere but the body it would be hidden behind.
+#[test_case(FILE_WRITE_TOOL_NAME ; "write")]
+#[test_case(FILE_EDIT_TOOL_NAME ; "edit")]
+fn a_write_still_ignores_the_view(tool: &'static str) {
+    let mut panel = compact_panel(&[("t1", tool)]);
+    panel.tool_done(long_done("t1", HELD_BODY_LINES));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "done".into()));
+    render(&mut panel, 80, 24);
+
+    assert!(
+        seg_text(&panel, "t1").contains("line 0"),
+        "{WRITE_STAYS_OPEN_MSG}"
     );
 }
