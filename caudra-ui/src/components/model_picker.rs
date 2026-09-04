@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use caudra_providers::ModelTier;
 use caudra_providers::dynamic;
-use caudra_providers::model_registry::{self, CompactionTarget, GoalEvaluatorTarget};
+use caudra_providers::model_registry::{self, CompactionTarget, GoalEvaluatorTarget, TitleTarget};
 use caudra_providers::provider::ProviderKind;
 
 use crate::components::Overlay;
@@ -55,6 +55,7 @@ pub enum ModelPickerAction {
     Select(String),
     SetGoalEvaluator(GoalEvaluatorTarget),
     SetCompaction(CompactionTarget),
+    SetTitleModel(TitleTarget),
     AssignTier(String, ModelTier),
     ResetTier(ModelTier),
     Close,
@@ -99,16 +100,18 @@ enum PickerMode {
     Chat,
     Goal,
     Compact,
+    Title,
     Fast,
     Balanced,
     Best,
 }
 
 impl PickerMode {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Chat,
         Self::Goal,
         Self::Compact,
+        Self::Title,
         Self::Fast,
         Self::Balanced,
         Self::Best,
@@ -119,6 +122,7 @@ impl PickerMode {
             Self::Chat => "Chat",
             Self::Goal => "Goal",
             Self::Compact => "Compact",
+            Self::Title => "Title",
             Self::Fast => "Fast",
             Self::Balanced => "Balanced",
             Self::Best => "Best",
@@ -157,6 +161,7 @@ pub struct ModelPicker {
     current_spec: String,
     goal_target: GoalEvaluatorTarget,
     compaction_target: CompactionTarget,
+    title_target: TitleTarget,
     mode: PickerMode,
     needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
@@ -175,6 +180,7 @@ impl ModelPicker {
             current_spec: String::new(),
             goal_target: GoalEvaluatorTarget::Auto,
             compaction_target: CompactionTarget::Auto,
+            title_target: TitleTarget::Auto,
             mode: PickerMode::Chat,
             needs_rebuild: false,
             anchor: None,
@@ -191,6 +197,7 @@ impl ModelPicker {
         self.current_spec = current_spec.to_owned();
         self.goal_target = model_registry::goal_evaluator_target();
         self.compaction_target = model_registry::compaction_target();
+        self.title_target = model_registry::title_target();
         self.anchor = None;
         self.needs_rebuild = false;
         self.picker.set_footer_builder(model_footer_line);
@@ -206,6 +213,7 @@ impl ModelPicker {
         self.current_spec = current_spec.to_owned();
         self.goal_target = target;
         self.compaction_target = model_registry::compaction_target();
+        self.title_target = model_registry::title_target();
         self.anchor = None;
         self.needs_rebuild = false;
         self.picker.set_footer_builder(assignment_footer_line);
@@ -337,6 +345,10 @@ impl ModelPicker {
                 CompactionTarget::Model(spec) => Some(spec.clone()),
                 CompactionTarget::Auto => None,
             },
+            PickerMode::Title => match &self.title_target {
+                TitleTarget::Model(spec) => Some(spec.clone()),
+                TitleTarget::Auto => None,
+            },
             mode => mode
                 .preset_tier()
                 .and_then(model_registry::override_spec_for_tier),
@@ -447,6 +459,10 @@ impl ModelPicker {
                     self.compaction_target = CompactionTarget::Auto;
                     ModelPickerAction::SetCompaction(CompactionTarget::Auto)
                 }
+                PickerMode::Title => {
+                    self.title_target = TitleTarget::Auto;
+                    ModelPickerAction::SetTitleModel(TitleTarget::Auto)
+                }
                 mode => ModelPickerAction::ResetTier(
                     mode.preset_tier().expect("preset mode must have a tier"),
                 ),
@@ -466,6 +482,9 @@ impl ModelPicker {
                 ),
                 PickerMode::Compact => {
                     ModelPickerAction::SetCompaction(CompactionTarget::Model(entry.spec))
+                }
+                PickerMode::Title => {
+                    ModelPickerAction::SetTitleModel(TitleTarget::Model(entry.spec))
                 }
                 mode => ModelPickerAction::AssignTier(
                     entry.spec,
@@ -902,9 +921,9 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(3, ModelTier::Weak     ; "fast")]
-    #[test_case(4, ModelTier::Medium   ; "balanced")]
-    #[test_case(5, ModelTier::Strong   ; "best")]
+    #[test_case(4, ModelTier::Weak     ; "fast")]
+    #[test_case(5, ModelTier::Medium   ; "balanced")]
+    #[test_case(6, ModelTier::Strong   ; "best")]
     fn preset_modes_assign_selected_exact_model(tabs: usize, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -942,7 +961,7 @@ mod tests {
     fn uppercase_r_resets_preset_while_lowercase_r_filters() {
         let mut p = ModelPicker::new(test_models());
         p.open("");
-        for _ in 0..3 {
+        for _ in 0..4 {
             p.handle_key(key(KeyCode::Tab));
         }
 
@@ -995,6 +1014,33 @@ mod tests {
         assert!(matches!(
             p.handle_key(key(KeyCode::Char('R'))),
             ModelPickerAction::SetCompaction(CompactionTarget::Auto)
+        ));
+    }
+
+    #[test]
+    fn title_mode_assigns_and_resets_exact_model() {
+        const TABS_TO_TITLE: usize = 3;
+        let spec = "anthropic/claude-sonnet-4-20250514";
+        let mut p = ModelPicker::new(test_models());
+        p.open(spec);
+        for _ in 0..TABS_TO_TITLE {
+            p.handle_key(key(KeyCode::Tab));
+        }
+        p.picker
+            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::SetTitleModel(TitleTarget::Model(value)) if value == spec
+        ));
+
+        p.open(spec);
+        for _ in 0..TABS_TO_TITLE {
+            p.handle_key(key(KeyCode::Tab));
+        }
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('R'))),
+            ModelPickerAction::SetTitleModel(TitleTarget::Auto)
         ));
     }
 

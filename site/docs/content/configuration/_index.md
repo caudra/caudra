@@ -139,6 +139,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
+| `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with a small model |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
 

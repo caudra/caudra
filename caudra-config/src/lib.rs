@@ -665,6 +665,7 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
+    pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub shell_output_filter: Option<bool>,
 }
@@ -681,6 +682,7 @@ impl AgentFileConfig {
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
+            generate_titles,
             stale_read_check,
             shell_output_filter
         );
@@ -1367,6 +1369,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Name a new session by summarizing its first prompt with a small model"
+    )]
+    pub generate_titles: bool,
+
+    #[config(
+        default = true,
         desc = "Require re-reading a file that changed on disk before editing it"
     )]
     pub stale_read_check: bool,
@@ -1421,6 +1429,7 @@ impl AgentConfig {
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
+            generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             max_turns: None,
@@ -2830,6 +2839,23 @@ mod tests {
 
         assert_eq!(
             raw.into_config(no_rtk).unwrap().agent.shell_output_filter,
+            expected
+        );
+    }
+
+    #[test_case(None,        true  ; "titles_generated_by_default")]
+    #[test_case(Some(false), false ; "titles_disabled_in_config")]
+    fn generate_titles_config(configured: Option<bool>, expected: bool) {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                generate_titles: configured,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.generate_titles,
             expected
         );
     }

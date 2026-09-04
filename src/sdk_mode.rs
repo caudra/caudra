@@ -1666,6 +1666,7 @@ impl EventPump {
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
+            | AgentEvent::SessionTitle { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentProgress { .. }
             | AgentEvent::SubagentHistory { .. }

@@ -49,7 +49,7 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Model-aware reasoning and workload roles
 
-**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Goal, Compact, Fast, Balanced, and Best are separate model purposes with their own assignments and fallbacks.
+**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Goal, Compact, Title, Fast, Balanced, and Best are separate model purposes with their own assignments and fallbacks.
 
 **Why:** Provider-wide reasoning tables can advertise unsupported settings and send invalid requests. Model-declared controls keep the UI and request payload aligned with the model that will receive them.
 

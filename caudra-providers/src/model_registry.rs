@@ -120,6 +120,23 @@ impl fmt::Display for CompactionTarget {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum TitleTarget {
+    #[default]
+    Auto,
+    Model(String),
+}
+
+impl fmt::Display for TitleTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("default"),
+            Self::Model(spec) => f.write_str(spec),
+        }
+    }
+}
+
 pub fn goal_evaluator_target() -> GoalEvaluatorTarget {
     read().goal_evaluator.clone().unwrap_or_default()
 }
@@ -128,16 +145,22 @@ pub fn compaction_target() -> CompactionTarget {
     read().compaction.clone().unwrap_or_default()
 }
 
+pub fn title_target() -> TitleTarget {
+    read().title.clone().unwrap_or_default()
+}
+
 pub fn load_from_storage(dir: &StateDir) {
     let overrides = read_overrides(dir);
     let PersistedRoles {
         goal_evaluator,
         compaction,
+        title,
     } = read_roles(dir);
     let mut registry = write();
     registry.set_overrides(overrides);
     registry.goal_evaluator = goal_evaluator.filter(|target| *target != GoalEvaluatorTarget::Auto);
     registry.compaction = compaction;
+    registry.title = title;
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
@@ -177,6 +200,14 @@ pub fn set_compaction_and_persist(target: CompactionTarget, dir: &StateDir) {
     update_persisted_roles(dir, |roles| roles.compaction = Some(target));
 }
 
+pub fn set_title_model_and_persist(target: TitleTarget, dir: &StateDir) {
+    {
+        let mut registry = write();
+        registry.title = Some(target.clone());
+    }
+    update_persisted_roles(dir, |roles| roles.title = Some(target));
+}
+
 fn update_and_persist(dir: &StateDir, update: impl Fn(&mut BTreeMap<ModelTier, String>)) {
     {
         let mut reg = write();
@@ -205,6 +236,7 @@ struct ModelRegistry {
     known_models: HashMap<String, Vec<ModelInfo>>,
     goal_evaluator: Option<GoalEvaluatorTarget>,
     compaction: Option<CompactionTarget>,
+    title: Option<TitleTarget>,
 }
 
 impl ModelRegistry {
@@ -362,6 +394,8 @@ struct PersistedRoles {
     goal_evaluator: Option<GoalEvaluatorTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<TitleTarget>,
 }
 
 fn read_overrides(dir: &StateDir) -> BTreeMap<ModelTier, String> {
@@ -433,6 +467,7 @@ mod tests {
         let roles = read_roles(&dir);
         assert!(roles.goal_evaluator.is_none(), "{IGNORED}");
         assert!(roles.compaction.is_none(), "{IGNORED}");
+        assert!(roles.title.is_none(), "{IGNORED}");
     }
 
     #[test]
@@ -634,6 +669,7 @@ mod tests {
         let (_temp, dir) = state_dir();
         let goal_evaluator = GoalEvaluatorTarget::Model("openai/gpt-5.4-nano".into());
         let compaction = CompactionTarget::Model("openai/gpt-5.4-mini".into());
+        let title = TitleTarget::Model("openai/gpt-5.4-nano".into());
 
         update_persisted_roles(&dir, |roles| {
             roles.goal_evaluator = Some(goal_evaluator.clone());
@@ -641,15 +677,20 @@ mod tests {
         update_persisted_roles(&dir, |roles| {
             roles.compaction = Some(compaction.clone());
         });
+        update_persisted_roles(&dir, |roles| {
+            roles.title = Some(title.clone());
+        });
 
         let roles = read_roles(&dir);
         assert_eq!(roles.goal_evaluator, Some(goal_evaluator));
         assert_eq!(roles.compaction, Some(compaction.clone()));
+        assert_eq!(roles.title, Some(title.clone()));
 
         update_persisted_roles(&dir, |roles| roles.goal_evaluator = None);
         let roles = read_roles(&dir);
         assert!(roles.goal_evaluator.is_none());
         assert_eq!(roles.compaction, Some(compaction));
+        assert_eq!(roles.title, Some(title));
     }
 
     #[test]
@@ -660,6 +701,7 @@ mod tests {
         let roles = read_roles(&dir);
         assert!(roles.goal_evaluator.is_none());
         assert!(roles.compaction.is_none());
+        assert!(roles.title.is_none());
     }
 
     #[test]

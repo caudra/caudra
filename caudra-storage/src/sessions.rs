@@ -40,7 +40,7 @@ const LOG_FORMAT_VERSION: u32 = 3;
 pub const SESSIONS_DIR: &str = "sessions";
 const DEFAULT_TITLE: &str = "New session";
 pub const DEFAULT_SUBAGENT_PROFILE_NAME: &str = "builtin";
-const MAX_TITLE_LEN: usize = 60;
+const MAX_TITLE_LEN: usize = 100;
 /// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
 pub(crate) const ARCHIVE_DIR: &str = "archive";
 /// Archives kept per session. The extra ones go on the next archive, not on a
@@ -597,10 +597,14 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
     let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
         return DEFAULT_TITLE.into();
     };
-    let text = normalize_title(text);
+    truncate_title(&normalize_title(text))
+}
 
+/// Shared by the heuristic title and the model-written one, so both render the
+/// same way in the picker.
+pub fn truncate_title(text: &str) -> String {
     if text.len() <= MAX_TITLE_LEN {
-        return text;
+        return text.to_owned();
     }
 
     let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
@@ -1177,6 +1181,16 @@ where
         }
     }
 
+    /// A model-written title may land long after the prompt that triggered it,
+    /// by which time the user could have renamed the session or forked it.
+    /// Only a title Caudra derived itself is safe to replace, and that is
+    /// exactly the one [`generate_title`] still reproduces.
+    pub fn set_title_if_auto(&mut self, title: String) {
+        if self.title == DEFAULT_TITLE || self.title == generate_title(&self.messages) {
+            self.set_title(title);
+        }
+    }
+
     pub fn delete(id: CaudraId, dir: &StateDir) -> Result<(), SessionError> {
         Self::delete_with_version(id, dir, None)
     }
@@ -1251,6 +1265,13 @@ mod tests {
     const HEADER_RECORD: &str = "header";
     const MSG_RECORD: &str = "msg";
     const META_RECORD: &str = "meta";
+    const LONG_TITLE: &str = "This is a very long title that exceeds the one hundred character cap and should therefore be truncated at a word boundary";
+    const LONG_TITLE_TRUNCATED: &str =
+        "This is a very long title that exceeds the one hundred character cap and should therefore be…";
+    const MODEL_TITLE: &str = "Session title from a small model";
+    const RENAMED_TITLE: &str = "Renamed by hand";
+    const TITLE_PROMPT: &str = "add refresh token support";
+    const FORK_TITLE: &str = "Renamed by hand (fork #1)";
 
     fn state_dir() -> (TempDir, StateDir) {
         let temp = TempDir::new().unwrap();
@@ -2015,11 +2036,7 @@ mod tests {
 
     #[test_case("short title", "short title" ; "short_passthrough")]
     #[test_case("", DEFAULT_TITLE ; "empty_defaults")]
-    #[test_case(
-        "This is a very long title that exceeds the sixty character limit and should be truncated at a word boundary",
-        "This is a very long title that exceeds the sixty character…"
-        ; "long_truncates_at_word"
-    )]
+    #[test_case(LONG_TITLE, LONG_TITLE_TRUNCATED ; "long_truncates_at_word")]
     #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
@@ -2028,6 +2045,20 @@ mod tests {
             vec![user_message(input)]
         };
         assert_eq!(generate_title(&messages), expected);
+    }
+
+    #[test_case(DEFAULT_TITLE, MODEL_TITLE ; "replaces_default")]
+    #[test_case(TITLE_PROMPT, MODEL_TITLE ; "replaces_heuristic")]
+    #[test_case(RENAMED_TITLE, RENAMED_TITLE ; "keeps_manual_rename")]
+    #[test_case(FORK_TITLE, FORK_TITLE ; "keeps_fork_title")]
+    fn set_title_if_auto_only_replaces_derived_titles(current: &str, expected: &str) {
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message(TITLE_PROMPT));
+        session.set_title(current.into());
+
+        session.set_title_if_auto(MODEL_TITLE.into());
+
+        assert_eq!(session.title, expected);
     }
 
     #[test]

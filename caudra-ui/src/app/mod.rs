@@ -1239,6 +1239,7 @@ impl App {
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
             ModelPickerAction::ResetTier(tier) => vec![Action::ResetTier(tier)],
             ModelPickerAction::SetCompaction(target) => vec![Action::SetCompaction(target)],
+            ModelPickerAction::SetTitleModel(target) => vec![Action::SetTitleModel(target)],
         }
     }
 
@@ -2087,6 +2088,12 @@ impl App {
                     chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
                 }
             }
+            return vec![];
+        }
+        // Generated off the turn's critical path, so it can land after the run
+        // that asked for it retired; a title is session state, not a frame.
+        if let AgentEvent::SessionTitle { title } = envelope.event {
+            self.state.session_mut().set_title_if_auto(title);
             return vec![];
         }
         if let AgentEvent::SubagentHistory {

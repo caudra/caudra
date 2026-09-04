@@ -209,7 +209,7 @@ impl Chat {
             AgentEvent::QueueBatchConsumed { items } => {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
-            AgentEvent::QueueDrained => {}
+            AgentEvent::QueueDrained | AgentEvent::SessionTitle { .. } => {}
             AgentEvent::Retry { .. } | AgentEvent::SubagentProgress { .. } => {
                 unreachable!("handled before handle_event")
             }

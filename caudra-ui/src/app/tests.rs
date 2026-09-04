@@ -2409,7 +2409,10 @@ fn the_transcript_can_be_selected_while_a_question_is_open() {
         row,
     ));
     assert!(
-        matches!(app.selection_state, Some(SelectionState::PendingCopy { .. })),
+        matches!(
+            app.selection_state,
+            Some(SelectionState::PendingCopy { .. })
+        ),
         "a drag across the transcript has to end in a selection"
     );
 }
@@ -2432,7 +2435,8 @@ fn the_question_form_docks_between_the_transcript_and_the_status_bar() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     assert!(
-        app.question_form.contains(Position::new(bottom.x, bottom.y))
+        app.question_form
+            .contains(Position::new(bottom.x, bottom.y))
             && !app
                 .question_form
                 .contains(Position::new(bottom.x, status.y)),

@@ -1036,6 +1036,12 @@ pub enum AgentEvent {
     },
     AutoCompacting,
     CompactionDone,
+    /// A model-written name for the session, produced off the turn's critical
+    /// path. Arrives at most once per session and may land after the run that
+    /// triggered it has finished.
+    SessionTitle {
+        title: String,
+    },
     Retry {
         attempt: u32,
         message: String,

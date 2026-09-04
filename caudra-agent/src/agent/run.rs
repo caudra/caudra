@@ -21,6 +21,7 @@ use super::history::{History, repair_tool_pairs, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::provider_projection;
 use super::streaming::{StreamError, stream_with_retry};
+use super::title;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -297,6 +298,10 @@ impl<'h> Agent<'h> {
             caudra_otel::emit::user_prompt(&message);
         }
 
+        if self.should_generate_title(&message) {
+            self.spawn_title(message);
+        }
+
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
@@ -325,6 +330,45 @@ impl<'h> Agent<'h> {
         self.emit_done(reason)?;
 
         Ok(reason)
+    }
+
+    /// Only the prompt that opens a session can name it: `rollback_len` is the
+    /// history length before this run, so zero means nothing came before. A
+    /// resumed session already carries a title and never asks for another.
+    fn should_generate_title(&self, prompt: &str) -> bool {
+        self.config.generate_titles
+            && self.audience.contains(ToolAudience::MAIN)
+            && self.root_tool_use_id.is_none()
+            && self.session_id.is_some()
+            && self.rollback_len == 0
+            && !prompt.trim().is_empty()
+    }
+
+    /// Detached: nobody waits for a title, and a turn must not pay for one.
+    /// The event can therefore land after the run that triggered it ended.
+    fn spawn_title(&self, prompt: String) {
+        let provider = Arc::clone(&self.provider);
+        let model = Arc::clone(&self.model);
+        let timeouts = self.timeouts;
+        let model_policy = Arc::clone(&self.model_policy);
+        let cancel = self.cancel.clone();
+        let session_id = self.session_id.clone();
+        let event_tx = self.event_tx.clone();
+        smol::spawn(async move {
+            let resolved = title::resolve(&provider, &model, timeouts, &model_policy).await;
+            if let Some(title) = title::generate(
+                &*resolved.provider,
+                &resolved.model,
+                &prompt,
+                &cancel,
+                session_id.as_ref(),
+            )
+            .await
+            {
+                event_tx.try_send(AgentEvent::SessionTitle { title });
+            }
+        })
+        .detach();
     }
 
     fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
@@ -1841,6 +1885,34 @@ mod tests {
 
             assert!(result.is_ok());
         });
+    }
+
+    #[test_case(|_| {}, true ; "first_prompt_of_a_stored_session")]
+    #[test_case(|a| a.session_id = None, false ; "no_session_to_name")]
+    #[test_case(|a| a.rollback_len = 1, false ; "history_already_had_turns")]
+    #[test_case(|a| a.config.generate_titles = false, false ; "disabled_in_config")]
+    #[test_case(|a| a.root_tool_use_id = Some("call-1".into()), false ; "subagent_run")]
+    #[test_case(|a| a.audience = ToolAudience::GENERAL_SUB, false ; "not_the_main_audience")]
+    fn should_generate_title_only_for_a_session_opening_prompt(
+        adjust: fn(&mut Agent<'_>),
+        expected: bool,
+    ) {
+        const PROMPT: &str = "add refresh token support";
+        let mut history = History::default();
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.session_id = Some(SessionRef::from_id(caudra_storage::id::CaudraId::generate()));
+        adjust(&mut agent);
+
+        assert_eq!(agent.should_generate_title(PROMPT), expected);
+    }
+
+    #[test]
+    fn a_blank_prompt_never_names_a_session() {
+        let mut history = History::default();
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.session_id = Some(SessionRef::from_id(caudra_storage::id::CaudraId::generate()));
+
+        assert!(!agent.should_generate_title("   \n\t"));
     }
 
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]

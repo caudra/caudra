@@ -339,6 +339,9 @@ impl SessionStore {
         envelope: &Envelope,
     ) -> Result<(), caudra_storage::sessions::SessionError> {
         match &envelope.event {
+            AgentEvent::SessionTitle { title } => {
+                self.session.set_title_if_auto(title.clone());
+            }
             AgentEvent::ToolDone(done) => {
                 self.session
                     .insert_tool_output(done.id.clone(), done.output.clone());

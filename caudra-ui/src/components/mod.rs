@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use caudra_agent::AgentInput;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
-use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget};
+use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget, TitleTarget};
 use caudra_providers::{CaudraId, HistoryItem, ModelTier};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
@@ -428,6 +428,7 @@ pub enum Action {
     ResetTier(ModelTier),
     SetGoalEvaluator(GoalEvaluatorTarget),
     SetCompaction(CompactionTarget),
+    SetTitleModel(TitleTarget),
     RefreshModels,
     RefreshUsage,
     Compact,
@@ -844,7 +845,12 @@ mod tests {
             HANG_WIDTH,
         )
         .iter()
-        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
         .collect()
     }
 

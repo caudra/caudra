@@ -2261,6 +2261,15 @@ impl<'t> EventLoop<'t> {
                     .app
                     .flash(format!("Compaction model: {target}"));
             }
+            Action::SetTitleModel(target) => {
+                caudra_providers::model_registry::set_title_model_and_persist(
+                    target.clone(),
+                    &self.ctx.storage,
+                );
+                self.sessions[idx]
+                    .app
+                    .flash(format!("Title model: {target}"));
+            }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();

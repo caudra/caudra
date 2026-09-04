@@ -146,7 +146,7 @@ pub fn run(
     image_paths: Vec<PathBuf>,
     format: OutputFormat,
     verbose: bool,
-    config: AgentConfig,
+    mut config: AgentConfig,
     permissions_config: PermissionsConfig,
     timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
@@ -170,6 +170,9 @@ pub fn run(
     let images = load_images(&image_paths)?;
     let (prompt, goal) = print_goal(prompt)?;
 
+    // Print mode mints a throwaway session id and never opens a session store,
+    // so a generated title would have nowhere to land.
+    config.generate_titles = false;
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -278,6 +281,7 @@ pub fn run(
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
+            | AgentEvent::SessionTitle { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest(_)
             | AgentEvent::PermissionRequestResolved { .. }

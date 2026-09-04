@@ -29,6 +29,16 @@ Credentials, configuration, trust, model preferences, plans, memory notes, and l
 
 What the run spends is still recorded in the persistent [usage ledger](/docs/token-economy/#lifetime-spend), labelled as ephemeral, so an ephemeral run stays visible in your spending totals.
 
+## Titles
+
+A new session is named from its first prompt right away, trimmed to 100 characters at a word boundary, so it is findable in the session picker before the first reply arrives.
+
+While the turn runs, Caudra asks a small model for a better name and replaces the trimmed text in place. That request is detached from the turn: it never delays a reply, and a failure or timeout leaves the trimmed title standing. It happens once per session, on the first prompt only.
+
+A title you set yourself is never overwritten. Renaming through the session picker, the Lua API, or a fork marks the title as yours, and a generated name arriving afterwards is dropped.
+
+Choose which model writes titles under the Title purpose in `/model`, described in [Providers](/docs/providers/). Set `agent.generate_titles = false` to keep the trimmed prompt and skip the request.
+
 ## Message actions
 
 Right-click a message, or hold the left mouse button for half a second, to open Message Actions. Normal left clicks still select text, expand reasoning, and interact with tool output.
