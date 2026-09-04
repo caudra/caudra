@@ -8,6 +8,7 @@ pub mod http_policy;
 pub mod logging;
 pub mod root;
 pub mod server;
+pub mod transfer;
 pub mod transports;
 
 use cli::{CliOptions, Transport};
@@ -47,6 +48,7 @@ pub async fn run(
                 ),
                 type_check: options.code_type_check,
             },
+            max_transfer_bytes: options.max_transfer_bytes,
         },
     )
     .await?;

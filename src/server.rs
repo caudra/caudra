@@ -31,6 +31,7 @@ use crate::{
         ExecutionEnvironmentDisclosure, TOOL_NAME as EXECUTION_ENVIRONMENT_TOOL,
         ToolGroupDisclosure, tool as execution_environment_tool,
     },
+    transfer::TransferToolGroup,
 };
 
 const MODERN_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
@@ -62,6 +63,7 @@ pub struct ToolConfiguration<'a> {
     pub shell_policy: ShellPermissionPolicy,
     pub shell_output_filter: bool,
     pub code: CodeConfiguration<'a>,
+    pub max_transfer_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -72,6 +74,9 @@ pub struct WorkcellServer {
     // The code group owns a worker pool, which is shared rather than cloned so every server clone
     // draws on the same bounded set of subprocesses.
     code: Option<Arc<CodeToolGroup>>,
+    // Server-only: the tools here mint URLs for the `/files` route, so this group exists solely
+    // because the binary owns an HTTP transport. A native embedder never sees it.
+    transfer: Option<TransferToolGroup>,
     execution_environment: Option<ExecutionEnvironmentDisclosure>,
     modern_only: bool,
 }
@@ -146,6 +151,19 @@ impl WorkcellServer {
         } else {
             None
         };
+        let transfer = if groups.contains(&ToolGroup::Transfer) {
+            Some(
+                TransferToolGroup::new(
+                    root.ok_or(ServerBuildError::Filesystem)?,
+                    tools.allow_write,
+                    tools.max_transfer_bytes,
+                )
+                .await
+                .map_err(|_| ServerBuildError::Filesystem)?,
+            )
+        } else {
+            None
+        };
         compose_catalog([
             files.as_ref().map_or_else(Vec::new, FileToolGroup::catalog),
             web.as_ref()
@@ -154,6 +172,9 @@ impl WorkcellServer {
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
             code.as_ref().map_or_else(Vec::new, |group| group.catalog()),
+            transfer
+                .as_ref()
+                .map_or_else(Vec::new, TransferToolGroup::catalog),
             if behavior.expose_execution_environment {
                 vec![execution_environment_tool()]
             } else {
@@ -170,6 +191,7 @@ impl WorkcellServer {
             web,
             shell,
             code,
+            transfer,
             execution_environment,
             modern_only: behavior.modern_only,
         })
@@ -197,6 +219,9 @@ impl WorkcellServer {
             self.code
                 .as_ref()
                 .map_or_else(Vec::new, |group| group.catalog()),
+            self.transfer
+                .as_ref()
+                .map_or_else(Vec::new, TransferToolGroup::catalog),
             self.execution_environment
                 .as_ref()
                 .map_or_else(Vec::new, |_| vec![execution_environment_tool()]),
@@ -207,6 +232,13 @@ impl WorkcellServer {
     #[must_use]
     pub const fn modern_only(&self) -> bool {
         self.modern_only
+    }
+
+    /// Lets the HTTP transport mount the byte-moving route for exactly the group it built. Returns
+    /// `None` when transfer is not enabled, and the transport must then mount no route at all.
+    #[must_use]
+    pub const fn transfer(&self) -> Option<&TransferToolGroup> {
+        self.transfer.as_ref()
     }
 
     fn validate_request_context(
@@ -274,6 +306,11 @@ impl WorkcellServer {
             && let Some(result) = code
                 .dispatch(name, arguments.clone(), cancellation.clone())
                 .await
+        {
+            return result;
+        }
+        if let Some(transfer) = &self.transfer
+            && let Some(result) = transfer.dispatch(name, arguments.clone()).await
         {
             return result;
         }
@@ -542,6 +579,7 @@ mod tests {
                 },
                 type_check: true,
             },
+            max_transfer_bytes: crate::cli::DEFAULT_MAX_TRANSFER_BYTES,
         }
     }
 
@@ -552,6 +590,7 @@ mod tests {
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
             workcell_mcp_code::catalog(),
+            crate::transfer::catalog::catalog(true),
             vec![execution_environment_tool()],
         ])
         .unwrap()
@@ -559,7 +598,8 @@ mod tests {
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
         // Order is a compatibility contract. `code_execution` follows `shell` so the documented
-        // files/web/shell prefix is unchanged, and precedes the host-owned disclosure tool.
+        // files/web/shell prefix is unchanged, the server-only transfer tools follow it, and the
+        // host-owned disclosure tool stays last.
         assert_eq!(
             names,
             [
@@ -574,6 +614,8 @@ mod tests {
                 "webfetch",
                 "shell",
                 "code_execution",
+                "file_download",
+                "file_upload",
                 "execution_environment",
             ]
         );

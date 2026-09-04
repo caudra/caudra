@@ -11,6 +11,7 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
+    routing::get,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
@@ -29,6 +30,7 @@ use crate::{
     cli::HttpBindMode,
     http_policy::{self, HttpPolicy},
     server::WorkcellServer,
+    transfer,
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -112,6 +114,8 @@ impl HttpServer {
     ) -> Result<Self, TransportError> {
         configuration.validate()?;
         let modern_only = server.modern_only();
+        let transfer = server.transfer().cloned();
+        let transfer_enabled = transfer.is_some();
         let requested = SocketAddrV4::new(
             match configuration.bind_mode {
                 HttpBindMode::Loopback => Ipv4Addr::LOCALHOST,
@@ -139,14 +143,24 @@ impl HttpServer {
                 Arc::new(NeverSessionManager::default()),
                 transport_config,
             );
-        let router = Router::new()
-            .nest_service(http_policy::ENDPOINT_PATH, service)
+        let mut router = Router::new().nest_service(http_policy::ENDPOINT_PATH, service);
+        // Mounted only when the group exists, so the route and the tools that advertise it are
+        // enabled by the same decision.
+        if let Some(group) = transfer {
+            router = router.route(
+                transfer::ENDPOINT_PATH,
+                get(transfer::endpoints::download)
+                    .post(transfer::endpoints::upload)
+                    .with_state(group),
+            );
+        }
+        let router = router
             .layer(middleware::from_fn_with_state(
                 configuration.authentication,
                 authenticate,
             ))
             .layer(middleware::from_fn_with_state(
-                HttpPolicy::new(configuration.allowed_hosts, modern_only),
+                HttpPolicy::new(configuration.allowed_hosts, modern_only, transfer_enabled),
                 http_policy::enforce,
             ));
         let (state_tx, _state_rx) = watch::channel(ServeState::Running);
@@ -252,15 +266,18 @@ async fn authenticate(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_owned();
     let authorization = request.headers().get(AUTHORIZATION);
     match (authentication, authorization) {
         (None, None) => next.run(request).await,
-        (None, Some(_)) => http_policy::policy_error(
+        (None, Some(_)) => http_policy::path_error(
+            &path,
             StatusCode::BAD_REQUEST,
             -32_000,
             "Authorization is not configured.",
         ),
-        (Some(_), None) => http_policy::policy_error(
+        (Some(_), None) => http_policy::path_error(
+            &path,
             StatusCode::UNAUTHORIZED,
             -32_000,
             "Bearer authentication is required.",
@@ -275,7 +292,8 @@ async fn authenticate(
                 request.headers_mut().remove(AUTHORIZATION);
                 next.run(request).await
             } else {
-                http_policy::policy_error(
+                http_policy::path_error(
+                    &path,
                     StatusCode::UNAUTHORIZED,
                     -32_000,
                     "Bearer authentication failed.",

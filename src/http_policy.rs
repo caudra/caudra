@@ -26,11 +26,15 @@ const REQUEST_ID: &str = "x-request-id";
 pub struct HttpPolicy {
     allowed_hosts: Arc<HashSet<String>>,
     modern_only: bool,
+    transfer: bool,
 }
 
 impl HttpPolicy {
+    /// `transfer` must match whether the transfer tool group was actually built. When it is false the
+    /// transfer route is indistinguishable from any other unknown path, so a deployment without the
+    /// group does not disclose that the route exists.
     #[must_use]
-    pub fn new(hosts: impl IntoIterator<Item = String>, modern_only: bool) -> Self {
+    pub fn new(hosts: impl IntoIterator<Item = String>, modern_only: bool, transfer: bool) -> Self {
         Self {
             allowed_hosts: Arc::new(
                 hosts
@@ -39,7 +43,34 @@ impl HttpPolicy {
                     .collect(),
             ),
             modern_only,
+            transfer,
         }
+    }
+
+    fn classify_route(&self, path: &str) -> Route {
+        match route_of(path) {
+            Route::Transfer if !self.transfer => Route::Unknown,
+            route => route,
+        }
+    }
+}
+
+/// Which contract a request is speaking. The two routes differ in method set, body handling, and
+/// error envelope, so every branch below has to know which one it is answering for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Route {
+    Mcp,
+    Transfer,
+    Unknown,
+}
+
+fn route_of(path: &str) -> Route {
+    if path == ENDPOINT_PATH {
+        Route::Mcp
+    } else if path == crate::transfer::ENDPOINT_PATH {
+        Route::Transfer
+    } else {
+        Route::Unknown
     }
 }
 
@@ -51,20 +82,41 @@ pub async fn enforce(
     let request_id = format!("http_{}", Uuid::new_v4());
     let started = Instant::now();
     let method = safe_method(request.method());
+    let route = policy.classify_route(request.uri().path());
     let mut response = match classify_host(request.headers(), &policy.allowed_hosts) {
-        HostClassification::Invalid => {
-            policy_error(StatusCode::BAD_REQUEST, -32_000, "Invalid Host header.")
-        }
+        HostClassification::Invalid => route_error(
+            route,
+            StatusCode::BAD_REQUEST,
+            -32_000,
+            "Invalid Host header.",
+        ),
         HostClassification::Foreign => {
-            policy_error(StatusCode::FORBIDDEN, -32_000, "Host not allowed.")
+            route_error(route, StatusCode::FORBIDDEN, -32_000, "Host not allowed.")
         }
-        HostClassification::Allowed if request.headers().contains_key(ORIGIN) => policy_error(
+        HostClassification::Allowed if request.headers().contains_key(ORIGIN) => route_error(
+            route,
             StatusCode::FORBIDDEN,
             -32_000,
             "Browser-origin requests are not allowed.",
         ),
-        HostClassification::Allowed if request.uri().path() != ENDPOINT_PATH => {
+        // A disabled transfer route lands here alongside every other unknown path, so the response
+        // does not disclose that this build could have served it.
+        HostClassification::Allowed if route == Route::Unknown => {
             policy_error(StatusCode::NOT_FOUND, -32_001, "MCP endpoint not found.")
+        }
+        HostClassification::Allowed if route == Route::Transfer => {
+            if matches!(*request.method(), Method::GET | Method::POST) {
+                // Deliberately no body buffering: a transfer body is arbitrarily large and must
+                // stream through to the handler.
+                bound_transfer_server_error(next.run(request).await)
+            } else {
+                let mut response =
+                    transfer_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+                response
+                    .headers_mut()
+                    .insert(ALLOW, HeaderValue::from_static("GET, POST"));
+                response
+            }
         }
         HostClassification::Allowed if request.headers().contains_key("mcp-session-id") => {
             policy_error(
@@ -308,6 +360,35 @@ pub(crate) fn policy_error(status: StatusCode, code: i32, message: &'static str)
     json_rpc_error(status, code, message, Value::Null, None)
 }
 
+/// Rejects a request in the envelope its route speaks. A caller that asked for bytes and received a
+/// JSON-RPC error would have to guess which contract answered it.
+fn route_error(route: Route, status: StatusCode, code: i32, message: &'static str) -> Response {
+    match route {
+        Route::Transfer => transfer_error(status, message),
+        Route::Mcp | Route::Unknown => policy_error(status, code, message),
+    }
+}
+
+/// Route-aware rejection for layers that run after [`enforce`] and so only ever see a path this
+/// build actually serves.
+pub(crate) fn path_error(
+    path: &str,
+    status: StatusCode,
+    code: i32,
+    message: &'static str,
+) -> Response {
+    route_error(route_of(path), status, code, message)
+}
+
+fn transfer_error(status: StatusCode, message: &'static str) -> Response {
+    (
+        status,
+        [(CONTENT_TYPE, "application/json; charset=utf-8")],
+        json!({ "message": message, "code": status.as_u16() }).to_string(),
+    )
+        .into_response()
+}
+
 fn json_rpc_error(
     status: StatusCode,
     code: i32,
@@ -344,6 +425,17 @@ fn bound_server_error(response: Response) -> Response {
     }
 }
 
+/// The transfer-route counterpart of [`bound_server_error`]. Replacing the body also discards any
+/// streaming body the handler had begun, which is the point: a failed transfer must not leave a
+/// caller reading a truncated response as if it were the file.
+fn bound_transfer_server_error(response: Response) -> Response {
+    if response.status().is_server_error() {
+        transfer_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error.")
+    } else {
+        response
+    }
+}
+
 fn apply_security_headers(response: &mut Response, request_id: &str) {
     response.headers_mut().insert(
         REQUEST_ID,
@@ -373,5 +465,60 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(HOST, HeaderValue::from_static("example.com"));
         assert_eq!(classify_host(&headers, &hosts), HostClassification::Foreign);
+    }
+
+    /// A build without the transfer group must answer `/files` exactly as it answers any other
+    /// unknown path, so the response does not disclose that the route exists elsewhere.
+    #[test]
+    fn a_disabled_transfer_route_is_indistinguishable_from_an_unknown_path() {
+        let disabled = HttpPolicy::new(["127.0.0.1".to_owned()], false, false);
+        assert_eq!(disabled.classify_route("/files"), Route::Unknown);
+        assert_eq!(disabled.classify_route("/absent"), Route::Unknown);
+
+        let enabled = HttpPolicy::new(["127.0.0.1".to_owned()], false, true);
+        assert_eq!(enabled.classify_route("/files"), Route::Transfer);
+        assert_eq!(enabled.classify_route("/mcp"), Route::Mcp);
+        // `/mcp` is matched exactly; a nested path is not the protocol endpoint.
+        assert_eq!(enabled.classify_route("/files/nested"), Route::Unknown);
+    }
+
+    /// A caller that asked for bytes must not have to guess whether a JSON-RPC envelope came from
+    /// the protocol endpoint or from the transfer route.
+    #[test]
+    fn each_route_rejects_in_its_own_envelope() {
+        let transfer = transfer_error(StatusCode::FORBIDDEN, "Host not allowed.");
+        assert_eq!(transfer.status(), StatusCode::FORBIDDEN);
+        let mcp = route_error(
+            Route::Mcp,
+            StatusCode::FORBIDDEN,
+            -32_000,
+            "Host not allowed.",
+        );
+        assert_eq!(mcp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            path_error(
+                crate::transfer::ENDPOINT_PATH,
+                StatusCode::UNAUTHORIZED,
+                -32_000,
+                "Bearer authentication is required.",
+            )
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_route_bodies_are_never_buffered_or_json_parsed() {
+        // The `/mcp` bound exists to keep a JSON document parseable in memory. A transfer body is
+        // arbitrarily large, so admitting it through the same path would cap every upload at this
+        // bound and buffer it entirely in memory.
+        const { assert!(MAX_JSON_BODY_BYTES < crate::cli::DEFAULT_MAX_TRANSFER_BYTES) };
+        let request = Request::post("/files?path=a.bin")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(vec![0_u8; 32]))
+            .expect("request");
+        // A body that is not JSON would be rejected by `bounded_body`; the transfer branch never
+        // calls it, which is what makes streaming possible.
+        assert!(bounded_body(request, false).await.is_err());
     }
 }

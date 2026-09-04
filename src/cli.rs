@@ -7,12 +7,19 @@ use crate::environment::StartupEnvironment;
 pub const DEFAULT_PORT: u16 = 3001;
 const CODE_WORKER_CACHE_ENV: &str = "WORKCELL_MCP_CODE_WORKER_CACHE";
 
+/// Transfer bounds are independent of `FilesystemLimits::max_write_bytes`. That limit keeps a tool
+/// result inside the model's context budget; this one bounds a side channel the model never reads,
+/// so the two are sized for different failure modes and must not be unified.
+pub const DEFAULT_MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSFER_BYTES_CEILING: usize = 16 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
 pub enum ToolGroup {
     Files,
     Web,
     Shell,
     Code,
+    Transfer,
 }
 
 impl ToolGroup {
@@ -23,6 +30,7 @@ impl ToolGroup {
             Self::Web => "web",
             Self::Shell => "shell",
             Self::Code => "code",
+            Self::Transfer => "transfer",
         }
     }
 }
@@ -143,6 +151,10 @@ pub struct RawOptions {
     /// Reject all pre-2026 MCP clients instead of serving the stateless fallback.
     #[arg(long)]
     pub modern_only: bool,
+
+    /// Maximum bytes accepted or served by a single `/files` transfer.
+    #[arg(long)]
+    pub max_transfer_bytes: Option<usize>,
 }
 
 pub struct CliOptions {
@@ -165,6 +177,7 @@ pub struct CliOptions {
     pub allowed_hosts: Vec<String>,
     pub expose_execution_environment: bool,
     pub modern_only: bool,
+    pub max_transfer_bytes: usize,
 }
 
 impl fmt::Debug for CliOptions {
@@ -204,6 +217,7 @@ impl fmt::Debug for CliOptions {
                 &self.expose_execution_environment,
             )
             .field("modern_only", &self.modern_only)
+            .field("max_transfer_bytes", &self.max_transfer_bytes)
             .finish()
     }
 }
@@ -221,6 +235,9 @@ pub enum CliError {
     CodeOptionRequiresCode,
     HttpOptionRequiresHttp,
     InvalidAllowedHost,
+    TransferRequiresHttp,
+    TransferOptionRequiresTransfer,
+    InvalidMaxTransferBytes,
 }
 
 impl fmt::Display for CliError {
@@ -228,12 +245,16 @@ impl fmt::Display for CliError {
         formatter.write_str(match self {
             Self::InvalidEnvironment => "Workcell environment configuration is invalid",
             Self::InvalidToolGroup => {
-                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, and code"
+                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, code, and transfer"
             }
             Self::DuplicateToolGroup => "each tool group may be selected only once",
-            Self::RootRequired => "files and shell tools require a root directory",
-            Self::RootWithoutLocalTools => "root requires the files or shell tool group",
-            Self::AllowWriteRequiresFiles => "--allow-write requires the files tool group",
+            Self::RootRequired => "files, shell, and transfer tools require a root directory",
+            Self::RootWithoutLocalTools => {
+                "root requires the files, shell, or transfer tool group"
+            }
+            Self::AllowWriteRequiresFiles => {
+                "--allow-write requires the files or transfer tool group"
+            }
             Self::WebIconsRequireWeb => "--web-icons requires the web tool group",
             Self::ShellOptionRequiresShell => {
                 "--shell-policy, --yolo, and --no-shell-output-filter require the shell tool group"
@@ -244,6 +265,15 @@ impl fmt::Display for CliError {
             Self::HttpOptionRequiresHttp => "HTTP options require --transport http",
             Self::InvalidAllowedHost => {
                 "HTTP allowed hosts must be plain hostnames or IP addresses"
+            }
+            Self::TransferRequiresHttp => {
+                "the transfer tool group moves bytes over HTTP and requires --transport http"
+            }
+            Self::TransferOptionRequiresTransfer => {
+                "--max-transfer-bytes requires the transfer tool group"
+            }
+            Self::InvalidMaxTransferBytes => {
+                "--max-transfer-bytes must be between 1 and 17179869184"
             }
         })
     }
@@ -262,6 +292,19 @@ impl RawOptions {
         let explicit_code_options = self.code_worker.is_some()
             || self.code_worker_cache.is_some()
             || self.no_code_type_check;
+        let max_transfer_bytes_env =
+            match environment_value(environment, "WORKCELL_MCP_MAX_TRANSFER_BYTES")? {
+                Some(value) => Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| CliError::InvalidMaxTransferBytes)?,
+                ),
+                None => None,
+            };
+        let explicit_max_transfer_bytes = max_transfer_bytes_env.is_some();
+        // Transfer is deliberately absent from the default set. It only functions under the HTTP
+        // transport, so defaulting it on would turn every plain `workcell-mcp <root>` invocation
+        // into a startup error.
         let groups = if self.groups.is_empty() {
             match environment_value(environment, "WORKCELL_MCP_TOOL_GROUPS")? {
                 Some(value) => parse_groups(&value)?,
@@ -387,14 +430,20 @@ impl RawOptions {
             }
         };
 
-        let has_local = groups.contains(&ToolGroup::Files) || groups.contains(&ToolGroup::Shell);
+        // Transfer resolves every path through a confined `FileToolGroup`, so it needs a root for
+        // the same reason the files tools do.
+        let has_local = groups.contains(&ToolGroup::Files)
+            || groups.contains(&ToolGroup::Shell)
+            || groups.contains(&ToolGroup::Transfer);
         if has_local && self.root.is_none() {
             return Err(CliError::RootRequired);
         }
         if !has_local && self.root.is_some() {
             return Err(CliError::RootWithoutLocalTools);
         }
-        if self.allow_write && !groups.contains(&ToolGroup::Files) {
+        if self.allow_write
+            && !(groups.contains(&ToolGroup::Files) || groups.contains(&ToolGroup::Transfer))
+        {
             return Err(CliError::AllowWriteRequiresFiles);
         }
         if web_icons && !groups.contains(&ToolGroup::Web) {
@@ -416,6 +465,20 @@ impl RawOptions {
         if transport == Transport::Stdio && (explicit_http_options || http_token_file.is_some()) {
             return Err(CliError::HttpOptionRequiresHttp);
         }
+        let has_transfer = groups.contains(&ToolGroup::Transfer);
+        if has_transfer && transport != Transport::Http {
+            return Err(CliError::TransferRequiresHttp);
+        }
+        if !has_transfer && (self.max_transfer_bytes.is_some() || explicit_max_transfer_bytes) {
+            return Err(CliError::TransferOptionRequiresTransfer);
+        }
+        let max_transfer_bytes = match self.max_transfer_bytes.or(max_transfer_bytes_env) {
+            Some(value) if value == 0 || value > MAX_TRANSFER_BYTES_CEILING => {
+                return Err(CliError::InvalidMaxTransferBytes);
+            }
+            Some(value) => value,
+            None => DEFAULT_MAX_TRANSFER_BYTES,
+        };
 
         Ok(CliOptions {
             root: self.root,
@@ -437,6 +500,7 @@ impl RawOptions {
             allowed_hosts,
             expose_execution_environment,
             modern_only,
+            max_transfer_bytes,
         })
     }
 }
@@ -477,6 +541,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
             "code" => Ok(ToolGroup::Code),
+            "transfer" => Ok(ToolGroup::Transfer),
             _ => Err(CliError::InvalidToolGroup),
         })
         .collect()
@@ -517,6 +582,75 @@ mod tests {
         }
         for host in ["", "https://example.com", "user@example.com", "bad host"] {
             assert!(!valid_host(host));
+        }
+    }
+
+    /// Transfer mints URLs for an HTTP route this process would never serve over stdio, so the
+    /// combination is a startup error rather than a group that silently hands out dead URLs.
+    #[test]
+    fn transfer_requires_the_http_transport() {
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "files",
+            "--tool-group",
+            "transfer",
+            ".",
+        ])
+        .unwrap();
+        let environment = StartupEnvironment::load(None).unwrap();
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::TransferRequiresHttp
+        );
+    }
+
+    #[test]
+    fn transfer_options_require_the_transfer_group() {
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "files",
+            "--max-transfer-bytes",
+            "1024",
+            ".",
+        ])
+        .unwrap();
+        let environment = StartupEnvironment::load(None).unwrap();
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::TransferOptionRequiresTransfer
+        );
+    }
+
+    #[test]
+    fn transfer_over_http_resolves_with_a_bounded_limit() {
+        for (argument, expected) in [
+            (None, Ok(DEFAULT_MAX_TRANSFER_BYTES)),
+            (Some("0"), Err(CliError::InvalidMaxTransferBytes)),
+            (Some("1048576"), Ok(1_048_576)),
+            (Some("17179869184"), Ok(MAX_TRANSFER_BYTES_CEILING)),
+            (Some("17179869185"), Err(CliError::InvalidMaxTransferBytes)),
+        ] {
+            let mut arguments = vec![
+                "workcell-mcp",
+                "--tool-group",
+                "files",
+                "--tool-group",
+                "transfer",
+                "--transport",
+                "http",
+            ];
+            if let Some(argument) = argument {
+                arguments.extend(["--max-transfer-bytes", argument]);
+            }
+            arguments.push(".");
+            let raw = RawOptions::try_parse_from(arguments).unwrap();
+            let environment = StartupEnvironment::load(None).unwrap();
+            let actual = raw
+                .resolve(&environment)
+                .map(|options| options.max_transfer_bytes);
+            assert_eq!(actual, expected, "{argument:?}");
         }
     }
 

@@ -65,10 +65,13 @@ sequenceDiagram
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Code | `code_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
+| Transfer | `file_download`, `file_upload` | HTTP transport only. Prepares a byte transfer over `/files`; `file_upload` needs `--allow-write`. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
-All groups are enabled by default. Use repeatable `--tool-group files|web|shell|code` arguments to
-expose a subset. Files and shell require a positional root.
+All groups except transfer are enabled by default. Use repeatable
+`--tool-group files|web|shell|code|transfer` arguments to expose a subset. Files, shell, and transfer
+require a positional root. Transfer additionally requires `--transport http`, because its tools mint
+URLs for a route only the HTTP transport serves; requesting it over stdio is a startup error.
 
 The filesystem tools enforce a canonical root. The shell tool uses that root as its initial working
 directory, but shell commands can deliberately access any path, network, or process visible inside the
@@ -119,7 +122,33 @@ workcell-mcp --transport http --port 3001 --allow-write /absolute/workspace/root
 ```
 
 The only HTTP MCP endpoint is `POST /mcp`. HTTP is stateless and emits one readiness JSON line on
-stdout after binding.
+stdout after binding. Enabling the transfer group adds exactly one further route, `GET|POST /files`,
+which moves raw bytes rather than JSON-RPC. It is absent unless that group is enabled.
+
+### File Transfer
+
+MCP results are bounded at tens of kilobytes, so a real file cannot be base64-encoded through a tool
+result. Transfer therefore splits the operation: the tool authorizes a path and returns a URL, and the
+harness moves the bytes.
+
+```mermaid
+sequenceDiagram
+    participant H as Harness
+    participant M as POST /mcp
+    participant F as GET/POST /files
+    H->>M: tools/call file_download {path}
+    M-->>H: {"method":"GET","url":"/files?path=...","bytes":N}
+    Note over H,M: no bytes have moved yet
+    H->>F: GET /files?path=... (same bearer token)
+    F-->>H: application/octet-stream
+```
+
+`url` is relative because only the harness knows the externally reachable origin, which may differ
+from the bind address behind a proxy or port mapping. The URL carries no signature and is not a
+capability: `/files` re-resolves and re-authorizes the path on every request, so it grants nothing the
+caller's existing credentials did not already grant. Uploads must send
+`Content-Type: application/octet-stream`, are bounded by `--max-transfer-bytes` (default 64 MiB), and
+are published by an atomic rename, so an interrupted transfer never leaves a truncated file.
 
 ## Client Configuration
 
@@ -239,7 +268,14 @@ flowchart TB
 - `WORKCELL_MCP_HTTP_TOKEN` supplies a direct process-level bearer.
 - `--http-token-file` or `WORKCELL_MCP_HTTP_TOKEN_FILE` reads the bearer from a regular bounded file.
 - `--allowed-host` or `WORKCELL_MCP_ALLOWED_HOSTS` controls accepted HTTP host authorities.
-- Browser `Origin` headers, non-POST methods, unknown routes, invalid JSON, and bodies over 12 MiB are rejected.
+- `--max-transfer-bytes` or `WORKCELL_MCP_MAX_TRANSFER_BYTES` bounds a single `/files` transfer in
+  either direction. It applies only with the transfer group and is independent of the `POST /mcp`
+  JSON body bound.
+- Browser `Origin` headers, unknown routes, and methods the route does not admit are rejected. On
+  `/mcp` that means POST only, with invalid JSON and bodies over 12 MiB rejected; on `/files` it means
+  GET and POST only, with bodies streamed rather than buffered and bounded by `--max-transfer-bytes`.
+- Authentication is identical on both routes. `/files` is not reachable without the same bearer token
+  `POST /mcp` requires, and a minted transfer URL carries no independent authority.
 - There are no lease, user, tenant, administration, or dynamic configuration endpoints.
 
 Token files and `WORKCELL_MCP_HTTP_TOKEN` are mutually exclusive. Prefer a mounted secret file where

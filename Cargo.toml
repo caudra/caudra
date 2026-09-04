@@ -135,6 +135,7 @@ unimplemented = "deny"
 axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+futures-util.workspace = true
 rmcp.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -142,10 +143,12 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 uuid.workspace = true
+workcell-tool-contract.workspace = true
 workcell-environment = { workspace = true, features = ["mcp"] }
 workcell-mcp-code = { workspace = true, features = ["bundled-worker", "mcp"] }
 workcell-mcp-files = { workspace = true, features = ["index", "mcp"] }

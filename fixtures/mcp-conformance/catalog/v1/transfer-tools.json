@@ -1,0 +1,152 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.transfer.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-transfer",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/src/transfer/catalog.rs",
+    "rust/src/transfer/mod.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "file_download",
+        "title": "Prepare file download",
+        "description": "Prepare a download so the harness can retrieve a file's raw bytes over HTTP.\n\n- This tool transfers no bytes. It authorizes the path and returns the URL the harness must fetch.\n- The harness issues `GET <url>` against the same origin as its MCP endpoint, reusing the credentials it already sends, then writes the response body wherever the user asked for it.\n- `url` is relative on purpose: only the harness knows the externally reachable origin, which may differ from this process's bind address behind a proxy or port mapping.\n- Use this for binary or large files. `file_read` is still the right tool for reading text into context.\n- Directories are rejected. Use `file_read` to list one.\n- Reporting the file as delivered before the harness performs the fetch is incorrect.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute path of the file to download."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "GET"
+            },
+            "url": {
+              "type": "string",
+              "description": "Relative URL to resolve against the origin of the MCP endpoint."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative path of the file."
+            },
+            "name": {
+              "type": "string",
+              "description": "File name."
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Size of the file in bytes."
+            }
+          },
+          "required": [
+            "method",
+            "url",
+            "path",
+            "name",
+            "bytes"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "transfer.download.v1"
+        }
+      },
+      {
+        "name": "file_upload",
+        "title": "Prepare file upload",
+        "description": "Prepare an upload so the harness can send raw bytes into this execution environment over HTTP.\n\n- This tool transfers no bytes. It authorizes the destination and returns the URL the harness must post to.\n- The harness issues `POST <url>` against the same origin as its MCP endpoint with `Content-Type: application/octet-stream`, the raw bytes as the request body, and the credentials it already sends.\n- `url` is relative on purpose: only the harness knows the externally reachable origin, which may differ from this process's bind address behind a proxy or port mapping.\n- Missing parent directories are created. An existing file is replaced only once the transfer completes, so an interrupted upload never leaves a truncated file behind.\n- Bodies larger than `maxBytes` are rejected.\n- Reporting the file as written before the harness performs the post is incorrect.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute destination path for the uploaded file."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "const": "POST"
+            },
+            "url": {
+              "type": "string",
+              "description": "Relative URL to resolve against the origin of the MCP endpoint."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative destination path."
+            },
+            "name": {
+              "type": "string",
+              "description": "Destination file name."
+            },
+            "contentType": {
+              "type": "string",
+              "const": "application/octet-stream"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991,
+              "description": "Largest body the endpoint will accept."
+            }
+          },
+          "required": [
+            "method",
+            "url",
+            "path",
+            "name",
+            "contentType",
+            "maxBytes"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "transfer.upload.v1"
+        }
+      }
+    ]
+  }
+}

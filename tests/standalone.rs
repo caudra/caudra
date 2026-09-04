@@ -62,6 +62,7 @@ async fn fixture_server_with_options(
                 },
                 type_check: true,
             },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
         },
     )
     .await
@@ -1049,6 +1050,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
                 worker: WorkerSource::Path(&worker),
                 type_check: true,
             },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
         },
     )
     .await
@@ -1151,6 +1153,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                     },
                     type_check: true,
                 },
+                max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             },
         )
         .await
@@ -1179,4 +1182,167 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
             "index",
         ]
     );
+}
+
+/// The full hybrid transfer: MCP mints a relative URL that moves no bytes, and the caller's existing
+/// credentials are what authorize the byte-moving request. The minted URL is an affordance, not a
+/// capability, so it grants nothing an unauthenticated caller could use.
+#[tokio::test]
+async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_credentials() {
+    let root = tempfile::tempdir().expect("temporary root");
+    tokio::fs::write(root.path().join("payload.bin"), b"downloaded bytes")
+        .await
+        .expect("fixture file");
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files, ToolGroup::Transfer],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: false,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: 4096,
+        },
+    )
+    .await
+    .expect("server");
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let origin = format!("http://{}", http.address());
+    let endpoint = format!("{origin}/mcp");
+    let client = Client::new();
+
+    let prepared = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        mcp_request(
+            1,
+            "tools/call",
+            json!({"name": "file_download", "arguments": {"path": "payload.bin"}}),
+        ),
+    )
+    .await;
+    assert_eq!(prepared.status(), StatusCode::OK);
+    let structured = final_sse_json(prepared).await["result"]["structuredContent"].clone();
+    assert_eq!(structured["bytes"], 16);
+    let url = structured["url"].as_str().expect("minted url").to_owned();
+    assert!(url.starts_with("/files?path="), "{url}");
+
+    // Without credentials the minted URL is worthless.
+    let anonymous = client.get(format!("{origin}{url}")).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let downloaded = client
+        .get(format!("{origin}{url}"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        b"downloaded bytes"
+    );
+
+    let prepared_upload = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        mcp_request(
+            2,
+            "tools/call",
+            json!({"name": "file_upload", "arguments": {"path": "nested/received.bin"}}),
+        ),
+    )
+    .await;
+    let upload_url = final_sse_json(prepared_upload).await["result"]["structuredContent"]["url"]
+        .as_str()
+        .expect("minted url")
+        .to_owned();
+    // Preparing an upload writes nothing.
+    assert!(!root.path().join("nested/received.bin").exists());
+
+    let uploaded = client
+        .post(format!("{origin}{upload_url}"))
+        .bearer_auth(TOKEN)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(b"uploaded bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    assert_eq!(
+        tokio::fs::read(root.path().join("nested/received.bin"))
+            .await
+            .expect("published"),
+        b"uploaded bytes"
+    );
+
+    // The transfer route admits exactly GET and POST, and says so.
+    let deleted = client
+        .delete(format!("{origin}/files?path=payload.bin"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(deleted.headers().get(header::ALLOW).unwrap(), "GET, POST");
+
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+/// A server built without the transfer group must answer `/files` exactly as it answers any other
+/// unknown path, so the response does not disclose that the route exists elsewhere.
+#[tokio::test]
+async fn the_files_route_is_absent_when_the_transfer_group_is_not_enabled() {
+    let (_root, server) = fixture_server().await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let client = Client::new();
+    let absent = client
+        .get(format!("http://{}/files?path=visible.txt", http.address()))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let unknown = client
+        .get(format!("http://{}/absent", http.address()))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    assert_eq!(absent.status(), unknown.status());
+    assert_eq!(absent.text().await.unwrap(), unknown.text().await.unwrap());
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
 }

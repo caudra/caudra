@@ -29,6 +29,35 @@ names, and the filesystem crate denies direct native calls independently. No too
 this, and the mutation schemas reject unknown fields so a stale argument cannot be dropped into an
 unintended write.
 
+The optional transfer tool group is the only feature that adds an HTTP route, `GET|POST /files`. It
+exists because MCP tool results are bounded at tens of kilobytes, so a real file cannot be carried
+through JSON-RPC. `file_download` and `file_upload` move no bytes: they authorize a path and return a
+relative URL that the caller fetches over the same listener. The route is a byte channel, not a second
+control plane.
+
+The minted URL is an affordance, not a capability. It carries no signature, expiry, or nonce, and
+confers no authority of its own. `/files` re-resolves the path through the same filesystem confinement
+the file tools use, and re-checks write authority, on every request, so a stale, replayed, or
+hand-written URL is treated exactly like a fresh one and a guessed one grants nothing. Authentication
+is unchanged and shared: without the process bearer that `POST /mcp` requires, `/files` returns 401.
+The route is registered only when the transfer group is built, and a server without it answers `/files`
+identically to any other unknown path, so a deployment does not disclose that the route could exist.
+Transfer requires the HTTP transport; requesting it over stdio is a startup error rather than a group
+that hands out unreachable URLs.
+
+Consequences an operator should weigh: enabling transfer makes the root readable, and with
+`--allow-write` writable, as raw bytes by anything holding the bearer token, without the size and
+rendering bounds the file tools apply. That is the intent, and it is the same authority the bearer
+already had through `file_read` and `file_write`, but it is materially easier to exercise at volume.
+Uploads are bounded by `--max-transfer-bytes`, streamed rather than buffered so the bound holds for
+chunked bodies with no declared length, staged in a hidden sibling file, and published by an atomic
+same-filesystem rename, so a failed or abandoned transfer leaves no truncated file at the destination.
+Uploads must declare `Content-Type: application/octet-stream`; multipart, `Range` requests, directory
+transfer, and extended-attribute metadata are deliberately not implemented. `Content-Disposition` file
+names are restricted to printable ASCII with quoting and path characters removed, so a hostile file
+name cannot inject header structure or a traversal into a client's save path. Requests are logged
+without paths, queries, or file names.
+
 Shell requests are parsed into command scopes before execution. Without `--shell-policy` or `--yolo`,
 all shell requests are denied. An explicit deny rejects the entire request before any command starts;
 `--yolo` permits unmatched classified scopes but does not override a deny. If deny rules exist, opaque
@@ -155,7 +184,12 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
 - Credential-free Exa MCP search is not private or an availability guarantee. Queries leave the
   execution boundary, and normalized results can still contain inaccurate or malicious web content.
 - A bearer token authenticates one process endpoint. It does not express per-tool, per-user, or
-  per-request authorization.
+  per-request authorization. With the transfer group enabled, that one token also authorizes raw byte
+  reads of the root, and raw byte writes under `--allow-write`, over `/files`.
+- Transfer inherits the filesystem time-of-check/time-of-use window and widens it: a path authorized
+  by `file_download` is re-resolved when the caller fetches it, so the bytes delivered are whatever the
+  path resolves to at fetch time, not at authorization time. The reported size may likewise differ from
+  the delivered body if the file changes in between.
 - Monty is pre-1.0 software on a `0.0.x` line with a version-coupled worker protocol. Workcell pins the
   `monty-pool` dependency and the installed worker to the same release and they must be upgraded
   together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal

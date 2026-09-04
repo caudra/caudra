@@ -4679,6 +4679,7 @@ dependencies = [
  "axum",
  "clap",
  "dotenvy",
+ "futures-util",
  "reqwest",
  "rmcp",
  "rustix 0.38.44",
@@ -4691,12 +4692,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "workcell-environment",
  "workcell-mcp-code",
  "workcell-mcp-files",
  "workcell-mcp-shell",
  "workcell-mcp-web",
+ "workcell-tool-contract",
 ]
 
 [[package]]

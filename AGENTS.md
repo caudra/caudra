@@ -13,6 +13,10 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 
 - `src/` owns process startup, CLI policy, MCP composition, transport lifecycle, authentication, and
   sanitized execution-environment disclosure.
+- `src/transfer` owns the server-only file transfer group and its `/files` byte route. It lives in the
+  binary, not a crate, so `crates/workcell` cannot re-export it and a native embedder cannot link it.
+  Keep it there. Path resolution delegates to `mcp-files`; do not add a second resolver, a signing key,
+  or any authority the process bearer does not already carry.
 - `crates/tool-contract` owns the protocol-neutral `ToolSpec` contract shared by every tool group. It
   must not depend on any protocol SDK.
 - `crates/workcell` is the embedding facade. It only re-exports; keep logic in the owning crate.
@@ -71,8 +75,12 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - Prepared operations must disclose every resource they would touch before any effect occurs, so a
   native host can authorize them.
 - Container HTTP bind must remain authenticated. Do not add an unauthenticated wildcard bind.
-- HTTP exposes only `POST /mcp`. New control or administrative endpoints require a documented threat
+- HTTP exposes `POST /mcp`, and `GET|POST /files` when the transfer group is enabled. Both are
+  documented in `SECURITY.md`. New control or administrative endpoints require a documented threat
   model and explicit maintainer approval.
+- A minted transfer URL is an affordance, not a capability. `/files` must re-resolve and re-authorize
+  every request and must never accept a signature, token, or expiry in place of the process bearer.
+  A build without the transfer group must answer `/files` exactly as it answers any unknown path.
 - Never log roots, paths, URLs, queries, tool arguments/results, environment values, or credentials.
 - Preserve outbound SSRF checks, DNS pinning, redirect validation, response bounds, parser gates,
   process concurrency, timeout, cancellation, and output limits.
@@ -91,7 +99,7 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, web, shell, code, execution environment.
+- Preserve stable catalog order: files, web, shell, code, transfer, execution environment.
 - Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.

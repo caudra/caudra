@@ -409,7 +409,11 @@ impl FileToolGroup {
         Ok(output)
     }
 
-    async fn inspect_path(
+    /// Resolves a caller-supplied path through the same confinement policy the
+    /// tools use, so a host that moves bytes over a side channel authorizes the
+    /// identical resource set. Resolution alone is not permission: `Write`
+    /// callers must still check [`Self::allow_write`].
+    pub async fn inspect_path(
         &self,
         requested_path: &str,
         access: FileResourceAccess,
