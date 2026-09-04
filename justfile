@@ -14,6 +14,10 @@ code-worker:
     if [ ! -x "{{ monty_worker }}" ] || ! "{{ monty_worker }}" --version 2>&1 | grep -qx "monty-runtime {{ monty_version }}"; then cargo install monty-runtime --version "={{ monty_version }}" --locked --no-default-features --force --root target/code-worker --target-dir target/code-worker-build; fi
     "{{ monty_worker }}" --version
 
+# Install Caudra with the pinned worker embedded.
+install: code-worker
+    cargo install --locked --path . --force
+
 build *ARGS:
     "{{ cargo_cmd }}" build {{ ARGS }}
 
