@@ -134,6 +134,19 @@ fn same_key(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+/// The same for a tool named at runtime. A batch child knows only its tool's
+/// name, so it resolves the keys its header already shows the way the row for
+/// that tool would.
+pub(super) fn compact_args_for(
+    tool: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    compact_args(
+        raw_input,
+        compact_tool(tool).map_or(&[], |entry| entry.header_keys),
+    )
+}
+
 /// The primitive inputs a compact header does not already show, rendered the
 /// way opencode does: `[offset=1, limit=260]`.
 fn compact_args(raw_input: Option<&serde_json::Value>, header_keys: &[&str]) -> Option<String> {

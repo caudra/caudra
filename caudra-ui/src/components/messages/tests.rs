@@ -4833,8 +4833,10 @@ fn auto_follows_the_newest_reasoning_too() {
 
 const BATCH_TOOL: &str = "batch";
 const BATCH_CHILD_BODY: &str = "child_body_line";
-const EXPECT_BODY_HIDDEN: &str = "folding a child hides its body";
+const EXPECT_BODY_HIDDEN: &str = "a folded child draws no body";
+const EXPECT_BODY_SHOWN: &str = "an opened child draws its body";
 const EXPECT_OTHERS_KEPT: &str = "the other children are untouched";
+const EXPECT_SUMMARIES_KEPT: &str = "a folded batch still lists what it ran";
 
 fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
@@ -4842,6 +4844,7 @@ fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
         summary: format!("{tool} ran"),
         status: caudra_agent::BatchToolStatus::Success,
         input: None,
+        raw_input: None,
         output: Some(ToolOutput::Plain(
             format!("{BATCH_CHILD_BODY}_{marker}").into(),
         )),
@@ -4883,41 +4886,58 @@ fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
     batch_row(panel, RowTarget::BatchChild(index))
 }
 
+/// The bug: a batch dumped every child body into the transcript, which is
+/// what the compact list exists to avoid. A card nobody has touched is the
+/// roster of what ran.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+fn an_untouched_batch_shows_no_child_bodies(view: ViewMode) {
+    let mut panel = panel_with_batch();
+    panel.set_view(view);
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("read ran"), "{EXPECT_SUMMARIES_KEPT}");
+    assert!(text.contains("grep ran"), "{EXPECT_SUMMARIES_KEPT}");
+    assert!(!text.contains("child_body_line_a"), "{EXPECT_BODY_HIDDEN}");
+    assert!(!text.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
+}
+
 #[test]
-fn clicking_a_batch_child_folds_only_that_child() {
+fn clicking_a_batch_child_opens_only_that_child() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
-    let before = seg_text(&panel, "t1");
-    assert!(before.contains("child_body_line_a"));
-    assert!(before.contains("child_body_line_b"));
 
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
     render(&mut panel, 80, 24);
-    let folded = seg_text(&panel, "t1");
+    let opened = seg_text(&panel, "t1");
+    assert!(opened.contains("child_body_line_a"), "{EXPECT_BODY_SHOWN}");
     assert!(
-        !folded.contains("child_body_line_a"),
+        !opened.contains("child_body_line_b"),
+        "{EXPECT_OTHERS_KEPT}"
+    );
+}
+
+#[test]
+fn clicking_an_open_batch_child_folds_it_again() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+    assert!(
+        !seg_text(&panel, "t1").contains("child_body_line_a"),
         "{EXPECT_BODY_HIDDEN}"
     );
-    assert!(folded.contains("child_body_line_b"), "{EXPECT_OTHERS_KEPT}");
-    assert!(folded.contains("read ran"), "the summary stays");
 }
 
+/// Opening a child shifts every row below it, so the second child has to be
+/// found where it now is rather than where it started.
 #[test]
-fn clicking_a_folded_batch_child_unfolds_it() {
-    let mut panel = panel_with_batch();
-    let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
-    render(&mut panel, 80, 24);
-
-    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
-    render(&mut panel, 80, 24);
-    assert!(seg_text(&panel, "t1").contains("child_body_line_a"));
-}
-
-/// A fold shifts every row below it, so the second child has to be found
-/// where it now is rather than where it started.
-#[test]
-fn a_fold_above_does_not_move_the_click_off_the_child_below() {
+fn an_open_child_above_does_not_move_the_click_off_the_child_below() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
@@ -4926,86 +4946,8 @@ fn a_fold_above_does_not_move_the_click_off_the_child_below() {
     assert!(panel.handle_click(batch_child_row(&panel, 1), area));
     render(&mut panel, 80, 24);
     let both = seg_text(&panel, "t1");
-    assert!(!both.contains("child_body_line_a"), "{EXPECT_BODY_HIDDEN}");
-    assert!(!both.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
-}
-
-const TALL_CHILD_LINES: usize = 6;
-const EXPECT_WHOLE_CHILD: &str = "expanding a child shows the body it was hiding";
-const EXPECT_STILL_CAPPED: &str = "the sibling keeps the budget it had";
-
-fn tall_batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
-    let text = (0..TALL_CHILD_LINES)
-        .map(|i| format!("{BATCH_CHILD_BODY}_{marker}{i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    caudra_agent::BatchToolEntry {
-        tool: tool.into(),
-        summary: format!("{tool} ran"),
-        status: caudra_agent::BatchToolStatus::Success,
-        input: None,
-        output: Some(ToolOutput::Plain(text.into())),
-        annotation: None,
-    }
-}
-
-fn panel_with_tall_batch() -> MessagesPanel {
-    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
-    panel.tool_done(ToolDoneEvent {
-        tool: BATCH_TOOL.into(),
-        output: ToolOutput::Batch {
-            entries: vec![tall_batch_child("read", "a"), tall_batch_child("grep", "b")],
-            text: String::new(),
-        },
-        ..done("t1")
-    });
-    render(&mut panel, 80, 24);
-    panel
-}
-
-fn last_line_of(marker: &str) -> String {
-    format!("{BATCH_CHILD_BODY}_{marker}{}", TALL_CHILD_LINES - 1)
-}
-
-/// The reported bug: a child said "click to expand" and no click reached it,
-/// so the body it was hiding could not be opened by any input.
-#[test]
-fn clicking_a_truncated_batch_child_expands_only_that_child() {
-    let mut panel = panel_with_tall_batch();
-    let area = Rect::new(0, 0, 80, 24);
-    let before = seg_text(&panel, "t1");
-    assert!(
-        !before.contains(&last_line_of("a")),
-        "the child starts budgeted"
-    );
-
-    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
-    render(&mut panel, 80, 24);
-
-    let expanded = seg_text(&panel, "t1");
-    assert!(
-        expanded.contains(&last_line_of("a")),
-        "{EXPECT_WHOLE_CHILD}"
-    );
-    assert!(
-        !expanded.contains(&last_line_of("b")),
-        "{EXPECT_STILL_CAPPED}"
-    );
-}
-
-#[test]
-fn clicking_an_expanded_batch_child_puts_it_back() {
-    let mut panel = panel_with_tall_batch();
-    let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
-    render(&mut panel, 80, 24);
-
-    assert!(panel.handle_click(batch_row(&panel, RowTarget::BatchBody(0)), area));
-    render(&mut panel, 80, 24);
-    assert!(
-        !seg_text(&panel, "t1").contains(&last_line_of("a")),
-        "a second click on the same control undoes it"
-    );
+    assert!(both.contains("child_body_line_a"), "{EXPECT_BODY_SHOWN}");
+    assert!(both.contains("child_body_line_b"), "{EXPECT_BODY_SHOWN}");
 }
 
 /// A batch child is a control, so the pointer has to say so before the press.
@@ -5057,10 +4999,10 @@ fn loading_a_session_forgets_the_raw_view() {
     assert!(!text.contains("raw_8"), "{EXPECT_FILTERED}");
 }
 
-/// A fold names a tool id from the session that is going away, so carrying it
-/// into the next one would fold whatever inherits the id.
+/// A child view names a tool id from the session that is going away, so
+/// carrying it into the next one would open whatever inherits the id.
 #[test]
-fn loading_a_session_forgets_the_folds() {
+fn loading_a_session_forgets_the_child_views() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
@@ -5070,10 +5012,11 @@ fn loading_a_session_forgets_the_folds() {
     assert!(panel.batch_views.is_empty());
 }
 
-/// Folding is a choice about the body, like the raw/filtered switch, so the
-/// reset a mode change performs on every disclosure must leave it alone.
+/// Opening a child is a choice about the body, like the raw/filtered switch,
+/// so the reset a mode change performs on every disclosure must leave it
+/// alone.
 #[test]
-fn changing_mode_keeps_a_batch_child_folded() {
+fn changing_mode_keeps_a_batch_child_open() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
@@ -5083,8 +5026,9 @@ fn changing_mode_keeps_a_batch_child_folded() {
     render(&mut panel, 80, 24);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
-    assert!(!seg_text(&panel, "t1").contains("child_body_line_a"));
-    assert!(seg_text(&panel, "t1").contains("child_body_line_b"));
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("child_body_line_a"), "{EXPECT_BODY_SHOWN}");
+    assert!(!text.contains("child_body_line_b"), "{EXPECT_OTHERS_KEPT}");
 }
 
 const SPACER_HOLD_MSG: &str = "a card that closes itself must not move what is above it";
@@ -5225,5 +5169,87 @@ fn a_live_thought_after_a_wrapped_row_keeps_its_separator() {
         panel.last_total_lines > settled + 1,
         "{STREAMING_WRAPPED_GAP_MSG} (settled: {settled}, now: {})",
         panel.last_total_lines
+    );
+}
+
+const STALE_ROSTER_MSG: &str =
+    "a settled batch must draw the children it really ran, not the roster it started from";
+
+/// The async highlight hands its result back and the next rebuild may reuse
+/// it. Nothing reuses anything until that lands, so a test that skips it
+/// exercises the fresh path and proves nothing about the cached one.
+fn settle_highlights(panel: &mut MessagesPanel) {
+    for seg in panel.cache.segments_mut() {
+        seg.settle_highlight();
+    }
+}
+
+fn pending_child(tool: &str) -> caudra_agent::BatchToolEntry {
+    caudra_agent::BatchToolEntry {
+        tool: tool.into(),
+        summary: String::new(),
+        status: caudra_agent::BatchToolStatus::Pending,
+        input: None,
+        raw_input: None,
+        output: None,
+        annotation: None,
+    }
+}
+
+/// The reported bug: a finished batch drew three pending rows with no titles,
+/// and only a click put the real roster on screen.
+#[test]
+fn a_batch_that_finished_does_not_draw_the_roster_it_started_with() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![pending_child("file_read"), pending_child("file_read")],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+
+    panel.batch_progress("t1", 0, batch_child("file_read", "a"));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains("file_read ran"),
+        "{STALE_ROSTER_MSG}: {text:?}"
+    );
+}
+
+const CHILD_ARGS_MSG: &str = "a batch child names the inputs its header omits, as a row does";
+
+/// A child row showed only the header, so the batch hid exactly the arguments
+/// that distinguish one call from the next: three reads of three files all
+/// read as the same row.
+#[test]
+fn a_batch_child_lists_the_inputs_its_header_omits() {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut child = batch_child(FILE_READ_TOOL_NAME, "a");
+    child.summary = "caudra-storage/src/lib.rs".into();
+    child.raw_input = Some(serde_json::json!({
+        "file_path": "caudra-storage/src/lib.rs",
+        "offset": 1,
+        "limit": 10,
+    }));
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("offset=1"), "{CHILD_ARGS_MSG}: {text:?}");
+    assert!(text.contains("limit=10"), "{CHILD_ARGS_MSG}: {text:?}");
+    assert!(
+        !text.contains("file_path="),
+        "the header already shows the path: {text:?}"
     );
 }

@@ -5,6 +5,7 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
+use super::tool_display::compact_args_for;
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -444,10 +445,13 @@ fn render_batch(
             Span::styled(format!("{}> ", entry.tool), t.tool_prefix),
             Span::raw(entry.summary.clone()),
         ];
+        if let Some(args) = compact_args_for(&entry.tool, entry.raw_input.as_ref()) {
+            spans.push(Span::styled(args, t.tool_dim));
+        }
         if let Some(annotation) = &entry.annotation {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        let view = limits.views.get(index);
+        let view = limits.child_view(index);
         if view == ChildView::Folded {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
@@ -910,17 +914,17 @@ impl SectionFlags {
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum ChildView {
     /// Summary row only, body put away.
+    #[default]
     Folded,
     /// Body drawn within the child's own line budget.
-    #[default]
     Budgeted,
     /// Body drawn whole, however long it runs.
     Expanded,
 }
 
-/// The batch children the reader has moved off `Budgeted`, by their index in
-/// the roster. Children draw budgeted until one is clicked, so a card nobody
-/// has touched looks exactly as it always did.
+/// The batch children the reader has opened, by their index in the roster.
+/// Children start folded, so a card nobody has touched reads as the list of
+/// what it ran rather than every result at once.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct BatchViews(Arc<[(usize, ChildView)]>);
 
@@ -928,24 +932,26 @@ impl BatchViews {
     pub fn new(views: impl IntoIterator<Item = (usize, ChildView)>) -> Self {
         let mut views: Vec<(usize, ChildView)> = views
             .into_iter()
-            .filter(|(_, view)| *view != ChildView::Budgeted)
+            .filter(|(_, view)| *view != ChildView::Folded)
             .collect();
         views.sort_unstable_by_key(|(index, _)| *index);
         views.dedup_by_key(|(index, _)| *index);
         Self(views.into())
     }
 
-    fn get(&self, index: usize) -> ChildView {
+    /// `None` is a child the reader has not spoken about, which the card
+    /// resolves: folding is the default but an opened card overrides it.
+    fn get(&self, index: usize) -> Option<ChildView> {
         self.0
             .iter()
             .find(|(held, _)| *held == index)
-            .map_or(ChildView::Budgeted, |(_, view)| *view)
+            .map(|(_, view)| *view)
     }
 
     /// Clicking the control that asked for a view a second time puts the child
     /// back to budgeted, so every control undoes itself.
     pub fn toggled(&self, index: usize, view: ChildView) -> Self {
-        let next = if self.get(index) == view {
+        let next = if self.get(index).unwrap_or_default() == view {
             ChildView::Budgeted
         } else {
             view
@@ -995,6 +1001,19 @@ impl RenderLimits {
 
     pub fn is_output_expanded(&self) -> bool {
         self.output == usize::MAX
+    }
+
+    /// What a child draws as. Children the reader has not spoken about are
+    /// folded, so the card is the list of what ran; opening the card is a
+    /// statement about everything in it and shows them all.
+    fn child_view(&self, index: usize) -> ChildView {
+        self.views
+            .get(index)
+            .unwrap_or(if self.is_output_expanded() {
+                ChildView::Budgeted
+            } else {
+                ChildView::Folded
+            })
     }
 
     /// A child renders on its own terms: its own tool's budget, unless the
@@ -1770,6 +1789,7 @@ mod tests {
             summary: format!("{tool} summary"),
             status: BatchToolStatus::Success,
             input: None,
+            raw_input: None,
             output: Some(ToolOutput::Plain(caudra_agent::TextOutput {
                 text,
                 instructions: None,
@@ -1830,11 +1850,12 @@ mod tests {
         seen
     }
 
-    /// A card nobody has clicked has to look exactly as it always did.
+    /// The point of the card: a batch nobody has clicked is the list of what
+    /// it ran, not every result at once.
     #[test]
-    fn an_untouched_batch_draws_every_child_body() {
+    fn an_untouched_batch_draws_no_child_bodies() {
         let (lines, rows) = batch(BatchViews::default());
-        assert_eq!(body_count(&lines), 5);
+        assert_eq!(body_count(&lines), 0);
         assert_eq!(
             lines.len(),
             rows.len(),
@@ -1848,9 +1869,9 @@ mod tests {
     }
 
     #[test]
-    fn folding_a_child_hides_only_its_body() {
-        let (lines, rows) = batch(BatchViews::new([(0, ChildView::Folded)]));
-        assert_eq!(body_count(&lines), 3, "the other child is untouched");
+    fn opening_a_child_shows_only_its_body() {
+        let (lines, rows) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
+        assert_eq!(body_count(&lines), 2, "the other child stays folded");
         assert_eq!(lines.len(), rows.len());
         assert_eq!(
             targets(&rows),
@@ -1863,7 +1884,6 @@ mod tests {
     /// was put away.
     #[test]
     fn a_folded_child_says_so() {
-        let (folded, _) = batch(BatchViews::new([(0, ChildView::Folded)]));
         let marked = |lines: &[Line<'static>]| {
             lines
                 .iter()
@@ -1874,15 +1894,16 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(marked(&folded), 1);
-        assert_eq!(marked(&batch(BatchViews::default()).0), 0);
+        assert_eq!(marked(&batch(BatchViews::default()).0), 2);
+        let (one_open, _) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
+        assert_eq!(marked(&one_open), 1);
     }
 
     /// The target names the child, so a click after a fold above it still
     /// reaches the one the reader aimed at.
     #[test]
     fn a_summary_row_names_its_own_child() {
-        let (_, rows) = batch(BatchViews::new([(0, ChildView::Folded)]));
+        let (_, rows) = batch(BatchViews::new([(0, ChildView::Budgeted)]));
         assert_eq!(
             targets(&rows),
             vec![RowTarget::BatchChild(0), RowTarget::BatchChild(1)]
@@ -1893,7 +1914,11 @@ mod tests {
     /// the click, so the affordance was unreachable by any input.
     #[test]
     fn a_truncated_child_body_takes_a_click() {
-        let (lines, rows) = batch_of([1, 6], budgets(ROOMY, CHILD_BUDGET), BatchViews::default());
+        let (lines, rows) = batch_of(
+            [1, 6],
+            budgets(ROOMY, CHILD_BUDGET),
+            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Budgeted)]),
+        );
         assert!(
             lines
                 .iter()
@@ -1918,7 +1943,7 @@ mod tests {
         let (lines, rows) = batch_of(
             [5, whole],
             budgets(SIBLING_KEPT, CHILD_BUDGET),
-            BatchViews::new([(1, ChildView::Expanded)]),
+            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Expanded)]),
         );
         assert_eq!(
             body_count(&lines),
@@ -1935,10 +1960,11 @@ mod tests {
         );
     }
 
-    #[test_case(&[], 1, ChildView::Folded, &[(1, ChildView::Folded)] ; "records_the_first")]
-    #[test_case(&[(1, ChildView::Folded)], 1, ChildView::Folded, &[] ; "same_control_undoes_itself")]
-    #[test_case(&[(1, ChildView::Folded)], 1, ChildView::Expanded, &[(1, ChildView::Expanded)] ; "other_control_takes_over")]
-    #[test_case(&[(0, ChildView::Folded)], 1, ChildView::Expanded, &[(0, ChildView::Folded), (1, ChildView::Expanded)] ; "leaves_the_others")]
+    #[test_case(&[], 1, ChildView::Folded, &[(1, ChildView::Budgeted)] ; "the_summary_opens_a_folded_child")]
+    #[test_case(&[(1, ChildView::Budgeted)], 1, ChildView::Folded, &[] ; "the_summary_folds_it_again")]
+    #[test_case(&[(1, ChildView::Budgeted)], 1, ChildView::Expanded, &[(1, ChildView::Expanded)] ; "the_body_expands_it")]
+    #[test_case(&[(1, ChildView::Expanded)], 1, ChildView::Expanded, &[(1, ChildView::Budgeted)] ; "the_body_puts_it_back")]
+    #[test_case(&[(0, ChildView::Budgeted)], 1, ChildView::Expanded, &[(0, ChildView::Budgeted), (1, ChildView::Expanded)] ; "leaves_the_others")]
     fn toggled_views(
         start: &[(usize, ChildView)],
         index: usize,
@@ -1956,7 +1982,7 @@ mod tests {
         let limits = RenderLimits::new(
             SectionFlags::default(),
             PARENT_BUDGET,
-            BatchViews::new([(0, ChildView::Folded)]),
+            BatchViews::new([(0, ChildView::Budgeted)]),
             ToolOutputLines::DEFAULT,
         );
         assert_eq!(
@@ -1975,7 +2001,7 @@ mod tests {
         let (lines, _) = batch_of(
             [6, 6],
             budgets(read_budget, grep_budget),
-            BatchViews::default(),
+            BatchViews::new([(0, ChildView::Budgeted), (1, ChildView::Budgeted)]),
         );
         assert_eq!(
             body_count(&lines),

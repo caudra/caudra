@@ -18,7 +18,9 @@ use crate::tools::registry::{
 };
 use crate::tools::schema::{ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::{BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput};
+use crate::types::{
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput, ToolStartEvent,
+};
 use crate::{AgentEvent, task_set::TaskSet};
 
 pub const MAX_BATCH_SIZE: usize = 25;
@@ -206,6 +208,7 @@ impl Child {
                 summary: String::new(),
                 status: BatchToolStatus::Error,
                 input: None,
+                raw_input: None,
                 output: Some(ToolOutput::Plain(reason.into())),
                 annotation: None,
             },
@@ -214,6 +217,7 @@ impl Child {
                 summary: String::new(),
                 status: BatchToolStatus::Pending,
                 input: None,
+                raw_input: None,
                 output: None,
                 annotation: None,
             },
@@ -239,17 +243,26 @@ impl BatchCall {
             );
             let entries = Arc::clone(&entries);
             set.spawn(async move {
-                publish(&entries, index, &ctx, |entry| {
-                    entry.status = BatchToolStatus::Running;
-                });
-                let (done, start) = tool_dispatch::run_capturing(
+                let done = tool_dispatch::run(
                     &registry,
                     mcp.as_ref(),
                     ctx.tool_use_id.clone().unwrap_or_default(),
                     &child.tool,
                     &child.params,
                     &ctx,
-                    Emit::Capture,
+                    // The roster shows a child the way a standalone card
+                    // would, which is the header the call introduced itself
+                    // with rather than a bare tool name. Taken as the child
+                    // starts, or the row carries no title for as long as it
+                    // runs, which on a batch is the whole time worth watching.
+                    Emit::Capture(&mut |start: &ToolStartEvent| {
+                        publish(&entries, index, &ctx, |entry| {
+                            entry.status = BatchToolStatus::Running;
+                            entry.summary = start.summary.clone();
+                            entry.input = start.input.clone();
+                            entry.raw_input = start.raw_input.clone();
+                        });
+                    }),
                 )
                 .await;
                 publish(&entries, index, &ctx, |entry| {
@@ -260,13 +273,6 @@ impl BatchCall {
                     };
                     entry.annotation = done.annotation.clone();
                     entry.output = Some(done.output.clone());
-                    // The roster shows a child the way a standalone card
-                    // would, which is the header the call introduced itself
-                    // with rather than a bare tool name.
-                    if let Some(start) = start {
-                        entry.summary = start.summary;
-                        entry.input = start.input;
-                    }
                 });
             });
         }
@@ -404,7 +410,7 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::tools::registry::ToolRegistry;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use serde_json::json;
     use test_case::test_case;
 
@@ -444,6 +450,7 @@ mod tests {
             summary: String::new(),
             status,
             input: None,
+            raw_input: None,
             output: Some(ToolOutput::Plain(text.into())),
             annotation: None,
         }
@@ -762,6 +769,52 @@ mod tests {
             panic!("expected a batch result");
         };
         assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
+    }
+
+    const BATCH_ID: &str = "batch-1";
+    const EXPECT_RUNNING_SUMMARY: &str =
+        "a child names what it is acting on while it runs, not only once it is done";
+
+    /// The header was taken from the value `run_capturing` returns, which only
+    /// arrives once the child has finished. Every row in a running batch was a
+    /// bare `tool>` for exactly as long as the batch was worth watching.
+    #[test]
+    fn a_running_child_already_carries_its_header() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let (tx, rx) = flume::unbounded::<crate::Envelope>();
+        let mut ctx = stub_ctx_with(
+            &AgentMode::Build,
+            Some(&crate::EventSender::new(tx, 0)),
+            Some(BATCH_ID),
+        );
+        ctx.registry = Arc::clone(&registry);
+
+        smol::block_on(async {
+            parsed(calls(json!([{ "tool": HEADER_TOOL, "path": HEADER_PATH }])))
+                .unwrap()
+                .execute(&ctx)
+                .await
+        });
+
+        let running = rx
+            .drain()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::BatchProgress(progress) => Some(progress.entry),
+                _ => None,
+            })
+            .find(|entry| entry.status == BatchToolStatus::Running)
+            .expect("a child reports that it started");
+        assert_eq!(running.summary, HEADER_PATH, "{EXPECT_RUNNING_SUMMARY}");
     }
 
     /// Two children that can only both finish if they ran at the same time, so

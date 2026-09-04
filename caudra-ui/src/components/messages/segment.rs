@@ -6,9 +6,11 @@ use crate::theme;
 use super::super::code_view::{BatchViews, RowTarget, SectionFlags};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
+use caudra_agent::{ToolInput, ToolOutput};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::cell::Cell;
+use std::sync::Arc;
 
 const INST_SUFFIX: &str = "__inst";
 
@@ -30,13 +32,39 @@ struct CachedHeight {
     height: u16,
 }
 
-#[derive(Default, PartialEq, Eq)]
+/// What the cached highlight was computed from. Reuse splices those lines
+/// back verbatim, so anything that changes them has to change this too.
+#[derive(Default)]
 struct HighlightKey {
-    has_output: bool,
+    /// Held rather than compared by value: a tool that republishes its result
+    /// hands over a fresh `Arc`, and identity settles it without walking an
+    /// output that can run to megabytes. Keeping it also pins the allocation,
+    /// so a freed one cannot be mistaken for its replacement.
+    input: Option<Arc<ToolInput>>,
+    output: Option<Arc<ToolOutput>>,
     theme_gen: u64,
     /// A child view changes which lines the range holds, so reusing across a
     /// fold would splice back the body the reader just put away.
     views: BatchViews,
+}
+
+impl PartialEq for HighlightKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.theme_gen == other.theme_gen
+            && self.views == other.views
+            && same_source(&self.input, &other.input)
+            && same_source(&self.output, &other.output)
+    }
+}
+
+impl Eq for HighlightKey {}
+
+fn same_source<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl HighlightKey {
@@ -45,7 +73,8 @@ impl HighlightKey {
     /// splice old-palette lines back in.
     fn from_request(hl: Option<&HighlightRequest>) -> Self {
         Self {
-            has_output: hl.is_some_and(|h| h.output.is_some()),
+            input: hl.and_then(|h| h.input.clone()),
+            output: hl.and_then(|h| h.output.clone()),
             theme_gen: theme::generation(),
             views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
         }
@@ -423,6 +452,21 @@ impl Segment {
             self.invalidate_height();
         }
         self.pending_highlight = None;
+    }
+
+    /// Stands in for the worker answering with what it was given, which is
+    /// what a body with nothing to highlight really returns. Reuse is only
+    /// reachable once a result has landed, so a test that never settles is
+    /// testing the wrong path.
+    #[cfg(test)]
+    pub fn settle_highlight(&mut self) {
+        let Some((start, end)) = self.highlight_range else {
+            self.pending_highlight = None;
+            return;
+        };
+        let lines = self.lines[start..end].to_vec();
+        let rows = self.rows[start..end].to_vec();
+        self.apply_highlight_result(lines, rows);
     }
 
     /// Keeps recorded line positions (spinners, buffer base) in step when
@@ -847,9 +891,9 @@ mod tests {
             ..Segment::default()
         };
 
-        let folded =
-            HighlightKey::from_request(Some(&request(BatchViews::new([(0, ChildView::Folded)]))));
-        assert!(seg.reuse_highlight(&folded, (1, 3)).is_none());
+        let opened =
+            HighlightKey::from_request(Some(&request(BatchViews::new([(0, ChildView::Budgeted)]))));
+        assert!(seg.reuse_highlight(&opened, (1, 3)).is_none());
         let same = HighlightKey::from_request(Some(&request(BatchViews::default())));
         assert!(seg.reuse_highlight(&same, (1, 3)).is_some());
     }

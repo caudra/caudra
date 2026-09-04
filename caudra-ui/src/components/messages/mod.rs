@@ -654,8 +654,8 @@ pub struct MessagesPanel {
     /// `disclosure` because it is a choice about the body rather than an
     /// expansion of it, so closing the card must not forget it.
     shell_raw: HashSet<String>,
-    /// Which batch children the reader folded away, by parent tool id. Empty
-    /// for every card nobody has clicked, which is nearly all of them.
+    /// Which batch children the reader opened, by parent tool id. Empty for
+    /// every card nobody has clicked, which is nearly all of them.
     batch_views: BatchViewMap,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.

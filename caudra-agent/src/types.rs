@@ -178,6 +178,11 @@ pub struct BatchToolEntry {
     pub status: BatchToolStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<ToolInput>,
+    /// What the child was called with, for the arguments its header leaves
+    /// out. The same source a standalone row reads, so a child in a batch
+    /// names its inputs the way it would on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<ToolOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
