@@ -117,11 +117,6 @@ pub(super) struct Segment {
     /// `reflow_segment`; partial splices (`apply_highlight_result`) leave it
     /// set so the segment still reflows later.
     pub(super) stale: bool,
-    /// Blank rows held below the card so that closing it moves nothing else.
-    /// They count in the layout and draw nothing, and are handed back once
-    /// they are off screen, where giving up the space costs the reader
-    /// nothing.
-    reserved: u16,
 }
 
 impl Segment {
@@ -170,27 +165,6 @@ impl Segment {
 
     pub fn chrome(&self, width: u16) -> SegmentChrome {
         SegmentChrome::for_kind(self.kind, width, self.margin_top)
-    }
-
-    pub fn reserved(&self) -> u16 {
-        self.reserved
-    }
-
-    /// Adds to what is already held: a card can lose rows more than once
-    /// before the reader scrolls past what it gave up the first time.
-    pub fn reserve(&mut self, rows: u16) {
-        if rows == 0 {
-            return;
-        }
-        self.reserved = self.reserved.saturating_add(rows);
-        self.invalidate_height();
-    }
-
-    pub fn release(&mut self) {
-        if self.reserved != 0 {
-            self.reserved = 0;
-            self.invalidate_height();
-        }
     }
 
     pub fn content_width(&self, width: u16) -> u16 {
@@ -280,13 +254,6 @@ impl Segment {
     /// Rows the lines really take at `width`, ignoring the cache. Same as
     /// `height` for any segment that is not stale.
     pub fn drawn_height(&self, width: u16) -> u16 {
-        self.card_height(width).saturating_add(self.reserved)
-    }
-
-    /// The card without the blank rows held below it, which is what the
-    /// renderer draws into and what every row inside the card is measured
-    /// against.
-    pub fn card_height(&self, width: u16) -> u16 {
         let chrome = self.chrome(width);
         chrome
             .content_start()
@@ -615,27 +582,6 @@ impl SegmentCache {
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Segment> {
         self.segments.get_mut(idx)
-    }
-
-    /// Where each held-open run of blank rows starts in the document, with
-    /// the segment holding it. Only walks far enough to answer, since the
-    /// caller reclaims from the top down.
-    pub fn spacers(&self, width: u16) -> impl Iterator<Item = (usize, u32, u16)> + '_ {
-        let mut offset: u32 = 0;
-        self.segments
-            .iter()
-            .enumerate()
-            .filter_map(move |(i, seg)| {
-                offset += seg.height(width) as u32;
-                let reserved = seg.reserved();
-                (reserved > 0).then(|| (i, offset - reserved as u32, reserved))
-            })
-    }
-
-    pub fn release(&mut self, idx: usize) {
-        if let Some(seg) = self.segments.get_mut(idx) {
-            seg.release();
-        }
     }
 
     pub fn find_by_tool_id(&self, id: &str) -> Option<usize> {

@@ -1660,6 +1660,7 @@ fn collapsed_streaming_thinking_does_not_leak_its_body() {
     let mut panel = MessagesPanel::new(
         UiConfig {
             typewriter_ms_per_char: 0,
+            show_thinking: false,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -1678,7 +1679,13 @@ fn collapsed_streaming_thinking_does_not_leak_its_body() {
 
 #[test]
 fn collapsed_streaming_thinking_uses_the_displayed_buffer_title() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: false,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
     panel.thinking_delta("**Buffered trace**\n\nnot yet revealed");
 
@@ -3174,15 +3181,17 @@ fn transcript_hover_clears_explicitly_and_on_scroll_or_layout_change() {
     assert!(panel.hover.is_none());
 }
 
+/// Reasoning is part of how the answer was reached, so the reader sees it
+/// without asking. Turning the gate off is what hides it.
 #[test]
-fn default_collapses_streaming_thinking() {
+fn default_shows_streaming_thinking() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_thinking.set_buffer("visible reasoning");
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("Thinking") && !text.contains("visible reasoning"),
-        "default config should collapse reasoning; got: {text}"
+        text.contains("Thinking") && text.contains("visible reasoning"),
+        "default config should show reasoning; got: {text}"
     );
 }
 
@@ -3216,6 +3225,25 @@ fn streaming_reasoning_shows_a_spinner_and_tenths_timer() {
 
     assert!(SPINNER_GLYPHS.chars().any(|glyph| text.contains(glyph)));
     assert!(text.contains("Thinking · 1.2s"));
+    // The body is drawn now rather than counted, so the typewriter revealing
+    // it is real work and asks for the faster cadence of the two.
+    assert_eq!(panel.cadence(), Cadence::SMOOTH);
+}
+
+/// A collapsed block reveals nothing, so believing its typewriter would pin
+/// the loop at full frame rate for the whole reasoning phase.
+#[test]
+fn collapsed_streaming_reasoning_only_asks_for_the_spinner() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: false,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.thinking_delta("working");
+    render(&mut panel, 80, 5);
+
     assert_eq!(panel.cadence(), Cadence::SPINNER);
 }
 
@@ -4379,6 +4407,9 @@ fn a_user_message_still_separates_from_the_compact_list() {
 #[test]
 fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
     let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    // Both blocks have to be collapsed for the comparison to be about the
+    // margin rather than about one of them drawing a body.
+    panel.show_thinking = false;
     finished(&mut panel, &["t1"]);
     render(&mut panel, 80, 24);
     let settled = panel.last_total_lines;
@@ -4682,51 +4713,51 @@ fn untimed_reasoning_drops_the_duration_suffix() {
     assert_eq!(first_line_text(&panel, 0), "Thought");
 }
 
-#[test]
-fn switching_to_compact_collapses_reasoning_that_show_thinking_had_open() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: true,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
+/// Density is a claim about tool calls. Reasoning is how the answer was
+/// reached, so no mode takes it away and switching modes cannot either.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn no_mode_closes_reasoning(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(
         DisplayRole::Thinking,
         "reasoning".into(),
     ));
     rebuild(&mut panel);
-    assert!(panel.reasoning_open(&panel.messages[0], 0));
+    assert!(panel.reasoning_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
 
-    panel.set_view(ViewMode::Compact);
+    panel.set_view(view);
     rebuild(&mut panel);
-    assert!(!panel.reasoning_open(&panel.messages[0], 0));
 
-    panel.set_view(ViewMode::Expanded);
-    assert!(
-        panel.reasoning_open(&panel.messages[0], 0),
-        "{COMPACT_RESET_MSG}"
-    );
+    assert!(panel.reasoning_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
 }
 
-#[test]
-fn a_compact_thought_reopens_on_click_even_when_show_thinking_is_on() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: true,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
+/// The click is the only way to fold a long block, so it has to work in the
+/// mode that draws every card in full as much as in the dense ones.
+#[test_case(ViewMode::Expanded ; "expanded")]
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_thought_folds_and_reopens_on_click(view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
     panel.push(DisplayMessage::new(
         DisplayRole::Thinking,
         THINKING_TEXT.into(),
     ));
-    panel.set_view(ViewMode::Compact);
     rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
 
-    assert!(panel.handle_click(0, Rect::new(0, 0, 80, 24)));
-    assert!(panel.reasoning_open(&panel.messages[0], 0));
+    assert!(panel.handle_click(0, area), "{THOUGHT_FOLD_MSG}");
+    assert!(
+        !panel.reasoning_open(&panel.messages[0]),
+        "{THOUGHT_FOLD_MSG}"
+    );
+
+    assert!(panel.handle_click(0, area), "{THOUGHT_FOLD_MSG}");
+    assert!(
+        panel.reasoning_open(&panel.messages[0]),
+        "{THOUGHT_FOLD_MSG}"
+    );
 }
 
 #[test]
@@ -4788,9 +4819,10 @@ const AUTO_TAIL_MSG: &str = "auto must leave the newest card open";
 const AUTO_HANDOFF_MSG: &str = "the card auto opened must close once a newer one takes its place";
 const AUTO_STREAM_MSG: &str = "nothing settled is newest while the model is still writing";
 const MANUAL_STICKY_MSG: &str = "a card the reader opened must stay open as the transcript grows";
-const REASONING_GATE_MSG: &str =
-    "the gate decides whether reasoning may show; the mode only decides when";
-const REASONING_TAIL_MSG: &str = "auto must open the newest reasoning and close the one before it";
+const REASONING_GATE_MSG: &str = "the gate is the only thing that decides whether reasoning shows";
+const REASONING_TAIL_MSG: &str = "a thought must stay open once the transcript grows past it";
+const MODE_KEEPS_MSG: &str = "no view mode may take reasoning away";
+const THOUGHT_FOLD_MSG: &str = "a click must fold an open thought and open a folded one";
 
 fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
     let mut panel = panel_with_tools(ids);
@@ -4958,16 +4990,16 @@ fn a_card_the_reader_opened_survives_the_next_one() {
     assert!(panel.card_closed("t2"), "{AUTO_HANDOFF_MSG}");
 }
 
-/// `show_thinking` is the reader saying they do not want reasoning at all. No
-/// mode overrules that; the modes only choose among reasoning they may show,
-/// which is why the same three modes answer differently once it is on.
+/// `show_thinking` is the reader saying whether they want reasoning at all,
+/// and it is the whole answer: the modes divide tool calls by density and
+/// have no say over how the answer was reached.
 #[test_case(ViewMode::Expanded, false, false; "expanded obeys the gate")]
 #[test_case(ViewMode::Compact, false, false; "compact obeys the gate")]
 #[test_case(ViewMode::Auto, false, false; "auto obeys the gate")]
-#[test_case(ViewMode::Expanded, true, true; "expanded opens what it may")]
-#[test_case(ViewMode::Compact, true, false; "compact closes what it may")]
-#[test_case(ViewMode::Auto, true, true; "auto opens the newest")]
-fn reasoning_answers_to_the_gate_before_the_mode(view: ViewMode, show_thinking: bool, open: bool) {
+#[test_case(ViewMode::Expanded, true, true; "expanded opens it")]
+#[test_case(ViewMode::Compact, true, true; "compact opens it too")]
+#[test_case(ViewMode::Auto, true, true; "auto opens it too")]
+fn reasoning_answers_to_the_gate_alone(view: ViewMode, show_thinking: bool, open: bool) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.show_thinking = show_thinking;
     panel.set_view(view);
@@ -4975,34 +5007,33 @@ fn reasoning_answers_to_the_gate_before_the_mode(view: ViewMode, show_thinking: 
     rebuild(&mut panel);
 
     assert_eq!(
-        panel.reasoning_open(&panel.messages[0], 0),
+        panel.reasoning_open(&panel.messages[0]),
         open,
         "{REASONING_GATE_MSG}"
     );
 }
 
+/// Auto governs tool cards by recency. Reasoning is not a card it governs,
+/// so a newer message is not a reason to close the thought behind it.
 #[test]
-fn auto_follows_the_newest_reasoning_too() {
+fn auto_leaves_older_reasoning_open() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.show_thinking = true;
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "first".into()));
     rebuild(&mut panel);
-    assert!(
-        panel.reasoning_open(&panel.messages[0], 0),
-        "{REASONING_TAIL_MSG}"
-    );
+    let open = panel.segment_heights()[0];
 
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "second".into()));
     rebuild(&mut panel);
 
     assert!(
-        !panel.reasoning_open(&panel.messages[0], 0),
+        panel.reasoning_open(&panel.messages[0]),
         "{REASONING_TAIL_MSG}"
     );
     assert!(
-        panel.reasoning_open(&panel.messages[1], 1),
+        panel.reasoning_open(&panel.messages[1]),
         "{REASONING_TAIL_MSG}"
     );
+    assert_eq!(panel.segment_heights()[0], open, "{REASONING_TAIL_MSG}");
 }
 
 const BATCH_TOOL: &str = "batch";
@@ -5205,13 +5236,9 @@ fn changing_mode_keeps_a_batch_child_open() {
     assert!(!text.contains("child_body_line_b"), "{EXPECT_OTHERS_KEPT}");
 }
 
-const SPACER_HOLD_MSG: &str = "a card that closes itself must not move what is above it";
-const SPACER_BLANK_MSG: &str = "the rows a closed card holds must draw nothing";
-const SPACER_RECLAIM_MSG: &str = "held rows must go back once they are off screen";
-const SPACER_REOPEN_MSG: &str = "opening a held card by hand must reuse the rows it held";
+const CLOSED_CARD_SHRINKS_MSG: &str = "a card auto closes must give its rows back at once";
 const SPACER_SETUP_MSG: &str = "the test must start from a card with a body to give up";
 const HELD_BODY_LINES: usize = 5;
-const REPLIES_PAST_THE_VIEWPORT: usize = 40;
 
 fn auto_panel_with_body(lines: usize) -> MessagesPanel {
     let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
@@ -5226,58 +5253,26 @@ fn supersede(panel: &mut MessagesPanel) {
     rebuild(panel);
 }
 
-/// The whole point of the held rows: auto closes the card, and the reader,
-/// who may be reading something else entirely, sees nothing move.
+/// The card used to hold its rows as blanks so nothing moved under the
+/// reader. Those rows still answered clicks and hover as the card that had
+/// given them up, and the transcript kept space it was not drawing into, so
+/// the card now shrinks to its header the moment auto closes it.
 #[test]
-fn a_card_that_closes_itself_holds_the_rows_it_gave_up() {
+fn a_card_auto_closes_gives_its_rows_back_at_once() {
     let mut panel = auto_panel_with_body(HELD_BODY_LINES);
-    let open = panel.segment_heights()[0];
-    assert!(open > 1, "{SPACER_SETUP_MSG}");
+    assert!(panel.segment_heights()[0] > 1, "{SPACER_SETUP_MSG}");
 
     supersede(&mut panel);
 
     assert!(panel.card_closed("t1"), "{AUTO_HANDOFF_MSG}");
-    assert_eq!(panel.segment_heights()[0], open, "{SPACER_HOLD_MSG}");
+    assert_eq!(panel.segment_heights()[0], 1, "{CLOSED_CARD_SHRINKS_MSG}");
 }
 
+/// Opening by hand shows the whole body, and it has to match a card that was
+/// never closed at all rather than carry anything over from the close.
 #[test]
-fn the_rows_a_closed_card_holds_draw_nothing() {
-    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
-    let body = "line 0";
-    assert!(seg_text(&panel, "t1").contains(body), "{SPACER_SETUP_MSG}");
-
-    supersede(&mut panel);
-    let terminal = render(&mut panel, 80, 24);
-
-    assert!(!buffer_text(&terminal).contains(body), "{SPACER_BLANK_MSG}");
-}
-
-/// Held rows are a courtesy to the reader's eyes, not a permanent cost. Once
-/// they are above the viewport, giving them back moves nothing they can see.
-#[test]
-fn held_rows_go_back_once_they_are_off_screen() {
-    let mut panel = auto_panel_with_body(HELD_BODY_LINES);
-    supersede(&mut panel);
-    assert!(panel.segment_heights()[0] > 1, "{SPACER_HOLD_MSG}");
-
-    for i in 0..REPLIES_PAST_THE_VIEWPORT {
-        panel.push(DisplayMessage::new(
-            DisplayRole::Assistant,
-            format!("reply {i}"),
-        ));
-    }
-    rebuild(&mut panel);
-
-    assert_eq!(panel.segment_heights()[0], 1, "{SPACER_RECLAIM_MSG}");
-}
-
-/// Reopening has to spend the held rows rather than add to them, or the card
-/// comes back taller than it ever was.
-#[test]
-fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
+fn opening_a_closed_card_by_hand_matches_a_card_that_never_closed() {
     let area = Rect::new(0, 0, 80, 24);
-    // A click opens the whole body, so the height to match is a card that
-    // opened the same way without ever holding rows.
     let mut fresh = auto_panel_with_body(HELD_BODY_LINES);
     assert!(fresh.handle_click(0, area), "{COMPACT_CLICK_MSG}");
     rebuild(&mut fresh);
@@ -5285,12 +5280,11 @@ fn opening_a_held_card_by_hand_reuses_the_rows_it_held() {
 
     let mut panel = auto_panel_with_body(HELD_BODY_LINES);
     supersede(&mut panel);
-    assert!(panel.segment_heights()[0] > 1, "{SPACER_HOLD_MSG}");
 
     assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
     rebuild(&mut panel);
 
-    assert_eq!(panel.segment_heights()[0], opened, "{SPACER_REOPEN_MSG}");
+    assert_eq!(panel.segment_heights()[0], opened, "{COMPACT_CLICK_MSG}");
 }
 
 const STREAMING_FLUSH_CLICK_MSG: &str = "a live thought must open on the row it is drawn at";
@@ -5312,7 +5306,13 @@ fn wrapping_tool(panel: &mut MessagesPanel, id: &'static str) {
 #[test_case(ViewMode::Compact ; "compact")]
 #[test_case(ViewMode::Auto ; "auto")]
 fn a_live_thought_opens_on_the_row_it_is_drawn_at(view: ViewMode) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: false,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
     panel.set_view(view);
     panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t1"));

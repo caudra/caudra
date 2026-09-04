@@ -866,7 +866,6 @@ impl MessagesPanel {
     /// Shows the whole body, since that is the only thing a click opens to.
     fn open_card(&mut self, tool_id: &str) {
         self.disclosure.insert(tool_id.to_owned(), CardState::Full);
-        self.release_spacer(tool_id);
         self.rebuild_expanded_tool(tool_id);
     }
 
@@ -881,73 +880,15 @@ impl MessagesPanel {
             return;
         }
         let previous = mem::replace(&mut self.auto_open, latest);
-        if let Some(idx) = previous {
-            self.close_and_hold_the_space(idx);
-        }
-        if let Some(idx) = latest {
+        for idx in previous.into_iter().chain(latest) {
             self.rebuild_card(idx);
         }
     }
 
-    /// Closing a card the reader may be mid-sentence in would pull everything
-    /// below it upward. The rows it gives up stay in the layout as blank ones
-    /// until they are off screen, so the card changes and nothing else moves.
-    /// Measured across the whole cache because a card can carry an
-    /// instruction segment that shrinks with it.
-    fn close_and_hold_the_space(&mut self, msg_index: usize) {
-        let width = self.viewport_width;
-        let before = self.cache.total_height(width);
-        self.rebuild_card(msg_index);
-        let freed = before.saturating_sub(self.cache.total_height(width));
-        let Ok(freed) = u16::try_from(freed) else {
-            return;
-        };
-        if let Some(seg) = self
-            .card_segment(msg_index)
-            .and_then(|idx| self.cache.get_mut(idx))
-        {
-            seg.reserve(freed);
-        }
-    }
-
-    fn card_segment(&self, msg_index: usize) -> Option<usize> {
-        match &self.messages.get(msg_index)?.role {
-            DisplayRole::Tool(t) => self.cache.find_by_tool_id(&t.id),
-            _ => self
-                .cache
-                .segments()
-                .iter()
-                .position(|seg| seg.msg_index == Some(msg_index)),
-        }
-    }
-
-    /// Hands back blank rows once they are off screen. Reclaiming above the
-    /// viewport takes rows out from under the text the reader is looking at,
-    /// so the scroll offset gives up exactly the same ones.
-    fn reclaim_spacers(&mut self, width: u16, viewport_height: u16) {
-        let top = self.scroll_top as u32;
-        let bottom = top + viewport_height as u32;
-        let mut above: u32 = 0;
-        let mut done: Vec<usize> = Vec::new();
-        for (idx, start, rows) in self.cache.spacers(width) {
-            if start + rows as u32 <= top {
-                above += rows as u32;
-                done.push(idx);
-            } else if start >= bottom {
-                done.push(idx);
-            }
-        }
-        for idx in done {
-            self.cache.release(idx);
-        }
-        self.scroll_top = self
-            .scroll_top
-            .saturating_sub(above.min(u16::MAX as u32) as u16);
-    }
-
     /// The last card, when the mode is the only thing deciding whether it is
     /// open. A card the reader chose for, or one that cannot close at all,
-    /// does not move when the transcript grows past it.
+    /// does not move when the transcript grows past it. Reasoning is absent
+    /// because no mode closes it.
     fn auto_governed_tail(&self) -> Option<usize> {
         let idx = self.messages.len().checked_sub(1)?;
         if !self.is_latest(idx) {
@@ -955,9 +896,6 @@ impl MessagesPanel {
         }
         let governed = match &self.messages[idx].role {
             DisplayRole::Tool(t) => t.is_collapsible() && !self.disclosure.contains_key(&t.id),
-            DisplayRole::Thinking => {
-                self.show_thinking && self.messages[idx].reasoning_open.is_none()
-            }
             _ => false,
         };
         governed.then_some(idx)
@@ -1693,8 +1631,7 @@ impl MessagesPanel {
                 .messages
                 .get(msg_index)
                 .is_some_and(|message| {
-                    matches!(message.role, DisplayRole::Thinking)
-                        && !self.reasoning_open(message, msg_index)
+                    matches!(message.role, DisplayRole::Thinking) && !self.reasoning_open(message)
                 })
                 .then_some(HoverTarget::CachedThinking(msg_index));
         };
@@ -2045,7 +1982,6 @@ impl MessagesPanel {
         }
         self.disclosure
             .insert(tool_id.to_owned(), CardState::Closed);
-        self.release_spacer(tool_id);
         self.rebuild_expanded_tool(tool_id);
         true
     }
@@ -2057,7 +1993,6 @@ impl MessagesPanel {
         if self.disclosure.remove(tool_id).is_none() {
             return false;
         }
-        self.release_spacer(tool_id);
         self.rebuild_expanded_tool(tool_id);
         true
     }
@@ -2078,12 +2013,6 @@ impl MessagesPanel {
             .toggled(index);
         self.batch_views.insert(tool_id.to_owned(), views);
         self.rebuild_tool_segment(tool_id);
-    }
-
-    fn release_spacer(&mut self, tool_id: &str) {
-        if let Some(idx) = self.cache.find_by_tool_id(tool_id) {
-            self.cache.release(idx);
-        }
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
@@ -2136,23 +2065,17 @@ impl MessagesPanel {
         ])
     }
 
-    /// The live block is always the last card, so auto keeps it open.
     fn streaming_reasoning_open(&self) -> bool {
-        self.streaming_reasoning_open
-            .unwrap_or(self.show_thinking && self.view != ViewMode::Compact)
+        self.streaming_reasoning_open.unwrap_or(self.show_thinking)
     }
 
-    /// What the reader asked of a settled block, or what the mode says when
-    /// they have not asked.
-    fn reasoning_open(&self, msg: &DisplayMessage, msg_index: usize) -> bool {
-        msg.reasoning_open.unwrap_or(
-            self.show_thinking
-                && match self.view {
-                    ViewMode::Expanded => true,
-                    ViewMode::Compact => false,
-                    ViewMode::Auto => self.is_latest(msg_index),
-                },
-        )
+    /// What the reader asked of a settled block, or the gate when they have
+    /// not asked. Reasoning is how the answer was reached rather than a call
+    /// the transcript can summarise in a row, so no view mode closes it: the
+    /// modes decide density among tool cards, and `show_thinking` is the only
+    /// thing that decides whether reasoning starts open.
+    fn reasoning_open(&self, msg: &DisplayMessage) -> bool {
+        msg.reasoning_open.unwrap_or(self.show_thinking)
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -2288,9 +2211,6 @@ impl MessagesPanel {
         self.resolve_scroll(width, streaming_sum, has_selection);
         self.reflow_viewport(width, has_selection);
         self.cache.update_margins(width);
-        if !has_selection {
-            self.reclaim_spacers(width, area.height);
-        }
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
         if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
             self.clear_hover();
@@ -2315,13 +2235,12 @@ impl MessagesPanel {
                 .map(|feedback| (feedback, accent));
             cursor.render(
                 (seg.lines(), Some(seg.links())),
-                seg.height(width).saturating_sub(seg.reserved()),
+                seg.height(width),
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent, compact),
                 RenderFeedback { highlight, hover },
                 frame,
             );
-            cursor.skip_rows(seg.reserved());
         }
 
         let mut height_idx = 0usize;
@@ -2594,11 +2513,7 @@ impl MessagesPanel {
                 SegmentKind::Thinking => {
                     let open = message.map_or_else(
                         || self.streaming_reasoning_open(),
-                        |message| {
-                            fragment
-                                .msg_index
-                                .is_some_and(|index| self.reasoning_open(message, index))
-                        },
+                        |message| self.reasoning_open(message),
                     );
                     let reasoning = message.map_or_else(
                         || {
@@ -3020,10 +2935,10 @@ impl MessagesPanel {
         doc_row >= thinking_start && doc_row < thinking_start + height
     }
 
+    /// Reasoning opens by default, so the click is the only way to fold a
+    /// long block back to its header. A drag that selects text never reaches
+    /// here, so the body stays clickable without swallowing selections.
     fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking && self.view == ViewMode::Expanded {
-            return false;
-        }
         let Some(idx) = msg_idx else { return false };
         let Some(msg) = self.messages.get(idx) else {
             return false;
@@ -3031,7 +2946,7 @@ impl MessagesPanel {
         if !matches!(msg.role, DisplayRole::Thinking) {
             return false;
         }
-        let open = self.reasoning_open(msg, idx);
+        let open = self.reasoning_open(msg);
         self.messages[idx].reasoning_open = Some(!open);
         self.rebuild_thinking_segment(idx, width);
         true
@@ -3041,28 +2956,27 @@ impl MessagesPanel {
         let Some(message) = self.messages.get(msg_idx).cloned() else {
             return;
         };
-        let (lines, links, provenance, diagrams, search_text) =
-            if !self.reasoning_open(&message, msg_idx) {
-                let lines =
-                    self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
-                let links = LinkMap::none_for(&lines);
-                (
-                    lines,
-                    links,
-                    None,
-                    Vec::new(),
-                    format!("thinking> {}", message.text),
-                )
-            } else {
-                let built = build_message_lines(&message, width, self.pans_for(msg_idx));
-                (
-                    built.lines,
-                    built.links,
-                    built.provenance,
-                    built.diagrams,
-                    built.search_text,
-                )
-            };
+        let (lines, links, provenance, diagrams, search_text) = if !self.reasoning_open(&message) {
+            let lines =
+                self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
+            let links = LinkMap::none_for(&lines);
+            (
+                lines,
+                links,
+                None,
+                Vec::new(),
+                format!("thinking> {}", message.text),
+            )
+        } else {
+            let built = build_message_lines(&message, width, self.pans_for(msg_idx));
+            (
+                built.lines,
+                built.links,
+                built.provenance,
+                built.diagrams,
+                built.search_text,
+            )
+        };
         let seg_idx = self
             .cache
             .segments()
@@ -3189,7 +3103,7 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks, last_idx);
                 }
             } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && !self.reasoning_open(msg, i) {
+                if matches!(&msg.role, DisplayRole::Thinking) && !self.reasoning_open(msg) {
                     let (text, duration) = (msg.text.clone(), msg.thinking_duration);
                     let lines = self.build_cached_thinking_indicator(&text, duration);
                     let search_text = format!("thinking> {text}");
@@ -3320,9 +3234,10 @@ impl MessagesPanel {
             return;
         };
 
-        let collapsed = self.messages.get(msg_idx).is_some_and(|m| {
-            matches!(m.role, DisplayRole::Thinking) && !self.reasoning_open(m, msg_idx)
-        });
+        let collapsed = self
+            .messages
+            .get(msg_idx)
+            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && !self.reasoning_open(m));
         if collapsed {
             // Geometry is width-independent, but `width_changed` also fires on
             // theme changes; rebuild so spans pick up the new palette.

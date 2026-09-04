@@ -67,24 +67,6 @@ impl RenderCursor {
         self.terminal_links
     }
 
-    /// Advances past rows that are part of the layout but have nothing to
-    /// draw, which is what keeps a closed card from pulling the transcript
-    /// up under the reader.
-    pub fn skip_rows(&mut self, rows: u16) {
-        if rows == 0 {
-            return;
-        }
-        if self.skip >= rows {
-            self.skip -= rows;
-            return;
-        }
-        let visible = rows
-            .saturating_sub(self.skip)
-            .min(self.bottom.saturating_sub(self.y));
-        self.skip = 0;
-        self.y += visible;
-    }
-
     pub fn render(
         &mut self,
         content: (&[Line<'static>], Option<&LinkMap>),
