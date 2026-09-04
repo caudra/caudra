@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
     CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
@@ -784,7 +784,13 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
-    let spec = req.value.0.to_string();
+    let spec = req
+        .value
+        .as_value_id()
+        .ok_or_else(|| {
+            AcpError::invalid_params().data(json_str(&"config option expects a value id"))
+        })?
+        .to_string();
     if !srv.model_policy.allows(&spec) {
         return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
     }
@@ -1161,7 +1167,7 @@ mod tests {
 
         assert_eq!(
             error.code,
-            agent_client_protocol_schema::ErrorCode::Other(SESSION_IN_USE_ERROR_CODE)
+            agent_client_protocol_schema::v1::ErrorCode::Other(SESSION_IN_USE_ERROR_CODE)
         );
         assert!(error.message.contains(&id.to_string()));
     }
