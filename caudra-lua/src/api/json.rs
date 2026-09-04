@@ -43,7 +43,7 @@ impl UserData for LuaSchemaValidator {
                 .validator
                 .iter_errors(&json)
                 .map(|e| {
-                    let path = e.instance_path.to_string();
+                    let path = e.instance_path().to_string();
                     if path.is_empty() {
                         e.to_string()
                     } else {
