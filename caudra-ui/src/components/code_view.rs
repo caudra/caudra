@@ -421,6 +421,17 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
 /// A batch reads as a list of what it ran. Each child gets the indicator and
 /// `tool> summary` line the transcript would show it with, then its own body
 /// indented under it, so a child looks the same here as it does standalone.
+///
+/// Spacing follows the transcript's own rule: a row that carries nothing but
+/// itself is a list entry and stacks flush against its neighbours, while one
+/// with a body has stopped being an entry and takes a blank row on both sides.
+///
+/// The transcript separates a row that merely wraps, which this cannot: these
+/// are logical lines and the wrapping happens downstream, at a width no one
+/// here knows. It reads as the list anyway, because every child opens in the
+/// marker column and a continuation line does not, which is the distinction
+/// the blank row was buying. Threading a width in would also put the gaps back
+/// exactly where they are worst, since a long search header is what wraps.
 fn render_batch(
     entries: &[BatchToolEntry],
     highlight: bool,
@@ -429,11 +440,19 @@ fn render_batch(
     let t = theme::current();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
+    let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
-        if !lines.is_empty() {
+        let view = limits.child_view(index);
+        // Resolved before the summary row so the separator below knows whether
+        // this child is a list entry or a block.
+        let body = (view != ChildView::Folded)
+            .then(|| child_body(entry, highlight, &limits.for_child(view, &entry.tool)));
+        let has_body = body.as_ref().is_some_and(|(body, _)| !body.is_empty());
+        if !lines.is_empty() && (previous_has_body || has_body) {
             lines.push(Line::default());
             rows.push(None);
         }
+        previous_has_body = has_body;
         let (marker, style) = match entry.status {
             BatchToolStatus::Pending => (BATCH_PENDING_MARKER, t.tool_dim),
             BatchToolStatus::Running => (BATCH_RUNNING_MARKER, t.spinner),
@@ -456,22 +475,19 @@ fn render_batch(
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        let view = limits.child_view(index);
         if view == ChildView::Folded {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
         rows.push(Some(RowTarget::BatchChild(index)));
-        if view == ChildView::Folded {
-            continue;
+        if let Some((body, truncated)) = body {
+            // A body only answers to a click when there is something behind it
+            // to show, or something already shown to put back.
+            let target =
+                (truncated || view == ChildView::Expanded).then_some(RowTarget::BatchBody(index));
+            rows.resize(rows.len() + body.len(), target);
+            lines.extend(indent_all(body));
         }
-        let (body, truncated) = child_body(entry, highlight, &limits.for_child(view, &entry.tool));
-        // A body only answers to a click when there is something behind it to
-        // show, or something already shown to put back.
-        let target =
-            (truncated || view == ChildView::Expanded).then_some(RowTarget::BatchBody(index));
-        rows.resize(rows.len() + body.len(), target);
-        lines.extend(indent_all(body));
     }
     (lines, rows)
 }
@@ -2071,6 +2087,55 @@ mod tests {
             Some(annotation) => assert!(row.contains(annotation), "{CHILD_COUNT_MSG}: {row:?}"),
             None => assert!(!row.contains('('), "{CHILD_COUNT_MSG}: {row:?}"),
         }
+    }
+
+    const BATCH_TIGHT_MSG: &str = "a roster of folded calls must stack like the list it is";
+    const BATCH_BODY_AIR_MSG: &str = "a child carrying a body must be set off from its neighbours";
+
+    fn blank_rows(lines: &[Line<'static>]) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_text(line).is_empty())
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// Every child was separated by a blank row whether or not it had anything
+    /// under it, so a roster of folded calls was drawn at twice its height and
+    /// read as unrelated cards rather than one list. Outside a batch the same
+    /// rows stack flush.
+    #[test]
+    fn folded_children_stack_the_way_the_transcript_stacks_them() {
+        let (lines, rows) = batch(BatchViews::default());
+
+        assert!(blank_rows(&lines).is_empty(), "{BATCH_TIGHT_MSG}");
+        assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
+    }
+
+    /// The other half of the transcript's rule: a row with a body is no longer
+    /// a list entry, and running it flush into its neighbours hides where the
+    /// body starts and ends.
+    #[test]
+    fn a_child_with_a_body_keeps_the_air_around_it() {
+        let entries = [
+            batch_entry("read", 1),
+            batch_entry("read", 2),
+            batch_entry("read", 1),
+        ];
+        let (lines, rows) = render_batch(
+            &entries,
+            false,
+            &RenderLimits::new(
+                SectionFlags::default(),
+                PARENT_BUDGET,
+                BatchViews::new([(1, ChildView::Budgeted)]),
+                budgets(ROOMY, ROOMY),
+            ),
+        );
+
+        assert_eq!(blank_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
+        assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
     }
 
     /// Opening the card is a statement about everything in it.
