@@ -138,8 +138,8 @@ flume = { version = "0.12", default-features = false, features = ["async", "sele
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1"
+toml_edit = "0.25"
 smol = "2"
 async-process = "2"
 async-lock = "3"
