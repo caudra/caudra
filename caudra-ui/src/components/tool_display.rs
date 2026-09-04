@@ -25,7 +25,7 @@ use caudra_agent::{
     BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle, SubagentProgress,
     ToolInput, ToolOutput,
 };
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::render_worker::RenderWorker;
@@ -64,6 +64,9 @@ const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
 const COMPACT_FALLBACK_SIGIL: char = '⚙';
 const COMPACT_ARG_LIMIT: usize = 3;
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
+/// The tools whose header is built from a pattern the model wrote.
+const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
+const QUERY_KEY: &str = "pattern";
 
 /// How a tool names itself on a compact row. The `name> ` prefix is gone
 /// there, so `label` is what identifies the call, and `header_keys` are the
@@ -132,6 +135,38 @@ fn same_key(left: &str, right: &str) -> bool {
             .collect::<String>()
     };
     normalize(left) == normalize(right)
+}
+
+/// A search header opens with the pattern and continues `in <path>`, so the
+/// text searched for and the sentence built around it arrive as one string.
+/// A pattern may hold spaces, the word `in`, or regex punctuation, so where it
+/// ends is not recoverable from the header; the input is what still has it
+/// verbatim. Italic rather than a colour because the query is a literal, which
+/// is what italic already marks everywhere else, and because a new colour would
+/// have to mean something in every theme.
+pub(super) fn header_spans(
+    tool: &str,
+    header: &str,
+    base: Style,
+    raw_input: Option<&serde_json::Value>,
+) -> Vec<Span<'static>> {
+    let query = QUERY_TOOLS
+        .contains(&tool)
+        .then(|| raw_input?.get(QUERY_KEY)?.as_str())
+        .flatten()
+        .filter(|query| !query.is_empty() && header.starts_with(query));
+    let Some(query) = query else {
+        return vec![Span::styled(header.to_owned(), base)];
+    };
+    let mut spans = vec![Span::styled(
+        query.to_owned(),
+        base.add_modifier(Modifier::ITALIC),
+    )];
+    let rest = &header[query.len()..];
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_owned(), base));
+    }
+    spans
 }
 
 /// The same for a tool named at runtime. A batch child knows only its tool's
@@ -518,6 +553,7 @@ impl ToolLineBuilder {
         annotation: Option<&str>,
         render_header: Option<&BufferSnapshot>,
         output: Option<&ToolOutput>,
+        raw_input: Option<&serde_json::Value>,
     ) {
         let mut spans = vec![Span::styled(
             format!("{tool_name}> "),
@@ -543,7 +579,7 @@ impl ToolLineBuilder {
             } else {
                 theme::current().tool
             };
-            spans.push(Span::styled(header.to_owned(), style));
+            spans.extend(header_spans(tool_name, header, style, raw_input));
         }
         let mut copy = format!("{tool_name}> {header}");
         if let Some(ann) = annotation {
@@ -570,10 +606,16 @@ impl ToolLineBuilder {
         let label = entry.map_or(tool_name, |entry| entry.label);
 
         let mut copy = format!("{label} {header}");
-        let mut spans = vec![
-            Span::styled(format!("{label} "), theme::current().tool_prefix),
-            Span::styled(header.to_owned(), theme::current().tool),
-        ];
+        let mut spans = vec![Span::styled(
+            format!("{label} "),
+            theme::current().tool_prefix,
+        )];
+        spans.extend(header_spans(
+            tool_name,
+            header,
+            theme::current().tool,
+            raw_input,
+        ));
         if let Some(args) = compact_args(raw_input, entry.map_or(&[], |entry| entry.header_keys)) {
             copy.push_str(&args);
             spans.push(Span::styled(args, theme::current().tool_dim));
@@ -1005,6 +1047,7 @@ pub fn build_tool_lines(
             msg.annotation.as_deref(),
             msg.render_header.as_ref(),
             msg.tool_output.as_deref(),
+            msg.tool_raw_input.as_deref(),
         );
         b.prepend_indicator(rctx.started_at);
     }
@@ -1134,7 +1177,7 @@ pub fn build_instructions_lines(
         // A loaded instruction card has no children to look themselves up.
         ToolOutputLines::default(),
     );
-    b.push_header("load", header, annotation.as_deref(), None, None);
+    b.push_header("load", header, annotation.as_deref(), None, None, None);
     b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
@@ -2781,5 +2824,81 @@ mod tests {
         let header_line = tl.lines.first().expect("header line");
         let dot = header_line.spans.last().expect("baked dot span");
         assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    const GREP_TOOL: &str = "file_grep";
+    const READ_TOOL: &str = "file_read";
+    const QUERY_MARK_MSG: &str =
+        "the text searched for must be marked off from the sentence built around it";
+
+    fn header_parts(
+        tool: &str,
+        header: &str,
+        raw_input: Option<serde_json::Value>,
+    ) -> Vec<(bool, String)> {
+        header_spans(tool, header, Style::default(), raw_input.as_ref())
+            .iter()
+            .map(|span| {
+                (
+                    span.style.add_modifier.contains(Modifier::ITALIC),
+                    span.content.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `pattern in path` arrives as one string, and a pattern may hold spaces
+    /// or the very word the header joins it with, so cutting the header text
+    /// would cut in the wrong place. The input is what still knows where the
+    /// query ends.
+    #[test_case(
+        "pub mod in caudra-agent/src", "pub mod",
+        &[(true, "pub mod"), (false, " in caudra-agent/src")]
+        ; "the query is marked off from its root"
+    )]
+    #[test_case(
+        "mod in src in caudra-ui", "mod in src",
+        &[(true, "mod in src"), (false, " in caudra-ui")]
+        ; "a pattern holding the joining word splits at its own end"
+    )]
+    #[test_case(
+        "fn main", "fn main",
+        &[(true, "fn main")]
+        ; "a rootless search is all query and gains no empty tail"
+    )]
+    fn a_search_header_marks_the_text_it_searched_for(
+        header: &str,
+        pattern: &str,
+        expected: &[(bool, &str)],
+    ) {
+        let parts = header_parts(
+            GREP_TOOL,
+            header,
+            Some(serde_json::json!({ "pattern": pattern })),
+        );
+        let expected: Vec<(bool, String)> = expected
+            .iter()
+            .map(|(italic, text)| (*italic, (*text).to_owned()))
+            .collect();
+
+        assert_eq!(parts, expected, "{QUERY_MARK_MSG}");
+    }
+
+    /// Marking a run of the header only says something when it is known to be
+    /// the query, so everything else is left as the one span it was.
+    #[test_case(READ_TOOL, "src/main.rs", Some(serde_json::json!({ "file_path": "src/main.rs" })) ; "a path is not a query")]
+    #[test_case(GREP_TOOL, "needle in src", None ; "a session that kept no input")]
+    #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "other" })) ; "a header that does not open with the pattern")]
+    #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "" })) ; "an empty pattern marks nothing")]
+    fn a_header_with_no_query_to_mark_stays_one_span(
+        tool: &str,
+        header: &str,
+        raw_input: Option<serde_json::Value>,
+    ) {
+        assert_eq!(
+            header_parts(tool, header, raw_input),
+            vec![(false, header.to_owned())],
+            "{QUERY_MARK_MSG}"
+        );
     }
 }

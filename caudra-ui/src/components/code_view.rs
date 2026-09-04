@@ -5,7 +5,7 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
-use super::tool_display::compact_args_for;
+use super::tool_display::{compact_args_for, header_spans};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -443,12 +443,17 @@ fn render_batch(
         let mut spans = vec![
             Span::styled(marker, style),
             Span::styled(format!("{}> ", entry.tool), t.tool_prefix),
-            Span::raw(entry.summary.clone()),
         ];
+        spans.extend(header_spans(
+            &entry.tool,
+            &entry.summary,
+            Style::default(),
+            entry.raw_input.as_ref(),
+        ));
         if let Some(args) = compact_args_for(&entry.tool, entry.raw_input.as_ref()) {
             spans.push(Span::styled(args, t.tool_dim));
         }
-        if let Some(annotation) = &entry.annotation {
+        if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
         let view = limits.child_view(index);
@@ -469,6 +474,21 @@ fn render_batch(
         lines.extend(indent_all(body));
     }
     (lines, rows)
+}
+
+/// What a child row reports after its arguments. `batch` carries only the
+/// annotation the dispatch returned, which is `None` for every tool that lets
+/// its output speak instead, so a child lost the count its standalone row
+/// shows: a grep of thirty files named no matches at all. A failure is left
+/// out because its output is the error text, which the body already draws in
+/// full and which reduces to a line count here.
+fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
+    if let Some(annotation) = &entry.annotation {
+        return Some(annotation.clone());
+    }
+    (entry.status == BatchToolStatus::Success)
+        .then(|| entry.output.as_ref().and_then(ToolOutput::annotation))
+        .flatten()
 }
 
 /// A child's own rendering, structured where the tool produced structure and
@@ -2008,6 +2028,49 @@ mod tests {
             read_budget + grep_budget,
             "each child spends its own tool's budget, not the parent's"
         );
+    }
+
+    const GREP_CHILD: &str = "grep";
+    const GIVEN_ANNOTATION: &str = "cached";
+    const CHILD_COUNT_MSG: &str =
+        "a child row reports what its result holds, the way a standalone row does";
+
+    fn child_row(entry: BatchToolEntry) -> String {
+        let limits = RenderLimits::new(
+            SectionFlags::default(),
+            PARENT_BUDGET,
+            BatchViews::default(),
+            ToolOutputLines::DEFAULT,
+        );
+        line_text(&render_batch(&[entry], false, &limits).0[0])
+    }
+
+    /// The reported bug: a finished grep named no matches. `batch` copies only
+    /// the dispatch's annotation, which grep never sets, so the row that
+    /// answers how much matched was blank on the one tool whose entire result
+    /// is a count.
+    #[test_case(BatchToolStatus::Success, None, Some("(3 matches in 2 files)") ; "the result speaks for itself")]
+    #[test_case(BatchToolStatus::Success, Some(GIVEN_ANNOTATION), Some("(cached)") ; "a given annotation still wins")]
+    #[test_case(BatchToolStatus::Error, None, None ; "a failure is named by its own body")]
+    fn a_child_row_annotates_what_its_result_holds(
+        status: BatchToolStatus,
+        given: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let row = child_row(BatchToolEntry {
+            status,
+            annotation: given.map(str::to_owned),
+            output: Some(ToolOutput::GrepResult {
+                entries: grep_entries(&[("a.rs", &[1, 2_usize]), ("b.rs", &[3_usize])]),
+                capped: None,
+            }),
+            ..batch_entry(GREP_CHILD, 0)
+        });
+
+        match expected {
+            Some(annotation) => assert!(row.contains(annotation), "{CHILD_COUNT_MSG}: {row:?}"),
+            None => assert!(!row.contains('('), "{CHILD_COUNT_MSG}: {row:?}"),
+        }
     }
 
     /// Opening the card is a statement about everything in it.
