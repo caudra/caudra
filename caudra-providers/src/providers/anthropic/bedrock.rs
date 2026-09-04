@@ -536,7 +536,6 @@ impl Provider for Bedrock {
             }
             let auth = self.auth.lock().unwrap().clone();
             let requested_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
-            let long_context = requested_id.ends_with(shared::LONG_CONTEXT_SUFFIX);
             let model_id = shared::strip_long_context(&requested_id).to_string();
 
             let mut body = shared::build_request_body_with_system(
@@ -559,9 +558,6 @@ impl Provider for Bedrock {
             let mut betas = Vec::new();
             if has_examples {
                 betas.push(shared::BETA_TOOL_EXAMPLES_BEDROCK);
-            }
-            if long_context {
-                betas.push(shared::LONG_CONTEXT_BETA);
             }
             if !betas.is_empty() {
                 body["anthropic_beta"] = json!(betas);

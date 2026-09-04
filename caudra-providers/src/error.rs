@@ -52,6 +52,8 @@ impl AgentError {
     ///
     /// Provider error formats:
     /// - Anthropic:  413 "prompt is too long"  <https://docs.anthropic.com/en/docs/errors>
+    /// - Anthropic:  400 long-context entitlement refusals, which name the feature instead of
+    ///   the size; compacting below the wide window is the only way forward.
     /// - OpenAI:     400 "maximum context length is X tokens"  <https://platform.openai.com/docs/guides/error-codes>
     /// - Gemini:     400 "input token count exceeds" / "too many tokens"  <https://ai.google.dev/gemini-api/docs/troubleshooting>
     /// - Ollama:     400 "context length exceeded"  <https://docs.ollama.com/api/errors>
@@ -79,7 +81,9 @@ impl AgentError {
                     || m.contains("too long")
                     || m.contains("too many")
                     || m.contains("maximum");
-                is_scope && is_overflow
+                let is_long_context_entitlement =
+                    m.contains("long context") && !m.contains("out of extra usage");
+                (is_scope && is_overflow) || is_long_context_entitlement
             }
             _ => false,
         }
@@ -241,6 +245,10 @@ mod tests {
     // Bedrock: https://repost.aws/knowledge-center/bedrock-validation-exception-errors
     #[test_case(400, "Input is too long for requested model.", true                                                          ; "bedrock")]
     #[test_case(400, "Input is too long for the model", true                                              ; "too_long_input")]
+    // Anthropic: long-context entitlement refusals name the feature, not the size
+    #[test_case(400, "Extra usage is required for long context requests", true                            ; "anthropic_long_context_entitlement")]
+    #[test_case(400, "The long context beta is not yet available for this account", true                  ; "anthropic_long_context_beta")]
+    #[test_case(400, "You're out of extra usage for long context requests", false                         ; "anthropic_extra_usage_exhausted")]
     #[test_case(400, "Rate limit exceeded", false                                                         ; "not_context")]
     #[test_case(400, "Invalid API key", false                                                             ; "auth_error")]
     #[test_case(500, "Internal server error", false                                                       ; "server_error")]

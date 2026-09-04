@@ -41,7 +41,7 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
 
-const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
+const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 376k working window, which keeps cost and latency bounded while leaving plenty of room before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size."#;
 
 const ANTHROPIC_OAUTH_NOTE: &str = r#"Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 

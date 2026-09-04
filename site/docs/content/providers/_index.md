@@ -50,15 +50,15 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 |------|--------|-------------------------------|---------|
 | Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
 | Medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 200K ctx / 128K out |
+| Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 376K ctx / 64K out |
+| Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 376K ctx / 128K out |
 | Medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
 | Strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
+| Strong | claude-opus-4-6 | $5.00 / $25.00 | 376K ctx / 128K out |
+| Strong | claude-opus-4-7 | $5.00 / $25.00 | 376K ctx / 128K out |
+| Strong | claude-opus-4-8 | $5.00 / $25.00 | 376K ctx / 128K out |
+| Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 376K ctx / 128K out |
+| Strong | claude-fable-5 | $10.00 / $50.00 | 376K ctx / 128K out |
 | Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
@@ -67,7 +67,7 @@ Run `caudra auth login anthropic` to sign in to a Claude subscription through br
 
 This experimental flow uses Claude Code's public client registration. Anthropic limits Pro and Max subscription tokens to official clients in its terms. The flow may stop working when Anthropic changes its OAuth or request protocol.
 
-Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
+Recent Claude models accept up to 1M tokens. Caudra runs them at a 376k working window, which keeps cost and latency bounded while leaving plenty of room before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size.
 
 #### Amazon Bedrock
 

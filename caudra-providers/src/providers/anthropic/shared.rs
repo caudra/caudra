@@ -23,12 +23,16 @@ pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 /// an unknown-window model is ever routed here; 32k is safe for every Claude.
 pub(crate) const FALLBACK_MAX_TOKENS: u32 = 32_000;
 
-/// A `-1m` suffix is our own convention for asking Anthropic for the 1M context
-/// window. We strip it from the id before sending and add [`LONG_CONTEXT_BETA`]
-/// to the request instead.
+/// A `-1m` suffix is our own convention for asking Anthropic for the full 1M
+/// context window. The API has never heard of the suffix, so we strip it from
+/// the id before sending.
 pub(crate) const LONG_CONTEXT_SUFFIX: &str = "-1m";
-pub(crate) const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
 pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
+
+/// Long-context models accept 1M tokens natively, with no beta header. This is
+/// the working window we run them at, capped well below that ceiling to bound
+/// cost and latency, the same way `GPT_5_6_CONTEXT_WINDOW` caps OpenAI's.
+pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 376_000;
 
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
@@ -661,7 +665,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(64000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
@@ -680,7 +684,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -735,7 +739,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
@@ -754,7 +758,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -775,7 +779,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -796,7 +800,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -814,7 +818,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(128000),
-            context_window: 200_000,
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -866,8 +870,8 @@ mod tests {
     }
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, canonical_tool_name, long_context_window,
-        oauth_tool_name, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW, canonical_tool_name,
+        long_context_window, oauth_tool_name, strip_long_context,
     };
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
@@ -881,6 +885,22 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    const NARROW_CONTEXT_WINDOW: u32 = 200_000;
+
+    #[test_case("anthropic/claude-sonnet-4-6", WIDE_CONTEXT_WINDOW   ; "sonnet_4_6_is_wide")]
+    #[test_case("anthropic/claude-sonnet-5", WIDE_CONTEXT_WINDOW     ; "sonnet_5_is_wide")]
+    #[test_case("anthropic/claude-opus-4-8", WIDE_CONTEXT_WINDOW     ; "opus_4_8_is_wide")]
+    #[test_case("anthropic/claude-opus-5", WIDE_CONTEXT_WINDOW       ; "opus_5_is_wide")]
+    #[test_case("anthropic/claude-fable-5", WIDE_CONTEXT_WINDOW      ; "fable_5_is_wide")]
+    #[test_case("anthropic/claude-opus-4-5", NARROW_CONTEXT_WINDOW   ; "opus_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW ; "sonnet_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW  ; "haiku_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW    ; "suffix_still_opts_into_the_ceiling")]
+    fn context_window_matches_the_declared_tier(spec: &str, expected: u32) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.context_window, expected);
     }
 
     #[test_case("bash" ; "builtin")]

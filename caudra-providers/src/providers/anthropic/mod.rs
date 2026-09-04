@@ -560,7 +560,6 @@ impl Anthropic {
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         fast: bool,
-        long_context: bool,
         session_id: Option<&SessionRef>,
         oauth_tool_names: Option<&HashMap<String, String>>,
     ) -> Result<StreamResponse, AgentError> {
@@ -579,9 +578,6 @@ impl Anthropic {
         }
         if fast {
             betas.push(FAST_MODE_BETA);
-        }
-        if long_context {
-            betas.push(shared::LONG_CONTEXT_BETA);
         }
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
@@ -743,12 +739,11 @@ impl Provider for Anthropic {
                 None
             };
             let fast = apply_fast_mode(&mut body, model, &opts);
-            let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
 
-            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, "sending API request");
             if !self.is_oauth() {
                 return self
-                    .do_stream_request(&body, event_tx, fast, long_context, session_id, None)
+                    .do_stream_request(&body, event_tx, fast, session_id, None)
                     .await;
             }
 
@@ -760,7 +755,6 @@ impl Provider for Anthropic {
                         &body,
                         &relay_tx,
                         fast,
-                        long_context,
                         session_id,
                         oauth_tool_names.as_ref(),
                     )
@@ -788,7 +782,6 @@ impl Provider for Anthropic {
                         &body,
                         event_tx,
                         fast,
-                        long_context,
                         session_id,
                         oauth_tool_names.as_ref(),
                     )
