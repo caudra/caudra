@@ -1346,7 +1346,7 @@ fn file_permissions(
 }
 
 fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvocation {
-    let opaque = shell.analysis().opaque || shell_command_has_redirection(shell.command());
+    let opaque = shell.analysis().opaque || shell_command_hides_operands(shell.command());
     let workdir = shell.workdir().to_string_lossy().into_owned();
     let scopes = if opaque || shell.analysis().scopes.is_empty() {
         vec![shell_permission_scope(shell.command(), shell.workdir())]
@@ -1385,16 +1385,15 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
             }
         })
         .collect();
-    let authority = if opaque {
-        PermissionAuthorityProfile::ExactOnly
-    } else {
-        PermissionAuthorityProfile::Shell
-    };
     PreparedInvocation {
         intent: PermissionIntent::new(
+            // Opaque commands carry `requires_prompt` instead of forcing a prompt on
+            // the whole request: scope allows and configured command allows still
+            // cannot cover them, while an explicitly confirmed structured authority
+            // can.
             PermissionScopes {
                 scopes,
-                force_prompt: opaque,
+                force_prompt: false,
             },
             resources,
             if opaque {
@@ -1403,55 +1402,103 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
                 PermissionRisk::High
             },
         )
-        .with_authority(authority),
+        .with_authority(PermissionAuthorityProfile::Shell),
         execution: PreparedExecution::Shell(group, shell),
         mutation_targets: Vec::new(),
     }
 }
 
-fn shell_command_has_redirection(command: &str) -> bool {
-    if command.contains("$'") || command.contains("$\"") {
-        return true;
-    }
-    let mut single_quoted = false;
-    let mut double_quoted = false;
+/// Reports whether a command carries operands that the analyzed scopes drop.
+///
+/// Shell analysis strips redirection nodes from each scope's source, so a file
+/// redirect, heredoc, or here-string would leave the reviewed text describing
+/// less than the command actually does. File descriptor duplication such as
+/// `2>&1` names no operand and stays reviewable.
+fn shell_command_hides_operands(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0;
     let mut comment_eligible = true;
-    let mut chars = command.chars();
-    while let Some(character) = chars.next() {
-        match character {
-            '\\' if !single_quoted => {
-                chars.next();
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\\' => {
+                index += 2;
                 comment_eligible = false;
             }
-            '\'' if !double_quoted => {
-                single_quoted = !single_quoted;
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                index = skip_quoted(bytes, index + 2, b'\'', true);
                 comment_eligible = false;
             }
-            '"' if !single_quoted => {
-                double_quoted = !double_quoted;
+            b'\'' => {
+                index = skip_quoted(bytes, index + 1, b'\'', false);
                 comment_eligible = false;
             }
-            '#' if !single_quoted && !double_quoted && comment_eligible => {
-                for character in chars.by_ref() {
-                    if character == '\n' {
-                        comment_eligible = true;
-                        break;
-                    }
+            b'"' => {
+                index = skip_quoted(bytes, index + 1, b'"', true);
+                comment_eligible = false;
+            }
+            b'#' if comment_eligible => {
+                index = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+            }
+            b'<' | b'>' => {
+                if !duplicates_descriptor(bytes, index) {
+                    return true;
                 }
+                index += 2;
+                comment_eligible = false;
             }
-            '<' | '>' if !single_quoted && !double_quoted => return true,
-            '\n' if !single_quoted && !double_quoted => comment_eligible = true,
-            character if !single_quoted && !double_quoted && character.is_whitespace() => {
+            b';' | b'|' | b'&' | b'(' | b')' => {
+                index += 1;
                 comment_eligible = true;
             }
-            ';' | '|' | '&' | '(' | ')' if !single_quoted && !double_quoted => {
-                comment_eligible = true;
+            _ => {
+                comment_eligible = byte.is_ascii_whitespace();
+                index += 1;
             }
-            _ if !single_quoted && !double_quoted => comment_eligible = false,
-            _ => {}
         }
     }
     false
+}
+
+/// Advances past a quoted span, optionally honoring backslash escapes.
+fn skip_quoted(bytes: &[u8], mut index: usize, terminator: u8, escapes: bool) -> usize {
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\\' if escapes => index += 2,
+            byte if byte == terminator => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+/// Reports whether the redirect at `index` targets a descriptor rather than a file.
+///
+/// `>&` and `<&` duplicate or close a descriptor when followed by a digit run or
+/// `-`; any other word is a file target that redirects both streams.
+fn duplicates_descriptor(bytes: &[u8], index: usize) -> bool {
+    if bytes.get(index + 1) != Some(&b'&') {
+        return false;
+    }
+    let mut cursor = index + 2;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let digits = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == digits && bytes.get(cursor) != Some(&b'-') {
+        return false;
+    }
+    if bytes.get(cursor) == Some(&b'-') {
+        cursor += 1;
+    }
+    bytes.get(cursor).is_none_or(|byte| {
+        byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>')
+    })
 }
 
 fn exact_custom_prepared(
@@ -2093,18 +2140,30 @@ mod tests {
     #[test_case("git status > /tmp/status", true; "output_redirect")]
     #[test_case("> /tmp/status git status", true; "leading_redirect")]
     #[test_case("cat 2>>errors", true; "fd_redirect")]
+    #[test_case("cat >| clobber", true; "clobbering_redirect")]
+    #[test_case("cat &> combined", true; "combined_redirect")]
+    #[test_case("cat >& combined", true; "descriptor_syntax_file_target")]
+    #[test_case("cat >&2log", true; "descriptor_prefixed_file_target")]
     #[test_case("cat <input", true; "input_redirect")]
     #[test_case("cat <<EOF\nvalue\nEOF", true; "heredoc")]
     #[test_case("cat <<<value", true; "here_string")]
     #[test_case("git status # '\n> victim", true; "quote_in_comment_before_redirect")]
     #[test_case("printf foo#bar > output", true; "hash_inside_word_before_redirect")]
+    #[test_case(r"printf $'a\'b' > output", true; "redirect_after_ansi_c_quote")]
+    #[test_case("cargo check 2>&1 | head -40", false; "stderr_to_stdout")]
+    #[test_case("cargo check >&2", false; "stdout_to_stderr")]
+    #[test_case("cargo check 1>&2", false; "explicit_stdout_to_stderr")]
+    #[test_case("exec 3<&0", false; "input_descriptor_duplicate")]
+    #[test_case("cargo check >& 2", false; "spaced_descriptor_duplicate")]
+    #[test_case("cargo check 2>&-", false; "descriptor_close")]
     #[test_case("printf ok # > ignored", false; "redirect_inside_comment")]
     #[test_case("printf '%s > %s' left right", false; "single_quoted_literal")]
     #[test_case(r#"printf ">""#, false; "double_quoted_literal")]
     #[test_case(r"printf \>", false; "escaped_literal")]
-    #[test_case(r"printf $'a\'b'", true; "ansi_c_quoted_command")]
-    fn shell_redirections_require_exact_authority(command: &str, expected: bool) {
-        assert_eq!(shell_command_has_redirection(command), expected);
+    #[test_case(r"printf $'a\'b'", false; "ansi_c_quoted_literal")]
+    #[test_case(r"printf $'>'", false; "ansi_c_quoted_redirect_literal")]
+    fn shell_commands_hiding_operands_require_exact_authority(command: &str, expected: bool) {
+        assert_eq!(shell_command_hides_operands(command), expected);
     }
 
     #[test_case("/usr/bin/git status"; "absolute_executable")]
@@ -2153,12 +2212,34 @@ mod tests {
             .expect("shell preflight")
             .expect("shell permission intent");
 
-        assert!(intent.scopes.force_prompt);
-        assert_eq!(intent.authority, PermissionAuthorityProfile::ExactOnly);
+        assert!(!intent.scopes.force_prompt);
+        assert_eq!(intent.authority, PermissionAuthorityProfile::Shell);
         assert_eq!(intent.resources.len(), 1);
         assert_eq!(intent.resources[0].value, command);
         assert!(intent.resources[0].protected);
         assert!(intent.resources[0].requires_prompt);
+    }
+
+    #[test]
+    fn shell_descriptor_duplication_stays_reviewable() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": "cargo check --all-targets 2>&1"}))
+            .expect("valid shell input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("shell preflight")
+            .expect("shell permission intent");
+
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(intent.resources[0].value, "cargo check --all-targets");
+        assert!(!intent.resources[0].protected);
+        assert!(!intent.resources[0].requires_prompt);
     }
 
     fn shell_output(exit_code: i32) -> WorkcellShellOutput {

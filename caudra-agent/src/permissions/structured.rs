@@ -21,6 +21,7 @@ pub use caudra_storage::permission_state::{
 const NATIVE_OWNER: &str = "caudra";
 const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;
+const LISTED_COMMANDS_MAX: usize = 3;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = super::NORMALIZED_COMMAND_ATTRIBUTE;
@@ -529,22 +530,7 @@ pub fn resource_constraint_matches(
     {
         return false;
     }
-    if resource.protected
-        && (constraint.protected != Some(true)
-            || !matches!(
-                constraint.selector,
-                PermissionResourceSelector::Exact { .. }
-                    | PermissionResourceSelector::Digest { .. }
-            )
-            || constraint.attributes.len() != resource.attributes.len()
-            || constraint.attributes.values().any(|selector| {
-                !matches!(
-                    selector,
-                    PermissionResourceSelector::Exact { .. }
-                        | PermissionResourceSelector::Digest { .. }
-                )
-            }))
-    {
+    if resource.protected && !protected_coverage_allowed(constraint, resource) {
         return false;
     }
     if !selector_matches(&constraint.selector, &resource.value, &resource.kind) {
@@ -560,6 +546,39 @@ pub fn resource_constraint_matches(
             selector_matches(selector, value, &kind)
         })
     })
+}
+
+/// Reports whether a constraint is specific enough to cover a protected resource.
+///
+/// Protected resources normally demand an exact or digest selector with every
+/// attribute pinned the same way. Protected commands additionally accept the
+/// blanket `Any` selector, which reaches a saved rule only through a typed
+/// broad shell confirmation, so redirects and heredocs stop prompting once the
+/// user grants arbitrary command execution. Command patterns stay excluded
+/// because the reviewed text of a protected command describes more than the
+/// pattern does.
+fn protected_coverage_allowed(
+    constraint: &PermissionResourceConstraint,
+    resource: &PermissionResource,
+) -> bool {
+    if resource.kind == PermissionResourceKind::Command
+        && matches!(constraint.selector, PermissionResourceSelector::Any)
+    {
+        return true;
+    }
+    constraint.protected == Some(true)
+        && matches!(
+            constraint.selector,
+            PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. }
+        )
+        && constraint.attributes.len() == resource.attributes.len()
+        && constraint.attributes.values().all(|selector| {
+            matches!(
+                selector,
+                PermissionResourceSelector::Exact { .. }
+                    | PermissionResourceSelector::Digest { .. }
+            )
+        })
 }
 
 pub fn permission_rule_covers_request(
@@ -1448,71 +1467,93 @@ fn rule_options(
         && !resources.is_empty()
         && resources
             .iter()
-            .all(|resource| resource.kind == PermissionResourceKind::Command && !resource.protected)
+            .all(|resource| resource.kind == PermissionResourceKind::Command)
     {
-        options.push(option(
-            "allow_exact_commands",
-            "These commands in this workdir",
-            "Allow the reviewed commands and workdir with different timeout or display controls.",
-            StructuredPermissionEffect::Allow,
-            exact_resource_constraints(resources),
-            PermissionArgumentConstraint::Unconstrained,
-            reusable.clone(),
-            true,
-            false,
-            None,
-        ));
-        let mut patterns = Vec::new();
-        let mut exact_fallbacks = 0;
-        let pattern_constraints = exact_resource_constraints(resources)
-            .into_iter()
-            .zip(resources)
-            .map(|(mut constraint, resource)| {
-                if let Some(pattern) = super::command_pattern::reusable_prefix(&resource.value) {
-                    if !patterns.contains(&pattern) {
-                        patterns.push(pattern.clone());
-                    }
-                    constraint.selector = PermissionResourceSelector::CommandPattern { pattern };
-                } else {
-                    exact_fallbacks += 1;
-                }
-                constraint
-            })
-            .collect();
-        if !patterns.is_empty() {
-            let label = if patterns.len() == 1 && exact_fallbacks == 0 {
-                format!(
-                    "Any `{}` command in this workdir",
-                    patterns[0].strip_suffix(" *").unwrap_or(&patterns[0])
-                )
-            } else {
-                "These command patterns in this workdir".into()
-            };
-            let summaries = patterns
-                .iter()
-                .map(|pattern| safe_summary(pattern))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let description = if exact_fallbacks == 0 {
-                format!("Allow commands matching these patterns in this workdir: {summaries}.")
-            } else {
-                format!(
-                    "Allow commands matching these patterns in this workdir: {summaries}. Keep {exact_fallbacks} exact fallback command{}.",
-                    if exact_fallbacks == 1 { "" } else { "s" }
-                )
-            };
+        let workdir_label = resources
+            .first()
+            .and_then(|resource| resource.attributes.get("workdir"))
+            .map_or_else(
+                || "this workdir".to_owned(),
+                |workdir| safe_summary(workdir),
+            );
+        // Protected commands were reviewed as whole command lines because analysis
+        // dropped operands, so only the blanket options below describe them
+        // truthfully.
+        if resources.iter().all(|resource| !resource.protected) {
             options.push(option(
-                "allow_command_patterns",
-                &label,
-                &description,
+                "allow_exact_commands",
+                if resources.len() == 1 {
+                    "This command in this workdir"
+                } else {
+                    "These commands in this workdir"
+                },
+                &format!(
+                    "Allow {} in {workdir_label} with different timeout or display controls.",
+                    listed_commands(resources.iter().map(|resource| resource.value.as_str()))
+                ),
                 StructuredPermissionEffect::Allow,
-                pattern_constraints,
+                exact_resource_constraints(resources),
                 PermissionArgumentConstraint::Unconstrained,
                 reusable.clone(),
                 true,
                 false,
                 None,
             ));
+            let mut patterns = Vec::new();
+            let mut exact_fallbacks = Vec::new();
+            let pattern_constraints = exact_resource_constraints(resources)
+                .into_iter()
+                .zip(resources)
+                .map(|(mut constraint, resource)| {
+                    if let Some(pattern) = super::command_pattern::reusable_prefix(&resource.value)
+                    {
+                        if !patterns.contains(&pattern) {
+                            patterns.push(pattern.clone());
+                        }
+                        constraint.selector =
+                            PermissionResourceSelector::CommandPattern { pattern };
+                    } else {
+                        exact_fallbacks.push(resource.value.as_str());
+                    }
+                    constraint
+                })
+                .collect();
+            if !patterns.is_empty() {
+                let label = if patterns.len() == 1 && exact_fallbacks.is_empty() {
+                    format!(
+                        "Any `{}` command in this workdir",
+                        patterns[0].strip_suffix(" *").unwrap_or(&patterns[0])
+                    )
+                } else {
+                    "These command patterns in this workdir".into()
+                };
+                let summaries = patterns
+                    .iter()
+                    .map(|pattern| safe_summary(pattern))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut description = format!(
+                    "Allow commands matching these patterns in {workdir_label}: {summaries}."
+                );
+                if !exact_fallbacks.is_empty() {
+                    description.push_str(&format!(
+                        " Also allow {} exactly as reviewed.",
+                        listed_commands(exact_fallbacks.iter().copied())
+                    ));
+                }
+                options.push(option(
+                    "allow_command_patterns",
+                    &label,
+                    &description,
+                    StructuredPermissionEffect::Allow,
+                    pattern_constraints,
+                    PermissionArgumentConstraint::Unconstrained,
+                    reusable.clone(),
+                    true,
+                    false,
+                    None,
+                ));
+            }
         }
         if let Some(workdir) = resources
             .first()
@@ -1530,7 +1571,7 @@ fn rule_options(
                     kind: PermissionResourceKind::Command,
                     selector: PermissionResourceSelector::Any,
                     access: Some(PermissionResourceAccess::Execute),
-                    protected: Some(false),
+                    protected: None,
                     attributes: BTreeMap::from([(
                         "workdir".into(),
                         PermissionResourceSelector::Digest {
@@ -1558,7 +1599,7 @@ fn rule_options(
                 kind: PermissionResourceKind::Command,
                 selector: PermissionResourceSelector::Any,
                 access: Some(PermissionResourceAccess::Execute),
-                protected: Some(false),
+                protected: None,
                 attributes: BTreeMap::new(),
             }],
             PermissionArgumentConstraint::Unconstrained,
@@ -1866,6 +1907,21 @@ fn safe_summary(value: &str) -> String {
     output
 }
 
+/// Renders reviewed commands as a backtick-quoted list, capped for readability.
+fn listed_commands<'a>(commands: impl ExactSizeIterator<Item = &'a str>) -> String {
+    let total = commands.len();
+    let listed = commands
+        .take(LISTED_COMMANDS_MAX)
+        .map(|command| format!("`{}`", safe_summary(command)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > LISTED_COMMANDS_MAX {
+        format!("{listed}, +{} more", total - LISTED_COMMANDS_MAX)
+    } else {
+        listed
+    }
+}
+
 fn deserialize_tool_key<'de, D>(deserializer: D) -> Result<ToolKey, D::Error>
 where
     D: Deserializer<'de>,
@@ -1881,6 +1937,7 @@ mod tests {
     use crate::tools::PermissionScopes;
     use serde_json::json;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -1931,6 +1988,14 @@ mod tests {
             protected: false,
             requires_prompt: false,
             attributes: BTreeMap::from([("workdir".into(), workdir.into())]),
+        }
+    }
+
+    fn protected_command_resource(value: &str, workdir: &str) -> PermissionResource {
+        PermissionResource {
+            protected: true,
+            requires_prompt: true,
+            ..command_resource(value, workdir)
         }
     }
 
@@ -2635,7 +2700,7 @@ mod tests {
         assert_eq!(option.label, "These command patterns in this workdir");
         assert_eq!(
             option.description,
-            "Allow commands matching these patterns in this workdir: git diff *, git status *. Keep 1 exact fallback command."
+            r#"Allow commands matching these patterns in /project: git diff *, git status *. Also allow `printf "%s\n" done` exactly as reviewed."#
         );
         assert!(option.broad);
         assert!(!option.is_default);
@@ -2670,8 +2735,6 @@ mod tests {
             assert_eq!(constraint.protected, exact.protected);
             assert_eq!(constraint.attributes, exact.attributes);
         }
-        assert!(!option.description.contains("printf"));
-        assert!(!option.description.contains("/project"));
     }
 
     #[test]
@@ -2732,6 +2795,170 @@ mod tests {
                 .iter()
                 .all(|option| option.id != "allow_command_patterns")
         );
+    }
+
+    #[test]
+    fn exact_command_option_names_every_reviewed_command_and_workdir() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![
+                command_resource("cargo test", "/project"),
+                command_resource("git status --short", "/project"),
+            ],
+            json!({"command": "multiple"}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_exact_commands")
+            .unwrap();
+
+        assert_eq!(option.label, "These commands in this workdir");
+        assert_eq!(
+            option.description,
+            "Allow `cargo test`, `git status --short` in /project with different timeout or display controls."
+        );
+    }
+
+    #[test]
+    fn exact_command_option_uses_a_singular_label_for_one_command() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("cargo test", "/project")],
+            json!({"command": "cargo test"}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_exact_commands")
+            .unwrap();
+
+        assert_eq!(option.label, "This command in this workdir");
+        assert_eq!(
+            option.description,
+            "Allow `cargo test` in /project with different timeout or display controls."
+        );
+    }
+
+    #[test]
+    fn listed_commands_cap_the_enumeration_and_escape_control_characters() {
+        let commands = ["one", "two", "three", "four\nfive"];
+
+        assert_eq!(
+            listed_commands(commands.iter().copied()),
+            "`one`, `two`, `three`, +1 more"
+        );
+        assert_eq!(
+            listed_commands(commands[3..].iter().copied()),
+            r"`four\nfive`"
+        );
+    }
+
+    #[test]
+    fn protected_commands_offer_only_exact_and_blanket_authorities() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![protected_command_resource(
+                "git status > /tmp/status",
+                "/project",
+            )],
+            json!({"command": "git status > /tmp/status"}),
+        );
+
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "allow_exact",
+                "deny_exact",
+                "allow_commands_in_workdir",
+                "allow_any_command",
+            ]
+        );
+    }
+
+    #[test_case("allow_commands_in_workdir", true; "workdir_authority")]
+    #[test_case("allow_any_command", true; "global_authority")]
+    #[test_case("allow_command_patterns", false; "pattern_authority")]
+    #[test_case("allow_exact_commands", false; "exact_command_authority")]
+    fn broad_shell_authority_reaches_protected_commands(option_id: &str, covers: bool) {
+        let reviewed = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("git status --short", "/project")],
+            json!({"command": "git status --short"}),
+        );
+        let rule = reviewed
+            .options
+            .iter()
+            .find(|option| option.id == option_id)
+            .expect("shell authority option")
+            .rule
+            .clone();
+        let protected = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![protected_command_resource(
+                "git status > /tmp/out",
+                "/project",
+            )],
+            json!({"command": "git status > /tmp/out"}),
+        );
+
+        assert_eq!(permission_rule_covers_request(&rule, &protected), covers);
+    }
+
+    #[test]
+    fn broad_shell_authority_stops_at_its_workdir() {
+        let reviewed = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("git status", "/project")],
+            json!({"command": "git status"}),
+        );
+        let rule = reviewed
+            .options
+            .iter()
+            .find(|option| option.id == "allow_commands_in_workdir")
+            .expect("workdir authority option")
+            .rule
+            .clone();
+        let elsewhere = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![protected_command_resource(
+                "git status > /tmp/out",
+                "/other",
+            )],
+            json!({"command": "git status > /tmp/out"}),
+        );
+
+        assert!(!permission_rule_covers_request(&rule, &elsewhere));
+    }
+
+    #[test_case(PermissionResourceKind::Command, true; "protected_command")]
+    #[test_case(PermissionResourceKind::File, false; "protected_file")]
+    #[test_case(PermissionResourceKind::Directory, false; "protected_directory")]
+    fn blanket_selectors_reach_protected_commands_only(
+        kind: PermissionResourceKind,
+        matches: bool,
+    ) {
+        let constraint = PermissionResourceConstraint {
+            kind: kind.clone(),
+            selector: PermissionResourceSelector::Any,
+            access: Some(PermissionResourceAccess::Execute),
+            protected: None,
+            attributes: BTreeMap::new(),
+        };
+        let resource = PermissionResource {
+            kind,
+            value: "/etc/shadow".into(),
+            access: Some(PermissionResourceAccess::Execute),
+            protected: true,
+            requires_prompt: true,
+            attributes: BTreeMap::new(),
+        };
+
+        assert_eq!(resource_constraint_matches(&constraint, &resource), matches);
     }
 
     #[test]

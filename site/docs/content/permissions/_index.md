@@ -47,7 +47,9 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Permission prompts
 
-The prompt shows the action, risk, selected authority, typed resources, and complete validated JSON before its controls. Resources already covered by another rule appear after unresolved resources with an `already allowed` marker. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible. Likely secret values and URL query values are masked.
+The prompt shows the action, risk, selected authority, and typed resources before its controls. Resources already covered by another rule appear after unresolved resources with an `already allowed` marker. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible.
+
+The validated JSON input starts collapsed to a summary of its shape and size. Press `i` to read all of it. Nothing is truncated when it is expanded. Likely secret values and URL query values are masked in both states.
 
 | Key | Action |
 |---|---|
@@ -59,6 +61,7 @@ The prompt shows the action, risk, selected authority, typed resources, and comp
 | `n` | Add guidance and deny once |
 | `d` | Deny this exact call for the project, after confirmation |
 | `D` | Deny this exact call globally, after confirmation |
+| `i` | Expand or collapse the validated JSON input |
 | `f` | Show technical identity and digest details |
 | `Esc` or `Ctrl-C` | Deny once |
 
@@ -120,7 +123,7 @@ deny = ["admin_delete"]
 
 Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
 
-Command patterns never authorize shell redirects. A command containing `<` or `>` outside quotes becomes a protected exact request that includes the complete original command. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
+Command patterns never authorize a redirect that names a file. Writing to a file, reading from a file, and heredocs all produce a protected request carrying the complete original command. File descriptor duplication such as `2>&1` names no file and stays an ordinary reviewable command. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
 
 For shell allow and ask rules, the most specific matching pattern wins and ask wins a tie. Any matching deny still blocks the complete call. Rule order in the file has no effect. A catch-all `ask = ["*"]` can therefore coexist with more specific read-only allows.
 
@@ -155,7 +158,7 @@ Every registered model tool reaches the permission manager. A tool without decla
 
 ## MCP tool calls
 
-Generic MCP tools use the complete canonical JSON input as their exact authority. The prompt never truncates the reviewed input.
+Generic MCP tools use the complete canonical JSON input as their exact authority.
 
 Caudra binds approval to one immutable MCP transport, server configuration digest, remote tool name, and discovered tool contract. A reconnect cannot switch the transport after approval. A changed description or schema creates a different contract.
 
@@ -165,11 +168,13 @@ The TUI can select broad whole-tool MCP authority for the current conversation. 
 
 ## Shell parsing
 
-Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, and functions so each command in `&&`, `||`, `;`, and pipeline expressions is authorized independently. Shell redirects keep the complete original command as protected exact authority.
+Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, and functions so each command in `&&`, `||`, `;`, and pipeline expressions is authorized independently. Analysis drops redirect operands from the reviewed text, so a command that redirects to or from a file keeps the complete original command as its protected authority.
 
 The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments rather than arbitrary text.
 
-Command substitution, process substitution, subshells, arithmetic expansion, redirects, and parse failures force exact review.
+Command substitution, process substitution, subshells, arithmetic expansion, wrappers such as `eval` and `sudo`, file redirects, heredocs, and parse failures all mark the command protected. A protected command is reviewed as one whole command line.
+
+Configured allows, scope allows, and command patterns never cover a protected command. The two unrestricted shell authorities do, because they already authorize any command the user can write, including `tee` and an interpreter reading a script from standard input. Selecting one requires the `ALLOW BROAD SHELL ACCESS` phrase. Deny rules still apply. Builtin command-family asks do not reach protected commands, so a broad grant also silences those asks for them.
 
 Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 

@@ -30,6 +30,7 @@ const KEY_GUIDE_DENY: &str = "n";
 const KEY_DENY_LOCAL: &str = "d";
 const KEY_DENY_GLOBAL: &str = "D";
 const KEY_DETAILS: &str = "f";
+const KEY_INPUT: &str = "i";
 const HINT_ENTER: &str = "Enter";
 const HINT_ESC: &str = "Esc";
 const HINT_TAB: &str = "Tab";
@@ -113,6 +114,7 @@ pub struct PermissionPrompt {
     buffer: TextBuffer,
     scroll: ModalScroll,
     full_details: bool,
+    input_expanded: bool,
     selected_option: String,
     row_hits: Vec<PromptHit>,
     mouse_down: Option<PromptTarget>,
@@ -166,6 +168,7 @@ impl PermissionPrompt {
             buffer: TextBuffer::new(String::new()),
             scroll: ModalScroll::new_top(),
             full_details: false,
+            input_expanded: false,
             selected_option: "allow_exact".into(),
             row_hits: Vec::new(),
             mouse_down: None,
@@ -348,6 +351,11 @@ impl PermissionPrompt {
             }
             KeyCode::Char('f') => {
                 self.full_details = !self.full_details;
+                self.scroll.reset();
+                None
+            }
+            KeyCode::Char('i') => {
+                self.input_expanded = !self.input_expanded;
                 self.scroll.reset();
                 None
             }
@@ -585,6 +593,7 @@ impl PermissionPrompt {
         self.buffer = TextBuffer::new(String::new());
         self.scroll.reset();
         self.full_details = false;
+        self.input_expanded = false;
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
@@ -790,6 +799,7 @@ impl PermissionPrompt {
                 }
             }
         }
+        let masked = masked_json(&request.input);
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
@@ -802,11 +812,17 @@ impl PermissionPrompt {
                 t.panel_title,
             )),
         ]);
-        lines.extend(
-            masked_json(&request.input)
-                .lines()
-                .map(|line| Line::from(format!("    {line}"))),
-        );
+        if self.input_expanded {
+            lines.extend(masked.lines().map(|line| Line::from(format!("    {line}"))));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {} · {KEY_INPUT} to expand",
+                    input_summary(&request.input, masked.len())
+                ),
+                t.tool_dim,
+            )));
+        }
 
         if self.full_details {
             lines.extend([
@@ -870,6 +886,7 @@ impl PermissionPrompt {
                 FooterRow::Hints(&[
                     (KEY_DENY_GLOBAL, "deny global"),
                     (HINT_TAB, "authority"),
+                    (KEY_INPUT, "input"),
                     (KEY_DETAILS, "details"),
                 ]),
             ],
@@ -887,6 +904,7 @@ impl PermissionPrompt {
                     (KEY_DENY_LOCAL, "Deny project"),
                     (KEY_DENY_GLOBAL, "Deny global"),
                     (HINT_TAB, "Authority"),
+                    (KEY_INPUT, "Input"),
                     (KEY_DETAILS, "Details"),
                     (HINT_SCROLL, "Inspect"),
                 ]),
@@ -1010,6 +1028,24 @@ fn risk_name(risk: &PermissionRisk) -> &'static str {
         PermissionRisk::Critical => "critical",
         PermissionRisk::Unknown => "unknown",
     }
+}
+
+/// Describes a collapsed input by shape and size, so the reviewer knows how
+/// much the expanded block holds before spending a screen on it.
+fn input_summary(input: &Value, bytes: usize) -> String {
+    let shape = match input {
+        Value::Object(fields) => plural(fields.len(), "field"),
+        Value::Array(items) => plural(items.len(), "item"),
+        Value::String(_) => "string".into(),
+        Value::Number(_) => "number".into(),
+        Value::Bool(_) => "boolean".into(),
+        Value::Null => "null".into(),
+    };
+    format!("{shape} · {}", plural(bytes, "byte"))
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
 }
 
 fn masked_json(input: &Value) -> String {
@@ -1326,6 +1362,7 @@ mod tests {
             )),
             None,
         );
+        prompt.handle_key(key(KeyCode::Char('i')));
         let first = render(&mut prompt, 60, 12);
         assert!(!first.contains(tail));
         for _ in 0..20 {
@@ -1334,6 +1371,54 @@ mod tests {
         let scrolled = render(&mut prompt, 60, 12);
         assert!(scrolled.contains(tail));
         assert!(scrolled.contains("convo"));
+    }
+
+    #[test]
+    fn input_is_collapsed_until_requested() {
+        let mut prompt = PermissionPrompt::new();
+        let secret_free_value = "PAYLOAD-VALUE";
+        prompt.enqueue(
+            request("collapsed", json!({"command": secret_free_value})),
+            None,
+        );
+
+        let collapsed = render(&mut prompt, 100, 24);
+        assert!(!collapsed.contains(secret_free_value));
+        assert!(collapsed.contains("1 field"));
+        assert!(collapsed.contains("i to expand"));
+
+        prompt.handle_key(key(KeyCode::Char('i')));
+        let expanded = render(&mut prompt, 100, 24);
+        assert!(expanded.contains(secret_free_value));
+        assert!(!expanded.contains("i to expand"));
+    }
+
+    #[test]
+    fn collapsing_the_input_shortens_the_prompt() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            request(
+                "tall",
+                json!({"values": (0..24).map(|value| format!("line-{value}")).collect::<Vec<_>>() }),
+            ),
+            None,
+        );
+
+        let collapsed = prompt.height(100);
+        prompt.handle_key(key(KeyCode::Char('i')));
+
+        assert!(prompt.height(100) > collapsed);
+    }
+
+    #[test]
+    fn resolving_a_request_recollapses_the_input() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(request("first", json!({"command": "one"})), None);
+        prompt.enqueue(request("second", json!({"command": "two"})), None);
+        prompt.handle_key(key(KeyCode::Char('i')));
+        prompt.resolve("first");
+
+        assert!(render(&mut prompt, 100, 24).contains("i to expand"));
     }
 
     #[test]
@@ -1378,6 +1463,7 @@ mod tests {
         structured.presentation.action = "run\u{1b}[2Jdanger".into();
         let mut prompt = PermissionPrompt::new();
         prompt.enqueue(structured, None);
+        prompt.handle_key(key(KeyCode::Char('i')));
         let screen = render(&mut prompt, 100, 24);
         assert!(!screen.contains('\u{1b}'));
         assert!(!screen.contains("do-not-show"));

@@ -4661,6 +4661,101 @@ mod tests {
             .await
     }
 
+    async fn enforce_opaque_command_without_prompt(
+        manager: &PermissionManager,
+        workdir: &Path,
+        command: &str,
+    ) -> Result<(), PermissionError> {
+        let intent = crate::tools::PermissionIntent::new(
+            crate::tools::PermissionScopes::single(command.to_owned()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Command,
+                value: command.into(),
+                access: Some(PermissionResourceAccess::Execute),
+                protected: true,
+                requires_prompt: true,
+                attributes: BTreeMap::from([(
+                    "workdir".into(),
+                    workdir.to_string_lossy().into_owned(),
+                )]),
+            }],
+            PermissionRisk::Critical,
+        )
+        .with_authority(PermissionAuthorityProfile::Shell);
+        let (event_tx, _event_rx) = flume::unbounded::<crate::Envelope>();
+        manager
+            .enforce_with_intent(
+                &ToolKey::native("bash"),
+                &intent,
+                &serde_json::json!({"command": command}),
+                &crate::EventSender::new(event_tx, 0),
+                None,
+                "opaque-request",
+                &crate::CancelToken::none(),
+                None,
+                None,
+                true,
+            )
+            .await
+    }
+
+    #[test]
+    fn broad_shell_authority_silences_opaque_command_prompts() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+            let opaque = "cargo check > /tmp/out";
+
+            assert!(
+                enforce_opaque_command_without_prompt(&manager, &project, opaque)
+                    .await
+                    .is_err()
+            );
+
+            answer_enforcement(
+                Arc::clone(&manager),
+                "cargo check",
+                serde_json::json!({"command": "cargo check"}),
+                PermissionAnswer::AllowOption {
+                    option_id: "allow_commands_in_workdir".into(),
+                    lifetime: PermissionLifetime::Conversation,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                enforce_opaque_command_without_prompt(&manager, &project, opaque)
+                    .await
+                    .is_ok()
+            );
+        });
+    }
+
+    #[test]
+    fn configured_command_allows_never_cover_opaque_commands() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager = Arc::new(PermissionManager::new_persistent_in(
+                make_config(vec![allow_rule("*")]),
+                project.clone(),
+                Arc::default(),
+                StateDir::from_path(temp.path().join("state")),
+            ));
+
+            assert!(
+                enforce_opaque_command_without_prompt(&manager, &project, "cargo check > /tmp/out")
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
     #[test]
     fn exact_global_rule_matches_after_restart_without_storing_raw_input() {
         smol::block_on(async {
