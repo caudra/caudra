@@ -5,7 +5,7 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
-use super::tool_display::{compact_args_for, header_spans};
+use super::tool_display::{compact_args_for, compact_sigil_label, header_spans};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -457,9 +457,10 @@ fn render_batch(
             BatchToolStatus::Success => (BATCH_DONE_MARKER, t.tool_success),
             BatchToolStatus::Error => (BATCH_DONE_MARKER, t.tool_error),
         };
+        let (sigil, label) = compact_sigil_label(&entry.tool);
         let mut spans = vec![
             Span::styled(marker, style),
-            Span::styled(format!("{}> ", entry.tool), t.tool_prefix),
+            Span::styled(format!("{sigil} {label} "), t.tool_prefix),
         ];
         spans.extend(header_spans(
             &entry.tool,
@@ -1925,6 +1926,52 @@ mod tests {
             Some(annotation) => assert!(row.contains(annotation), "{CHILD_COUNT_MSG}: {row:?}"),
             None => assert!(!row.contains('('), "{CHILD_COUNT_MSG}: {row:?}"),
         }
+    }
+
+    const SHELL_CHILD: &str = "shell";
+    const SHELL_WIRE_CHILD: &str = "mcp_Shell";
+    const SHELL_CHILD_ROW: &str = "$ Shell";
+    const UNTABLED_CHILD: &str = "srv.custom";
+    const UNTABLED_CHILD_ROW: &str = "⚙ srv.custom";
+    const CHILD_LABEL_MSG: &str = "a child names its tool the way a standalone compact row does";
+
+    /// A child row printed the string the model called, so a batch run under
+    /// Anthropic OAuth read `mcp_Shell>` where the same call on its own read
+    /// `$ Shell`. The roster carries the resolved name now, and the table
+    /// answers for a qualified one either way.
+    #[test_case(SHELL_CHILD, SHELL_CHILD_ROW ; "a tabled tool answers with its row")]
+    #[test_case(SHELL_WIRE_CHILD, SHELL_CHILD_ROW ; "a wire name reaches the same row")]
+    #[test_case(UNTABLED_CHILD, UNTABLED_CHILD_ROW ; "an untabled tool answers with itself")]
+    fn a_child_row_names_its_tool_like_a_compact_row(tool: &str, expected: &str) {
+        let row = child_row(batch_entry(tool, 0));
+        assert!(
+            row.starts_with(&format!("{BATCH_DONE_MARKER}{expected} ")),
+            "{CHILD_LABEL_MSG}: {row:?}"
+        );
+    }
+
+    const CHILD_TIMEOUT: u32 = 120_000;
+    const COMMAND_KEY: &str = "command=";
+    const CHILD_ARGS_MSG: &str = "a child's brackets carry what its own header does not show";
+
+    /// The same filter a standalone row uses, reached through the same table,
+    /// so a child cannot print the command it has already drawn. The timeout
+    /// is there to prove the brackets are still drawn at all.
+    #[test]
+    fn a_child_row_never_repeats_its_header_in_brackets() {
+        let mut entry = batch_entry(SHELL_WIRE_CHILD, 0);
+        let summary = entry.summary.clone();
+        entry.raw_input = Some(serde_json::json!({
+            "command": summary,
+            "timeout": CHILD_TIMEOUT,
+        }));
+
+        let row = child_row(entry);
+        assert!(!row.contains(COMMAND_KEY), "{CHILD_ARGS_MSG}: {row:?}");
+        assert!(
+            row.contains(&format!("timeout={CHILD_TIMEOUT}")),
+            "{CHILD_ARGS_MSG}: {row:?}"
+        );
     }
 
     const BATCH_TIGHT_MSG: &str = "a roster of folded calls must stack like the list it is";

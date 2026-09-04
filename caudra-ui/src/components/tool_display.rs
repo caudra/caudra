@@ -147,6 +147,14 @@ fn is_query_tool(name: &str) -> bool {
     compact_row(name).is_some_and(|(tool, _)| QUERY_TOOLS.contains(&tool))
 }
 
+/// How a tool introduces itself on a one-line row. A name the table has never
+/// heard of answers with itself, which is all there is to say about it.
+pub(super) fn compact_sigil_label(name: &str) -> (char, &str) {
+    compact_tool(name).map_or((COMPACT_FALLBACK_SIGIL, name), |entry| {
+        (entry.sigil, entry.label)
+    })
+}
+
 fn same_key(left: &str, right: &str) -> bool {
     let normalize = |key: &str| {
         key.chars()

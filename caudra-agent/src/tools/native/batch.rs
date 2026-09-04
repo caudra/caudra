@@ -255,9 +255,17 @@ impl BatchCall {
                     // with rather than a bare tool name. Taken as the child
                     // starts, or the row carries no title for as long as it
                     // runs, which on a batch is the whole time worth watching.
+                    //
+                    // The name comes from the same event for the same reason:
+                    // start is the first point where an alias has been
+                    // resolved. Under Anthropic OAuth the model calls a tool by
+                    // its wire name, so the roster is holding `mcp_Shell` until
+                    // this replaces it with `shell`, and every reader of the
+                    // name past here is looking at the tool the registry knows.
                     Emit::Capture(&mut |start: &ToolStartEvent| {
                         publish(&entries, index, &ctx, |entry| {
                             entry.status = BatchToolStatus::Running;
+                            entry.tool = start.tool.to_string();
                             entry.summary = start.summary.clone();
                             entry.input = start.input.clone();
                             entry.raw_input = start.raw_input.clone();
@@ -412,6 +420,7 @@ mod tests {
     use crate::tools::registry::ToolRegistry;
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use serde_json::json;
+    use std::collections::HashMap;
     use test_case::test_case;
 
     const READ: &str = "read";
@@ -769,6 +778,54 @@ mod tests {
             panic!("expected a batch result");
         };
         assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
+    }
+
+    const HEADER_TOOL_WIRE: &str = "mcp_Header_tool";
+    const EXPECT_RESOLVED_NAME: &str =
+        "the roster names the tool that ran, not the alias it was called by";
+
+    /// Anthropic OAuth renames every tool on the wire, so the model asks for
+    /// `mcp_Header_tool` and the registry only knows `header_tool`. Dispatch
+    /// resolved the alias to find the tool but the roster kept the model's
+    /// string, which left the transcript naming a tool that does not exist and
+    /// handed that same name back to the model in the batch's own answer.
+    #[test]
+    fn a_child_is_named_by_the_tool_that_ran() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+        ctx.tool_name_aliases = Some(Arc::new(HashMap::from([(
+            HEADER_TOOL_WIRE.to_owned(),
+            HEADER_TOOL.to_owned(),
+        )])));
+
+        let result = smol::block_on(async {
+            parsed(calls(
+                json!([{ "tool": HEADER_TOOL_WIRE, "path": HEADER_PATH }]),
+            ))
+            .unwrap()
+            .execute(&ctx)
+            .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, text }) = result.output else {
+            panic!("expected a batch result");
+        };
+        assert_eq!(entries[0].tool, HEADER_TOOL, "{EXPECT_RESOLVED_NAME}");
+        assert!(
+            !text.contains(HEADER_TOOL_WIRE),
+            "{EXPECT_RESOLVED_NAME}: {text:?}"
+        );
     }
 
     const BATCH_ID: &str = "batch-1";
