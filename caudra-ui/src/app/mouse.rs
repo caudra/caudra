@@ -61,14 +61,6 @@ impl App {
             ) {
                 return actions;
             }
-        } else if self.question_form.is_open() {
-            if let Some(actions) = self.route_overlay_mouse(
-                event,
-                |app, event| app.question_form.handle_mouse(event),
-                |app, action| app.handle_question_form_action(action),
-            ) {
-                return actions;
-            }
         } else if self.session_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -192,6 +184,19 @@ impl App {
                 self.clear_control_hovers();
                 return actions;
             }
+        }
+        // Docked and not modal, so it is asked last and only acts on what it
+        // drew: a drag that selected text releases as a selection rather than
+        // pressing whatever it ended over.
+        if self.question_form.is_open()
+            && !(event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection())
+            && let Some(action) = self.question_form.handle_mouse(event)
+        {
+            self.clear_control_hovers();
+            if event.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.selection_state = None;
+            }
+            return self.handle_question_form_action(action);
         }
         // Bottom-stack chrome rather than an overlay, so it is checked after
         // the overlay chain and only when nothing modal is drawn over it.
@@ -683,12 +688,7 @@ impl App {
         map: impl FnOnce(&mut Self, T) -> Vec<crate::components::Action>,
     ) -> Option<Vec<crate::components::Action>> {
         self.clear_control_hovers();
-        if event.kind == MouseEventKind::Up(MouseButton::Left)
-            && matches!(
-                &self.selection_state,
-                Some(SelectionState::Dragging { sel, .. }) if !sel.is_empty()
-            )
-        {
+        if event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection() {
             return None;
         }
 
@@ -704,6 +704,15 @@ impl App {
             }
             _ => Some(actions),
         }
+    }
+
+    /// A drag that has covered ground, so the release belongs to the selection
+    /// rather than to whatever control it happened to end over.
+    fn dragging_selection(&self) -> bool {
+        matches!(
+            &self.selection_state,
+            Some(SelectionState::Dragging { sel, .. }) if !sel.is_empty()
+        )
     }
 
     fn clear_control_hovers(&mut self) {

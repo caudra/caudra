@@ -42,8 +42,7 @@ impl App {
         self.sync_subagent_input_target();
         self.queue_hits.clear();
         self.admission_hits.clear();
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
-        let layout = self.compute_layout(frame.area(), form_visible);
+        let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
 
         self.render_background(frame);
@@ -91,22 +90,26 @@ impl App {
         }
     }
 
-    fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
+    fn compute_layout(&self, area: Rect) -> ViewLayout {
         let permission_open = self.permission_prompt.is_open();
+        let question_open = self.question_form.is_open();
+        // Both park the agent on the user, so both own the bottom outright.
+        let blocking_form = permission_open || question_open;
+        let form_visible = blocking_form || self.plan_form_active();
 
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it.
         let [content, status_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        // The permission prompt owns the bottom area, so drop any `below` split
-        // here at the source. That keeps "prompt wins bottom" in one filter
+        // A blocking form owns the bottom area, so drop any `below` split here
+        // at the source. That keeps "the form wins bottom" in one filter
         // instead of needing a fix-up further down.
         let reqs: Vec<_> = self
             .float_mgr
             .split_reqs(content)
             .into_iter()
-            .filter(|r| !(permission_open && r.split == Split::Below))
+            .filter(|r| !(blocking_form && r.split == Split::Below))
             .collect();
         let splits = carve(content, &reqs);
         let inner = main_content_area(splits.inner);
@@ -116,6 +119,10 @@ impl App {
         let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
         let bottom_height = if permission_open {
             self.permission_prompt.height(inner.width).min(max_bottom)
+        } else if question_open {
+            self.question_form
+                .height(inner.width, inner.height)
+                .min(max_bottom)
         } else if below_active {
             0
         } else if form_visible {
@@ -213,6 +220,8 @@ impl App {
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
+        } else if self.question_form.is_open() {
+            self.question_form.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let queue_entries = self.active_queue_entries();
             let queue_title = self.active_queue_title();
@@ -353,7 +362,6 @@ impl App {
         render_if_open!(self.memory_picker);
         render_if_open!(self.task_picker);
         render_if_open!(self.session_picker);
-        render_if_open!(self.question_form);
 
         overlay_rect
     }
@@ -483,7 +491,10 @@ impl App {
 
         self.zones.push_overlay(layout.status_area);
 
-        if self.permission_prompt.is_open() || self.plan_form_active() {
+        if self.permission_prompt.is_open()
+            || self.question_form.is_open()
+            || self.plan_form_active()
+        {
             self.zones.push_overlay(layout.bottom_area);
         }
 
@@ -546,8 +557,7 @@ impl App {
     /// input_area, splits)`.
     #[cfg(test)]
     pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, SplitLayout) {
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
-        let layout = self.compute_layout(area, form_visible);
+        let layout = self.compute_layout(area);
         (
             layout.msg_area,
             layout.bottom_area,

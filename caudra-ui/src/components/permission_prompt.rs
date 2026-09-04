@@ -120,6 +120,9 @@ pub struct PermissionPrompt {
     mouse_down: Option<PromptTarget>,
     /// What the pointer is resting on, so a control can say it is about to act.
     hover: Option<PromptTarget>,
+    /// Where the prompt last drew, so a wheel event can tell whether it landed
+    /// on the prompt or on the transcript above it.
+    area: Rect,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -173,6 +176,7 @@ impl PermissionPrompt {
             row_hits: Vec::new(),
             mouse_down: None,
             hover: None,
+            area: Rect::default(),
         }
     }
 
@@ -410,7 +414,12 @@ impl PermissionPrompt {
         self.scroll.scroll(delta);
     }
 
+    pub fn contains(&self, pos: Position) -> bool {
+        self.area.contains(pos)
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        self.area = area;
         let Some(request) = self.current() else {
             self.row_hits.clear();
             return;

@@ -10,13 +10,12 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear};
 use unicode_width::UnicodeWidthStr;
 
 use caudra_agent::types::AskedQuestion;
 
 use super::form::render_form;
-use super::{Overlay, VisualRows, visual_rows};
+use super::{Overlay, VisualRows, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -46,11 +45,6 @@ const HINT_SHIFT_ENTER: &str = "Shift+Enter";
 const HINT_TAB: &str = "Tab";
 const HINT_SHIFT_TAB: &str = "Shift+Tab";
 const HINT_ESC: &str = "Esc";
-
-/// Lines `review_lines` spends on the tab bar and heading before the first
-/// question, and the lines each question then takes.
-const REVIEW_HEADER_LINES: u16 = 4;
-const REVIEW_LINES_PER_QUESTION: u16 = 2;
 
 pub enum QuestionFormAction {
     Consumed,
@@ -114,6 +108,41 @@ enum FormTarget {
 struct RowHit {
     area: Rect,
     target: FormTarget,
+}
+
+/// The body the form draws, and the logical-line span each clickable target
+/// occupies in it. Built in one pass, so a hit rect can never sit on a line
+/// other than the one that drew the target.
+#[derive(Default)]
+struct Body {
+    lines: Vec<Line<'static>>,
+    spans: Vec<TargetSpan>,
+}
+
+#[derive(Clone, Copy)]
+struct TargetSpan {
+    target: FormTarget,
+    first: u16,
+    count: u16,
+}
+
+impl Body {
+    fn push(&mut self, target: FormTarget, lines: Vec<Line<'static>>) {
+        self.spans.push(TargetSpan {
+            target,
+            first: self.lines.len() as u16,
+            count: lines.len() as u16,
+        });
+        self.lines.extend(lines);
+    }
+
+    /// Where a target starts, or the top for one this mode never drew.
+    fn first(&self, target: FormTarget) -> u16 {
+        self.spans
+            .iter()
+            .find(|span| span.target == target)
+            .map_or(0, |span| span.first)
+    }
 }
 
 impl QuestionForm {
@@ -190,79 +219,61 @@ impl QuestionForm {
         self.follow_cursor = false;
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    /// The rows the form wants, so the layout can reserve them before the
+    /// form draws into them. The cap leaves the transcript on screen; the
+    /// layout clamps this again against the room it actually has.
+    pub fn height(&self, width: u16, available: u16) -> u16 {
+        let body_width = width.saturating_sub(2);
+        (visual_rows(&self.body(body_width).lines, body_width).total + CHROME_ROWS)
+            .min(available * MAX_HEIGHT_PERCENT / 100)
+            .max(CHROME_ROWS + 1)
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width.saturating_sub(2);
-        let lines = self.lines();
-        let rows = visual_rows(&lines, width);
-        let height = (rows.total + CHROME_ROWS)
-            .min(area.height * MAX_HEIGHT_PERCENT / 100)
-            .max(CHROME_ROWS + 1);
-        let form = Rect {
-            x: area.x,
-            y: area.y + area.height.saturating_sub(height),
-            width: area.width,
-            height,
-        };
-        self.area = form;
+        let body = self.body(width);
+        let rows = visual_rows(&body.lines, width);
+        self.area = area;
         // The cursor may sit below the fold on a long option list, so the
         // viewport follows it rather than staying where the user left it.
-        let visible = height.saturating_sub(CHROME_ROWS);
+        let visible = area.height.saturating_sub(CHROME_ROWS);
         if self.follow_cursor {
-            let focus = rows.row_of(self.focus_line());
+            let focus = rows.row_of(body.first(self.focus_target()));
             self.scroll = self
                 .scroll
                 .min(focus)
-                .max(focus.saturating_sub(visible - 1));
+                .max(focus.saturating_sub(visible.saturating_sub(1)));
         }
         self.scroll = self.scroll.min(rows.total.saturating_sub(visible));
         let t = theme::current();
-        // The form floats over the transcript, so the cells behind it have to
-        // go before anything is drawn: a border alone leaves the old text
-        // showing through the gaps.
-        frame.render_widget(Clear, form);
-        frame.render_widget(Block::default().style(t.surface_style()), form);
         let hint = render_form(
             &t,
             TITLE,
             frame,
-            form,
-            lines,
+            area,
+            body.lines,
             (self.scroll, 0),
             Some(self.hint()),
         );
-        self.record_row_hits(&rows, form, visible, hint);
-        form
+        self.record_row_hits(&body.spans, &rows, area, visible, hint);
     }
 
     /// Where everything clickable landed on screen, so a click can name what
     /// it hit. Only what is inside the viewport is recorded: a row scrolled
     /// out of sight must not be clickable through whatever is drawn over it.
-    fn record_row_hits(&mut self, rows: &VisualRows, form: Rect, visible: u16, hint: Rect) {
+    fn record_row_hits(
+        &mut self,
+        spans: &[TargetSpan],
+        rows: &VisualRows,
+        form: Rect,
+        visible: u16,
+        hint: Rect,
+    ) {
         self.row_hits.clear();
         self.push_tab_hits(rows, form, visible);
-        match self.mode {
-            Mode::Selecting => {
-                for index in 0..=self.custom_row() {
-                    let first = self.option_line_at(index);
-                    for line in first..first + self.option_rows(index) {
-                        self.push_line_hit(rows, form, visible, line, FormTarget::Option(index));
-                    }
-                }
-            }
-            Mode::EditingCustom => {
-                let first = self.option_line_at(self.custom_row());
-                for index in 0..self.custom.line_count() {
-                    let line = first + index as u16;
-                    self.push_line_hit(rows, form, visible, line, FormTarget::Editor(index));
-                }
-            }
-            Mode::Confirming => {
-                for index in 0..self.questions.len() {
-                    let first = REVIEW_HEADER_LINES + index as u16 * REVIEW_LINES_PER_QUESTION;
-                    for line in first..first + REVIEW_LINES_PER_QUESTION {
-                        self.push_line_hit(rows, form, visible, line, FormTarget::ReviewRow(index));
-                    }
-                }
+        for span in spans {
+            for line in span.first..span.first + span.count {
+                self.push_line_hit(rows, form, visible, line, span.target);
             }
         }
         let hints = super::hint_hits(self.hint_pairs(), hint);
@@ -335,7 +346,9 @@ impl QuestionForm {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent) -> QuestionFormAction {
+    /// `None` where the event missed everything the form drew. The form is
+    /// not modal, so the transcript behind it acts on what it does not want.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<QuestionFormAction> {
         let position = Position::new(event.column, event.row);
         let hit = self
             .row_hits
@@ -345,9 +358,8 @@ impl QuestionForm {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down = hit.map(|hit| hit.target);
-                if let Some(hit) = hit {
-                    self.aim(hit, event);
-                }
+                self.aim(hit?, event);
+                Some(QuestionFormAction::Consumed)
             }
             // Hovering picks the row out, the same as walking onto it would.
             // Nothing else moves under the pointer alone.
@@ -357,24 +369,23 @@ impl QuestionForm {
                     self.cursor = index;
                     self.follow_cursor = true;
                 }
+                hit.map(|_| QuestionFormAction::Consumed)
             }
             // A press and release on the same target is the click; anything
             // else is a drag that only moved the cursor.
             MouseEventKind::Up(MouseButton::Left) => {
-                let pressed = self.mouse_down.take();
-                if let Some(target) = hit.map(|hit| hit.target)
-                    && pressed == Some(target)
-                {
-                    // Hints are held by position and a mode change reshuffles
-                    // them, so the mark is dropped rather than left pointing
-                    // at whatever moved into its place.
-                    self.hover = None;
-                    return self.activate(target);
+                let pressed = self.mouse_down.take()?;
+                if hit.map(|hit| hit.target) != Some(pressed) {
+                    return Some(QuestionFormAction::Consumed);
                 }
+                // Hints are held by position and a mode change reshuffles
+                // them, so the mark is dropped rather than left pointing at
+                // whatever moved into its place.
+                self.hover = None;
+                Some(self.activate(pressed))
             }
-            _ => {}
+            _ => None,
         }
-        QuestionFormAction::Consumed
     }
 
     /// What a press does before the release decides whether it was a click:
@@ -657,42 +668,20 @@ impl QuestionForm {
         super::hint_line_hovered(self.hint_pairs(), hovered)
     }
 
-    fn lines(&self) -> Vec<Line<'static>> {
+    fn body(&self, width: u16) -> Body {
         match self.mode {
-            Mode::Confirming => self.review_lines(),
-            _ => self.selecting_lines(),
+            Mode::Confirming => self.review_body(width),
+            _ => self.selecting_body(width),
         }
     }
 
-    /// The first option's index in the list `selecting_lines` builds. Counted
-    /// the same way that function assembles it.
-    fn first_option_line(&self) -> u16 {
-        let header = if self.has_review() { 2 } else { 0 };
-        // Question text, the single/multiple hint, and a blank line.
-        let preamble = self.question().question.lines().count() as u16 + 2;
-        header + preamble
-    }
-
-    /// Where an option starts in that same list, counting the description
-    /// lines the ones before it took.
-    fn option_line_at(&self, index: usize) -> u16 {
-        self.first_option_line()
-            + (0..index)
-                .map(|before| self.option_rows(before))
-                .sum::<u16>()
-    }
-
-    /// The lines an option occupies: its label, and its description under it.
-    fn option_rows(&self, index: usize) -> u16 {
-        1 + u16::from(self.option_description(index).is_some())
-    }
-
-    /// Which line the viewport has to keep on screen.
-    fn focus_line(&self) -> u16 {
-        if self.mode == Mode::Confirming {
-            return 0;
+    /// What the viewport has to keep on screen. The review draws neither, so
+    /// it falls back to the top of the body.
+    fn focus_target(&self) -> FormTarget {
+        match self.mode {
+            Mode::EditingCustom => FormTarget::Editor(0),
+            _ => FormTarget::Option(self.cursor),
         }
-        self.option_line_at(self.cursor)
     }
 
     /// The tab bar's spans paired with what each one selects. Drawing and hit
@@ -738,18 +727,18 @@ impl QuestionForm {
         )
     }
 
-    fn selecting_lines(&self) -> Vec<Line<'static>> {
+    fn selecting_body(&self, width: u16) -> Body {
         let t = theme::current();
         let question = self.question();
-        let mut lines = Vec::new();
+        let mut body = Body::default();
         if self.has_review() {
-            lines.push(self.tab_bar());
-            lines.push(Line::default());
+            body.lines.push(self.tab_bar());
+            body.lines.push(Line::default());
         }
         for line in question.question.lines() {
-            lines.push(Line::from(Span::raw(format!(" {line}"))));
+            body.lines.push(Line::from(Span::raw(format!(" {line}"))));
         }
-        lines.push(Line::styled(
+        body.lines.push(Line::styled(
             if question.multiple {
                 MULTI_HINT
             } else {
@@ -757,16 +746,19 @@ impl QuestionForm {
             },
             t.tool_dim,
         ));
-        lines.push(Line::default());
+        body.lines.push(Line::default());
         for index in 0..question.options.len() {
-            lines.extend(self.option_lines(index));
+            body.push(FormTarget::Option(index), self.option_lines(index, width));
         }
         if self.mode == Mode::EditingCustom {
-            lines.extend(self.custom_editor_lines());
+            for (index, line) in self.custom_editor_lines().into_iter().enumerate() {
+                body.push(FormTarget::Editor(index), vec![line]);
+            }
         } else {
-            lines.extend(self.option_lines(self.custom_row()));
+            let custom = self.custom_row();
+            body.push(FormTarget::Option(custom), self.option_lines(custom, width));
         }
-        lines
+        body
     }
 
     /// The label an option offers. The row past the last of them is the one
@@ -788,9 +780,10 @@ impl QuestionForm {
         (!described.is_empty()).then_some(described)
     }
 
-    /// An option's label, and its description on the line below so a long one
-    /// never crowds the labels the user is choosing between.
-    fn option_lines(&self, index: usize) -> Vec<Line<'static>> {
+    /// An option's label, and its description on the lines below so a long
+    /// one never crowds the labels the user is choosing between. A wrapped
+    /// description hangs under the first row of itself, not under the pointer.
+    fn option_lines(&self, index: usize, width: u16) -> Vec<Line<'static>> {
         let t = theme::current();
         let picked = match self.question().options.get(index) {
             Some(option) => self.is_picked(&option.label),
@@ -799,9 +792,10 @@ impl QuestionForm {
         let mut lines =
             vec![self.option_line(index == self.cursor, picked, self.option_label(index))];
         if let Some(description) = self.option_description(index) {
-            lines.push(Line::styled(
-                format!("{DESC_INDENT}{}", description.replace('\n', " ")),
-                t.tool_dim,
+            lines.extend(hanging_lines(
+                Span::styled(DESC_INDENT, t.tool_dim),
+                Span::styled(description.replace('\n', " "), t.tool_dim),
+                width,
             ));
         }
         lines
@@ -863,35 +857,37 @@ impl QuestionForm {
             .collect()
     }
 
-    fn review_lines(&self) -> Vec<Line<'static>> {
+    fn review_body(&self, width: u16) -> Body {
         let t = theme::current();
-        let mut lines = vec![
+        let mut body = Body::default();
+        body.lines.extend([
             self.tab_bar(),
             Line::default(),
             Line::styled(REVIEW_HEADING, t.panel_title),
             Line::default(),
-        ];
+        ]);
         for (index, question) in self.questions.iter().enumerate() {
-            lines.push(Line::from(Span::styled(
-                format!(" {}. {}", index + 1, question.question.replace('\n', " ")),
-                super::hover_style(
-                    Style::default(),
-                    self.hover == Some(FormTarget::ReviewRow(index)),
-                ),
-            )));
+            let on = self.hover == Some(FormTarget::ReviewRow(index));
+            let numbered = super::hover_style(Style::default(), on);
+            let mut lines = hanging_lines(
+                Span::styled(format!(" {}. ", index + 1), numbered),
+                Span::styled(question.question.replace('\n', " "), numbered),
+                width,
+            );
             let picked = &self.answers[index];
             let text = if picked.is_empty() {
                 NO_ANSWER.to_owned()
             } else {
                 picked.join(", ")
             };
-            let on = self.hover == Some(FormTarget::ReviewRow(index));
-            lines.push(Line::from(vec![
+            lines.extend(hanging_lines(
                 Span::styled(ANSWER_ARROW, super::hover_style(t.tool_dim, on)),
                 Span::styled(text, super::hover_style(t.todo_completed, on)),
-            ]));
+                width,
+            ));
+            body.push(FormTarget::ReviewRow(index), lines);
         }
-        lines
+        body
     }
 }
 
@@ -954,8 +950,11 @@ impl Overlay for QuestionForm {
         self.close();
     }
 
+    /// The form is docked under the transcript rather than drawn over it, so
+    /// scrolling, selecting and hovering the chat behind it stay live while
+    /// it waits for an answer.
     fn is_modal(&self) -> bool {
-        true
+        false
     }
 
     fn cadence(&self) -> Cadence {
@@ -968,7 +967,6 @@ mod tests {
     use super::*;
     use crate::components::key as key_event;
     use caudra_agent::types::QuestionOption;
-    use ratatui::widgets::Paragraph;
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -1031,40 +1029,35 @@ mod tests {
         form
     }
 
-    const SCREEN: Rect = Rect {
-        x: 0,
-        y: 0,
-        width: TERMINAL_WIDTH,
-        height: TERMINAL_HEIGHT,
-    };
     const TERMINAL_WIDTH: u16 = 80;
     const TERMINAL_HEIGHT: u16 = 24;
+
+    /// Where the layout would dock the form: the rows it asks for, at the
+    /// bottom of the screen.
+    fn docked(form: &QuestionForm) -> Rect {
+        let height = form.height(TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        Rect {
+            x: 0,
+            y: TERMINAL_HEIGHT - height,
+            width: TERMINAL_WIDTH,
+            height,
+        }
+    }
 
     fn render(form: &mut QuestionForm) -> Rect {
         let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut drawn = Rect::default();
-        terminal
-            .draw(|frame| drawn = form.view(frame, SCREEN))
-            .unwrap();
-        drawn
+        let area = docked(form);
+        terminal.draw(|frame| form.view(frame, area)).unwrap();
+        area
     }
 
-    /// The screen with the form drawn over a full-width backdrop, so a test
-    /// can tell an opaque surface from one the transcript shows through.
+    /// The screen the form drew on, row by row.
     fn painted(form: &mut QuestionForm) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let backdrop = BEHIND.to_string().repeat(TERMINAL_WIDTH as usize);
-                let lines: Vec<Line<'static>> = (0..TERMINAL_HEIGHT)
-                    .map(|_| Line::from(Span::raw(backdrop.clone())))
-                    .collect();
-                frame.render_widget(Paragraph::new(lines), SCREEN);
-                form.view(frame, SCREEN);
-            })
-            .unwrap();
+        let area = docked(form);
+        terminal.draw(|frame| form.view(frame, area)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..TERMINAL_HEIGHT)
             .map(|y| {
@@ -1084,9 +1077,12 @@ mod tests {
         }
     }
 
+    /// A press and release on one cell. An event the form passes through is
+    /// one that did nothing to it, which is what `Consumed` stands for here.
     fn click(form: &mut QuestionForm, column: u16, row: u16) -> QuestionFormAction {
         form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
         form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+            .unwrap_or(QuestionFormAction::Consumed)
     }
 
     fn hit_area(form: &QuestionForm, target: FormTarget) -> Rect {
@@ -1122,26 +1118,28 @@ mod tests {
         );
     }
 
-    /// One character, so a single surviving cell is a failure. A word would
-    /// let a border cover its first letter and hide the leak.
-    const BEHIND: char = '\u{2591}';
-
+    /// The form is docked, so the rows it asks for are the rows it draws in:
+    /// a mismatch would leave a gap the transcript no longer owns.
     #[test]
-    fn the_form_paints_over_what_is_behind_it() {
+    fn the_form_fills_the_rows_it_asked_for() {
         let mut form = opened(vec![question(HEADER, false)]);
         let drawn = render(&mut form);
+        assert_eq!(drawn.height, form.height(TERMINAL_WIDTH, TERMINAL_HEIGHT));
         let rows = painted(&mut form);
-        for y in drawn.y..drawn.bottom() {
-            assert!(
-                !rows[y as usize].contains(BEHIND),
-                "row {y} shows the transcript through the form: {:?}",
-                rows[y as usize]
-            );
-        }
         assert!(
-            rows[drawn.y.saturating_sub(1) as usize].contains(BEHIND),
-            "the form must not erase more than it covers"
+            rows[drawn.y as usize].starts_with(BORDER_TOP_LEFT),
+            "the form starts on the first row it reserved: {:?}",
+            rows[drawn.y as usize]
         );
+    }
+
+    /// A list longer than the screen must not push the transcript off it.
+    #[test]
+    fn the_height_is_capped_and_floored() {
+        let capped = opened(vec![long_question()]).height(TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert_eq!(capped, TERMINAL_HEIGHT * MAX_HEIGHT_PERCENT / 100);
+        let floored = opened(vec![question(HEADER, false)]).height(TERMINAL_WIDTH, CHROME_ROWS);
+        assert_eq!(floored, CHROME_ROWS + 1, "the chrome always has a body row");
     }
 
     #[test]
@@ -1160,6 +1158,7 @@ mod tests {
         );
     }
 
+    const BORDER_TOP_LEFT: &str = "\u{256d}";
     const BORDER_BOTTOM_LEFT: &str = "\u{2570}";
     const BORDER_BOTTOM_RIGHT: &str = "\u{256f}";
     const SUBMIT_HINT: &str = "submit";
@@ -1252,6 +1251,66 @@ mod tests {
         );
     }
 
+    /// A description that wraps has to read as one block under its label.
+    /// `Wrap` alone restarts every continuation row in column zero.
+    #[test]
+    fn a_wrapped_description_hangs_under_the_first_row_of_itself() {
+        let mut form = opened(vec![wordy_question()]);
+        let drawn = render(&mut form);
+        let hits: Vec<Rect> = form
+            .row_hits
+            .iter()
+            .filter(|hit| hit.target == FormTarget::Option(0))
+            .map(|hit| hit.area)
+            .collect();
+        assert!(hits.len() > 2, "the description wrapped onto more rows");
+        let rows = painted(&mut form);
+        // The first cell inside the border, where a row that lost its indent
+        // would start instead.
+        let inside = drawn.x as usize + 1;
+        for hit in &hits[1..] {
+            let row: Vec<char> = rows[hit.y as usize].chars().collect();
+            let (indent, text) = row[inside..].split_at(DESC_INDENT.len());
+            assert!(
+                indent.iter().all(|cell| *cell == ' ') && text[0] != ' ',
+                "row {} starts somewhere other than the indent: {:?}",
+                hit.y,
+                rows[hit.y as usize]
+            );
+        }
+    }
+
+    /// Every row of a description belongs to the option it describes, so a
+    /// click on the last of them picks the same thing as a click on the label.
+    #[test]
+    fn clicking_the_last_row_of_a_wrapped_description_picks_its_option() {
+        let mut form = opened(vec![wordy_question()]);
+        render(&mut form);
+        let last = form
+            .row_hits
+            .iter()
+            .rfind(|hit| hit.target == FormTarget::Option(0))
+            .expect("the option was drawn")
+            .area;
+        let action = click(&mut form, last.x + 1, last.y);
+        assert!(
+            matches!(&action, QuestionFormAction::Submit(picks) if picks == &[vec![YES.to_owned()]]),
+        );
+    }
+
+    /// One option whose description is far wider than the form.
+    fn wordy_question() -> AskedQuestion {
+        AskedQuestion {
+            question: PICK.into(),
+            header: HEADER.into(),
+            options: vec![QuestionOption {
+                label: YES.into(),
+                description: [YES_DESC; 20].join(" "),
+            }],
+            multiple: false,
+        }
+    }
+
     #[test]
     fn clicking_the_custom_row_opens_the_answer_box() {
         let mut form = opened(vec![question(HEADER, false)]);
@@ -1285,15 +1344,25 @@ mod tests {
         ));
         let action =
             form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, second));
-        assert!(matches!(action, QuestionFormAction::Consumed));
+        assert!(matches!(action, Some(QuestionFormAction::Consumed)));
     }
 
+    /// The border belongs to no control, and the form is not modal, so the
+    /// event has to reach whatever is behind it rather than being swallowed.
     #[test]
-    fn clicking_the_chrome_picks_nothing() {
+    fn clicking_the_chrome_passes_the_event_through() {
         let mut form = opened(vec![question(HEADER, false)]);
         let drawn = render(&mut form);
-        let action = click(&mut form, drawn.x, drawn.y);
-        assert!(matches!(action, QuestionFormAction::Consumed));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert!(
+                form.handle_mouse(mouse(kind, drawn.x, drawn.y)).is_none(),
+                "{kind:?} on the border is not the form's to take"
+            );
+        }
     }
 
     #[test]
@@ -1797,11 +1866,8 @@ mod tests {
     fn reversed_cells(form: &mut QuestionForm) -> Vec<(u16, u16)> {
         let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                form.view(frame, SCREEN);
-            })
-            .unwrap();
+        let area = docked(form);
+        terminal.draw(|frame| form.view(frame, area)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..TERMINAL_HEIGHT)
             .flat_map(|y| (0..TERMINAL_WIDTH).map(move |x| (x, y)))
@@ -1834,6 +1900,9 @@ mod tests {
         );
     }
 
+    /// A short question and its answer, neither of them wrapped.
+    const REVIEW_ROWS_PER_QUESTION: usize = 2;
+
     /// A review row is the question and the answer under it, so the mark
     /// covers both of its lines and nothing outside them.
     #[test]
@@ -1850,13 +1919,55 @@ mod tests {
             .filter(|hit| hit.target == FormTarget::ReviewRow(1))
             .map(|hit| hit.area)
             .collect();
-        assert_eq!(areas.len(), REVIEW_LINES_PER_QUESTION as usize);
+        assert_eq!(areas.len(), REVIEW_ROWS_PER_QUESTION);
         assert!(
             marked.iter().all(|(x, y)| areas
                 .iter()
                 .any(|area| area.contains(Position::new(*x, *y)))),
             "{EXPECT_UNMARKED}: {marked:?} outside {areas:?}"
         );
+    }
+
+    /// A review row that wraps is still one target, so the mark and the click
+    /// have to reach every row of it.
+    #[test]
+    fn a_wrapped_review_row_is_marked_and_clickable_throughout() {
+        let mut form = opened(vec![
+            AskedQuestion {
+                question: [PICK; 20].join(" "),
+                header: HEADER.into(),
+                options: Vec::new(),
+                multiple: false,
+            },
+            question(SECOND, false),
+        ]);
+        form.mode = Mode::Confirming;
+        render(&mut form);
+        let areas: Vec<Rect> = form
+            .row_hits
+            .iter()
+            .filter(|hit| hit.target == FormTarget::ReviewRow(0))
+            .map(|hit| hit.area)
+            .collect();
+        assert!(
+            areas.len() > REVIEW_ROWS_PER_QUESTION,
+            "the question wrapped onto more rows"
+        );
+
+        hover(&mut form, FormTarget::ReviewRow(0));
+        let marked = reversed_cells(&mut form);
+        assert!(!marked.is_empty(), "{EXPECT_MARKED}");
+        assert!(
+            marked.iter().all(|(x, y)| areas
+                .iter()
+                .any(|area| area.contains(Position::new(*x, *y)))),
+            "{EXPECT_UNMARKED}: {marked:?} outside {areas:?}"
+        );
+
+        let last = areas.last().expect("the row was drawn");
+        click(&mut form, last.x + 1, last.y);
+        assert_eq!(form.mode, Mode::Selecting);
+        assert_eq!(form.tab, 0, "the last row goes back to its own question");
     }
 
     /// An option row is already marked by the cursor the hover moves, so

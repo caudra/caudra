@@ -55,6 +55,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::selection::wrap_breaks;
+
 pub(crate) const CHEVRON: &str = "❯ ";
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
@@ -196,6 +198,47 @@ impl VisualRows {
     fn height_of(&self, line: u16) -> u16 {
         self.row_of(line + 1).saturating_sub(self.row_of(line))
     }
+}
+
+/// A prefixed line pre-wrapped so every row after the first hangs under the
+/// text instead of restarting at column zero, which is all `Wrap` can do. The
+/// wrap points come from [`wrap_breaks`], which already replays ratatui's
+/// algorithm, so the rows this hands back are the rows the widget would draw.
+pub(crate) fn hanging_lines(
+    prefix: Span<'static>,
+    text: Span<'static>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let indent = UnicodeWidthStr::width(prefix.content.as_ref()) as u16;
+    let chars: Vec<char> = text.content.chars().collect();
+    let mut starts = vec![0];
+    starts.extend(
+        wrap_breaks(&chars, width.saturating_sub(indent).max(1))
+            .into_iter()
+            .map(|brk| brk.start),
+    );
+    let hang = Span::styled(" ".repeat(usize::from(indent)), prefix.style);
+    starts
+        .iter()
+        .enumerate()
+        .map(|(row, &start)| {
+            let end = starts.get(row + 1).copied().unwrap_or(chars.len());
+            // Trailing spaces are what the wrap broke on; keeping them could
+            // push a row past the width it was measured for.
+            let content: String = chars[start..end].iter().collect();
+            let content = match end == chars.len() {
+                true => content,
+                false => content.trim_end().to_owned(),
+            };
+            Line::from(vec![
+                match row {
+                    0 => prefix.clone(),
+                    _ => hang.clone(),
+                },
+                Span::styled(content, text.style),
+            ])
+        })
+        .collect()
 }
 
 /// Measured with the same widget that draws them, so the two can never
@@ -788,6 +831,55 @@ mod tests {
     const MODAL_VIEWPORT: u16 = 20;
     const MODAL_MAX_OFFSET: u16 = MODAL_TOTAL - MODAL_VIEWPORT;
     const MODAL_HALF_PAGE: u16 = MODAL_VIEWPORT / 2;
+
+    const HANG_PREFIX: &str = "--> ";
+    const HANG_WIDTH: u16 = 12;
+
+    /// The rows `hanging_lines` builds, as text, so a test can read them the
+    /// way the terminal draws them.
+    fn hung(text: &str) -> Vec<String> {
+        hanging_lines(
+            Span::raw(HANG_PREFIX),
+            Span::raw(text.to_owned()),
+            HANG_WIDTH,
+        )
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+        .collect()
+    }
+
+    #[test_case("one two",          &["--> one two"]                     ; "fits_on_one_row")]
+    #[test_case("one two three",    &["--> one two", "    three"]        ; "wraps_at_a_word")]
+    #[test_case("one    two",       &["--> one", "    two"]              ; "drops_the_spaces_it_broke_on")]
+    #[test_case("aaaaaaaaaaaa",     &["--> aaaaaaaa", "    aaaa"]        ; "breaks_a_word_wider_than_the_body")]
+    fn hanging_lines_hang_under_the_first_row(text: &str, expected: &[&str]) {
+        assert_eq!(hung(text), expected);
+    }
+
+    /// Measured with the widget that draws them, so a row that is one cell too
+    /// wide would wrap again and land back in column zero.
+    #[test]
+    fn every_hung_row_fits_the_width_it_was_wrapped_for() {
+        let lines = hanging_lines(
+            Span::raw(HANG_PREFIX),
+            Span::raw("one two three four five sixsixsixsixsix".to_owned()),
+            HANG_WIDTH,
+        );
+        let rows = visual_rows(&lines, HANG_WIDTH);
+        assert_eq!(rows.total as usize, lines.len(), "no row wrapped twice");
+    }
+
+    /// A prefix with no room left for text still has to hand back a row per
+    /// character rather than dividing by zero.
+    #[test]
+    fn a_prefix_as_wide_as_the_body_still_wraps() {
+        let lines = hanging_lines(
+            Span::raw(HANG_PREFIX),
+            Span::raw("ab".to_owned()),
+            HANG_PREFIX.len() as u16,
+        );
+        assert_eq!(lines.len(), 2);
+    }
 
     /// Modals answer the same navigation keys as the transcript.
     #[test_case(keybindings::key::SCROLL_TOP_ALT.to_key_event(),     0                                  ; "ctrl_home")]

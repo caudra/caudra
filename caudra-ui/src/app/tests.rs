@@ -46,7 +46,7 @@ use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -2296,6 +2296,152 @@ fn transcript_scroll_binds_use_the_navigation_keys() {
     assert_eq!(kb::SCROLL_HALF_DOWN.code, KeyCode::PageDown);
     assert_eq!(kb::SCROLL_TOP_ALT.code, KeyCode::Home);
     assert_eq!(kb::SCROLL_BOTTOM_ALT.code, KeyCode::End);
+}
+
+const QUESTION_TEXT: &str = "Which one?";
+const QUESTION_HEADER: &str = "Pick";
+const QUESTION_OPTION: &str = "First";
+
+/// A full transcript with the question form waiting under it.
+fn question_app() -> App {
+    let mut app = test_app();
+    for i in 0..TRANSCRIPT_LINES {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+    app.question_form
+        .open(vec![caudra_agent::types::AskedQuestion {
+            question: QUESTION_TEXT.into(),
+            header: QUESTION_HEADER.into(),
+            options: vec![caudra_agent::types::QuestionOption {
+                label: QUESTION_OPTION.into(),
+                description: String::new(),
+            }],
+            multiple: false,
+        }]);
+    app
+}
+
+/// The form is docked under the transcript rather than drawn over it, so the
+/// chat behind it can still be read while it waits for an answer.
+#[test]
+fn the_transcript_scrolls_by_key_while_a_question_is_open() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+    app.active_chat().enable_auto_scroll();
+    let half = app.active_chat().half_page() as u16;
+
+    app.update(Msg::Key(kb::SCROLL_TOP_ALT.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0, "Ctrl+Home");
+    assert!(!app.chats[0].auto_scroll(), "Ctrl+Home must unpin");
+
+    app.update(Msg::Key(kb::SCROLL_HALF_DOWN.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), half, "PageDown");
+
+    app.update(Msg::Key(kb::SCROLL_BOTTOM_ALT.to_key_event()));
+    assert!(app.chats[0].auto_scroll(), "Ctrl+End");
+    assert!(app.question_form.is_open(), "and the question still stands");
+}
+
+/// The keys the form owns must not be handed over with them.
+#[test]
+fn the_form_still_answers_its_own_keys() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(
+        !app.question_form.is_open(),
+        "Enter picks the option under the cursor and answers"
+    );
+}
+
+/// Where the pointer is decides whose wheel event it is.
+#[test]
+fn the_wheel_goes_to_whichever_of_the_two_it_lands_on() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+    let (msg_area, bottom_area, ..) = app.layout_geometry(TEST_AREA);
+
+    app.active_chat().enable_auto_scroll();
+    app.update(Msg::Scroll {
+        column: msg_area.x + 1,
+        row: msg_area.y + 1,
+        delta: 3,
+    });
+    assert!(
+        !app.chats[0].auto_scroll(),
+        "the wheel over the chat has to move the chat"
+    );
+
+    app.active_chat().enable_auto_scroll();
+    app.update(Msg::Scroll {
+        column: bottom_area.x + 1,
+        row: bottom_area.y + 1,
+        delta: 3,
+    });
+    assert!(
+        app.chats[0].auto_scroll(),
+        "the wheel over the form is the form's"
+    );
+}
+
+#[test]
+fn the_transcript_can_be_selected_while_a_question_is_open() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+    let (msg_area, ..) = app.layout_geometry(TEST_AREA);
+    let row = msg_area.y + 1;
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        msg_area.x + 1,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        msg_area.x + 6,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        msg_area.x + 6,
+        row,
+    ));
+    assert!(
+        matches!(app.selection_state, Some(SelectionState::PendingCopy { .. })),
+        "a drag across the transcript has to end in a selection"
+    );
+}
+
+/// Docked means the form takes rows from the chat instead of covering them,
+/// and leaves the status bar where it was.
+#[test]
+fn the_question_form_docks_between_the_transcript_and_the_status_bar() {
+    let (msg_before, ..) = test_app().layout_geometry(TEST_AREA);
+    let mut app = question_app();
+    let (msg_after, bottom, status, ..) = app.layout_geometry(TEST_AREA);
+
+    assert!(
+        msg_after.height < msg_before.height,
+        "the chat shrinks to make room for the form"
+    );
+    assert_eq!(bottom.bottom(), status.y, "the status bar keeps its row");
+
+    let backend = ratatui::backend::TestBackend::new(TEST_AREA.width, TEST_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    assert!(
+        app.question_form.contains(Position::new(bottom.x, bottom.y))
+            && !app
+                .question_form
+                .contains(Position::new(bottom.x, status.y)),
+        "the form drew in the rows the layout reserved and nowhere else"
+    );
+    assert!(
+        app.zones.find(SelectionZone::Input).is_none(),
+        "the composer is not drawn under a pending question"
+    );
 }
 
 /// Ctrl is what promotes Home/End to transcript navigation; bare presses stay

@@ -830,8 +830,15 @@ impl App {
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
-        if self.permission_prompt.is_open() {
+        let pos = Position::new(column, row);
+        // Docked forms are not modal, so they claim the wheel only where they
+        // drew: everywhere else it belongs to the transcript behind them.
+        if self.permission_prompt.is_open() && self.permission_prompt.contains(pos) {
             self.permission_prompt.scroll(delta);
+            return None;
+        }
+        if self.question_form.is_open() && self.question_form.contains(pos) {
+            self.question_form.scroll(delta);
             return None;
         }
         if self.btw_modal.is_open() {
@@ -850,7 +857,6 @@ impl App {
             self.goal_modal.scroll(delta);
             return None;
         }
-        let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
             return None;
@@ -889,7 +895,6 @@ impl App {
             return None;
         }
         try_picker!(self.session_picker);
-        try_picker!(self.question_form);
         // Not modal: the palette floats over the transcript, so it claims the
         // wheel only where it actually drew.
         if self.command_palette.is_active() && self.command_palette.contains(pos) {
@@ -961,14 +966,7 @@ impl App {
         if key::VIEW_TOGGLE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::ViewToggle));
         }
-        if key::SCROLL_HALF_UP.matches(key) || key::SCROLL_HALF_UP_ALT.matches(key) {
-            let half = self.chats[self.active_chat].half_page();
-            self.active_chat().scroll(half);
-            return Some(vec![]);
-        }
-        if key::SCROLL_HALF_DOWN.matches(key) {
-            let half = self.chats[self.active_chat].half_page();
-            self.active_chat().scroll(-half);
+        if self.scroll_transcript(key) {
             return Some(vec![]);
         }
         // Only claimed when a diagram actually moves, so the binding stays
@@ -978,15 +976,27 @@ impl App {
                 return Some(vec![]);
             }
         }
-        if key::SCROLL_TOP.matches(key) || key::SCROLL_TOP_ALT.matches(key) {
-            self.active_chat().scroll_to_top();
-            return Some(vec![]);
-        }
-        if key::SCROLL_BOTTOM.matches(key) || key::SCROLL_BOTTOM_ALT.matches(key) {
-            self.active_chat().enable_auto_scroll();
-            return Some(vec![]);
-        }
         None
+    }
+
+    /// Keys that only move the transcript. A form waiting on an answer hands
+    /// these through so the chat behind it can still be read, which is why
+    /// they live apart from the rest of the global binds.
+    fn scroll_transcript(&mut self, key: KeyEvent) -> bool {
+        if key::SCROLL_HALF_UP.matches(key) || key::SCROLL_HALF_UP_ALT.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(half);
+        } else if key::SCROLL_HALF_DOWN.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(-half);
+        } else if key::SCROLL_TOP.matches(key) || key::SCROLL_TOP_ALT.matches(key) {
+            self.active_chat().scroll_to_top();
+        } else if key::SCROLL_BOTTOM.matches(key) || key::SCROLL_BOTTOM_ALT.matches(key) {
+            self.active_chat().enable_auto_scroll();
+        } else {
+            return false;
+        }
+        true
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
@@ -1168,6 +1178,11 @@ impl App {
         }
 
         if self.question_form.is_open() {
+            // The form is docked, not modal: keys that only move the
+            // transcript keep working while it waits for an answer.
+            if self.scroll_transcript(key) {
+                return Some(vec![]);
+            }
             let action = self.question_form.handle_key(key);
             return Some(self.handle_question_form_action(action));
         }
