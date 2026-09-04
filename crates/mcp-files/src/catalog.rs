@@ -473,12 +473,13 @@ fn index_output_schema() -> Map<String, Value> {
     });
     schema(json!({
         "$schema": DRAFT_07,
+        "type": "object",
         "oneOf": [
             {
                 "type": "object",
                 "additionalProperties": false,
                 "required": [
-                    "kind", "path", "relativePath", "language", "skeleton", "lines",
+                    "kind", "path", "relativePath", "language", "lines",
                     "sourceLineCount", "parseError", "truncated"
                 ],
                 "properties": {
@@ -486,7 +487,6 @@ fn index_output_schema() -> Map<String, Value> {
                     "path": {"type": "string"},
                     "relativePath": {"type": "string"},
                     "language": {"type": "string"},
-                    "skeleton": {"type": "string"},
                     "lines": {"type": "array", "items": output_line},
                     "sourceLineCount": {"type": "integer", "minimum": 1},
                     "parseError": {"type": "boolean"},
@@ -497,8 +497,7 @@ fn index_output_schema() -> Map<String, Value> {
                 "type": "object",
                 "additionalProperties": false,
                 "required": [
-                    "kind", "path", "relativePath", "entries", "totalCount", "truncated",
-                    "listing"
+                    "kind", "path", "relativePath", "entries", "totalCount", "truncated"
                 ],
                 "properties": {
                     "kind": {"const": "directory"},
@@ -510,8 +509,7 @@ fn index_output_schema() -> Map<String, Value> {
                         "minimum": 0,
                         "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
                     },
-                    "truncated": {"type": "boolean"},
-                    "listing": {"type": "string"}
+                    "truncated": {"type": "boolean"}
                 }
             }
         ]
@@ -577,7 +575,22 @@ mod tests {
             assert_eq!(index.name, "index");
             assert_eq!(index.contract_id, "file.index.v1");
             assert_eq!(index.presentation, "file.index.v1");
-            assert!(index.output_schema.is_some());
+            assert_eq!(index.output_schema.as_ref().unwrap()["type"], "object");
+            let variants = index.output_schema.as_ref().unwrap()["oneOf"]
+                .as_array()
+                .expect("index output variants");
+            assert!(
+                !variants[0]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("skeleton"))
+            );
+            assert!(
+                !variants[1]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("listing"))
+            );
             let path = &index.input_schema["properties"]["path"];
             assert!(path.get("maxLength").is_none());
             assert_eq!(

@@ -237,6 +237,7 @@
           },
           "outputSchema": {
             "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
             "oneOf": [
               {
                 "type": "object",
@@ -246,7 +247,6 @@
                   "path",
                   "relativePath",
                   "language",
-                  "skeleton",
                   "lines",
                   "sourceLineCount",
                   "parseError",
@@ -257,7 +257,6 @@
                   "path": { "type": "string" },
                   "relativePath": { "type": "string" },
                   "language": { "type": "string" },
-                  "skeleton": { "type": "string" },
                   "lines": {
                     "type": "array",
                     "items": {
@@ -298,8 +297,7 @@
                   "relativePath",
                   "entries",
                   "totalCount",
-                  "truncated",
-                  "listing"
+                  "truncated"
                 ],
                 "properties": {
                   "kind": { "const": "directory" },
@@ -325,8 +323,7 @@
                     "minimum": 0,
                     "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
                   },
-                  "truncated": { "type": "boolean" },
-                  "listing": { "type": "string" }
+                  "truncated": { "type": "boolean" }
                 }
               }
             ]
