@@ -505,9 +505,20 @@ impl ToolInvocation for MemoryCall {
 
     fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            match self.run_all(&TAG_CACHE) {
-                Ok(text) => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
-                Err(error) => ToolExecResult::from(Err(format!("error: {error}"))),
+            let text = match self.run_all(&TAG_CACHE) {
+                Ok(text) => text,
+                Err(error) => return ToolExecResult::from(Err(format!("error: {error}"))),
+            };
+            // A write's reply is a receipt. The note is what the reader came
+            // for, and the model already has it, so only the receipt goes back.
+            let note = (self.command == Command::Write)
+                .then_some(self.content.as_deref())
+                .flatten()
+                .filter(|content| !content.trim().is_empty());
+            match note {
+                Some(note) => ToolExecResult::from(Ok(ToolOutput::Markdown(note.into())))
+                    .with_model_output(Some(text)),
+                None => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
             }
         })
     }
@@ -787,6 +798,63 @@ mod tests {
         )
         .unwrap();
         assert!(!out.starts_with(DIR_PREFIX), "{out}");
+    }
+
+    const BODY_MSG: &str = "the reader sees the note, the model sees the receipt";
+    const NOTE_BODY: &str = "# Session picker\n\nThe picker merges **two** sources.";
+
+    fn execute_in(input: Value, dir: &Path) -> ToolExecResult {
+        let call = Box::new(call_in(input, dir));
+        smol::block_on(call.execute(&stub_ctx(&AgentMode::Build)))
+    }
+
+    fn markdown(result: ToolExecResult) -> String {
+        match result.output.expect("a call that succeeded") {
+            ToolOutput::Markdown(text) => text.text,
+            other => panic!("{BODY_MSG}, got {other:?}"),
+        }
+    }
+
+    /// A write's reply is a receipt, so rendering it is rendering nothing. The
+    /// note is what the reader came for, and the model wrote it and does not
+    /// need it back.
+    #[test]
+    fn a_write_renders_the_note_and_replies_with_the_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = execute_in(
+            json!({ "command": "write", "path": "a.md", "content": NOTE_BODY, "tags": ["ui"] }),
+            temp.path(),
+        );
+        assert_eq!(out.model_output.as_deref(), Some("wrote a.md (tags: ui)"));
+        assert_eq!(markdown(out), NOTE_BODY, "{BODY_MSG}");
+    }
+
+    /// Nothing to render is not a reason to render nothing: an empty note
+    /// would leave the row with no body at all, so the receipt stands in.
+    #[test]
+    fn a_blank_note_falls_back_to_its_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = execute_in(
+            json!({ "command": "write", "path": "a.md", "content": "  \n " }),
+            temp.path(),
+        );
+        assert_eq!(out.model_output, None, "{BODY_MSG}");
+        assert!(markdown(out).starts_with("wrote a.md"), "{BODY_MSG}");
+    }
+
+    /// Browsing has one answer, so both sides read it.
+    #[test_case("list" ; "a list")]
+    #[test_case("read" ; "a read")]
+    fn a_browsing_call_shows_the_model_what_the_reader_sees(command: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        run(
+            json!({ "command": "write", "path": "a.md", "content": NOTE_BODY }),
+            temp.path(),
+        )
+        .unwrap();
+        let out = execute_in(json!({ "command": command, "path": "a.md" }), temp.path());
+        assert_eq!(out.model_output, None, "{BODY_MSG}");
+        assert!(markdown(out).contains(DIR_PREFIX), "{BODY_MSG}");
     }
 
     #[test]

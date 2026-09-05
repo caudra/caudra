@@ -69,6 +69,10 @@ pub const FILTERED_AFFORDANCE: &str = "click for filtered";
 const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
 const COMPACT_FALLBACK_SIGIL: char = '⚙';
 const COMPACT_ARG_LIMIT: usize = 3;
+/// Short enough that three of them still leave the header readable, and that a
+/// payload argument cannot become the row.
+const COMPACT_ARG_MAX_CHARS: usize = 40;
+const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 /// The tools whose header is built from a pattern the model wrote.
 const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
@@ -195,7 +199,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("todo_write", '⚙', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD, &["name"]),
     tool_row("question", '→', ASK, &["questions"]),
-    tool_row("memory", '⚙', MEMORY, &[]),
+    tool_row("memory", '⚙', MEMORY, &["content"]),
     tool_row("sessions", '⚙', SESSIONS, &[]),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
@@ -333,7 +337,8 @@ fn duration_millis(tool: Option<&str>, key: &str, value: &serde_json::Number) ->
 /// must survive a header that happens to contain a `1`.
 ///
 /// `tool` is the name the row is tabled under, which is what says whether a
-/// number is a count or a duration.
+/// number is a count or a duration. Every string is bounded on the way in, so
+/// a tool the table has never heard of cannot spill a payload across the row.
 fn compact_args(
     raw_input: Option<&serde_json::Value>,
     header: &str,
@@ -349,14 +354,12 @@ fn compact_args(
     {
         let scalar = match value {
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
-            serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
-            serde_json::Value::Number(number) => {
-                Cow::Owned(duration_millis(tool, key, number).map_or_else(
-                    || number.to_string(),
-                    |millis| humanize_duration(Duration::from_millis(millis)),
-                ))
-            }
-            serde_json::Value::Bool(flag) => Cow::Owned(flag.to_string()),
+            serde_json::Value::String(text) => one_line(text),
+            serde_json::Value::Number(number) => duration_millis(tool, key, number).map_or_else(
+                || number.to_string(),
+                |millis| humanize_duration(Duration::from_millis(millis)),
+            ),
+            serde_json::Value::Bool(flag) => flag.to_string(),
             _ => continue,
         };
         if shown > 0 {
@@ -369,6 +372,25 @@ fn compact_args(
         }
     }
     (!rendered.is_empty()).then(|| format!(" [{rendered}]"))
+}
+
+/// One line, single-spaced, and short enough that the value cannot become the
+/// row. A tabled tool folds its payload away by key, but an untabled one has
+/// no `header_keys` to fold anything with, and a file body arriving under a
+/// name nobody knows would otherwise be pasted across the header verbatim.
+fn one_line(value: &str) -> String {
+    let mut out = String::new();
+    for word in value.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if let Some((cut, _)) = out.char_indices().nth(COMPACT_ARG_MAX_CHARS) {
+        out.truncate(cut);
+        out.push(ELLIPSIS);
+    }
+    out
 }
 
 pub struct RoleStyle {
@@ -3193,6 +3215,63 @@ mod tests {
             sorted_args(compact_args_for(tool, header, Some(&raw_input))).as_deref(),
             expected,
             "{ARGS_MSG}"
+        );
+    }
+
+    const BLOB_MSG: &str = "a payload argument never becomes the row";
+    const NOTE_BODY: &str = "# Session picker\n\nThe picker merges **two** sources.";
+
+    /// The reported bug: a stored note was pasted into the header as
+    /// `[content=…]`, one `Line` deep, so its newlines vanished and its
+    /// markdown read as run-on prose.
+    #[test]
+    fn a_stored_note_never_reaches_the_header() {
+        assert_eq!(
+            compact_args_for(
+                "memory",
+                "write session-picker.md",
+                Some(&serde_json::json!({
+                    "command": "write",
+                    "path": "session-picker.md",
+                    "content": NOTE_BODY,
+                    "tags": ["ui"],
+                })),
+            ),
+            None,
+            "{BLOB_MSG}"
+        );
+    }
+
+    /// What the memory row is spared by key, every other tool is spared by
+    /// bound: a name the table has never heard of still cannot spill a body
+    /// across the header.
+    #[test]
+    fn a_blob_under_an_unknown_key_is_flattened_and_cut() {
+        let rendered = compact_args_for(
+            "srv.unknown",
+            "",
+            Some(&serde_json::json!({ "note": NOTE_BODY.repeat(4) })),
+        )
+        .expect(BLOB_MSG);
+        assert!(!rendered.contains('\n'), "{BLOB_MSG}");
+        assert!(rendered.ends_with(&format!("{ELLIPSIS}]")), "{BLOB_MSG}");
+        assert_eq!(
+            rendered.chars().count(),
+            // ` [note=` + the cut value + the ellipsis + `]`
+            " [note=]".len() + COMPACT_ARG_MAX_CHARS + 1,
+            "{BLOB_MSG}"
+        );
+    }
+
+    /// The bound is a ceiling, not a toll: an ordinary short value still
+    /// reaches the row whole.
+    #[test]
+    fn a_value_that_fits_is_left_as_it_came() {
+        assert_eq!(
+            compact_args_for("srv.unknown", "", Some(&serde_json::json!({ "q": "a b" })))
+                .as_deref(),
+            Some(" [q=a b]"),
+            "{BLOB_MSG}"
         );
     }
 
