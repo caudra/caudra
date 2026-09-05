@@ -417,6 +417,7 @@ impl Workbench {
         self.touched.extend(changes.files);
         if changes.structural {
             self.tree.reload();
+            self.palette.invalidate();
         }
         self.scm.refresh();
         self.apply_marks();
@@ -967,6 +968,9 @@ impl Workbench {
         if keys::TOGGLE_HIDDEN.matches(key) {
             self.show_hidden = !self.show_hidden;
             self.tree.set_show_hidden(self.show_hidden);
+            // The walk the palette cached was taken under the old answer, so
+            // it would go on offering hidden files after they were turned off.
+            self.palette.invalidate();
             return Some(WorkbenchAction::Consumed);
         }
         for (bind, view) in [
@@ -982,12 +986,14 @@ impl Workbench {
             }
         }
         if keys::QUICK_OPEN.matches(key) {
+            self.palette.set_priority(self.other_tabs());
             self.palette.open(&self.root, self.show_hidden);
             return Some(WorkbenchAction::Consumed);
         }
         if keys::REFRESH.matches(key) {
             self.tree.reload();
             self.scm.refresh();
+            self.palette.invalidate();
             self.apply_marks();
             return Some(WorkbenchAction::Consumed);
         }
@@ -1609,6 +1615,21 @@ impl Workbench {
         })
     }
 
+    /// The open tabs the palette lists first, most recently opened before the
+    /// rest. The active one is left out: `Ctrl+P` then `Enter` is worth a
+    /// keystroke only if it lands somewhere other than where the cursor is.
+    fn other_tabs(&self) -> Vec<String> {
+        let active = self.editor.active_index();
+        self.editor
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != active)
+            .rev()
+            .map(|(_, tab)| self.relative(&tab.path).display().to_string())
+            .collect()
+    }
+
     fn relative<'a>(&'a self, path: &'a Path) -> &'a Path {
         path.strip_prefix(&self.root).unwrap_or(path)
     }
@@ -1809,6 +1830,7 @@ mod tests {
     const TAB_OFF_STRIP: &str = "the strip is not showing the tab the editor is on";
     const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
     const WRONG_BAR: &str = "the pane is not saying how much of its content is off screen";
+    const WRONG_ORDER: &str = "the palette is not offering the project the way it should";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2437,6 +2459,43 @@ mod tests {
             workbench.tree.selected().map(|row| row.name.clone()),
             Some("b.txt".to_owned()),
             "opening from the palette must reveal the file in the tree"
+        );
+    }
+
+    /// `a.txt` is open and active and `b.txt` is not, so the palette leads
+    /// with the one worth going to.
+    #[test]
+    fn the_palette_offers_the_other_open_tabs_first() {
+        let (dir, mut workbench) = project();
+        workbench.open_path(&dir.path().join("sub/b.txt"));
+        workbench.open_path(&dir.path().join("a.txt"));
+
+        workbench.handle_key(KeyEvent::new(keys::QUICK_OPEN.code, KeyModifiers::CONTROL));
+
+        assert_eq!(
+            workbench.palette.rows().next(),
+            Some("sub/b.txt"),
+            "{WRONG_ORDER}"
+        );
+    }
+
+    #[test_case(keys::REFRESH.code, KeyModifiers::NONE ; "refresh rewalks")]
+    #[test_case(keys::TOGGLE_HIDDEN.code, KeyModifiers::CONTROL ; "so does changing what counts")]
+    fn the_palette_rewalks_when_the_project_is_said_to_have_moved(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let (dir, mut workbench) = project();
+        workbench.handle_key(KeyEvent::new(keys::QUICK_OPEN.code, KeyModifiers::CONTROL));
+        workbench.handle_key(key(KeyCode::Esc));
+        fs::write(dir.path().join("late.txt"), "").expect("a file");
+
+        workbench.handle_key(KeyEvent::new(code, modifiers));
+        workbench.handle_key(KeyEvent::new(keys::QUICK_OPEN.code, KeyModifiers::CONTROL));
+
+        assert!(
+            workbench.palette.rows().any(|row| row == "late.txt"),
+            "{WRONG_ORDER}"
         );
     }
 

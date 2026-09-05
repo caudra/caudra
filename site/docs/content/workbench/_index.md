@@ -63,7 +63,7 @@ Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file,
 
 Rows carry two marks. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
 
-`Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it.
+`Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it. Before you type anything it lists your other open tabs first, most recent before the rest, so `Ctrl+P` then `Enter` goes back to the file you came from. The project is walked once and reused, and walked again after `F5`, after `Ctrl+H`, or when a file appears or disappears on disk.
 
 ## Editor
 

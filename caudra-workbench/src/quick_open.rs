@@ -19,6 +19,9 @@ pub struct QuickOpen {
     query: String,
     /// Paths relative to the root, which is what is matched and shown.
     files: Vec<String>,
+    /// Paths to list first while nothing has been typed, which is the open
+    /// tabs. Held across opens because it is set on the way in.
+    priority: Vec<String>,
     matches: Vec<usize>,
     selected: usize,
     scroll: usize,
@@ -32,6 +35,7 @@ impl Default for QuickOpen {
             open: false,
             query: String::new(),
             files: Vec::new(),
+            priority: Vec::new(),
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -46,8 +50,13 @@ impl QuickOpen {
         self.open
     }
 
+    /// Walks the project only when it has nothing to show, so reopening the
+    /// palette costs a match rather than a full crawl of the tree. What makes
+    /// the list stale is [`QuickOpen::invalidate`].
     pub fn open(&mut self, root: &Path, show_hidden: bool) {
-        self.files = walk(root, show_hidden);
+        if self.files.is_empty() {
+            self.files = walk(root, show_hidden);
+        }
         self.query.clear();
         self.open = true;
         self.rescan();
@@ -55,8 +64,17 @@ impl QuickOpen {
 
     pub fn close(&mut self) {
         self.open = false;
-        self.files = Vec::new();
         self.matches = Vec::new();
+    }
+
+    /// Throws the walk away, so the next open pays for a fresh one.
+    pub fn invalidate(&mut self) {
+        self.files = Vec::new();
+    }
+
+    /// The paths to offer ahead of the rest before anything is typed.
+    pub fn set_priority(&mut self, priority: Vec<String>) {
+        self.priority = priority;
     }
 
     pub fn query(&self) -> &str {
@@ -124,14 +142,22 @@ impl QuickOpen {
         self.scroll = self.scroll.min(self.matches.len().saturating_sub(viewport));
     }
 
-    /// An empty query lists the files as walked, so the palette is useful
-    /// before anything is typed.
+    /// An empty query lists the priority paths and then the rest as walked, so
+    /// the palette is useful before anything is typed.
     fn rescan(&mut self) {
         self.selected = 0;
         self.scroll = 0;
         self.matches.clear();
         if self.query.is_empty() {
-            self.matches.extend(0..self.files.len().min(MAX_MATCHES));
+            let promoted: Vec<usize> = self
+                .priority
+                .iter()
+                .filter_map(|wanted| self.files.iter().position(|file| file == wanted))
+                .collect();
+            self.matches.extend(promoted.iter().copied());
+            self.matches
+                .extend((0..self.files.len()).filter(|index| !promoted.contains(index)));
+            self.matches.truncate(MAX_MATCHES);
             return;
         }
 
@@ -177,6 +203,7 @@ mod tests {
     const NOT_FOUND: &str = "the file typed for is not among the matches";
     const WRONG_ORDER: &str = "the closest match must come first";
     const WRONG_END: &str = "the selection did not land on the end of the list it was sent to";
+    const STALE: &str = "the palette is not offering what the project holds";
 
     fn fixture() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -203,6 +230,50 @@ mod tests {
         let (_tmp, palette) = opened();
         assert_eq!(palette.len(), 3, "{NOT_FOUND}");
         assert!(palette.len() <= MAX_MATCHES);
+    }
+
+    /// The walk is what makes opening the palette expensive, so it survives a
+    /// close and only a deliberate invalidation pays for it again.
+    #[test]
+    fn reopening_does_not_rewalk_until_the_project_is_said_to_have_moved() {
+        let (tmp, mut palette) = opened();
+        palette.close();
+        fs::write(tmp.path().join("late.rs"), "").unwrap();
+
+        palette.open(tmp.path(), false);
+        assert!(
+            !rows(&palette).iter().any(|row| row == "late.rs"),
+            "{STALE}"
+        );
+
+        palette.close();
+        palette.invalidate();
+        palette.open(tmp.path(), false);
+        assert!(rows(&palette).iter().any(|row| row == "late.rs"), "{STALE}");
+    }
+
+    #[test]
+    fn an_empty_query_lists_the_priority_paths_first() {
+        let (tmp, mut palette) = opened();
+        palette.close();
+        palette.set_priority(vec!["src/nested/deep.rs".to_owned()]);
+        palette.open(tmp.path(), false);
+
+        let found = rows(&palette);
+        assert_eq!(found[0], "src/nested/deep.rs", "{WRONG_ORDER}");
+        assert_eq!(found.len(), 3, "{WRONG_ORDER}");
+    }
+
+    /// A path the walk never found cannot be promoted, and must not push the
+    /// rest of the list down a row either.
+    #[test]
+    fn a_priority_path_that_is_gone_is_left_out() {
+        let (tmp, mut palette) = opened();
+        palette.close();
+        palette.set_priority(vec!["deleted.rs".to_owned()]);
+        palette.open(tmp.path(), false);
+
+        assert_eq!(rows(&palette).len(), 3, "{WRONG_ORDER}");
     }
 
     #[test]
