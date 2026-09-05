@@ -388,6 +388,8 @@ pub enum UsageGrouping {
     Model,
     Provider,
     Project,
+    /// Chat against what Caudra spent on its own: goals, compaction, titles.
+    Purpose,
     Day,
     Month,
     Total,

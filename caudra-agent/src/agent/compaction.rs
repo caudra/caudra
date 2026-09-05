@@ -4,6 +4,7 @@ use caudra_config::{AgentConfig, CompactionBuffer};
 use caudra_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
+use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
@@ -101,6 +102,8 @@ fn finish_compact(
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
+        provider: model.provider.to_string(),
+        purpose: LedgerPurpose::Compaction,
         cost: model.billed_cost(&response.usage, false),
         context_size: Some(response.usage.output),
         context_window: model.context_window,

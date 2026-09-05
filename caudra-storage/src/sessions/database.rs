@@ -48,6 +48,7 @@ use super::{
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
+use crate::usage_ledger::LedgerPurpose;
 use crate::{
     StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
 };
@@ -55,7 +56,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -96,7 +97,33 @@ const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
 /// `cost` is the priced sum rather than a nullable per-entry price: a bucket
 /// mixes priced and unpriced turns, so `SUM(cost)` alone would quietly
 /// understate. `unpriced_turns` is what makes the shortfall countable.
+///
+/// `purpose` separates the conversation from what Caudra spends on its own, so
+/// a bill can name goal evaluation, compaction, or titles. The model cannot
+/// stand in for it: those workloads often run on the chat model.
 const USAGE_LEDGER_TABLE: &str = r#"
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral)
+) STRICT, WITHOUT ROWID;
+"#;
+
+/// What the `1 -> 2` step actually produced. Frozen: replaying history must
+/// rebuild the shape of the day, not today's shape, or `2 -> 3` would find its
+/// work already done and the chain would stop describing what happened.
+const USAGE_LEDGER_TABLE_V2: &str = r#"
 CREATE TABLE usage_ledger (
     bucket_start   INTEGER NOT NULL,
     provider       TEXT NOT NULL,
@@ -114,6 +141,34 @@ CREATE TABLE usage_ledger (
 ) STRICT, WITHOUT ROWID;
 "#;
 
+/// A `WITHOUT ROWID` primary key cannot be widened in place, so the table is
+/// rebuilt. Everything recorded before the split was the conversation or was
+/// billed as if it were, and `chat` is the honest name for that.
+const USAGE_LEDGER_ADD_PURPOSE: &str = r#"
+ALTER TABLE usage_ledger RENAME TO usage_ledger_v2;
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral)
+) STRICT, WITHOUT ROWID;
+INSERT INTO usage_ledger
+    SELECT bucket_start, provider, model, cwd, 'chat', ephemeral, input_tokens,
+           output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns
+    FROM usage_ledger_v2;
+DROP TABLE usage_ledger_v2;
+"#;
+
 /// One step of the schema chain. A fresh database gets [`SCHEMA`] at
 /// [`SCHEMA_VERSION`] directly; only an existing database replays these.
 struct Migration {
@@ -122,11 +177,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    from: 1,
-    to: 2,
-    sql: USAGE_LEDGER_TABLE,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from: 1,
+        to: 2,
+        sql: USAGE_LEDGER_TABLE_V2,
+    },
+    Migration {
+        from: 2,
+        to: 3,
+        sql: USAGE_LEDGER_ADD_PURPOSE,
+    },
+];
 
 // Session state in this schema is canonical. The one exception is
 // `usage_ledger`, which is a second durable representation on purpose: its
@@ -259,6 +321,7 @@ pub struct LedgerEntry<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub cwd: &'a str,
+    pub purpose: LedgerPurpose,
     pub ephemeral: bool,
     pub usage: StoredTokenUsage,
     pub cost: Option<f64>,
@@ -272,6 +335,7 @@ pub struct UsageBucket {
     pub provider: String,
     pub model: String,
     pub cwd: String,
+    pub purpose: String,
     pub ephemeral: bool,
     pub input: u64,
     pub output: u64,
@@ -601,11 +665,11 @@ impl SessionDatabase {
             None => (0.0, 0, 1),
         };
         self.connection.execute(
-            "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, ephemeral, \
+            "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
                  input_tokens, output_tokens, cache_creation, cache_read, cost, \
                  priced_turns, unpriced_turns) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-             ON CONFLICT(bucket_start, provider, model, cwd, ephemeral) DO UPDATE SET \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral) DO UPDATE SET \
                  input_tokens = input_tokens + excluded.input_tokens, \
                  output_tokens = output_tokens + excluded.output_tokens, \
                  cache_creation = cache_creation + excluded.cache_creation, \
@@ -618,6 +682,7 @@ impl SessionDatabase {
                 entry.provider,
                 entry.model,
                 entry.cwd,
+                entry.purpose.storage_name(),
                 i64::from(entry.ephemeral),
                 i64::from(entry.usage.input),
                 i64::from(entry.usage.output),
@@ -633,10 +698,10 @@ impl SessionDatabase {
 
     pub fn usage_buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {
         let mut statement = self.connection.prepare(
-            "SELECT bucket_start, provider, model, cwd, ephemeral, input_tokens, output_tokens, \
-                    cache_creation, cache_read, cost, priced_turns, unpriced_turns  \
+            "SELECT bucket_start, provider, model, cwd, purpose, ephemeral, input_tokens, \
+                    output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns  \
              FROM usage_ledger WHERE ?1 IS NULL OR bucket_start >= ?1  \
-             ORDER BY bucket_start DESC, provider ASC, model ASC, cwd ASC",
+             ORDER BY bucket_start DESC, provider ASC, model ASC, cwd ASC, purpose ASC",
         )?;
         let mut rows = statement.query(params![since])?;
         let mut buckets = Vec::new();
@@ -646,14 +711,15 @@ impl SessionDatabase {
                 provider: row.get(1)?,
                 model: row.get(2)?,
                 cwd: row.get(3)?,
-                ephemeral: row.get::<_, i64>(4)? != 0,
-                input: from_i64(row.get(5)?, "usage_ledger.input_tokens")?,
-                output: from_i64(row.get(6)?, "usage_ledger.output_tokens")?,
-                cache_creation: from_i64(row.get(7)?, "usage_ledger.cache_creation")?,
-                cache_read: from_i64(row.get(8)?, "usage_ledger.cache_read")?,
-                cost: row.get(9)?,
-                priced_turns: from_i64(row.get(10)?, "usage_ledger.priced_turns")?,
-                unpriced_turns: from_i64(row.get(11)?, "usage_ledger.unpriced_turns")?,
+                purpose: row.get(4)?,
+                ephemeral: row.get::<_, i64>(5)? != 0,
+                input: from_i64(row.get(6)?, "usage_ledger.input_tokens")?,
+                output: from_i64(row.get(7)?, "usage_ledger.output_tokens")?,
+                cache_creation: from_i64(row.get(8)?, "usage_ledger.cache_creation")?,
+                cache_read: from_i64(row.get(9)?, "usage_ledger.cache_read")?,
+                cost: row.get(10)?,
+                priced_turns: from_i64(row.get(11)?, "usage_ledger.priced_turns")?,
+                unpriced_turns: from_i64(row.get(12)?, "usage_ledger.unpriced_turns")?,
             });
         }
         Ok(buckets)
@@ -3226,6 +3292,9 @@ mod tests {
         "a fresh database must get the current schema without replaying migrations";
     const OLDER_SCHEMA_VERSION: i64 = -1;
     const NEWER_SCHEMA_VERSION: i64 = SCHEMA_VERSION + 1;
+    const MIGRATION_KEEPS_SPEND: &str =
+        "widening the ledger key must carry every recorded row across";
+    const LEDGER_COST: f64 = 3.5;
     const TRIM_KEEPS_SMALL: &str = "trim must keep rich outputs at or below the threshold";
     const TRIM_DROPS_LARGE: &str = "trim must drop rich outputs above the threshold";
     const ARTIFACTS_REMOVED: &str = "trim must remove every artifact directory";
@@ -4155,6 +4224,55 @@ mod tests {
         assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
         assert_eq!(database.persisted_session_ids().unwrap(), vec![id]);
         assert_eq!(database.usage_buckets(None).unwrap(), Vec::new());
+    }
+
+    /// A database as the ledger's first release left it: schema 2, no purpose.
+    fn seed_v2_database(state_dir: &StateDir) {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGE_SIZE)
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.execute_batch(USAGE_LEDGER_TABLE_V2).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, ephemeral, \
+                 input_tokens, output_tokens, cache_creation, cache_read, cost, \
+                 priced_turns, unpriced_turns) \
+                 VALUES (0, 'anthropic', ?1, ?2, 0, 10, 20, 0, 0, ?3, 1, 0)",
+                params![MODEL, CWD, LEDGER_COST],
+            )
+            .unwrap();
+        drop(connection);
+    }
+
+    #[test]
+    fn migrating_a_v2_ledger_attributes_its_rows_to_chat() {
+        let (_temp, state_dir) = state_dir();
+        seed_v2_database(&state_dir);
+
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let rows = database.usage_buckets(None).unwrap();
+
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(rows.len(), 1, "{MIGRATION_KEEPS_SPEND}");
+        assert_eq!(
+            rows[0].purpose,
+            LedgerPurpose::Chat.storage_name(),
+            "{MIGRATION_KEEPS_SPEND}"
+        );
+        assert_eq!(rows[0].cost, LEDGER_COST, "{MIGRATION_KEEPS_SPEND}");
+        assert_eq!(rows[0].model, MODEL, "{MIGRATION_KEEPS_SPEND}");
     }
 
     #[test]

@@ -87,14 +87,27 @@ From the shell:
 ```bash
 caudra storage usage                          # by model, all time
 caudra storage usage --group-by project       # where the money went
+caudra storage usage --group-by purpose       # chat against everything else
 caudra storage usage --group-by month --json  # for a spreadsheet
 caudra storage usage --since 30d
 caudra storage usage --prune-older-than 1y
 ```
+
+Every row records why the model was called, so you can separate the conversation from the work Caudra does around it:
+
+| Purpose | What it covers |
+| --- | --- |
+| `chat` | Conversation turns, including the ones subagents run |
+| `goal` | [Completion goal](/docs/commands/#completion-goals) evaluations |
+| `compaction` | Summarizing a session that filled its window |
+| `title` | Naming a session |
+| `btw` | `/btw` questions asked beside the conversation |
+
+The model cannot answer that question on its own, because goals, compaction, and titles often run on the model already in use.
 
 Two things worth knowing about the numbers:
 
 - Runs started with `--ephemeral` leave no session behind, and their spend is still recorded and labelled, so the totals stay complete.
 - A model with no published price contributes tokens but no cost. Caudra reports how many turns those were rather than counting them as free, so the total is a floor.
 
-The ledger holds one row per hour, model, and project, so it stays small on its own. [Retention](/docs/sessions/#retention) never touches it, and `--prune-older-than` is how you trim it.
+The ledger holds one row per hour, model, project, and purpose, so it stays small on its own. [Retention](/docs/sessions/#retention) never touches it, and `--prune-older-than` is how you trim it.

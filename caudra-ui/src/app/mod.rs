@@ -93,7 +93,7 @@ use caudra_providers::{
 use caudra_storage::StateDir;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
-use caudra_storage::usage_ledger::{LifetimeUsage, TurnUsage, UsageLedger};
+use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
@@ -2200,8 +2200,23 @@ impl App {
         }
         // Generated off the turn's critical path, so it can land after the run
         // that asked for it retired; a title is session state, not a frame.
-        if let AgentEvent::SessionTitle { title } = envelope.event {
-            self.state.session_mut().set_title_if_auto(title);
+        // The spend is recorded even when the answer was unusable, and
+        // `context_size` is left alone: the request never enters history.
+        if let AgentEvent::SessionTitle {
+            title,
+            usage,
+            cost,
+            model,
+            provider,
+        } = envelope.event
+        {
+            self.state.token_usage += usage;
+            add_cost(&mut self.state.cost, cost);
+            self.record_model_usage(&provider, &model, LedgerPurpose::Title, usage, cost);
+            self.state.goal.record_external_usage(usage, cost);
+            if let Some(title) = title {
+                self.state.session_mut().set_title_if_auto(title);
+            }
             return vec![];
         }
         if let AgentEvent::SubagentHistory {
@@ -2446,7 +2461,7 @@ impl App {
             if subagent_id.is_some() {
                 self.state.goal.record_external_usage(tc.usage, tc.cost);
             }
-            self.record_model_usage(&tc.model, tc.usage, tc.cost);
+            self.record_model_usage(&tc.provider, &tc.model, tc.purpose, tc.usage, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -2486,11 +2501,7 @@ impl App {
                 self.state.token_usage += usage;
                 add_cost(&mut self.state.cost, cost);
                 add_cost(&mut self.chats[chat_idx].cost, cost);
-                if usage.context_tokens() > 0 || cost.is_some() {
-                    let usage_model =
-                        goal_usage_model(&model, &self.state.model.provider).to_string();
-                    self.record_model_usage(&usage_model, usage, cost);
-                }
+                self.record_goal_usage(&model, usage, cost);
                 if applied && verdict == GoalVerdict::NotMet {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Assistant,
@@ -2553,11 +2564,7 @@ impl App {
                 self.state.token_usage += usage;
                 add_cost(&mut self.state.cost, cost);
                 add_cost(&mut self.chats[chat_idx].cost, cost);
-                if usage.context_tokens() > 0 || cost.is_some() {
-                    let usage_model =
-                        goal_usage_model(&model, &self.state.model.provider).to_string();
-                    self.record_model_usage(&usage_model, usage, cost);
-                }
+                self.record_goal_usage(&model, usage, cost);
                 if applied {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Error,
@@ -3401,20 +3408,49 @@ impl App {
     /// The one place a turn's spend is recorded. The session keeps its own
     /// per-model breakdown for `/usage`, and the ledger keeps the money: a
     /// forgotten session must not take what it cost with it.
-    fn record_model_usage(&mut self, model: &str, usage: TokenUsage, cost: Option<f64>) {
+    ///
+    /// `provider` comes from whoever answered rather than from the chat model.
+    /// Goal evaluation, compaction and titles can each resolve to another
+    /// provider, and billing them to the conversation's provider would make
+    /// `--group-by provider` describe a session that never happened.
+    fn record_model_usage(
+        &mut self,
+        provider: &str,
+        model: &str,
+        purpose: LedgerPurpose,
+        usage: TokenUsage,
+        cost: Option<f64>,
+    ) {
+        let key = session_usage_model(provider, model, &self.state.model.provider);
         self.state
             .session_mut()
-            .add_model_usage(model, usage.billed(cost));
+            .add_model_usage(&key, usage.billed(cost));
         self.storage_writer.record_usage(TurnUsage {
-            provider: self.state.model.provider.to_string(),
+            provider: provider.to_owned(),
             model: model.to_owned(),
             cwd: self.state.session.cwd.clone(),
+            purpose,
             input: usage.input,
             output: usage.output,
             cache_creation: usage.cache_creation,
             cache_read: usage.cache_read,
             cost,
         });
+    }
+
+    /// The evaluator reports a fully qualified spec because it may have been
+    /// served by a provider this session never chose. A resolution that failed
+    /// before reaching a model reports no spec and no spend, and recording
+    /// zeroes would invent a row for a request that never happened.
+    fn record_goal_usage(&mut self, spec: &str, usage: TokenUsage, cost: Option<f64>) {
+        if usage.context_tokens() == 0 && cost.is_none() {
+            return;
+        }
+        let (provider, model) = match spec.split_once('/') {
+            Some((provider, model)) => (provider.to_owned(), model.to_owned()),
+            None => (self.state.model.provider.to_string(), spec.to_owned()),
+        };
+        self.record_model_usage(&provider, &model, LedgerPurpose::Goal, usage, cost);
     }
 
     /// btw spends real tokens outside any turn, so it settles into the same
@@ -3426,7 +3462,13 @@ impl App {
             self.state.token_usage += btw.usage;
             add_cost(&mut self.state.cost, btw.cost);
             add_cost(&mut self.main_chat().cost, btw.cost);
-            self.record_model_usage(&btw.model, btw.usage, btw.cost);
+            self.record_model_usage(
+                &btw.provider,
+                &btw.model,
+                LedgerPurpose::Btw,
+                btw.usage,
+                btw.cost,
+            );
             self.state.goal.record_external_usage(btw.usage, btw.cost);
         }
         dirty
@@ -3630,10 +3672,15 @@ impl App {
     }
 }
 
-fn goal_usage_model<'a>(model: &'a str, current_provider: &str) -> &'a str {
-    match model.split_once('/') {
-        Some((provider, id)) if provider == current_provider => id,
-        _ => model,
+/// The key `/usage` groups a session's spend under. Bare while the answer came
+/// from the conversation's own provider, so the common case reads as the model
+/// alone, and qualified once a workload resolves elsewhere, so two providers
+/// serving the same model id stay apart.
+fn session_usage_model(provider: &str, model: &str, current_provider: &str) -> String {
+    if provider == current_provider {
+        model.to_owned()
+    } else {
+        format!("{provider}/{model}")
     }
 }
 

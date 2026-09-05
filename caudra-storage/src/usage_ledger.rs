@@ -23,12 +23,49 @@ use crate::{StateClass, StateDir, now_epoch};
 pub const BUCKET_SECONDS: u64 = 60 * 60;
 const MONTH_FORMAT: &str = "%Y-%m";
 
+/// Why a model was called. Chat is the conversation itself; the rest is what
+/// Caudra spends on the user's behalf without being asked, which is exactly the
+/// spend a bill is queried about. The model alone cannot answer that: a goal
+/// evaluated by the chat model is indistinguishable from the chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerPurpose {
+    Chat,
+    Goal,
+    Compaction,
+    Title,
+    Btw,
+}
+
+impl LedgerPurpose {
+    pub const fn storage_name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Goal => "goal",
+            Self::Compaction => "compaction",
+            Self::Title => "title",
+            Self::Btw => "btw",
+        }
+    }
+
+    pub fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "goal" => Some(Self::Goal),
+            "compaction" => Some(Self::Compaction),
+            "title" => Some(Self::Title),
+            "btw" => Some(Self::Btw),
+            _ => None,
+        }
+    }
+}
+
 /// One turn's contribution, before it is folded into its bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnUsage {
     pub provider: String,
     pub model: String,
     pub cwd: String,
+    pub purpose: LedgerPurpose,
     pub input: u32,
     pub output: u32,
     pub cache_creation: u32,
@@ -70,6 +107,7 @@ impl UsageLedger {
             provider: &turn.provider,
             model: &turn.model,
             cwd: &turn.cwd,
+            purpose: turn.purpose,
             ephemeral: self.ephemeral,
             usage: StoredTokenUsage {
                 input: turn.input,
@@ -95,7 +133,7 @@ impl UsageLedger {
     }
 }
 
-/// One line of a lifetime breakdown: a model, a project, or a month.
+/// One line of a lifetime breakdown: a model, a project, a purpose, or a month.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSlice {
     pub label: String,
@@ -104,7 +142,7 @@ pub struct UsageSlice {
     pub turns: u64,
 }
 
-/// Everything recorded, folded three ways. Built from the whole table, so it
+/// Everything recorded, folded four ways. Built from the whole table, so it
 /// answers "what has this cost me" rather than "what has this session cost me".
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LifetimeUsage {
@@ -124,6 +162,7 @@ pub struct LifetimeUsage {
     pub since: Option<i64>,
     pub by_model: Vec<UsageSlice>,
     pub by_project: Vec<UsageSlice>,
+    pub by_purpose: Vec<UsageSlice>,
     pub by_month: Vec<UsageSlice>,
 }
 
@@ -148,6 +187,7 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
     let mut summary = LifetimeUsage::default();
     let mut by_model: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_project: BTreeMap<String, UsageSlice> = BTreeMap::new();
+    let mut by_purpose: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_month: BTreeMap<String, UsageSlice> = BTreeMap::new();
     for bucket in buckets {
         summary.input += bucket.input;
@@ -171,10 +211,12 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
             bucket,
         );
         add_slice(&mut by_project, bucket.cwd.clone(), bucket);
+        add_slice(&mut by_purpose, bucket.purpose.clone(), bucket);
         add_slice(&mut by_month, month_label(bucket.bucket_start), bucket);
     }
     summary.by_model = ranked(by_model);
     summary.by_project = ranked(by_project);
+    summary.by_purpose = ranked(by_purpose);
     summary.by_month = by_month.into_values().rev().collect();
     summary
 }
@@ -220,6 +262,7 @@ fn month_label(bucket_start: i64) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const PROVIDER: &str = "anthropic";
     const MODEL: &str = "claude-opus-4";
@@ -230,12 +273,14 @@ mod tests {
     const EPHEMERAL_PERSISTS: &str = "an ephemeral run spends real money and must record it";
     const NO_VOLATILE_LEDGER: &str = "the ledger belongs to the persistent root";
     const UNPRICED_COUNTED: &str = "an unpriced turn must be counted, not dropped";
+    const PURPOSE_SEPARATES: &str = "spend Caudra makes on its own must stay tellable from the chat";
 
     fn turn(model: &str, cost: Option<f64>) -> TurnUsage {
         TurnUsage {
             provider: PROVIDER.into(),
             model: model.into(),
             cwd: CWD.into(),
+            purpose: LedgerPurpose::Chat,
             input: 10,
             output: 20,
             cache_creation: 30,
@@ -294,6 +339,88 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().map(|row| row.cost).sum::<f64>(), 2.0);
+    }
+
+    #[test]
+    fn one_model_in_one_hour_still_splits_by_purpose() {
+        let (_temp, dir) = state_dir();
+        ledger(&dir).record_at(&turn(MODEL, Some(1.0)), 0).unwrap();
+        ledger(&dir)
+            .record_at(
+                &TurnUsage {
+                    purpose: LedgerPurpose::Goal,
+                    ..turn(MODEL, Some(4.0))
+                },
+                0,
+            )
+            .unwrap();
+
+        let rows = ledger(&dir).buckets(None).unwrap();
+
+        assert_eq!(rows.len(), 2, "{PURPOSE_SEPARATES}");
+        let goal = rows
+            .iter()
+            .find(|row| row.purpose == LedgerPurpose::Goal.storage_name())
+            .expect(PURPOSE_SEPARATES);
+        assert_eq!(goal.cost, 4.0, "{PURPOSE_SEPARATES}");
+    }
+
+    #[test_case(LedgerPurpose::Chat ; "chat")]
+    #[test_case(LedgerPurpose::Goal ; "goal")]
+    #[test_case(LedgerPurpose::Compaction ; "compaction")]
+    #[test_case(LedgerPurpose::Title ; "title")]
+    #[test_case(LedgerPurpose::Btw ; "btw")]
+    fn a_purpose_round_trips_through_the_ledger(purpose: LedgerPurpose) {
+        let (_temp, dir) = state_dir();
+        ledger(&dir)
+            .record_at(
+                &TurnUsage {
+                    purpose,
+                    ..turn(MODEL, Some(1.0))
+                },
+                0,
+            )
+            .unwrap();
+
+        let rows = ledger(&dir).buckets(None).unwrap();
+
+        assert_eq!(rows[0].purpose, purpose.storage_name());
+        assert_eq!(
+            LedgerPurpose::from_storage_name(&rows[0].purpose),
+            Some(purpose)
+        );
+    }
+
+    #[test]
+    fn a_lifetime_summary_ranks_purposes_by_cost() {
+        let (_temp, dir) = state_dir();
+        let ledger = ledger(&dir);
+        ledger.record_at(&turn(MODEL, Some(1.0)), 0).unwrap();
+        ledger
+            .record_at(
+                &TurnUsage {
+                    purpose: LedgerPurpose::Goal,
+                    ..turn(MODEL, Some(6.0))
+                },
+                0,
+            )
+            .unwrap();
+
+        let lifetime = ledger.lifetime().unwrap();
+
+        assert_eq!(
+            lifetime
+                .by_purpose
+                .iter()
+                .map(|slice| slice.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                LedgerPurpose::Goal.storage_name(),
+                LedgerPurpose::Chat.storage_name()
+            ],
+            "{PURPOSE_SEPARATES}"
+        );
+        assert_eq!(lifetime.by_purpose[0].cost, 6.0);
     }
 
     #[test]

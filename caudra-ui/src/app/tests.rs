@@ -37,12 +37,13 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    StoredImage, StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft,
-    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
+    StoredActiveGoal, StoredGoalVerdict, StoredImage, StoredMode, StoredPasteRange,
+    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    StoredSubagentOutcome, StoredTokenUsage,
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
-use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
+use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
@@ -53,12 +54,28 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// What [`test_model`] answers as, so a turn recorded in a test lands under
+/// the session's own provider the way a real one does.
+const TEST_PROVIDER: &str = "anthropic";
+const OTHER_PROVIDER: &str = "openrouter";
 const LEDGER_PROVIDER: &str = "anthropic";
 const LEDGER_MODEL: &str = "claude-opus-5";
 const LEDGER_CWD: &str = "/home/dev/caudra";
 const LEDGER_COST: f64 = 0.25;
 const LIFETIME_IS_NOT_READ_UNTIL_ASKED_FOR: &str =
     "opening the session view must not touch the ledger";
+const GOAL_REASON: &str = "lint has not run";
+const GOAL_INPUT: u32 = 400;
+const GOAL_OUTPUT: u32 = 90;
+const GOAL_COST: f64 = 0.125;
+const GOAL_EVALUATIONS: u32 = 3;
+const GOAL_ELAPSED_MS: u64 = 90_000;
+const GOAL_PROGRESS_SURVIVES: &str =
+    "an active goal must resume with the spend and count it already had";
+const GOAL_SPEND_IS_ITS_OWN: &str = "goal evaluation must not be billed as the conversation";
+const TITLE_SPEND_IS_RECORDED: &str = "a title costs real tokens and must not be dropped";
+const TITLE_TEXT: &str = "Sqlite ledger work";
+const TITLE_CONTEXT_SIZE: u32 = 1234;
 const TASK_ID: &str = "task1";
 pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
@@ -343,10 +360,22 @@ fn tool_start(id: &str, tool: &str) -> AgentEvent {
 }
 
 fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEvent {
+    turn_complete_from(TEST_PROVIDER, usage, model, cost, LedgerPurpose::Chat)
+}
+
+fn turn_complete_from(
+    provider: &str,
+    usage: TokenUsage,
+    model: &str,
+    cost: Option<f64>,
+    purpose: LedgerPurpose,
+) -> AgentEvent {
     AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: Default::default(),
         usage,
         model: model.into(),
+        provider: provider.into(),
+        purpose,
         cost,
         context_size: None,
         context_window: 0,
@@ -5070,6 +5099,7 @@ fn the_lifetime_view_reads_spend_the_current_session_never_produced() {
             provider: LEDGER_PROVIDER.into(),
             model: LEDGER_MODEL.into(),
             cwd: LEDGER_CWD.into(),
+            purpose: LedgerPurpose::Chat,
             input: 1,
             output: 1,
             cache_creation: 0,
@@ -5181,17 +5211,143 @@ fn goal_model_opens_dedicated_picker_without_starting_goal(command: &str) {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
+/// The evaluator can be served by a provider this session never chose. Billing
+/// that to the chat provider would make `--group-by provider` describe a
+/// session that never happened.
 #[test]
-fn qualified_goal_model_uses_the_normal_session_usage_key() {
+fn goal_evaluation_is_billed_to_its_own_provider_and_purpose() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::GoalEvaluation {
+        verdict: GoalVerdict::NotMet,
+        reason: GOAL_REASON.into(),
+        evaluation: 1,
+        applied: true,
+        usage: TokenUsage {
+            input: GOAL_INPUT,
+            output: GOAL_OUTPUT,
+            ..Default::default()
+        },
+        cost: Some(GOAL_COST),
+        model: format!("{OTHER_PROVIDER}/{LEDGER_MODEL}"),
+    }));
+    drain_writer(app, writer);
+
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1, "{GOAL_SPEND_IS_ITS_OWN}");
+    assert_eq!(rows[0].provider, OTHER_PROVIDER, "{GOAL_SPEND_IS_ITS_OWN}");
+    assert_eq!(rows[0].model, LEDGER_MODEL, "{GOAL_SPEND_IS_ITS_OWN}");
     assert_eq!(
-        goal_usage_model("anthropic/claude-haiku", "anthropic"),
-        "claude-haiku"
+        rows[0].purpose,
+        LedgerPurpose::Goal.storage_name(),
+        "{GOAL_SPEND_IS_ITS_OWN}"
     );
+    assert_eq!(rows[0].cost, GOAL_COST, "{GOAL_SPEND_IS_ITS_OWN}");
+}
+
+/// Compaction runs on its own model and is not the conversation, so it must
+/// reach the ledger under its own provider and purpose.
+#[test]
+fn compaction_is_billed_to_its_own_provider_and_purpose() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(turn_complete_from(
+        OTHER_PROVIDER,
+        TokenUsage {
+            input: GOAL_INPUT,
+            output: GOAL_OUTPUT,
+            ..Default::default()
+        },
+        LEDGER_MODEL,
+        Some(GOAL_COST),
+        LedgerPurpose::Compaction,
+    )));
+    drain_writer(app, writer);
+
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].provider, OTHER_PROVIDER);
+    assert_eq!(rows[0].purpose, LedgerPurpose::Compaction.storage_name());
+}
+
+/// The title request never enters the conversation, so its spend is recorded
+/// while the context size it would otherwise report is ignored.
+#[test]
+fn title_spend_reaches_the_ledger_without_moving_the_context_size() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.chats[0].context_size = TITLE_CONTEXT_SIZE;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::SessionTitle {
+        title: Some(TITLE_TEXT.into()),
+        usage: TokenUsage {
+            input: GOAL_INPUT,
+            output: GOAL_OUTPUT,
+            ..Default::default()
+        },
+        cost: Some(GOAL_COST),
+        model: LEDGER_MODEL.into(),
+        provider: OTHER_PROVIDER.into(),
+    }));
     assert_eq!(
-        goal_usage_model("openrouter/vendor/model", "anthropic"),
-        "openrouter/vendor/model"
+        app.chats[0].context_size, TITLE_CONTEXT_SIZE,
+        "a title is not in context and must not resize it"
     );
-    assert_eq!(goal_usage_model("bare-model", "anthropic"), "bare-model");
+    assert_eq!(app.state.session.title, TITLE_TEXT);
+    drain_writer(app, writer);
+
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1, "{TITLE_SPEND_IS_RECORDED}");
+    assert_eq!(
+        rows[0].purpose,
+        LedgerPurpose::Title.storage_name(),
+        "{TITLE_SPEND_IS_RECORDED}"
+    );
+    assert_eq!(rows[0].provider, OTHER_PROVIDER, "{TITLE_SPEND_IS_RECORDED}");
+    assert_eq!(rows[0].cost, GOAL_COST, "{TITLE_SPEND_IS_RECORDED}");
+}
+
+/// An unusable answer was still billed, so the spend lands even though no
+/// title does.
+#[test]
+fn an_unusable_title_still_records_what_it_cost() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let original = app.state.session.title.clone();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::SessionTitle {
+        title: None,
+        usage: TokenUsage {
+            input: GOAL_INPUT,
+            ..Default::default()
+        },
+        cost: Some(GOAL_COST),
+        model: LEDGER_MODEL.into(),
+        provider: TEST_PROVIDER.into(),
+    }));
+    assert_eq!(app.state.session.title, original);
+    drain_writer(app, writer);
+
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1, "{TITLE_SPEND_IS_RECORDED}");
+    assert_eq!(rows[0].cost, GOAL_COST, "{TITLE_SPEND_IS_RECORDED}");
+}
+
+#[test_case("anthropic", "claude-haiku", "claude-haiku" ; "own_provider_reads_bare")]
+#[test_case("openrouter", "vendor/model", "openrouter/vendor/model" ; "foreign_provider_stays_qualified")]
+fn the_session_usage_key_names_a_foreign_provider_only(
+    provider: &str,
+    model: &str,
+    expected: &str,
+) {
+    assert_eq!(session_usage_model(provider, model, TEST_PROVIDER), expected);
 }
 
 #[test]
@@ -5227,11 +5383,16 @@ fn deferred_goal_builds_an_automatic_checkin() {
 #[test]
 fn active_goal_round_trips_through_session_metadata() {
     let mut app = test_app();
-    app.state.goal.set("persist me").unwrap();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
     app.checkpoint_with(Duration::ZERO);
     assert_eq!(
-        app.state.session.meta.active_goal.as_deref(),
-        Some("persist me")
+        app.state
+            .session
+            .meta
+            .active_goal
+            .as_ref()
+            .map(|goal| goal.condition.as_str()),
+        Some(GOAL_CONDITION)
     );
 
     let model = app.state.model.clone();
@@ -5243,7 +5404,118 @@ fn active_goal_round_trips_through_session_metadata() {
     );
     assert_eq!(
         state.goal.snapshot().unwrap().condition.as_ref(),
-        "persist me"
+        GOAL_CONDITION
+    );
+}
+
+/// The panel reports spend, evaluations, elapsed time and the latest reason.
+/// A resume that dropped them would report a goal that had done nothing, so
+/// the whole progress record has to survive a write and a read.
+#[test]
+fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
+    let mut app = test_app();
+    app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        condition: GOAL_CONDITION.into(),
+        evaluations: GOAL_EVALUATIONS,
+        elapsed_ms: GOAL_ELAPSED_MS,
+        usage: StoredTokenUsage {
+            input: GOAL_INPUT,
+            output: GOAL_OUTPUT,
+            cost: Some(GOAL_COST),
+            ..Default::default()
+        },
+        last_verdict: Some(StoredGoalVerdict::NotMet),
+        last_reason: Some(GOAL_REASON.into()),
+    }));
+
+    let model = app.state.model.clone();
+    let mut resumed = test_app();
+    resumed.state = SessionState::from_session(
+        Arc::unwrap_or_clone(app.state.session),
+        &model,
+        &resumed.storage,
+        &resumed.model_policy,
+    );
+
+    let snapshot = resumed.state.goal.snapshot().expect(GOAL_PROGRESS_SURVIVES);
+    assert_eq!(snapshot.condition.as_ref(), GOAL_CONDITION);
+    assert_eq!(snapshot.usage.input, GOAL_INPUT, "{GOAL_PROGRESS_SURVIVES}");
+    assert_eq!(snapshot.cost, Some(GOAL_COST), "{GOAL_PROGRESS_SURVIVES}");
+    assert_eq!(
+        snapshot.evaluations, GOAL_EVALUATIONS,
+        "{GOAL_PROGRESS_SURVIVES}"
+    );
+    assert_eq!(snapshot.last_verdict, Some(GoalVerdict::NotMet));
+    assert_eq!(snapshot.last_reason.as_deref(), Some(GOAL_REASON));
+    assert!(
+        snapshot.elapsed() >= Duration::from_millis(GOAL_ELAPSED_MS),
+        "the clock must carry on from what was stored, not restart"
+    );
+
+    // Spend that lands after the resume adds to what was restored rather than
+    // replacing it, and the next checkpoint keeps the sum.
+    resumed.state.goal.record_external_usage(
+        TokenUsage {
+            input: GOAL_INPUT,
+            ..Default::default()
+        },
+        Some(GOAL_COST),
+    );
+    resumed.checkpoint_with(Duration::ZERO);
+
+    let stored = resumed
+        .state
+        .session
+        .meta
+        .active_goal
+        .clone()
+        .expect(GOAL_PROGRESS_SURVIVES);
+    assert_eq!(
+        stored.usage.input,
+        GOAL_INPUT * 2,
+        "{GOAL_PROGRESS_SURVIVES}"
+    );
+    assert_eq!(
+        stored.usage.cost,
+        Some(GOAL_COST * 2.0),
+        "{GOAL_PROGRESS_SURVIVES}"
+    );
+    assert_eq!(
+        stored.evaluations, GOAL_EVALUATIONS,
+        "{GOAL_PROGRESS_SURVIVES}"
+    );
+    assert_eq!(
+        stored.last_verdict,
+        Some(StoredGoalVerdict::NotMet),
+        "an unmet verdict must not be stored as impossible"
+    );
+    assert_eq!(stored.last_reason.as_deref(), Some(GOAL_REASON));
+    assert!(
+        stored.elapsed_ms >= GOAL_ELAPSED_MS,
+        "the stored clock must never go backwards across a resume"
+    );
+}
+
+/// A resumed goal is status, not a trigger. Reopening a session must not spend
+/// money on a turn the user did not ask for.
+#[test]
+fn resuming_an_active_goal_starts_no_work_on_its_own() {
+    let mut app = test_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.checkpoint_with(Duration::ZERO);
+
+    let session = Arc::unwrap_or_clone(app.state.session.clone());
+    let model = app.state.model.clone();
+    let mut resumed = test_app();
+    resumed.state =
+        SessionState::from_session(session, &model, &resumed.storage, &resumed.model_policy);
+    resumed.restore_resumed_session();
+
+    assert!(resumed.state.goal.snapshot().is_some());
+    assert_eq!(
+        resumed.status,
+        Status::Idle,
+        "a resumed goal must wait for the next message"
     );
 }
 
@@ -6838,7 +7110,14 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.token_usage.input = 42;
     app.state.session_mut().meta.input_draft = Some("old draft".into());
     app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt("queued")];
-    app.state.session_mut().meta.active_goal = Some("goal".into());
+    app.state.session_mut().meta.active_goal = Some(Box::new(StoredActiveGoal {
+        condition: GOAL_CONDITION.into(),
+        evaluations: 0,
+        elapsed_ms: 0,
+        usage: StoredTokenUsage::default(),
+        last_verdict: None,
+        last_reason: None,
+    }));
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);
     app.state.session_mut().replace_messages(items);
@@ -7669,6 +7948,7 @@ fn btw_usage_settles_into_the_session_ledger() {
         },
         cost: Some(BTW_COST),
         model: BTW_MODEL.into(),
+        provider: TEST_PROVIDER.into(),
     }))
     .unwrap();
     let _ = app.tick();

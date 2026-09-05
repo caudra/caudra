@@ -6,6 +6,7 @@ use caudra_providers::model_registry::TitleTarget;
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
     AgentError, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions, Timeouts,
+    TokenUsage,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{normalize_title, truncate_title};
@@ -109,15 +110,24 @@ fn title_model_error(spec: &str, error: ModelError) -> AgentError {
     }
 }
 
-/// `None` whenever the model fails, stalls, or answers with nothing usable, so
-/// the heuristic title the session already carries stands.
+/// What a title attempt cost and what it produced. `title` is `None` when the
+/// model answered with nothing usable, so the heuristic title the session
+/// already carries stands. The spend is reported either way: an unusable
+/// answer was still billed.
+pub(crate) struct TitleOutcome {
+    pub title: Option<String>,
+    pub usage: TokenUsage,
+}
+
+/// `None` only when the request itself failed or stalled, which is the one
+/// case with no spend to attribute.
 pub(crate) async fn generate(
     provider: &dyn Provider,
     model: &Model,
     prompt: &str,
     cancel: &CancelToken,
     session_id: Option<&SessionRef>,
-) -> Option<String> {
+) -> Option<TitleOutcome> {
     let messages = [Message::user(format!(
         "{PROMPT_PREFIX}{}",
         clamp(prompt, MAX_PROMPT_BYTES)
@@ -143,7 +153,10 @@ pub(crate) async fn generate(
     .map_err(AgentError::from);
 
     match response {
-        Ok(response) => clean(&response_text(&response.message)),
+        Ok(response) => Some(TitleOutcome {
+            title: clean(&response_text(&response.message)),
+            usage: response.usage,
+        }),
         Err(error) => {
             warn!(%error, model = %model.id, "session title generation failed");
             None

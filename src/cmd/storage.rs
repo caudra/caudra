@@ -16,7 +16,7 @@ use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
 use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket};
-use caudra_storage::usage_ledger::UsageLedger;
+use caudra_storage::usage_ledger::{LedgerPurpose, UsageLedger};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 use jiff::tz::TimeZone;
@@ -646,6 +646,7 @@ fn usage_key(bucket: &UsageBucket, group_by: UsageGrouping) -> String {
         UsageGrouping::Model => format!("{}/{}", bucket.provider, bucket.model),
         UsageGrouping::Provider => bucket.provider.clone(),
         UsageGrouping::Project => bucket.cwd.clone(),
+        UsageGrouping::Purpose => bucket.purpose.clone(),
         UsageGrouping::Day => bucket_time(bucket, DAY_FORMAT),
         UsageGrouping::Month => bucket_time(bucket, MONTH_FORMAT),
         UsageGrouping::Total => USAGE_TOTAL.to_owned(),
@@ -676,6 +677,7 @@ fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
         UsageGrouping::Model => "Provider / Model",
         UsageGrouping::Provider => "Provider",
         UsageGrouping::Project => "Project",
+        UsageGrouping::Purpose => "Purpose",
         UsageGrouping::Day => "Day",
         UsageGrouping::Month => "Month",
         UsageGrouping::Total => "Total",
@@ -799,13 +801,26 @@ mod tests {
     const HOUR: i64 = 3600;
     const UNPRICED_VISIBLE: &str = "a total that cannot price some of its tokens must say so";
     const EPHEMERAL_COUNTED: &str = "ephemeral spend is real money and belongs in the total";
+    const PURPOSE_IS_ANSWERABLE: &str = "a bill must be able to name what goals cost";
 
     fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
+        purposed_bucket(bucket_start, provider, model, cwd, cost, LedgerPurpose::Chat)
+    }
+
+    fn purposed_bucket(
+        bucket_start: i64,
+        provider: &str,
+        model: &str,
+        cwd: &str,
+        cost: f64,
+        purpose: LedgerPurpose,
+    ) -> UsageBucket {
         UsageBucket {
             bucket_start,
             provider: provider.into(),
             model: model.into(),
             cwd: cwd.into(),
+            purpose: purpose.storage_name().into(),
             ephemeral: false,
             input: 10,
             output: 5,
@@ -831,6 +846,26 @@ mod tests {
 
         assert_eq!(rows.len(), expected);
         assert_eq!(rows.iter().map(|row| row.cost).sum::<f64>(), 3.0);
+    }
+
+    #[test]
+    fn grouping_by_purpose_separates_goal_spend_from_the_conversation() {
+        let buckets = [
+            bucket(0, "anthropic", "opus", "/a", 1.0),
+            purposed_bucket(0, "anthropic", "opus", "/a", 4.0, LedgerPurpose::Goal),
+        ];
+
+        let rows = group_usage(&buckets, UsageGrouping::Purpose);
+
+        assert_eq!(
+            rows.iter().map(|row| row.group.as_str()).collect::<Vec<_>>(),
+            [
+                LedgerPurpose::Goal.storage_name(),
+                LedgerPurpose::Chat.storage_name()
+            ],
+            "{PURPOSE_IS_ANSWERABLE}"
+        );
+        assert_eq!(rows[0].cost, 4.0, "{PURPOSE_IS_ANSWERABLE}");
     }
 
     #[test]

@@ -523,6 +523,7 @@ fn retryable(error: &SessionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use tempfile::TempDir;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -647,6 +648,7 @@ mod tests {
             provider: PROVIDER.into(),
             model: model.into(),
             cwd: CWD.into(),
+            purpose: LedgerPurpose::Chat,
             input: 1,
             output: 2,
             cache_creation: 0,

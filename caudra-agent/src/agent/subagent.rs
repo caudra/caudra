@@ -825,6 +825,7 @@ mod tests {
     use super::*;
     use crate::TurnCompleteEvent;
     use caudra_providers::Message;
+    use caudra_storage::usage_ledger::LedgerPurpose;
 
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
@@ -874,6 +875,8 @@ mod tests {
             message: Message::default(),
             usage,
             model: "test-model".into(),
+            provider: "test-provider".into(),
+            purpose: LedgerPurpose::Chat,
             cost: Some(cost),
             context_size: None,
             context_window: 0,

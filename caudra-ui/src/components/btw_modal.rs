@@ -27,6 +27,7 @@ pub struct BtwUsage {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
     pub model: String,
+    pub provider: String,
 }
 
 pub enum BtwEvent {
@@ -230,6 +231,7 @@ mod tests {
     use test_case::test_case;
 
     const MODEL: &str = "test-model";
+    const PROVIDER: &str = "anthropic";
 
     fn open_modal(m: &mut BtwModal, question: &str) -> (flume::Sender<BtwEvent>, CancelToken) {
         let (tx, rx) = flume::bounded(64);
@@ -246,6 +248,7 @@ mod tests {
                 ..Default::default()
             },
             cost: Some(0.5),
+            provider: PROVIDER.into(),
             model: MODEL.into(),
         })
     }

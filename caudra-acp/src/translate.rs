@@ -414,6 +414,7 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_providers::ImageSource;
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use serde_json::json;
     use test_case::test_case;
 
@@ -794,6 +795,8 @@ mod tests {
                 cache_read: 50_000,
             },
             model: "test-model".into(),
+            provider: "test-provider".into(),
+            purpose: LedgerPurpose::Chat,
             cost,
             context_size,
             context_window,

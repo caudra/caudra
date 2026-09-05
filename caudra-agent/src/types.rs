@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use caudra_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use caudra_storage::tool_outputs::ToolOutputRef;
+use caudra_storage::usage_ledger::LedgerPurpose;
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -1053,8 +1054,18 @@ pub enum AgentEvent {
     /// A model-written name for the session, produced off the turn's critical
     /// path. Arrives at most once per session and may land after the run that
     /// triggered it has finished.
+    ///
+    /// Carries its own spend rather than riding [`AgentEvent::TurnComplete`]:
+    /// the title never enters the conversation, so reporting it as a turn
+    /// would overwrite the context size with a request that is not in context.
     SessionTitle {
-        title: String,
+        /// `None` when the model answered with nothing usable. The spend still
+        /// has to be reported, so the event fires either way.
+        title: Option<String>,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        model: String,
+        provider: String,
     },
     Retry {
         attempt: u32,
@@ -1335,6 +1346,14 @@ pub struct TurnCompleteEvent {
     pub message: Message,
     pub usage: TokenUsage,
     pub model: String,
+    /// Named separately from `model`, which stays the bare id the UI shows.
+    /// A tiered workload can resolve to another provider entirely, and the
+    /// spend belongs to whoever billed it.
+    pub provider: String,
+    /// Why this call happened. Compaction rides the same event as the
+    /// conversation and must not be billed as if it were the conversation.
+    #[serde(skip)]
+    pub purpose: LedgerPurpose,
     #[serde(skip)]
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

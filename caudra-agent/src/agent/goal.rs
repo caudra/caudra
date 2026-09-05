@@ -10,6 +10,7 @@ use caudra_providers::{
     TokenUsage,
 };
 use caudra_storage::id::SessionRef;
+use caudra_storage::sessions::{StoredActiveGoal, StoredGoalVerdict};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
@@ -52,6 +53,9 @@ pub struct GoalSnapshot {
     pub last_verdict: Option<GoalVerdict>,
     pub last_reason: Option<Arc<str>>,
     pub started_at: Instant,
+    /// What the goal had already spent on the clock before this process saw
+    /// it. Zero for a goal set here, and the stored total for a resumed one.
+    pub elapsed_before: Duration,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
     pub(crate) generation: u64,
@@ -59,7 +63,27 @@ pub struct GoalSnapshot {
 
 impl GoalSnapshot {
     pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
+        self.elapsed_before + self.started_at.elapsed()
+    }
+}
+
+impl From<GoalVerdict> for StoredGoalVerdict {
+    fn from(verdict: GoalVerdict) -> Self {
+        match verdict {
+            GoalVerdict::Met => Self::Met,
+            GoalVerdict::NotMet => Self::NotMet,
+            GoalVerdict::Impossible => Self::Impossible,
+        }
+    }
+}
+
+impl From<StoredGoalVerdict> for GoalVerdict {
+    fn from(verdict: StoredGoalVerdict) -> Self {
+        match verdict {
+            StoredGoalVerdict::Met => Self::Met,
+            StoredGoalVerdict::NotMet => Self::NotMet,
+            StoredGoalVerdict::Impossible => Self::Impossible,
+        }
     }
 }
 
@@ -99,10 +123,28 @@ pub(crate) enum GoalApply {
 }
 
 impl GoalHandle {
-    pub fn restored(condition: Option<&str>) -> Self {
+    /// Reopens a goal a previous run left active, with the spend, evaluation
+    /// count and clock it had then. A condition that no longer validates is
+    /// dropped rather than resumed: the panel would have nothing to show and
+    /// the evaluator nothing to check.
+    pub fn restored(stored: Option<&StoredActiveGoal>) -> Self {
         let handle = Self::default();
-        if let Some(condition) = condition.and_then(|value| Goal::validate(value).ok()) {
-            handle.set_validated(condition);
+        if let Some(stored) = stored
+            && let Ok(condition) = Goal::validate(&stored.condition)
+        {
+            let mut state = handle.lock();
+            state.generation = state.generation.wrapping_add(1);
+            state.active = Some(GoalSnapshot {
+                condition,
+                evaluations: stored.evaluations,
+                last_verdict: stored.last_verdict.map(Into::into),
+                last_reason: stored.last_reason.as_deref().map(Arc::from),
+                started_at: Instant::now(),
+                elapsed_before: Duration::from_millis(stored.elapsed_ms),
+                usage: stored.usage.into(),
+                cost: stored.usage.cost,
+                generation: state.generation,
+            });
         }
         handle
     }
@@ -121,6 +163,7 @@ impl GoalHandle {
             last_verdict: None,
             last_reason: None,
             started_at: Instant::now(),
+            elapsed_before: Duration::ZERO,
             usage: TokenUsage::default(),
             cost: None,
             generation: state.generation,

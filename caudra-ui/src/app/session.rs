@@ -14,7 +14,7 @@ use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
 };
-use caudra_agent::{GoalStatus, GoalVerdict};
+use caudra_agent::GoalStatus;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
     merge_history_items, project_messages,
@@ -22,7 +22,7 @@ use caudra_providers::{
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionLease, SessionMeta, StoredGoalResult, StoredGoalVerdict, StoredImage, StoredPasteRange,
+    SessionLease, SessionMeta, StoredActiveGoal, StoredGoalResult, StoredImage, StoredPasteRange,
     StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
     StoredSubagentOutcome,
 };
@@ -38,6 +38,12 @@ use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+
+/// Saturates rather than wraps: a goal left open for longer than `u64`
+/// milliseconds is not a number worth panicking over.
+fn as_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 fn stored_subagent_outcome(outcome: Option<TaskOutcome>) -> StoredSubagentOutcome {
     match outcome {
@@ -320,19 +326,23 @@ impl App {
             thinking: Some(state.thinking.clone().into()),
             fast: state.fast,
             workflow: state.workflow,
-            active_goal: state.goal.active_condition(),
+            active_goal: state.goal.snapshot().map(|goal| {
+                Box::new(StoredActiveGoal {
+                    condition: goal.condition.to_string(),
+                    evaluations: goal.evaluations,
+                    elapsed_ms: as_millis(goal.elapsed()),
+                    usage: goal.usage.billed(goal.cost),
+                    last_verdict: goal.last_verdict.map(Into::into),
+                    last_reason: goal.last_reason.map(|reason| reason.to_string()),
+                })
+            }),
             goal_result: match state.goal.status() {
                 Some(GoalStatus::Finished(goal)) => Some(Box::new(StoredGoalResult {
                     condition: goal.condition.to_string(),
-                    verdict: match goal.verdict {
-                        GoalVerdict::Met => StoredGoalVerdict::Met,
-                        GoalVerdict::Impossible | GoalVerdict::NotMet => {
-                            StoredGoalVerdict::Impossible
-                        }
-                    },
+                    verdict: goal.verdict.into(),
                     reason: goal.reason.to_string(),
                     evaluations: goal.evaluations,
-                    duration_ms: goal.duration.as_millis().min(u128::from(u64::MAX)) as u64,
+                    duration_ms: as_millis(goal.duration),
                     usage: goal.usage.billed(goal.cost),
                 })),
                 Some(GoalStatus::Active(_)) | None => None,

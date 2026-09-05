@@ -34,6 +34,7 @@ use crate::{
 };
 use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_storage::id::SessionRef;
+use caudra_storage::usage_ledger::LedgerPurpose;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const AUTH_RELOAD_POLL_MIN_MS: u64 = 250;
@@ -363,7 +364,7 @@ impl<'h> Agent<'h> {
         let event_tx = self.event_tx.clone();
         smol::spawn(async move {
             let resolved = title::resolve(&provider, &model, timeouts, &model_policy).await;
-            if let Some(title) = title::generate(
+            if let Some(outcome) = title::generate(
                 &*resolved.provider,
                 &resolved.model,
                 &prompt,
@@ -372,7 +373,13 @@ impl<'h> Agent<'h> {
             )
             .await
             {
-                event_tx.try_send(AgentEvent::SessionTitle { title });
+                event_tx.try_send(AgentEvent::SessionTitle {
+                    title: outcome.title,
+                    usage: outcome.usage,
+                    cost: resolved.model.billed_cost(&outcome.usage, false),
+                    model: resolved.model.id.clone(),
+                    provider: resolved.model.provider.to_string(),
+                });
             }
         })
         .detach();
@@ -832,6 +839,8 @@ impl<'h> Agent<'h> {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
+                provider: self.model.provider.to_string(),
+                purpose: LedgerPurpose::Chat,
                 cost: self
                     .model
                     .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),

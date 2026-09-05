@@ -149,6 +149,7 @@ async fn run_btw(
                 cost: model.billed_cost(&response.usage, opts.fast),
                 usage: response.usage,
                 model: model.id.clone(),
+                provider: model.provider.to_string(),
             }));
         }
         // The receiver is already gone, which is what cancelled the stream.

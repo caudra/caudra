@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
-use caudra_agent::{GoalHandle, GoalResult, GoalVerdict};
+use caudra_agent::{GoalHandle, GoalResult};
 use caudra_config::{Effect, ModelPolicy};
 use caudra_providers::provider::adjust_model;
 use caudra_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use caudra_storage::StateDir;
-use caudra_storage::sessions::{StoredEffect, StoredGoalVerdict, StoredMode, StoredRule};
+use caudra_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
 use crate::AppSession;
 
@@ -95,10 +95,7 @@ impl SessionState {
         if let Some(stored) = session.meta.goal_result.as_ref() {
             goal.restore_finished(GoalResult {
                 condition: Arc::from(stored.condition.as_str()),
-                verdict: match stored.verdict {
-                    StoredGoalVerdict::Met => GoalVerdict::Met,
-                    StoredGoalVerdict::Impossible => GoalVerdict::Impossible,
-                },
+                verdict: stored.verdict.into(),
                 reason: Arc::from(stored.reason.as_str()),
                 evaluations: stored.evaluations,
                 duration: std::time::Duration::from_millis(stored.duration_ms),

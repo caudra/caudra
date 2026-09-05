@@ -166,6 +166,7 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
 #[serde(rename_all = "snake_case")]
 pub enum StoredGoalVerdict {
     Met,
+    NotMet,
     Impossible,
 }
 
@@ -178,6 +179,28 @@ pub struct StoredGoalResult {
     pub duration_ms: u64,
     #[serde(default)]
     pub usage: StoredTokenUsage,
+}
+
+/// A goal still running when the session was last written. Everything the
+/// status panel shows, because a goal that survives a resume and reports zero
+/// spend and zero evaluations is worse than one that reports nothing at all.
+///
+/// `elapsed_ms` accumulates rather than recording a start instant: the session
+/// is not running between resumes, and billing a goal for the days it spent
+/// closed would be a lie in the other direction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredActiveGoal {
+    pub condition: String,
+    #[serde(default)]
+    pub evaluations: u32,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub usage: StoredTokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verdict: Option<StoredGoalVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,7 +281,7 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_goal: Option<String>,
+    pub active_goal: Option<Box<StoredActiveGoal>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_result: Option<Box<StoredGoalResult>>,
     /// `None` when the user never set yolo for this session, which is what

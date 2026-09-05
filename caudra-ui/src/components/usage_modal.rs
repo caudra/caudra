@@ -325,6 +325,7 @@ fn build_lifetime_lines(
     for (heading, slices) in [
         ("Per model", &lifetime.by_model),
         ("Per project", &lifetime.by_project),
+        ("Per purpose", &lifetime.by_purpose),
         ("Per month", &lifetime.by_month),
     ] {
         if slices.is_empty() {
