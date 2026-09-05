@@ -263,6 +263,10 @@ pub struct Workbench {
     sidebar_collapsed: bool,
     show_hidden: bool,
     styles: WorkbenchStyles,
+    /// Whether a pane whose content overruns it gives up a column to say so.
+    /// The host owns the setting, so this mirrors `ui.scrollbar` rather than
+    /// reading it.
+    scrollbars: bool,
     /// Bumped on every palette change so open tabs know to rehighlight.
     theme_generation: u64,
     panes: PaneRects,
@@ -316,6 +320,7 @@ impl Workbench {
             sidebar_collapsed: false,
             show_hidden: false,
             styles,
+            scrollbars: true,
             theme_generation: 0,
             panes: PaneRects::default(),
             tree: Tree::default(),
@@ -375,6 +380,10 @@ impl Workbench {
         self.styles = styles;
         self.theme_generation += 1;
         self.editor.set_theme_generation(self.theme_generation);
+    }
+
+    pub fn set_scrollbars(&mut self, scrollbars: bool) {
+        self.scrollbars = scrollbars;
     }
 
     /// Whether a background worker owes an answer, so the host knows to look
@@ -1730,11 +1739,12 @@ fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [Sectio
 #[cfg(test)]
 mod tests {
     use super::{
-        Choice, Cursor, Drag, EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH,
-        MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES, ScmLayout, Section,
-        SidebarView, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys, layout,
-        layout_sections, scm,
+        Choice, Cursor, DEFAULT_SIDEBAR_WIDTH, Drag, EDGE_SCROLL_LINES, Focus, Layout,
+        MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES,
+        ScmLayout, Section, SidebarView, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys,
+        layout, layout_sections, scm,
     };
+    use crate::chrome::SCROLLBAR_THUMB;
     use crate::fs::tree::GitMark;
     use crate::search;
     use crate::view::{
@@ -1798,6 +1808,7 @@ mod tests {
     const ESC_LEFT: &str = "esc left the workbench instead of dropping the selection it was in";
     const TAB_OFF_STRIP: &str = "the strip is not showing the tab the editor is on";
     const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
+    const WRONG_BAR: &str = "the pane is not saying how much of its content is off screen";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1916,6 +1927,19 @@ mod tests {
             fs::write(&path, "one\n").expect("a file");
             workbench.open_path(&path);
         }
+        (dir, workbench)
+    }
+
+    /// Forty files of sixty lines, which overruns both the sidebar's rows and
+    /// the editor's in a 24-row terminal.
+    fn tall_project() -> (TempDir, Workbench) {
+        let dir = TempDir::new().expect("a temporary directory");
+        for index in 0..40 {
+            let path = dir.path().join(format!("file{index}.txt"));
+            fs::write(&path, "line\n".repeat(60)).expect("a file");
+        }
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
         (dir, workbench)
     }
 
@@ -3463,6 +3487,87 @@ mod tests {
         );
     }
 
+    #[test_case(true, true ; "a tree taller than its pane draws one")]
+    #[test_case(false, false ; "turning them off gives the column back")]
+    fn a_scrollbar_says_how_far_down_the_tree_is(scrollbars: bool, expected: bool) {
+        let (_dir, mut workbench) = tall_project();
+        workbench.set_scrollbars(scrollbars);
+
+        let painted = draw(&mut workbench, 80, 24);
+
+        assert_eq!(painted.contains(SCROLLBAR_THUMB), expected, "{WRONG_BAR}");
+        assert_eq!(
+            workbench.panes.rows.right() == workbench.panes.rows.x + DEFAULT_SIDEBAR_WIDTH,
+            !expected,
+            "{WRONG_BAR}"
+        );
+    }
+
+    #[test]
+    fn a_tree_that_fits_keeps_its_whole_width() {
+        let (_dir, mut workbench) = project();
+
+        let painted = draw(&mut workbench, 80, 24);
+
+        assert!(!painted.contains(SCROLLBAR_THUMB), "{WRONG_BAR}");
+    }
+
+    #[test]
+    fn a_file_taller_than_its_pane_draws_a_scrollbar() {
+        let (dir, mut workbench) = tall_project();
+        workbench.open_path(&dir.path().join("file0.txt"));
+        workbench.sidebar_collapsed = true;
+
+        assert!(
+            draw(&mut workbench, 80, 24).contains(SCROLLBAR_THUMB),
+            "{WRONG_BAR}"
+        );
+    }
+
+    /// Each section scrolls on its own, so each gives up its own column, and
+    /// the body it records is the rows it drew into rather than the room it
+    /// was given.
+    #[test]
+    fn a_crowded_section_keeps_its_scrollbar_out_of_its_body() {
+        let dir = TempDir::new().expect("a temporary directory");
+        gix::init(dir.path()).expect("a repository");
+        for index in 0..40 {
+            fs::write(dir.path().join(format!("f{index}.txt")), "").expect("a file");
+        }
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        workbench.handle_key(alt(keys::VIEW_SOURCE_CONTROL.code));
+
+        assert!(
+            draw(&mut workbench, 80, 24).contains(SCROLLBAR_THUMB),
+            "{WRONG_BAR}"
+        );
+
+        let sidebar = workbench.panes.sidebar.expect("a sidebar");
+        assert!(
+            workbench
+                .panes
+                .sections
+                .iter()
+                .any(|rects| rects.body.right() < sidebar.right()),
+            "{WRONG_BAR}"
+        );
+    }
+
+    /// The bar owns its column, so a press there acts on nothing rather than on
+    /// the row painted beside it.
+    #[test]
+    fn the_scrollbar_column_is_not_a_row_hit() {
+        let (_dir, mut workbench) = tall_project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let before = workbench.tree.selected_index();
+
+        workbench.handle_mouse(click(rows.right(), rows.y + 3));
+
+        assert_eq!(workbench.tree.selected_index(), before, "{WRONG_CLICK}");
+    }
+
     /// The strip has room for three of these, so most of them are off screen
     /// whichever one is active.
     #[test]
@@ -3489,7 +3594,11 @@ mod tests {
 
         workbench.handle_mouse(click(tabs.x + 1, tabs.y));
 
-        assert_eq!(workbench.editor.active_index(), shown.start, "{WRONG_CLICK}");
+        assert_eq!(
+            workbench.editor.active_index(),
+            shown.start,
+            "{WRONG_CLICK}"
+        );
     }
 
     #[test]

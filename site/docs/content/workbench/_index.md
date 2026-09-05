@@ -55,6 +55,8 @@ Source control and search rows follow the explorer, and so do the `Ctrl+P` file 
 
 Whatever the pointer rests on is highlighted, so you can see what a click would hit. A row that is already selected is left as it is.
 
+A pane whose content runs past its bottom gives up its last column to a scrollbar, so you can see how much is off screen. Panes that fit keep their full width, and setting `ui.scrollbar` to `false` turns the bars off here as it does everywhere else. The bar is a marker rather than a handle: use the wheel or the arrow keys to move.
+
 ## Explorer
 
 Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files. One click of the [mouse](#mouse) does the same as `Enter`.

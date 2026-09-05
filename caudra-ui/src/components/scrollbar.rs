@@ -13,6 +13,12 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Read by surfaces that draw their own bar rather than calling
+/// [`render_vertical_scrollbar`], which is the workbench.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u16, position: u16) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;

@@ -3355,6 +3355,9 @@ impl App {
             return Dirty::NO;
         }
         self.sync_workbench_theme();
+        // The workbench paints its own bars, so the setting reaches it here
+        // rather than through the shared helper every other surface calls.
+        self.workbench.set_scrollbars(scrollbar::enabled());
         let (dirty, flash) = self.workbench.tick();
         if let Some(flash) = flash {
             self.status_bar.flash(flash);

@@ -68,6 +68,9 @@ const TAB_GAP: &str = " ";
 const CLOSE_MARK: &str = "\u{d7}";
 pub(crate) const MORE_LEFT: &str = "\u{2039}";
 pub(crate) const MORE_RIGHT: &str = "\u{203a}";
+const SCROLLBAR_WIDTH: u16 = 1;
+/// Narrower than this and the bar would be all there is left of the pane.
+const SCROLLBAR_MIN_WIDTH: u16 = 2;
 /// The search buttons in the order [`toggle_row`] paints them, which is also
 /// the order [`toggle_at`] measures.
 const TOGGLES: [(Toggle, &str); 3] = [
@@ -217,10 +220,10 @@ impl Workbench {
             toggle_row(&self.search, pointed, &self.styles, toggles.width),
         );
 
-        self.panes.rows = body;
         let height = body.height as usize;
         self.search.clamp_scroll(height);
         if !self.search.has_results() {
+            self.panes.rows = body;
             let notice = match (self.search.error(), self.search.is_running()) {
                 (Some(error), _) => error,
                 (None, true) => SEARCHING,
@@ -231,10 +234,13 @@ impl Workbench {
             return;
         }
 
+        let total = self.search.rows().len();
+        let (rows, bar) = scroll_column(self.scrollbars, body, total);
+        self.panes.rows = rows;
         let scroll = self.search.scroll();
         let selected = self.search.selected_index();
         let root = self.root.clone();
-        let pointed = self.hovered_row(body);
+        let pointed = self.hovered_row(rows);
         for (offset, row) in self
             .search
             .rows()
@@ -244,10 +250,11 @@ impl Workbench {
             .enumerate()
         {
             let chosen = focused && scroll + offset == selected;
-            let line = search_row(&self.search, *row, &root, chosen, &self.styles, body.width);
+            let line = search_row(&self.search, *row, &root, chosen, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
-            chrome::render_line(buf, line_at(body, offset), line);
+            chrome::render_line(buf, line_at(rows, offset), line);
         }
+        self.scrollbar(buf, bar, total, scroll);
     }
 
     /// Three stacked sections, each with a pinned title row over a list that
@@ -282,7 +289,8 @@ impl Workbench {
             );
             let line = emphasize(line, pointed && !chosen, &self.styles);
             chrome::render_line(buf, rects.header, line);
-            self.render_section(buf, section, rects.body, focused);
+            self.panes.sections[index].body =
+                self.render_section(buf, section, rects.body, focused);
         }
         if self.scm.is_empty() {
             let notice = Rect {
@@ -296,36 +304,50 @@ impl Workbench {
         }
     }
 
-    fn render_section(&mut self, buf: &mut Surface, section: Section, area: Rect, focused: bool) {
+    /// Reports the rows it drew into, which is the section's body less
+    /// whatever its scrollbar took.
+    fn render_section(
+        &mut self,
+        buf: &mut Surface,
+        section: Section,
+        area: Rect,
+        focused: bool,
+    ) -> Rect {
         let height = area.height as usize;
         self.scm.clamp_scroll(section, height);
         if height == 0 {
-            return;
+            return area;
         }
+        let total = self.scm.rows(section).len();
+        let (rows, bar) = scroll_column(self.scrollbars, area, total);
         let scroll = self.scm.scroll(section);
         let cursor = self.scm.cursor();
-        let pointed = self.hovered_row(area);
-        for offset in 0..height.min(self.scm.rows(section).len().saturating_sub(scroll)) {
+        let pointed = self.hovered_row(rows);
+        for offset in 0..height.min(total.saturating_sub(scroll)) {
             let row = self.scm.rows(section)[scroll + offset];
             let chosen =
                 focused && cursor.section == section && cursor.row == Some(scroll + offset);
-            let line = scm_row(&self.scm, section, row, chosen, &self.styles, area.width);
+            let line = scm_row(&self.scm, section, row, chosen, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
-            chrome::render_line(buf, line_at(area, offset), line);
+            chrome::render_line(buf, line_at(rows, offset), line);
         }
+        self.scrollbar(buf, bar, total, scroll);
+        rows
     }
 
     fn render_tree(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
-        self.panes.rows = area;
         let height = area.height as usize;
         self.tree.clamp_scroll(height);
         if self.tree.rows().is_empty() {
+            self.panes.rows = area;
             placeholder(buf, area, EMPTY_TREE, self.styles.dim);
             return;
         }
+        let (rows, bar) = scroll_column(self.scrollbars, area, self.tree.rows().len());
+        self.panes.rows = rows;
         let scroll = self.tree.scroll();
         let selected = self.tree.selected_index();
-        let pointed = self.hovered_row(area);
+        let pointed = self.hovered_row(rows);
         for (offset, row) in self
             .tree
             .rows()
@@ -335,10 +357,11 @@ impl Workbench {
             .enumerate()
         {
             let chosen = focused && scroll + offset == selected;
-            let line = tree_row(row, chosen, &self.styles, area.width);
+            let line = tree_row(row, chosen, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
-            chrome::render_line(buf, line_at(area, offset), line);
+            chrome::render_line(buf, line_at(rows, offset), line);
         }
+        self.scrollbar(buf, bar, self.tree.rows().len(), scroll);
     }
 
     fn render_editor(&mut self, buf: &mut Surface, area: Rect) {
@@ -383,8 +406,9 @@ impl Workbench {
             Constraint::Length(1),
         ])
         .areas(panel);
-        self.panes.palette = rows;
         self.palette.clamp_scroll(rows.height as usize);
+        let (rows, bar) = scroll_column(self.scrollbars, rows, self.palette.len());
+        self.panes.palette = rows;
 
         chrome::render_line(
             buf,
@@ -421,6 +445,7 @@ impl Workbench {
                 )),
             );
         }
+        self.scrollbar(buf, bar, self.palette.len(), scroll);
         chrome::render_line(
             buf,
             rule,
@@ -544,6 +569,12 @@ impl Workbench {
         }
     }
 
+    fn scrollbar(&self, buf: &mut Surface, bar: Option<Rect>, total: usize, at: usize) {
+        if let Some(bar) = bar {
+            chrome::vertical_scrollbar(buf, bar, total, at, self.styles.border);
+        }
+    }
+
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
         let focused = self.focus == Focus::Editor && self.goto.is_none() && !self.palette.is_open();
         let Some(tab) = self.editor.active_mut() else {
@@ -557,9 +588,14 @@ impl Workbench {
             return;
         }
 
-        let gutter = digits(tab.buffer.line_count()) + GUTTER_GAP;
+        let lines = tab.buffer.line_count();
+        let gutter = digits(lines) + GUTTER_GAP;
         let [numbers, text] =
             Layout::horizontal([Constraint::Length(gutter), Constraint::Min(1)]).areas(area);
+        // Taken off the text rather than the gutter, and taken from the rect
+        // the cursor is placed against too, so a caret at the right margin
+        // cannot end up underneath the bar.
+        let (text, bar) = scroll_column(self.scrollbars, text, lines);
         self.panes.text = text;
 
         let first = tab.scroll();
@@ -588,6 +624,7 @@ impl Workbench {
                 ),
             );
         }
+        self.scrollbar(buf, bar, lines, first);
     }
 
     fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str) {
@@ -855,6 +892,20 @@ fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Li
         })
         .collect();
     Line::from(spans).style(base)
+}
+
+/// Splits a pane into the rows and the column its scrollbar takes. A pane whose
+/// content already fits keeps its full width, so the bar shows up only where it
+/// has something to say. The rect it reports is the one the caller records for
+/// hit-testing, which is what stops a click landing on the bar's column from
+/// acting on the row painted beside it.
+fn scroll_column(enabled: bool, area: Rect, total: usize) -> (Rect, Option<Rect>) {
+    if !enabled || area.width < SCROLLBAR_MIN_WIDTH || total <= area.height as usize {
+        return (area, None);
+    }
+    let [rows, bar] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(SCROLLBAR_WIDTH)]).areas(area);
+    (rows, Some(bar))
 }
 
 fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
@@ -1322,11 +1373,12 @@ mod tests {
 
     use super::{
         Editor, Focus, SidebarView, Tab, TabHit, Toggle, Workbench, WorkbenchStyles, header_at,
-        keys, tab_at, toggle_at, visible_range,
+        keys, scroll_column, tab_at, toggle_at, visible_range,
     };
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
     const WRONG_STRIP: &str = "the strip is not showing the tabs it has room for";
+    const WRONG_BAR: &str = "the pane gave up the wrong amount of room to its scrollbar";
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
     const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
@@ -1423,13 +1475,34 @@ mod tests {
         );
     }
 
+    #[test_case(true, 5, true ; "content past the pane takes a column")]
+    #[test_case(true, 4, false ; "content that fits keeps the whole width")]
+    #[test_case(false, 40, false ; "a bar turned off takes nothing")]
+    fn a_pane_gives_up_a_column_only_when_it_has_something_to_say(
+        enabled: bool,
+        total: usize,
+        expected: bool,
+    ) {
+        let area = Rect::new(0, 0, 20, 4);
+
+        let (rows, bar) = scroll_column(enabled, area, total);
+
+        assert_eq!(bar.is_some(), expected, "{WRONG_BAR}");
+        assert_eq!(rows.width, area.width - u16::from(expected), "{WRONG_BAR}");
+    }
+
+    /// A bar in a one-column pane would be the whole pane.
+    #[test]
+    fn a_pane_too_narrow_for_a_bar_keeps_what_it_has() {
+        let (rows, bar) = scroll_column(true, Rect::new(0, 0, 1, 4), 40);
+
+        assert!(bar.is_none(), "{WRONG_BAR}");
+        assert_eq!(rows.width, 1, "{WRONG_BAR}");
+    }
+
     #[test]
     fn an_empty_strip_shows_nothing() {
-        assert_eq!(
-            visible_range(&Editor::default(), 80),
-            0..0,
-            "{WRONG_STRIP}"
-        );
+        assert_eq!(visible_range(&Editor::default(), 80), 0..0, "{WRONG_STRIP}");
     }
 
     #[test_case(0, None ; "the gap in front of a segment is not a button")]
