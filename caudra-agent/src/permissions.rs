@@ -1097,12 +1097,16 @@ impl PermissionManager {
                     }
                 }
                 if shell_tool {
+                    let command = bash_command_scope(scope).unwrap_or(scope);
+                    if include_builtin_allows && command_pattern::builtin_allowed(command) {
+                        decision.allowed = true;
+                    }
                     match configured_command_decision(
                         config.iter().filter(|rule| {
                             include_config_shell_policy || rule.effect == Effect::Deny
                         }),
                         tool,
-                        bash_command_scope(scope).unwrap_or(scope),
+                        command,
                         None,
                         false,
                     ) {
@@ -3323,11 +3327,61 @@ mod tests {
     #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
     #[test_case("task", "task:research" => true ; "task_allowed")]
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
+    #[test_case("bash", "echo hi" => true ; "literal_echo_allowed")]
+    #[test_case("shell", "echo hi" => true ; "literal_echo_allowed_for_shell")]
+    #[test_case("bash", "echo $HOME" => false ; "expanding_echo_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(
             default_mgr().check(&ToolKey::native(tool), scope, None),
             PermissionCheck::Allowed
         )
+    }
+
+    #[test]
+    fn builtin_echo_allow_requires_a_bundled_implementation() {
+        let manager = default_mgr();
+        let tool = ToolKey::native("shell");
+        assert!(matches!(
+            manager.check_inner(&tool, &["echo hi"], false, None, true, true),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            manager.check_inner(&tool, &["echo hi"], false, None, false, true),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test_case(Effect::Deny; "deny")]
+    #[test_case(Effect::Ask; "ask")]
+    fn configured_rules_override_the_builtin_echo_allow(effect: Effect) {
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule("echo *", effect)]),
+            PathBuf::from("/tmp"),
+        );
+        let request = shell_request(&["echo hi"], workcell_shell_subject());
+        let coverage = manager.request_coverage(&request, &[], true);
+
+        match effect {
+            Effect::Deny => assert!(coverage.is_err()),
+            Effect::Ask => {
+                let (_, must_prompt, prompt_required) = coverage.unwrap();
+                assert!(must_prompt);
+                assert_eq!(prompt_required, vec![true]);
+            }
+            Effect::Allow => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn builtin_echo_allow_covers_only_the_literal_command_in_a_chain() {
+        let manager = default_mgr();
+        let request = shell_request(&["echo hi", "rm -rf build"], workcell_shell_subject());
+        let (covered, must_prompt, prompt_required) =
+            manager.request_coverage(&request, &[], true).unwrap();
+
+        assert_eq!(covered, vec![true, false]);
+        assert!(must_prompt);
+        assert_eq!(prompt_required, vec![false, true]);
     }
 
     #[test]

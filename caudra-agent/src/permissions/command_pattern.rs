@@ -20,6 +20,13 @@ pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
     "pkill *",
 ];
 
+/// Command families a trusted native shell tool may run without a prompt.
+///
+/// An entry is honored only when every token is literal after quoting, so the
+/// reviewed text is exactly what the shell runs. A configured ask or deny still
+/// overrides the default.
+pub(crate) const BUILTIN_ALLOW_PATTERNS: &[&str] = &["echo *"];
+
 #[derive(Clone, Copy)]
 enum Quote {
     Single,
@@ -112,6 +119,20 @@ pub(crate) fn matches(pattern: &str, command: &str) -> bool {
             || command_tokens[pattern.literals.len()..]
                 .iter()
                 .all(|token| !contains_unquoted_shell_operator(token)))
+}
+
+/// `matches` rejects operators, separators, newlines, and path-qualified
+/// executables; decoding every token additionally rejects any expansion the
+/// shell would perform after the command was reviewed.
+pub(crate) fn builtin_allowed(command: &str) -> bool {
+    BUILTIN_ALLOW_PATTERNS
+        .iter()
+        .any(|pattern| matches(pattern, command))
+        && tokenize(command).is_some_and(|tokens| {
+            tokens
+                .iter()
+                .all(|token| decode_static_token(token).is_some())
+        })
 }
 
 pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
@@ -294,7 +315,10 @@ fn decode_static_token(token: &str) -> Option<String> {
 mod tests {
     use test_case::test_case;
 
-    use super::{BUILTIN_ASK_PATTERNS, matches, reusable_prefix, specificity, tokenize};
+    use super::{
+        BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, builtin_allowed, matches, reusable_prefix,
+        specificity, tokenize,
+    };
 
     #[test]
     fn tokenize_preserves_source_spelling() {
@@ -432,5 +456,38 @@ mod tests {
                 "pkill *",
             ]
         );
+    }
+
+    #[test]
+    fn builtin_allow_patterns_are_exact() {
+        assert_eq!(BUILTIN_ALLOW_PATTERNS, &["echo *"]);
+    }
+
+    #[test_case("echo", true; "bare command")]
+    #[test_case("echo hi", true)]
+    #[test_case("echo hello world", true)]
+    #[test_case("echo -n hi", true; "leading flag")]
+    #[test_case(r#"echo "plain text""#, true; "double quoted literal")]
+    #[test_case("echo 'a $HOME b'", true; "single quotes suppress expansion")]
+    #[test_case(r#"echo -e "a\tb""#, true; "escape sequence stays literal")]
+    #[test_case("echo $HOME", false; "parameter expansion")]
+    #[test_case(r#"echo "$HOME""#, false; "quoted parameter expansion")]
+    #[test_case("echo ${HOME}", false; "braced parameter expansion")]
+    #[test_case("echo $(id)", false; "command substitution")]
+    #[test_case("echo `id`", false; "backtick substitution")]
+    #[test_case("echo *", false; "glob expansion")]
+    #[test_case("echo *.rs", false; "suffixed glob expansion")]
+    #[test_case("echo ~", false; "tilde expansion")]
+    #[test_case("echo {a,b}", false; "brace expansion")]
+    #[test_case("echo hi > victim", false; "output redirect")]
+    #[test_case("echo hi | sh", false; "pipeline")]
+    #[test_case("echo hi; rm -rf /", false; "command separator")]
+    #[test_case("echo hi && rm -rf /", false; "conditional separator")]
+    #[test_case("echo hi\nrm -rf /", false; "newline separator")]
+    #[test_case("echo 'unterminated", false; "malformed input")]
+    #[test_case("/bin/echo hi", false; "path qualified executable")]
+    #[test_case("ls", false; "uncovered command")]
+    fn builtin_allows_only_fully_literal_commands(command: &str, expected: bool) {
+        assert_eq!(builtin_allowed(command), expected);
     }
 }

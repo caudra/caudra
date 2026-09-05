@@ -129,6 +129,8 @@ For shell allow and ask rules, the most specific matching pattern wins and ask w
 
 Caudra also asks by default for these command families unless a configured or remembered allow covers them: `rm`, destructive Git operations, `chmod`, `chown`, `dd`, `mkfs`, network transfer and remote-login commands, and process termination commands.
 
+Caudra allows `echo` by default when every argument is literal after quoting, so the reviewed text is exactly what the shell runs. Parameter expansion, command substitution, globs, tildes, braces, redirects, and operators all fall back to the normal prompt, and a configured ask or deny still overrides the default. Single quotes keep their contents literal, so `echo '$HOME'` is allowed while `echo $HOME` asks.
+
 Legacy deny matching remains glob-like for compatibility:
 
 | Pattern | Matches |
