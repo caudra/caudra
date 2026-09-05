@@ -600,7 +600,7 @@ impl Workbench {
         }
         if self.panes.tabs.contains(position) {
             self.focus = Focus::Editor;
-            if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs.x) {
+            if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) {
                 self.hit_tab(hit);
             }
             return;
@@ -759,7 +759,7 @@ impl Workbench {
         if !self.panes.tabs.contains(at.into()) {
             return;
         }
-        if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs.x) {
+        if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) {
             self.focus = Focus::Editor;
             self.close_at(hit.index);
         }
@@ -1738,7 +1738,8 @@ mod tests {
     use crate::fs::tree::GitMark;
     use crate::search;
     use crate::view::{
-        NOT_A_REPOSITORY, TabHit, confirm_at, header_at, mode_at, tab_at, toggle_at,
+        MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, TabHit, confirm_at, header_at, mode_at, tab_at,
+        toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1795,6 +1796,8 @@ mod tests {
     const KEPT_CLIPBOARD: &str = "what was copied before";
     const NOT_STEPPED: &str = "the find keys did not walk to the match they were pointed at";
     const ESC_LEFT: &str = "esc left the workbench instead of dropping the selection it was in";
+    const TAB_OFF_STRIP: &str = "the strip is not showing the tab the editor is on";
+    const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1867,7 +1870,7 @@ mod tests {
         let tabs = workbench.panes.tabs;
         (tabs.x..tabs.right())
             .find(|column| {
-                tab_at(&workbench.editor, *column, tabs.x) == Some(TabHit { index, close: true })
+                tab_at(&workbench.editor, *column, tabs) == Some(TabHit { index, close: true })
             })
             .expect("a close mark on the tab")
     }
@@ -1900,6 +1903,20 @@ mod tests {
 
     fn cursor(workbench: &Workbench) -> Cursor {
         workbench.editor.active().expect(NO_TAB).buffer.cursor()
+    }
+
+    /// More tabs than a strip beside the sidebar can hold at 80 columns, each
+    /// titled the same width, so what fits is arithmetic rather than luck.
+    fn many_tabs(count: usize) -> (TempDir, Workbench) {
+        let dir = TempDir::new().expect("a temporary directory");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        for index in 0..count {
+            let path = dir.path().join(format!("file{index}.txt"));
+            fs::write(&path, "one\n").expect("a file");
+            workbench.open_path(&path);
+        }
+        (dir, workbench)
     }
 
     /// Puts the cursor on `a.txt`, which is what the editing tests want open.
@@ -3444,6 +3461,74 @@ mod tests {
             workbench.selected_text().expect("a selection").len() > reached,
             "{WRONG_CLICK}"
         );
+    }
+
+    /// The strip has room for three of these, so most of them are off screen
+    /// whichever one is active.
+    #[test]
+    fn the_active_tab_is_always_on_the_strip() {
+        let (_dir, mut workbench) = many_tabs(8);
+
+        for _ in 0..workbench.editor.tabs().len() {
+            let title = workbench.active_title();
+            assert!(
+                draw(&mut workbench, 80, 24).contains(&title),
+                "{TAB_OFF_STRIP}"
+            );
+            workbench.handle_key(alt(keys::NEXT_TAB.code));
+        }
+    }
+
+    #[test]
+    fn a_click_lands_on_the_tab_under_it_after_the_strip_scrolled() {
+        let (_dir, mut workbench) = many_tabs(8);
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+        let shown = visible_range(&workbench.editor, tabs.width);
+        assert!(shown.start > 0, "{TAB_OFF_STRIP}");
+
+        workbench.handle_mouse(click(tabs.x + 1, tabs.y));
+
+        assert_eq!(workbench.editor.active_index(), shown.start, "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn a_close_mark_is_reachable_after_the_strip_scrolled() {
+        let (_dir, mut workbench) = many_tabs(8);
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+        let last = workbench.editor.tabs().len() - 1;
+
+        workbench.handle_mouse(click(close_column(&workbench, last), tabs.y));
+
+        assert_eq!(workbench.editor.tabs().len(), last, "{WRONG_CLICK}");
+    }
+
+    /// The strip opens on its last tab, so what it cut off is all to the left.
+    /// Cycling past the end wraps to the first, and the overflow changes ends.
+    #[test]
+    fn the_strip_marks_which_end_it_cut_off() {
+        let (_dir, mut workbench) = many_tabs(8);
+
+        let painted = draw(&mut workbench, 80, 24);
+        assert!(painted.contains(MORE_LEFT), "{NO_OVERFLOW_MARK}");
+        assert!(!painted.contains(MORE_RIGHT), "{NO_OVERFLOW_MARK}");
+
+        workbench.handle_key(alt(keys::NEXT_TAB.code));
+
+        let painted = draw(&mut workbench, 80, 24);
+        assert!(!painted.contains(MORE_LEFT), "{NO_OVERFLOW_MARK}");
+        assert!(painted.contains(MORE_RIGHT), "{NO_OVERFLOW_MARK}");
+    }
+
+    #[test]
+    fn a_strip_with_room_to_spare_marks_neither_end() {
+        let (_dir, mut workbench) = many_tabs(2);
+
+        let painted = draw(&mut workbench, 80, 24);
+
+        assert!(!painted.contains(MORE_LEFT), "{NO_OVERFLOW_MARK}");
+        assert!(!painted.contains(MORE_RIGHT), "{NO_OVERFLOW_MARK}");
     }
 
     #[test]

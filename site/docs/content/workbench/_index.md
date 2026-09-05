@@ -65,7 +65,7 @@ Rows carry two marks. On the right, the source control letter for that path: `M`
 
 ## Editor
 
-Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
+Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. When more tabs are open than the strip can hold, it scrolls to keep the active one in view and marks the end it cut off with `‹` or `›`. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
 
 Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` and `Ctrl+X` copy and cut to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
 

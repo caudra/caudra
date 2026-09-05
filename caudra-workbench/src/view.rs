@@ -4,6 +4,7 @@
 //! knows about terminal columns, and because the layout it records in
 //! [`PaneRects`] is what paging and scrolling read back.
 
+use std::ops::Range;
 use std::path::Path;
 
 use caudra_highlight::StyledSegment;
@@ -65,6 +66,8 @@ const GOTO_PROMPT: &str = "Go to line: ";
 const NO_MATCHES: &str = "No results";
 const TAB_GAP: &str = " ";
 const CLOSE_MARK: &str = "\u{d7}";
+pub(crate) const MORE_LEFT: &str = "\u{2039}";
+pub(crate) const MORE_RIGHT: &str = "\u{203a}";
 /// The search buttons in the order [`toggle_row`] paints them, which is also
 /// the order [`toggle_at`] measures.
 const TOGGLES: [(Toggle, &str); 3] = [
@@ -500,11 +503,13 @@ impl Workbench {
 
     fn render_tabs(&mut self, buf: &mut Surface, area: Rect) {
         let active = self.editor.active_index();
+        let shown = visible_range(&self.editor, area.width);
         let pointed = self
             .hovering(area)
-            .and_then(|at| tab_at(&self.editor, at.0, area.x));
+            .and_then(|at| tab_at(&self.editor, at.0, area));
         let mut spans = Vec::new();
-        for (index, tab) in self.editor.tabs().iter().enumerate() {
+        for index in shown.clone() {
+            let tab = &self.editor.tabs()[index];
             let under = pointed.filter(|hit| hit.index == index);
             let mut style = if index == active {
                 self.styles.tab_active
@@ -527,6 +532,16 @@ impl Workbench {
             spans.push(Span::styled(TAB_GAP, self.styles.background));
         }
         chrome::render_line(buf, area, Line::from(spans));
+
+        // Painted over the gap either end of the strip, which the tabs leave
+        // blank, so saying there is more costs no title.
+        if shown.start > 0 {
+            overwrite(buf, (area.x, area.y), MORE_LEFT, self.styles.dim);
+        }
+        if shown.end < self.editor.tabs().len() {
+            let last = area.right().saturating_sub(1);
+            overwrite(buf, (last, area.y), MORE_RIGHT, self.styles.dim);
+        }
     }
 
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
@@ -707,12 +722,40 @@ fn tab_width(tab: &Tab) -> usize {
         + CLOSE_MARK.chars().count()
 }
 
+/// The tabs the strip has room for, as many as fit ending at the active one.
+/// Derived on every paint rather than stored, so the strip cannot remember a
+/// position the tabs have since moved out from under.
+pub(crate) fn visible_range(editor: &Editor, width: u16) -> Range<usize> {
+    let Some(tab) = editor.active() else {
+        return 0..0;
+    };
+    let tabs = editor.tabs();
+    let active = editor.active_index();
+    let width = width as usize;
+    let mut room = width.saturating_sub(tab_width(tab));
+
+    let mut first = active;
+    while first > 0 && tab_width(&tabs[first - 1]) <= room {
+        first -= 1;
+        room -= tab_width(&tabs[first]);
+    }
+    let mut end = active + 1;
+    while end < tabs.len() && tab_width(&tabs[end]) <= room {
+        room -= tab_width(&tabs[end]);
+        end += 1;
+    }
+    first..end
+}
+
 /// Which tab a click at `column` landed on, and whether it landed on that
-/// tab's close mark.
-pub(crate) fn tab_at(editor: &Editor, column: u16, origin: u16) -> Option<TabHit> {
-    let mut left = column.checked_sub(origin)? as usize;
-    for (index, tab) in editor.tabs().iter().enumerate() {
-        let width = tab_width(tab);
+/// tab's close mark. Measured over the tabs the strip is showing, so a click
+/// answers to what is under it rather than to the tab that would have been
+/// there had the strip never scrolled.
+pub(crate) fn tab_at(editor: &Editor, column: u16, strip: Rect) -> Option<TabHit> {
+    let shown = visible_range(editor, strip.width);
+    let mut left = column.checked_sub(strip.x)? as usize;
+    for index in shown {
+        let width = tab_width(&editor.tabs()[index]);
         if left < width {
             let close = left == width - TAB_GAP.len() - CLOSE_MARK.chars().count();
             return Some(TabHit { index, close });
@@ -812,6 +855,13 @@ fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Li
         })
         .collect();
     Line::from(spans).style(base)
+}
+
+fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
+    if let Some(cell) = buf.cell_mut(at) {
+        cell.set_symbol(symbol);
+        cell.set_style(style);
+    }
 }
 
 fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
@@ -1268,15 +1318,24 @@ mod tests {
 
     use test_case::test_case;
 
+    use ratatui::layout::Rect;
+
     use super::{
         Editor, Focus, SidebarView, Tab, TabHit, Toggle, Workbench, WorkbenchStyles, header_at,
-        keys, tab_at, toggle_at,
+        keys, tab_at, toggle_at, visible_range,
     };
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
+    const WRONG_STRIP: &str = "the strip is not showing the tabs it has room for";
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
     const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
+
+    /// Wide enough for every tab the cases open, so only the ones that ask for
+    /// a narrow strip have to say so.
+    fn strip(x: u16) -> Rect {
+        Rect::new(x, 0, 80, 1)
+    }
 
     /// Two two-column titles, so every tab spans ` ab \u{d7} ` and the second
     /// starts where the first ended.
@@ -1307,13 +1366,17 @@ mod tests {
     #[test_case(10, Some(TabHit { index: 1, close: true }) ; "every tab has its own close mark")]
     #[test_case(12, None ; "past the last tab is nothing")]
     fn a_column_falls_on_the_tab_the_strip_painted(column: u16, expected: Option<TabHit>) {
-        assert_eq!(tab_at(&editor(false), column, 0), expected, "{WRONG_TAB}");
+        assert_eq!(
+            tab_at(&editor(false), column, strip(0)),
+            expected,
+            "{WRONG_TAB}"
+        );
     }
 
     #[test]
     fn a_dirty_mark_shifts_the_close_mark_along_with_the_title() {
         assert_eq!(
-            tab_at(&editor(true), 5, 0),
+            tab_at(&editor(true), 5, strip(0)),
             Some(TabHit {
                 index: 0,
                 close: true
@@ -1326,8 +1389,47 @@ mod tests {
     fn the_origin_is_taken_off_before_the_strip_is_measured() {
         let editor = editor(false);
 
-        assert_eq!(tab_at(&editor, 9, 0), tab_at(&editor, 12, 3), "{WRONG_TAB}");
-        assert_eq!(tab_at(&editor, 2, 3), None, "{WRONG_TAB}");
+        assert_eq!(
+            tab_at(&editor, 9, strip(0)),
+            tab_at(&editor, 12, strip(3)),
+            "{WRONG_TAB}"
+        );
+        assert_eq!(tab_at(&editor, 2, strip(3)), None, "{WRONG_TAB}");
+    }
+
+    /// Both tabs span six columns, so a strip eleven wide has room for one and
+    /// the second is the one the cursor is on.
+    #[test]
+    fn a_strip_too_narrow_for_both_shows_the_active_one() {
+        let editor = editor(false);
+
+        assert_eq!(visible_range(&editor, 12), 0..2, "{WRONG_STRIP}");
+        assert_eq!(visible_range(&editor, 11), 1..2, "{WRONG_STRIP}");
+    }
+
+    /// The strip is measured from the tab it is showing, so the first column
+    /// of a scrolled strip is the second tab rather than the first.
+    #[test]
+    fn a_scrolled_strip_measures_from_what_it_shows() {
+        let editor = editor(false);
+
+        assert_eq!(
+            tab_at(&editor, 1, Rect::new(0, 0, 11, 1)),
+            Some(TabHit {
+                index: 1,
+                close: false
+            }),
+            "{WRONG_TAB}"
+        );
+    }
+
+    #[test]
+    fn an_empty_strip_shows_nothing() {
+        assert_eq!(
+            visible_range(&Editor::default(), 80),
+            0..0,
+            "{WRONG_STRIP}"
+        );
     }
 
     #[test_case(0, None ; "the gap in front of a segment is not a button")]
