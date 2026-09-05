@@ -9,7 +9,7 @@ use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
-use crate::repaint::Dirty;
+use crate::repaint::{Dirty, Watch};
 use caudra_agent::GoalStatus;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
@@ -2151,15 +2151,30 @@ fn unrevert_failure_status_value(
 impl App {
     pub(super) fn sessions_browse(&mut self) -> Vec<Action> {
         let rows = self.session_rows();
+        // Both halves are read here, so both watches start from what the
+        // picker is already showing rather than reporting their own birth as
+        // an arrival and rebuilding the list on the very next tick.
+        self.stored_session_generation = self.storage_writer.generation();
+        self.live_session_watch = Watch::seeded(self.live_sessions.load_full());
         self.session_picker.open(rows, now_secs());
         Vec::new()
     }
 
+    /// Both halves are polled, because each moves on its own: renaming or
+    /// deleting a session the event loop has not got open touches only the
+    /// store, and the writer thread is what finishes it, so the picker used
+    /// to keep showing a row that no longer existed.
     pub(crate) fn refresh_session_picker(&mut self) -> Dirty {
         if !self.session_picker.is_open() {
             return Dirty::NO;
         }
-        if self.live_session_watch.poll(self.live_sessions.load_full()) == Dirty::NO {
+        let generation = self.storage_writer.generation();
+        // `|` never short-circuits: the live watch must poll either way, or it
+        // reports the arrival it missed on some later, unrelated tick.
+        let changed = self.live_session_watch.poll(self.live_sessions.load_full())
+            | Dirty::from(generation != self.stored_session_generation);
+        self.stored_session_generation = generation;
+        if changed == Dirty::NO {
             return Dirty::NO;
         }
         let rows = self.session_rows();

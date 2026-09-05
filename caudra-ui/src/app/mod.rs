@@ -281,6 +281,9 @@ pub struct App {
     /// sibling sessions. Polled while the picker is open.
     pub(crate) live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
     live_session_watch: Watch<Vec<SessionRow>>,
+    /// The picker's other half comes from a disk query, which no publisher
+    /// covers; see [`StorageWriter::generation`].
+    stored_session_generation: u64,
     question_subagent: Option<String>,
     pub(super) stash_picker: StashPicker,
     pub(super) plan_form: PlanForm,
@@ -442,6 +445,7 @@ impl App {
             session_picker: SessionPicker::new(),
             live_sessions: Arc::default(),
             live_session_watch: Watch::default(),
+            stored_session_generation: 0,
             question_subagent: None,
             stash_picker: StashPicker::new(),
             plan_form: PlanForm::new(),

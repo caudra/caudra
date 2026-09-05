@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +65,7 @@ pub struct StorageWriter {
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
     done_rx: flume::Receiver<()>,
+    generation: Arc<AtomicU64>,
 }
 
 impl StorageWriter {
@@ -76,6 +78,8 @@ impl StorageWriter {
         let writer_usage = Arc::clone(&usage);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let (done_tx, done_rx) = flume::bounded::<()>(1);
+        let generation: Arc<AtomicU64> = Arc::default();
+        let writer_generation = Arc::clone(&generation);
 
         std::thread::Builder::new()
             .name("storage-writer".into())
@@ -92,6 +96,7 @@ impl StorageWriter {
                     wal_warning_active: false,
                     commits_since_checkpoint: 0,
                     checkpoint_stalls: 0,
+                    generation: writer_generation,
                 };
                 while wake_rx.recv().is_ok() {
                     writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
@@ -112,7 +117,16 @@ impl StorageWriter {
             workspace_tabs,
             usage,
             done_rx,
+            generation,
         }
+    }
+
+    /// Counts stored-session changes this process has made. A view built from
+    /// a disk query holds the value it read at and re-queries when it moves;
+    /// nothing else tells it that a session it is showing has been retitled or
+    /// erased, because those rows are not the ones the event loop publishes.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Records what a turn spent. Never coalesced and never dropped on a
@@ -242,12 +256,22 @@ struct Writer {
     wal_warning_active: bool,
     commits_since_checkpoint: u32,
     checkpoint_stalls: u32,
+    generation: Arc<AtomicU64>,
 }
 
 impl Writer {
     fn forget(&mut self, id: CaudraId) {
         self.cursors.remove(&id);
         self.failing.remove(&id);
+    }
+
+    /// Publishes that a session row moved, before the operation reports back:
+    /// a caller that waits for its own write must never then read a
+    /// generation that predates it.
+    fn mark_changed(&self, result: &Result<(), SessionError>) {
+        if result.is_ok() {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn flush(&mut self, pending: &Pending) {
@@ -265,10 +289,12 @@ impl Writer {
                         // is the last retry.
                         lock(pending).entry(id).or_insert(Entry::Save(session));
                     }
+                    self.mark_changed(&result);
                     self.report(id, &result);
                 }
                 Entry::SaveSync(session, done) => {
                     let result = self.write(&session);
+                    self.mark_changed(&result);
                     self.report(id, &result);
                     let _ = done.send(result);
                 }
@@ -281,6 +307,7 @@ impl Writer {
                         }
                         self.checkpoint(true);
                     }
+                    self.mark_changed(&session_result);
                     done(session_result);
                 }
             }
@@ -538,11 +565,34 @@ mod tests {
         "each turn must reach the sum; the ledger is money, not a snapshot";
     const SPEND_OUTLIVES: &str = "forgetting a session must not erase what it cost";
     const TITLE: &str = "renamed after reload";
+    const GENERATION_LAGS: &str =
+        "a change that has already reported back must be visible in the generation that follows it";
+    const GENERATION_RAN_AHEAD: &str =
+        "nothing reached disk, so nothing should ask a reader to look again";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         (tmp, dir)
+    }
+
+    /// A writer driven directly, with no thread behind it, so a test can
+    /// step one flush at a time.
+    fn bare_writer(dir: &StateDir, warn_tx: flume::Sender<String>) -> Writer {
+        Writer {
+            dir: dir.clone(),
+            warn_tx,
+            database: None,
+            ledger: None,
+            cursors: HashMap::new(),
+            deleted_sessions: HashMap::new(),
+            failing: HashSet::new(),
+            size_warning_level: 0,
+            wal_warning_active: false,
+            commits_since_checkpoint: 0,
+            checkpoint_stalls: 0,
+            generation: Arc::default(),
+        }
     }
 
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
@@ -568,6 +618,43 @@ mod tests {
 
     fn block_session_database(dir: &StateDir) {
         std::fs::create_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
+    }
+
+    /// A caller that waited for its own delete then read the generation used
+    /// to be able to see the value from before it, and treat a store it had
+    /// just changed as unchanged.
+    #[test]
+    fn a_completed_change_is_never_older_than_the_generation_it_reports() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let session = AppSession::new(MODEL, CWD);
+        let id = session.id;
+        let empty = writer.generation();
+
+        writer.save_sync(Arc::new(session)).unwrap();
+        let saved = writer.generation();
+        writer.delete_sync(id).unwrap();
+        let deleted = writer.generation();
+
+        assert!(saved > empty, "{GENERATION_LAGS}");
+        assert!(deleted > saved, "{GENERATION_LAGS}");
+    }
+
+    /// A write that is going to be retried has changed nothing yet, and a
+    /// view that re-queries the store on every attempt would spend a disk
+    /// read per failure to find the same rows.
+    #[test]
+    fn a_failed_write_leaves_the_generation_where_it_was() {
+        let (_tmp, dir) = state_dir();
+        block_session_database(&dir);
+        let (writer, _warn_rx) = writer(&dir);
+        let before = writer.generation();
+
+        writer
+            .save_sync(Arc::new(AppSession::new(MODEL, CWD)))
+            .unwrap_err();
+
+        assert_eq!(writer.generation(), before, "{GENERATION_RAN_AHEAD}");
     }
 
     /// Snapshots must coalesce per session id, not into one `latest` slot:
@@ -934,19 +1021,7 @@ mod tests {
     fn failed_write_keeps_its_cursor_for_retry() {
         let (_tmp, dir) = state_dir();
         let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut writer = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            database: None,
-            ledger: None,
-            cursors: HashMap::new(),
-            deleted_sessions: HashMap::new(),
-            failing: HashSet::new(),
-            size_warning_level: 0,
-            wal_warning_active: false,
-            commits_since_checkpoint: 0,
-            checkpoint_stalls: 0,
-        };
+        let mut writer = bare_writer(&dir, warn_tx);
         let mut stale = AppSession::new(MODEL, CWD);
         let id = stale.id;
         writer.write(&stale).unwrap();
@@ -973,19 +1048,7 @@ mod tests {
         let mut queued = stored.clone();
         queued.set_title("queued".into());
         let (warn_tx, warn_rx) = flume::unbounded();
-        let mut writer = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            database: None,
-            ledger: None,
-            cursors: HashMap::new(),
-            deleted_sessions: HashMap::new(),
-            failing: HashSet::new(),
-            size_warning_level: 0,
-            wal_warning_active: false,
-            commits_since_checkpoint: 0,
-            checkpoint_stalls: 0,
-        };
+        let mut writer = bare_writer(&dir, warn_tx);
 
         writer.write(&first).unwrap();
         writer.write(&queued).unwrap();
@@ -1003,19 +1066,7 @@ mod tests {
         let mut unrelated = AppSession::load(stored.id, &dir).unwrap();
         unrelated.set_title("unrelated stale".into());
         let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut writer = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            database: None,
-            ledger: None,
-            cursors: HashMap::new(),
-            deleted_sessions: HashMap::new(),
-            failing: HashSet::new(),
-            size_warning_level: 0,
-            wal_warning_active: false,
-            commits_since_checkpoint: 0,
-            checkpoint_stalls: 0,
-        };
+        let mut writer = bare_writer(&dir, warn_tx);
         writer.write(&first).unwrap();
 
         assert!(matches!(

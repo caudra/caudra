@@ -75,6 +75,9 @@ const GOAL_PROGRESS_SURVIVES: &str =
 const GOAL_SPEND_IS_ITS_OWN: &str = "goal evaluation must not be billed as the conversation";
 const TITLE_SPEND_IS_RECORDED: &str = "a title costs real tokens and must not be dropped";
 const TITLE_TEXT: &str = "Sqlite ledger work";
+const GENERATED_TITLE: &str = "Named on demand";
+const PICKER_MISSED_IT: &str = "the picker lists stored sessions from this workspace";
+const PICKER_KEPT_IT: &str = "a session erased from the store must leave the list with it";
 const TITLE_CONTEXT_SIZE: u32 = 1234;
 const TASK_ID: &str = "task1";
 pub(crate) const RESEARCH_NAME: &str = "research";
@@ -5310,7 +5313,10 @@ fn title_spend_reaches_the_ledger_without_moving_the_context_size() {
         LedgerPurpose::Title.storage_name(),
         "{TITLE_SPEND_IS_RECORDED}"
     );
-    assert_eq!(rows[0].provider, OTHER_PROVIDER, "{TITLE_SPEND_IS_RECORDED}");
+    assert_eq!(
+        rows[0].provider, OTHER_PROVIDER,
+        "{TITLE_SPEND_IS_RECORDED}"
+    );
     assert_eq!(rows[0].cost, GOAL_COST, "{TITLE_SPEND_IS_RECORDED}");
 }
 
@@ -5348,7 +5354,10 @@ fn the_session_usage_key_names_a_foreign_provider_only(
     model: &str,
     expected: &str,
 ) {
-    assert_eq!(session_usage_model(provider, model, TEST_PROVIDER), expected);
+    assert_eq!(
+        session_usage_model(provider, model, TEST_PROVIDER),
+        expected
+    );
 }
 
 #[test]
@@ -7071,6 +7080,42 @@ fn fork_fails_when_referenced_managed_output_is_missing() {
     assert!(error.contains("Failed to copy managed tool outputs for fork"));
     assert!(error.contains(&missing_ref.id.to_string()));
     assert!(error.contains(&source_session_id.to_string()));
+}
+
+/// The picker's live half never moves for a session this process does not
+/// have open, so a delete that only the writer thread can finish left the row
+/// on screen for as long as the picker stayed up.
+#[test]
+fn deleting_a_stored_session_drops_it_from_the_open_picker() {
+    let (_temp, storage, writer, mut app) = tempdir_app();
+    let mut stored = AppSession::new(&app.state.session.model, &app.state.session.cwd);
+    let id = stored.id;
+    stored.save(&storage).unwrap();
+    app.sessions_browse();
+    assert!(app.session_picker.ids().contains(&id), "{PICKER_MISSED_IT}");
+    assert_eq!(app.refresh_session_picker(), Dirty::NO, "{QUIET}");
+
+    writer.delete_sync(id).unwrap();
+
+    assert_eq!(app.refresh_session_picker(), Dirty::YES, "{OWED}");
+    assert!(!app.session_picker.ids().contains(&id), "{PICKER_KEPT_IT}");
+    assert_eq!(app.refresh_session_picker(), Dirty::NO, "{QUIET}");
+}
+
+#[test]
+fn retitling_a_stored_session_refreshes_the_open_picker() {
+    let (_temp, storage, writer, mut app) = tempdir_app();
+    let mut stored = AppSession::new(&app.state.session.model, &app.state.session.cwd);
+    let id = stored.id;
+    stored.save(&storage).unwrap();
+    app.sessions_browse();
+    assert_eq!(app.refresh_session_picker(), Dirty::NO, "{QUIET}");
+    let mut renamed = AppSession::load(id, &storage).unwrap();
+    renamed.set_title(GENERATED_TITLE.into());
+
+    writer.save_sync(Arc::new(renamed)).unwrap();
+
+    assert_eq!(app.refresh_session_picker(), Dirty::YES, "{OWED}");
 }
 
 #[test]

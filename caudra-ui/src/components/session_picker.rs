@@ -184,6 +184,14 @@ impl SessionPicker {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn ids(&self) -> Vec<CaudraId> {
+        (0..)
+            .map_while(|index| self.picker.item(index))
+            .map(|item| item.id)
+            .collect()
+    }
+
     pub fn is_open(&self) -> bool {
         self.picker.is_open()
     }
@@ -449,19 +457,12 @@ mod tests {
         picker
     }
 
-    fn ids(picker: &SessionPicker) -> Vec<CaudraId> {
-        (0..)
-            .map_while(|index| picker.picker.item(index))
-            .map(|item| item.id)
-            .collect()
-    }
-
     #[test]
     fn the_current_session_sorts_first_and_says_so() {
         let mut current = row(SECOND, TITLE_B, 500, Some(SessionActivity::Idle));
         current.focused = true;
         let picker = opened(vec![row(FIRST, TITLE_A, 10, None), current]);
-        assert_eq!(ids(&picker), [id(SECOND), id(FIRST)]);
+        assert_eq!(picker.ids(), [id(SECOND), id(FIRST)]);
         assert_eq!(picker.picker.item(0).unwrap().detail(), Some(CURRENT_LABEL));
     }
 
@@ -471,7 +472,7 @@ mod tests {
             row(FIRST, TITLE_A, 5_000, None),
             row(SECOND, TITLE_B, 10, None),
         ]);
-        assert_eq!(ids(&picker), [id(SECOND), id(FIRST)]);
+        assert_eq!(picker.ids(), [id(SECOND), id(FIRST)]);
     }
 
     #[test]
@@ -480,7 +481,7 @@ mod tests {
             row(FIRST, TITLE_A, 5_000, None),
             row(SECOND, TITLE_B, 10, None),
         ]);
-        let before = ids(&picker);
+        let before = picker.ids();
         picker.refresh(
             vec![
                 row(FIRST, TITLE_A, 5_000, None),
@@ -490,7 +491,7 @@ mod tests {
             NOW,
         );
         assert_eq!(
-            ids(&picker),
+            picker.ids(),
             [id(THIRD)].into_iter().chain(before).collect::<Vec<_>>(),
             "the newcomer enters above rows already on screen"
         );
