@@ -1,6 +1,9 @@
 use std::env;
 
-use caudra_config::{AgentConfig, CompactionBuffer};
+use caudra_config::{
+    AgentConfig, CompactionBuffer, DEFAULT_COMPACTION_BUFFER,
+    DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER,
+};
 use caudra_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
@@ -192,10 +195,24 @@ pub async fn compact(
     Ok(usage)
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
+/// A window that excludes output only needs the reserve to absorb estimation
+/// drift, so it holds back less than one that has to fit a response as well.
+fn resolve_buffer(model: &Model, configured: Option<CompactionBuffer>) -> CompactionBuffer {
+    configured.unwrap_or(if model.window_excludes_output {
+        DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER
+    } else {
+        DEFAULT_COMPACTION_BUFFER
+    })
+}
+
+pub(super) fn is_overflow(
+    usage: &TokenUsage,
+    model: &Model,
+    buffer: Option<CompactionBuffer>,
+) -> bool {
     let usable = model
         .context_window
-        .saturating_sub(buffer.resolve(model.context_window));
+        .saturating_sub(resolve_buffer(model, buffer).resolve(model.context_window));
     usage.context_tokens() >= usable
 }
 
@@ -388,6 +405,12 @@ mod tests {
     fn small_context_model(context_window: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
+        model
+    }
+
+    fn input_budget_model(context_window: u32) -> Model {
+        let mut model = small_context_model(context_window);
+        model.window_excludes_output = true;
         model
     }
 
@@ -610,6 +633,20 @@ mod tests {
         );
     }
 
+    /// The reserve only has to cover estimation drift here, so the old 20%
+    /// trigger at 297_600 must no longer compact.
+    #[test_case(297_600, false ; "below_total_window_reserve")]
+    #[test_case(334_799, false ; "below_scaled_threshold")]
+    #[test_case(334_800, true  ; "at_scaled_threshold")]
+    fn overflow_reserves_less_when_window_excludes_output(input: u32, expected: bool) {
+        let model = input_budget_model(372_000);
+        let usage = TokenUsage {
+            input,
+            ..Default::default()
+        };
+        assert_eq!(is_overflow(&usage, &model, None), expected);
+    }
+
     #[test_case(CompactionBuffer::Tokens(10_000), 53_999, false ; "explicit_tokens_below")]
     #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
@@ -619,7 +656,24 @@ mod tests {
             input,
             ..Default::default()
         };
-        assert_eq!(is_overflow(&usage, &model, buffer), expected);
+        assert_eq!(is_overflow(&usage, &model, Some(buffer)), expected);
+    }
+
+    /// An explicit buffer is the user's number, so it wins over the reserve the
+    /// window would otherwise pick for itself.
+    #[test_case(CompactionBuffer::Percent(50), 185_999, false ; "explicit_percent_below")]
+    #[test_case(CompactionBuffer::Percent(50), 186_000, true  ; "explicit_percent_overrides_default")]
+    fn explicit_buffer_overrides_input_budget_default(
+        buffer: CompactionBuffer,
+        input: u32,
+        expected: bool,
+    ) {
+        let model = input_budget_model(372_000);
+        let usage = TokenUsage {
+            input,
+            ..Default::default()
+        };
+        assert_eq!(is_overflow(&usage, &model, Some(buffer)), expected);
     }
 
     #[test]

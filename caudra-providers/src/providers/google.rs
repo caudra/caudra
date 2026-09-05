@@ -726,6 +726,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
+            window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         }

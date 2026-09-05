@@ -804,6 +804,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         discovered_free: false,
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
+        window_excludes_output: false,
         reasoning_options: caudra_providers::ReasoningOptions::default(),
         thinking_fields: None,
     }

@@ -156,6 +156,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         discovered_free: false,
         max_output_tokens,
         context_window,
+        window_excludes_output: false,
         reasoning_options: declared
             .and_then(|m| m.reasoning_options.clone())
             .unwrap_or_default(),

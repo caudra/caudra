@@ -8,7 +8,10 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model::{
+    Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
+    window_excludes_output,
+};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use caudra_storage::id::SessionRef;
@@ -396,13 +399,17 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
             if let Ok(entry) = lookup_entry(manifest.models, model_id) {
                 model.context_window = entry.context_window;
                 model.max_output_tokens = entry.max_output_tokens;
+                model.window_excludes_output =
+                    window_excludes_output(manifest.slug, entry.context_window);
                 model.supports_vision_override =
                     model.supports_vision_override.or(Some(entry.vision));
             }
         }
     }
+    // A hand-declared window is a total until its author says otherwise.
     if let Some(cw) = ov.context_window {
         model.context_window = cw;
+        model.window_excludes_output = false;
     }
     model.max_output_tokens = ov.max_output_tokens.or(model.max_output_tokens);
     if let Some(thinking) = ov.supports_thinking {

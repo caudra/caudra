@@ -21,6 +21,7 @@ use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
+const ANTHROPIC_SLUG: &str = "anthropic";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -241,6 +242,14 @@ pub struct ModelEntry {
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
 }
 
+/// Whether a resolved window is an input budget rather than the API total.
+/// Anthropic is the only static table that declares one; the OpenAI plan windows
+/// are set at runtime by `openai::platform::adjust_model`, since they depend on
+/// which credentials are in play.
+pub(crate) fn window_excludes_output(manifest_slug: &str, context_window: u32) -> bool {
+    manifest_slug == ANTHROPIC_SLUG && anthropic::shared::window_excludes_output(context_window)
+}
+
 pub(crate) fn lookup_entry<'a>(
     entries: &'a [ModelEntry],
     model_id: &str,
@@ -268,8 +277,6 @@ impl ModelFamily {
         matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
     }
 }
-
-const FAST_PROVIDER: &str = "anthropic";
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
@@ -312,6 +319,11 @@ pub struct Model {
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    /// `context_window` is an input budget and `max_output_tokens` is granted on
+    /// top of it, rather than the API total the two share. True only for the
+    /// working windows caudra caps itself, which is why they need less reserved
+    /// for compaction than a total does.
+    pub window_excludes_output: bool,
     pub thinking_fields: Option<Box<ThinkingFields>>,
     /// Levels and bounds this model accepts, resolved once at construction so a
     /// request never needs a live catalog lookup. Empty when nothing declared
@@ -370,6 +382,7 @@ impl Model {
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             context_window,
+            window_excludes_output: window_excludes_output(manifest.slug, context_window),
             thinking_fields: None,
             reasoning_options,
         }
@@ -404,6 +417,7 @@ impl Model {
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
+            window_excludes_output: false,
             thinking_fields: None,
             reasoning_options: meta.reasoning_options,
         }
@@ -470,7 +484,7 @@ impl Model {
     /// time.
     pub fn supports_fast(&self) -> bool {
         self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.slug == FAST_PROVIDER)
+            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.slug == ANTHROPIC_SLUG)
     }
 
     pub fn spec(&self) -> String {

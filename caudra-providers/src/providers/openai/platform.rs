@@ -604,8 +604,12 @@ impl Provider for OpenAi {
             && let Some(plan_context_window) = coding_plan_context_window(&model.id)
         {
             model.context_window = baseline_context_window.min(plan_context_window);
+            // The plan windows are `total - max_output_tokens`, so the output
+            // allowance sits on top rather than inside them.
+            model.window_excludes_output = model.context_window == plan_context_window;
         } else {
             model.context_window = baseline_context_window;
+            model.window_excludes_output = false;
         }
     }
 }
@@ -670,10 +674,12 @@ mod tests {
             model.context_window,
             baseline_context_window.min(coding_plan_context_window(&model.id).unwrap())
         );
+        assert!(model.window_excludes_output);
 
         provider.auth_state.lock().unwrap().oauth_tokens = None;
         provider.adjust_model(&mut model);
         assert_eq!(model.context_window, baseline_context_window);
+        assert!(!model.window_excludes_output);
     }
 
     #[test]

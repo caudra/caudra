@@ -39,6 +39,9 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+/// Windows that already exclude output need less held back, since the reserve
+/// only has to absorb estimation drift rather than a whole response.
+pub const DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(10);
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -1358,8 +1361,8 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
-    #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
-    pub compaction_buffer: CompactionBuffer,
+    #[config(default = "None", ty = "u32 | string", default_doc = "20%, or 10% when the model's window excludes output", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
+    pub compaction_buffer: Option<CompactionBuffer>,
 
     #[config(
         ty = "String",
@@ -1434,7 +1437,7 @@ impl AgentConfig {
             max_continuation_turns: file
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
-            compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            compaction_buffer: file.compaction_buffer,
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             generate_titles: file.generate_titles.unwrap_or(true),

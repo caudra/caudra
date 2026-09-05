@@ -107,6 +107,7 @@ impl ScriptModel {
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
+            window_excludes_output: false,
             reasoning_options: self.reasoning_options.clone().unwrap_or_default(),
             thinking_fields: self.thinking_fields.clone().map(Box::new),
         }

@@ -1125,6 +1125,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
+            window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
         };

@@ -31,8 +31,10 @@ pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
 
 /// Long-context models accept 1M tokens natively, with no beta header. This is
 /// the working window we run them at, capped well below that ceiling to bound
-/// cost and latency, the same way `GPT_5_6_CONTEXT_WINDOW` caps OpenAI's.
-pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 376_000;
+/// cost and latency, and aligned with `GPT_5_6_PLAN_CONTEXT_WINDOW`. Unlike the
+/// 200k entries, it is an *input* budget: `max_output_tokens` is granted on top
+/// of it rather than carved out of it.
+pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
@@ -48,6 +50,12 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
     model_id
         .ends_with(LONG_CONTEXT_SUFFIX)
         .then_some(LONG_CONTEXT_WINDOW)
+}
+
+/// Only the window caudra caps itself excludes output. `LONG_CONTEXT_WINDOW` is
+/// Anthropic's real ceiling and therefore a total, so this matches on equality.
+pub(crate) fn window_excludes_output(context_window: u32) -> bool {
+    context_window == WIDE_CONTEXT_WINDOW
 }
 
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
@@ -907,18 +915,25 @@ mod tests {
 
     const NARROW_CONTEXT_WINDOW: u32 = 200_000;
 
-    #[test_case("anthropic/claude-sonnet-4-6", WIDE_CONTEXT_WINDOW   ; "sonnet_4_6_is_wide")]
-    #[test_case("anthropic/claude-sonnet-5", WIDE_CONTEXT_WINDOW     ; "sonnet_5_is_wide")]
-    #[test_case("anthropic/claude-opus-4-8", WIDE_CONTEXT_WINDOW     ; "opus_4_8_is_wide")]
-    #[test_case("anthropic/claude-opus-5", WIDE_CONTEXT_WINDOW       ; "opus_5_is_wide")]
-    #[test_case("anthropic/claude-fable-5", WIDE_CONTEXT_WINDOW      ; "fable_5_is_wide")]
-    #[test_case("anthropic/claude-opus-4-5", NARROW_CONTEXT_WINDOW   ; "opus_4_5_stays_narrow")]
-    #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW ; "sonnet_4_5_stays_narrow")]
-    #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW  ; "haiku_4_5_stays_narrow")]
-    #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW    ; "suffix_still_opts_into_the_ceiling")]
-    fn context_window_matches_the_declared_tier(spec: &str, expected: u32) {
+    /// Only the window caudra picks itself is an input budget. The 200k entries
+    /// and the 1M ceiling are API totals, so they keep the larger reserve.
+    #[test_case("anthropic/claude-sonnet-4-6", WIDE_CONTEXT_WINDOW,   true  ; "sonnet_4_6_is_wide")]
+    #[test_case("anthropic/claude-sonnet-5", WIDE_CONTEXT_WINDOW,     true  ; "sonnet_5_is_wide")]
+    #[test_case("anthropic/claude-opus-4-8", WIDE_CONTEXT_WINDOW,     true  ; "opus_4_8_is_wide")]
+    #[test_case("anthropic/claude-opus-5", WIDE_CONTEXT_WINDOW,       true  ; "opus_5_is_wide")]
+    #[test_case("anthropic/claude-fable-5", WIDE_CONTEXT_WINDOW,      true  ; "fable_5_is_wide")]
+    #[test_case("anthropic/claude-opus-4-5", NARROW_CONTEXT_WINDOW,   false ; "opus_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW, false ; "sonnet_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW,  false ; "haiku_4_5_stays_narrow")]
+    #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW,    false ; "suffix_still_opts_into_the_ceiling")]
+    fn context_window_matches_the_declared_tier(
+        spec: &str,
+        expected: u32,
+        excludes_output: bool,
+    ) {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.context_window, expected);
+        assert_eq!(model.window_excludes_output, excludes_output);
     }
 
     #[test_case("bash" ; "builtin")]

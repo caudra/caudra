@@ -136,7 +136,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `max_output_bytes` | usize | `51200` | 1024 | Host-enforced default max tool-result size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Host-enforced default max tool-result lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
-| `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
+| `compaction_buffer` | u32 \| string | `20%, or 10% when the model's window excludes output` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with a small model |
