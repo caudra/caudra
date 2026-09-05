@@ -9,7 +9,7 @@ use code_view::{BatchViewMap, BatchViews, Disclosure, RenderLimits, RowTarget};
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -21,8 +21,8 @@ use crate::markdown::{
     truncation_notice,
 };
 use caudra_agent::{
-    BatchToolStatus, BufferSnapshot, InstructionBlock, ShellOutput, SnapshotSpan, SpanStyle,
-    SubagentProgress, ToolInput, ToolOutput,
+    BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
+    SpanStyle, SubagentProgress, ToolInput, ToolOutput, tools::humanize_duration,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -66,6 +66,20 @@ const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 /// The tools whose header is built from a pattern the model wrote.
 const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
 const QUERY_KEY: &str = "pattern";
+const MILLIS_PER_SECOND: u64 = 1_000;
+
+/// Duration inputs and the millis one of their units is worth, so a bracket
+/// reads `10m` instead of `600000`. `timeout` is milliseconds to a subprocess
+/// and seconds to a fetch, so the unit belongs to the tool rather than to the
+/// key, and reading it off the name alone would be wrong by a factor of a
+/// thousand. A key that names its own unit still gets a row, because the tool
+/// it belongs to is what says the name is a duration at all.
+const DURATION_ARGS: &[(&str, &str, u64)] = &[
+    ("shell", "timeout", 1),
+    ("code_execution", "timeout", 1),
+    ("webfetch", "timeout", MILLIS_PER_SECOND),
+    ("websearch", "timeoutSec", MILLIS_PER_SECOND),
+];
 /// What separates a server or namespace from the tool it qualifies.
 const QUALIFIER: [char; 3] = ['_', '.', '-'];
 
@@ -108,7 +122,7 @@ impl From<Indicator> for Tense {
     fn from(indicator: Indicator) -> Self {
         match indicator {
             Indicator::InProgress => Self::Present,
-            Indicator::Success => Self::Past,
+            Indicator::Success | Indicator::Warning => Self::Past,
             Indicator::Error => Self::Plain,
         }
     }
@@ -279,11 +293,24 @@ pub(super) fn compact_args_for(
     header: &str,
     raw_input: Option<&serde_json::Value>,
 ) -> Option<String> {
+    let row = compact_row(tool);
     compact_args(
         raw_input,
         header,
-        compact_tool(tool).map_or(&[], |entry| entry.header_keys),
+        row.map(|(tool, _)| tool),
+        row.map_or(&[], |(_, entry)| entry.header_keys),
     )
+}
+
+/// The value of a duration input in milliseconds, or `None` for a number that
+/// is not one. The tool has to be one the table knows, since the unit is its
+/// to declare.
+fn duration_millis(tool: Option<&str>, key: &str, value: &serde_json::Number) -> Option<u64> {
+    let tool = tool?;
+    let (_, _, millis_per_unit) = DURATION_ARGS
+        .iter()
+        .find(|(known, arg, _)| *known == tool && same_key(arg, key))?;
+    value.as_u64()?.checked_mul(*millis_per_unit)
 }
 
 /// The primitive inputs a compact header does not already show, rendered the
@@ -295,9 +322,13 @@ pub(super) fn compact_args_for(
 /// print its whole header back as `[k=v]`. Only strings are checked against
 /// it, because a number is what the brackets exist to carry and `offset=1`
 /// must survive a header that happens to contain a `1`.
+///
+/// `tool` is the name the row is tabled under, which is what says whether a
+/// number is a count or a duration.
 fn compact_args(
     raw_input: Option<&serde_json::Value>,
     header: &str,
+    tool: Option<&str>,
     header_keys: &[&str],
 ) -> Option<String> {
     let fields = raw_input?.as_object()?;
@@ -310,7 +341,12 @@ fn compact_args(
         let scalar = match value {
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
             serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
-            serde_json::Value::Number(number) => Cow::Owned(number.to_string()),
+            serde_json::Value::Number(number) => {
+                Cow::Owned(duration_millis(tool, key, number).map_or_else(
+                    || number.to_string(),
+                    |millis| humanize_duration(Duration::from_millis(millis)),
+                ))
+            }
             serde_json::Value::Bool(flag) => Cow::Owned(flag.to_string()),
             _ => continue,
         };
@@ -507,6 +543,8 @@ pub fn append_right_info(
 enum Indicator {
     InProgress,
     Success,
+    /// The call worked and answered with nothing.
+    Warning,
     Error,
 }
 
@@ -517,6 +555,44 @@ impl From<ToolStatus> for Indicator {
             ToolStatus::Success => Self::Success,
             ToolStatus::Error => Self::Error,
         }
+    }
+}
+
+impl Indicator {
+    /// A search that found nothing succeeded, so nothing about the status says
+    /// the answer is empty, and `0 matches` reads like any other count at a
+    /// glance. The output is what knows, so the color comes from there.
+    fn resolve(status: ToolStatus, output: Option<&ToolOutput>) -> Self {
+        match (Self::from(status), output) {
+            (Self::Success, Some(output)) if found_nothing(output) => Self::Warning,
+            (indicator, _) => indicator,
+        }
+    }
+}
+
+/// Whether a finished call is a confirmed miss. A search that stopped early is
+/// not one: Workcell says so by writing its own notice instead of the empty
+/// answer, so comparing against that answer excludes a capped scan by
+/// construction rather than by guessing at the text.
+fn found_nothing(output: &ToolOutput) -> bool {
+    match output {
+        ToolOutput::GrepResult { entries, .. } => {
+            entries.iter().all(|entry| entry.match_count() == 0)
+        }
+        ToolOutput::Plain(text) => text.text == NO_FILES_FOUND,
+        _ => false,
+    }
+}
+
+/// The color a finished batch child answers with, resolved here so every
+/// status-to-color decision lives beside the sigils it paints.
+pub(super) fn batch_sigil_style(status: BatchToolStatus, output: Option<&ToolOutput>) -> Style {
+    let theme = theme::current();
+    match status {
+        BatchToolStatus::Pending => theme.tool_dim,
+        BatchToolStatus::Running => theme.spinner,
+        BatchToolStatus::Success => finished_style(Indicator::resolve(ToolStatus::Success, output)),
+        BatchToolStatus::Error => theme.tool_error,
     }
 }
 
@@ -716,8 +792,8 @@ impl ToolLineBuilder {
         annotation: Option<&str>,
         raw_input: Option<&serde_json::Value>,
     ) {
-        let entry = compact_tool(tool_name);
-        let label = entry.map_or(tool_name, |entry| entry.label(self.indicator.into()));
+        let row = compact_row(tool_name);
+        let label = row.map_or(tool_name, |(_, entry)| entry.label(self.indicator.into()));
 
         let mut copy = format!("{label} {header}");
         let mut spans = vec![Span::styled(
@@ -733,7 +809,8 @@ impl ToolLineBuilder {
         if let Some(args) = compact_args(
             raw_input,
             header,
-            entry.map_or(&[], |entry| entry.header_keys),
+            row.map(|(tool, _)| tool),
+            row.map_or(&[], |(_, entry)| entry.header_keys),
         ) {
             copy.push_str(&args);
             spans.push(Span::styled(args, theme::current().tool_dim));
@@ -1055,10 +1132,11 @@ fn bake_spans(
 }
 
 fn finished_style(indicator: Indicator) -> Style {
-    if matches!(indicator, Indicator::Error) {
-        theme::current().tool_error
-    } else {
-        theme::current().tool_success
+    let theme = theme::current();
+    match indicator {
+        Indicator::Error => theme.tool_error,
+        Indicator::Warning => theme.tool_warning,
+        _ => theme.tool_success,
     }
 }
 
@@ -1144,7 +1222,7 @@ pub fn build_tool_lines(
         rctx.width,
         expanded.full,
         rctx.tool_output_lines.get(tool_name),
-        status.into(),
+        Indicator::resolve(status, msg.tool_output.as_deref()),
         rctx.views_for(msg.role.tool_id()),
     );
     b.apply_output_format(msg.tool_output.as_deref());
@@ -1348,8 +1426,8 @@ mod tests {
     use crate::markdown::TRUNCATION_PREFIX;
     use caudra_agent::tools::{FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect};
     use caudra_agent::{
-        ShellFilterInfo, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
-        ToolOutput,
+        GrepFileEntry, GrepMatchGroup, ShellFilterInfo, SnapshotLine, SnapshotSpan,
+        SubagentActivity, TextOutput, ToolInput, ToolOutput,
     };
     use std::time::Duration;
     use test_case::test_case;
@@ -3089,6 +3167,113 @@ mod tests {
             .as_deref(),
             Some(" [offset=1]"),
             "{ARGS_MSG}"
+        );
+    }
+
+    const DURATION_MSG: &str = "a duration input reads as one, in the unit its tool quotes";
+
+    /// `timeout` is milliseconds to a subprocess and seconds to a fetch, so
+    /// the same key and the same number have to come out a thousand-fold
+    /// apart. A count is left alone: only the table says a number is a span
+    /// of time, which is why an untabled tool cannot turn one into `2m`.
+    #[test_case(
+        "shell", serde_json::json!({ "timeout": 600_000 }), Some(" [timeout=10m]")
+        ; "a subprocess quotes its timeout in millis"
+    )]
+    #[test_case(
+        "code_execution", serde_json::json!({ "timeout": 5_000 }), Some(" [timeout=5s]")
+        ; "so does the code worker"
+    )]
+    #[test_case(
+        "webfetch", serde_json::json!({ "timeout": 30 }), Some(" [timeout=30s]")
+        ; "a fetch quotes the same key in seconds"
+    )]
+    #[test_case(
+        "websearch", serde_json::json!({ "timeoutSec": 60 }), Some(" [timeoutSec=1m]")
+        ; "a key naming its unit still answers to its tool"
+    )]
+    #[test_case(
+        "mcp_Shell", serde_json::json!({ "timeout": 120_000 }), Some(" [timeout=2m]")
+        ; "a qualified tool reads the same unit"
+    )]
+    #[test_case(
+        "file_read", serde_json::json!({ "limit": 200 }), Some(" [limit=200]")
+        ; "a count is not a duration"
+    )]
+    #[test_case(
+        "srv.unknown", serde_json::json!({ "timeout": 600_000 }), Some(" [timeout=600000]")
+        ; "an untabled tool has no unit to quote"
+    )]
+    fn a_duration_input_is_shown_in_units_a_reader_holds(
+        tool: &str,
+        raw_input: serde_json::Value,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(
+            compact_args_for(tool, "", Some(&raw_input)).as_deref(),
+            expected,
+            "{DURATION_MSG}"
+        );
+    }
+
+    const EMPTY_ANSWER_MSG: &str = "a search that found nothing says so in colour";
+
+    fn grep_output(matches: usize) -> ToolOutput {
+        let groups = (0..matches)
+            .map(|i| GrepMatchGroup::single(i + 1, "hit"))
+            .collect::<Vec<_>>();
+        ToolOutput::GrepResult {
+            entries: vec![GrepFileEntry {
+                path: "src/lib.rs".into(),
+                groups,
+            }],
+            capped: None,
+        }
+    }
+
+    /// Nothing about `Success` says the answer was empty, and `0 matches`
+    /// reads like any other count, so the colour is what has to carry it.
+    #[test_case(grep_output(0), true  ; "a grep with no hits is a miss")]
+    #[test_case(grep_output(2), false ; "a grep with hits is not")]
+    #[test_case(
+        ToolOutput::GrepResult { entries: Vec::new(), capped: None }, true
+        ; "a grep that opened no file at all is a miss"
+    )]
+    #[test_case(
+        ToolOutput::Plain(NO_FILES_FOUND.into()), true
+        ; "a glob answering with the empty answer is a miss"
+    )]
+    #[test_case(
+        ToolOutput::Plain("scan stopped early".into()), false
+        ; "a scan that stopped early is not a confirmed miss"
+    )]
+    fn an_empty_answer_is_told_apart_from_a_full_one(output: ToolOutput, warns: bool) {
+        assert_eq!(
+            matches!(
+                Indicator::resolve(ToolStatus::Success, Some(&output)),
+                Indicator::Warning
+            ),
+            warns,
+            "{EMPTY_ANSWER_MSG}"
+        );
+    }
+
+    /// The colour says how the call went, so a failure keeps saying so even
+    /// when its output would otherwise read as empty.
+    #[test]
+    fn a_failure_is_never_downgraded_to_an_empty_answer() {
+        assert!(matches!(
+            Indicator::resolve(ToolStatus::Error, Some(&grep_output(0))),
+            Indicator::Error
+        ));
+    }
+
+    #[test]
+    fn an_empty_answer_and_a_full_one_do_not_share_a_colour() {
+        assert_ne!(
+            finished_style(Indicator::Warning),
+            finished_style(Indicator::Success),
+            "{EMPTY_ANSWER_MSG}"
         );
     }
 }

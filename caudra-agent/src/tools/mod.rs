@@ -339,14 +339,18 @@ impl Deadline {
     }
 }
 
-pub fn timeout_annotation(secs: u64) -> String {
-    let d = Duration::from_secs(secs);
-    let formatted: String = format_duration(d)
+/// A duration for somewhere too narrow to spare the spaces, so `1m 30s` reads
+/// `1m30s`. Shared so a timeout says the same thing wherever it is shown.
+pub fn humanize_duration(duration: Duration) -> String {
+    format_duration(duration)
         .to_string()
         .chars()
         .filter(|c| !c.is_whitespace())
-        .collect();
-    format!("{formatted} timeout")
+        .collect()
+}
+
+pub fn timeout_annotation(secs: u64) -> String {
+    format!("{} timeout", humanize_duration(Duration::from_secs(secs)))
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -914,6 +918,17 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+    }
+
+    /// Sub-second input is what separates this from `timeout_annotation`,
+    /// which only ever sees whole seconds.
+    #[test_case(600_000, "10m"     ; "a_round_timeout_is_one_unit")]
+    #[test_case(120_000, "2m"      ; "minutes_only")]
+    #[test_case(5_000,   "5s"      ; "seconds_only")]
+    #[test_case(1_500,   "1s500ms" ; "a_tail_keeps_its_millis")]
+    #[test_case(250,     "250ms"   ; "under_a_second_stays_millis")]
+    fn humanize_duration_cases(millis: u64, expected: &str) {
+        assert_eq!(humanize_duration(Duration::from_millis(millis)), expected);
     }
 
     #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]

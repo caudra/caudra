@@ -447,6 +447,7 @@ pub fn style_by_name(name: &str) -> Style {
         "tool" => t.tool,
         "tool_prefix" => t.tool_prefix,
         "tool_success" => t.tool_success,
+        "tool_warning" => t.tool_warning,
         "tool_error" => t.tool_error,
         "tool_annotation" => t.tool_annotation,
         "spinner" => t.spinner,
@@ -502,6 +503,8 @@ pub struct Theme {
     pub tool_annotation: Style,
     pub tool_prefix: Style,
     pub tool_success: Style,
+    /// A call that worked and answered with nothing.
+    pub tool_warning: Style,
     pub tool_error: Style,
     pub tool_dim: Style,
     pub error: Style,
@@ -969,6 +972,13 @@ impl Theme {
             tool_annotation: style("tool_annotation"),
             tool_prefix: style("tool_prefix"),
             tool_success: style("tool_success"),
+            // Every bundled theme already names a yellow for a todo in
+            // flight, and a warning is the same signal, so a theme only has
+            // to say anything here to disagree.
+            tool_warning: ui
+                .get("tool_warning")
+                .map(|d| ensure_contrast(resolve_style(d, &palette), background, MIN_CONTRAST_TEXT))
+                .unwrap_or_else(|| style("todo_in_progress")),
             tool_error: style("tool_error"),
             tool_dim: style("tool_dim"),
             error: style("error"),
@@ -1566,6 +1576,38 @@ mod tests {
                 ratio >= MIN_CONTRAST_TEXT,
                 "{name}: {role} contrast {ratio:.2} is below {MIN_CONTRAST_TEXT:.1}",
             );
+        }
+    }
+
+    const OUTCOME_MSG: &str = "an outcome colour that repeats another says nothing";
+
+    /// No theme defines `tool_warning`, so all of them reach it through the
+    /// yellow they already name for a todo in flight. That only works if the
+    /// yellow is actually apart from the other two outcomes, which is not
+    /// true by construction: `zenburn` greens its success with `yellow_green`
+    /// and `dark_daltonized` drops red altogether.
+    #[test]
+    fn every_theme_tells_its_three_outcomes_apart() {
+        for entry in BUNDLED_THEMES {
+            let theme = bundled(entry.name);
+            let outcomes = [
+                ("tool_success", theme.tool_success),
+                ("tool_warning", theme.tool_warning),
+                ("tool_error", theme.tool_error),
+            ];
+            for (i, (role, style)) in outcomes.iter().enumerate() {
+                let fg = style
+                    .fg
+                    .unwrap_or_else(|| panic!("{}: {role} must set fg", entry.name));
+                for (other_role, other) in &outcomes[i + 1..] {
+                    assert_ne!(
+                        fg,
+                        other.fg.unwrap(),
+                        "{}: {role} and {other_role} are the same colour. {OUTCOME_MSG}",
+                        entry.name,
+                    );
+                }
+            }
         }
     }
 

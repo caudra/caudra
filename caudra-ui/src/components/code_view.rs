@@ -5,7 +5,7 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
-use super::tool_display::{compact_args_for, compact_sigil_label, header_spans};
+use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -24,9 +24,6 @@ const BATCH_CHILD_INDENT: &str = "  ";
 const ANSWER_MARK: &str = "  \u{2713} ";
 const ANSWER_INDENT: &str = "    ";
 const NO_ANSWER: &str = "(no answer)";
-const BATCH_PENDING_MARKER: &str = "\u{25cb} ";
-const BATCH_RUNNING_MARKER: &str = "\u{b7} ";
-const BATCH_DONE_MARKER: &str = "\u{25cf} ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
@@ -417,9 +414,12 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
     lines
 }
 
-/// A batch reads as a list of what it ran. Each child gets the indicator and
-/// `tool> summary` line the transcript would show it with, then its own body
-/// indented under it, so a child looks the same here as it does standalone.
+/// A batch reads as a list of what it ran. Each child gets the one-line form
+/// the transcript would show it with, then its own body indented under it, so
+/// a child looks the same here as it does standalone: its sigil opens the row
+/// and carries the outcome in its color, exactly as a compact row's does. A
+/// status dot in front of that would only say a second time what the sigil's
+/// color and the label's tense already say.
 ///
 /// Spacing follows the transcript's own rule: a row that carries nothing but
 /// itself is a list entry and stacks flush against its neighbours, while one
@@ -427,10 +427,10 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
 ///
 /// The transcript separates a row that merely wraps, which this cannot: these
 /// are logical lines and the wrapping happens downstream, at a width no one
-/// here knows. It reads as the list anyway, because every child opens in the
-/// marker column and a continuation line does not, which is the distinction
-/// the blank row was buying. Threading a width in would also put the gaps back
-/// exactly where they are worst, since a long search header is what wraps.
+/// here knows. It reads as the list anyway, because every child opens on its
+/// sigil and a continuation line does not, which is the distinction the blank
+/// row was buying. Threading a width in would also put the gaps back exactly
+/// where they are worst, since a long search header is what wraps.
 fn render_batch(
     entries: &[BatchToolEntry],
     highlight: bool,
@@ -451,16 +451,13 @@ fn render_batch(
             rows.push(None);
         }
         previous_has_body = has_body;
-        let (marker, style) = match entry.status {
-            BatchToolStatus::Pending => (BATCH_PENDING_MARKER, t.tool_dim),
-            BatchToolStatus::Running => (BATCH_RUNNING_MARKER, t.spinner),
-            BatchToolStatus::Success => (BATCH_DONE_MARKER, t.tool_success),
-            BatchToolStatus::Error => (BATCH_DONE_MARKER, t.tool_error),
-        };
         let (sigil, label) = compact_sigil_label(&entry.tool, entry.status.into());
         let mut spans = vec![
-            Span::styled(marker, style),
-            Span::styled(format!("{sigil} {label} "), t.tool_prefix),
+            Span::styled(
+                format!("{sigil} "),
+                batch_sigil_style(entry.status, entry.output.as_ref()),
+            ),
+            Span::styled(format!("{label} "), t.tool_prefix),
         ];
         spans.extend(header_spans(
             &entry.tool,
@@ -1900,6 +1897,11 @@ mod tests {
         line_text(&render_batch(&[entry], false, &limits).0[0])
     }
 
+    fn child_sigil(entry: BatchToolEntry) -> Span<'static> {
+        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::default());
+        render_batch(&[entry], false, &limits).0[0].spans[0].clone()
+    }
+
     /// The reported bug: a finished grep named no matches. `batch` copies only
     /// the dispatch's annotation, which grep never sets, so the row that
     /// answers how much matched was blank on the one tool whose entire result
@@ -1945,18 +1947,89 @@ mod tests {
     fn a_child_row_names_its_tool_like_a_compact_row(tool: &str, expected: &str) {
         let row = child_row(batch_entry(tool, 0));
         assert!(
-            row.starts_with(&format!("{BATCH_DONE_MARKER}{expected} ")),
+            row.starts_with(&format!("{expected} ")),
             "{CHILD_LABEL_MSG}: {row:?}"
         );
     }
 
+    const SIGIL_MSG: &str = "a child opens on its sigil, which is what carries the outcome";
+
+    /// The row used to lead with a status dot and then repeat the outcome in
+    /// the sigil that followed it, which a standalone compact row has never
+    /// done. Pending and running are still told apart from a finished call
+    /// without it, by the tense of the label beside the sigil.
+    #[test_case(BatchToolStatus::Pending, "$ Run"     ; "pending")]
+    #[test_case(BatchToolStatus::Running, "$ Running" ; "running")]
+    #[test_case(BatchToolStatus::Success, "$ Ran"     ; "success")]
+    #[test_case(BatchToolStatus::Error,   "$ Run"     ; "error")]
+    fn a_child_row_leads_with_its_sigil(status: BatchToolStatus, expected: &str) {
+        let row = child_row(BatchToolEntry {
+            status,
+            ..batch_entry(SHELL_CHILD, 0)
+        });
+        assert!(row.starts_with(expected), "{SIGIL_MSG}: {row:?}");
+    }
+
+    fn shell_child(status: BatchToolStatus) -> BatchToolEntry {
+        BatchToolEntry {
+            status,
+            ..batch_entry(SHELL_CHILD, 0)
+        }
+    }
+
+    /// Colour is the only thing left saying how a child went, so every state
+    /// has to reach the row with one of its own.
+    #[test]
+    fn every_child_state_paints_its_sigil_apart() {
+        let styles = [
+            BatchToolStatus::Pending,
+            BatchToolStatus::Running,
+            BatchToolStatus::Success,
+            BatchToolStatus::Error,
+        ]
+        .map(|status| child_sigil(shell_child(status)).style);
+
+        for (i, style) in styles.iter().enumerate() {
+            for other in &styles[i + 1..] {
+                assert_ne!(style, other, "{SIGIL_MSG}");
+            }
+        }
+    }
+
+    /// The same rule a standalone row runs, reached through the child's own
+    /// structured output rather than through its status, which says only that
+    /// the search completed.
+    #[test]
+    fn a_child_that_found_nothing_is_not_painted_as_a_hit() {
+        let found_nothing = child_sigil(BatchToolEntry {
+            status: BatchToolStatus::Success,
+            output: Some(ToolOutput::GrepResult {
+                entries: Vec::new(),
+                capped: None,
+            }),
+            ..batch_entry(GREP_CHILD, 0)
+        });
+        let found_something = child_sigil(BatchToolEntry {
+            status: BatchToolStatus::Success,
+            output: Some(ToolOutput::GrepResult {
+                entries: grep_entries(&[("a.rs", &[1_usize])]),
+                capped: None,
+            }),
+            ..batch_entry(GREP_CHILD, 0)
+        });
+
+        assert_ne!(found_nothing.style, found_something.style, "{SIGIL_MSG}");
+    }
+
     const CHILD_TIMEOUT: u32 = 120_000;
+    const CHILD_TIMEOUT_SHOWN: &str = "timeout=2m";
     const COMMAND_KEY: &str = "command=";
     const CHILD_ARGS_MSG: &str = "a child's brackets carry what its own header does not show";
 
     /// The same filter a standalone row uses, reached through the same table,
     /// so a child cannot print the command it has already drawn. The timeout
-    /// is there to prove the brackets are still drawn at all.
+    /// is there to prove the brackets are still drawn at all, and that a child
+    /// reaches the same table a standalone row does to read its unit.
     #[test]
     fn a_child_row_never_repeats_its_header_in_brackets() {
         let mut entry = batch_entry(SHELL_WIRE_CHILD, 0);
@@ -1969,7 +2042,7 @@ mod tests {
         let row = child_row(entry);
         assert!(!row.contains(COMMAND_KEY), "{CHILD_ARGS_MSG}: {row:?}");
         assert!(
-            row.contains(&format!("timeout={CHILD_TIMEOUT}")),
+            row.contains(CHILD_TIMEOUT_SHOWN),
             "{CHILD_ARGS_MSG}: {row:?}"
         );
     }
