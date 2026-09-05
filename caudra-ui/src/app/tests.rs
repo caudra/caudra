@@ -10321,6 +10321,8 @@ const SUSPEND_TRAPPED: &str =
     "Ctrl+Z must reach the workbench as undo instead of backgrounding the process";
 const QUIT_REACHABLE: &str =
     "Ctrl+C without a selection must still reach quit, or the workbench traps the session";
+const WHEEL_MISROUTED: &str =
+    "the wheel must reach the open workbench, not the transcript behind it";
 
 fn alt(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::ALT)
@@ -10373,6 +10375,24 @@ fn ctrl_z_suspends_only_while_the_workbench_is_closed() {
         "{SUSPEND_TRAPPED}"
     );
     assert!(app.workbench.is_open(), "{SUSPEND_TRAPPED}");
+}
+
+/// The wheel is aggregated into `Msg::Scroll` before `handle_mouse` runs, so
+/// the workbench needs its own branch there. Without it the transcript scrolled
+/// under an open workbench and none of its panes moved.
+#[test]
+fn the_wheel_reaches_an_open_workbench_rather_than_the_transcript() {
+    let mut app = open_workbench();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.active_chat().enable_auto_scroll();
+
+    app.update(Msg::Scroll {
+        column: 10,
+        row: 10,
+        delta: 3,
+    });
+
+    assert!(app.chats[0].auto_scroll(), "{WHEEL_MISROUTED}");
 }
 
 #[test]

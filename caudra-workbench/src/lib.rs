@@ -480,6 +480,16 @@ impl Workbench {
             }
             _ => return WorkbenchAction::Passthrough,
         };
+        self.scroll(event.column, event.row, delta);
+        WorkbenchAction::Consumed
+    }
+
+    /// A wheel turn over `(column, row)`, worth `delta` rows and negative
+    /// upwards. The host coalesces a burst of notches and scales them by the
+    /// configured scroll size, so this is its own entry point rather than a
+    /// [`MouseEvent`] the caller has to build.
+    pub fn scroll(&mut self, column: u16, row: u16, delta: isize) {
+        let at = (column, row);
         if self.sidebar == SidebarView::SourceControl
             && self
                 .panes
@@ -508,7 +518,6 @@ impl Workbench {
                 tab.scroll_by(delta, rows);
             }
         }
-        WorkbenchAction::Consumed
     }
 
     /// A left press, told how many landed on this cell in a row. The panes are

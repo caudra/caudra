@@ -433,6 +433,13 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
+        // runs, so the workbench has to be offered it here as well or its panes
+        // never see a wheel at all. Its rows count downwards.
+        if self.workbench.is_open() {
+            self.workbench.scroll(column, row, -delta as isize);
+            return;
+        }
         if self.paste_editor.is_open() {
             self.paste_editor.scroll(delta);
             return;
