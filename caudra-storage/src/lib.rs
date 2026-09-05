@@ -22,6 +22,7 @@ pub mod tool_outputs;
 pub mod usage_ledger;
 pub mod version;
 pub mod view;
+pub mod workbench;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

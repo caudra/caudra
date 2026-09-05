@@ -1,3 +1,4 @@
+use caudra_workbench::keys as wb;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt::Write;
 use strum::EnumIter;
@@ -236,6 +237,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+R",
     };
+    pub const WORKBENCH: Bind = Bind {
+        code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+E",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -256,6 +262,11 @@ pub enum KeybindContext {
     FilePicker,
     StashPicker,
     SessionPicker,
+    Workbench,
+    WorkbenchExplorer,
+    WorkbenchEditor,
+    WorkbenchSourceControl,
+    WorkbenchSearch,
 }
 
 impl KeybindContext {
@@ -277,6 +288,11 @@ impl KeybindContext {
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
             Self::SessionPicker => "Session Picker",
+            Self::Workbench => "Workbench",
+            Self::WorkbenchExplorer => "Workbench Explorer",
+            Self::WorkbenchEditor => "Workbench Editor",
+            Self::WorkbenchSourceControl => "Workbench Source Control",
+            Self::WorkbenchSearch => "Workbench Search",
         }
     }
 
@@ -291,6 +307,10 @@ impl KeybindContext {
             | Self::FilePicker
             | Self::StashPicker
             | Self::SessionPicker => Some(Self::Picker),
+            Self::WorkbenchExplorer
+            | Self::WorkbenchEditor
+            | Self::WorkbenchSourceControl
+            | Self::WorkbenchSearch => Some(Self::Workbench),
             _ => None,
         }
     }
@@ -832,6 +852,178 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete stash entry (press twice)",
         context: KeybindContext::StashPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::WORKBENCH.label),
+        description: "Open the workbench",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::CLOSE.label, key::WORKBENCH.label),
+        description: "Back to the transcript",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_SIDEBAR.label),
+        description: "Show or hide the sidebar",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::SHRINK_SIDEBAR.label, wb::GROW_SIDEBAR.label),
+        description: "Narrow / widen the sidebar",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&[
+            wb::VIEW_EXPLORER.label,
+            wb::VIEW_SOURCE_CONTROL.label,
+            wb::VIEW_SEARCH.label,
+        ]),
+        description: "Explorer / source control / search",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::FOCUS_NEXT.label, wb::FOCUS_PREV.label),
+        description: "Leave the sidebar for the editor",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::QUICK_OPEN.label),
+        description: "Open a file by name",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::REFRESH.label),
+        description: "Reread the tree and the repository",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::SEND_TO_COMPOSER.label),
+        description: "Send the file or selection to the composer",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_HIDDEN.label),
+        description: "Show hidden and ignored files",
+        context: KeybindContext::WorkbenchExplorer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::SAVE.label),
+        description: "Save the active file",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::REVERT.label),
+        description: "Discard edits and take what is on disk",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
+        description: "Undo / redo",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::FIND.label, wb::GOTO_LINE.label),
+        description: "Find in file / go to line",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&[wb::COPY.label, wb::CUT.label, wb::PASTE.label]),
+        description: "Copy / cut / paste",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::SELECT_ALL.label),
+        description: "Select the whole buffer",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::KILL_LINE.label),
+        description: "Delete to the end of the line",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::PREV_TAB.label, wb::NEXT_TAB.label),
+        description: "Previous / next tab",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CLOSE_TAB.label),
+        description: "Close the active tab",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::STAGE_TOGGLE.label),
+        description: "Stage or unstage the selected file",
+        context: KeybindContext::WorkbenchSourceControl,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::OPEN_DIFF.label),
+        description: "Open the diff for the selected file",
+        context: KeybindContext::WorkbenchSourceControl,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::DISCARD.label),
+        description: "Discard changes (press twice)",
+        context: KeybindContext::WorkbenchSourceControl,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_LOG.label),
+        description: "Switch between changes and the commit log",
+        context: KeybindContext::WorkbenchSourceControl,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Run the search, then open the file at the match",
+        context: KeybindContext::WorkbenchSearch,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::NEXT_FIELD.label),
+        description: "Move between the query and the file globs",
+        context: KeybindContext::WorkbenchSearch,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_CASE.label),
+        description: "Match case",
+        context: KeybindContext::WorkbenchSearch,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_WORD.label),
+        description: "Match whole words",
+        context: KeybindContext::WorkbenchSearch,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_REGEX.label),
+        description: "Read the query as a regular expression",
+        context: KeybindContext::WorkbenchSearch,
         platform: Platform::All,
     },
 ];

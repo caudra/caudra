@@ -214,6 +214,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Reload plugins and config",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/workbench",
+        description: "Open the file explorer, editor and source control view",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

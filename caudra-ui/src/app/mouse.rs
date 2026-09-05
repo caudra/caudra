@@ -21,6 +21,11 @@ const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
+        if self.workbench.is_open() {
+            self.clear_control_hovers();
+            let action = self.workbench.handle_mouse(event);
+            return self.handle_workbench_action(action);
+        }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
             if event.kind == MouseEventKind::Down(MouseButton::Left) {

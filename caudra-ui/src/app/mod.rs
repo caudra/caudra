@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use caudra_workbench::{Layout as WorkbenchLayout, Workbench, WorkbenchAction};
+
 use crate::AppSession;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
@@ -62,6 +64,7 @@ use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
+use crate::components::workbench::styles as workbench_styles;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
     is_ctrl,
@@ -283,6 +286,11 @@ pub struct App {
     pub(super) stash_picker: StashPicker,
     pub(super) plan_form: PlanForm,
     pub(super) todo_panel: TodoPanel,
+    pub(crate) workbench: Workbench,
+    pub(super) workbench_theme_gen: u64,
+    /// The layout last read or written, so a tick only reaches storage when
+    /// something actually moved. `None` until the workbench first opens.
+    pub(super) workbench_layout: Option<WorkbenchLayout>,
     pub(super) status_bar: StatusBar,
     pub(super) status_hits: Vec<StatusBarHit>,
     pub(super) status_mouse_down: Option<StatusBarHit>,
@@ -439,6 +447,9 @@ impl App {
             stash_picker: StashPicker::new(),
             plan_form: PlanForm::new(),
             todo_panel: TodoPanel::default(),
+            workbench: Workbench::new(workbench_styles()),
+            workbench_theme_gen: crate::theme::generation(),
+            workbench_layout: None,
             status_bar: StatusBar::new(flash),
             status_hits: Vec::new(),
             status_mouse_down: None,
@@ -739,6 +750,9 @@ impl App {
             Msg::Paste(text) => {
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if self.workbench.is_open() && self.workbench.paste(&text) {
+                    return vec![];
+                }
                 if self.paste_editor.handle_paste(&text) {
                     return vec![];
                 }
@@ -966,6 +980,9 @@ impl App {
         if key::VIEW_TOGGLE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::ViewToggle));
         }
+        if key::WORKBENCH.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::Workbench));
+        }
         if self.scroll_transcript(key) {
             return Some(vec![]);
         }
@@ -1000,6 +1017,18 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.workbench.is_open() {
+            // `Alt+E` toggles from either side, so it never reaches the
+            // workbench's own keymap.
+            if key::WORKBENCH.matches(key) {
+                self.workbench.close();
+                return Some(vec![]);
+            }
+            match self.workbench.handle_key(key) {
+                WorkbenchAction::Passthrough => {}
+                action => return Some(self.handle_workbench_action(action)),
+            }
+        }
         if self.paste_editor.is_open() {
             match self.paste_editor.handle_key(key) {
                 PasteEditorAction::Consumed => {}
@@ -1292,6 +1321,31 @@ impl App {
                     chat.restore_scroll(top, auto);
                 }
                 self.search_modal.close();
+            }
+        }
+        Vec::new()
+    }
+
+    fn handle_workbench_action(&mut self, action: WorkbenchAction) -> Vec<Action> {
+        match action {
+            WorkbenchAction::Consumed | WorkbenchAction::Passthrough => {}
+            WorkbenchAction::Close => self.workbench.close(),
+            WorkbenchAction::Flash(message) => self.status_bar.flash(message),
+            WorkbenchAction::Copy(text) => {
+                let message = match self.clipboard.copy_text(&text) {
+                    Ok(CopyResult::Noop) => "Nothing to copy".to_owned(),
+                    Ok(CopyResult::Copied) => "Copied".to_owned(),
+                    Err(e) => format!("Copy failed: {e}"),
+                };
+                self.status_bar.flash(message);
+            }
+            WorkbenchAction::SendToComposer(text) => {
+                self.workbench.close();
+                if let InputAction::PaletteSync(val) =
+                    self.input_box.handle_paste_with_spaces(&text)
+                {
+                    self.command_palette.sync(&val);
+                }
             }
         }
         Vec::new()
@@ -1641,8 +1695,37 @@ impl App {
             BuiltinAction::StashPush => return self.stash_push(),
             BuiltinAction::StashPop => return self.stash_pop(),
             BuiltinAction::StashList => return self.stash_list(),
+            BuiltinAction::Workbench => {
+                self.sync_workbench_theme();
+                self.toggle_workbench();
+            }
         }
         vec![]
+    }
+
+    /// The stored layout is read once per run: a reader who closed every tab
+    /// and came back does not want them all opened again.
+    fn toggle_workbench(&mut self) {
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        let opening = !self.workbench.is_open();
+        self.workbench.toggle(&cwd);
+        if !opening || self.workbench_layout.is_some() {
+            return;
+        }
+        let layout: WorkbenchLayout =
+            caudra_storage::workbench::read(&self.storage, &cwd).unwrap_or_default();
+        self.workbench.restore(layout.clone());
+        self.workbench_layout = Some(layout);
+    }
+
+    /// The workbench paints from a palette resolved once, so a theme change
+    /// while it is open has to be handed over rather than read mid render.
+    fn sync_workbench_theme(&mut self) {
+        let generation = crate::theme::generation();
+        if self.workbench_theme_gen != generation {
+            self.workbench_theme_gen = generation;
+            self.workbench.set_styles(workbench_styles());
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1653,7 +1736,10 @@ impl App {
             self.last_exit = None;
         }
 
-        if key::SUSPEND.matches(key) && cfg!(unix) {
+        // Suspend is checked ahead of the overlays so a wedged UI can always be
+        // backgrounded. The workbench is the one overlay that has to win it:
+        // Ctrl+Z there is undo, and losing an edit to SIGTSTP is unrecoverable.
+        if key::SUSPEND.matches(key) && cfg!(unix) && !self.workbench.is_open() {
             return vec![Action::Suspend];
         }
 
@@ -2817,6 +2903,7 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            "/workbench" => self.run_builtin(BuiltinAction::Workbench),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -3017,8 +3104,9 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 24] {
+    fn overlays(&self) -> [&dyn Overlay; 25] {
         [
+            &self.workbench,
             &self.help_modal,
             &self.usage_modal,
             &self.goal_modal,
@@ -3046,8 +3134,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 24] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 25] {
         [
+            &mut self.workbench,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.goal_modal,
@@ -3201,7 +3290,34 @@ impl App {
             | self.tick_file_picker()
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
+            | self.tick_workbench()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_workbench(&mut self) -> Dirty {
+        if !self.workbench.is_open() {
+            return Dirty::NO;
+        }
+        self.sync_workbench_theme();
+        let (dirty, flash) = self.workbench.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        self.persist_workbench_layout();
+        Dirty::from(dirty)
+    }
+
+    /// A layout moves when a tab opens or a pane resizes, which is rare enough
+    /// to write on the change itself rather than on a timer or on each of the
+    /// several ways an overlay can leave the screen.
+    fn persist_workbench_layout(&mut self) {
+        let layout = self.workbench.layout();
+        if self.workbench_layout.as_ref() == Some(&layout) {
+            return;
+        }
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        caudra_storage::workbench::persist(&self.storage, &cwd, &layout);
+        self.workbench_layout = Some(layout);
     }
 
     fn tick_permission_config_trust(&mut self) -> Dirty {

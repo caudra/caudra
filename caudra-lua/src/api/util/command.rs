@@ -478,6 +478,7 @@ pub enum BuiltinAction {
     StashPush,
     StashPop,
     StashList,
+    Workbench,
 }
 
 pub enum UiAction {

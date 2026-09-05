@@ -29,6 +29,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/skills/"><span class="card-title">Skills</span><span class="card-desc">Write Markdown playbooks the agent loads on demand.</span></a>
     <a class="card" href="/docs/sessions/"><span class="card-title">Sessions</span><span class="card-desc">Fork conversation points and restore chat or workspace state.</span></a>
     <a class="card" href="/docs/review/"><span class="card-title">Review</span><span class="card-desc">Mark passages of a reply and send notes on them back.</span></a>
+    <a class="card" href="/docs/workbench/"><span class="card-title">Workbench</span><span class="card-desc">File explorer, editor, source control, and search beside the transcript.</span></a>
     <a class="card" href="/docs/system-prompts/"><span class="card-title">System Prompts</span><span class="card-desc">Create named prompt profiles without copying Caudra's dynamic prompt.</span></a>
     <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them.</span></a>
     <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>

@@ -44,6 +44,7 @@ Type `/` in the input box to open the command palette.
 | `/workflow` | Toggle workflow context for custom Lua tools |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
+| `/workbench` | Open the file explorer, editor and source control view |
 
 ## Sessions
 

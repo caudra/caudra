@@ -118,7 +118,10 @@ impl Highlighter {
         }
     }
 
-    fn from_state(
+    /// Resumes mid-file from a state captured earlier. Syntect's parse state is
+    /// a running fold over the lines before it, so this is the only way to
+    /// highlight line N without walking 0..N again.
+    pub fn from_state(
         theme: Arc<Theme>,
         highlight_state: HighlightState,
         parse_state: ParseState,
@@ -168,6 +171,12 @@ impl Highlighter {
 
     pub fn state(self) -> (HighlightState, ParseState) {
         (self.highlight_state, self.parse_state)
+    }
+
+    /// [`Self::state`] without giving up the highlighter, for a caller laying
+    /// down checkpoints as it walks a file it is still walking.
+    pub fn snapshot(&self) -> (HighlightState, ParseState) {
+        (self.highlight_state.clone(), self.parse_state.clone())
     }
 }
 

@@ -16,6 +16,7 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::Streaming,
     KeybindContext::FormInput,
     KeybindContext::Picker,
+    KeybindContext::Workbench,
 ];
 
 fn label_str(label: KeyLabel) -> String {

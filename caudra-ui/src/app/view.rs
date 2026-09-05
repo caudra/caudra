@@ -11,6 +11,8 @@ use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use caudra_lua::Split;
+#[cfg(test)]
+use caudra_workbench::{Focus, SidebarView};
 use caudra_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
@@ -42,6 +44,10 @@ impl App {
         self.sync_subagent_input_target();
         self.queue_hits.clear();
         self.admission_hits.clear();
+        if self.workbench.is_open() {
+            self.render_workbench(frame);
+            return;
+        }
         let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
 
@@ -54,6 +60,20 @@ impl App {
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
+    }
+
+    /// The workbench replaces the transcript outright. Caudra's own status bar
+    /// stays, so the model and the token budget never leave the screen, and
+    /// there are no message zones behind it to register or select.
+    fn render_workbench(&mut self, frame: &mut Frame) {
+        let render_chat = self.active_chat;
+        let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+            .areas(main_content_area(frame.area()));
+        self.zones = ZoneRegistry::new();
+        self.zones.push_overlay(frame.area());
+        self.render_background(frame);
+        self.workbench.view(frame, body);
+        self.render_status_bar(frame, status, render_chat);
     }
 
     pub(crate) fn apply_terminal_links(&self, buffer: &mut Buffer) {
@@ -585,7 +605,17 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.paste_editor.is_open() {
+        if self.workbench.is_open() {
+            contexts.push(KeybindContext::Workbench);
+            contexts.push(match self.workbench.sidebar_view() {
+                SidebarView::Explorer => KeybindContext::WorkbenchExplorer,
+                SidebarView::SourceControl => KeybindContext::WorkbenchSourceControl,
+                SidebarView::Search => KeybindContext::WorkbenchSearch,
+            });
+            if self.workbench.focus() == Focus::Editor {
+                contexts.push(KeybindContext::WorkbenchEditor);
+            }
+        } else if self.paste_editor.is_open() {
             contexts.push(KeybindContext::PasteEditor);
         } else if self.review.is_open() {
             contexts.push(KeybindContext::Review);

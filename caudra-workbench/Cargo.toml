@@ -1,0 +1,33 @@
+[package]
+name = "caudra-workbench"
+description = "File explorer, editor, source control, and search workbench for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-highlight = { workspace = true }
+crossterm = { workspace = true }
+flume = { workspace = true }
+gix = { workspace = true }
+globset = { workspace = true }
+grep-matcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
+ignore = { workspace = true }
+memchr = { workspace = true }
+notify = { workspace = true }
+nucleo = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+similar = { workspace = true }
+syntect = { workspace = true }
+thiserror = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }

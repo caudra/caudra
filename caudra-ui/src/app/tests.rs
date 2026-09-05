@@ -10189,3 +10189,90 @@ fn restoring_is_refused_while_a_queued_prompt_is_being_edited() {
     assert_eq!(app.input_box.buffer.value(), "queued");
     assert_eq!(stash_entries(&app).len(), 1);
 }
+
+const WORKBENCH_OPENS: &str = "Alt+E must put the workbench on screen";
+const WORKBENCH_CLOSES: &str = "Alt+E must hand the screen back to the transcript";
+const SUSPEND_TRAPPED: &str =
+    "Ctrl+Z must reach the workbench as undo instead of backgrounding the process";
+const QUIT_REACHABLE: &str =
+    "Ctrl+C without a selection must still reach quit, or the workbench traps the session";
+
+fn alt(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::ALT)
+}
+
+fn open_workbench() -> App {
+    let mut app = test_app();
+    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    app
+}
+
+#[test]
+fn alt_e_toggles_the_workbench() {
+    let mut app = test_app();
+    assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
+
+    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    assert!(app.workbench.is_open(), "{WORKBENCH_OPENS}");
+
+    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
+}
+
+#[test]
+fn the_workbench_command_opens_the_same_view() {
+    let mut app = test_app();
+    app.execute_command(cmd("/workbench"), 0);
+    assert!(app.workbench.is_open(), "{WORKBENCH_OPENS}");
+}
+
+#[test]
+fn esc_leaves_the_workbench() {
+    let mut app = open_workbench();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
+}
+
+#[test]
+fn ctrl_z_suspends_only_while_the_workbench_is_closed() {
+    let mut app = test_app();
+    let suspend = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert!(
+        matches!(app.update(Msg::Key(suspend)).as_slice(), [Action::Suspend]),
+        "a closed workbench must leave suspend alone"
+    );
+
+    let mut app = open_workbench();
+    assert!(
+        app.update(Msg::Key(suspend)).is_empty(),
+        "{SUSPEND_TRAPPED}"
+    );
+    assert!(app.workbench.is_open(), "{SUSPEND_TRAPPED}");
+}
+
+#[test]
+fn ctrl_c_is_not_swallowed_by_an_open_workbench() {
+    let mut app = open_workbench();
+    let actions = app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::ManualExit)),
+        "{QUIT_REACHABLE}"
+    );
+}
+
+#[test]
+fn the_workbench_reports_its_own_keybind_contexts() {
+    let app = open_workbench();
+    let contexts = app.active_keybind_contexts();
+    assert!(
+        contexts.contains(&KeybindContext::Workbench),
+        "the help modal must show the workbench keymap while it is open"
+    );
+    assert!(
+        !contexts.contains(&KeybindContext::Editing),
+        "the composer keymap must not be offered while the composer is hidden"
+    );
+}

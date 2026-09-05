@@ -282,7 +282,7 @@ fn set_window_title(
 /// `"help"`, `"plan_toggle"`, `"plan_editor"`, `"edit_input"`,
 /// `"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
 /// `"copy_message"`, `"review"`, `"view_toggle"`, `"stash_push"`,
-/// `"stash_pop"`, `"stash_list"`.
+/// `"stash_pop"`, `"stash_list"`, `"workbench"`.
 ///
 /// For slash commands rather than keybound actions, see
 /// `caudra.api.run_command`.

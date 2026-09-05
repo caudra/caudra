@@ -64,6 +64,7 @@ members = [
   "caudra-config-macro",
   "caudra-lua-macro",
   "caudra-ui",
+  "caudra-workbench",
   "caudra-workcell",
 ]
 resolver = "3"
@@ -92,6 +93,7 @@ caudra-lua-macro = { path = "caudra-lua-macro" }
 caudra-highlight = { path = "caudra-highlight" }
 caudra-markdown = { path = "caudra-markdown" }
 caudra-otel = { path = "caudra-otel" }
+caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "caf27561d016ed7e1bb73b893171384f9dd35060", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "environment"] }
 serde = { version = "1", features = ["derive", "rc"] }
@@ -121,7 +123,16 @@ htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson", "hybrid", "unicode-perl", "unicode-word-boundary"] }
+gix = { version = "0.87", default-features = false, features = [
+    "sha1",
+    "status",
+    "index",
+    "revision",
+    "blob-diff",
+    "max-performance-safe",
+] }
 globset = "0.4"
+grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }

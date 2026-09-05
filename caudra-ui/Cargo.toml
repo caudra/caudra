@@ -14,6 +14,7 @@ caudra-markdown = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workbench = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 color-eyre = { workspace = true }
