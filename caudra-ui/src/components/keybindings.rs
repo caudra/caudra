@@ -974,13 +974,13 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(wb::STAGE_TOGGLE.label),
-        description: "Stage or unstage the selected file",
+        description: "Stage or unstage the file, folder, or whole section",
         context: KeybindContext::WorkbenchSourceControl,
         platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::OPEN_DIFF.label),
-        description: "Open the diff for the selected file",
+        description: "Open the diff, or the commit under the cursor",
         context: KeybindContext::WorkbenchSourceControl,
         platform: Platform::All,
     },
@@ -991,8 +991,14 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(wb::TOGGLE_LOG.label),
-        description: "Switch between changes and the commit log",
+        label: KeyLabel::Single(wb::TOGGLE_TREE.label),
+        description: "Switch the change sections between tree and flat",
+        context: KeybindContext::WorkbenchSourceControl,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::SHRINK_SECTION.label, wb::GROW_SECTION.label),
+        description: "Shrink / grow the section the cursor is in",
         context: KeybindContext::WorkbenchSourceControl,
         platform: Platform::All,
     },

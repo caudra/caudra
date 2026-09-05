@@ -43,7 +43,10 @@ The workbench takes the mouse the way an IDE does.
 | Click the `×` on a tab | Close it |
 | Middle-click a tab | Close it |
 | Click `FILES`, `GIT`, or `FIND` | Switch the sidebar view |
+| Click `TREE` or `FLAT` | Switch how source control lists paths |
 | Click `Aa`, `ab`, or `.*` | Turn that search toggle on or off |
+| Click a source control header | Fold or unfold that section |
+| Drag a source control header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
 
@@ -81,16 +84,42 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 
 ## Source control
 
-`Alt+2` lists staged and unstaged changes, with the current branch in the sidebar header.
+`Alt+2` shows three stacked sections, with the current branch in the sidebar header.
+
+```
+┌─────────────────┐
+│ FILES GIT FIND  │
+│ ▾ STAGED CHANGES│
+│   a.txt       M │
+│ ▾ CHANGES     3 │
+│   src/          │
+│     one.rs    M │
+│     two.rs    U │
+│ ▾ GRAPH         │
+│ ● 4f2a1c fix …  │
+│ ◉ 91be07 merge  │
+│ │○ 0cd334 wip   │
+└─────────────────┘
+```
+
+Each header carries a chevron, a title, and how many rows the section holds. `Space` on a header stages or unstages every path the section lists, so one press empties `CHANGES` into `STAGED CHANGES`.
+
+Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Alt+Up` and `Alt+Down` do the same from the keyboard.
+
+The two change sections nest paths as folders. A folder with one child is joined onto its parent, so `src/main/rust` is one row rather than three. `T` switches both sections to flat full paths, and the `TREE` or `FLAT` label on the right of the sidebar header does the same with the mouse.
+
+Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first parents, `◉` for a merge, and `│○` for a commit a merge brought in. The rail is one lane wide, so it says where a commit sits against the first-parent chain rather than drawing every branch. `Enter` opens the whole commit as a read-only tab: the message, the author, and the diff against its first parent, up to 100 files.
 
 | Key | Action |
 |-----|--------|
-| `Space` | Stage or unstage the selected file |
-| `D` or `Enter` | Open the diff |
+| `Space` | Stage or unstage the file, the folder, or the whole section |
+| `D` or `Enter` | Open the diff, the commit, or fold what the cursor is on |
 | `X` | Discard changes, twice to confirm |
-| `L` | Switch between the change list and the commit log |
+| `T` | Switch the change sections between tree and flat |
+| `Left` / `Right` | Fold and unfold a folder or a section |
+| `Alt+Up` / `Alt+Down` | Resize the section the cursor is in |
 
-Diffs open as read-only tabs. Discarding is destructive and asks for a second press of the same key.
+Diffs and commits open as read-only tabs. Discarding is destructive, asks for a second press of the same key, and works on one file at a time even when the cursor is on a folder.
 
 Caudra reads and writes the repository directly with [gix](https://github.com/GitoxideLabs/gitoxide), so nothing here shells out to `git`. Staging works on whole files. Hunk-level staging, committing, and branch operations are not part of this view, so use the terminal or ask the agent.
 
@@ -125,7 +154,7 @@ This is the fastest way to say "look at this" without typing the path or the lin
 
 ## What is remembered
 
-Open tabs, the active tab, the sidebar view, its width, and whether hidden files are shown are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path.
+Open tabs, the active tab, the sidebar view, its width, whether hidden files are shown, and how the source control sections were sized and folded are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path.
 
 Two clones of the same repository keep separate layouts.
 

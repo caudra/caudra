@@ -151,10 +151,11 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Editor | `Ctrl+K` | Delete to the end of the line |
 | Workbench Editor | `Alt+Left` / `Alt+Right` | Previous / next tab |
 | Workbench Editor | `Alt+W` | Close the active tab |
-| Workbench Source Control | `Space` | Stage or unstage the selected file |
-| Workbench Source Control | `D` | Open the diff for the selected file |
+| Workbench Source Control | `Space` | Stage or unstage the file, folder, or whole section |
+| Workbench Source Control | `D` | Open the diff, or the commit under the cursor |
 | Workbench Source Control | `X` | Discard changes (press twice) |
-| Workbench Source Control | `L` | Switch between changes and the commit log |
+| Workbench Source Control | `T` | Switch the change sections between tree and flat |
+| Workbench Source Control | `Alt+Up` / `Alt+Down` | Shrink / grow the section the cursor is in |
 | Workbench Search | `Enter` | Run the search, then open the file at the match |
 | Workbench Search | `Alt+I` | Move between the query and the file globs |
 | Workbench Search | `Alt+C` | Match case |

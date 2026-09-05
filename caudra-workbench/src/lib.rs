@@ -20,6 +20,7 @@ mod view;
 
 pub use action::WorkbenchAction;
 pub use style::WorkbenchStyles;
+use unicode_width::UnicodeWidthStr;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ use fs::tree::Tree;
 use fs::watch::Watch;
 use pointer::Clicks;
 use quick_open::QuickOpen;
-use scm::Scm;
+use scm::{MIN_SECTION_ROWS, Scm, Section};
 use search::Search;
 use view::{TabHit, Toggle};
 
@@ -50,6 +51,11 @@ const SCROLL_LINES: isize = 3;
 /// How far one tick of a drag that has run off the buffer scrolls it.
 const EDGE_SCROLL_LINES: isize = 1;
 const SIDEBAR_STEP: i16 = 2;
+/// Every source control section keeps its title row, folded or not, so the
+/// pane never loses the handle that unfolds it again.
+const SECTION_HEADER_ROWS: u16 = 1;
+/// How far one press of the section resize keys moves a border.
+const SECTION_STEP: i16 = 1;
 const STAGED: &str = "index";
 const WORKING: &str = "worktree";
 
@@ -97,6 +103,25 @@ pub struct Layout {
     pub sidebar_width: u16,
     pub sidebar_collapsed: bool,
     pub show_hidden: bool,
+    pub scm: ScmLayout,
+}
+
+/// How the source control pane was arranged. The sections are a list rather
+/// than three named fields so that reading one written by a build that knew a
+/// different number of them keeps whatever it does name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScmLayout {
+    /// Whether the change sections list paths whole instead of nesting them.
+    pub flat: bool,
+    pub sections: Vec<SectionLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SectionLayout {
+    pub height: u16,
+    pub collapsed: bool,
 }
 
 /// Written by hand because a zero width is not a narrow sidebar, it is an
@@ -110,6 +135,27 @@ impl Default for Layout {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
             show_hidden: false,
+            scm: ScmLayout::default(),
+        }
+    }
+}
+
+/// Hand-written for the same reason [`Layout`]'s is: a derived zero height is
+/// an unset section rather than a flat one.
+impl Default for ScmLayout {
+    fn default() -> Self {
+        Self {
+            flat: false,
+            sections: vec![SectionLayout::default(); Section::COUNT],
+        }
+    }
+}
+
+impl Default for SectionLayout {
+    fn default() -> Self {
+        Self {
+            height: scm::DEFAULT_SECTION_ROWS,
+            collapsed: false,
         }
     }
 }
@@ -138,6 +184,17 @@ struct PaneRects {
     /// The search view's case, word and regex buttons, empty in every other
     /// view.
     toggles: Rect,
+    /// Where the source control sections landed, in stacking order. Empty in
+    /// every other view.
+    sections: [SectionRect; Section::COUNT],
+}
+
+/// One band of the source control pane. The header is always drawn; the body
+/// is empty when the section is folded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SectionRect {
+    header: Rect,
+    body: Rect,
 }
 
 /// What the held left button is doing, which the pointer cannot tell from
@@ -148,6 +205,9 @@ enum Drag {
     None,
     Separator,
     Text,
+    /// Resizing the border above this section's header, which doubles as the
+    /// section's own fold handle when the pointer never moves.
+    Section(usize),
 }
 
 pub struct Workbench {
@@ -179,6 +239,10 @@ pub struct Workbench {
     /// Where the last drag reached, which is what tells a text drag it has run
     /// off the top or the bottom of the buffer and should scroll.
     drag_at: (u16, u16),
+    /// Where the button went down, so releasing without having moved can be
+    /// told from finishing a drag. That is what lets one press on a section
+    /// header both fold it and resize it.
+    drag_from: (u16, u16),
     /// Consecutive presses on one cell, which is how a double click is told
     /// from two single ones.
     clicks: Clicks,
@@ -214,6 +278,7 @@ impl Workbench {
             touched: HashSet::new(),
             drag: Drag::None,
             drag_at: (0, 0),
+            drag_from: (0, 0),
             clicks: Clicks::default(),
             hover: None,
             clipboard: String::new(),
@@ -317,6 +382,7 @@ impl Workbench {
             }
             tabs.push(tab.path.clone());
         }
+        let (flat, sections) = self.scm.saved();
         Layout {
             tabs,
             active,
@@ -324,6 +390,13 @@ impl Workbench {
             sidebar_width: self.sidebar_width,
             sidebar_collapsed: self.sidebar_collapsed,
             show_hidden: self.show_hidden,
+            scm: ScmLayout {
+                flat,
+                sections: sections
+                    .into_iter()
+                    .map(|(height, collapsed)| SectionLayout { height, collapsed })
+                    .collect(),
+            },
         }
     }
 
@@ -336,6 +409,13 @@ impl Workbench {
         self.set_sidebar_width(layout.sidebar_width);
         self.show_hidden = layout.show_hidden;
         self.tree.set_show_hidden(self.show_hidden);
+        let sections: Vec<(u16, bool)> = layout
+            .scm
+            .sections
+            .iter()
+            .map(|section| (section.height, section.collapsed))
+            .collect();
+        self.scm.restore(layout.scm.flat, &sections);
         for path in &layout.tabs {
             let _ = self.editor.open(path, self.theme_generation);
         }
@@ -380,6 +460,8 @@ impl Workbench {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.hover = Some(at);
+                self.drag_from = at;
+                self.drag_at = at;
                 let clicks = self.clicks.press(at, Instant::now());
                 self.press(at, clicks);
                 return WorkbenchAction::Consumed;
@@ -393,12 +475,23 @@ impl Workbench {
                 return WorkbenchAction::Consumed;
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.drag = Drag::None;
+                self.release();
                 return WorkbenchAction::Consumed;
             }
             _ => return WorkbenchAction::Passthrough,
         };
-        if self
+        if self.sidebar == SidebarView::SourceControl
+            && self
+                .panes
+                .sidebar
+                .is_some_and(|rect| rect.contains(at.into()))
+        {
+            // Each section scrolls on its own, so the wheel answers to the one
+            // the pointer is over rather than to whichever was last touched.
+            if let Some((section, body)) = self.section_under(at) {
+                self.scm.scroll_by(section, delta, body.height as usize);
+            }
+        } else if self
             .panes
             .sidebar
             .is_some_and(|rect| rect.contains(at.into()))
@@ -406,8 +499,8 @@ impl Workbench {
             let rows = self.sidebar_rows();
             match self.sidebar {
                 SidebarView::Explorer => self.tree.scroll_by(delta, rows),
-                SidebarView::SourceControl => self.scm.scroll_by(delta, rows),
                 SidebarView::Search => self.search.scroll_by(delta, rows),
+                SidebarView::SourceControl => {}
             }
         } else if self.panes.text.contains(at.into()) {
             let rows = self.panes.text.height as usize;
@@ -447,6 +540,11 @@ impl Workbench {
             if let Some(view) = view::header_at(at.0, self.panes.header.x) {
                 self.focus = Focus::Sidebar;
                 self.sidebar = view;
+            } else if self.sidebar == SidebarView::SourceControl
+                && view::mode_at(at.0, self.panes.header, self.head_width())
+            {
+                self.focus = Focus::Sidebar;
+                self.scm.toggle_flat();
             }
             return;
         }
@@ -461,6 +559,9 @@ impl Workbench {
             }
             return;
         }
+        if self.sidebar == SidebarView::SourceControl && self.press_scm(at, clicks) {
+            return;
+        }
         if self.panes.rows.contains(position) {
             self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
             return;
@@ -468,6 +569,54 @@ impl Workbench {
         if self.panes.text.contains(position) {
             self.press_text(at, clicks);
         }
+    }
+
+    /// A press somewhere in the source control pane. Reports whether it landed
+    /// on a section, so the caller can go on trying the other panes.
+    fn press_scm(&mut self, at: (u16, u16), clicks: u8) -> bool {
+        if let Some(index) = self.header_under(at) {
+            self.focus = Focus::Sidebar;
+            self.scm.select(Section::ALL[index], None);
+            // Armed rather than acted on: the same press starts a resize, and
+            // only the release can tell the two apart.
+            self.drag = Drag::Section(index);
+            return true;
+        }
+        let Some((section, body)) = self.section_under(at) else {
+            return false;
+        };
+        self.focus = Focus::Sidebar;
+        let row = self.scm.scroll(section) + (at.1 - body.y) as usize;
+        self.scm.select(section, Some(row));
+        let cursor = self.scm.cursor();
+        if cursor.section != section || cursor.row != Some(row) {
+            return true;
+        }
+        // A folder opens on the first click, the way the explorer does it, and
+        // a file or a commit opens on the second.
+        match clicks {
+            1 => drop(self.scm.toggle_fold()),
+            2 => self.open_scm_selection(),
+            _ => {}
+        }
+        true
+    }
+
+    /// The section header the pointer is on, by index into [`Section::ALL`].
+    fn header_under(&self, at: (u16, u16)) -> Option<usize> {
+        self.panes
+            .sections
+            .iter()
+            .position(|rects| rects.header.contains(at.into()))
+    }
+
+    /// The section body the pointer is on, and the rect it was drawn in.
+    fn section_under(&self, at: (u16, u16)) -> Option<(Section, Rect)> {
+        self.panes
+            .sections
+            .iter()
+            .position(|rects| rects.body.contains(at.into()))
+            .map(|index| (Section::ALL[index], self.panes.sections[index].body))
     }
 
     /// A press on the sidebar's list. One click picks a row out, and a second
@@ -487,12 +636,9 @@ impl Workbench {
                     _ => {}
                 }
             }
-            SidebarView::SourceControl => {
-                self.scm.select_index(self.scm.scroll() + offset);
-                if clicks == 2 {
-                    self.open_diff();
-                }
-            }
+            // Source control routes through `press_scm`: its rows belong to a
+            // section rather than to one list filling the sidebar.
+            SidebarView::SourceControl => {}
             SidebarView::Search => {
                 self.search.select_index(self.search.scroll() + offset);
                 if clicks == 2 {
@@ -570,8 +716,38 @@ impl Workbench {
                 self.drag_at = at;
                 self.extend_to(at);
             }
+            Drag::Section(index) => {
+                self.drag_at = at;
+                self.drag_border(index, at.1);
+            }
             Drag::None => {}
         }
+    }
+
+    /// Moves the border above section `index` to `row`, by resizing the nearest
+    /// open section above it. Whatever flexes below takes up the difference,
+    /// so one border only ever moves one section's own height.
+    fn drag_border(&mut self, index: usize, row: u16) {
+        let Some(above) = (0..index)
+            .rev()
+            .find(|above| self.panes.sections[*above].body.height > 0)
+        else {
+            return;
+        };
+        let top = self.panes.sections[above].body.y;
+        self.scm
+            .set_height(Section::ALL[above], row.saturating_sub(top));
+    }
+
+    /// The button came back up. A press that never moved was a click, which is
+    /// how one press on a section header both folds it and resizes it.
+    fn release(&mut self) {
+        if let Drag::Section(index) = self.drag
+            && self.drag_at == self.drag_from
+        {
+            self.scm.toggle_collapsed(Section::ALL[index]);
+        }
+        self.drag = Drag::None;
     }
 
     fn extend_to(&mut self, at: (u16, u16)) {
@@ -953,24 +1129,54 @@ impl Workbench {
             self.stage_selected();
             return;
         }
-        if keys::TOGGLE_LOG.matches(key) {
-            self.scm.toggle_listing();
+        if keys::TOGGLE_TREE.matches(key) {
+            self.scm.toggle_flat();
+            return;
+        }
+        if keys::SHRINK_SECTION.matches(key) || keys::GROW_SECTION.matches(key) {
+            let step = match keys::GROW_SECTION.matches(key) {
+                true => SECTION_STEP,
+                false => -SECTION_STEP,
+            };
+            let section = self.scm.cursor().section;
+            let height = self.scm.height(section).saturating_add_signed(step);
+            self.scm.set_height(section, height);
             return;
         }
         if keys::OPEN_DIFF.matches(key) {
-            self.open_diff();
+            self.activate_scm();
             return;
         }
-        let page = self.sidebar_rows().max(1) as isize;
+        let page = self.scm_rows().max(1) as isize;
         match key.code {
-            KeyCode::Up => self.scm.move_selection(-1),
-            KeyCode::Down => self.scm.move_selection(1),
-            KeyCode::PageUp => self.scm.move_selection(-page),
-            KeyCode::PageDown => self.scm.move_selection(page),
+            KeyCode::Up => self.scm.move_cursor(-1),
+            KeyCode::Down => self.scm.move_cursor(1),
+            KeyCode::PageUp => self.scm.move_cursor(-page),
+            KeyCode::PageDown => self.scm.move_cursor(page),
             KeyCode::Home => self.scm.select_first(),
             KeyCode::End => self.scm.select_last(),
-            KeyCode::Right | KeyCode::Enter => self.open_diff(),
+            KeyCode::Left => self.scm.fold(),
+            KeyCode::Right => drop(self.scm.unfold()),
+            KeyCode::Enter => self.activate_scm(),
             _ => {}
+        }
+    }
+
+    /// What `Enter` means in the pane: fold a section or a folder, and open
+    /// anything else.
+    fn activate_scm(&mut self) {
+        if self.scm.toggle_fold() {
+            return;
+        }
+        self.open_scm_selection();
+    }
+
+    /// Opens whatever the cursor is on as a read-only tab, which is a diff for
+    /// a change and the whole commit for a row of the graph.
+    fn open_scm_selection(&mut self) {
+        match self.scm.cursor().section {
+            Section::Graph => self.open_commit(),
+            _ => self.open_diff(),
         }
     }
 
@@ -1028,7 +1234,7 @@ impl Workbench {
     }
 
     fn stage_selected(&mut self) {
-        if let Err(error) = self.scm.toggle_staged() {
+        if let Err(error) = self.scm.stage() {
             self.flash = Some(error.to_string());
             return;
         }
@@ -1068,6 +1274,36 @@ impl Workbench {
         let title = format!("{} \u{2194} {side}", self.relative(&change.path).display());
         self.editor.push(Tab::synthetic(
             &change.path,
+            title,
+            rendered.lines,
+            rendered.kinds,
+            self.theme_generation,
+        ));
+        self.focus = Focus::Editor;
+    }
+
+    /// Opens the selected commit as a read-only tab.
+    ///
+    /// Every commit tab is filed under the repository's own directory, so a
+    /// second commit replaces the first rather than stacking up, and the path
+    /// can never collide with a file: [`Editor::push`] keeps one tab per path,
+    /// and no file tab is ever opened on a directory.
+    fn open_commit(&mut self) {
+        let opened = match self.scm.selected_commit_diff() {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return,
+            Err(error) => {
+                self.flash = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(workdir) = self.scm.workdir().map(Path::to_path_buf) else {
+            return;
+        };
+        let (commit, rendered) = opened;
+        let title = format!("{} {}", commit.id, commit.summary);
+        self.editor.push(Tab::synthetic(
+            &workdir,
             title,
             rendered.lines,
             rendered.kinds,
@@ -1231,6 +1467,23 @@ impl Workbench {
         self.panes.rows.height as usize
     }
 
+    /// The rows a page key moves by in the source control pane, which is the
+    /// body of the section the cursor is in rather than the whole sidebar.
+    fn scm_rows(&self) -> usize {
+        let section = self.scm.cursor().section;
+        let index = Section::ALL
+            .iter()
+            .position(|candidate| *candidate == section)
+            .unwrap_or_default();
+        self.panes.sections[index].body.height as usize
+    }
+
+    /// The width of what the sidebar header prints on its right, which is where
+    /// the tree-or-flat button has to be measured from.
+    fn head_width(&self) -> usize {
+        self.scm.head().map(UnicodeWidthStr::width).unwrap_or_default()
+    }
+
     /// The layout clamps again against the room a frame actually has, so this
     /// only has to keep the remembered width sane.
     fn set_sidebar_width(&mut self, width: u16) {
@@ -1270,25 +1523,78 @@ fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
     }
 }
 
+/// Stacks the source control sections into `area`.
+///
+/// Every section keeps its header, so three rows are spoken for before any
+/// body is drawn. Each expanded section then takes the height it asked for,
+/// except the last one, which takes whatever is left: that leaves exactly one
+/// section absorbing a terminal resize, so the others keep the size they were
+/// dragged to.
+fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [SectionRect; Section::COUNT] {
+    let mut rects = [SectionRect::default(); Section::COUNT];
+    let headers = SECTION_HEADER_ROWS * Section::COUNT as u16;
+    let mut room = area.height.saturating_sub(headers);
+    let last_open = wanted
+        .iter()
+        .rposition(|(_, collapsed)| !collapsed)
+        .unwrap_or_default();
+
+    let mut y = area.y;
+    for (index, (height, collapsed)) in wanted.into_iter().enumerate() {
+        // A frame too short for three headers draws the ones that fit and
+        // stops, rather than wrapping a section off the bottom of the pane.
+        if y >= area.bottom() {
+            break;
+        }
+        rects[index].header = Rect {
+            y,
+            height: SECTION_HEADER_ROWS,
+            ..area
+        };
+        y += SECTION_HEADER_ROWS;
+        if collapsed || room == 0 {
+            continue;
+        }
+        let below = wanted[index + 1..]
+            .iter()
+            .filter(|(_, collapsed)| !collapsed)
+            .count() as u16;
+        let body = match index == last_open {
+            true => room,
+            false => height.clamp(
+                MIN_SECTION_ROWS,
+                room.saturating_sub(MIN_SECTION_ROWS * below)
+                    .max(MIN_SECTION_ROWS),
+            ),
+        }
+        .min(room);
+        rects[index].body = Rect { y, height: body, ..area };
+        y += body;
+        room -= body;
+    }
+    rects
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Cursor, Drag, EDGE_SCROLL_LINES, Focus, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
-        MIN_SIDEBAR_WIDTH, SCROLL_LINES, SidebarView, Toggle, Workbench, WorkbenchAction,
-        WorkbenchStyles, keys, layout,
+        Cursor, Drag, EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
+        MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle,
+        Workbench, WorkbenchAction, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::fs::tree::GitMark;
-    use crate::scm::Listing;
     use crate::search;
-    use crate::view::{NOT_A_REPOSITORY, TabHit, header_at, tab_at, toggle_at};
+    use crate::view::{NOT_A_REPOSITORY, TabHit, header_at, mode_at, tab_at, toggle_at};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use gix::bstr::BString;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer as Surface, Cell};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1318,6 +1624,9 @@ mod tests {
     const WRONG_WIDTH: &str = "the sidebar is not the width it was asked for";
     const WRONG_LAYOUT: &str = "the workbench did not come back the way it was left";
     const WRONG_HOVER: &str = "the row under the pointer is not marked the way it should be";
+    const WRONG_GEOMETRY: &str = "the sections did not divide the room the way they were asked to";
+    const WRONG_ROW: &str = "the pointer did not act on the row it was pointing at";
+    const LAYOUT_LOST: &str = "the source control layout did not come back the way it was left";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1815,6 +2124,69 @@ mod tests {
             .map(|change| (change.relative.clone(), change.staged, change.mark))
     }
 
+    /// One index entry, as the tree writer wants it: the path it was recorded
+    /// under, the mode it had, and the blob it points at.
+    type Staged = (BString, gix::objs::tree::EntryMode, gix::ObjectId);
+
+    /// Writes `entries` out as a tree, folder objects and all. The index is a
+    /// flat list of slash-separated paths and git will not read a tree that
+    /// keeps them that way, so every folder is rebuilt on the way down.
+    fn write_tree(repo: &gix::Repository, entries: &[Staged]) -> gix::ObjectId {
+        let mut tree = gix::objs::Tree::empty();
+        let mut folders: BTreeMap<BString, Vec<Staged>> = BTreeMap::new();
+        for (path, mode, id) in entries {
+            match path.iter().position(|byte| *byte == b'/') {
+                Some(cut) => folders
+                    .entry(path[..cut].into())
+                    .or_default()
+                    .push((path[cut + 1..].into(), *mode, *id)),
+                None => tree.entries.push(gix::objs::tree::Entry {
+                    mode: *mode,
+                    filename: path.clone(),
+                    oid: *id,
+                }),
+            }
+        }
+        for (name, held) in folders {
+            tree.entries.push(gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Tree.into(),
+                filename: name,
+                oid: write_tree(repo, &held),
+            });
+        }
+        tree.entries.sort();
+        repo.write_object(&tree).expect("a tree").detach()
+    }
+
+    /// Records whatever is staged, so the graph has a commit to list. The test
+    /// environment has no git identity, so the signature is spelled out rather
+    /// than inherited.
+    fn commit_all(workbench: &mut Workbench) {
+        let workdir = workbench.scm.workdir().expect("a repository").to_path_buf();
+        let repo = gix::open(&workdir).expect("a repository");
+        let index = repo.index_or_empty().expect("an index");
+        let entries: Vec<Staged> = index
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path(&index).to_owned(),
+                    entry.mode.to_tree_entry_mode().expect("a tree mode"),
+                    entry.id,
+                )
+            })
+            .collect();
+        let id = write_tree(&repo, &entries);
+        let who = gix::actor::SignatureRef {
+            name: "Workbench Test".into(),
+            email: "test@example.invalid".into(),
+            time: "1700000000 +0000",
+        };
+        repo.commit_as(who, who, "HEAD", "initial", id, repo.head_id().ok())
+            .expect("a commit");
+        workbench.handle_key(key(keys::REFRESH.code));
+    }
+
     #[test]
     fn the_source_control_pane_lists_an_untracked_file() {
         let (_dir, workbench) = repository();
@@ -1843,21 +2215,45 @@ mod tests {
     }
 
     #[test]
-    fn space_stages_the_selection_and_stages_it_back() {
+    fn space_moves_the_change_between_the_two_sections() {
         let (_dir, mut workbench) = repository();
-        workbench.handle_key(key(KeyCode::Char(' ')));
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+
+        assert_eq!(workbench.scm.count(Section::Staged), 1, "{CHANGE_MISSING}");
+        assert_eq!(workbench.scm.count(Section::Unstaged), 0, "{CHANGE_MISSING}");
+        // The cursor stays where it was, so a run of presses stages a run of
+        // files instead of chasing each one up into the staged section.
+        assert_eq!(
+            workbench.scm.cursor().section,
+            Section::Unstaged,
+            "{WRONG_PANE}"
+        );
+
+        workbench.scm.select(Section::Staged, Some(0));
         assert_eq!(
             selected_change(&workbench),
             Some(("a.txt".to_owned(), true, GitMark::Added)),
             "{CHANGE_MISSING}"
         );
 
-        workbench.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(
-            selected_change(&workbench),
-            Some(("a.txt".to_owned(), false, GitMark::Untracked)),
-            "{CHANGE_MISSING}"
-        );
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+
+        assert_eq!(workbench.scm.count(Section::Staged), 0, "{CHANGE_MISSING}");
+        assert_eq!(workbench.scm.count(Section::Unstaged), 1, "{CHANGE_MISSING}");
+    }
+
+    #[test]
+    fn space_on_a_header_stages_every_path_the_section_lists() {
+        let (dir, mut workbench) = repository();
+        fs::write(dir.path().join("b.txt"), "second\n").expect("write");
+        workbench.handle_key(key(keys::REFRESH.code));
+        assert_eq!(workbench.scm.count(Section::Unstaged), 2, "{CHANGE_MISSING}");
+
+        workbench.scm.select(Section::Unstaged, None);
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+
+        assert_eq!(workbench.scm.count(Section::Staged), 2, "{CHANGE_MISSING}");
+        assert_eq!(workbench.scm.count(Section::Unstaged), 0, "{CHANGE_MISSING}");
     }
 
     #[test]
@@ -1922,13 +2318,272 @@ mod tests {
     }
 
     #[test]
-    fn the_log_key_switches_what_the_pane_lists() {
+    fn the_tree_key_switches_how_the_change_sections_list_paths() {
         let (_dir, mut workbench) = repository();
-        workbench.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(workbench.scm.listing(), Listing::Log, "{WRONG_PANE}");
+        assert!(!workbench.scm.is_flat(), "{WRONG_PANE}");
 
-        workbench.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(workbench.scm.listing(), Listing::Changes, "{WRONG_PANE}");
+        workbench.handle_key(key(keys::TOGGLE_TREE.code));
+        assert!(workbench.scm.is_flat(), "{WRONG_PANE}");
+
+        workbench.handle_key(key(keys::TOGGLE_TREE.code));
+        assert!(!workbench.scm.is_flat(), "{WRONG_PANE}");
+    }
+
+    /// A repository whose changes are spread over a folder, so the sections
+    /// have enough rows for the geometry to be worth measuring.
+    ///
+    /// The files are committed before they are changed: git reports an
+    /// untracked directory as the directory itself, so nothing under it would
+    /// reach the tree.
+    fn nested_repository() -> (TempDir, Workbench) {
+        const PATHS: [&str; 3] = ["src/a.txt", "src/b.txt", "top.txt"];
+        let dir = TempDir::new().expect("a temporary directory");
+        gix::init(dir.path()).expect("a repository");
+        fs::create_dir(dir.path().join("src")).expect("a directory");
+        for name in PATHS {
+            fs::write(dir.path().join(name), "one\n").expect("a file");
+        }
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        workbench.handle_key(alt(KeyCode::Char('2')));
+        for name in PATHS {
+            workbench.scm.stage_path(name).expect("staging");
+        }
+        commit_all(&mut workbench);
+        // Longer than what was committed: a rewrite of the same length within
+        // the same second is racily clean, and status would call it unchanged.
+        for name in PATHS {
+            fs::write(dir.path().join(name), "one\ntwo\n").expect("a file");
+        }
+        workbench.handle_key(key(keys::REFRESH.code));
+        (dir, workbench)
+    }
+
+    /// The screen row a section's body starts on, read off the geometry the
+    /// last frame recorded rather than worked out again here.
+    fn body_of(workbench: &Workbench, section: Section) -> Rect {
+        let index = Section::ALL
+            .iter()
+            .position(|candidate| *candidate == section)
+            .expect("a section");
+        workbench.panes.sections[index].body
+    }
+
+    fn header_of(workbench: &Workbench, section: Section) -> Rect {
+        let index = Section::ALL
+            .iter()
+            .position(|candidate| *candidate == section)
+            .expect("a section");
+        workbench.panes.sections[index].header
+    }
+
+    #[test]
+    fn every_section_keeps_its_header_and_the_last_open_one_takes_the_rest() {
+        let area = Rect::new(0, 0, 20, 20);
+        let rects = layout_sections(area, [(4, false), (4, false), (4, false)]);
+
+        assert_eq!(rects[0].header.height, 1, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[0].body.height, 4, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[1].body.height, 4, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[2].body.height, 9, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[2].body.bottom(), area.bottom(), "{WRONG_GEOMETRY}");
+    }
+
+    #[test]
+    fn a_folded_section_gives_its_body_away_and_keeps_its_header() {
+        let rects = layout_sections(Rect::new(0, 0, 20, 20), [(4, true), (4, false), (4, false)]);
+
+        assert_eq!(rects[0].header.height, 1, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[0].body.height, 0, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[1].body.height, 4, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[2].body.height, 13, "{WRONG_GEOMETRY}");
+    }
+
+    #[test]
+    fn the_sections_never_reach_past_the_room_they_were_given() {
+        for height in 0..12u16 {
+            let area = Rect::new(0, 0, 20, height);
+            let rects = layout_sections(area, [(8, false), (8, false), (8, false)]);
+            for rect in rects {
+                assert!(rect.header.bottom() <= area.bottom(), "{WRONG_GEOMETRY}");
+                assert!(rect.body.bottom() <= area.bottom(), "{WRONG_GEOMETRY}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_section_asking_for_more_than_there_is_leaves_the_ones_below_a_row() {
+        let rects = layout_sections(Rect::new(0, 0, 20, 8), [(40, false), (4, false), (4, false)]);
+
+        assert_eq!(rects[0].body.height, 3, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[1].body.height, MIN_SECTION_ROWS, "{WRONG_GEOMETRY}");
+        assert_eq!(rects[2].body.height, MIN_SECTION_ROWS, "{WRONG_GEOMETRY}");
+    }
+
+    #[test]
+    fn a_click_in_the_second_section_selects_that_section_and_not_the_first() {
+        let (_dir, mut workbench) = nested_repository();
+        workbench.scm.toggle_flat();
+        paint(&mut workbench, 80, 24);
+        let body = body_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(click(body.x + 1, body.y + 1));
+
+        assert_eq!(
+            workbench.scm.cursor(),
+            scm::Cursor {
+                section: Section::Unstaged,
+                row: Some(1)
+            },
+            "{WRONG_ROW}"
+        );
+    }
+
+    #[test]
+    fn a_press_and_release_on_a_header_folds_the_section() {
+        let (_dir, mut workbench) = nested_repository();
+        paint(&mut workbench, 80, 24);
+        let header = header_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(click(header.x + 2, header.y));
+        workbench.handle_mouse(release(header.x + 2, header.y));
+
+        assert!(workbench.scm.is_collapsed(Section::Unstaged), "{WRONG_ROW}");
+    }
+
+    #[test]
+    fn a_press_that_drags_a_header_resizes_instead_of_folding() {
+        let (_dir, mut workbench) = nested_repository();
+        // The staged section has to have a body: an empty one is drawn folded,
+        // and there is nothing above the border to resize.
+        workbench.scm.stage_path("top.txt").expect("staging");
+        workbench.handle_key(key(keys::REFRESH.code));
+        paint(&mut workbench, 80, 24);
+        let header = header_of(&workbench, Section::Unstaged);
+        let before = workbench.scm.height(Section::Staged);
+
+        workbench.handle_mouse(click(header.x + 2, header.y));
+        workbench.handle_mouse(drag(header.x + 2, header.y + 3));
+        workbench.handle_mouse(release(header.x + 2, header.y + 3));
+
+        assert!(!workbench.scm.is_collapsed(Section::Unstaged), "{WRONG_ROW}");
+        assert_eq!(
+            workbench.scm.height(Section::Staged),
+            before + 3,
+            "{WRONG_GEOMETRY}"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_section_the_pointer_is_over() {
+        let (dir, mut workbench) = nested_repository();
+        for index in 0..20 {
+            fs::write(dir.path().join(format!("f{index}.txt")), "one\n").expect("a file");
+        }
+        workbench.handle_key(key(keys::REFRESH.code));
+        workbench.scm.set_height(Section::Unstaged, 4);
+        paint(&mut workbench, 80, 24);
+        let body = body_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(wheel(body.x + 1, body.y + 1));
+
+        assert_eq!(
+            workbench.scm.scroll(Section::Unstaged),
+            SCROLL_LINES as usize,
+            "{WRONG_ROW}"
+        );
+        assert_eq!(workbench.scm.scroll(Section::Graph), 0, "{WRONG_ROW}");
+    }
+
+    #[test]
+    fn a_click_on_a_folder_folds_it_and_a_click_on_a_file_only_selects() {
+        let (_dir, mut workbench) = nested_repository();
+        paint(&mut workbench, 80, 24);
+        let body = body_of(&workbench, Section::Unstaged);
+        let before = workbench.scm.rows(Section::Unstaged).len();
+
+        workbench.handle_mouse(click(body.x + 1, body.y));
+
+        assert!(
+            workbench.scm.rows(Section::Unstaged).len() < before,
+            "{WRONG_ROW}"
+        );
+    }
+
+    #[test]
+    fn the_header_button_switches_between_tree_and_flat() {
+        let (_dir, mut workbench) = nested_repository();
+        paint(&mut workbench, 80, 24);
+        let header = workbench.panes.header;
+        let column = (header.x..header.right())
+            .find(|column| mode_at(*column, header, workbench.head_width()))
+            .expect("a tree or flat button");
+
+        workbench.handle_mouse(click(column, header.y));
+
+        assert!(workbench.scm.is_flat(), "{WRONG_PANE}");
+    }
+
+    #[test]
+    fn a_stored_source_control_layout_survives_a_round_trip() {
+        let (_dir, mut workbench) = nested_repository();
+        workbench.scm.toggle_flat();
+        workbench.scm.set_height(Section::Staged, 3);
+        workbench.scm.toggle_collapsed(Section::Graph);
+
+        let stored = workbench.layout();
+        let mut restored = Workbench::new(WorkbenchStyles::default());
+        restored.restore(stored.clone());
+
+        assert_eq!(restored.layout().scm, stored.scm, "{LAYOUT_LOST}");
+        assert!(restored.scm.is_flat(), "{LAYOUT_LOST}");
+        assert_eq!(restored.scm.height(Section::Staged), 3, "{LAYOUT_LOST}");
+        assert!(restored.scm.is_collapsed(Section::Graph), "{LAYOUT_LOST}");
+    }
+
+    #[test]
+    fn a_stored_layout_naming_no_sections_keeps_the_defaults() {
+        let stored = Layout {
+            scm: ScmLayout {
+                flat: true,
+                sections: Vec::new(),
+            },
+            ..Layout::default()
+        };
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+
+        workbench.restore(stored);
+
+        assert!(workbench.scm.is_flat(), "{LAYOUT_LOST}");
+        assert_eq!(
+            workbench.scm.height(Section::Staged),
+            scm::DEFAULT_SECTION_ROWS,
+            "{LAYOUT_LOST}"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_commit_opens_it_as_a_tab_that_cannot_be_edited() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+
+        workbench.handle_key(key(KeyCode::Enter));
+
+        let tab = workbench.editor.active().expect("a commit tab");
+        assert!(tab.diff_kinds().is_some(), "{DIFF_EDITABLE}");
+        assert!(!tab.is_editable(), "{DIFF_EDITABLE}");
+        assert!(tab.title.contains("initial"), "{DIFF_EDITABLE}");
+    }
+
+    #[test]
+    fn the_graph_lists_the_commits_that_were_made() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+
+        assert_eq!(workbench.scm.count(Section::Graph), 1, "{CHANGE_MISSING}");
     }
 
     #[test]
@@ -2041,7 +2696,6 @@ mod tests {
         let (_dir, mut workbench) = project();
         workbench.handle_key(alt(KeyCode::Char('2')));
         assert!(!workbench.scm.is_repository(), "{WRONG_PANE}");
-        assert!(workbench.scm.rows().is_empty(), "{WRONG_PANE}");
         assert!(
             draw(&mut workbench, 100, 20).contains(NOT_A_REPOSITORY),
             "{NOT_PAINTED}"

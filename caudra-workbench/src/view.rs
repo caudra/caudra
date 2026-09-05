@@ -16,17 +16,20 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::editor::{DiffKind, Editor, Tab, render};
 use crate::fs::tree::{GitMark, Row as TreeRow};
+use crate::scm::graph::Rail;
 use crate::scm::repo::{Change, Commit};
-use crate::scm::{Listing, Row as ScmRow, Scm};
+use crate::scm::tree::{Dir, SEPARATOR};
+use crate::scm::{Row as ScmRow, Scm, Section};
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
-use crate::{Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout};
+use crate::{
+    Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout, layout_sections,
+};
 
 const HINT_GAP: &str = "  ";
 const EMPTY_EDITOR_HINT: &str = "No file open";
 const NO_CHANGES: &str = "No changes";
 pub(crate) const NOT_A_REPOSITORY: &str = "Not a git repository";
-const HISTORY_HINT: &str = "history";
 const SEARCH_PROMPT: &str = "Search  ";
 const INCLUDE_PROMPT: &str = "Files   ";
 const SEARCHING: &str = "Searching\u{2026}";
@@ -37,8 +40,17 @@ const WORD_TOGGLE: &str = "ab";
 const REGEX_TOGGLE: &str = ".*";
 const CARET: &str = "\u{2588}";
 const ENTER_LABEL: &str = "Enter";
-const CHANGES_HINT: &str = "changes";
 const SUMMARY_GAP: &str = " ";
+/// The two-column rail down the left of the graph. A commit on the chain of
+/// first parents sits on the trunk, one a merge brought in hangs beside it.
+const RAIL_TRUNK: &str = "\u{25cf} ";
+const RAIL_MERGE: &str = "\u{25c9} ";
+const RAIL_SIDE: &str = "\u{2502}\u{25cb}";
+const TREE_LABEL: &str = "TREE";
+const FLAT_LABEL: &str = "FLAT";
+const TREE_HINT: &str = "tree";
+const FLAT_HINT: &str = "flat";
+const COUNT_GAP: &str = " ";
 const EMPTY_TREE: &str = "Nothing to show";
 const DIRTY_MARK: &str = "\u{25cf}";
 const AGENT_MARK: &str = "\u{25e6}";
@@ -126,15 +138,23 @@ impl Workbench {
                 ]
             })
             .collect();
+        let mut right = Vec::new();
+        if self.sidebar == SidebarView::SourceControl {
+            let mode = match self.scm.is_flat() {
+                true => FLAT_LABEL,
+                false => TREE_LABEL,
+            };
+            let pointed = self
+                .hovering(header)
+                .is_some_and(|at| mode_at(at.0, header, context.width()));
+            right.push(Span::styled(mode, emphasized(self.styles.dim, pointed, &self.styles)));
+            right.push(Span::styled(TAB_GAP, self.styles.background));
+        }
+        right.push(Span::styled(context, self.styles.dim));
         chrome::render_line(
             buf,
             header,
-            chrome::status_line(
-                switcher,
-                vec![Span::styled(context, self.styles.dim)],
-                header.width,
-                self.styles.dim,
-            ),
+            chrome::status_line(switcher, right, header.width, self.styles.dim),
         );
 
         match self.sidebar {
@@ -221,25 +241,66 @@ impl Workbench {
         }
     }
 
+    /// Three stacked sections, each with a pinned title row over a list that
+    /// scrolls under it. The title stays put so the fold handle and the count
+    /// never scroll out of reach.
     fn render_scm(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
-        self.panes.rows = area;
-        let height = area.height as usize;
-        self.scm.clamp_scroll(height);
-        if self.scm.rows().is_empty() {
-            let notice = match (self.scm.error(), self.scm.is_repository()) {
-                (Some(error), _) => error,
-                (None, true) => NO_CHANGES,
-                (None, false) => NOT_A_REPOSITORY,
-            };
+        if !self.scm.is_repository() || self.scm.error().is_some() {
+            let notice = self.scm.error().unwrap_or(NOT_A_REPOSITORY);
             placeholder(buf, area, notice, self.styles.dim);
             return;
         }
-        let scroll = self.scm.scroll();
-        let selected = self.scm.selected_index();
+        let wanted = Section::ALL.map(|section| {
+            (
+                self.scm.height(section),
+                self.scm.is_collapsed(section) || self.scm.count(section) == 0,
+            )
+        });
+        self.panes.sections = layout_sections(area, wanted);
+
+        let cursor = self.scm.cursor();
+        for (index, section) in Section::ALL.into_iter().enumerate() {
+            let rects = self.panes.sections[index];
+            let chosen = focused && cursor.section == section && cursor.row.is_none();
+            let pointed = self.hovering(rects.header).is_some();
+            let line = section_header(
+                section,
+                self.scm.count(section),
+                self.scm.is_collapsed(section),
+                chosen,
+                &self.styles,
+                rects.header.width,
+            );
+            let line = emphasize(line, pointed && !chosen, &self.styles);
+            chrome::render_line(buf, rects.header, line);
+            self.render_section(buf, section, rects.body, focused);
+        }
+        if self.scm.is_empty() {
+            let notice = Rect {
+                y: self.panes.sections[Section::COUNT - 1].header.bottom(),
+                height: area
+                    .bottom()
+                    .saturating_sub(self.panes.sections[Section::COUNT - 1].header.bottom()),
+                ..area
+            };
+            placeholder(buf, notice, NO_CHANGES, self.styles.dim);
+        }
+    }
+
+    fn render_section(&mut self, buf: &mut Surface, section: Section, area: Rect, focused: bool) {
+        let height = area.height as usize;
+        self.scm.clamp_scroll(section, height);
+        if height == 0 {
+            return;
+        }
+        let scroll = self.scm.scroll(section);
+        let cursor = self.scm.cursor();
         let pointed = self.hovered_row(area);
-        for (offset, row) in self.scm.rows().iter().skip(scroll).take(height).enumerate() {
-            let chosen = focused && scroll + offset == selected;
-            let line = scm_row(&self.scm, *row, chosen, &self.styles, area.width);
+        for offset in 0..height.min(self.scm.rows(section).len().saturating_sub(scroll)) {
+            let row = self.scm.rows(section)[scroll + offset];
+            let chosen =
+                focused && cursor.section == section && cursor.row == Some(scroll + offset);
+            let line = scm_row(&self.scm, section, row, chosen, &self.styles, area.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(area, offset), line);
         }
@@ -494,15 +555,15 @@ impl Workbench {
     /// What the status bar offers, which is whatever the focused pane can do.
     fn status_hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::SourceControl {
-            let other = match self.scm.listing() {
-                Listing::Changes => HISTORY_HINT,
-                Listing::Log => CHANGES_HINT,
+            let other = match self.scm.is_flat() {
+                true => TREE_HINT,
+                false => FLAT_HINT,
             };
             return vec![
                 (keys::STAGE_TOGGLE.label, "stage"),
                 (keys::OPEN_DIFF.label, "diff"),
                 (keys::DISCARD.label, "discard"),
-                (keys::TOGGLE_LOG.label, other),
+                (keys::TOGGLE_TREE.label, other),
                 (keys::CLOSE.label, "back"),
             ];
         }
@@ -600,6 +661,26 @@ pub(crate) fn toggle_at(column: u16, origin: u16) -> Option<Toggle> {
     None
 }
 
+/// Whether `column` is on the sidebar header's tree-or-flat button, which sits
+/// at the right edge ahead of `context`, the branch name. Measured from the
+/// right the same way [`chrome::status_line`] lays that group out.
+pub(crate) fn mode_at(column: u16, header: Rect, context: usize) -> bool {
+    let trailing = (context + TAB_GAP.len() + TREE_LABEL.len()) as u16;
+    let Some(start) = header.right().checked_sub(trailing) else {
+        return false;
+    };
+    (start..start + TREE_LABEL.len() as u16).contains(&column)
+}
+
+/// The hover highlight as a style rather than a whole line, for the header
+/// segments that share a row with things that are not buttons.
+fn emphasized(base: Style, hovered: bool, styles: &WorkbenchStyles) -> Style {
+    match hovered {
+        true => base.patch(styles.hover),
+        false => base,
+    }
+}
+
 /// Paints the pointer's own highlight over a row it is resting on, keeping the
 /// colours the row already earned rather than replacing them.
 fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Line<'static> {
@@ -671,31 +752,84 @@ fn tree_row(row: &TreeRow, selected: bool, styles: &WorkbenchStyles, width: u16)
     chrome::status_line(left, right, width, styles.background)
 }
 
+/// A section's pinned title: the fold marker, the name, and how many paths or
+/// commits are behind it.
+fn section_header(
+    section: Section,
+    count: usize,
+    collapsed: bool,
+    selected: bool,
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
+    let marker = match collapsed {
+        true => COLLAPSED_MARK,
+        false => EXPANDED_MARK,
+    };
+    let style = match selected {
+        true => styles.selected,
+        false => styles.title,
+    };
+    let label = format!("{marker}{}", section.title());
+    let count = format!("{count}{COUNT_GAP}");
+    let left = vec![Span::styled(
+        chrome::fit(&label, (width as usize).saturating_sub(count.width())),
+        style,
+    )];
+    let right = vec![Span::styled(count, styles.dim)];
+    chrome::status_line(left, right, width, styles.background)
+}
+
 fn scm_row(
     scm: &Scm,
+    section: Section,
     row: ScmRow,
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
     match row {
-        ScmRow::Heading(text) => Line::from(Span::styled(
-            chrome::fit(text, width as usize),
-            styles.title,
-        )),
-        ScmRow::Change(index) => match scm.change(index) {
-            Some(change) => change_row(change, selected, styles, width),
+        ScmRow::Directory(index) => match scm.dir(section, index) {
+            Some(dir) => directory_row(dir, selected, styles, width),
             None => Line::default(),
         },
-        ScmRow::Commit(index) => match scm.commit(index) {
-            Some(commit) => commit_row(commit, selected, styles, width),
+        ScmRow::Change { index, depth } => match scm.change(index) {
+            Some(change) => change_row(change, depth, scm.is_flat(), selected, styles, width),
             None => Line::default(),
+        },
+        ScmRow::Commit(index) => match (scm.commit(index), scm.rail(index)) {
+            (Some(commit), Some(rail)) => commit_row(commit, rail, selected, styles, width),
+            _ => Line::default(),
         },
     }
 }
 
+fn directory_row(dir: &Dir, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
+    let marker = match dir.expanded {
+        true => EXPANDED_MARK,
+        false => COLLAPSED_MARK,
+    };
+    let style = match selected {
+        true => styles.selected,
+        false => styles.directory,
+    };
+    let label = format!(
+        "{:indent$}{marker}{}",
+        "",
+        dir.label,
+        indent = dir.depth * DEPTH_INDENT
+    );
+    Line::from(Span::styled(chrome::fit(&label, width as usize), style))
+        .style(styles.background)
+}
+
+/// The path, and its git letter on the right. Tree mode indents and shows only
+/// the filename; flat mode keeps the whole path and cuts it from the left,
+/// which is the end that names the file.
 fn change_row(
     change: &Change,
+    depth: usize,
+    flat: bool,
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
@@ -708,18 +842,35 @@ fn change_row(
         change.mark.letter(),
         git_style(change.mark, styles),
     )];
-    let label = format!("{LEAF_INDENT}{}", change.relative);
-    let left = vec![Span::styled(
-        chrome::fit_end(&label, (width as usize).saturating_sub(2)),
-        style,
-    )];
+    let budget = (width as usize).saturating_sub(2);
+    let left = match flat {
+        true => vec![Span::styled(
+            chrome::fit_end(&format!("{LEAF_INDENT}{}", change.relative), budget),
+            style,
+        )],
+        false => {
+            let name = change
+                .relative
+                .rsplit(SEPARATOR)
+                .next()
+                .unwrap_or(&change.relative);
+            vec![Span::styled(
+                chrome::fit(
+                    &format!("{:indent$}{LEAF_INDENT}{name}", "", indent = depth * DEPTH_INDENT),
+                    budget,
+                ),
+                style,
+            )]
+        }
+    };
     chrome::status_line(left, right, width, styles.background)
 }
 
-/// Author on the right, hash and summary on the left, so a narrow sidebar
+/// Author on the right, rail, hash and summary on the left, so a narrow sidebar
 /// drops the author rather than the line that identifies the commit.
 fn commit_row(
     commit: &Commit,
+    rail: Rail,
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
@@ -728,9 +879,15 @@ fn commit_row(
         true => styles.selected,
         false => styles.text,
     };
-    let budget = (width as usize).saturating_sub(commit.id.len() + LEAF_INDENT.len() + 1);
+    let mark = match rail {
+        Rail::Trunk => RAIL_TRUNK,
+        Rail::Merge => RAIL_MERGE,
+        Rail::Side => RAIL_SIDE,
+    };
+    let budget = (width as usize).saturating_sub(commit.id.len() + mark.width() + 1);
     let left = vec![
-        Span::styled(format!("{LEAF_INDENT}{}", commit.id), styles.accent),
+        Span::styled(mark, styles.dim),
+        Span::styled(commit.id.clone(), styles.accent),
         Span::styled(
             format!("{SUMMARY_GAP}{}", chrome::fit(&commit.summary, budget)),
             style,

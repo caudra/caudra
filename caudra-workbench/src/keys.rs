@@ -72,7 +72,9 @@ pub const GROW_SIDEBAR: Bind = bind!(KeyCode::Char('='), ALT, "Alt+=");
 pub const STAGE_TOGGLE: Bind = bind!(KeyCode::Char(' '), NONE, "Space");
 pub const OPEN_DIFF: Bind = bind!(KeyCode::Char('d'), NONE, "D");
 pub const DISCARD: Bind = bind!(KeyCode::Char('x'), NONE, "X");
-pub const TOGGLE_LOG: Bind = bind!(KeyCode::Char('l'), NONE, "L");
+pub const TOGGLE_TREE: Bind = bind!(KeyCode::Char('t'), NONE, "T");
+pub const SHRINK_SECTION: Bind = bind!(KeyCode::Up, ALT, "Alt+Up");
+pub const GROW_SECTION: Bind = bind!(KeyCode::Down, ALT, "Alt+Down");
 
 pub const NEXT_FIELD: Bind = bind!(KeyCode::Char('i'), ALT, "Alt+I");
 pub const TOGGLE_CASE: Bind = bind!(KeyCode::Char('c'), ALT, "Alt+C");
@@ -117,7 +119,14 @@ const GLOBAL_BINDS: &[Bind] = &[
 /// they are checked against the global set too: a collision there would take
 /// the key away from every other pane.
 #[cfg(test)]
-const SOURCE_CONTROL_BINDS: &[Bind] = &[STAGE_TOGGLE, OPEN_DIFF, DISCARD, TOGGLE_LOG];
+const SOURCE_CONTROL_BINDS: &[Bind] = &[
+    STAGE_TOGGLE,
+    OPEN_DIFF,
+    DISCARD,
+    TOGGLE_TREE,
+    SHRINK_SECTION,
+    GROW_SECTION,
+];
 
 /// Binds that only reach the search pane. Its fields swallow bare characters,
 /// so these carry `Alt` and are checked against everything else.
