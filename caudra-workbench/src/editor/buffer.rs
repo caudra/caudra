@@ -375,9 +375,7 @@ impl Buffer {
     }
 
     fn shift_selection(&mut self, deeper: bool) -> Option<Edit> {
-        let (start, end) = self
-            .selection()
-            .unwrap_or((self.cursor, self.cursor));
+        let (start, end) = self.selection().unwrap_or((self.cursor, self.cursor));
         let first = start.line;
         let last = end.line;
         let unit = self.indent.unit();
@@ -469,10 +467,7 @@ impl Buffer {
         if start.line == end.line {
             return slice(self.line(start.line), start.col..end.col);
         }
-        let mut out = slice(
-            self.line(start.line),
-            start.col..self.line_len(start.line),
-        );
+        let mut out = slice(self.line(start.line), start.col..self.line_len(start.line));
         for index in start.line + 1..end.line {
             out.push('\n');
             out.push_str(self.line(index));
@@ -564,7 +559,8 @@ mod tests {
     const CURSOR_RESTORED: &str = "undoing an edit must put the cursor back where it was";
     const GOAL_COLUMN: &str =
         "walking past a short line and back must return to the original column";
-    const SELECTION_ORDER: &str = "a selection must read in document order whichever way it was made";
+    const SELECTION_ORDER: &str =
+        "a selection must read in document order whichever way it was made";
     const NO_CONVERT: &str = "a tab-indented file must not be silently converted to spaces";
 
     fn buffer(text: &str) -> Buffer {
@@ -583,12 +579,7 @@ mod tests {
     #[test_case("hello",           Cursor::new(0, 2), "XY",   "heXYllo"         ; "in_middle")]
     #[test_case("a\nb",            Cursor::new(0, 1), "\nX",  "a\nX\nb"         ; "newline")]
     #[test_case("日本語",           Cursor::new(0, 1), "X",    "日X本語"          ; "wide_glyphs")]
-    fn inserting_lands_where_the_cursor_is(
-        start: &str,
-        at: Cursor,
-        text: &str,
-        expected: &str,
-    ) {
+    fn inserting_lands_where_the_cursor_is(start: &str, at: Cursor, text: &str, expected: &str) {
         let mut buffer = buffer(start);
         buffer.set_cursor(at, false);
         buffer.insert(text);

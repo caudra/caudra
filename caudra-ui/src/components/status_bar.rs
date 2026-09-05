@@ -806,8 +806,15 @@ mod tests {
             StatusBarHitTarget::Thinking,
             StatusBarHitTarget::Goal,
         ] {
-            let (_, hits, styles) =
-                render_at(BAR_WIDTH, None, false, false, Some(target), None, Some(&goal));
+            let (_, hits, styles) = render_at(
+                BAR_WIDTH,
+                None,
+                false,
+                false,
+                Some(target),
+                None,
+                Some(&goal),
+            );
             let hit = hits.iter().find(|hit| hit.target == target).unwrap();
             let start = usize::from(hit.area.x);
             let end = usize::from(hit.area.right());

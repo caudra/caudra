@@ -11,9 +11,9 @@ use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use caudra_lua::Split;
+use caudra_providers::RequestOptions;
 #[cfg(test)]
 use caudra_workbench::{Focus, SidebarView};
-use caudra_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Position, Rect};

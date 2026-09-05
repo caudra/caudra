@@ -161,7 +161,8 @@ mod tests {
     const SEPARATE: &str = "a newline must end the group so undo stops at line boundaries";
     const REDO_CLEARED: &str = "editing after an undo must drop the redo stack";
     const SAVE_BARRIER: &str = "a save must end the group so undo stops at what was saved";
-    const CLEAN_AGAIN: &str = "a buffer undone back to what is on disk must stop claiming to be dirty";
+    const CLEAN_AGAIN: &str =
+        "a buffer undone back to what is on disk must stop claiming to be dirty";
 
     fn insert(line: usize, col: usize, text: &str) -> Edit {
         Edit {

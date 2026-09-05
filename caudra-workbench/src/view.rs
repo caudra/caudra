@@ -126,7 +126,12 @@ impl Workbench {
         let search = self.search.query();
         for (rect, label, text, field) in [
             (query, SEARCH_PROMPT, &search.text, SearchField::Query),
-            (include, INCLUDE_PROMPT, &search.include, SearchField::Include),
+            (
+                include,
+                INCLUDE_PROMPT,
+                &search.include,
+                SearchField::Include,
+            ),
         ] {
             chrome::render_line(
                 buf,
@@ -217,7 +222,14 @@ impl Workbench {
         }
         let scroll = self.tree.scroll();
         let selected = self.tree.selected_index();
-        for (offset, row) in self.tree.rows().iter().skip(scroll).take(height).enumerate() {
+        for (offset, row) in self
+            .tree
+            .rows()
+            .iter()
+            .skip(scroll)
+            .take(height)
+            .enumerate()
+        {
             let line = tree_row(
                 row,
                 focused && scroll + offset == selected,
@@ -331,8 +343,7 @@ impl Workbench {
     }
 
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
-        let focused =
-            self.focus == Focus::Editor && self.goto.is_none() && !self.palette.is_open();
+        let focused = self.focus == Focus::Editor && self.goto.is_none() && !self.palette.is_open();
         let Some(tab) = self.editor.active_mut() else {
             self.panes.text = Rect::default();
             placeholder(buf, area, EMPTY_EDITOR_HINT, self.styles.dim);
@@ -382,10 +393,7 @@ impl Workbench {
         ];
         let right = match self.editor.active().map(|tab| &tab.find) {
             Some(find) if find.is_open() && !find.query().is_empty() => match find.position() {
-                Some((at, total)) => vec![Span::styled(
-                    format!("{at}/{total}"),
-                    self.styles.dim,
-                )],
+                Some((at, total)) => vec![Span::styled(format!("{at}/{total}"), self.styles.dim)],
                 None => vec![Span::styled(NO_MATCHES, self.styles.error)],
             },
             _ => Vec::new(),
@@ -403,10 +411,7 @@ impl Workbench {
     fn render_status(&mut self, buf: &mut Surface, area: Rect) {
         let half = area.width as usize / 2;
         let left = match (&self.flash, self.editor.active()) {
-            (Some(message), _) => vec![Span::styled(
-                chrome::fit(message, half),
-                self.styles.error,
-            )],
+            (Some(message), _) => vec![Span::styled(chrome::fit(message, half), self.styles.error)],
             (None, Some(tab)) => status_left(tab, self.relative(&tab.path), &self.styles, half),
             (None, None) => vec![Span::styled(
                 chrome::fit_end(&self.root.display().to_string(), half),
@@ -453,7 +458,11 @@ impl Workbench {
             ];
         }
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::Search {
-            let enter = if self.search.is_stale() { "search" } else { "open" };
+            let enter = if self.search.is_stale() {
+                "search"
+            } else {
+                "open"
+            };
             return vec![
                 (ENTER_LABEL, enter),
                 (keys::NEXT_FIELD.label, "files"),
@@ -486,10 +495,8 @@ impl Workbench {
 pub(crate) fn tab_at(editor: &Editor, column: u16, origin: u16) -> Option<usize> {
     let mut left = column.checked_sub(origin)? as usize;
     for (index, tab) in editor.tabs().iter().enumerate() {
-        let width = TAB_GAP.len()
-            + usize::from(tab.is_dirty())
-            + tab.title.chars().count()
-            + TAB_GAP.len();
+        let width =
+            TAB_GAP.len() + usize::from(tab.is_dirty()) + tab.title.chars().count() + TAB_GAP.len();
         if left < width {
             return Some(index);
         }
@@ -502,10 +509,7 @@ fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
     chrome::render_line(
         buf,
         area,
-        Line::from(Span::styled(
-            chrome::fit(text, area.width as usize),
-            style,
-        )),
+        Line::from(Span::styled(chrome::fit(text, area.width as usize), style)),
     );
 }
 
@@ -521,12 +525,7 @@ fn digits(count: usize) -> u16 {
     count.max(1).ilog10() as u16 + 1
 }
 
-fn tree_row(
-    row: &TreeRow,
-    selected: bool,
-    styles: &WorkbenchStyles,
-    width: u16,
-) -> Line<'static> {
+fn tree_row(row: &TreeRow, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
     let marker = match (row.is_dir(), row.expanded) {
         (true, true) => EXPANDED_MARK,
         (true, false) => COLLAPSED_MARK,
@@ -693,7 +692,11 @@ fn search_row(
                 let relative = path.strip_prefix(root).unwrap_or(path);
                 Line::from(Span::styled(
                     chrome::fit_end(&relative.display().to_string(), width as usize),
-                    if selected { styles.selected } else { styles.directory },
+                    if selected {
+                        styles.selected
+                    } else {
+                        styles.directory
+                    },
                 ))
             }
             None => Line::default(),
@@ -708,7 +711,11 @@ fn search_row(
 /// The line number, then the matching text with the match itself picked out, so
 /// the eye lands on the same thing the cursor would.
 fn hit_row(hit: &Hit, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
-    let style = if selected { styles.selected } else { styles.text };
+    let style = if selected {
+        styles.selected
+    } else {
+        styles.text
+    };
     let number = format!("{LEAF_INDENT}{}{SUMMARY_GAP}", hit.line);
     let budget = (width as usize).saturating_sub(number.chars().count());
     let text: Vec<char> = hit.text.chars().collect();
@@ -769,7 +776,12 @@ fn gutter_row(
     };
     let gap = GUTTER_GAP as usize;
     Line::from(Span::styled(
-        format!("{:>width$}{:gap$}", line + 1, "", width = width as usize - gap),
+        format!(
+            "{:>width$}{:gap$}",
+            line + 1,
+            "",
+            width = width as usize - gap
+        ),
         style,
     ))
 }

@@ -236,11 +236,7 @@ impl Tab {
         if !self.is_editable() {
             return Err(SaveError::ReadOnly(self.path.clone()));
         }
-        let contents = read::encode(
-            self.buffer.lines(),
-            self.line_ending,
-            self.trailing_newline,
-        );
+        let contents = read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline);
         self.modified = read::save(&self.path, &contents, self.modified)?;
         self.history.mark_saved();
         self.conflict = false;
@@ -440,7 +436,10 @@ mod tests {
 
         tab.save().unwrap();
         assert!(!tab.is_dirty(), "{CLEAN_START}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "// note\nfn main() {}\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "// note\nfn main() {}\n"
+        );
     }
 
     #[test]

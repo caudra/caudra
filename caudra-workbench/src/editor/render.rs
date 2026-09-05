@@ -66,8 +66,7 @@ impl Row<'_> {
     /// The line as one style per character, overlays applied, padded with
     /// blanks where an overlay reaches past the end of the text.
     fn cells(&self, limit: usize) -> Vec<(char, Style)> {
-        let mut cells: Vec<(char, Style)> =
-            self.text.chars().zip(self.char_styles()).collect();
+        let mut cells: Vec<(char, Style)> = self.text.chars().zip(self.char_styles()).collect();
 
         let reach = self
             .overlays
@@ -147,10 +146,19 @@ fn expand(cells: &[(char, Style)]) -> Vec<Column> {
         }
         let style = *style;
         if *ch == '\t' {
-            columns.resize(columns.len() + width, Column { ch: Some(BLANK), style });
+            columns.resize(
+                columns.len() + width,
+                Column {
+                    ch: Some(BLANK),
+                    style,
+                },
+            );
             continue;
         }
-        columns.push(Column { ch: Some(*ch), style });
+        columns.push(Column {
+            ch: Some(*ch),
+            style,
+        });
         columns.resize(columns.len() + width - 1, Column { ch: None, style });
     }
     columns
@@ -194,7 +202,12 @@ mod tests {
     const WRONG_STYLE: &str = "the painted row is not styled as expected";
 
     fn plain(text: &str) -> Row<'_> {
-        Row { text, segments: None, base: Style::default(), overlays: &[] }
+        Row {
+            text,
+            segments: None,
+            base: Style::default(),
+            overlays: &[],
+        }
     }
 
     fn painted(row: &Row<'_>, h_scroll: usize, width: usize) -> String {
@@ -208,21 +221,33 @@ mod tests {
     #[test_case("abc", 9, 3, "" ; "scrolling past the line leaves nothing")]
     #[test_case("abc", 0, 0, "" ; "a zero width window prints nothing")]
     fn painting_clips_to_the_window(text: &str, h_scroll: usize, width: usize, expected: &str) {
-        assert_eq!(painted(&plain(text), h_scroll, width), expected, "{WRONG_TEXT}");
+        assert_eq!(
+            painted(&plain(text), h_scroll, width),
+            expected,
+            "{WRONG_TEXT}"
+        );
     }
 
     #[test_case("\tx", 0, 8, "    x" ; "a tab reaches the next stop")]
     #[test_case("ab\tx", 0, 8, "ab  x" ; "a tab fills only what is left of the stop")]
     #[test_case("abcd\tx", 0, 9, "abcd    x" ; "a tab on a stop spans a whole one")]
     fn tabs_expand_to_the_next_stop(text: &str, h_scroll: usize, width: usize, expected: &str) {
-        assert_eq!(painted(&plain(text), h_scroll, width), expected, "{WRONG_TEXT}");
+        assert_eq!(
+            painted(&plain(text), h_scroll, width),
+            expected,
+            "{WRONG_TEXT}"
+        );
     }
 
     #[test_case(0, 4, "中文" ; "a wide glyph prints whole when it fits")]
     #[test_case(0, 3, "中 " ; "a wide glyph cut by the window becomes a blank")]
     #[test_case(1, 3, " 文" ; "scrolling into a wide glyph leaves its second column")]
     fn wide_glyphs_never_overflow_the_window(h_scroll: usize, width: usize, expected: &str) {
-        assert_eq!(painted(&plain("中文"), h_scroll, width), expected, "{WRONG_TEXT}");
+        assert_eq!(
+            painted(&plain("中文"), h_scroll, width),
+            expected,
+            "{WRONG_TEXT}"
+        );
     }
 
     #[test_case("abc", 0, 0 ; "the start of a line is column zero")]
@@ -248,7 +273,11 @@ mod tests {
     #[test_case("中文", 2 ; "a wide line round trips")]
     fn display_column_and_char_index_are_inverses(line: &str, count: usize) {
         for col in 0..=count {
-            assert_eq!(char_index(line, display_column(line, col)), col, "{WRONG_COLUMN}");
+            assert_eq!(
+                char_index(line, display_column(line, col)),
+                col,
+                "{WRONG_COLUMN}"
+            );
         }
     }
 

@@ -5,10 +5,10 @@ mod instructions;
 mod provider_projection;
 mod run;
 mod streaming;
-mod title;
-mod tool_preview;
 pub mod subagent;
+mod title;
 pub mod tool_dispatch;
+mod tool_preview;
 
 pub use compaction::compact;
 pub use goal::{

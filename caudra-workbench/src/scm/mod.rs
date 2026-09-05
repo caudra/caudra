@@ -483,7 +483,8 @@ mod tests {
         ]);
         scm.move_selection(1);
         let previous = scm.selected_path();
-        scm.changes.insert(0, change("staged.rs", true, GitMark::Added));
+        scm.changes
+            .insert(0, change("staged.rs", true, GitMark::Added));
         scm.rebuild(previous);
         assert_eq!(
             scm.selected_change().map(|c| c.relative.as_str()),
@@ -520,7 +521,11 @@ mod tests {
             Some(GitMark::Modified),
             "{MARK_WRONG}"
         );
-        assert_eq!(marks(&PathBuf::from("/repo/other.rs")), None, "{MARK_WRONG}");
+        assert_eq!(
+            marks(&PathBuf::from("/repo/other.rs")),
+            None,
+            "{MARK_WRONG}"
+        );
     }
 
     #[test]

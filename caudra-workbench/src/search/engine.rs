@@ -233,7 +233,8 @@ impl HitSink<'_> {
         let at = self.matcher.find(bytes).ok().flatten();
         let range = at.map_or((0, 0), |at| {
             (
-                text.get(..at.start()).map_or(0, |head| head.chars().count()),
+                text.get(..at.start())
+                    .map_or(0, |head| head.chars().count()),
                 text.get(..at.end()).map_or(0, |head| head.chars().count()),
             )
         });
@@ -376,7 +377,11 @@ mod tests {
         let hit = hits.first().expect("a hit");
         assert_eq!(hit.line, 2, "{WRONG_LINE}");
         assert_eq!(hit.text, "let needle = 1;", "{WRONG_LINE}");
-        assert_eq!(&hit.text[hit.range.0..hit.range.1], "needle", "{WRONG_RANGE}");
+        assert_eq!(
+            &hit.text[hit.range.0..hit.range.1],
+            "needle",
+            "{WRONG_RANGE}"
+        );
     }
 
     #[test]
@@ -461,7 +466,10 @@ mod tests {
     #[test]
     fn an_overlong_line_keeps_the_match_visible() {
         let padding = "x".repeat(MAX_LINE_CHARS * 2);
-        let (text, range) = clamp(&format!("{padding}needle"), (padding.len(), padding.len() + 6));
+        let (text, range) = clamp(
+            &format!("{padding}needle"),
+            (padding.len(), padding.len() + 6),
+        );
         assert!(text.chars().count() <= MAX_LINE_CHARS, "{WRONG_RANGE}");
         assert_eq!(&text[range.0..range.1], "needle", "{WRONG_RANGE}");
     }
@@ -469,6 +477,9 @@ mod tests {
     #[test_case("" ; "empty")]
     #[test_case("  ,  " ; "only separators")]
     fn a_blank_include_filters_nothing(include: &str) {
-        assert!(build_globs(include).expect("a glob set").is_none(), "{LEAKED}");
+        assert!(
+            build_globs(include).expect("a glob set").is_none(),
+            "{LEAKED}"
+        );
     }
 }

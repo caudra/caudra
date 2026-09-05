@@ -163,7 +163,10 @@ fn response_text(message: &Message) -> String {
 
 fn clean(raw: &str) -> Option<String> {
     let stripped = strip_thinking(raw);
-    let line = stripped.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = stripped
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
     let title = truncate_title(&normalize_title(line));
     (!title.is_empty()).then_some(title)
 }

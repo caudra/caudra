@@ -79,7 +79,9 @@ impl Find {
     }
 
     pub fn step(&mut self, delta: isize) -> Option<Match> {
-        let len = isize::try_from(self.matches.len()).ok().filter(|n| *n > 0)?;
+        let len = isize::try_from(self.matches.len())
+            .ok()
+            .filter(|n| *n > 0)?;
         let current = isize::try_from(self.current.unwrap_or_default()).unwrap_or_default();
         let next = (current + delta).rem_euclid(len);
         self.current = usize::try_from(next).ok();
@@ -201,7 +203,15 @@ mod tests {
         let mut find = Find::default();
         find.set_query("a".to_owned(), &rows, Cursor::new(1, 0));
 
-        assert_eq!(find.current(), Some(Match { line: 1, start: 0, end: 1 }), "{WRONG_CURRENT}");
+        assert_eq!(
+            find.current(),
+            Some(Match {
+                line: 1,
+                start: 0,
+                end: 1
+            }),
+            "{WRONG_CURRENT}"
+        );
         assert_eq!(find.position(), Some((2, 3)), "{WRONG_POSITION}");
     }
 
@@ -211,7 +221,15 @@ mod tests {
         let mut find = Find::default();
         find.set_query("a".to_owned(), &rows, Cursor::new(1, 0));
 
-        assert_eq!(find.current(), Some(Match { line: 0, start: 0, end: 1 }), "{WRONG_CURRENT}");
+        assert_eq!(
+            find.current(),
+            Some(Match {
+                line: 0,
+                start: 0,
+                end: 1
+            }),
+            "{WRONG_CURRENT}"
+        );
     }
 
     #[test_case(1, &[1, 2, 0] ; "forward wraps past the end")]
@@ -239,7 +257,15 @@ mod tests {
 
         find.refresh(&lines(&["x", "a", "a"]));
 
-        assert_eq!(find.current(), Some(Match { line: 1, start: 0, end: 1 }), "{WRONG_CURRENT}");
+        assert_eq!(
+            find.current(),
+            Some(Match {
+                line: 1,
+                start: 0,
+                end: 1
+            }),
+            "{WRONG_CURRENT}"
+        );
         assert_eq!(find.position(), Some((1, 2)), "{WRONG_POSITION}");
     }
 
@@ -248,7 +274,15 @@ mod tests {
         let mut find = search("a", &["x", "a"]);
         find.refresh(&lines(&["a", "x"]));
 
-        assert_eq!(find.current(), Some(Match { line: 0, start: 0, end: 1 }), "{WRONG_CURRENT}");
+        assert_eq!(
+            find.current(),
+            Some(Match {
+                line: 0,
+                start: 0,
+                end: 1
+            }),
+            "{WRONG_CURRENT}"
+        );
     }
 
     #[test]

@@ -134,10 +134,7 @@ impl Tree {
             return;
         }
         let last = self.rows.len() - 1;
-        self.selected = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(last);
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
     pub fn select_first(&mut self) {
@@ -427,7 +424,10 @@ mod tests {
     fn an_ignored_directory_appears_only_when_hidden_files_are_shown() {
         let tmp = fixture();
         let tree = Tree::new(tmp.path(), false);
-        assert!(!names(&tree).contains(&"target".to_owned()), "{IGNORED_HIDDEN}");
+        assert!(
+            !names(&tree).contains(&"target".to_owned()),
+            "{IGNORED_HIDDEN}"
+        );
 
         let tree = Tree::new(tmp.path(), true);
         assert!(names(&tree).contains(&"target".to_owned()));

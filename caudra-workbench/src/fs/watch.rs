@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use flume::Receiver;
 use notify::event::ModifyKind;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Result as Watched, Watcher as _};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Result as Watched, Watcher as _,
+};
 
 use crate::fs::tree::GIT_DIR;
 
@@ -65,7 +67,10 @@ impl Settle {
     }
 
     fn take(&mut self, now: Instant) -> Changes {
-        if self.since.is_none_or(|since| now.duration_since(since) < SETTLE) {
+        if self
+            .since
+            .is_none_or(|since| now.duration_since(since) < SETTLE)
+        {
             return Changes::default();
         }
         self.since = None;
@@ -113,9 +118,9 @@ fn fold(events: impl Iterator<Item = Event>) -> Changes {
     let mut changes = Changes::default();
     for event in events {
         let structural = match event.kind {
-            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => {
-                true
-            }
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_)) => true,
             EventKind::Modify(_) => false,
             _ => continue,
         };
@@ -150,7 +155,8 @@ mod tests {
 
     const NOT_LISTED: &str = "a path that changed is missing from the drained set";
     const WRONG_SHAPE: &str = "the tree was told the wrong thing about its shape";
-    const GIT_LEAKED: &str = "a path under .git was reported as a file rather than as repository state";
+    const GIT_LEAKED: &str =
+        "a path under .git was reported as a file rather than as repository state";
     const TOO_EAGER: &str = "a burst was reported before the tree went quiet";
     const HELD_BACK: &str = "a settled burst was not reported";
 
@@ -171,7 +177,10 @@ mod tests {
     #[test]
     fn a_written_file_is_listed_without_disturbing_the_tree() {
         let changes = drained(vec![event(CONTENT, "/root/a.rs")]);
-        assert!(changes.files.contains(&PathBuf::from("/root/a.rs")), "{NOT_LISTED}");
+        assert!(
+            changes.files.contains(&PathBuf::from("/root/a.rs")),
+            "{NOT_LISTED}"
+        );
         assert!(!changes.structural, "{WRONG_SHAPE}");
         assert!(!changes.git, "{GIT_LEAKED}");
     }
@@ -180,13 +189,19 @@ mod tests {
     #[test_case(REMOVED ; "removed")]
     #[test_case(RENAMED ; "renamed")]
     fn an_entry_appearing_or_leaving_makes_the_tree_stale(kind: EventKind) {
-        assert!(drained(vec![event(kind, "/root/a.rs")]).structural, "{WRONG_SHAPE}");
+        assert!(
+            drained(vec![event(kind, "/root/a.rs")]).structural,
+            "{WRONG_SHAPE}"
+        );
     }
 
     #[test_case(CONTENT ; "written")]
     #[test_case(CHMOD ; "chmod")]
     fn a_change_in_place_leaves_the_tree_alone(kind: EventKind) {
-        assert!(!drained(vec![event(kind, "/root/a.rs")]).structural, "{WRONG_SHAPE}");
+        assert!(
+            !drained(vec![event(kind, "/root/a.rs")]).structural,
+            "{WRONG_SHAPE}"
+        );
     }
 
     #[test]
@@ -213,7 +228,10 @@ mod tests {
     fn nothing_happening_drains_as_nothing() {
         assert!(drained(Vec::new()).is_empty(), "{NOT_LISTED}");
         assert!(
-            drained(vec![Event::new(EventKind::Access(notify::event::AccessKind::Read))]).is_empty(),
+            drained(vec![Event::new(EventKind::Access(
+                notify::event::AccessKind::Read
+            ))])
+            .is_empty(),
             "{NOT_LISTED}"
         );
     }
@@ -226,7 +244,10 @@ mod tests {
         assert!(settle.take(start + SETTLE / 2).is_empty(), "{TOO_EAGER}");
 
         settle.absorb(drained(vec![event(CONTENT, "/root/b.rs")]), start + SETTLE);
-        assert!(settle.take(start + SETTLE * 3 / 2).is_empty(), "{TOO_EAGER}");
+        assert!(
+            settle.take(start + SETTLE * 3 / 2).is_empty(),
+            "{TOO_EAGER}"
+        );
 
         let changes = settle.take(start + SETTLE * 2);
         assert_eq!(changes.files.len(), 2, "{HELD_BACK}");

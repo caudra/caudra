@@ -107,7 +107,11 @@ mod tests {
     #[test]
     fn a_replaced_line_renders_a_removal_and_an_addition() {
         let diff = unified("a\nb\nc\n", "a\nB\nc\n");
-        assert_eq!(diff.kinds.first(), Some(&DiffKind::Header), "{HEADER_FIRST}");
+        assert_eq!(
+            diff.kinds.first(),
+            Some(&DiffKind::Header),
+            "{HEADER_FIRST}"
+        );
         let rows = body(&diff);
         assert!(rows.contains(&("-b", DiffKind::Removed)), "{PREFIX_WRONG}");
         assert!(rows.contains(&("+B", DiffKind::Added)), "{PREFIX_WRONG}");
@@ -124,7 +128,11 @@ mod tests {
     fn a_new_file_is_all_additions() {
         let diff = unified("", "hello\nworld\n");
         let kinds: Vec<DiffKind> = diff.kinds.iter().skip(1).copied().collect();
-        assert_eq!(kinds, vec![DiffKind::Added, DiffKind::Added], "{PREFIX_WRONG}");
+        assert_eq!(
+            kinds,
+            vec![DiffKind::Added, DiffKind::Added],
+            "{PREFIX_WRONG}"
+        );
     }
 
     #[test]
@@ -141,7 +149,9 @@ mod tests {
     #[test]
     fn distant_edits_produce_separate_hunks() {
         let old: String = (0..40).map(|line| format!("line {line}\n")).collect();
-        let new = old.replace("line 1\n", "changed 1\n").replace("line 38\n", "changed 38\n");
+        let new = old
+            .replace("line 1\n", "changed 1\n")
+            .replace("line 38\n", "changed 38\n");
         let headers = unified(&old, &new)
             .kinds
             .iter()

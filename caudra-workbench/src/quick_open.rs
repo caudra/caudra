@@ -192,7 +192,10 @@ mod tests {
     #[test]
     fn directories_are_not_offered() {
         let (_tmp, palette) = opened();
-        assert!(!rows(&palette).iter().any(|row| row == "src"), "{NOT_FOUND}");
+        assert!(
+            !rows(&palette).iter().any(|row| row == "src"),
+            "{NOT_FOUND}"
+        );
     }
 
     #[test]
@@ -211,7 +214,9 @@ mod tests {
         palette.set_query("srmain".to_owned());
 
         assert!(
-            rows(&palette).first().is_some_and(|row| row.ends_with("main.rs")),
+            rows(&palette)
+                .first()
+                .is_some_and(|row| row.ends_with("main.rs")),
             "{WRONG_ORDER}"
         );
     }

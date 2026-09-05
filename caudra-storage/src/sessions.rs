@@ -1266,8 +1266,7 @@ mod tests {
     const MSG_RECORD: &str = "msg";
     const META_RECORD: &str = "meta";
     const LONG_TITLE: &str = "This is a very long title that exceeds the one hundred character cap and should therefore be truncated at a word boundary";
-    const LONG_TITLE_TRUNCATED: &str =
-        "This is a very long title that exceeds the one hundred character cap and should therefore be…";
+    const LONG_TITLE_TRUNCATED: &str = "This is a very long title that exceeds the one hundred character cap and should therefore be…";
     const MODEL_TITLE: &str = "Session title from a small model";
     const RENAMED_TITLE: &str = "Renamed by hand";
     const TITLE_PROMPT: &str = "add refresh token support";

@@ -81,10 +81,7 @@ pub fn render_line(buf: &mut Buffer, area: Rect, line: Line<'_>) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let row = Rect {
-        height: 1,
-        ..area
-    };
+    let row = Rect { height: 1, ..area };
     line.render(row, buf);
 }
 
@@ -96,7 +93,10 @@ pub fn status_line<'a>(
     width: u16,
     style: Style,
 ) -> Line<'a> {
-    let left_width: usize = left.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    let left_width: usize = left
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     let right_width: usize = right
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
@@ -133,7 +133,10 @@ mod tests {
     #[test_case("mixed日本語text", 7 ; "mixed_widths")]
     fn an_overlong_string_is_cut_to_width(text: &str, width: usize) {
         let cut = fit(text, width);
-        assert!(UnicodeWidthStr::width(cut.as_str()) <= width, "{WITHIN_BUDGET}");
+        assert!(
+            UnicodeWidthStr::width(cut.as_str()) <= width,
+            "{WITHIN_BUDGET}"
+        );
         assert!(cut.ends_with(ELLIPSIS), "a cut string must say it was cut");
     }
 
@@ -146,8 +149,14 @@ mod tests {
     #[test]
     fn fit_end_keeps_the_filename() {
         let cut = fit_end("caudra-ui/src/components/keybindings.rs", 20);
-        assert!(UnicodeWidthStr::width(cut.as_str()) <= 20, "{WITHIN_BUDGET}");
+        assert!(
+            UnicodeWidthStr::width(cut.as_str()) <= 20,
+            "{WITHIN_BUDGET}"
+        );
         assert!(cut.ends_with("keybindings.rs"), "{KEEPS_TAIL}");
-        assert!(cut.starts_with(ELLIPSIS), "a cut string must say it was cut");
+        assert!(
+            cut.starts_with(ELLIPSIS),
+            "a cut string must say it was cut"
+        );
     }
 }

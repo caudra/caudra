@@ -237,7 +237,11 @@ mod tests {
         let view = hl.segments(&lines, 0, 20);
 
         for (rendered, original) in text(&view).iter().zip(&lines) {
-            assert_eq!(rendered.trim_end_matches('\n'), original, "{SPANS_WHOLE_LINE}");
+            assert_eq!(
+                rendered.trim_end_matches('\n'),
+                original,
+                "{SPANS_WHOLE_LINE}"
+            );
         }
     }
 

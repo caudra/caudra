@@ -8,11 +8,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use gix::Repository;
 use gix::bstr::{BStr, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::tree_index::TrackRenames;
-use gix::Repository;
 
 use crate::fs::tree::GitMark;
 
@@ -189,7 +189,8 @@ impl Repo {
             Ok(metadata) => {
                 let id = repo
                     .write_blob_stream(
-                        fs::File::open(&path).map_err(|error| ScmError::Write(error.to_string()))?,
+                        fs::File::open(&path)
+                            .map_err(|error| ScmError::Write(error.to_string()))?,
                     )
                     .map_err(|error| ScmError::Write(error.to_string()))?
                     .detach();
@@ -274,10 +275,7 @@ impl Repo {
             true => repo
                 .open_index()
                 .map_err(|error| ScmError::Write(error.to_string()))?,
-            false => gix::index::File::from_state(
-                gix::index::State::new(repo.object_hash()),
-                path,
-            ),
+            false => gix::index::File::from_state(gix::index::State::new(repo.object_hash()), path),
         };
         // The cached tree describes the index as it was; leaving it behind
         // would let the next reader answer from a tree that no longer matches.
@@ -324,7 +322,11 @@ impl Repo {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
-    fn index_blob_bytes(&self, repo: &Repository, path: &BStr) -> Result<Option<Vec<u8>>, ScmError> {
+    fn index_blob_bytes(
+        &self,
+        repo: &Repository,
+        path: &BStr,
+    ) -> Result<Option<Vec<u8>>, ScmError> {
         let index = repo
             .index_or_empty()
             .map_err(|error| ScmError::Read(error.to_string()))?;
@@ -606,4 +608,3 @@ mod tests {
         );
     }
 }
-

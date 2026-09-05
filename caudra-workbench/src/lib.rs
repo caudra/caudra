@@ -28,8 +28,8 @@ use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
 use editor::Editor;
-use editor::buffer::Cursor;
 use editor::Tab;
+use editor::buffer::Cursor;
 use fs::tree::Tree;
 use fs::watch::Watch;
 use quick_open::QuickOpen;
@@ -47,8 +47,7 @@ const SIDEBAR_STEP: i16 = 2;
 const STAGED: &str = "index";
 const WORKING: &str = "worktree";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SidebarView {
     #[default]
@@ -354,7 +353,11 @@ impl Workbench {
             }
             _ => return WorkbenchAction::Passthrough,
         };
-        if self.panes.sidebar.is_some_and(|rect| rect.contains(at.into())) {
+        if self
+            .panes
+            .sidebar
+            .is_some_and(|rect| rect.contains(at.into()))
+        {
             let rows = self.sidebar_rows();
             match self.sidebar {
                 SidebarView::Explorer => self.tree.scroll_by(delta, rows),
@@ -380,7 +383,11 @@ impl Workbench {
             }
             return;
         }
-        if self.panes.sidebar.is_some_and(|rect| rect.contains(position)) {
+        if self
+            .panes
+            .sidebar
+            .is_some_and(|rect| rect.contains(position))
+        {
             let header = self.panes.sidebar.map_or(0, |rect| rect.y + 1);
             self.focus = Focus::Sidebar;
             if at.1 >= header {
@@ -1118,8 +1125,7 @@ mod tests {
     /// Paints one frame and hands back what it says, which is also what fills
     /// in the pane geometry the mouse tests measure against.
     fn draw(workbench: &mut Workbench, width: u16, height: u16) -> String {
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
         terminal
             .draw(|frame| workbench.view(frame, frame.area()))
             .expect("a frame");
@@ -1280,7 +1286,13 @@ mod tests {
 
         workbench.handle_key(key(KeyCode::Enter));
         assert_eq!(
-            workbench.editor.active().expect(NO_TAB).buffer.cursor().line,
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .buffer
+                .cursor()
+                .line,
             2,
             "Enter must step to the next match"
         );
@@ -1301,8 +1313,20 @@ mod tests {
         workbench.handle_key(key(KeyCode::Char('3')));
         workbench.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(workbench.editor.active().expect(NO_TAB).buffer.cursor().line, 2);
-        assert!(workbench.goto.is_none(), "the prompt must close after a jump");
+        assert_eq!(
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .buffer
+                .cursor()
+                .line,
+            2
+        );
+        assert!(
+            workbench.goto.is_none(),
+            "the prompt must close after a jump"
+        );
     }
 
     #[test]
@@ -1320,7 +1344,10 @@ mod tests {
 
         let cut = workbench.handle_key(KeyEvent::new(keys::CUT.code, KeyModifiers::CONTROL));
         assert!(matches!(cut, WorkbenchAction::Copy(text) if text.starts_with("one")));
-        assert_eq!(workbench.editor.active().expect(NO_TAB).buffer.line_count(), 1);
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).buffer.line_count(),
+            1
+        );
 
         workbench.handle_key(KeyEvent::new(keys::PASTE.code, KeyModifiers::CONTROL));
         assert_eq!(
@@ -1431,7 +1458,10 @@ mod tests {
 
         workbench.handle_key(key(KeyCode::Enter));
 
-        assert!(!workbench.palette.is_open(), "choosing must close the palette");
+        assert!(
+            !workbench.palette.is_open(),
+            "choosing must close the palette"
+        );
         assert_eq!(workbench.active_title(), "b.txt", "{NO_TAB}");
         assert_eq!(
             workbench.editor.active().expect(NO_TAB).path,
@@ -1459,14 +1489,26 @@ mod tests {
         let (dir, mut workbench) = project();
         fs::write(dir.path().join(".secret"), "").expect("a hidden file");
         workbench.tree.reload();
-        assert!(!workbench.tree.rows().iter().any(|row| row.name == ".secret"));
+        assert!(
+            !workbench
+                .tree
+                .rows()
+                .iter()
+                .any(|row| row.name == ".secret")
+        );
 
         workbench.handle_key(KeyEvent::new(
             keys::TOGGLE_HIDDEN.code,
             KeyModifiers::CONTROL,
         ));
 
-        assert!(workbench.tree.rows().iter().any(|row| row.name == ".secret"));
+        assert!(
+            workbench
+                .tree
+                .rows()
+                .iter()
+                .any(|row| row.name == ".secret")
+        );
     }
 
     #[test_case(30 ; "very_narrow")]
@@ -1847,11 +1889,7 @@ mod tests {
             separator.y,
         ));
 
-        assert_eq!(
-            workbench.sidebar_width,
-            separator.x + 10,
-            "{WRONG_WIDTH}"
-        );
+        assert_eq!(workbench.sidebar_width, separator.x + 10, "{WRONG_WIDTH}");
     }
 
     #[test]
@@ -1903,7 +1941,12 @@ mod tests {
         let (_dir, mut workbench) = repository();
         workbench.handle_key(key(keys::OPEN_DIFF.code));
         assert!(
-            workbench.editor.active().expect("a tab").diff_kinds().is_some(),
+            workbench
+                .editor
+                .active()
+                .expect("a tab")
+                .diff_kinds()
+                .is_some(),
             "{WRONG_LAYOUT}"
         );
 
