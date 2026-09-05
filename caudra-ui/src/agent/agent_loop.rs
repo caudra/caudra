@@ -11,7 +11,7 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::{
-    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+    DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry,
 };
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -45,6 +45,7 @@ pub(super) struct AgentLoop {
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
+    path_locks: Arc<PathLocks>,
     min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
@@ -113,6 +114,7 @@ impl AgentLoop {
             init_cancel,
             permissions,
             file_tracker: FileReadTracker::fresh(),
+            path_locks: PathLocks::fresh(),
             min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
@@ -430,6 +432,7 @@ impl AgentLoop {
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
+                path_locks: Arc::clone(&self.path_locks),
                 prompt_slots: Arc::new(prompt_slots),
                 prompt_profiles: Arc::clone(&self.prompt_profiles),
                 system_prompt_profile_name: Arc::from(

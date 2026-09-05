@@ -31,7 +31,8 @@ use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use crate::template;
 use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
+    DescriptionContext, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolFilter,
+    ToolRegistry,
 };
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -812,6 +813,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
+                    path_locks: PathLocks::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     prompt_profiles: Arc::clone(&params.prompt_profiles),
                     system_prompt_profile_name,
@@ -1030,6 +1032,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
+    let path_locks = PathLocks::fresh();
 
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
@@ -1162,6 +1165,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                         mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
+                        path_locks: Arc::clone(&path_locks),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         prompt_profiles: Arc::clone(&params.prompt_profiles),
                         system_prompt_profile_name: Arc::from(

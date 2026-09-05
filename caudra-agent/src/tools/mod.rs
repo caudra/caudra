@@ -9,10 +9,12 @@ mod file_tracker;
 pub mod grep;
 pub mod interpreter_bridge;
 pub mod native;
+mod path_locks;
 pub mod registry;
 pub mod schema;
 
-pub use file_tracker::FileReadTracker;
+pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
+pub use path_locks::{PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
     PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolEffect,
@@ -413,6 +415,10 @@ pub struct ToolContext {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: caudra_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    /// Serializes tool calls that declare the same file. Unlike `file_tracker`,
+    /// a subagent inherits its parent's handle: staleness is per-agent, but two
+    /// concurrent agents must not write one file at once.
+    pub path_locks: Arc<PathLocks>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     pub system_prompt_profile_name: Arc<str>,
@@ -673,6 +679,8 @@ pub fn interpreter_ctx(
         permissions,
         timeouts: caudra_providers::Timeouts::default(),
         file_tracker,
+        // Every caller is a one-shot or a test, so nothing shares these.
+        path_locks: PathLocks::fresh(),
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
         system_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),

@@ -248,7 +248,7 @@ async fn run_inner(
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
 
-        for target in mutation_targets {
+        for target in &mutation_targets {
             let is_plan_target = ctx
                 .mode
                 .plan_path()
@@ -262,7 +262,7 @@ async fn run_inner(
                     );
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
-                if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
+                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
                     return done_error(reason);
                 }
             }
@@ -297,6 +297,17 @@ async fn run_inner(
         emit.deliver(ctx, start);
 
         invocation.start(ctx).await;
+
+        // Taken after the permission verdict, so a prompt never blocks a
+        // sibling's write, and after the start event, so a call waiting on a
+        // contended file still renders as a running row. Held across execute:
+        // a tool's own stale check, write, and mtime record must not interleave
+        // with a concurrent call naming the same file. Not gated on
+        // `stale_read_check`; turning that off must not re-enable clobbering.
+        let _guards = ctx
+            .path_locks
+            .acquire(&mutation_targets, &invocation.read_targets(ctx))
+            .await;
 
         let result = invocation.execute(ctx).await;
 

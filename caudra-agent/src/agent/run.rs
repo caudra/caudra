@@ -26,7 +26,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
+use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, QueueConsumedItem, SessionMailbox, SubagentHistoryStore,
@@ -88,6 +88,7 @@ pub struct AgentParams {
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: caudra_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    pub path_locks: Arc<PathLocks>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     pub system_prompt_profile_name: Arc<str>,
@@ -135,6 +136,7 @@ pub struct Agent<'h> {
     mailbox: Option<SessionMailbox>,
     timeouts: caudra_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
+    path_locks: Arc<PathLocks>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     system_prompt_profile_name: Arc<str>,
@@ -185,6 +187,7 @@ impl<'h> Agent<'h> {
             root_tool_use_id: params.root_tool_use_id,
             mailbox: params.mailbox,
             file_tracker: params.file_tracker,
+            path_locks: params.path_locks,
             prompt_slots: params.prompt_slots,
             prompt_profiles: params.prompt_profiles,
             system_prompt_profile_name: params.system_prompt_profile_name,
@@ -910,6 +913,7 @@ impl<'h> Agent<'h> {
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
+            path_locks: Arc::clone(&self.path_locks),
             prompt_slots: Arc::clone(&self.prompt_slots),
             prompt_profiles: Arc::clone(&self.prompt_profiles),
             system_prompt_profile_name: Arc::clone(&self.system_prompt_profile_name),
@@ -1359,6 +1363,7 @@ mod tests {
                 mailbox: None,
                 timeouts: caudra_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
+                path_locks: PathLocks::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
                 system_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),

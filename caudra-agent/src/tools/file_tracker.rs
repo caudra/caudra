@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use tracing::warn;
 
-const STALE_READ_MSG: &str = "file changed since last read";
+pub const STALE_READ_MSG: &str = "file changed since last read";
 
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
 
@@ -14,7 +14,10 @@ fn get_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
+/// Shared with `path_locks` so a path keys identically in the tracker and in
+/// the lock map: canonicalize when the file exists, keep the path as given when
+/// it does not (a `file_write` creating a new file still needs a stable key).
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

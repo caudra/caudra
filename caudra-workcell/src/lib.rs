@@ -545,6 +545,7 @@ struct PreparedInvocation {
     intent: PermissionIntent,
     execution: PreparedExecution,
     mutation_targets: Vec<PathBuf>,
+    read_targets: Vec<PathBuf>,
 }
 
 struct WorkcellInvocation {
@@ -663,7 +664,6 @@ impl WorkcellInvocation {
                         Ok::<_, String>((groups.files, resource))
                     })
                     .await??;
-                check_stale(ctx, std::slice::from_ref(&resource.path))?;
                 let mut authorized = input.clone();
                 authorized.file_path = resource.path.to_string_lossy().into_owned();
                 file_prepared(
@@ -690,7 +690,6 @@ impl WorkcellInvocation {
                         Ok::<_, String>((groups.files, resource))
                     })
                     .await??;
-                check_stale(ctx, std::slice::from_ref(&resource.path))?;
                 let mut authorized = input.clone();
                 authorized.file_path = resource.path.to_string_lossy().into_owned();
                 file_prepared(
@@ -718,17 +717,6 @@ impl WorkcellInvocation {
                     })
                     .await??;
                 let resources = patch.resources().to_vec();
-                let stale_paths = resources
-                    .iter()
-                    .filter(|resource| {
-                        matches!(
-                            resource.access,
-                            FileResourceAccess::ReadWrite | FileResourceAccess::Delete
-                        )
-                    })
-                    .map(|resource| resource.path.clone())
-                    .collect::<Vec<_>>();
-                check_stale(ctx, &stale_paths)?;
                 file_patch_prepared(resources, &project, group, patch)
             }
             Input::Index(input) => {
@@ -769,6 +757,7 @@ impl WorkcellInvocation {
                     intent,
                     execution: PreparedExecution::Websearch(prepared),
                     mutation_targets: Vec::new(),
+                    read_targets: Vec::new(),
                 }
             }
             Input::Webfetch(input) => {
@@ -794,6 +783,7 @@ impl WorkcellInvocation {
                     intent,
                     execution: PreparedExecution::Webfetch(prepared),
                     mutation_targets: Vec::new(),
+                    read_targets: Vec::new(),
                 }
             }
             Input::Shell(input) => {
@@ -852,6 +842,15 @@ impl WorkcellInvocation {
             .take()
             .ok_or_else(|| "Workcell invocation preparation was already consumed".into())
     }
+
+    fn prepared_targets(&self, select: impl Fn(&PreparedInvocation) -> &[PathBuf]) -> Vec<PathBuf> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|prepared| select(prepared).to_vec())
+            .unwrap_or_default()
+    }
 }
 
 /// A bare pattern says nothing about where it ran, and the search root is the
@@ -899,12 +898,11 @@ impl ToolInvocation for WorkcellInvocation {
     }
 
     fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
-        self.prepared
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|prepared| prepared.mutation_targets.clone())
-            .unwrap_or_default()
+        self.prepared_targets(|prepared| &prepared.mutation_targets)
+    }
+
+    fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+        self.prepared_targets(|prepared| &prepared.read_targets)
     }
 
     fn blocked_in_plan_mode(&self) -> bool {
@@ -1215,15 +1213,15 @@ fn file_prepared(
     input: Input,
     input_pointers: &[&str],
 ) -> PreparedInvocation {
-    let (scopes, permission_resources, mutation_targets) = file_permissions(&resources, project);
-    let mutation = !mutation_targets.is_empty();
+    let permissions = file_permissions(&resources, project);
+    let mutation = !permissions.mutation_targets.is_empty();
     PreparedInvocation {
         intent: PermissionIntent::new(
             PermissionScopes {
-                scopes,
+                scopes: permissions.scopes,
                 force_prompt: false,
             },
-            permission_resources,
+            permissions.resources,
             if mutation {
                 PermissionRisk::High
             } else {
@@ -1237,7 +1235,8 @@ fn file_prepared(
                 .collect(),
         }),
         execution: PreparedExecution::File(group, input),
-        mutation_targets,
+        mutation_targets: permissions.mutation_targets,
+        read_targets: permissions.read_targets,
     }
 }
 
@@ -1246,15 +1245,14 @@ fn index_prepared(
     project: &Path,
     group: FileToolGroup,
 ) -> PreparedInvocation {
-    let (scopes, permission_resources, _) =
-        file_permissions(std::slice::from_ref(&resource), project);
+    let permissions = file_permissions(std::slice::from_ref(&resource), project);
     PreparedInvocation {
         intent: PermissionIntent::new(
             PermissionScopes {
-                scopes,
+                scopes: permissions.scopes,
                 force_prompt: false,
             },
-            permission_resources,
+            permissions.resources,
             PermissionRisk::Low,
         )
         .with_authority(PermissionAuthorityProfile::Filesystem {
@@ -1262,6 +1260,7 @@ fn index_prepared(
         }),
         execution: PreparedExecution::Index(group, resource),
         mutation_targets: Vec::new(),
+        read_targets: permissions.read_targets,
     }
 }
 
@@ -1271,15 +1270,15 @@ fn file_patch_prepared(
     group: FileToolGroup,
     patch: PreparedFilePatch,
 ) -> PreparedInvocation {
-    let (scopes, permission_resources, mutation_targets) = file_permissions(&resources, project);
+    let permissions = file_permissions(&resources, project);
     PreparedInvocation {
         intent: PermissionIntent::new(
             PermissionScopes {
-                scopes,
+                scopes: permissions.scopes,
                 force_prompt: false,
             },
-            permission_resources,
-            if mutation_targets.is_empty() {
+            permissions.resources,
+            if permissions.mutation_targets.is_empty() {
                 PermissionRisk::Low
             } else {
                 PermissionRisk::High
@@ -1289,31 +1288,43 @@ fn file_patch_prepared(
             input_pointers: Vec::new(),
         }),
         execution: PreparedExecution::FilePatch(group, patch),
-        mutation_targets,
+        mutation_targets: permissions.mutation_targets,
+        read_targets: permissions.read_targets,
     }
 }
 
-fn file_permissions(
-    resources: &[FileResource],
-    project: &Path,
-) -> (Vec<String>, Vec<PermissionResource>, Vec<PathBuf>) {
+struct FilePermissions {
+    scopes: Vec<String>,
+    resources: Vec<PermissionResource>,
+    mutation_targets: Vec<PathBuf>,
+    read_targets: Vec<PathBuf>,
+}
+
+fn file_permissions(resources: &[FileResource], project: &Path) -> FilePermissions {
     let mut scopes = Vec::with_capacity(resources.len());
     let mut permission_resources = Vec::with_capacity(resources.len());
     let mut mutation_targets = Vec::new();
+    let mut read_targets = Vec::new();
     for resource in resources {
-        let (kind, access, mutation) = match resource.access {
-            FileResourceAccess::Read => (
-                if resource.path.is_dir() {
-                    PermissionResourceKind::Directory
-                } else {
-                    PermissionResourceKind::File
-                },
+        // `whole_file_read` is decided here rather than from `kind` below,
+        // which the permission resource takes ownership of.
+        let (kind, access, mutation, whole_file_read) = match resource.access {
+            FileResourceAccess::Read if resource.path.is_dir() => (
+                PermissionResourceKind::Directory,
                 PermissionResourceAccess::Read,
                 false,
+                false,
+            ),
+            FileResourceAccess::Read => (
+                PermissionResourceKind::File,
+                PermissionResourceAccess::Read,
+                false,
+                true,
             ),
             FileResourceAccess::Traverse => (
                 PermissionResourceKind::Directory,
                 PermissionResourceAccess::Search,
+                false,
                 false,
             ),
             FileResourceAccess::Write
@@ -1322,6 +1333,7 @@ fn file_permissions(
                 PermissionResourceKind::File,
                 PermissionResourceAccess::Write,
                 true,
+                false,
             ),
         };
         let value = resource.path.to_string_lossy().into_owned();
@@ -1338,11 +1350,22 @@ fn file_permissions(
         ));
         if mutation {
             mutation_targets.push(resource.path.clone());
+        } else if whole_file_read {
+            // Whole-file reads only. A directory is too coarse to lock, and a
+            // search reports matches this call cannot name in advance.
+            read_targets.push(resource.path.clone());
         }
     }
     mutation_targets.sort();
     mutation_targets.dedup();
-    (scopes, permission_resources, mutation_targets)
+    read_targets.sort();
+    read_targets.dedup();
+    FilePermissions {
+        scopes,
+        resources: permission_resources,
+        mutation_targets,
+        read_targets,
+    }
 }
 
 fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvocation {
@@ -1404,7 +1427,10 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
         )
         .with_authority(PermissionAuthorityProfile::Shell),
         execution: PreparedExecution::Shell(group, shell),
+        // A command's writes are not knowable from its text, so shell neither
+        // takes guards nor invalidates the tracker.
         mutation_targets: Vec::new(),
+        read_targets: Vec::new(),
     }
 }
 
@@ -1522,6 +1548,7 @@ fn exact_custom_prepared(
         ),
         execution: PreparedExecution::None,
         mutation_targets: Vec::new(),
+        read_targets: Vec::new(),
     }
 }
 
@@ -3121,6 +3148,59 @@ mod tests {
             Some(PermissionResourceAccess::Write)
         );
         assert!(!invocation.mutation_targets(&ctx).is_empty());
+        assert!(
+            invocation.read_targets(&ctx).is_empty(),
+            "{EXPECT_NO_DOUBLE_GUARD}"
+        );
+    }
+
+    const CONTENT_FILE: &str = "readable.txt";
+    const EXPECT_NO_DOUBLE_GUARD: &str =
+        "a mutation target is never also a read target, or the call would block on itself";
+    const EXPECT_READ_GUARD: &str =
+        "a whole-file read is guarded, so a concurrent write cannot land between the \
+         content and the mtime recorded for it";
+    const EXPECT_NO_COARSE_GUARD: &str =
+        "a search names no file up front, so it declares nothing to guard";
+
+    /// `file_read` and `index` record the file's mtime only after reading its
+    /// content. Without a shared guard a write landing in between records an
+    /// mtime newer than what the model saw, and the next edit passes its stale
+    /// check holding stale content.
+    #[test_case("file_read", json!({ "filePath": CONTENT_FILE }), true ; "file_read_guards_its_file")]
+    #[test_case("index", json!({ "path": CONTENT_FILE }), true ; "index_guards_its_file")]
+    #[test_case("index", json!({ "path": "." }), false ; "index_does_not_guard_a_directory")]
+    #[test_case("file_grep", json!({ "pattern": "body" }), false ; "grep_guards_nothing")]
+    #[test_case("file_glob", json!({ "pattern": "*.txt" }), false ; "glob_guards_nothing")]
+    fn read_targets_cover_whole_file_reads_only(tool: &str, input: Value, guarded: bool) {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(root.path().join(CONTENT_FILE), "body").expect("seed file");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get(tool)
+            .expect("registered tool")
+            .tool
+            .parse(&input)
+            .expect("valid input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("preflight");
+
+        let expected: &[PathBuf] = &[root.path().join(CONTENT_FILE)];
+        let reason = if guarded {
+            EXPECT_READ_GUARD
+        } else {
+            EXPECT_NO_COARSE_GUARD
+        };
+        assert_eq!(
+            invocation.read_targets(&ctx) == expected,
+            guarded,
+            "{reason}"
+        );
+        assert!(
+            invocation.mutation_targets(&ctx).is_empty(),
+            "{EXPECT_NO_DOUBLE_GUARD}"
+        );
     }
 
     /// Write authority is Caudra's to grant, so a model cannot ask for a

@@ -763,6 +763,9 @@ fn build(
             mailbox: None,
             timeouts: ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
+            // Shared, not fresh: a subagent tracks its own reads but must not
+            // write a file a sibling agent is writing.
+            path_locks: Arc::clone(&ctx.path_locks),
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             prompt_profiles: Arc::clone(&ctx.prompt_profiles),
             system_prompt_profile_name: resolved.profile_name,

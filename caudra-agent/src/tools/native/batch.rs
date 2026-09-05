@@ -417,10 +417,14 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
 mod tests {
     use super::*;
     use crate::AgentMode;
+    use crate::tools::STALE_READ_MSG;
     use crate::tools::registry::ToolRegistry;
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
+    use futures_lite::future;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
 
     const READ: &str = "read";
@@ -913,6 +917,142 @@ mod tests {
         assert!(
             entries.iter().all(|e| e.status == BatchToolStatus::Success),
             "both children completed, so both were in flight together"
+        );
+    }
+
+    const MUTATOR: &str = "mutator";
+    const MARK_FIELD: &str = "mark";
+    const FIRST_MARK: &str = "first";
+    const SECOND_MARK: &str = "second";
+    const SEED: &str = "seed\n";
+    const EXPECT_SERIALIZED: &str = "children mutating one file run one at a time";
+    const EXPECT_NO_STALE: &str =
+        "a sibling's write is not a stale read: the tracker moves under the same guard";
+    const EXPECT_BOTH_APPLIED: &str =
+        "both edits survive, so neither read-modify-write clobbered the other";
+
+    #[derive(Default)]
+    struct Gauge {
+        inside: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Replays what a real mutating tool does between dispatch's guards: check
+    /// the tracker, read-modify-write, then record the new mtime. The yields
+    /// widen the window an unguarded sibling used to slip into.
+    struct MutatorTool {
+        gauge: Arc<Gauge>,
+        path: PathBuf,
+    }
+
+    struct MutatorCall {
+        gauge: Arc<Gauge>,
+        path: PathBuf,
+        mark: String,
+    }
+
+    impl ToolInvocation for MutatorCall {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(self.mark.clone()))
+        }
+        fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+            vec![self.path.clone()]
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let depth = self.gauge.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.gauge.peak.fetch_max(depth, Ordering::SeqCst);
+                let outcome = match ctx.file_tracker.check_before_edit(&self.path) {
+                    Ok(()) => {
+                        future::yield_now().await;
+                        let mut body = std::fs::read_to_string(&self.path).unwrap_or_default();
+                        body.push_str(&self.mark);
+                        std::fs::write(&self.path, body).expect("stub mutator writes");
+                        future::yield_now().await;
+                        ctx.file_tracker.record_read(&self.path);
+                        Ok(ToolOutput::Plain(BODY.into()))
+                    }
+                    Err(error) => Err(error),
+                };
+                self.gauge.inside.fetch_sub(1, Ordering::SeqCst);
+                ToolExecResult::from(outcome)
+            })
+        }
+    }
+
+    impl Tool for MutatorTool {
+        fn name(&self) -> &str {
+            MUTATOR
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(MutatorCall {
+                gauge: Arc::clone(&self.gauge),
+                path: self.path.clone(),
+                mark: input[MARK_FIELD].as_str().unwrap_or_default().to_owned(),
+            }))
+        }
+    }
+
+    /// The reported bug: two `file_edit` children on one file, where the loser
+    /// either failed a stale check the tracker had not caught up to or silently
+    /// dropped the other's edit.
+    #[test]
+    fn two_children_mutating_one_file_are_serialized() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("contended.rs");
+        std::fs::write(&path, SEED).expect("seeding the contended file");
+
+        let gauge = Arc::new(Gauge::default());
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(MutatorTool {
+                    gauge: Arc::clone(&gauge),
+                    path: path.clone(),
+                }),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: MUTATOR.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+        // Without a recorded read the stale check is a no-op, and the test
+        // would prove nothing about the window it is pinning.
+        ctx.file_tracker.record_read(&path);
+
+        let result = smol::block_on(async {
+            parsed(calls(json!([
+                { "tool": MUTATOR, MARK_FIELD: FIRST_MARK },
+                { "tool": MUTATOR, MARK_FIELD: SECOND_MARK },
+            ])))
+            .unwrap()
+            .execute(&ctx)
+            .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, text }) = result.output else {
+            panic!("expected a batch result");
+        };
+        assert_eq!(gauge.peak.load(Ordering::SeqCst), 1, "{EXPECT_SERIALIZED}");
+        assert!(!text.contains(STALE_READ_MSG), "{EXPECT_NO_STALE}: {text}");
+        assert!(
+            entries.iter().all(|e| e.status == BatchToolStatus::Success),
+            "{EXPECT_NO_STALE}: {entries:?}"
+        );
+        let body = std::fs::read_to_string(&path).expect("reading the contended file");
+        assert_eq!(
+            body,
+            format!("{SEED}{FIRST_MARK}{SECOND_MARK}"),
+            "{EXPECT_BOTH_APPLIED}"
         );
     }
 }

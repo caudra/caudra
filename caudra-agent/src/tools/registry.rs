@@ -330,11 +330,21 @@ pub trait ToolInvocation: Send + Sync {
     fn mutable_path(&self) -> Option<&Path> {
         None
     }
+    /// Files this call writes. Dispatch takes an exclusive guard on each for
+    /// the whole of `execute`, so an implementor must not re-enter dispatch.
     fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
         self.mutable_path()
             .map(Path::to_path_buf)
             .into_iter()
             .collect()
+    }
+    /// Files this call reads whole, named before it runs. Dispatch takes a
+    /// shared guard on each, so a concurrent write cannot land between the read
+    /// and the mtime the tool records for it. Paths a call only discovers while
+    /// running, like `file_grep` matches, cannot be declared here. Never
+    /// overlaps `mutation_targets`, which already covers read-modify-write.
+    fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+        Vec::new()
     }
     fn blocked_in_plan_mode(&self) -> bool {
         false
