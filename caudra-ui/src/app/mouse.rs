@@ -376,16 +376,10 @@ impl App {
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
                             if self.active_chat == 0
-                                && let Some(tool_id) = self.chats[0].tool_id_at(event.row, area)
+                                && let Some(task_id) = self.task_id_at(event.row, area)
+                                && self.focus_task(&task_id).is_ok()
                             {
-                                let task_id = self
-                                    .parent_task_ids
-                                    .get(tool_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_id.to_owned());
-                                if self.focus_task(&task_id).is_ok() {
-                                    return Vec::new();
-                                }
+                                return Vec::new();
                             }
                             self.chats[self.active_chat].handle_click(event.row, area);
                         }
@@ -759,24 +753,32 @@ impl App {
         }
     }
 
+    /// The transcript a click at `row` would open. A batch child is asked
+    /// about first: its row sits inside the batch's card, so the card's own id
+    /// answers for it and would send every roster row to the same place.
+    fn task_id_at(&self, row: u16, area: Rect) -> Option<String> {
+        let dispatched = self.chats[0]
+            .dispatched_id_at(row, area)
+            .and_then(|id| self.parent_task_ids.get(&id).cloned());
+        dispatched.or_else(|| {
+            let tool_id = self.chats[0].tool_id_at(row, area)?;
+            Some(
+                self.parent_task_ids
+                    .get(tool_id)
+                    .cloned()
+                    .unwrap_or_else(|| tool_id.to_owned()),
+            )
+        })
+    }
+
     fn update_transcript_hover(&mut self, row: u16, col: u16) {
         let area = self.msg_area();
-        let known_task_target = if self.active_chat == 0 {
-            self.chats[0]
-                .tool_id_at(row, area)
-                .map(|tool_id| {
-                    self.parent_task_ids
-                        .get(tool_id)
-                        .map_or(tool_id, String::as_str)
-                })
-                .is_some_and(|task_id| {
-                    self.chats
-                        .iter()
-                        .any(|chat| chat.task_id().is_some_and(|id| &**id == task_id))
-                })
-        } else {
-            false
-        };
+        let known_task_target = self.active_chat == 0
+            && self.task_id_at(row, area).is_some_and(|task_id| {
+                self.chats
+                    .iter()
+                    .any(|chat| chat.task_id().is_some_and(|id| **id == task_id))
+            });
         self.chats[self.active_chat].update_hover(row, col, area, known_task_target);
     }
 

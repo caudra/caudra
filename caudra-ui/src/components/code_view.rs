@@ -5,6 +5,7 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, truncation_notice};
 use crate::theme;
 
+use super::ToolProgress;
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
@@ -12,7 +13,7 @@ use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
-    SearchCap, ToolInput, ToolOutput,
+    SearchCap, SubagentProgress, ToolInput, ToolOutput,
 };
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -24,6 +25,10 @@ const BATCH_CHILD_INDENT: &str = "  ";
 const ANSWER_MARK: &str = "  \u{2713} ";
 const ANSWER_INDENT: &str = "    ";
 const NO_ANSWER: &str = "(no answer)";
+/// Indented past the child's own sigil, so the activity reads as belonging to
+/// the row above it rather than as another entry in the roster.
+const CHILD_ACTIVITY_PREFIX: &str = "  ├ ";
+const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
@@ -477,6 +482,12 @@ fn render_batch(
         }
         lines.push(Line::from(spans));
         rows.push(Some(RowTarget(index)));
+        // Between the header and the body, so a click below it still resolves
+        // to the child it looks like it is on.
+        if let Some(progress) = limits.progress.get(&index) {
+            lines.push(Line::from(child_progress_spans(progress)));
+            rows.push(Some(RowTarget(index)));
+        }
         if let Some(body) = body {
             rows.resize(rows.len() + body.len(), Some(RowTarget(index)));
             lines.extend(indent_all(body));
@@ -498,6 +509,29 @@ fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
     (entry.status == BatchToolStatus::Success)
         .then(|| entry.output.as_ref().and_then(ToolOutput::annotation))
         .flatten()
+}
+
+/// How a dispatched child is getting on. A settled child is described by its
+/// output, so what it was doing gives way to what it did, and only the tally
+/// survives as the record of work its output does not show.
+fn child_progress_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
+    let theme = theme::current();
+    let mut spans = vec![Span::styled(CHILD_ACTIVITY_PREFIX, theme.tool_dim)];
+    if progress.is_live() {
+        spans.push(Span::styled(
+            progress.report.activity.label().to_owned(),
+            theme.tool_prefix,
+        ));
+        if let Some(detail) = progress.report.activity.detail() {
+            spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
+        }
+        spans.push(Span::styled(CHILD_ACTIVITY_SEPARATOR, theme.tool_dim));
+    }
+    spans.push(Span::styled(
+        SubagentProgress::tally(progress.report.tools, progress.elapsed()),
+        theme.tool_dim,
+    ));
+    spans
 }
 
 /// A child's own rendering, structured where the tool produced structure and
@@ -947,10 +981,16 @@ impl BatchViews {
     }
 }
 
+/// What each dispatched child of one batch is doing, by index in the roster.
+/// Shared rather than cloned: a running batch rebuilds at the spinner cadence
+/// and the reports outlive none of it.
+pub type ChildProgress = Arc<HashMap<usize, ToolProgress>>;
+
 #[derive(Clone, Default)]
 pub struct RenderLimits {
     pub budget: usize,
     pub views: BatchViews,
+    pub progress: ChildProgress,
 }
 
 impl RenderLimits {
@@ -958,7 +998,19 @@ impl RenderLimits {
         Self {
             budget: if full { usize::MAX } else { budget },
             views,
+            progress: ChildProgress::default(),
         }
+    }
+
+    pub fn with_progress(self, progress: ChildProgress) -> Self {
+        Self { progress, ..self }
+    }
+
+    /// Whether any child is still reporting. A live row is redrawn every tick
+    /// from a clock the highlight worker does not have, so a batch holding one
+    /// renders here instead of being sent out and spliced back stale.
+    pub fn has_live_progress(&self) -> bool {
+        self.progress.values().any(ToolProgress::is_live)
     }
 
     pub fn is_expanded(&self) -> bool {
@@ -978,12 +1030,16 @@ impl RenderLimits {
         Self {
             budget: usize::MAX,
             views: BatchViews::default(),
+            progress: ChildProgress::default(),
         }
     }
 }
 
 /// The child views of every card that has any, by parent tool id.
 pub type BatchViewMap = HashMap<String, BatchViews>;
+
+/// The child reports of every batch that has any, by parent tool id.
+pub type BatchProgressMap = HashMap<String, ChildProgress>;
 
 /// The batch child a body line belongs to, by its roster index, so a click can
 /// name a row after the async highlight has replaced the spans under it. A

@@ -13,7 +13,8 @@ use caudra_agent::tools::{
 };
 use caudra_agent::{
     GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput,
-    SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput,
+    ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
@@ -5271,6 +5272,141 @@ fn loading_a_session_forgets_the_child_views() {
 
     panel.load_messages(Vec::new());
     assert!(panel.batch_views.is_empty());
+}
+
+const CHILD_ACTIVITY_MSG: &str = "a dispatched child says what it is doing while it runs";
+const CHILD_TALLY: &str = "2 tools";
+const RUNNING_TOOL: &str = "file_grep";
+
+fn running_child(tool: &str) -> caudra_agent::BatchToolEntry {
+    caudra_agent::BatchToolEntry {
+        status: caudra_agent::BatchToolStatus::Running,
+        output: None,
+        ..batch_child(tool, "x")
+    }
+}
+
+fn child_report() -> SubagentProgress {
+    SubagentProgress {
+        activity: SubagentActivity::tool(RUNNING_TOOL.into(), "in src"),
+        tools: 2,
+        elapsed: Duration::from_secs(3),
+    }
+}
+
+/// A batch running two subagents, neither finished.
+fn panel_with_running_batch() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![running_child("task"), running_child("task")],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    render(&mut panel, 80, 24);
+    panel
+}
+
+/// The reported bug: three dispatched subagents sat on the roster saying only
+/// that they were delegating. The report is published the whole time, but its
+/// id is the batch's own with an index appended, so it named a header that
+/// does not exist and was dropped.
+#[test]
+fn a_dispatched_child_reports_what_it_is_doing() {
+    let mut panel = panel_with_running_batch();
+
+    assert!(panel.set_batch_child_progress("t1", 0, child_report()));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains(RUNNING_TOOL),
+        "{CHILD_ACTIVITY_MSG}: {text:?}"
+    );
+    assert!(text.contains(CHILD_TALLY), "{CHILD_ACTIVITY_MSG}: {text:?}");
+}
+
+/// The index has to name a child of this batch. A report for a roster that has
+/// already gone would otherwise install a row against a card that cannot draw
+/// it, and the caller falls back to the header path on a `false`.
+#[test_case(0, true ; "a child of the roster takes it")]
+#[test_case(9, false ; "an index past the roster does not")]
+fn a_report_is_only_taken_for_a_child_that_exists(index: usize, expected: bool) {
+    let mut panel = panel_with_running_batch();
+    assert_eq!(
+        panel.set_batch_child_progress("t1", index, child_report()),
+        expected
+    );
+}
+
+/// What a subagent was doing is stale the moment it stops. What it did is the
+/// only record of the work its output does not show, so the tally stays.
+#[test]
+fn a_settled_child_keeps_its_tally_and_drops_its_activity() {
+    let mut panel = panel_with_running_batch();
+    panel.set_batch_child_progress("t1", 0, child_report());
+    render(&mut panel, 80, 24);
+
+    panel.batch_progress("t1", 0, batch_child("task", "a"));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        !text.contains(RUNNING_TOOL),
+        "{CHILD_ACTIVITY_MSG}: {text:?}"
+    );
+    assert!(text.contains(CHILD_TALLY), "{CHILD_ACTIVITY_MSG}: {text:?}");
+}
+
+/// The row sits between a child's header and its body, so every row below it
+/// shifts by one. A click that lands on the wrong child is what the Lua
+/// original had to correct for too.
+#[test]
+fn a_progress_row_belongs_to_the_child_it_reports_on() {
+    let mut panel = panel_with_running_batch();
+    panel.set_batch_child_progress("t1", 0, child_report());
+    render(&mut panel, 80, 24);
+
+    let first = batch_child_row(&panel, 0);
+    let second = batch_child_row(&panel, 1);
+    assert_eq!(
+        second - first,
+        2,
+        "the reporting child owns its header and the row under it"
+    );
+}
+
+/// The trap this design had to avoid. A batch reaches the highlight worker
+/// like any other card, and a rebuild reuses the cached answer whenever the
+/// key still matches. Progress is not in that key and could not usefully be:
+/// it moves on every report. So a second report would rebuild the card and
+/// then splice the first report's rows straight back over it, freezing the
+/// row on whatever the child was doing when the highlight was cached.
+#[test]
+fn a_later_report_is_not_overwritten_by_the_cached_one() {
+    const LATER_TOOL: &str = "file_read";
+    let mut panel = panel_with_running_batch();
+    panel.set_batch_child_progress("t1", 0, child_report());
+    render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+    render(&mut panel, 80, 24);
+
+    panel.set_batch_child_progress(
+        "t1",
+        0,
+        SubagentProgress {
+            activity: SubagentActivity::tool(LATER_TOOL.into(), "lib.rs"),
+            ..child_report()
+        },
+    );
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains(LATER_TOOL), "{CHILD_ACTIVITY_MSG}: {text:?}");
+    assert!(
+        !text.contains(RUNNING_TOOL),
+        "{CHILD_ACTIVITY_MSG}: {text:?}"
+    );
 }
 
 /// Opening a child is a choice about the body, like the raw/filtered switch,

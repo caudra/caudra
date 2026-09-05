@@ -408,6 +408,10 @@ impl Chat {
         self.messages_panel.tool_id_at(row, area)
     }
 
+    pub fn dispatched_id_at(&self, row: u16, area: Rect) -> Option<String> {
+        self.messages_panel.dispatched_id_at(row, area)
+    }
+
     pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
         self.messages_panel.source_at(row, area)
     }
@@ -503,7 +507,20 @@ impl Chat {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    /// A dispatched child's id is the batch's own with an index appended, so a
+    /// report either names a card with a header of its own or one row of a
+    /// roster. The suffix is dropped only when it resolves to a real child, so
+    /// a tool whose id merely contains a colon still reaches its own header.
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
+        if let Some((batch_id, index)) = tool_id
+            .rsplit_once(':')
+            .and_then(|(head, tail)| Some((head, tail.parse::<usize>().ok()?)))
+            && self
+                .messages_panel
+                .set_batch_child_progress(batch_id, index, report.clone())
+        {
+            return;
+        }
         self.messages_panel.set_tool_progress(tool_id, report);
     }
 

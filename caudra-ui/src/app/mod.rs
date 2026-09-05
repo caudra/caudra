@@ -2460,8 +2460,8 @@ impl App {
         }
 
         // Belongs on the parent's task header, not in the subagent transcript
-        // that already shows the work itself. A batch child reports through
-        // its own live channel and has no header here to land on.
+        // that already shows the work itself. A batch child has no header, so
+        // the same report is addressed to its row in the roster instead.
         if let AgentEvent::SubagentProgress { progress } = envelope.event {
             if let Some(tool_id) = &parent_tool_use_id {
                 self.chats[0].set_tool_progress(tool_id, progress);

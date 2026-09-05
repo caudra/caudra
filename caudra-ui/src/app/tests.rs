@@ -1608,10 +1608,10 @@ fn a_finished_subagent_keeps_the_tally_it_ended_on() {
     );
 }
 
-/// A batch child's parent id is synthetic, so there is no header here to
-/// stamp. It must fall through quietly instead of landing on the main chat.
+/// An id that names neither a header nor a roster still has to fall through
+/// quietly rather than stamp the main chat.
 #[test]
-fn a_dispatched_subagents_progress_finds_no_header_and_is_dropped() {
+fn a_progress_report_for_no_known_call_is_dropped() {
     let mut app = streaming_app();
     app.update(agent_msg(tool_start(TASK_ID, "batch")));
 
@@ -1622,6 +1622,128 @@ fn a_dispatched_subagents_progress_finds_no_header_and_is_dropped() {
     ));
 
     assert_eq!(parent_progress(&app, 0), None);
+}
+
+const DISPATCHED_TOOL: &str = "file_grep";
+
+fn batch_roster(id: &str, children: usize) -> AgentEvent {
+    let AgentEvent::ToolStart(mut start) = tool_start(id, "batch") else {
+        unreachable!("tool_start builds a ToolStart")
+    };
+    start.output = Some(ToolOutput::Batch {
+        entries: (0..children)
+            .map(|_| caudra_agent::BatchToolEntry {
+                tool: "task".into(),
+                summary: "research".into(),
+                status: caudra_agent::BatchToolStatus::Running,
+                input: None,
+                raw_input: None,
+                output: None,
+                annotation: None,
+            })
+            .collect(),
+        text: String::new(),
+    });
+    AgentEvent::ToolStart(start)
+}
+
+/// The reported regression. A dispatched child's id is the batch's own with an
+/// index appended, so the report named a header that does not exist and was
+/// dropped, leaving three subagents on the roster saying only that they had
+/// been dispatched. It belongs to the row the batch drew for that child.
+#[test]
+fn a_dispatched_subagents_progress_lands_on_its_row() {
+    let mut app = streaming_app();
+    app.update(agent_msg(batch_roster(TASK_ID, 2)));
+
+    app.update(subagent_msg(
+        progress_event(
+            SubagentActivity::tool(Arc::from(DISPATCHED_TOOL), "in src"),
+            4,
+        ),
+        &format!("{TASK_ID}:1"),
+        Some(SUBAGENT_NAME),
+    ));
+
+    // Never the batch's own header: the card reports that it ran a roster,
+    // not what one member of it is doing.
+    assert_eq!(parent_progress(&app, 0), None);
+    let rendered = rendered(&mut app);
+    assert!(
+        rendered.contains(DISPATCHED_TOOL),
+        "a dispatched child says what it is doing: {rendered}"
+    );
+}
+
+/// A batch child's row sits inside the batch's own card, so the card answers
+/// for it and every row on the roster opened the same transcript. Docs promise
+/// that clicking a task call opens the subagent it dispatched.
+#[test]
+fn clicking_a_dispatched_child_opens_that_childs_transcript() {
+    let mut app = streaming_app();
+    let child_id = format!("{TASK_ID}:1");
+    app.update(agent_msg(batch_roster(TASK_ID, 2)));
+    app.update(subagent_msg(
+        progress_event(SubagentActivity::Responding, 1),
+        &child_id,
+        Some(SUBAGENT_NAME),
+    ));
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].dispatched_id_at(row, area).as_deref() == Some(&*child_id))
+        .expect("the roster drew a row for the child");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+
+    assert_eq!(
+        app.chats[app.active_chat].task_id().map(|id| &**id),
+        Some(&*child_id),
+        "the click opened the subagent the child dispatched"
+    );
+}
+
+/// Only the children that dispatched a subagent have a transcript to open.
+/// The rest keep the fold they always had, even while a sibling on the same
+/// roster is holding a chat of its own.
+#[test]
+fn clicking_a_child_that_dispatched_nothing_still_folds_it() {
+    let mut app = streaming_app();
+    app.update(agent_msg(batch_roster(TASK_ID, 2)));
+    app.update(subagent_msg(
+        progress_event(SubagentActivity::Responding, 1),
+        &format!("{TASK_ID}:1"),
+        Some(SUBAGENT_NAME),
+    ));
+    let _ = rendered(&mut app);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| {
+            app.chats[0].dispatched_id_at(row, area).as_deref() == Some(&*format!("{TASK_ID}:0"))
+        })
+        .expect("the roster drew a row for the child");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+
+    assert_eq!(app.active_chat, 0, "an undispatched child opens no chat");
 }
 
 #[test]

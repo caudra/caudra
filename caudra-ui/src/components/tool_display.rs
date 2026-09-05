@@ -4,7 +4,7 @@ use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
-use code_view::{BatchViewMap, BatchViews, Disclosure, RenderLimits, RowTarget};
+use code_view::{BatchProgressMap, BatchViewMap, BatchViews, Disclosure, RenderLimits, RowTarget};
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -38,14 +38,21 @@ pub struct RenderCtx<'a> {
     /// tool id. Looked up here rather than passed in, so every path that
     /// builds a card reads the same views the click that set them named.
     pub batch_views: &'a BatchViewMap,
+    /// What each batch's dispatched children are doing, by parent tool id.
+    pub batch_progress: &'a BatchProgressMap,
 }
 
 impl RenderCtx<'_> {
-    fn views_for(&self, tool_id: Option<&str>) -> BatchViews {
-        tool_id
+    fn limits_for(&self, tool_id: Option<&str>, full: bool, budget: usize) -> RenderLimits {
+        let views = tool_id
             .and_then(|id| self.batch_views.get(id))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let progress = tool_id
+            .and_then(|id| self.batch_progress.get(id))
+            .cloned()
+            .unwrap_or_default();
+        RenderLimits::new(full, budget, views).with_progress(progress)
     }
 }
 
@@ -472,8 +479,13 @@ impl HighlightRequest {
             | ToolOutput::Shell(_)
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the
-            // highlighting worker exactly as a lone child would.
-            ToolOutput::Batch { ref entries, .. } => (!entries.is_empty()).then_some(o),
+            // highlighting worker exactly as a lone child would. A batch with
+            // a child still reporting is the exception: its rows carry a clock
+            // the worker has no way to read, so an answer spliced back over
+            // them would freeze what the reader is watching.
+            ToolOutput::Batch { ref entries, .. } => {
+                (!entries.is_empty() && !limits.has_live_progress()).then_some(o)
+            }
         });
         if input.is_none() && output.is_none() {
             return None;
@@ -706,13 +718,7 @@ struct ToolLineBuilder {
 }
 
 impl ToolLineBuilder {
-    fn new(
-        width: u16,
-        full: bool,
-        max_output_lines: usize,
-        indicator: Indicator,
-        views: BatchViews,
-    ) -> Self {
+    fn new(width: u16, indicator: Indicator, limits: RenderLimits) -> Self {
         Self {
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -724,7 +730,7 @@ impl ToolLineBuilder {
             rows: Vec::new(),
             width,
             truncation: false,
-            limits: RenderLimits::new(full, max_output_lines, views),
+            limits,
             markdown: false,
             indicator,
         }
@@ -1220,10 +1226,12 @@ pub fn build_tool_lines(
 
     let mut b = ToolLineBuilder::new(
         rctx.width,
-        expanded.full,
-        rctx.tool_output_lines.get(tool_name),
         Indicator::resolve(status, msg.tool_output.as_deref()),
-        rctx.views_for(msg.role.tool_id()),
+        rctx.limits_for(
+            msg.role.tool_id(),
+            expanded.full,
+            rctx.tool_output_lines.get(tool_name),
+        ),
     );
     b.apply_output_format(msg.tool_output.as_deref());
     if rctx.compact {
@@ -1359,10 +1367,12 @@ pub fn build_instructions_lines(
 
     let mut b = ToolLineBuilder::new(
         width,
-        expanded,
-        code_view::instruction_limit(expanded),
         Indicator::Success,
-        BatchViews::default(),
+        RenderLimits::new(
+            expanded,
+            code_view::instruction_limit(expanded),
+            BatchViews::default(),
+        ),
     );
     b.push_header("load", header, annotation.as_deref(), None, None, None);
     b.prepend_indicator(Instant::now());
@@ -1434,6 +1444,8 @@ mod tests {
 
     static NO_VIEWS: std::sync::LazyLock<BatchViewMap> =
         std::sync::LazyLock::new(BatchViewMap::new);
+    static NO_PROGRESS: std::sync::LazyLock<BatchProgressMap> =
+        std::sync::LazyLock::new(BatchProgressMap::new);
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
@@ -1442,6 +1454,7 @@ mod tests {
             tool_output_lines: &TOL,
             compact: false,
             batch_views: &NO_VIEWS,
+            batch_progress: &NO_PROGRESS,
         }
     }
 

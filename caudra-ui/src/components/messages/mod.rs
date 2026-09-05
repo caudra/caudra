@@ -17,7 +17,7 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_delta,
-    code_view::{BatchViewMap, Disclosure, RowTarget},
+    code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
     review,
 };
 use crate::animation::spinner_str;
@@ -665,6 +665,10 @@ pub struct MessagesPanel {
     /// Which batch children the reader opened, by parent tool id. Empty for
     /// every card nobody has clicked, which is nearly all of them.
     batch_views: BatchViewMap,
+    /// What each dispatched batch child is doing, by parent tool id and child
+    /// index. Live chrome rather than part of the roster: `BatchToolEntry` is
+    /// persisted, and what a subagent was doing is stale the moment it stops.
+    batch_child_progress: BatchProgressMap,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
     diagram_pans: HashMap<DiagramKey, u16>,
@@ -739,6 +743,7 @@ impl MessagesPanel {
             disclosure: HashMap::new(),
             shell_raw: HashSet::new(),
             batch_views: BatchViewMap::new(),
+            batch_child_progress: BatchProgressMap::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
@@ -967,6 +972,7 @@ impl MessagesPanel {
         self.disclosure.clear();
         self.shell_raw.clear();
         self.batch_views.clear();
+        self.batch_child_progress.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
@@ -1100,13 +1106,60 @@ impl MessagesPanel {
         if index >= entries.len() {
             return;
         }
+        let terminal = entry.status.is_terminal();
         let mut entries = entries.clone();
         entries[index] = entry;
         msg.tool_output = Some(Arc::new(ToolOutput::Batch {
             entries,
             text: String::new(),
         }));
+        // What it was doing is stale the moment it stops, but what it did is
+        // the only record of work its output does not show.
+        if terminal {
+            self.settle_child_progress(tool_id, index);
+        }
         self.rebuild_tool_segment(tool_id);
+    }
+
+    /// A dispatched batch child reporting in. Its id is the batch's own with
+    /// an index appended, so the envelope names a header that does not exist
+    /// and the report has to be addressed to the roster instead.
+    pub fn set_batch_child_progress(
+        &mut self,
+        tool_id: &str,
+        index: usize,
+        report: SubagentProgress,
+    ) -> bool {
+        if !self.batch_child_exists(tool_id, index) {
+            return false;
+        }
+        Arc::make_mut(
+            self.batch_child_progress
+                .entry(tool_id.to_owned())
+                .or_default(),
+        )
+        .insert(index, ToolProgress::live(report));
+        self.rebuild_tool_segment(tool_id);
+        true
+    }
+
+    fn batch_child_exists(&self, tool_id: &str, index: usize) -> bool {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .and_then(|msg| match msg.tool_output.as_deref() {
+                Some(ToolOutput::Batch { entries, .. }) => Some(entries.len()),
+                _ => None,
+            })
+            .is_some_and(|len| index < len)
+    }
+
+    fn settle_child_progress(&mut self, tool_id: &str, index: usize) {
+        if let Some(children) = self.batch_child_progress.get_mut(tool_id)
+            && let Some(progress) = Arc::make_mut(children).get_mut(&index)
+        {
+            progress.settle();
+        }
     }
 
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
@@ -1139,6 +1192,13 @@ impl MessagesPanel {
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
         let had_live_buf = self.retire_live_buf(&event.id);
+        // A child whose own terminal event never arrived stops here with the
+        // batch, so no row is left counting against a clock that has stopped.
+        if let Some(children) = self.batch_child_progress.get_mut(&event.id) {
+            Arc::make_mut(children)
+                .values_mut()
+                .for_each(ToolProgress::settle);
+        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -1544,6 +1604,22 @@ impl MessagesPanel {
         (rel >= segment.chrome(self.viewport_width).margin_top)
             .then_some(segment.tool_id.as_deref())
             .flatten()
+    }
+
+    /// The dispatched id of the batch child at `row`, which is the card's own
+    /// with the child's index appended. Rebuilding it is what lets a click on
+    /// a roster row reach the subagent that row dispatched, since the roster
+    /// carries no ids of its own.
+    pub fn dispatched_id_at(&self, row: u16, area: Rect) -> Option<String> {
+        if area.height == 0 {
+            return None;
+        }
+        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        let tool_id = segment.tool_id.as_deref()?;
+        let RowTarget(index) = segment.row_target_at(rel, self.viewport_width)?;
+        Some(format!("{tool_id}:{index}"))
     }
 
     pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
@@ -2848,6 +2924,7 @@ impl MessagesPanel {
             tool_output_lines: &self.tool_output_lines,
             compact: self.compact(),
             batch_views: &self.batch_views,
+            batch_progress: &self.batch_child_progress,
         }
     }
 
@@ -3031,15 +3108,24 @@ impl MessagesPanel {
     /// subagent has it, and its segment is a header plus that row until the
     /// call returns, so rebuilding at the spinner cadence stays cheap.
     fn refresh_live_progress(&mut self) {
+        let progress = &self.batch_child_progress;
         let live: Vec<String> = self
             .messages
             .iter()
-            .filter(|msg| msg.progress.as_ref().is_some_and(ToolProgress::is_live))
-            .filter_map(|msg| match &msg.role {
-                DisplayRole::Tool(tool) if tool.status == ToolStatus::InProgress => {
-                    Some(tool.id.clone())
+            .filter_map(|msg| {
+                let DisplayRole::Tool(tool) = &msg.role else {
+                    return None;
+                };
+                if tool.status != ToolStatus::InProgress {
+                    return None;
                 }
-                _ => None,
+                // A batch keeps a clock per child, since the reports belong to
+                // rows the card has no header for and it carries none itself.
+                let ticking = msg.progress.as_ref().is_some_and(ToolProgress::is_live)
+                    || progress
+                        .get(&tool.id)
+                        .is_some_and(|children| children.values().any(ToolProgress::is_live));
+                ticking.then(|| tool.id.clone())
             })
             .collect();
         for tool_id in live {
