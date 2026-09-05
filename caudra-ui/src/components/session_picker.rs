@@ -61,6 +61,7 @@ pub enum SessionPickerAction {
     Focus(CaudraId),
     Delete(CaudraId),
     Rename { id: CaudraId, title: String },
+    Generate(CaudraId),
     New,
     Closed,
 }
@@ -218,6 +219,11 @@ impl SessionPicker {
         if key::RENAME_SESSION.matches(key) {
             return self.start_rename();
         }
+        if key::GENERATE_TITLE.matches(key) {
+            return self
+                .selected_id()
+                .map_or(SessionPickerAction::Consumed, SessionPickerAction::Generate);
+        }
         let action = self.picker.handle_key(key);
         self.map_action(action)
     }
@@ -370,6 +376,7 @@ fn footer() -> Line<'static> {
         ("Enter", "open"),
         (key::NEW_SESSION.label, "new"),
         (key::RENAME_SESSION.label, "rename"),
+        (key::GENERATE_TITLE.label, "name it"),
         (key::DELETE.label, "delete"),
     ])
 }
@@ -618,6 +625,29 @@ mod tests {
         assert!(matches!(
             picker.handle_key(key_event(KeyCode::Enter)),
             SessionPickerAction::Rename { title, .. } if title == kept
+        ));
+    }
+
+    #[test]
+    fn naming_a_session_asks_for_the_selected_row() {
+        let mut picker = opened(vec![row(FIRST, TITLE_A, 10, None)]);
+
+        let action = picker.handle_key(key::GENERATE_TITLE.to_key_event());
+
+        assert!(matches!(action, SessionPickerAction::Generate(got) if got == id(FIRST)));
+        assert!(
+            picker.is_open(),
+            "the list stays up while the model answers"
+        );
+    }
+
+    #[test]
+    fn naming_nothing_asks_for_nothing() {
+        let mut picker = opened(Vec::new());
+
+        assert!(matches!(
+            picker.handle_key(key::GENERATE_TITLE.to_key_event()),
+            SessionPickerAction::Consumed
         ));
     }
 

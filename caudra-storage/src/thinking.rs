@@ -183,7 +183,9 @@ impl ReasoningOptions {
     }
 
     /// An explicit budget held to the model's declared bounds and the protocol
-    /// floor.
+    /// floor. The floor wins over a derived ceiling: a ceiling below it means
+    /// the caller sized the output window too small for a model that reasons,
+    /// not that a smaller budget became legal, and providers reject one.
     pub fn clamp_budget(&self, tokens: u32, max_output: Option<u32>) -> u32 {
         let floor = self
             .budget_bounds()
@@ -191,7 +193,7 @@ impl ReasoningOptions {
             .unwrap_or(MIN_THINKING_BUDGET)
             .max(MIN_THINKING_BUDGET);
         match self.budget_ceiling(max_output) {
-            Some(ceiling) => tokens.clamp(floor.min(ceiling), ceiling.max(floor)),
+            Some(ceiling) => tokens.clamp(floor, ceiling.max(floor)),
             None => tokens.max(floor),
         }
     }
@@ -287,12 +289,17 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BUDGET_LADDER, EFFORT_LEVELS, ReasoningOption, ReasoningOptions, StoredThinking,
-        ThinkingParseError, effort_rank,
+        BUDGET_LADDER, EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
+        StoredThinking, ThinkingParseError, effort_rank,
     };
 
     const SENTINEL_IS_NOT_A_BOUND: &str =
         "a negative bound means the model decides, not a token count to clamp against";
+    /// The window the session title request used to ask for. Half of it is
+    /// below the protocol floor, which is exactly how every title request
+    /// reached Anthropic with `budget_tokens: 256` and came back a 400.
+    const TIGHT_OUTPUT_WINDOW: u32 = 512;
+    const FLOOR_IS_NOT_NEGOTIABLE: &str = "a window too small for the floor is a caller sizing bug, not a licence to send a budget no provider accepts";
 
     /// models.dev publishes `min: -1` on a handful of models. Rejecting it once
     /// cost the entire catalog, because one unreadable model failed the whole
@@ -444,6 +451,22 @@ mod tests {
         // Claude Sonnet 4.5: declares only a floor, so the window sets the ceiling.
         let options = budget(Some(1024), None);
         assert_eq!(options.budget_for_effort(level, Some(64_000)), expected);
+    }
+
+    #[test_case(64 ; "below_the_floor")]
+    #[test_case(8_192 ; "above_the_ceiling")]
+    fn clamp_budget_keeps_the_floor_over_a_tighter_ceiling(tokens: u32) {
+        let clamped = budget(Some(1024), None).clamp_budget(tokens, Some(TIGHT_OUTPUT_WINDOW));
+
+        assert!(clamped >= MIN_THINKING_BUDGET, "{FLOOR_IS_NOT_NEGOTIABLE}");
+    }
+
+    #[test_case("max" ; "top_of_the_ladder")]
+    #[test_case("high" ; "below_the_top")]
+    fn budget_for_effort_never_falls_below_the_floor(level: &str) {
+        let derived = budget(Some(1024), None).budget_for_effort(level, Some(TIGHT_OUTPUT_WINDOW));
+
+        assert!(derived >= MIN_THINKING_BUDGET, "{FLOOR_IS_NOT_NEGOTIABLE}");
     }
 
     #[test]

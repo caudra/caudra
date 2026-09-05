@@ -1225,6 +1225,51 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    /// Reproduces `claude-haiku-4-5`: levels without a declared `none`, so
+    /// reasoning cannot be switched off, plus the budget floor the API enforces.
+    fn always_reasons_model(max_output: u32) -> crate::model::Model {
+        let mut model = thinking_model("claude-haiku-4-5");
+        model.max_output_tokens = Some(max_output);
+        model.reasoning_options = ReasoningOptions::new(vec![
+            ReasoningOption::Effort {
+                values: ["low", "medium", "high", "max"]
+                    .map(str::to_string)
+                    .to_vec(),
+            },
+            ReasoningOption::BudgetTokens {
+                min: Some(MIN_THINKING_BUDGET),
+                max: None,
+            },
+        ]);
+        model
+    }
+
+    /// What [`caudra_agent`]'s title request asks for: twice the floor, because
+    /// the budget derives from half the output window.
+    const TITLE_OUTPUT_WINDOW: u32 = MIN_THINKING_BUDGET * 2;
+    const BUDGET_UNDER_FLOOR: &str = "a budget below the floor is rejected outright";
+    const BUDGET_OVER_WINDOW: &str = "a budget the answer cannot fit beside is rejected too";
+
+    /// A short request on a model that always reasons still has to carry a
+    /// budget the provider accepts. Sizing the window at 512 shipped one that
+    /// did not, and every session title came back a 400.
+    #[test]
+    fn a_model_that_always_reasons_gets_a_budget_the_api_accepts() {
+        let mut body = json!({});
+
+        ThinkingConfig::Off.apply_to_body(&mut body, &always_reasons_model(TITLE_OUTPUT_WINDOW));
+
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(
+            budget >= u64::from(MIN_THINKING_BUDGET),
+            "{BUDGET_UNDER_FLOOR}"
+        );
+        assert!(
+            budget < u64::from(TITLE_OUTPUT_WINDOW),
+            "{BUDGET_OVER_WINDOW}"
+        );
+    }
+
     const LEVELS_WITH_NONE: &[&str] = &["none", "low", "medium", "high"];
     const LEVELS_WITHOUT_NONE: &[&str] = &["low", "medium", "high", "xhigh"];
     const HIGH_ONLY: &[&str] = &["high"];

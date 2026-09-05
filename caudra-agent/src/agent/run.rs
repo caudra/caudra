@@ -354,19 +354,25 @@ impl<'h> Agent<'h> {
 
     /// Detached: nobody waits for a title, and a turn must not pay for one.
     /// The event can therefore land after the run that triggered it ended.
+    ///
+    /// Which is why the title gets its own token rather than the run's: the
+    /// run's trigger fires when it is dropped at the end of the turn, so
+    /// sharing it cancels every title that outlives the prompt it names.
+    /// [`TITLE_TIMEOUT`](title) is what bounds the request instead.
     fn spawn_title(&self, prompt: String) {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
         let timeouts = self.timeouts;
         let model_policy = Arc::clone(&self.model_policy);
-        let cancel = self.cancel.clone();
+        let cancel = CancelToken::none();
         let session_id = self.session_id.clone();
         let event_tx = self.event_tx.clone();
         smol::spawn(async move {
-            let resolved = title::resolve(&provider, &model, timeouts, &model_policy).await;
-            if let Some(outcome) = title::generate(
-                &*resolved.provider,
-                &resolved.model,
+            if let Ok((resolved, outcome)) = title::for_prompt(
+                &provider,
+                &model,
+                timeouts,
+                &model_policy,
                 &prompt,
                 &cancel,
                 session_id.as_ref(),
@@ -1081,6 +1087,12 @@ mod tests {
     const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
     const ADJUSTED_CONTEXT_WINDOW: u32 = 1;
     const PARTIAL_RESPONSE: &str = "partial";
+    const TITLE_PROMPT: &str = "add refresh token support";
+    const MODEL_TITLE: &str = "Refresh token support";
+    const TITLE_MUST_SURVIVE: &str = "a title is asked for at the start of a turn and answers after it, so the turn ending must not cancel it";
+    /// Generous: the mock answers in microseconds, so this only bounds a
+    /// regression that would otherwise hang instead of failing.
+    const TITLE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -2163,6 +2175,85 @@ mod tests {
         adjust(&mut agent);
 
         assert_eq!(agent.should_generate_title(PROMPT), expected);
+    }
+
+    /// Yields once before answering. A provider that answers on its first poll
+    /// races an already-cancelled token as a coin flip; yielding lets the
+    /// cancelled side win deterministically, so the test can tell a shared
+    /// token from an independent one.
+    struct YieldingProvider(Mutex<Option<StreamResponse>>);
+
+    impl Provider for YieldingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                futures_lite::future::yield_now().await;
+                self.0.lock().unwrap().take().ok_or(AgentError::Channel)
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn title_response() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: MODEL_TITLE.into(),
+                }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        }
+    }
+
+    /// A run's `CancelTrigger` fires when the turn drops it, and a title is
+    /// asked for at the start of a turn but answers long after it. Sharing that
+    /// token meant every title came back `cancelled` instead.
+    #[test]
+    fn a_title_outlives_the_run_that_asked_for_it() {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (mut agent, event_rx) = make_agent(
+                YieldingProvider(Mutex::new(Some(title_response()))),
+                &mut history,
+            );
+            agent.session_id = Some(SessionRef::from_id(caudra_storage::id::CaudraId::generate()));
+            let (trigger, cancel) = CancelToken::new();
+            agent.cancel = cancel;
+            // The turn is over before the detached title ever reaches the wire.
+            trigger.cancel();
+
+            agent.spawn_title(TITLE_PROMPT.into());
+
+            let envelope = futures_lite::future::race(event_rx.recv_async(), async {
+                smol::Timer::after(TITLE_EVENT_TIMEOUT).await;
+                Err(flume::RecvError::Disconnected)
+            })
+            .await
+            .expect(TITLE_MUST_SURVIVE);
+
+            assert!(
+                matches!(envelope.event, AgentEvent::SessionTitle { title: Some(named), .. }
+                    if named == MODEL_TITLE),
+                "{TITLE_MUST_SURVIVE}"
+            );
+        });
     }
 
     #[test]

@@ -16,7 +16,7 @@ use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
 use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket};
-use caudra_storage::usage_ledger::{LedgerPurpose, UsageLedger};
+use caudra_storage::usage_ledger::UsageLedger;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 use jiff::tz::TimeZone;
@@ -796,6 +796,8 @@ fn truncate(text: &str, width: usize) -> String {
 mod tests {
     use test_case::test_case;
 
+    use caudra_storage::usage_ledger::LedgerPurpose;
+
     use super::*;
 
     const HOUR: i64 = 3600;
@@ -804,7 +806,14 @@ mod tests {
     const PURPOSE_IS_ANSWERABLE: &str = "a bill must be able to name what goals cost";
 
     fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
-        purposed_bucket(bucket_start, provider, model, cwd, cost, LedgerPurpose::Chat)
+        purposed_bucket(
+            bucket_start,
+            provider,
+            model,
+            cwd,
+            cost,
+            LedgerPurpose::Chat,
+        )
     }
 
     fn purposed_bucket(
@@ -858,7 +867,9 @@ mod tests {
         let rows = group_usage(&buckets, UsageGrouping::Purpose);
 
         assert_eq!(
-            rows.iter().map(|row| row.group.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.group.as_str())
+                .collect::<Vec<_>>(),
             [
                 LedgerPurpose::Goal.storage_name(),
                 LedgerPurpose::Chat.storage_name()

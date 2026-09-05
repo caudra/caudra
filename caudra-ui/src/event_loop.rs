@@ -34,7 +34,9 @@ use caudra_providers::{HistoryItem, Message, Model, ModelTier};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
-use caudra_storage::sessions::{SessionError, SessionLease, StoredImage, normalize_title};
+use caudra_storage::sessions::{
+    SessionError, SessionLease, StoredImage, TitleSource, normalize_title,
+};
 use caudra_storage::state::WorkspaceTabs;
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -76,6 +78,20 @@ const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
 const CWD_BUSY_ERR: &str = "Wait for all sessions to become idle before changing directory";
 const CWD_REVERT_ERR: &str = "Resolve pending reverts before changing directory";
+const NOTHING_TO_NAME_ERR: &str = "Nothing said yet, so there is nothing to name";
+const NO_TITLE_ERR: &str = "The model returned nothing usable";
+const NAMING_SESSION: &str = "Naming the session…";
+
+/// The prompt that opened a session, which is what its title is about.
+fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
+    messages
+        .iter()
+        .find_map(TitleSource::first_user_text)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| NOTHING_TO_NAME_ERR.to_owned())
+}
 
 fn preset_label(tier: ModelTier) -> &'static str {
     match tier {
@@ -728,6 +744,8 @@ pub(crate) struct EventLoop<'t> {
     auto_theme: Option<AutoSwitch>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
+    title_rx: flume::Receiver<GeneratedTitle>,
+    title_tx: flume::Sender<GeneratedTitle>,
     ui_action_rx: flume::Receiver<UiAction>,
     herdr_reporter: Option<HerdrReporterHandle>,
     _model_fetch_task: smol::Task<()>,
@@ -758,6 +776,15 @@ enum Wake {
     Agent(usize, Box<caudra_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
+    Title(GeneratedTitle),
+}
+
+/// What a model-written title came back as, for the session that asked. The
+/// error is carried rather than logged because this title is one the user
+/// asked for by hand and is waiting on.
+struct GeneratedTitle {
+    id: CaudraId,
+    result: Result<String, String>,
 }
 
 struct BackgroundModels {
@@ -894,6 +921,7 @@ impl<'t> EventLoop<'t> {
         }));
         let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
+        let (title_tx, title_rx) = flume::unbounded::<GeneratedTitle>();
 
         match ui_config.math {
             caudra_config::MathStyle::Unicode => caudra_markdown::render::MathStyle::Unicode,
@@ -973,6 +1001,8 @@ impl<'t> EventLoop<'t> {
             auto_theme,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
+            title_rx,
+            title_tx,
             ui_action_rx,
             herdr_reporter,
             _model_fetch_task: bg.task,
@@ -1061,6 +1091,7 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
+        sel = sel.recv(&self.title_rx, |res| res.ok().map(Wake::Title));
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -1082,6 +1113,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
         }
         Ok(())
     }
@@ -1681,6 +1713,55 @@ impl<'t> EventLoop<'t> {
             .map_err(|error| error.to_string())
     }
 
+    /// The prompt that opened the session, which is what a title is about. A
+    /// live session answers from memory; a stored one is read under a lease,
+    /// the same way [`Self::set_session_title`] writes one back.
+    fn session_opening_prompt(&self, id: CaudraId) -> Result<String, String> {
+        if let Some(i) = self.position(id) {
+            return opening_prompt(self.sessions[i].app.state.session.messages());
+        }
+        let _lease =
+            SessionLease::acquire(&self.ctx.storage, id).map_err(|error| error.to_string())?;
+        let session = load_app_session(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+        opening_prompt(session.messages())
+    }
+
+    /// Detached, because a title takes a network round trip and the picker
+    /// stays usable while it runs. The result comes back as [`Wake::Title`].
+    fn spawn_title(&self, id: CaudraId, prompt: String) {
+        let slot = self.ctx.model_slot.load_full();
+        let timeouts = self.ctx.timeouts;
+        let model_policy = Arc::clone(&self.ctx.model_policy);
+        let title_tx = self.title_tx.clone();
+        // A token nothing can fire, not a fresh pair: `CancelTrigger` cancels
+        // on drop, so a trigger left behind here would kill the request before
+        // it left the ground. The request's own timeout bounds it.
+        let cancel = CancelToken::none();
+        smol::spawn(async move {
+            let result = caudra_agent::agent::title::for_prompt(
+                &slot.provider,
+                &slot.model,
+                timeouts,
+                &model_policy,
+                &prompt,
+                &cancel,
+                None,
+            )
+            .await
+            .map_err(|error| error.user_message())
+            .and_then(|(_, outcome)| outcome.title.ok_or_else(|| NO_TITLE_ERR.to_owned()));
+            let _ = title_tx.send(GeneratedTitle { id, result });
+        })
+        .detach();
+    }
+
+    fn apply_generated_title(&mut self, id: CaudraId, result: Result<String, String>) {
+        let outcome = result.and_then(|title| self.set_session_title(id, &title));
+        if let Err(error) = outcome {
+            self.focused_app().flash(error);
+        }
+    }
+
     /// Lua acts on the focused session, the same target the model picker and
     /// `/thinking` write to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
@@ -2147,6 +2228,13 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
+            Action::GenerateSessionTitle(id) => match self.session_opening_prompt(id) {
+                Ok(prompt) => {
+                    self.spawn_title(id, prompt);
+                    self.sessions[idx].app.flash(NAMING_SESSION.into());
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
             Action::NewSession(lease) => {
                 let old_lease = std::mem::replace(&mut self.sessions[idx].lease, lease);
                 self.respawn_agent(idx, Vec::new());

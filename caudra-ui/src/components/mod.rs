@@ -469,6 +469,7 @@ pub enum Action {
         id: caudra_storage::id::CaudraId,
         title: String,
     },
+    GenerateSessionTitle(caudra_storage::id::CaudraId),
     OpenEditor(PathBuf),
     OpenUrl(String),
     EditInputInEditor,

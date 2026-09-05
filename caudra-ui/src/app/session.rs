@@ -10,11 +10,11 @@ use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
 use crate::repaint::Dirty;
+use caudra_agent::GoalStatus;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
 };
-use caudra_agent::GoalStatus;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
     merge_history_items, project_messages,
@@ -2178,6 +2178,7 @@ impl App {
             SessionPickerAction::Rename { id, title } => {
                 vec![Action::SetSessionTitle { id, title }]
             }
+            SessionPickerAction::Generate(id) => vec![Action::GenerateSessionTitle(id)],
             SessionPickerAction::New => vec![Action::RequestNewSession],
         }
     }

@@ -139,6 +139,7 @@ Some pickers add extra bindings on top of the defaults:
 | Model Picker | `R` | Reset model purpose |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
+| Session Picker | `Ctrl+G` | Name session with a small model |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
 | Workbench Explorer | `Ctrl+H` | Show hidden and ignored files |

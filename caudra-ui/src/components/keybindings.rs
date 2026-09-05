@@ -185,6 +185,7 @@ pub mod key {
     };
     pub const NEW_SESSION: Bind = ctrl_bind!('n');
     pub const RENAME_SESSION: Bind = ctrl_bind!('r');
+    pub const GENERATE_TITLE: Bind = ctrl_bind!('g');
     pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const MODEL_PICKER_FALLBACK: Bind = Bind {
         code: KeyCode::Char('m'),
@@ -839,6 +840,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Rename session",
+        context: KeybindContext::SessionPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::GENERATE_TITLE.label),
+        description: "Name session with a small model",
         context: KeybindContext::SessionPicker,
         platform: Platform::All,
     },

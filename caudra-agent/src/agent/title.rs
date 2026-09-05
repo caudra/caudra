@@ -5,8 +5,8 @@ use caudra_config::ModelPolicy;
 use caudra_providers::model_registry::TitleTarget;
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
-    AgentError, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions, Timeouts,
-    TokenUsage,
+    AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError, ModelTier,
+    RequestOptions, Timeouts, TokenUsage,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{normalize_title, truncate_title};
@@ -18,8 +18,12 @@ use crate::cancel::CancelToken;
 
 /// A title nobody is waiting for is worth one short attempt, not a long one.
 const TITLE_TIMEOUT: Duration = Duration::from_secs(20);
-/// One line, so anything past this is the model ignoring its instructions.
-const TITLE_OUTPUT_TOKENS: u32 = 512;
+/// One line is all the answer needs, but a model that reasons unconditionally
+/// draws its thinking budget from this same pool, and providers floor that
+/// budget at [`MIN_THINKING_BUDGET`]. Since the budget derives from half the
+/// output window, anything tighter than twice the floor produces a budget the
+/// provider rejects outright.
+const TITLE_OUTPUT_TOKENS: u32 = MIN_THINKING_BUDGET * 2;
 /// A pasted file makes a poor title and an expensive request; the opening of
 /// the prompt is what the title is about.
 const MAX_PROMPT_BYTES: usize = 4_096;
@@ -27,15 +31,39 @@ const PROMPT_PREFIX: &str = "Generate a title for this conversation:\n";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
-pub(crate) struct ResolvedTitleModel {
+pub struct ResolvedTitleModel {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
+}
+
+/// Resolves the title model and asks it for a name. The one entry point:
+/// the agent names a new session with it, and the session picker renames an
+/// existing one.
+pub async fn for_prompt(
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+    prompt: &str,
+    cancel: &CancelToken,
+    session_id: Option<&SessionRef>,
+) -> Result<(ResolvedTitleModel, TitleOutcome), AgentError> {
+    let resolved = resolve(provider, model, timeouts, model_policy).await;
+    let outcome = generate(
+        &*resolved.provider,
+        &resolved.model,
+        prompt,
+        cancel,
+        session_id,
+    )
+    .await?;
+    Ok((resolved, outcome))
 }
 
 /// Falls back to the chat model whenever the target cannot be resolved: a
 /// missing weak tier is a reason to use what is already loaded, not to skip
 /// naming the session.
-pub(crate) async fn resolve(
+async fn resolve(
     current_provider: &Arc<dyn Provider>,
     current_model: &Model,
     timeouts: Timeouts,
@@ -114,20 +142,20 @@ fn title_model_error(spec: &str, error: ModelError) -> AgentError {
 /// model answered with nothing usable, so the heuristic title the session
 /// already carries stands. The spend is reported either way: an unusable
 /// answer was still billed.
-pub(crate) struct TitleOutcome {
+pub struct TitleOutcome {
     pub title: Option<String>,
     pub usage: TokenUsage,
 }
 
-/// `None` only when the request itself failed or stalled, which is the one
+/// Errors only when the request itself failed or stalled, which is the one
 /// case with no spend to attribute.
-pub(crate) async fn generate(
+async fn generate(
     provider: &dyn Provider,
     model: &Model,
     prompt: &str,
     cancel: &CancelToken,
     session_id: Option<&SessionRef>,
-) -> Option<TitleOutcome> {
+) -> Result<TitleOutcome, AgentError> {
     let messages = [Message::user(format!(
         "{PROMPT_PREFIX}{}",
         clamp(prompt, MAX_PROMPT_BYTES)
@@ -153,13 +181,13 @@ pub(crate) async fn generate(
     .map_err(AgentError::from);
 
     match response {
-        Ok(response) => Some(TitleOutcome {
+        Ok(response) => Ok(TitleOutcome {
             title: clean(&response_text(&response.message)),
             usage: response.usage,
         }),
         Err(error) => {
             warn!(%error, model = %model.id, "session title generation failed");
-            None
+            Err(error)
         }
     }
 }
