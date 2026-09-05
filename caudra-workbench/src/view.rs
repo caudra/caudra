@@ -663,6 +663,14 @@ impl Workbench {
                 (keys::TOGGLE_REGEX.label, "regex"),
             ];
         }
+        if self.focus == Focus::Editor {
+            return vec![
+                (keys::SAVE.label, "save"),
+                (keys::FIND.label, "find"),
+                (keys::SEND_TO_COMPOSER.label, "send"),
+                (keys::CLOSE.label, "back"),
+            ];
+        }
         vec![
             (keys::VIEW_EXPLORER.label, "explorer"),
             (keys::FIND.label, "find"),
@@ -1260,11 +1268,15 @@ mod tests {
 
     use test_case::test_case;
 
-    use super::{Editor, SidebarView, Tab, TabHit, Toggle, header_at, tab_at, toggle_at};
+    use super::{
+        Editor, Focus, SidebarView, Tab, TabHit, Toggle, Workbench, WorkbenchStyles, header_at,
+        keys, tab_at, toggle_at,
+    };
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
     const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
+    const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
 
     /// Two two-column titles, so every tab spans ` ab \u{d7} ` and the second
     /// starts where the first ended.
@@ -1326,6 +1338,18 @@ mod tests {
     #[test_case(15, None ; "past the last label is nothing")]
     fn a_column_falls_on_the_view_the_header_painted(column: u16, expected: Option<SidebarView>) {
         assert_eq!(header_at(column, 0), expected, "{WRONG_VIEW}");
+    }
+
+    #[test_case(Focus::Editor, keys::SAVE.label ; "the editor is offered save")]
+    #[test_case(Focus::Sidebar, keys::VIEW_EXPLORER.label ; "the sidebar is offered its views")]
+    fn the_focused_pane_leads_the_status_hints(focus: Focus, expected: &str) {
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.focus = focus;
+        assert_eq!(
+            workbench.status_hints().first().map(|(bind, _)| *bind),
+            Some(expected),
+            "{WRONG_HINT}"
+        );
     }
 
     #[test_case(0, None ; "the gap in front of a button is not it")]
