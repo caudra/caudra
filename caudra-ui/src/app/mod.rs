@@ -1462,6 +1462,13 @@ impl App {
             LoginPickerAction::Configured { slug } => {
                 vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
+            LoginPickerAction::AuthenticateProvider {
+                provider,
+                model_spec,
+            } => vec![Action::AuthenticateProvider {
+                provider,
+                model_spec,
+            }],
         };
         if closed {
             self.login_picker.close();

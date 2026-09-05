@@ -18,33 +18,94 @@ use caudra_providers::provider::fetch_all_models;
 use caudra_providers::{ProviderData, catalog_providers};
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
-use caudra_storage::auth::ProviderCredentials;
 use caudra_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
+    ProviderAuth, ProviderCredentials, delete_provider_credentials, load_provider_credentials,
+    save_provider_credentials, try_load_provider_auth,
 };
 use caudra_storage::model::persist_model;
 
-pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
+use crate::cli::AuthMethod;
+
+const AUTH_STATUS_EMPTY: &str = "       ";
+const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
+const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
+const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
+const PROVIDER_SLUG_WIDTH: usize = 14;
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoginRoute {
+    AnthropicOauth,
+    OpenAiOauth,
+    XaiOauth,
+    Copilot,
+    ApiKey,
+}
+
+pub fn auth_login(
+    provider: Option<&str>,
+    method: Option<AuthMethod>,
+    storage: &StateDir,
+) -> Result<()> {
     match provider {
-        Some("anthropic") => anthropic_auth::login(storage)?,
-        Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
-        Some("copilot") => copilot_auth::login(storage)?,
-        Some(slug) => {
-            let slug = slugify(slug);
-            if builtin_provider(&slug).is_none()
-                && dynamic::display_name(&slug).is_none()
-                && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = caudra_providers::catalog_provider(&slug)
-            {
-                login_catalog_provider(&provider_data, storage)?;
-            } else {
-                login_provider(&slug, storage)?;
-            }
-        }
+        Some(provider) => login_slug(&slugify(provider), method, storage)?,
         None => login_interactive(storage)?,
     }
     Ok(())
+}
+
+fn login_slug(slug: &str, method: Option<AuthMethod>, storage: &StateDir) -> Result<()> {
+    match login_route(slug, method)? {
+        LoginRoute::AnthropicOauth => anthropic_auth::login(storage)?,
+        LoginRoute::OpenAiOauth => openai_auth::login(storage)?,
+        LoginRoute::XaiOauth => xai_auth::login(storage)?,
+        LoginRoute::Copilot => copilot_auth::login(storage)?,
+        LoginRoute::ApiKey => login_api_key_slug(slug, storage)?,
+    }
+    Ok(())
+}
+
+fn login_route(slug: &str, method: Option<AuthMethod>) -> Result<LoginRoute> {
+    match (slug, method) {
+        ("anthropic", Some(AuthMethod::ApiKey)) | ("openai", Some(AuthMethod::ApiKey)) => {
+            Ok(LoginRoute::ApiKey)
+        }
+        ("anthropic", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::AnthropicOauth),
+        ("openai", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::OpenAiOauth),
+        ("xai", None) => Ok(LoginRoute::XaiOauth),
+        ("copilot", None) => Ok(LoginRoute::Copilot),
+        (_, Some(_)) => bail!("--method is supported only for Anthropic and OpenAI"),
+        _ => Ok(LoginRoute::ApiKey),
+    }
+}
+
+fn login_api_key_slug(slug: &str, storage: &StateDir) -> Result<()> {
+    if builtin_provider(slug).is_none()
+        && dynamic::display_name(slug).is_none()
+        && ProvidersConfig::load().get(slug).is_none()
+        && let Some(provider_data) = caudra_providers::catalog_provider(slug)
+    {
+        login_catalog_provider(&provider_data, storage)
+    } else {
+        login_provider(slug, storage)
+    }
+}
+
+fn prompt_auth_method(display_name: &str) -> Result<AuthMethod> {
+    println!();
+    println!("  Authenticate with {display_name}:");
+    println!();
+    println!("  1. Subscription OAuth");
+    println!("  2. API key");
+    println!();
+    print!("  Select [1-2]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    match input.trim() {
+        "1" => Ok(AuthMethod::Oauth),
+        "2" => Ok(AuthMethod::ApiKey),
+        _ => bail!("invalid selection"),
+    }
 }
 
 fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
@@ -144,51 +205,60 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         .keys()
         .filter(|s| builtin_provider(s).is_none() && *s != "opencode")
         .collect();
+    let catalog_entries = catalog_providers();
+    let custom_idx = builtins.len() + custom_slugs.len() + catalog_entries.len() + 1;
+    let number_width = custom_idx.to_string().len();
+    let slug_width = builtins
+        .iter()
+        .map(|provider| provider.slug.len())
+        .chain(custom_slugs.iter().map(|slug| slug.len()))
+        .chain(catalog_entries.iter().map(|provider| provider.slug.len()))
+        .max()
+        .unwrap_or(PROVIDER_SLUG_WIDTH)
+        .max(PROVIDER_SLUG_WIDTH);
 
     println!();
     println!("  Available providers:");
     println!();
     for (i, b) in builtins.iter().enumerate() {
-        let status = if load_provider_credentials(storage, b.slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
-        } else if env::var(b.default_api_key_env).is_ok() {
-            "\x1b[33m~\x1b[0m"
-        } else {
-            " "
+        let status = match try_load_provider_auth(storage, b.slug) {
+            Ok(Some(ProviderAuth::OAuth(_))) => AUTH_STATUS_OAUTH,
+            Ok(Some(ProviderAuth::ApiKey(_))) => AUTH_STATUS_KEY,
+            _ if env::var(b.default_api_key_env).is_ok() => AUTH_STATUS_ENV,
+            _ => AUTH_STATUS_EMPTY,
         };
-        println!("  {} {}. {:<14} {}", status, i + 1, b.slug, b.display_name);
+        let number = i + 1;
+        let slug = b.slug;
+        let display = b.display_name;
+        println!("  {status} {number:>number_width$}. {slug:<slug_width$} {display}");
     }
     let mut idx = builtins.len();
     for slug in &custom_slugs {
         idx += 1;
         let status = if load_provider_credentials(storage, slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
+            AUTH_STATUS_KEY
         } else {
-            " "
+            AUTH_STATUS_EMPTY
         };
         let display = config
             .get(slug)
             .and_then(|d| d.display_name.as_deref())
             .unwrap_or(slug);
-        println!("  {} {}. {:<14} {}", status, idx, slug, display);
+        println!("  {status} {idx:>number_width$}. {slug:<slug_width$} {display}");
     }
 
-    let catalog_entries = catalog_providers();
     for cat in &catalog_entries {
         idx += 1;
         let status = if load_provider_credentials(storage, &cat.slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
+            AUTH_STATUS_KEY
         } else {
-            " "
+            AUTH_STATUS_EMPTY
         };
-        println!(
-            "  {} {}. {:<14} {}",
-            status, idx, cat.slug, cat.display_name
-        );
+        let slug = &cat.slug;
+        let display = &cat.display_name;
+        println!("  {status} {idx:>number_width$}. {slug:<slug_width$} {display}");
     }
-    idx += 1;
-    let custom_idx = idx;
-    println!("    {}. Custom provider...", custom_idx);
+    println!("  {AUTH_STATUS_EMPTY} {custom_idx:>number_width$}. Custom provider...");
     println!();
 
     print!("  Select [1-{}]: ", custom_idx);
@@ -205,7 +275,14 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         login_custom(storage)?;
     } else if choice <= builtins.len() {
         let slug = builtins[choice - 1].slug;
-        login_provider(slug, storage)?;
+        let method = match slug {
+            "anthropic" | "openai" => Some(prompt_auth_method(&resolve_display_name(
+                slug,
+                config.get(slug),
+            ))?),
+            _ => None,
+        };
+        login_slug(slug, method, storage)?;
     } else if choice <= builtins.len() + custom_slugs.len() {
         let slug = custom_slugs[choice - builtins.len() - 1];
         login_provider(slug, storage)?;
@@ -411,7 +488,7 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
 
 pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
-    match provider {
+    match slug.as_str() {
         "anthropic" => anthropic_auth::logout(storage)?,
         "openai" => openai_auth::logout(storage)?,
         "xai" => xai_auth::logout(storage)?,
@@ -442,26 +519,22 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     for b in &builtins {
         let def = config.get(b.slug);
         let display = resolve_display_name(b.slug, def);
+        let auth = try_load_provider_auth(storage, b.slug)
+            .with_context(|| format!("load credentials for '{}'", b.slug))?;
 
-        if load_tokens(storage, b.slug).is_some() {
+        if matches!(&auth, Some(ProviderAuth::OAuth(_))) {
             println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
-        } else if let Some(creds) = load_provider_credentials(storage, b.slug) {
+        } else if let Some(ProviderAuth::ApiKey(creds)) = &auth {
             let plan_info = def
                 .and_then(|d| d.plan.as_deref())
-                .map(|p| format!(" ({})", p))
+                .map(|p| format!(" ({p})"))
                 .unwrap_or_default();
-            let masked = if creds.api_key.len() > 8 {
-                format!(
-                    "{}...{}",
-                    &creds.api_key[..4],
-                    &creds.api_key[creds.api_key.len() - 4..]
-                )
-            } else {
-                "****".to_string()
-            };
             println!(
                 "  \x1b[32m✓\x1b[0m {:<14} {} (key: {}){}",
-                b.slug, display, masked, plan_info
+                b.slug,
+                display,
+                creds.masked_api_key(),
+                plan_info
             );
         } else if env::var(b.default_api_key_env).is_ok() {
             println!(
@@ -803,6 +876,28 @@ pub fn prompt(
 
     print!("{output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case("OpenAI", None, LoginRoute::OpenAiOauth ; "normalized_openai_defaults_to_oauth")]
+    #[test_case("Anthropic", None, LoginRoute::AnthropicOauth ; "normalized_anthropic_defaults_to_oauth")]
+    #[test_case("openai", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "openai_api_key")]
+    #[test_case("anthropic", Some(AuthMethod::ApiKey), LoginRoute::ApiKey ; "anthropic_api_key")]
+    #[test_case("xAI", None, LoginRoute::XaiOauth ; "normalized_xai")]
+    #[test_case("Copilot", None, LoginRoute::Copilot ; "normalized_copilot")]
+    #[test_case("google", None, LoginRoute::ApiKey ; "ordinary_provider")]
+    fn provider_login_routes(raw: &str, method: Option<AuthMethod>, expected: LoginRoute) {
+        assert_eq!(login_route(&slugify(raw), method).unwrap(), expected);
+    }
+
+    #[test]
+    fn oauth_method_rejects_non_subscription_provider() {
+        assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    }
 }
 
 #[cfg(test)]

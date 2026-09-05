@@ -53,12 +53,27 @@ impl InputReader {
     /// the tty. Blocks until the reader acknowledges it is out of
     /// `event::read`; the guard resumes reading on drop.
     pub(crate) fn pause(&self) -> PauseGuard<'_> {
-        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
-        let _ = self.ctl_tx.send(Ctl::Pause(ack_tx));
-        if ack_rx.recv_timeout(PAUSE_ACK_TIMEOUT).is_err() {
-            warn!("input reader did not acknowledge pause");
+        if let Err(error) = self.request_pause() {
+            warn!(%error, "failed to pause input reader");
         }
         PauseGuard(self)
+    }
+
+    pub(crate) fn try_pause(&self) -> Result<PauseGuard<'_>, String> {
+        self.request_pause()?;
+        Ok(PauseGuard(self))
+    }
+
+    fn request_pause(&self) -> Result<(), String> {
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        self.ctl_tx
+            .send(Ctl::Pause(ack_tx))
+            .map_err(|_| "terminal input reader is unavailable".to_string())?;
+        if ack_rx.recv_timeout(PAUSE_ACK_TIMEOUT).is_err() {
+            let _ = self.ctl_tx.send(Ctl::Resume);
+            return Err("terminal input reader did not acknowledge pause".into());
+        }
+        Ok(())
     }
 }
 

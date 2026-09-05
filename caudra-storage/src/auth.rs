@@ -15,6 +15,10 @@ use crate::{
 const AUTH_DIR: &str = "auth";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
+const ACCESS_FIELD: &str = "access";
+const API_KEY_FIELD: &str = "api_key";
+const EXPIRES_FIELD: &str = "expires";
+const REFRESH_FIELD: &str = "refresh";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -51,11 +55,32 @@ pub struct McpAuthData {
     pub token_endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCredentials {
     pub api_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAuth {
+    OAuth(OAuthTokens),
+    ApiKey(ProviderCredentials),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthKind {
+    OAuth,
+    ApiKey,
+}
+
+impl ProviderAuth {
+    pub fn kind(&self) -> ProviderAuthKind {
+        match self {
+            Self::OAuth(_) => ProviderAuthKind::OAuth,
+            Self::ApiKey(_) => ProviderAuthKind::ApiKey,
+        }
+    }
 }
 
 impl ProviderCredentials {
@@ -98,6 +123,38 @@ fn try_load_auth<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageE
     Ok(Some(serde_json::from_str(&data)?))
 }
 
+fn try_load_provider_auth_path(path: &Path) -> Result<Option<ProviderAuth>, StorageError> {
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = serde_json::from_str(&data)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| StorageError::InvalidProviderAuth("expected a JSON object".into()))?;
+    let has_api_key = object.contains_key(API_KEY_FIELD);
+    let has_oauth = [ACCESS_FIELD, REFRESH_FIELD, EXPIRES_FIELD]
+        .iter()
+        .any(|field| object.contains_key(*field));
+    match (has_api_key, has_oauth) {
+        (true, false) => serde_json::from_value(value)
+            .map(ProviderAuth::ApiKey)
+            .map(Some)
+            .map_err(Into::into),
+        (false, true) => serde_json::from_value(value)
+            .map(ProviderAuth::OAuth)
+            .map(Some)
+            .map_err(Into::into),
+        (true, true) => Err(StorageError::InvalidProviderAuth(
+            "contains both OAuth and API-key fields".into(),
+        )),
+        (false, false) => Err(StorageError::InvalidProviderAuth(
+            "missing OAuth or API-key fields".into(),
+        )),
+    }
+}
+
 fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -117,14 +174,24 @@ fn delete_auth(path: &Path) -> Result<bool, StorageError> {
 }
 
 pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
-    load_auth(&auth_path(dir, provider))
+    try_load_tokens(dir, provider).ok().flatten()
 }
 
 pub fn try_load_tokens(
     dir: &StateDir,
     provider: &str,
 ) -> Result<Option<OAuthTokens>, StorageError> {
-    try_load_auth(&auth_path(dir, provider))
+    Ok(match try_load_provider_auth(dir, provider)? {
+        Some(ProviderAuth::OAuth(tokens)) => Some(tokens),
+        Some(ProviderAuth::ApiKey(_)) | None => None,
+    })
+}
+
+pub fn try_load_provider_auth(
+    dir: &StateDir,
+    provider: &str,
+) -> Result<Option<ProviderAuth>, StorageError> {
+    try_load_provider_auth_path(&auth_path(dir, provider))
 }
 
 pub fn save_tokens(
@@ -136,6 +203,15 @@ pub fn save_tokens(
 }
 
 pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
+    let path = auth_path(dir, provider);
+    match try_load_provider_auth_path(&path)? {
+        Some(ProviderAuth::OAuth(_)) => delete_auth(&path),
+        Some(ProviderAuth::ApiKey(_)) | None => Ok(false),
+    }
+}
+
+pub fn delete_provider_auth(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
+    let _lock = lock_provider_auth(dir, provider)?;
     delete_auth(&auth_path(dir, provider))
 }
 
@@ -186,7 +262,10 @@ pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, Storag
 }
 
 pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
-    load_auth(&auth_path(dir, slug))
+    match try_load_provider_auth(dir, slug).ok().flatten()? {
+        ProviderAuth::ApiKey(credentials) => Some(credentials),
+        ProviderAuth::OAuth(_) => None,
+    }
 }
 
 pub fn save_provider_credentials(
@@ -199,7 +278,11 @@ pub fn save_provider_credentials(
 }
 
 pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
-    delete_auth(&auth_path(dir, slug))
+    let path = auth_path(dir, slug);
+    match try_load_provider_auth_path(&path)? {
+        Some(ProviderAuth::ApiKey(_)) => delete_auth(&path),
+        Some(ProviderAuth::OAuth(_)) | None => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -210,7 +293,17 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const TEST_PROVIDER: &str = "anthropic";
     const TEST_URL: &str = "https://mcp.example.com";
+
+    fn test_tokens() -> OAuthTokens {
+        OAuthTokens {
+            access: "access_tok".into(),
+            refresh: "refresh_tok".into(),
+            expires: 9_999_999_999,
+            account_id: None,
+        }
+    }
 
     fn test_mcp_data() -> McpAuthData {
         McpAuthData {
@@ -240,28 +333,89 @@ mod tests {
     fn save_load_delete_round_trip() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let tokens = OAuthTokens {
-            access: "access_tok".into(),
-            refresh: "refresh_tok".into(),
-            expires: 9999999999,
-            account_id: None,
-        };
-        save_tokens(&dir, "anthropic", &tokens).unwrap();
+        let tokens = test_tokens();
+        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
 
-        let loaded = load_tokens(&dir, "anthropic").unwrap();
+        let loaded = load_tokens(&dir, TEST_PROVIDER).unwrap();
         assert_eq!(loaded.access, "access_tok");
         assert_eq!(loaded.refresh, "refresh_tok");
-        assert_eq!(loaded.expires, 9999999999);
+        assert_eq!(loaded.expires, 9_999_999_999);
 
         #[cfg(unix)]
         {
-            let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
+            let metadata = fs::metadata(auth_path(&dir, TEST_PROVIDER)).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
         }
 
-        assert!(delete_tokens(&dir, "anthropic").unwrap());
-        assert!(load_tokens(&dir, "anthropic").is_none());
-        assert!(!delete_tokens(&dir, "anthropic").unwrap());
+        assert!(delete_tokens(&dir, TEST_PROVIDER).unwrap());
+        assert!(load_tokens(&dir, TEST_PROVIDER).is_none());
+        assert!(!delete_tokens(&dir, TEST_PROVIDER).unwrap());
+    }
+
+    #[test]
+    fn provider_auth_classifies_existing_file_shapes() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let tokens = test_tokens();
+        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
+        assert_eq!(
+            try_load_provider_auth(&dir, TEST_PROVIDER).unwrap(),
+            Some(ProviderAuth::OAuth(tokens))
+        );
+
+        let credentials = ProviderCredentials {
+            api_key: "api-key".into(),
+            host: None,
+        };
+        save_provider_credentials(&dir, TEST_PROVIDER, &credentials).unwrap();
+        assert_eq!(
+            try_load_provider_auth(&dir, TEST_PROVIDER).unwrap(),
+            Some(ProviderAuth::ApiKey(credentials.clone()))
+        );
+        assert!(try_load_tokens(&dir, TEST_PROVIDER).unwrap().is_none());
+        assert_eq!(
+            load_provider_credentials(&dir, TEST_PROVIDER),
+            Some(credentials)
+        );
+    }
+
+    #[test]
+    fn provider_auth_rejects_ambiguous_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let path = auth_path(&dir, TEST_PROVIDER);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            r#"{"api_key":"key","access":"a","refresh":"r","expires":1}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            try_load_provider_auth(&dir, TEST_PROVIDER),
+            Err(StorageError::InvalidProviderAuth(_))
+        ));
+    }
+
+    #[test]
+    fn typed_delete_preserves_other_auth_method() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let credentials = ProviderCredentials {
+            api_key: "api-key".into(),
+            host: None,
+        };
+        save_provider_credentials(&dir, TEST_PROVIDER, &credentials).unwrap();
+        assert!(!delete_tokens(&dir, TEST_PROVIDER).unwrap());
+        assert_eq!(
+            load_provider_credentials(&dir, TEST_PROVIDER),
+            Some(credentials)
+        );
+
+        let tokens = test_tokens();
+        save_tokens(&dir, TEST_PROVIDER, &tokens).unwrap();
+        assert!(!delete_provider_credentials(&dir, TEST_PROVIDER).unwrap());
+        assert_eq!(load_tokens(&dir, TEST_PROVIDER), Some(tokens));
     }
 
     #[test]

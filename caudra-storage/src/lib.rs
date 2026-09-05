@@ -190,6 +190,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("invalid provider authentication: {0}")]
+    InvalidProviderAuth(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("slug collision after max attempts")]

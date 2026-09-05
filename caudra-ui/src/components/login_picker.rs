@@ -8,13 +8,13 @@ use caudra_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slu
 use caudra_providers::catalog_providers_if_available;
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
-    ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
+    ProviderAuthKind, ProviderCredentials, save_provider_credentials, try_load_provider_auth,
 };
 use caudra_storage::model::persist_model;
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
-use crate::components::{Overlay, input_line_with_cursor};
+use crate::components::{Overlay, SubscriptionProvider, input_line_with_cursor};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -31,7 +31,7 @@ const PROTOCOLS: &[(&str, &str)] = &[
 struct ProviderItem {
     slug: String,
     display_name: String,
-    has_key: bool,
+    stored_auth: Option<ProviderAuthKind>,
     has_env: bool,
     configured: bool,
     section: Option<&'static str>,
@@ -47,8 +47,10 @@ impl PickerItem for ProviderItem {
     }
 
     fn detail(&self) -> Option<&str> {
-        if self.has_key {
-            Some("saved")
+        if self.stored_auth == Some(ProviderAuthKind::OAuth) {
+            Some("oauth")
+        } else if self.stored_auth == Some(ProviderAuthKind::ApiKey) {
+            Some("saved key")
         } else if self.has_env {
             Some("env")
         } else if self.configured {
@@ -56,6 +58,28 @@ impl PickerItem for ProviderItem {
         } else {
             None
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LoginMethod {
+    Oauth,
+    ApiKey,
+}
+
+struct AuthMethodItem {
+    method: LoginMethod,
+    label: &'static str,
+    detail: &'static str,
+}
+
+impl PickerItem for AuthMethodItem {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn detail(&self) -> Option<&str> {
+        Some(self.detail)
     }
 }
 
@@ -91,6 +115,10 @@ struct CustomInfo {
 enum Step {
     Closed,
     PickProvider(ListPicker<ProviderItem>),
+    PickAuthMethod {
+        picker: ListPicker<AuthMethodItem>,
+        provider: SubscriptionProvider,
+    },
     PickPlan {
         picker: ListPicker<PlanItem>,
         slug: String,
@@ -136,6 +164,12 @@ enum StepAction {
         builtin_url: Option<String>,
         api_key_optional: bool,
     },
+    GoPickAuthMethod {
+        provider: SubscriptionProvider,
+    },
+    GoOauth {
+        provider: SubscriptionProvider,
+    },
     GoPickPlan {
         slug: String,
     },
@@ -155,6 +189,9 @@ enum StepAction {
         message: String,
         model_spec: Option<String>,
         slug: String,
+    },
+    GoError {
+        message: String,
     },
     Back,
     Close,
@@ -181,16 +218,18 @@ impl LoginPicker {
         let mut items: Vec<ProviderItem> = builtins
             .iter()
             .map(|b| {
-                let has_key = load_provider_credentials(&storage, b.slug).is_some()
-                    || load_tokens(&storage, b.slug).is_some();
+                let stored_auth = try_load_provider_auth(&storage, b.slug)
+                    .ok()
+                    .flatten()
+                    .map(|auth| auth.kind());
                 let has_env = std::env::var(b.default_api_key_env).is_ok();
-                let configured = !has_key
+                let configured = stored_auth.is_none()
                     && !has_env
                     && config.get(b.slug).is_some_and(|d| d.base_url.is_some());
                 ProviderItem {
                     slug: b.slug.to_string(),
                     display_name: b.display_name.to_string(),
-                    has_key,
+                    stored_auth,
                     has_env,
                     configured,
                     section: None,
@@ -202,7 +241,10 @@ impl LoginPicker {
             if slug == "opencode" || providers::builtin_provider(slug).is_some() {
                 continue;
             }
-            let has_key = load_provider_credentials(&storage, slug).is_some();
+            let stored_auth = try_load_provider_auth(&storage, slug)
+                .ok()
+                .flatten()
+                .map(|auth| auth.kind());
             let has_env = def
                 .api_key_env
                 .as_deref()
@@ -210,7 +252,7 @@ impl LoginPicker {
             items.push(ProviderItem {
                 slug: slug.clone(),
                 display_name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
-                has_key,
+                stored_auth,
                 has_env,
                 configured: false,
                 section: None,
@@ -220,15 +262,15 @@ impl LoginPicker {
         if let Some(catalog) = catalog_providers_if_available() {
             let state_dir = StateDir::resolve().ok();
             for cat in catalog {
-                let has_key = state_dir
+                let stored_auth = state_dir
                     .as_ref()
                     .and_then(|s| cat.load_key_from_storage(s))
-                    .is_some();
+                    .map(|_| ProviderAuthKind::ApiKey);
                 let has_env = cat.env_key_set().is_some();
                 items.push(ProviderItem {
                     slug: cat.slug.clone(),
                     display_name: cat.display_name.clone(),
-                    has_key,
+                    stored_auth,
                     has_env,
                     configured: false,
                     section: Some("Providers from Models.dev"),
@@ -238,7 +280,7 @@ impl LoginPicker {
             items.push(ProviderItem {
                 slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
                 display_name: "Models.dev providers (not yet downloaded)".to_string(),
-                has_key: false,
+                stored_auth: None,
                 has_env: false,
                 configured: false,
                 section: Some("Providers from Models.dev"),
@@ -248,7 +290,7 @@ impl LoginPicker {
         items.push(ProviderItem {
             slug: "custom".to_string(),
             display_name: "Custom provider...".to_string(),
-            has_key: false,
+            stored_auth: None,
             has_env: false,
             configured: false,
             section: None,
@@ -278,6 +320,9 @@ impl LoginPicker {
         let action = match &mut self.step {
             Step::Closed => return LoginPickerAction::Consumed,
             Step::PickProvider(picker) => Self::map_provider_action(picker.handle_key(key)),
+            Step::PickAuthMethod { picker, provider } => {
+                Self::map_auth_method_action(picker.handle_key(key), *provider)
+            }
             Step::PickPlan { picker, slug } => Self::map_plan_action(picker.handle_key(key), slug),
             Step::CustomName { input } => match key.code {
                 KeyCode::Enter => {
@@ -357,10 +402,8 @@ impl LoginPicker {
                             host: None,
                         };
                         if let Err(e) = save_provider_credentials(&storage, &slug_c, &creds) {
-                            return self.transition(StepAction::GoDone {
+                            return self.transition(StepAction::GoError {
                                 message: format!("Error: {e}"),
-                                model_spec: None,
-                                slug: slug_c.clone(),
                             });
                         }
                     }
@@ -384,10 +427,8 @@ impl LoginPicker {
                         };
                         config.upsert(slug_c.clone(), provider_def);
                         if let Err(e) = config.save() {
-                            return self.transition(StepAction::GoDone {
+                            return self.transition(StepAction::GoError {
                                 message: format!("Error saving config: {e}"),
-                                model_spec: None,
-                                slug: slug_c.clone(),
                             });
                         }
                     } else {
@@ -401,10 +442,8 @@ impl LoginPicker {
                             }
                             config.upsert(slug_c.clone(), def);
                             if let Err(e) = config.save() {
-                                return self.transition(StepAction::GoDone {
+                                return self.transition(StepAction::GoError {
                                     message: format!("Error saving config: {e}"),
-                                    model_spec: None,
-                                    slug: slug_c.clone(),
                                 });
                             }
                         }
@@ -487,6 +526,9 @@ impl LoginPicker {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> LoginPickerAction {
         let action = match &mut self.step {
             Step::PickProvider(picker) => Self::map_provider_action(picker.handle_mouse(event)),
+            Step::PickAuthMethod { picker, provider } => {
+                Self::map_auth_method_action(picker.handle_mouse(event), *provider)
+            }
             Step::PickPlan { picker, slug } => {
                 Self::map_plan_action(picker.handle_mouse(event), slug)
             }
@@ -509,6 +551,7 @@ impl LoginPicker {
     pub fn contains(&self, pos: Position) -> bool {
         match &self.step {
             Step::PickProvider(picker) => picker.contains(pos),
+            Step::PickAuthMethod { picker, .. } => picker.contains(pos),
             Step::PickPlan { picker, .. } => picker.contains(pos),
             Step::CustomProtocol { picker, .. } => picker.contains(pos),
             Step::Closed
@@ -523,6 +566,7 @@ impl LoginPicker {
     pub fn scroll(&mut self, delta: i32) {
         match &mut self.step {
             Step::PickProvider(picker) => picker.scroll(delta),
+            Step::PickAuthMethod { picker, .. } => picker.scroll(delta),
             Step::PickPlan { picker, .. } => picker.scroll(delta),
             Step::CustomProtocol { picker, .. } => picker.scroll(delta),
             Step::Closed
@@ -541,6 +585,8 @@ impl LoginPicker {
                     StepAction::None
                 } else if item.slug == "custom" {
                     StepAction::GoCustomName
+                } else if let Some(provider) = subscription_provider(&item.slug) {
+                    StepAction::GoPickAuthMethod { provider }
                 } else {
                     let slug = item.slug.clone();
                     let config = providers::ProvidersConfig::load();
@@ -575,6 +621,27 @@ impl LoginPicker {
                 }
             }
             PickerAction::Close => StepAction::Close,
+            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+        }
+    }
+
+    fn map_auth_method_action(
+        action: PickerAction<AuthMethodItem>,
+        provider: SubscriptionProvider,
+    ) -> StepAction {
+        match action {
+            PickerAction::Select(item) => match item.method {
+                LoginMethod::Oauth => StepAction::GoOauth { provider },
+                LoginMethod::ApiKey => StepAction::GoEnterKey {
+                    slug: provider.slug().into(),
+                    plan: None,
+                    display_name: provider.display_name().into(),
+                    custom: None,
+                    builtin_url: None,
+                    api_key_optional: false,
+                },
+            },
+            PickerAction::Close => StepAction::Back,
             PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
         }
     }
@@ -635,6 +702,48 @@ impl LoginPicker {
                     api_key_optional,
                 };
                 LoginPickerAction::Consumed
+            }
+            StepAction::GoPickAuthMethod { provider } => {
+                let items = vec![
+                    AuthMethodItem {
+                        method: LoginMethod::Oauth,
+                        label: "Subscription OAuth",
+                        detail: match provider {
+                            SubscriptionProvider::Anthropic => "Claude subscription",
+                            SubscriptionProvider::OpenAi => "ChatGPT/Codex subscription",
+                        },
+                    },
+                    AuthMethodItem {
+                        method: LoginMethod::ApiKey,
+                        label: "API key",
+                        detail: "provider console key",
+                    },
+                ];
+                let mut picker = ListPicker::new();
+                picker.open(
+                    items,
+                    format!(" {} authentication ", provider.display_name()),
+                );
+                self.step = Step::PickAuthMethod { picker, provider };
+                LoginPickerAction::Consumed
+            }
+            StepAction::GoOauth { provider } => {
+                let config = ProvidersConfig::load();
+                let Some(model_spec) =
+                    providers::resolve_default_model(provider.slug(), config.get(provider.slug()))
+                else {
+                    return self.transition(StepAction::GoError {
+                        message: format!(
+                            "No default model configured for {}",
+                            provider.display_name()
+                        ),
+                    });
+                };
+                self.step = Step::Closed;
+                LoginPickerAction::AuthenticateProvider {
+                    provider,
+                    model_spec,
+                }
             }
             StepAction::GoBuiltinUrl { slug, display_name } => {
                 let config = providers::ProvidersConfig::load();
@@ -703,6 +812,10 @@ impl LoginPicker {
                     LoginPickerAction::Configured { slug }
                 }
             }
+            StepAction::GoError { message } => {
+                self.step = Step::Done { message };
+                LoginPickerAction::Consumed
+            }
             StepAction::Back => {
                 let mut picker = ListPicker::new();
                 picker.open(self.provider_items.clone(), TITLE);
@@ -720,6 +833,7 @@ impl LoginPicker {
         match &mut self.step {
             Step::Closed => Rect::default(),
             Step::PickProvider(picker) => picker.view(frame, area),
+            Step::PickAuthMethod { picker, .. } => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CustomName { input } => {
                 let modal = Modal {
@@ -839,8 +953,24 @@ impl Overlay for LoginPicker {
 pub enum LoginPickerAction {
     Consumed,
     Close,
-    Authenticated { model_spec: String },
-    Configured { slug: String },
+    Authenticated {
+        model_spec: String,
+    },
+    Configured {
+        slug: String,
+    },
+    AuthenticateProvider {
+        provider: SubscriptionProvider,
+        model_spec: String,
+    },
+}
+
+fn subscription_provider(slug: &str) -> Option<SubscriptionProvider> {
+    match slug {
+        "anthropic" => Some(SubscriptionProvider::Anthropic),
+        "openai" => Some(SubscriptionProvider::OpenAi),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -879,7 +1009,7 @@ mod tests {
             vec![ProviderItem {
                 slug: "custom".into(),
                 display_name: "Custom provider...".into(),
-                has_key: false,
+                stored_auth: None,
                 has_env: false,
                 configured: false,
                 section: None,
@@ -901,6 +1031,37 @@ mod tests {
             LoginPickerAction::Consumed
         ));
         assert!(matches!(picker.step, Step::CustomName { .. }));
+    }
+
+    #[test]
+    fn subscription_provider_prompts_for_method_before_authenticating() {
+        let mut provider_picker = ListPicker::new();
+        provider_picker.open(
+            vec![ProviderItem {
+                slug: "anthropic".into(),
+                display_name: "Anthropic".into(),
+                stored_auth: None,
+                has_env: false,
+                configured: false,
+                section: None,
+            }],
+            TITLE,
+        );
+        let mut picker = LoginPicker::new();
+        picker.step = Step::PickProvider(provider_picker);
+
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            LoginPickerAction::Consumed
+        ));
+        assert!(matches!(picker.step, Step::PickAuthMethod { .. }));
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            LoginPickerAction::AuthenticateProvider {
+                provider: SubscriptionProvider::Anthropic,
+                ..
+            }
+        ));
     }
 
     #[test]

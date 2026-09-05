@@ -235,13 +235,21 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
 }
 
 pub fn login(storage: &StateDir) -> Result<(), AgentError> {
+    login_inner(storage, true)
+}
+
+pub fn login_browser_callback(storage: &StateDir) -> Result<(), AgentError> {
+    login_inner(storage, false)
+}
+
+fn login_inner(storage: &StateDir, allow_paste: bool) -> Result<(), AgentError> {
     println!(
         "Anthropic subscription OAuth uses Claude Code's public client registration.\nThis may conflict with Anthropic's terms for Claude subscriptions."
     );
     if !confirm("Continue? [y/N] ")? {
         return Err(AgentError::Cancelled);
     }
-    let tokens = browser_login()?;
+    let tokens = browser_login(allow_paste)?;
     let _lock = lock_provider_auth(storage, PROVIDER)?;
     save_tokens(storage, PROVIDER, &tokens)?;
     println!("Authenticated with Anthropic successfully.");
@@ -277,7 +285,7 @@ fn confirm(message: &str) -> Result<bool, AgentError> {
     ))
 }
 
-fn browser_login() -> Result<OAuthTokens, AgentError> {
+fn browser_login(allow_paste: bool) -> Result<OAuthTokens, AgentError> {
     let (verifier, challenge) = pkce_pair()?;
     let state = random_token()?;
     let listener = bind_callback()?;
@@ -292,9 +300,13 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
         warn!(%error, "failed to open browser");
     }
     println!("Waiting for Anthropic OAuth callback on {redirect_uri}...");
-    println!("If the redirect cannot reach this process, paste the redirect URL or CODE#STATE.");
+    if allow_paste {
+        println!(
+            "If the redirect cannot reach this process, paste the redirect URL or CODE#STATE."
+        );
+    }
 
-    let callback = wait_for_callback(listener, &state)?;
+    let callback = wait_for_callback(listener, &state, allow_paste)?;
     if let Some(error) = callback.error {
         return Err(AgentError::Config {
             message: format!("Anthropic authorization failed: {error}"),
@@ -340,16 +352,19 @@ fn bind_callback() -> Result<TcpListener, AgentError> {
 fn wait_for_callback(
     listener: TcpListener,
     expected_state: &str,
+    allow_paste: bool,
 ) -> Result<CallbackResult, AgentError> {
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
-    let paste_rx = spawn_paste_reader();
+    let paste_rx = allow_paste.then(spawn_paste_reader);
     loop {
         if Instant::now() >= deadline {
             return Err(AgentError::Config {
                 message: CALLBACK_TIMEOUT_MESSAGE.into(),
             });
         }
-        if let Ok(pasted) = paste_rx.try_recv() {
+        if let Some(paste_rx) = &paste_rx
+            && let Ok(pasted) = paste_rx.try_recv()
+        {
             match parse_callback_input(&pasted, expected_state) {
                 Ok(result) => return Ok(result),
                 Err(error) => eprintln!("Ignored OAuth callback: {error}"),

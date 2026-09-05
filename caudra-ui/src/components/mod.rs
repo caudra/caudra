@@ -393,6 +393,28 @@ pub struct LoadedSession {
     pub model_spec: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionProvider {
+    Anthropic,
+    OpenAi,
+}
+
+impl SubscriptionProvider {
+    pub(crate) const fn slug(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+        }
+    }
+}
+
 use std::path::PathBuf;
 
 pub enum Action {
@@ -424,6 +446,10 @@ pub enum Action {
     ChangeSystemPromptProfile(String),
     RefreshProvider {
         slug: String,
+    },
+    AuthenticateProvider {
+        provider: SubscriptionProvider,
+        model_spec: String,
     },
     AssignTier(String, ModelTier),
     ResetTier(ModelTier),

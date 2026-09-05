@@ -88,16 +88,16 @@ Several other Claude Code flags are accepted and ignored so existing scripts kee
 ### `caudra auth`
 
 ```bash
-caudra auth login [provider]   # interactive picker if omitted
+caudra auth login [provider] [--method oauth|api-key]
 caudra auth logout <provider>
 caudra auth status
 ```
 
-`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). Anthropic, OpenAI, xAI, and Copilot have dedicated flows when named explicitly. Other providers prompt for a key and a plan when the provider has more than one. Custom providers can be created from the interactive picker.
+`login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic or OpenAI. Named Anthropic and OpenAI logins default to OAuth. Pass `--method api-key` to store a key instead.
 
-`caudra auth login anthropic` starts experimental Claude subscription OAuth. The command explains the Anthropic terms limitation before opening the browser. Use the interactive picker or `ANTHROPIC_API_KEY` for API-key auth.
+Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI and Copilot retain their dedicated named login flows. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
 
-`status` shows each provider as configured (key on disk), env-only, or missing.
+The TUI `/login` command offers the same method choice for Anthropic and OpenAI. `status` distinguishes saved OAuth, saved API keys, environment credentials, configured endpoints, and missing credentials.
 
 ### `caudra models`
 

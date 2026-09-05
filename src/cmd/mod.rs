@@ -76,8 +76,8 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                AuthAction::Login { provider } => {
-                    subcmd::auth_login(provider.as_deref(), &storage)?
+                AuthAction::Login { provider, method } => {
+                    subcmd::auth_login(provider.as_deref(), method, &storage)?
                 }
                 AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
                 AuthAction::Status => subcmd::auth_status(&storage)?,

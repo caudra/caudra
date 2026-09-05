@@ -2227,6 +2227,46 @@ impl<'t> EventLoop<'t> {
                 self.change_system_prompt_profile(idx, &name);
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
+            Action::AuthenticateProvider {
+                provider,
+                model_spec,
+            } => {
+                let storage = self.ctx.storage.clone();
+                let pause = match self.input.try_pause() {
+                    Ok(pause) => pause,
+                    Err(error) => {
+                        self.sessions[idx].app.flash(error);
+                        return;
+                    }
+                };
+                let result = terminal::with_normal_terminal(self.terminal, || match provider {
+                    crate::components::SubscriptionProvider::Anthropic => {
+                        caudra_providers::anthropic_auth::login_browser_callback(&storage)
+                    }
+                    crate::components::SubscriptionProvider::OpenAi => {
+                        caudra_providers::openai_auth::login(&storage)
+                    }
+                });
+                drop(pause);
+                self.terminal_focused = false;
+
+                match result {
+                    Ok(()) => {
+                        self.refresh_provider(provider.slug().into());
+                        if let Err(error) = self.change_model(&model_spec) {
+                            self.sessions[idx].app.flash(error);
+                        }
+                        self.refresh_models();
+                        self.sessions[idx].app.flash(format!(
+                            "Authenticated with {} subscription",
+                            provider.display_name()
+                        ));
+                    }
+                    Err(error) => self.sessions[idx]
+                        .app
+                        .flash(format!("{} login failed: {error}", provider.display_name())),
+                }
+            }
             Action::AssignTier(spec, tier) => {
                 caudra_providers::model_registry::set_and_persist(
                     spec.clone(),

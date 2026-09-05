@@ -346,6 +346,25 @@ pub(crate) fn suspend(terminal: &mut ratatui::DefaultTerminal) {
     resume(terminal);
 }
 
+pub(crate) fn with_normal_terminal<T>(
+    terminal: &mut ratatui::DefaultTerminal,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct ResumeGuard<'a>(&'a mut ratatui::DefaultTerminal);
+
+    impl Drop for ResumeGuard<'_> {
+        fn drop(&mut self) {
+            resume(self.0);
+        }
+    }
+
+    teardown();
+    let guard = ResumeGuard(terminal);
+    let result = operation();
+    drop(guard);
+    result
+}
+
 fn teardown() {
     pop_terminal_modes();
     terminal::disable_raw_mode().ok();

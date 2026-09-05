@@ -489,6 +489,9 @@ pub enum AuthAction {
     Login {
         /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
         provider: Option<String>,
+        /// Authentication method for Anthropic or OpenAI
+        #[arg(long, value_enum, requires = "provider")]
+        method: Option<AuthMethod>,
     },
     /// Remove stored credentials for a provider
     Logout {
@@ -497,6 +500,12 @@ pub enum AuthAction {
     },
     /// Show authentication status for all providers
     Status,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AuthMethod {
+    Oauth,
+    ApiKey,
 }
 
 pub fn normalize_tool_name(name: &str) -> Result<String> {
@@ -568,5 +577,26 @@ mod tests {
         let cli = Cli::try_parse_from(["caudra", "--ephemeral"]).unwrap();
 
         assert!(cli.ephemeral);
+    }
+
+    #[test]
+    fn provider_auth_method_parses() {
+        let cli = Cli::try_parse_from(["caudra", "auth", "login", "openai", "--method", "api-key"])
+            .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Login {
+                    provider: Some(provider),
+                    method: Some(AuthMethod::ApiKey),
+                }
+            }) if provider == "openai"
+        ));
+    }
+
+    #[test]
+    fn provider_auth_method_requires_provider() {
+        assert!(Cli::try_parse_from(["caudra", "auth", "login", "--method", "oauth"]).is_err());
     }
 }

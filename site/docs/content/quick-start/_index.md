@@ -72,12 +72,13 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/caudra/
 ## Connect a provider
 
 ```bash
-caudra auth login              # interactive picker (OAuth or API key)
-caudra auth login anthropic    # Claude subscription OAuth
-export ANTHROPIC_API_KEY=... # or just export a key
+caudra auth login                           # choose a provider and auth method
+caudra auth login anthropic                 # Claude subscription OAuth
+caudra auth login openai                    # ChatGPT/Codex subscription OAuth
+caudra auth login anthropic --method api-key
 ```
 
-Anthropic, OpenAI, Google, Ollama, and friends all work; multiple keys in one var rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
+Open `/login` inside the TUI for the same OAuth and API-key choices. You can also set provider environment variables such as `ANTHROPIC_API_KEY`. Multiple keys in one variable rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
 
 ## First session
 
