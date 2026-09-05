@@ -4990,6 +4990,47 @@ mod tests {
         });
     }
 
+    /// A second process writes straight to the store, so the manager's cached
+    /// records are the only thing that could answer. Both directions have to
+    /// reach it without a restart.
+    #[test]
+    fn live_managers_follow_rules_written_by_another_process() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let state_dir = StateDir::from_path(temp.path().join("state"));
+            let input = serde_json::json!({"command": "cargo check"});
+            let manager = persistent_manager(state_dir.clone(), &project);
+            answer_enforcement(
+                Arc::clone(&manager),
+                "cargo check",
+                input.clone(),
+                PermissionAnswer::AllowAlwaysLocal,
+            )
+            .await
+            .unwrap();
+            let granted = manager.structured_rule_inventory().unwrap().remove(0);
+            let mut elsewhere = PermissionState::open(&state_dir).unwrap();
+
+            assert!(elsewhere.revoke(&granted.id).unwrap());
+            assert!(
+                enforce_without_prompt(&manager, "cargo check", input.clone())
+                    .await
+                    .is_err()
+            );
+
+            elsewhere
+                .insert(granted.project.clone(), granted.rule.clone())
+                .unwrap();
+            assert!(
+                enforce_without_prompt(&manager, "cargo check", input)
+                    .await
+                    .is_ok()
+            );
+        });
+    }
+
     #[test]
     fn project_rules_load_only_for_the_canonical_project() {
         smol::block_on(async {

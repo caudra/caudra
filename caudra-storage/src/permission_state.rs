@@ -712,6 +712,26 @@ mod tests {
     }
 
     #[test]
+    fn refresh_sees_writes_from_an_independent_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let mut writer = PermissionState::open(&state_dir).unwrap();
+        let mut reader = PermissionState::open(&state_dir).unwrap();
+
+        let record = writer
+            .insert(None, rule(PermissionLifetime::Global))
+            .unwrap();
+        assert!(reader.records().is_empty());
+        reader.refresh().unwrap();
+        assert_eq!(reader.records().len(), 1);
+        assert!(reader.records()[0].is_active());
+
+        assert!(writer.revoke(&record.id).unwrap());
+        reader.refresh().unwrap();
+        assert!(!reader.records()[0].is_active());
+    }
+
+    #[test]
     fn independent_handles_do_not_clobber_each_other() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
