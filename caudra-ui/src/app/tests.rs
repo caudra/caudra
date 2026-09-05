@@ -90,6 +90,8 @@ const FIRST_CONTENT: &str = "after first";
 const CURRENT_CONTENT: &str = "current";
 const CONFLICT_CONTENT: &str = "conflict";
 const CONTINUED_CONTENT: &str = "continued after revert";
+const GOAL_CONDITION: &str = "all focused tests pass";
+const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -3104,14 +3106,39 @@ fn clicking_status_thinking_cycles_from_visible_off_state() {
 #[test]
 fn status_controls_are_read_only_in_subagent_chat() {
     let mut app = app_with_subagent();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
     app.focus_task(TASK_ID).unwrap();
-    let _ = rendered(&mut app);
 
+    assert!(rendered(&mut app).contains(GOAL_CHIP_PREFIX));
     assert!(
         app.status_hits
             .iter()
             .all(|hit| hit.target == StatusBarHitTarget::BackToMain)
     );
+}
+
+#[test]
+fn clicking_the_goal_chip_opens_the_goal_modal() {
+    let mut app = test_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Goal).is_empty());
+
+    assert!(app.goal_modal.is_open());
+}
+
+#[test]
+fn opening_the_goal_modal_clears_footer_hover() {
+    let mut app = test_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    let hit = status_hit(&mut app, StatusBarHitTarget::Goal);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Goal));
+
+    click_status(&mut app, StatusBarHitTarget::Goal);
+
+    assert!(app.goal_modal.is_open());
+    assert_eq!(app.status_hover, None);
 }
 
 #[test]

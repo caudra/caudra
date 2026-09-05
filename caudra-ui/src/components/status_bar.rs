@@ -32,6 +32,7 @@ pub enum StatusBarHitTarget {
     Mode,
     Model,
     Thinking,
+    Goal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,16 +215,24 @@ impl StatusBar {
             ));
         }
 
-        if let Some(goal) = ctx.goal {
+        let goal_hit = ctx.goal.map(|goal| {
+            let label = format!(
+                "[goal · {} · {}]",
+                goal.evaluations,
+                format_goal_elapsed(goal.elapsed())
+            );
+            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+            let width = label.width();
+            left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(
-                format!(
-                    " [goal · {} · {}]",
-                    goal.evaluations,
-                    format_goal_elapsed(goal.elapsed())
+                label,
+                hover_style(
+                    theme::current().status_notice,
+                    ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Goal),
                 ),
-                theme::current().status_notice,
             ));
-        }
+            (offset, width)
+        });
 
         if let Some(retry) = ctx.retry_info {
             let secs = retry
@@ -469,6 +478,16 @@ impl StatusBar {
                 StatusBarHitTarget::Thinking,
             );
         }
+        if let Some((offset, width)) = goal_hit {
+            push_hit(
+                &mut hits,
+                left_area,
+                offset,
+                width,
+                ctx.settings_clickable,
+                StatusBarHitTarget::Goal,
+            );
+        }
         hits
     }
 }
@@ -629,6 +648,14 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+    const GOAL_CONDITION: &str = "all focused tests pass";
+    const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
+
+    fn active_goal() -> GoalSnapshot {
+        caudra_agent::GoalHandle::default()
+            .set(GOAL_CONDITION)
+            .unwrap()
+    }
 
     fn render_at(
         width: u16,
@@ -637,6 +664,7 @@ mod tests {
         yolo: bool,
         hovered: Option<StatusBarHitTarget>,
         hover_url: Option<&str>,
+        goal: Option<&GoalSnapshot>,
     ) -> (String, Vec<StatusBarHit>, Vec<Style>) {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -662,7 +690,7 @@ mod tests {
             workflow: false,
             yolo,
             restoring: false,
-            goal: None,
+            goal,
             mode_clickable: true,
             settings_clickable: true,
             hovered,
@@ -682,7 +710,7 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_at(BAR_WIDTH, global_cost, show_global, yolo, None, None).0
+        render_at(BAR_WIDTH, global_cost, show_global, yolo, None, None, None).0
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -722,7 +750,16 @@ mod tests {
     #[test_case(40 ; "medium")]
     #[test_case(BAR_WIDTH ; "wide")]
     fn status_hits_stay_inside_the_rendered_area(width: u16) {
-        let (_, hits, _) = render_at(width, Some(SESSION_COST), true, true, None, None);
+        let goal = active_goal();
+        let (_, hits, _) = render_at(
+            width,
+            Some(SESSION_COST),
+            true,
+            true,
+            None,
+            None,
+            Some(&goal),
+        );
         let area = Rect::new(0, 0, width, 1);
         assert!(hits.iter().all(|hit| {
             hit.area.width > 0
@@ -733,7 +770,7 @@ mod tests {
 
     #[test]
     fn compact_status_preserves_mode_control() {
-        let (_, hits, _) = render_at(20, None, false, false, None, None);
+        let (_, hits, _) = render_at(20, None, false, false, None, None, None);
         assert!(
             hits.iter()
                 .any(|hit| hit.target == StatusBarHitTarget::Mode)
@@ -742,11 +779,13 @@ mod tests {
 
     #[test]
     fn wide_status_exposes_all_main_controls() {
-        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None);
+        let goal = active_goal();
+        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, Some(&goal));
         for target in [
             StatusBarHitTarget::Mode,
             StatusBarHitTarget::Model,
             StatusBarHitTarget::Thinking,
+            StatusBarHitTarget::Goal,
         ] {
             assert!(hits.iter().any(|hit| hit.target == target));
         }
@@ -760,12 +799,15 @@ mod tests {
 
     #[test]
     fn hover_highlights_labels_without_their_leading_spaces() {
+        let goal = active_goal();
         for target in [
             StatusBarHitTarget::Mode,
             StatusBarHitTarget::Model,
             StatusBarHitTarget::Thinking,
+            StatusBarHitTarget::Goal,
         ] {
-            let (_, hits, styles) = render_at(BAR_WIDTH, None, false, false, Some(target), None);
+            let (_, hits, styles) =
+                render_at(BAR_WIDTH, None, false, false, Some(target), None, Some(&goal));
             let hit = hits.iter().find(|hit| hit.target == target).unwrap();
             let start = usize::from(hit.area.x);
             let end = usize::from(hit.area.right());
@@ -782,10 +824,43 @@ mod tests {
     #[test]
     fn hovered_url_replaces_status_content() {
         const URL: &str = "https://example.com/docs";
-        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, Some(URL));
+        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, Some(URL), None);
 
         assert!(text.trim_start().starts_with(URL));
         assert!(hits.is_empty());
+    }
+
+    /// The chip is the only left-side control whose width comes from live
+    /// numbers, so the hit is measured against what was drawn rather than
+    /// against a re-formatted label whose elapsed time may already have moved.
+    #[test]
+    fn goal_chip_hit_covers_the_chip_alone() {
+        let goal = active_goal();
+        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, Some(&goal));
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Goal)
+            .expect("an active goal is a footer control");
+
+        let chip: String = text
+            .chars()
+            .skip(usize::from(hit.area.x))
+            .take(usize::from(hit.area.width))
+            .collect();
+        assert!(chip.starts_with(GOAL_CHIP_PREFIX), "{chip}");
+        assert!(chip.ends_with(']'), "{chip}");
+        assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+    }
+
+    #[test]
+    fn a_session_without_a_goal_has_no_goal_control() {
+        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, None);
+
+        assert!(!text.contains(GOAL_CHIP_PREFIX));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Goal)
+        );
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

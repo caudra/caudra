@@ -76,7 +76,7 @@ Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an 
 
 The evaluator choice is saved globally in the `model.roles` row of Caudra's SQLite state database and applies across sessions. The same Goal mode is available from `/model` with `Tab`. Press uppercase `R` in that mode to restore Default.
 
-Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active.
+Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
 Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
 

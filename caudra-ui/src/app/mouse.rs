@@ -663,6 +663,11 @@ impl App {
                 self.cycle_reasoning_effort();
                 Vec::new()
             }
+            StatusBarHitTarget::Goal if self.is_main_chat() => {
+                self.clear_control_hovers();
+                self.goal_modal.open();
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
