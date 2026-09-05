@@ -174,6 +174,12 @@ pub struct QuestionEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchToolEntry {
     pub tool: String,
+    /// What the child was allowed to do, stamped from the child's own start
+    /// event so the card reads the same however long after the run it is
+    /// opened. A roster entry that has not started yet carries `Unknown`, as
+    /// does one restored from a session written before this was recorded.
+    #[serde(default)]
+    pub effect: ToolEffect,
     /// The child's header line, from the same summary the transcript shows.
     pub summary: String,
     pub status: BatchToolStatus,
@@ -1636,6 +1642,23 @@ mod tests {
                 filtered_utf8_bytes: 20,
             }),
         }
+    }
+
+    const EXPECT_UNCLASSIFIED: &str =
+        "a roster written before effects were recorded reads as unclassified, not as read-only";
+
+    /// Restored sessions carry the roster verbatim, so the field has to be
+    /// optional on the wire. `chat` fills the gap back in from the registry.
+    #[test]
+    fn a_child_recorded_without_an_effect_is_unclassified() {
+        let entry: BatchToolEntry = serde_json::from_value(serde_json::json!({
+            "tool": "file_read",
+            "summary": "lib.rs",
+            "status": "Success",
+        }))
+        .expect("a roster from an older session still loads");
+
+        assert_eq!(entry.effect, ToolEffect::Unknown, "{EXPECT_UNCLASSIFIED}");
     }
 
     #[test]

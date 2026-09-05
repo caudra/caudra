@@ -17,7 +17,7 @@ use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
 };
 use crate::tools::schema::{ParamSchema, Property, to_json_schema, validate};
-use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
+use crate::tools::{DescriptionContext, ToolAudience, ToolContext, ToolEffect};
 use crate::types::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput, ToolStartEvent,
 };
@@ -205,6 +205,7 @@ impl Child {
         match self.rejection {
             Some(reason) => BatchToolEntry {
                 tool: self.tool.clone(),
+                effect: ToolEffect::Unknown,
                 summary: String::new(),
                 status: BatchToolStatus::Error,
                 input: None,
@@ -214,6 +215,7 @@ impl Child {
             },
             None => BatchToolEntry {
                 tool: self.tool.clone(),
+                effect: ToolEffect::Unknown,
                 summary: String::new(),
                 status: BatchToolStatus::Pending,
                 input: None,
@@ -266,6 +268,7 @@ impl BatchCall {
                         publish(&entries, index, &ctx, |entry| {
                             entry.status = BatchToolStatus::Running;
                             entry.tool = start.tool.to_string();
+                            entry.effect = start.effect;
                             entry.summary = start.summary.clone();
                             entry.input = start.input.clone();
                             entry.raw_input = start.raw_input.clone();
@@ -460,6 +463,7 @@ mod tests {
     fn entry(tool: &str, status: BatchToolStatus, text: &str) -> BatchToolEntry {
         BatchToolEntry {
             tool: tool.into(),
+            effect: ToolEffect::Unknown,
             summary: String::new(),
             status,
             input: None,
@@ -829,6 +833,47 @@ mod tests {
         assert!(
             !text.contains(HEADER_TOOL_WIRE),
             "{EXPECT_RESOLVED_NAME}: {text:?}"
+        );
+    }
+
+    const EXPECT_STAMPED_EFFECT: &str =
+        "a child carries the effect it ran under, so the card folds it by the standalone rule";
+
+    /// The roster is all the transcript has: a child has no card of its own to
+    /// ask the registry about, and a restored session may be read long after
+    /// the tool is gone. Taken as the child starts, for the same reason its
+    /// name is.
+    #[test]
+    fn a_child_carries_the_effect_it_ran_under() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register_audited(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+                ToolEffect::Mutating,
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+
+        let result = smol::block_on(async {
+            parsed(calls(json!([{ "tool": HEADER_TOOL, "path": HEADER_PATH }])))
+                .unwrap()
+                .execute(&ctx)
+                .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, .. }) = result.output else {
+            panic!("expected a batch result");
+        };
+        assert_eq!(
+            entries[0].effect,
+            ToolEffect::Mutating,
+            "{EXPECT_STAMPED_EFFECT}"
         );
     }
 

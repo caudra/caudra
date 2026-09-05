@@ -1663,6 +1663,7 @@ fn batch_roster(id: &str, children: usize) -> AgentEvent {
         entries: (0..children)
             .map(|_| caudra_agent::BatchToolEntry {
                 tool: "task".into(),
+                effect: ToolEffect::Orchestrator,
                 summary: "research".into(),
                 status: caudra_agent::BatchToolStatus::Running,
                 input: None,

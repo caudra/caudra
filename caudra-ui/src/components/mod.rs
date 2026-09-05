@@ -706,19 +706,25 @@ pub struct ToolRole {
 }
 
 impl ToolRole {
-    /// Whether the card can be put away behind its header without losing the
-    /// record of what the call did.
-    ///
-    /// `ToolEffect` alone cannot answer this. It says whether a call may
-    /// change something, which is what permissions need, and a write and a
-    /// shell command are both `Mutating`. What matters here is where the
-    /// record lives. A write's diff exists nowhere but the body, so hiding it
-    /// loses the change. A shell command is named in full by its own header,
-    /// down to its exit status, and what its body holds is what the command
-    /// printed rather than what it did.
     pub fn is_collapsible(&self) -> bool {
-        self.effect.is_collapsible() || self.name.as_ref() == SHELL_TOOL_NAME
+        is_collapsible(self.effect, &self.name)
     }
+}
+
+/// Whether a call can be put away behind its header without losing the record
+/// of what it did.
+///
+/// `ToolEffect` alone cannot answer this. It says whether a call may change
+/// something, which is what permissions need, and a write and a shell command
+/// are both `Mutating`. What matters here is where the record lives. A write's
+/// diff exists nowhere but the body, so hiding it loses the change. A shell
+/// command is named in full by its own header, down to its exit status, and
+/// what its body holds is what the command printed rather than what it did.
+///
+/// Taken loose from `ToolRole` because a batch child is the same call without
+/// a card of its own, and it has to fold by the same rule or the two drift.
+pub(crate) fn is_collapsible(effect: ToolEffect, tool: &str) -> bool {
+    effect.is_collapsible() || tool == SHELL_TOOL_NAME
 }
 
 #[derive(Debug, Clone, PartialEq)]

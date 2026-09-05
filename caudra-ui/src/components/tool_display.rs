@@ -52,7 +52,7 @@ impl RenderCtx<'_> {
             .and_then(|id| self.batch_progress.get(id))
             .cloned()
             .unwrap_or_default();
-        RenderLimits::new(full, budget, views).with_progress(progress)
+        RenderLimits::new(full, budget, views, *self.tool_output_lines).with_progress(progress)
     }
 }
 
@@ -1374,6 +1374,7 @@ pub fn build_instructions_lines(
             expanded,
             code_view::instruction_limit(expanded),
             BatchViews::default(),
+            ToolOutputLines::default(),
         ),
     );
     b.push_header("load", header, annotation.as_deref(), None, None, None);
@@ -2314,14 +2315,14 @@ mod tests {
         tool: &str,
         expect_text: bool,
     ) {
-        let limits = RenderLimits::new(false, TOL.get(tool), BatchViews::default());
+        let limits = RenderLimits::new(false, TOL.get(tool), BatchViews::default(), TOL);
         let resolved = resolve_output(output.as_ref(), body, None, 0, limits, false);
         assert_eq!(resolved.text.is_some(), expect_text);
     }
 
     #[test]
     fn resolve_output_pre_truncated_forwarded() {
-        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default());
+        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default(), TOL);
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
         assert_eq!(resolved.skipped, 42);
     }
@@ -2329,7 +2330,7 @@ mod tests {
     #[test]
     fn resolve_output_truncation_overrides_pre_truncated() {
         let long = n_lines(200);
-        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default());
+        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default(), TOL);
         let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
         assert!(resolved.skipped > 5);
     }

@@ -5,8 +5,8 @@ use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncation_notice};
 use crate::theme;
 
-use super::ToolProgress;
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
+use super::{ToolProgress, is_collapsible};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -15,6 +15,7 @@ use caudra_agent::{
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
     SearchCap, SubagentProgress, ToolInput, ToolOutput,
 };
+use caudra_config::ToolOutputLines;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -449,11 +450,15 @@ fn render_batch(
     let mut rows = Vec::new();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
-        let open = limits.child_open(index);
+        let view = limits.child(index, entry);
         // Resolved before the summary row so the separator below knows whether
         // this child is a list entry or a block.
-        let body = open.then(|| child_body(entry, highlight, &limits.for_child()));
-        let has_body = body.as_ref().is_some_and(|body| !body.is_empty());
+        let body = view.map(|child| child_body(entry, highlight, &child));
+        let has_body = body.as_ref().is_some_and(|(lines, _)| !lines.is_empty());
+        // Every row of a child answers for it, whether or not a click would
+        // change what is drawn: this is also how a dispatched child's rows are
+        // traced back to the subagent they belong to.
+        let target = Some(RowTarget(index));
         if !lines.is_empty() && (previous_has_body || has_body) {
             lines.push(Line::default());
             rows.push(None);
@@ -480,19 +485,19 @@ fn render_batch(
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        if !open && holds_a_body(entry) {
+        if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
-        rows.push(Some(RowTarget(index)));
+        rows.push(target);
         // Between the header and the body, so a click below it still resolves
         // to the child it looks like it is on.
         if let Some(progress) = limits.progress.get(&index) {
             lines.push(Line::from(child_progress_spans(progress)));
-            rows.push(Some(RowTarget(index)));
+            rows.push(target);
         }
-        if let Some(body) = body {
-            rows.resize(rows.len() + body.len(), Some(RowTarget(index)));
+        if let Some((body, _)) = body {
+            rows.resize(rows.len() + body.len(), target);
             lines.extend(indent_all(body));
         }
     }
@@ -555,24 +560,45 @@ fn child_progress_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
 }
 
 /// A child's own rendering, structured where the tool produced structure and
-/// its text otherwise. Errors read as plain text: a failed call has no
-/// structured result to draw. An opened child draws whole, so nothing here
-/// truncates.
+/// its text otherwise, with whether it is holding anything back. Errors read
+/// as plain text: a failed call has no structured result to draw.
 fn child_body(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, bool) {
     let output = entry.output.as_ref();
     if entry.status == BatchToolStatus::Error {
-        return text_lines(output.map_or(String::new(), ToolOutput::as_text));
+        return capped(
+            text_lines(output.map_or(String::new(), ToolOutput::as_text)),
+            limits.budget,
+        );
     }
     match output {
-        Some(ToolOutput::Markdown(text)) => markdown_lines(&text.text),
-        Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => text_lines(text.text.clone()),
-        Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text()),
-        other => render_tool_content(entry.input.as_ref(), other, highlight, limits.clone()).lines,
+        Some(ToolOutput::Markdown(text)) => capped(markdown_lines(&text.text), limits.budget),
+        Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
+            capped(text_lines(text.text.clone()), limits.budget)
+        }
+        Some(ToolOutput::Shell(shell)) => capped(text_lines(shell.raw_text()), limits.budget),
+        other => {
+            let content =
+                render_tool_content(entry.input.as_ref(), other, highlight, limits.clone());
+            (content.lines, content.truncation)
+        }
     }
+}
+
+/// Holds a text body to the budget its own card would hold it to, and says how
+/// much that hid. The tools that draw themselves already write this notice, so
+/// a child announces what it is keeping back wherever the body came from.
+fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, bool) {
+    let hidden = lines.len().saturating_sub(budget);
+    if !should_truncate(hidden) {
+        return (lines, false);
+    }
+    lines.truncate(budget);
+    lines.push(truncation_line(hidden));
+    (lines, true)
 }
 
 /// A child that answered in markdown is answering, not quoting: a subagent's
@@ -992,9 +1018,11 @@ pub struct Disclosure {
     pub shell_raw: bool,
 }
 
-/// The batch children the reader has opened, by their index in the roster.
-/// Children start folded, so a card nobody has touched reads as the list of
-/// what it ran rather than every result at once.
+/// The batch children the reader has asked to see whole, by their index in the
+/// roster. A child not named here is drawn the way its own card would be: a
+/// read-only one folds to its summary row, so a batch nobody has touched reads
+/// as the list of what it ran, and one whose body is the only record of what it
+/// did rests at its tool's budget.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct BatchViews(Arc<[usize]>);
 
@@ -1033,14 +1061,18 @@ pub struct RenderLimits {
     pub budget: usize,
     pub views: BatchViews,
     pub progress: ChildProgress,
+    /// Every tool's budget rather than only this card's, because a batch child
+    /// rests at the one its own tool would be drawn with.
+    pub tool_lines: ToolOutputLines,
 }
 
 impl RenderLimits {
-    pub fn new(full: bool, budget: usize, views: BatchViews) -> Self {
+    pub fn new(full: bool, budget: usize, views: BatchViews, tool_lines: ToolOutputLines) -> Self {
         Self {
             budget: if full { usize::MAX } else { budget },
             views,
             progress: ChildProgress::default(),
+            tool_lines,
         }
     }
 
@@ -1059,21 +1091,31 @@ impl RenderLimits {
         self.budget == usize::MAX
     }
 
-    /// A child the reader has opened draws whole. Opening the parent says
-    /// nothing about its children: the card's own body is the list of what
+    /// How much of one child to draw, or `None` to fold it to its summary row.
+    ///
+    /// A child the reader asked for draws whole. Otherwise it answers the
+    /// question its own card answers: a call whose body is the only record of
+    /// what it did is drawn, resting at the budget that card would rest at,
+    /// and one the header already accounts for folds away. Opening the parent
+    /// says nothing about any of it: the card's own body is the list of what
     /// ran, and each child answers for itself.
-    fn child_open(&self, index: usize) -> bool {
-        self.views.is_open(index)
-    }
-
-    /// A child renders on its own terms. The views name this card's children,
-    /// so carrying them inward would fold a nested batch by the wrong roster.
-    fn for_child(&self) -> Self {
-        Self {
-            budget: usize::MAX,
+    ///
+    /// The views and the reports name this card's children, so both are
+    /// dropped on the way in or a nested batch would read them as its own.
+    fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
+        let budget = if self.views.is_open(index) {
+            usize::MAX
+        } else if is_collapsible(entry.effect, &entry.tool) {
+            return None;
+        } else {
+            self.tool_lines.get(&entry.tool)
+        };
+        Some(Self {
+            budget,
             views: BatchViews::default(),
             progress: ChildProgress::default(),
-        }
+            tool_lines: self.tool_lines,
+        })
     }
 }
 
@@ -1254,6 +1296,7 @@ mod tests {
     use super::*;
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::GrepMatchGroup;
+    use caudra_agent::tools::ToolEffect;
     use test_case::test_case;
 
     fn plain(text: &str) -> DiffSpan {
@@ -1796,10 +1839,15 @@ mod tests {
     }
     const CHILD_BODY: &str = "child body line";
     const EXPECT_ROW: &str = "the summary row has to name its child";
-    /// What `batch` itself resolves to. A child never reads it: opened, it
-    /// draws whole.
+    /// What `batch` itself resolves to. A child never reads it: it rests at
+    /// its own tool's budget, or draws whole once asked for.
     const PARENT_BUDGET: usize = 3;
+    /// The budgets the children rest at, which are the ones the reader's own
+    /// card would use.
+    const TOOL_LINES: ToolOutputLines = ToolOutputLines::DEFAULT;
 
+    /// Read-only unless a case says otherwise: a call that changed nothing is
+    /// the one the card folds, which is what most of these are about.
     fn batch_entry(tool: &str, body_lines: usize) -> BatchToolEntry {
         let text = (0..body_lines)
             .map(|i| format!("{CHILD_BODY} {i}"))
@@ -1807,6 +1855,7 @@ mod tests {
             .join("\n");
         BatchToolEntry {
             tool: tool.into(),
+            effect: ToolEffect::ReadOnly,
             summary: format!("{tool} summary"),
             status: BatchToolStatus::Success,
             input: None,
@@ -1821,16 +1870,16 @@ mod tests {
         }
     }
 
+    fn limits(views: BatchViews) -> RenderLimits {
+        RenderLimits::new(false, PARENT_BUDGET, views, TOOL_LINES)
+    }
+
     fn batch_of(
         sizes: [usize; 2],
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
         let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
-        render_batch(
-            &entries,
-            false,
-            &RenderLimits::new(false, PARENT_BUDGET, views),
-        )
+        render_batch(&entries, false, &limits(views))
     }
 
     fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
@@ -1967,13 +2016,15 @@ mod tests {
     /// reach it.
     #[test]
     fn views_do_not_reach_a_nested_batch() {
-        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::new([0]));
-        assert_eq!(limits.for_child().views, BatchViews::default());
+        let child = limits(BatchViews::new([0]))
+            .child(0, &batch_entry("read", 1))
+            .expect("an asked-for child draws");
+        assert_eq!(child.views, BatchViews::default());
     }
 
-    /// A child used to draw within its own tool's budget, which made the card
-    /// a third state between folded and whole. Opening one now answers the
-    /// question the reader asked.
+    /// Asking for a child is asking for all of it. A budget is where a child
+    /// rests, never where a click lands, so opening one answers the question
+    /// the click asked rather than half of it.
     #[test]
     fn an_opened_child_draws_whole() {
         let whole = 6;
@@ -1991,13 +2042,11 @@ mod tests {
         "a child row reports what its result holds, the way a standalone row does";
 
     fn child_row(entry: BatchToolEntry) -> String {
-        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::default());
-        line_text(&render_batch(&[entry], false, &limits).0[0])
+        line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).0[0])
     }
 
     fn child_sigil(entry: BatchToolEntry) -> Span<'static> {
-        let limits = RenderLimits::new(false, PARENT_BUDGET, BatchViews::default());
-        render_batch(&[entry], false, &limits).0[0].spans[0].clone()
+        render_batch(&[entry], false, &limits(BatchViews::default())).0[0].spans[0].clone()
     }
 
     /// The reported bug: a finished grep named no matches. `batch` copies only
@@ -2179,11 +2228,7 @@ mod tests {
             batch_entry("read", 2),
             batch_entry("read", 1),
         ];
-        let (lines, rows) = render_batch(
-            &entries,
-            false,
-            &RenderLimits::new(false, PARENT_BUDGET, BatchViews::new([1])),
-        );
+        let (lines, rows) = render_batch(&entries, false, &limits(BatchViews::new([1])));
 
         assert_eq!(blank_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
@@ -2195,9 +2240,101 @@ mod tests {
     #[test]
     fn an_opened_card_leaves_its_children_folded() {
         let whole = 6;
-        let limits = RenderLimits::new(true, PARENT_BUDGET, BatchViews::default());
+        let opened = RenderLimits::new(true, PARENT_BUDGET, BatchViews::default(), TOOL_LINES);
         let entries = [batch_entry("read", whole), batch_entry("grep", whole)];
-        let (lines, _) = render_batch(&entries, false, &limits);
+        let (lines, _) = render_batch(&entries, false, &opened);
         assert_eq!(body_count(&lines), 0);
+    }
+
+    const WRITE_CHILD: &str = "file_write";
+    /// What a write rests at on a card of its own, which is what a child of a
+    /// batch has to rest at too.
+    const WRITE_BUDGET: usize = ToolOutputLines::DEFAULT.write;
+    const CHANGED_MSG: &str =
+        "a child whose body is the only record of what it did draws with the card";
+    const CHILD_BUDGET_MSG: &str = "an unasked child rests where its own card would rest";
+
+    fn write_entry(body_lines: usize) -> BatchToolEntry {
+        BatchToolEntry {
+            effect: ToolEffect::Mutating,
+            ..batch_entry(WRITE_CHILD, body_lines)
+        }
+    }
+
+    fn write_batch(
+        body_lines: usize,
+        views: BatchViews,
+    ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
+        render_batch(&[write_entry(body_lines)], false, &limits(views))
+    }
+
+    /// The reported bug: a batch of edits drew a roster of headers and no
+    /// diffs, while every one of those edits outside a batch keeps its body in
+    /// all three view modes. Folding them away loses the change.
+    #[test]
+    fn a_child_that_changed_something_draws_without_a_click() {
+        let (lines, _) = write_batch(2, BatchViews::default());
+
+        assert_eq!(body_count(&lines), 2, "{CHANGED_MSG}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line_text(line).contains(BATCH_FOLDED_MARK)),
+            "nothing was put away, so nothing may claim it was"
+        );
+    }
+
+    /// `shell` changes things too, and its header names the whole command down
+    /// to the exit status, so it folds where a write does not.
+    #[test]
+    fn a_shell_child_still_folds() {
+        let entry = BatchToolEntry {
+            effect: ToolEffect::Mutating,
+            ..batch_entry(SHELL_CHILD, 2)
+        };
+
+        let (lines, _) = render_batch(&[entry], false, &limits(BatchViews::default()));
+
+        assert_eq!(body_count(&lines), 0, "{CHANGED_MSG}");
+    }
+
+    /// Otherwise a batch of five writes is five whole files, which is the
+    /// flood the card exists to prevent.
+    #[test]
+    fn an_unasked_child_rests_at_its_own_tools_budget() {
+        let (lines, rows) = write_batch(WRITE_BUDGET * 2, BatchViews::default());
+
+        assert_eq!(body_count(&lines), WRITE_BUDGET, "{CHILD_BUDGET_MSG}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains(TRUNCATION_PREFIX)),
+            "a child holding something back has to say so: {CHILD_BUDGET_MSG}"
+        );
+        assert!(
+            unique_targets(&rows).contains(&RowTarget(0)),
+            "and the row it says it on has to take the click"
+        );
+    }
+
+    #[test]
+    fn asking_for_a_resting_child_draws_it_whole() {
+        let (lines, rows) = write_batch(WRITE_BUDGET * 2, BatchViews::new([0]));
+
+        assert_eq!(body_count(&lines), WRITE_BUDGET * 2, "{CHANGED_MSG}");
+        assert!(
+            unique_targets(&rows).contains(&RowTarget(0)),
+            "an opened child stays a control, or it could not be put back"
+        );
+    }
+
+    /// A dispatched child is traced back to its subagent through the rows it
+    /// owns, so every row of one keeps naming it however it was drawn.
+    #[test]
+    fn every_row_of_a_resting_child_still_names_it() {
+        let (lines, rows) = write_batch(2, BatchViews::default());
+
+        assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
+        assert_eq!(unique_targets(&rows), vec![RowTarget(0)]);
     }
 }

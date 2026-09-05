@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use caudra_storage::tool_outputs::ToolOutputRef;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::permissions::{PermissionAuthorityProfile, PermissionResource, PermissionRisk};
@@ -96,7 +96,7 @@ impl ToolSource {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolEffect {
     ReadOnly,

@@ -5105,6 +5105,7 @@ const EXPECT_SUMMARIES_KEPT: &str = "a folded batch still lists what it ran";
 fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
         tool: tool.into(),
+        effect: effect_of(tool),
         summary: format!("{tool} ran"),
         status: caudra_agent::BatchToolStatus::Success,
         input: None,
@@ -5121,7 +5122,10 @@ fn panel_with_batch() -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         tool: BATCH_TOOL.into(),
         output: ToolOutput::Batch {
-            entries: vec![batch_child("read", "a"), batch_child("grep", "b")],
+            entries: vec![
+                batch_child(FILE_READ_TOOL_NAME, "a"),
+                batch_child(FILE_GREP_TOOL_NAME, "b"),
+            ],
             text: String::new(),
         },
         ..done("t1")
@@ -5165,6 +5169,36 @@ fn an_untouched_batch_shows_no_child_bodies(view: ViewMode) {
     assert!(text.contains("read ran"), "{EXPECT_SUMMARIES_KEPT}");
     assert!(text.contains("grep ran"), "{EXPECT_SUMMARIES_KEPT}");
     assert!(!text.contains("child_body_line_a"), "{EXPECT_BODY_HIDDEN}");
+    assert!(!text.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
+}
+
+const EXPECT_CHANGE_SHOWN: &str = "a child whose body is the only record of what it did draws with \
+     the card, in every mode, exactly as its own card would";
+
+/// The rule a standalone card has always run: no mode may hide a call that
+/// changed something. A batch folded every child regardless, so a whole turn
+/// of edits ran inside one and showed not a single diff.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+fn a_batch_child_that_changed_something_shows_it_in_every_mode(view: ViewMode) {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![
+                batch_child(FILE_EDIT_TOOL_NAME, "a"),
+                batch_child(FILE_READ_TOOL_NAME, "b"),
+            ],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    panel.set_view(view);
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("child_body_line_a"), "{EXPECT_CHANGE_SHOWN}");
     assert!(!text.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
 }
 
@@ -5560,6 +5594,7 @@ fn settle_highlights(panel: &mut MessagesPanel) {
 fn pending_child(tool: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
         tool: tool.into(),
+        effect: effect_of(tool),
         summary: String::new(),
         status: caudra_agent::BatchToolStatus::Pending,
         input: None,
@@ -5598,12 +5633,14 @@ const QUEUED_MARK: &str = "(queued)";
 
 /// The mark says a body is being withheld, so a child with nothing to withhold
 /// must not carry it. A dispatched child that has not answered yet drew one,
-/// which reads as a result the reader is being kept from.
-#[test_case(true, true ; "a child with output offers it")]
-#[test_case(false, false ; "a child with none promises nothing")]
-fn only_a_child_hiding_something_says_so(has_output: bool, expected: bool) {
+/// which reads as a result the reader is being kept from. A child that draws
+/// its own body is withholding nothing either.
+#[test_case(FILE_READ_TOOL_NAME, true, true ; "a folded child offers its body")]
+#[test_case(FILE_READ_TOOL_NAME, false, false ; "a folded child with none promises nothing")]
+#[test_case(TASK_TOOL_NAME, true, false ; "a child drawing its own body hides none of it")]
+fn only_a_child_hiding_something_says_so(tool: &str, has_output: bool, expected: bool) {
     let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
-    let mut child = batch_child("task", "a");
+    let mut child = batch_child(tool, "a");
     if !has_output {
         child.output = None;
     }

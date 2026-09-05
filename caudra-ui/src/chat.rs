@@ -17,7 +17,8 @@ use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
 use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
-    AgentEvent, BufferSnapshot, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, SubagentProgress, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -672,7 +673,10 @@ pub fn history_to_display(
                         (status, Some(result.content))
                     })
                     .unwrap_or((ToolStatus::Success, None));
-                let reconstructed = tool_outputs.get(call_id.as_str()).cloned();
+                let reconstructed = tool_outputs
+                    .get(call_id.as_str())
+                    .cloned()
+                    .map(|output| stamped_batch_effects(output, reg));
                 let (text, truncated_lines, tool_output, mut annotation) = build_loaded_tool(
                     static_name,
                     &summary,
@@ -804,6 +808,34 @@ pub(crate) fn restore_item_for(
         clicks: Vec::new(),
         state,
         lua_provenance: stored.lua_provenance().cloned(),
+    })
+}
+
+/// Fills in the effects of a restored batch's children from the registry,
+/// the way the call above resolves the parent's. A child stamps its own as it
+/// starts, so this only ever answers for a session written before that was
+/// recorded; the disclosure rule reads the effect, and without this every such
+/// child would read as unclassified and open. A tool no longer registered
+/// stays unclassified, which is what its own card does with it.
+fn stamped_batch_effects(output: Arc<ToolOutput>, reg: &ToolRegistry) -> Arc<ToolOutput> {
+    let ToolOutput::Batch { entries, text } = output.as_ref() else {
+        return output;
+    };
+    if !entries.iter().any(|e| e.effect == ToolEffect::Unknown) {
+        return output;
+    }
+    let entries = entries
+        .iter()
+        .map(|entry| BatchToolEntry {
+            effect: reg
+                .get(&entry.tool)
+                .map_or(entry.effect, |tool| tool.effect),
+            ..entry.clone()
+        })
+        .collect();
+    Arc::new(ToolOutput::Batch {
+        entries,
+        text: text.clone(),
     })
 }
 

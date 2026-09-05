@@ -821,12 +821,13 @@ mod tests {
     #[test]
     fn a_fold_forces_a_fresh_highlight() {
         use crate::components::code_view::RenderLimits;
+        use caudra_config::ToolOutputLines;
 
         let request = |views: BatchViews| HighlightRequest {
             range: (1, 3),
             input: None,
             output: None,
-            limits: RenderLimits::new(false, 0, views),
+            limits: RenderLimits::new(false, 0, views, ToolOutputLines::default()),
         };
         let seg = Segment {
             highlight_key: HighlightKey::from_request(Some(&request(BatchViews::default()))),
