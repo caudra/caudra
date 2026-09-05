@@ -472,6 +472,8 @@ impl Workbench {
 
         let first = tab.scroll();
         let last = (first + text.height as usize).min(tab.buffer.line_count());
+        tab.highlight(first, last);
+        let tab = &*tab;
         let segments = tab.segments(first, last);
         let h_scroll = tab.h_scroll();
         for line in first..last {

@@ -132,13 +132,18 @@ impl Tab {
         self.h_scroll
     }
 
-    /// Syntax colours for the rows on screen. A diff tab is coloured by its
-    /// [`DiffKind`]s instead, so it asks for none.
-    pub fn segments(&mut self, first: usize, last: usize) -> Vec<Vec<StyledSegment>> {
-        if self.diff_kinds.is_some() {
-            return Vec::new();
+    /// Works out the syntax colours for the rows about to be drawn. A diff tab
+    /// is coloured by its [`DiffKind`]s instead, so it asks for none.
+    pub fn highlight(&mut self, first: usize, last: usize) {
+        if self.diff_kinds.is_none() {
+            self.highlighter.fill(self.buffer.lines(), first, last);
         }
-        self.highlighter.segments(self.buffer.lines(), first, last)
+    }
+
+    /// The colours [`Self::highlight`] worked out, borrowed rather than copied
+    /// out so a frame costs no allocation.
+    pub fn segments(&self, first: usize, last: usize) -> &[Vec<StyledSegment>] {
+        self.highlighter.cached(first, last)
     }
 
     /// Counts changes to the text, so a caller can tell a motion from an edit

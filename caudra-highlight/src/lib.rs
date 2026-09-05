@@ -165,6 +165,42 @@ impl Highlighter {
         }
     }
 
+    /// Highlights a run of lines in one pass.
+    ///
+    /// [`SynHighlighter::new`] folds every scope in the theme into a selector
+    /// table and sorts it, so building one per line costs about as much as the
+    /// parsing it feeds. Here it is built once for the whole run. Syntect wants
+    /// each line to carry its newline, which is added in a buffer the run
+    /// reuses rather than a `String` per line.
+    pub fn highlight_lines<'a>(
+        &mut self,
+        lines: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<Vec<StyledSegment>> {
+        let syn_hl = SynHighlighter::new(&self.theme);
+        let set = syntax_set();
+        let mut buffer = String::new();
+        let mut out = Vec::new();
+        for line in lines {
+            buffer.clear();
+            buffer.push_str(line);
+            if !buffer.ends_with('\n') {
+                buffer.push('\n');
+            }
+            out.push(match self.parse_state.parse_line(&buffer, set) {
+                Ok(ops) => HighlightIterator::new(
+                    &mut self.highlight_state,
+                    &ops,
+                    &buffer,
+                    &syn_hl,
+                )
+                .map(|(style, text)| StyledSegment::from_syntect(style, normalize_text(text)))
+                .collect(),
+                Err(_) => vec![StyledSegment::fallback(normalize_text(&buffer))],
+            });
+        }
+        out
+    }
+
     pub fn advance(&mut self, text: &str) {
         let _ = self.raw_highlight_line(text);
     }
