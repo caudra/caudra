@@ -843,6 +843,7 @@ dependencies = [
  "caudra-providers",
  "caudra-storage",
  "event-listener",
+ "fastrand",
  "flume",
  "futures-lite",
  "getrandom 0.4.3",
@@ -1058,6 +1059,7 @@ dependencies = [
 name = "caudra-providers"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "base64 0.23.1",
  "caudra-config",
  "caudra-storage",

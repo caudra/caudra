@@ -5,11 +5,12 @@ pub mod auth;
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use caudra_storage::StateDir;
+use caudra_storage::auth::OAuthTokens;
 use caudra_storage::id::SessionRef;
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
@@ -19,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::model::{Model, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -52,6 +53,8 @@ const LABEL_WEEK_ALL: &str = "Weekly usage";
 const EMPTY_USAGE_ERROR: &str =
     "Anthropic usage response contained no quota limits; the endpoint schema may have changed";
 const OAUTH_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_CHANGED_STATUS: u16 = 503;
+const AUTH_CHANGED_MESSAGE: &str = "Anthropic authentication changed while retrying";
 
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 
@@ -393,29 +396,55 @@ enum AuthMode {
 fn resolve_native_auth(
     storage: &StateDir,
     base_url: Option<String>,
-) -> Result<(super::ResolvedAuth, AuthMode, Option<KeyPool>), AgentError> {
-    match auth::resolve_oauth(storage) {
-        Ok(Some(resolved)) => return Ok((resolved, AuthMode::ClaudeOauth, None)),
+) -> Result<
+    (
+        super::ResolvedAuth,
+        AuthMode,
+        Option<KeyPool>,
+        Option<OAuthTokens>,
+    ),
+    AgentError,
+> {
+    match auth::load_oauth_tokens(storage) {
+        Ok(Some(tokens)) => {
+            let resolved = auth::build_oauth_resolved(&tokens);
+            return Ok((resolved, AuthMode::ClaudeOauth, None, Some(tokens)));
+        }
         Ok(None) => {}
         Err(oauth_error) => match KeyPool::resolve("anthropic", ENV_VAR) {
             Ok(pool) => {
                 warn!(error = %oauth_error, "Anthropic OAuth unavailable; using API key");
                 let resolved = resolve_auth_from_key(pool.current(), base_url);
-                return Ok((resolved, AuthMode::ApiKey, Some(pool)));
+                return Ok((resolved, AuthMode::ApiKey, Some(pool), None));
             }
             Err(_) => return Err(oauth_error),
         },
     }
     let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
     let resolved = resolve_auth_from_key(pool.current(), base_url);
-    Ok((resolved, AuthMode::ApiKey, Some(pool)))
+    Ok((resolved, AuthMode::ApiKey, Some(pool), None))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AuthSnapshot {
+    resolved: super::ResolvedAuth,
+    mode: AuthMode,
+    oauth_tokens: Option<OAuthTokens>,
+}
+
+struct AuthState {
+    resolved: Arc<Mutex<super::ResolvedAuth>>,
+    mode: AuthMode,
+    key_pool: Option<KeyPool>,
+    oauth_tokens: Option<OAuthTokens>,
 }
 
 pub struct Anthropic {
     client: HttpClient,
-    auth: Arc<Mutex<super::ResolvedAuth>>,
-    auth_mode: Arc<Mutex<AuthMode>>,
-    key_pool: Arc<Mutex<Option<KeyPool>>>,
+    auth_state: Mutex<AuthState>,
+    auth_update: async_lock::Mutex<()>,
+    rejected_auth_credentials: Mutex<HashSet<String>>,
+    model_pricing: Mutex<HashMap<String, ModelPricing>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
@@ -429,15 +458,22 @@ impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
         let resolved_base_url = resolve_anthropic_base_url();
-        let (resolved, auth_mode, pool) = resolve_native_auth(&storage, resolved_base_url.clone())?;
+        let (resolved, auth_mode, pool, oauth_tokens) =
+            resolve_native_auth(&storage, resolved_base_url.clone())?;
         if let Some(pool) = &pool {
             debug!(keys = pool.len(), "using API key authentication");
         }
         Ok(Self {
             client: super::http_client(timeouts),
-            auth: Arc::new(Mutex::new(resolved)),
-            auth_mode: Arc::new(Mutex::new(auth_mode)),
-            key_pool: Arc::new(Mutex::new(pool)),
+            auth_state: Mutex::new(AuthState {
+                resolved: Arc::new(Mutex::new(resolved)),
+                mode: auth_mode,
+                key_pool: pool,
+                oauth_tokens,
+            }),
+            auth_update: async_lock::Mutex::new(()),
+            rejected_auth_credentials: Mutex::new(HashSet::new()),
+            model_pricing: Mutex::new(HashMap::new()),
             storage: Some(storage),
             system_prefix: None,
             stream_timeout: timeouts.stream,
@@ -452,9 +488,15 @@ impl Anthropic {
     ) -> Self {
         Self {
             client: super::http_client(timeouts),
-            auth,
-            auth_mode: Arc::new(Mutex::new(AuthMode::Injected)),
-            key_pool: Arc::new(Mutex::new(None)),
+            auth_state: Mutex::new(AuthState {
+                resolved: auth,
+                mode: AuthMode::Injected,
+                key_pool: None,
+                oauth_tokens: None,
+            }),
+            auth_update: async_lock::Mutex::new(()),
+            rejected_auth_credentials: Mutex::new(HashSet::new()),
+            model_pricing: Mutex::new(HashMap::new()),
             storage: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
@@ -471,67 +513,182 @@ impl Anthropic {
         self
     }
 
+    fn auth_snapshot(&self) -> AuthSnapshot {
+        let state = self.auth_state.lock().unwrap();
+        let resolved = state.resolved.lock().unwrap().clone();
+        AuthSnapshot {
+            resolved,
+            mode: state.mode,
+            oauth_tokens: state.oauth_tokens.clone(),
+        }
+    }
+
     fn is_oauth(&self) -> bool {
-        *self.auth_mode.lock().unwrap() == AuthMode::ClaudeOauth
+        self.auth_snapshot().mode == AuthMode::ClaudeOauth
     }
 
     fn current_auth(&self) -> super::ResolvedAuth {
-        self.auth.lock().unwrap().clone()
+        self.auth_snapshot().resolved
     }
 
-    async fn refresh_oauth(&self) -> Result<(), AgentError> {
+    fn rejected_auth_credentials(&self) -> Vec<String> {
+        self.rejected_auth_credentials
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn mark_auth_rejected(&self, credential: Option<String>) {
+        if let Some(credential) = credential {
+            self.rejected_auth_credentials
+                .lock()
+                .unwrap()
+                .insert(credential);
+        }
+    }
+
+    fn auth_replacement_available(&self, snapshot: &AuthSnapshot) -> bool {
+        auth_credential(&snapshot.resolved).is_some_and(|credential| {
+            !self
+                .rejected_auth_credentials
+                .lock()
+                .unwrap()
+                .contains(&credential)
+        })
+    }
+
+    fn install_oauth_tokens(&self, tokens: &OAuthTokens) {
+        let mut state = self.auth_state.lock().unwrap();
+        *state.resolved.lock().unwrap() = auth::build_oauth_resolved(tokens);
+        state.mode = AuthMode::ClaudeOauth;
+        state.key_pool = None;
+        state.oauth_tokens = Some(tokens.clone());
+        drop(state);
+        let mut rejected = self.rejected_auth_credentials.lock().unwrap();
+        if !rejected.contains(&tokens.access) {
+            rejected.clear();
+        }
+    }
+
+    fn install_resolved_auth(
+        &self,
+        resolved: super::ResolvedAuth,
+        mode: AuthMode,
+        key_pool: Option<KeyPool>,
+        oauth_tokens: Option<OAuthTokens>,
+    ) {
+        let mut state = self.auth_state.lock().unwrap();
+        *state.resolved.lock().unwrap() = resolved;
+        state.mode = mode;
+        state.key_pool = key_pool;
+        state.oauth_tokens = oauth_tokens;
+    }
+
+    async fn refresh_oauth(
+        &self,
+        mut rejected_accesses: Vec<String>,
+    ) -> Result<AuthSnapshot, AgentError> {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
-        let rejected_access = bearer_token(&self.current_auth());
+        let _update = self.auth_update.lock().await;
+        let current = self.auth_snapshot();
+        if current.mode != AuthMode::ClaudeOauth {
+            return Ok(current);
+        }
+        for access in self.rejected_auth_credentials() {
+            if !rejected_accesses.contains(&access) {
+                rejected_accesses.push(access);
+            }
+        }
         let tokens =
-            smol::unblock(move || auth::refresh_from_storage(&storage, rejected_access.as_deref()))
-                .await?;
-        *self.auth.lock().unwrap() = auth::build_oauth_resolved(&tokens);
+            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses)).await?;
+        self.install_oauth_tokens(&tokens);
         debug!("refreshed Anthropic OAuth token");
-        Ok(())
+        Ok(self.auth_snapshot())
     }
 
-    async fn ensure_oauth_fresh(&self) {
-        let Some(storage) = self.storage.clone().filter(|_| self.is_oauth()) else {
-            return;
+    async fn auth_for_request(&self) -> Result<AuthSnapshot, AgentError> {
+        let snapshot = self.auth_snapshot();
+        let Some(storage) = self
+            .storage
+            .clone()
+            .filter(|_| snapshot.mode == AuthMode::ClaudeOauth)
+        else {
+            return Ok(snapshot);
         };
-        match smol::unblock(move || auth::refresh_from_storage(&storage, None)).await {
-            Ok(tokens) => *self.auth.lock().unwrap() = auth::build_oauth_resolved(&tokens),
-            Err(error) => warn!(%error, "proactive Anthropic OAuth refresh failed"),
+        let _update = self.auth_update.lock().await;
+        let current = self.auth_snapshot();
+        if current.mode != AuthMode::ClaudeOauth {
+            return Ok(current);
         }
+        let attempted_access = auth_credential(&current.resolved);
+        let rejected_accesses = self.rejected_auth_credentials();
+        let tokens =
+            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses))
+                .await
+                .inspect_err(|error| {
+                    if oauth_auth_error(error) {
+                        self.mark_auth_rejected(attempted_access);
+                    }
+                    warn!(%error, "proactive Anthropic OAuth refresh failed");
+                })?;
+        self.install_oauth_tokens(&tokens);
+        Ok(self.auth_snapshot())
     }
 
     async fn with_oauth_retry<T, F, Fut>(&self, operation: F) -> Result<T, AgentError>
     where
-        F: Fn() -> Fut,
+        F: Fn(super::ResolvedAuth, bool) -> Fut,
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
-        self.ensure_oauth_fresh().await;
-        let result = operation().await;
-        if self.is_oauth()
-            && matches!(&result, Err(error) if oauth_auth_error(error))
-            && self.refresh_oauth().await.is_ok()
-        {
-            return operation().await;
+        let snapshot = self.auth_for_request().await?;
+        let oauth = snapshot.mode == AuthMode::ClaudeOauth;
+        let request_auth = snapshot.resolved;
+        let attempted_access = auth_credential(&request_auth);
+        let result = operation(request_auth, oauth).await;
+        let Err(error) = result else {
+            return result;
+        };
+        if (oauth && oauth_auth_error(&error)) || (!oauth && error.is_auth_error()) {
+            self.mark_auth_rejected(attempted_access);
         }
-        result
+        if !oauth || !oauth_auth_error(&error) {
+            return Err(error);
+        }
+        let retry_snapshot = self.refresh_oauth(self.rejected_auth_credentials()).await?;
+        let retry_oauth = retry_snapshot.mode == AuthMode::ClaudeOauth;
+        let retry_auth = retry_snapshot.resolved;
+        let retry_access = bearer_token(&retry_auth);
+        let retry = operation(retry_auth, retry_oauth).await;
+        if matches!(&retry, Err(error) if oauth_auth_error(error)) {
+            self.mark_auth_rejected(retry_access);
+        }
+        retry.map_err(normalize_oauth_auth_error)
     }
 
-    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
-        self.build_request_with_session(method, path, None)
+    fn build_request(
+        &self,
+        auth: &super::ResolvedAuth,
+        oauth: bool,
+        method: &str,
+        path: &str,
+    ) -> isahc::http::request::Builder {
+        self.build_request_with_session(auth, oauth, method, path, None)
     }
 
     fn build_request_with_session(
         &self,
+        auth: &super::ResolvedAuth,
+        oauth: bool,
         method: &str,
         path: &str,
         session_id: Option<&str>,
     ) -> isahc::http::request::Builder {
-        let auth = self.current_auth();
         let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
         let url = format!("{}{path}", origin(base));
-        let oauth = self.is_oauth();
         let user_agent = if oauth {
             format!("claude-cli/{} (external, cli)", auth::CLAUDE_CODE_VERSION)
         } else {
@@ -557,6 +714,7 @@ impl Anthropic {
 
     async fn do_stream_request(
         &self,
+        auth: &AuthSnapshot,
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         fast: bool,
@@ -564,16 +722,23 @@ impl Anthropic {
         oauth_tool_names: Option<&HashMap<String, String>>,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let path = if self.is_oauth() {
+        let oauth = auth.mode == AuthMode::ClaudeOauth;
+        let path = if oauth {
             OAUTH_MESSAGES_PATH
         } else {
             MESSAGES_PATH
         };
         let mut builder = self
-            .build_request_with_session("POST", path, session_id.map(SessionRef::as_str))
+            .build_request_with_session(
+                &auth.resolved,
+                oauth,
+                "POST",
+                path,
+                session_id.map(SessionRef::as_str),
+            )
             .header("content-type", "application/json");
         let mut betas = Vec::new();
-        if self.is_oauth() {
+        if oauth {
             betas.extend_from_slice(OAUTH_MESSAGE_BETAS);
         }
         if fast {
@@ -593,7 +758,11 @@ impl Anthropic {
         }
     }
 
-    async fn do_list_models(&self) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
+    async fn do_list_models(
+        &self,
+        auth: &super::ResolvedAuth,
+        oauth: bool,
+    ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let mut models = Vec::new();
         let mut after_id: Option<String> = None;
 
@@ -603,7 +772,7 @@ impl Anthropic {
                 path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request("GET", &path).body(())?;
+            let request = self.build_request(auth, oauth, "GET", &path).body(())?;
             let mut response = self.client.send_async(request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
@@ -632,9 +801,13 @@ impl Anthropic {
         Ok(models)
     }
 
-    async fn do_oauth_get(&self, path: &str) -> Result<String, AgentError> {
+    async fn do_oauth_get(
+        &self,
+        auth: &super::ResolvedAuth,
+        path: &str,
+    ) -> Result<String, AgentError> {
         let request = self
-            .build_request("GET", path)
+            .build_request(auth, true, "GET", path)
             .timeout(OAUTH_METADATA_TIMEOUT)
             .header("anthropic-beta", OAUTH_BETA)
             .header("content-type", "application/json")
@@ -646,12 +819,19 @@ impl Anthropic {
         Ok(response.text().await?)
     }
 
-    async fn do_fetch_usage(&self) -> Result<ProviderUsage, AgentError> {
-        parse_usage(&self.do_oauth_get(USAGE_PATH).await?)
+    async fn do_fetch_usage(
+        &self,
+        auth: &super::ResolvedAuth,
+    ) -> Result<ProviderUsage, AgentError> {
+        parse_usage(&self.do_oauth_get(auth, USAGE_PATH).await?)
     }
 
-    async fn do_fetch_profile_plan(&self) -> Result<Option<String>, AgentError> {
-        let profile: OauthProfile = serde_json::from_str(&self.do_oauth_get(PROFILE_PATH).await?)?;
+    async fn do_fetch_profile_plan(
+        &self,
+        auth: &super::ResolvedAuth,
+    ) -> Result<Option<String>, AgentError> {
+        let profile: OauthProfile =
+            serde_json::from_str(&self.do_oauth_get(auth, PROFILE_PATH).await?)?;
         Ok(profile_plan(&profile))
     }
 }
@@ -669,9 +849,30 @@ fn bearer_token(auth: &super::ResolvedAuth) -> Option<String> {
     })
 }
 
+fn auth_credential(auth: &super::ResolvedAuth) -> Option<String> {
+    bearer_token(auth).or_else(|| {
+        auth.headers
+            .iter()
+            .find_map(|(key, value)| key.eq_ignore_ascii_case("x-api-key").then(|| value.clone()))
+    })
+}
+
 fn oauth_auth_error(error: &AgentError) -> bool {
     matches!(error, AgentError::Api { status: 401, .. })
         || matches!(error, AgentError::Api { status: 403, message } if message.contains("OAuth token has been revoked"))
+}
+
+fn normalize_oauth_auth_error(error: AgentError) -> AgentError {
+    match error {
+        AgentError::Api {
+            status: 403,
+            message,
+        } if message.contains("OAuth token has been revoked") => AgentError::Api {
+            status: 401,
+            message,
+        },
+        error => error,
+    }
 }
 
 fn random_id() -> String {
@@ -699,6 +900,8 @@ impl Provider for Anthropic {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let auth_snapshot = self.auth_for_request().await?;
+            let oauth = auth_snapshot.mode == AuthMode::ClaudeOauth;
             let system_blocks = if let Some(prefix) = &self.system_prefix {
                 vec![
                     shared::SystemBlock {
@@ -729,7 +932,7 @@ impl Provider for Anthropic {
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
-            let oauth_tool_names = if self.is_oauth() {
+            let oauth_tool_names = if oauth {
                 Some(shared::apply_oauth_request_profile(
                     &mut body,
                     system,
@@ -741,17 +944,23 @@ impl Provider for Anthropic {
             let fast = apply_fast_mode(&mut body, model, &opts);
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, "sending API request");
-            if !self.is_oauth() {
-                return self
-                    .do_stream_request(&body, event_tx, fast, session_id, None)
+            if !oauth {
+                let attempted_credential = auth_credential(&auth_snapshot.resolved);
+                let result = self
+                    .do_stream_request(&auth_snapshot, &body, event_tx, fast, session_id, None)
                     .await;
+                if matches!(&result, Err(error) if error.is_auth_error()) {
+                    self.mark_auth_rejected(attempted_credential);
+                }
+                return result;
             }
 
-            self.ensure_oauth_fresh().await;
+            let attempted_access = bearer_token(&auth_snapshot.resolved);
             let (relay_tx, relay_rx) = flume::unbounded();
             let attempt = async {
                 let result = self
                     .do_stream_request(
+                        &auth_snapshot,
                         &body,
                         &relay_tx,
                         fast,
@@ -773,20 +982,44 @@ impl Provider for Anthropic {
                 forwarded
             };
             let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
-            if matches!(&result, Err(error) if oauth_auth_error(error))
-                && forwarded == 0
-                && self.refresh_oauth().await.is_ok()
-            {
-                return self
-                    .do_stream_request(&body, event_tx, fast, session_id, oauth_tool_names.as_ref())
-                    .await;
+            if matches!(&result, Err(error) if oauth_auth_error(error)) {
+                self.mark_auth_rejected(attempted_access);
             }
-            result
+            if matches!(&result, Err(error) if oauth_auth_error(error)) && forwarded == 0 {
+                let retry_auth = self.refresh_oauth(self.rejected_auth_credentials()).await?;
+                if retry_auth.mode != AuthMode::ClaudeOauth {
+                    return Err(AgentError::Api {
+                        status: AUTH_CHANGED_STATUS,
+                        message: AUTH_CHANGED_MESSAGE.into(),
+                    });
+                }
+                let retry_access = bearer_token(&retry_auth.resolved);
+                let retry = self
+                    .do_stream_request(
+                        &retry_auth,
+                        &body,
+                        event_tx,
+                        fast,
+                        session_id,
+                        oauth_tool_names.as_ref(),
+                    )
+                    .await;
+                if matches!(&retry, Err(error) if oauth_auth_error(error)) {
+                    self.mark_auth_rejected(retry_access);
+                }
+                return retry.map_err(normalize_oauth_auth_error);
+            }
+            result.map_err(normalize_oauth_auth_error)
         })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async { self.with_oauth_retry(|| self.do_list_models()).await })
+        Box::pin(async move {
+            self.with_oauth_retry(
+                |auth, oauth| async move { self.do_list_models(&auth, oauth).await },
+            )
+            .await
+        })
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -794,21 +1027,42 @@ impl Provider for Anthropic {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
+            let _update = self.auth_update.lock().await;
             let base_url = self.resolved_base_url.clone();
-            let (resolved, mode, pool) =
+            let (resolved, mode, pool, oauth_tokens) =
                 smol::unblock(move || resolve_native_auth(&storage, base_url)).await?;
-            *self.auth.lock().unwrap() = resolved;
-            *self.auth_mode.lock().unwrap() = mode;
-            *self.key_pool.lock().unwrap() = pool;
+            self.install_resolved_auth(resolved, mode, pool, oauth_tokens);
+            let snapshot = self.auth_snapshot();
+            let mut rejected = self.rejected_auth_credentials.lock().unwrap();
+            if auth_credential(&snapshot.resolved)
+                .is_none_or(|credential| !rejected.contains(&credential))
+            {
+                rejected.clear();
+            }
             debug!("reloaded Anthropic auth from storage and environment");
             Ok(())
+        })
+    }
+
+    fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            let previous = self.auth_snapshot();
+            self.reload_auth().await?;
+            let current = self.auth_snapshot();
+            Ok(previous != current || self.auth_replacement_available(&current))
         })
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
-                self.refresh_oauth().await
+                let mut rejected = self.rejected_auth_credentials();
+                if rejected.is_empty()
+                    && let Some(access) = bearer_token(&self.auth_snapshot().resolved)
+                {
+                    rejected.push(access);
+                }
+                self.refresh_oauth(rejected).await.map(|_| ())
             } else {
                 self.reload_auth().await
             }
@@ -818,11 +1072,16 @@ impl Provider for Anthropic {
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
             let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.lock().unwrap().as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
+            let state = self.auth_state.lock().unwrap();
+            let Some(pool) = state.key_pool.as_ref() else {
+                return Ok(false);
+            };
+            if !pool.rotate() {
+                return Ok(false);
+            }
+            *state.resolved.lock().unwrap() =
+                resolve_auth_from_key(pool.current(), base_url.clone());
+            Ok(true)
         })
     }
 
@@ -831,8 +1090,13 @@ impl Provider for Anthropic {
             if !usage_eligible(&self.current_auth(), self.resolved_base_url.as_deref()) {
                 return Ok(None);
             }
-            let mut usage = self.with_oauth_retry(|| self.do_fetch_usage()).await?;
-            match self.with_oauth_retry(|| self.do_fetch_profile_plan()).await {
+            let mut usage = self
+                .with_oauth_retry(|auth, _| async move { self.do_fetch_usage(&auth).await })
+                .await?;
+            match self
+                .with_oauth_retry(|auth, _| async move { self.do_fetch_profile_plan(&auth).await })
+                .await
+            {
                 Ok(plan) => usage.plan = plan,
                 Err(error) => warn!(%error, "failed to fetch Anthropic OAuth profile"),
             }
@@ -841,11 +1105,20 @@ impl Provider for Anthropic {
     }
 
     fn adjust_model(&self, model: &mut Model) {
+        let pricing = self
+            .model_pricing
+            .lock()
+            .unwrap()
+            .entry(model.id.clone())
+            .or_insert_with(|| model.pricing.clone())
+            .clone();
         if self.is_oauth() {
             model.pricing.input = 0.0;
             model.pricing.output = 0.0;
             model.pricing.cache_write = 0.0;
             model.pricing.cache_read = 0.0;
+        } else {
+            model.pricing = pricing;
         }
     }
 
@@ -916,6 +1189,7 @@ async fn parse_sse_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ResolvedAuth;
     use crate::{
         CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage,
     };
@@ -1126,9 +1400,16 @@ mod tests {
             ))),
             crate::providers::Timeouts::default(),
         );
-        *provider.auth_mode.lock().unwrap() = AuthMode::ClaudeOauth;
+        provider.auth_state.lock().unwrap().mode = AuthMode::ClaudeOauth;
+        let request_auth = provider.current_auth();
         let request = provider
-            .build_request_with_session("POST", OAUTH_MESSAGES_PATH, Some("session-id"))
+            .build_request_with_session(
+                &request_auth,
+                true,
+                "POST",
+                OAUTH_MESSAGES_PATH,
+                Some("session-id"),
+            )
             .body(())
             .unwrap();
         assert_eq!(
@@ -1173,7 +1454,7 @@ mod tests {
         );
         assert!(provider.resolved_base_url.is_none());
         assert!(!usage_eligible(
-            &provider.auth.lock().unwrap(),
+            &provider.current_auth(),
             provider.resolved_base_url.as_deref()
         ));
     }
@@ -1536,6 +1817,49 @@ data: {\"type\":\"content_block_stop\"}\n";
         );
         assert!(header);
         assert_eq!(body["speed"], json!("fast"));
+    }
+
+    #[test]
+    fn model_pricing_is_restored_after_oauth() {
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer("test-key"))),
+            crate::providers::Timeouts::default(),
+        );
+        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let baseline = model.pricing.clone();
+        provider.adjust_model(&mut model);
+
+        provider.auth_state.lock().unwrap().mode = AuthMode::ClaudeOauth;
+        provider.adjust_model(&mut model);
+        assert_eq!(model.pricing.input, 0.0);
+        assert_eq!(model.pricing.output, 0.0);
+        assert_eq!(model.pricing.cache_write, 0.0);
+        assert_eq!(model.pricing.cache_read, 0.0);
+
+        provider.auth_state.lock().unwrap().mode = AuthMode::Injected;
+        provider.adjust_model(&mut model);
+        assert_eq!(model.pricing.input, baseline.input);
+        assert_eq!(model.pricing.output, baseline.output);
+        assert_eq!(model.pricing.cache_write, baseline.cache_write);
+        assert_eq!(model.pricing.cache_read, baseline.cache_read);
+    }
+
+    #[test]
+    fn replacement_auth_remains_visible_to_all_waiters() {
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer("rejected"))),
+            crate::providers::Timeouts::default(),
+        );
+        provider.mark_auth_rejected(Some("rejected".into()));
+        assert!(!provider.auth_replacement_available(&provider.auth_snapshot()));
+
+        provider.install_resolved_auth(
+            ResolvedAuth::bearer("replacement"),
+            AuthMode::Injected,
+            None,
+            None,
+        );
+        assert!(provider.auth_replacement_available(&provider.auth_snapshot()));
     }
 
     #[test]

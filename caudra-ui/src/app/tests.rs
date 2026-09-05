@@ -2178,7 +2178,9 @@ fn cancel_clears_pending_input() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.pending_input = PendingInput::AuthRetry {
+        waiters: HashSet::from([None]),
+    };
     cancel_app(&mut app);
     assert_eq!(app.pending_input, PendingInput::None);
 }
@@ -6858,6 +6860,22 @@ fn retry_clears_subagent_in_progress_tools() {
     assert!(app.retry_info.is_none());
 }
 
+#[test]
+fn auth_stream_reset_clears_partial_tools_without_retry_status() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::ToolPending {
+        id: "t1".into(),
+        name: "bash".into(),
+    }));
+
+    app.update(agent_msg(AgentEvent::StreamReset));
+
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(app.retry_info.is_none());
+}
+
 fn auth_retry_enter(app: &mut App) -> Vec<Action> {
     app.update(Msg::Key(key(KeyCode::Enter)))
 }
@@ -6876,10 +6894,12 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
-    assert!(matches!(
+    assert_eq!(
         app.pending_input,
-        PendingInput::AuthRetry { subagent_id: None }
-    ));
+        PendingInput::AuthRetry {
+            waiters: HashSet::from([None])
+        }
+    );
 
     let actions = submit(&mut app);
     assert!(actions.is_empty());
@@ -6913,10 +6933,12 @@ fn auth_required_in_subagent_shows_in_both_chats() {
 
     assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
     assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
-    assert!(matches!(
+    assert_eq!(
         app.pending_input,
-        PendingInput::AuthRetry { subagent_id: Some(ref id) } if id == "sub1"
-    ));
+        PendingInput::AuthRetry {
+            waiters: HashSet::from([Some("sub1".into())])
+        }
+    );
 }
 
 #[test]
@@ -6936,6 +6958,49 @@ fn auth_retry_in_subagent_routes_to_subagent_channel() {
 }
 
 #[test]
+fn auth_retry_wakes_every_waiting_agent() {
+    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    app.update(agent_msg(AgentEvent::AuthRequired));
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(main_rx.try_recv().unwrap(), "");
+    assert_eq!(sub_rx.try_recv().unwrap(), "");
+    assert_eq!(app.pending_input, PendingInput::None);
+}
+
+#[test]
+fn auth_restored_clears_only_the_matching_waiter() {
+    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("sub1");
+    app.update(agent_msg(AgentEvent::AuthRequired));
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+
+    app.update(subagent_msg(
+        AgentEvent::AuthRestored,
+        "sub1",
+        Some("research"),
+    ));
+
+    assert_eq!(
+        app.pending_input,
+        PendingInput::AuthRetry {
+            waiters: HashSet::from([None])
+        }
+    );
+    app.update(agent_msg(AgentEvent::AuthRestored));
+    assert_eq!(app.pending_input, PendingInput::None);
+}
+
+#[test]
 fn cancel_clears_subagent_auth_retry() {
     let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
@@ -6947,6 +7012,35 @@ fn cancel_clears_subagent_auth_retry() {
     cancel_app(&mut app);
 
     assert_eq!(app.pending_input, PendingInput::None);
+    assert!(sub_rx.try_recv().is_err());
+}
+
+#[test]
+fn cancelling_one_auth_waiter_does_not_retry_it_as_the_main_agent() {
+    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    app.update(agent_msg(AgentEvent::AuthRequired));
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+    app.focus_task("sub1").unwrap();
+
+    let actions = app.handle_subagent_cancel();
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelSubagent { tool_use_id }] if tool_use_id == "sub1"
+    ));
+    assert_eq!(
+        app.pending_input,
+        PendingInput::AuthRetry {
+            waiters: HashSet::from([None])
+        }
+    );
+    app.active_chat = 0;
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(main_rx.try_recv().unwrap(), "");
     assert!(sub_rx.try_recv().is_err());
 }
 
@@ -6974,7 +7068,7 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
     app.answer_tx = Some(main_tx);
 
     app.pending_input = PendingInput::AuthRetry {
-        subagent_id: Some("nonexistent".into()),
+        waiters: HashSet::from([Some("nonexistent".into())]),
     };
     app.update(Msg::Key(key(KeyCode::Enter)));
 
@@ -9329,7 +9423,9 @@ fn notification_message_and_urgency(
 #[test]
 fn attention_prioritizes_permission_and_normalizes_tool() {
     let mut app = test_app();
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.pending_input = PendingInput::AuthRetry {
+        waiters: HashSet::from([None]),
+    };
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
@@ -9358,7 +9454,9 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
 #[test]
 fn attention_classifies_auth_and_ready_plan() {
     let mut app = test_app();
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.pending_input = PendingInput::AuthRetry {
+        waiters: HashSet::from([None]),
+    };
     assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
 
     app.pending_input = PendingInput::None;

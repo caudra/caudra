@@ -19,7 +19,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,8 +121,7 @@ pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
-const AUTH_EXPIRED_MSG: &str =
-    "Token expired. Run `caudra auth login` in another terminal, then press Enter to retry.";
+const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
@@ -230,7 +229,7 @@ pub(super) enum PendingInput {
     #[default]
     None,
     AuthRetry {
-        subagent_id: Option<String>,
+        waiters: HashSet<Option<String>>,
     },
 }
 
@@ -2065,8 +2064,10 @@ impl App {
         admission: caudra_agent::PromptAdmission,
     ) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
-            PendingInput::AuthRetry { subagent_id } => {
-                self.send_to_agent(subagent_id.as_deref(), String::new());
+            PendingInput::AuthRetry { waiters } => {
+                for subagent_id in waiters {
+                    self.send_to_agent(subagent_id.as_deref(), String::new());
+                }
                 return vec![];
             }
             PendingInput::None => {}
@@ -2145,11 +2146,25 @@ impl App {
         self.chats[self.active_chat].mark_finished(TaskOutcome::Killed, CANCELLED_TEXT);
         self.sync_subagents();
         self.subagent_answers.remove(&task_id);
+        self.clear_auth_waiter(Some(&task_id));
         self.preserve_unconsumed_steers(&task_id);
 
         vec![Action::CancelSubagent {
             tool_use_id: task_id,
         }]
+    }
+
+    fn clear_auth_waiter(&mut self, subagent_id: Option<&str>) {
+        let empty = match &mut self.pending_input {
+            PendingInput::AuthRetry { waiters } => {
+                waiters.retain(|waiter| waiter.as_deref() != subagent_id);
+                waiters.is_empty()
+            }
+            PendingInput::None => false,
+        };
+        if empty {
+            self.pending_input = PendingInput::None;
+        }
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
@@ -2392,6 +2407,12 @@ impl App {
             }
         }
 
+        if matches!(envelope.event, AgentEvent::StreamReset) {
+            self.chats[chat_idx].stream_reset();
+            self.retry_info = None;
+            return vec![];
+        }
+
         if let AgentEvent::Retry {
             attempt,
             message,
@@ -2624,6 +2645,18 @@ impl App {
         }
 
         if let ChatEventResult::AuthRequired = result {
+            let inserted = match &mut self.pending_input {
+                PendingInput::None => {
+                    self.pending_input = PendingInput::AuthRetry {
+                        waiters: HashSet::from([subagent_id.clone()]),
+                    };
+                    true
+                }
+                PendingInput::AuthRetry { waiters } => waiters.insert(subagent_id.clone()),
+            };
+            if !inserted {
+                return vec![];
+            }
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
@@ -2634,7 +2667,11 @@ impl App {
                     AUTH_EXPIRED_MSG.into(),
                 ));
             }
-            self.pending_input = PendingInput::AuthRetry { subagent_id };
+            return vec![];
+        }
+
+        if let ChatEventResult::AuthRestored = result {
+            self.clear_auth_waiter(subagent_id.as_deref());
             return vec![];
         }
 
@@ -2677,6 +2714,7 @@ impl App {
                     }
                 }
                 ChatEventResult::AuthRequired
+                | ChatEventResult::AuthRestored
                 | ChatEventResult::Question(_)
                 | ChatEventResult::PermissionRequest(_)
                 | ChatEventResult::PermissionRequestResolved { .. }

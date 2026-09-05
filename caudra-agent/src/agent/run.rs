@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use caudra_providers::model_registry::CompactionTarget;
 use caudra_providers::provider::Provider;
@@ -36,6 +36,8 @@ use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const AUTH_RELOAD_POLL_MIN_MS: u64 = 250;
+const AUTH_RELOAD_POLL_MAX_MS: u64 = 1_000;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -152,9 +154,11 @@ pub struct Agent<'h> {
 
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+        let mut model = params.model;
+        params.provider.adjust_model(&mut model);
         Self {
             provider: params.provider,
-            model: Arc::new(params.model),
+            model: Arc::new(model),
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -516,8 +520,8 @@ impl<'h> Agent<'h> {
                 }
                 return Err(AgentError::Cancelled);
             }
-            Err(StreamError::Other(e)) if e.is_auth_error() => {
-                return self.wait_for_reauth(e).await;
+            Err(StreamError::Auth { error, forwarded }) => {
+                return self.wait_for_reauth(error, forwarded).await;
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -753,7 +757,14 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+    async fn wait_for_reauth(
+        &mut self,
+        err: AgentError,
+        reset_stream: bool,
+    ) -> Result<TurnOutcome, AgentError> {
+        if reset_stream {
+            self.event_tx.send(AgentEvent::StreamReset)?;
+        }
         if self.reauth_attempts >= MAX_REAUTH_ATTEMPTS {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
@@ -766,17 +777,49 @@ impl<'h> Agent<'h> {
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
         self.event_tx.send(AgentEvent::AuthRequired)?;
         let rx = rx.lock().await;
-        match futures_lite::future::race(rx.recv_async(), async {
-            self.cancel.cancelled().await;
-            Err(flume::RecvError::Disconnected)
-        })
-        .await
-        {
-            Ok(_) => {
-                self.provider.refresh_auth().await?;
-                Ok(TurnOutcome::Continue)
+        enum Wake {
+            Response(Result<String, flume::RecvError>),
+            Poll,
+            Cancelled,
+        }
+        loop {
+            let poll_delay = Duration::from_millis(fastrand::u64(
+                AUTH_RELOAD_POLL_MIN_MS..=AUTH_RELOAD_POLL_MAX_MS,
+            ));
+            let wake = futures_lite::future::race(
+                async { Wake::Response(rx.recv_async().await) },
+                futures_lite::future::race(
+                    async {
+                        self.cancel.cancelled().await;
+                        Wake::Cancelled
+                    },
+                    async {
+                        smol::Timer::after(poll_delay).await;
+                        Wake::Poll
+                    },
+                ),
+            )
+            .await;
+            match wake {
+                Wake::Response(Ok(_)) => {
+                    self.provider.refresh_auth().await?;
+                    self.provider.adjust_model(Arc::make_mut(&mut self.model));
+                    self.event_tx.send(AgentEvent::AuthRestored)?;
+                    return Ok(TurnOutcome::Continue);
+                }
+                Wake::Response(Err(_)) | Wake::Cancelled => return Err(AgentError::Cancelled),
+                Wake::Poll => match self.provider.reload_auth_if_changed().await {
+                    Ok(true) => {
+                        self.provider.adjust_model(Arc::make_mut(&mut self.model));
+                        self.event_tx.send(AgentEvent::AuthRestored)?;
+                        return Ok(TurnOutcome::Continue);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug!(%error, "failed to poll for replacement credentials");
+                    }
+                },
             }
-            Err(_) => Err(AgentError::Cancelled),
         }
     }
 
@@ -1020,6 +1063,12 @@ mod tests {
     use crate::permissions::PermissionManager;
     use crate::{Envelope, QueueItemId};
 
+    const AUTH_ERROR_STATUS: u16 = 401;
+    const AUTH_ERROR_MESSAGE: &str = "expired";
+    const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
+    const ADJUSTED_CONTEXT_WINDOW: u32 = 1;
+    const PARTIAL_RESPONSE: &str = "partial";
+
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
     }
@@ -1082,6 +1131,68 @@ mod tests {
         calls: AtomicUsize,
         evaluator_started: flume::Sender<()>,
         evaluator_response: flume::Receiver<StreamResponse>,
+    }
+
+    #[derive(Default)]
+    struct ReauthState {
+        stream_calls: AtomicUsize,
+        reloads: AtomicUsize,
+        refreshes: AtomicUsize,
+        adjustments: AtomicUsize,
+    }
+
+    struct ReauthProvider {
+        state: Arc<ReauthState>,
+    }
+
+    impl Provider for ReauthProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            event_tx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                if self.state.stream_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    event_tx
+                        .send(ProviderEvent::TextDelta {
+                            text: PARTIAL_RESPONSE.into(),
+                        })
+                        .unwrap();
+                    return Err(auth_error());
+                }
+                Ok(text_response(StopReason::EndTurn))
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+
+        fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+            Box::pin(async {
+                self.state.refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+            Box::pin(async {
+                self.state.reloads.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+
+        fn adjust_model(&self, model: &mut Model) {
+            self.state.adjustments.fetch_add(1, Ordering::SeqCst);
+            model.context_window = ADJUSTED_CONTEXT_WINDOW;
+        }
     }
 
     impl Provider for ControlledEvaluatorProvider {
@@ -1279,6 +1390,140 @@ mod tests {
             workflow: false,
             prompt: None,
         }
+    }
+
+    fn auth_error() -> AgentError {
+        AgentError::Api {
+            status: AUTH_ERROR_STATUS,
+            message: AUTH_ERROR_MESSAGE.into(),
+        }
+    }
+
+    #[test]
+    fn automatic_reauth_reload_resumes_without_manual_response() {
+        smol::block_on(async {
+            let state = Arc::new(ReauthState::default());
+            let provider = ReauthProvider {
+                state: Arc::clone(&state),
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let (_answer_tx, answer_rx) = flume::unbounded();
+            let mut agent =
+                agent.with_user_response_rx(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            let outcome = agent.wait_for_reauth(auth_error(), true).await.unwrap();
+
+            assert!(matches!(outcome, TurnOutcome::Continue));
+            assert_eq!(state.reloads.load(Ordering::SeqCst), 1);
+            assert_eq!(state.refreshes.load(Ordering::SeqCst), 0);
+            assert_eq!(state.adjustments.load(Ordering::SeqCst), 2);
+            assert_eq!(agent.model.context_window, ADJUSTED_CONTEXT_WINDOW);
+            drop(agent);
+            let events: Vec<_> = event_rx.try_iter().map(|event| event.event).collect();
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    AgentEvent::StreamReset,
+                    AgentEvent::AuthRequired,
+                    AgentEvent::AuthRestored
+                ]
+            ));
+        });
+    }
+
+    #[test]
+    fn manual_reauth_response_refreshes_auth() {
+        smol::block_on(async {
+            let state = Arc::new(ReauthState::default());
+            let provider = ReauthProvider {
+                state: Arc::clone(&state),
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let (answer_tx, answer_rx) = flume::unbounded();
+            answer_tx.send(String::new()).unwrap();
+            let mut agent =
+                agent.with_user_response_rx(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            let outcome = agent.wait_for_reauth(auth_error(), false).await.unwrap();
+
+            assert!(matches!(outcome, TurnOutcome::Continue));
+            assert_eq!(state.reloads.load(Ordering::SeqCst), 0);
+            assert_eq!(state.refreshes.load(Ordering::SeqCst), 1);
+            assert_eq!(state.adjustments.load(Ordering::SeqCst), 2);
+            assert_eq!(agent.model.context_window, ADJUSTED_CONTEXT_WINDOW);
+            drop(agent);
+            let events: Vec<_> = event_rx.try_iter().map(|event| event.event).collect();
+            assert!(matches!(
+                events.as_slice(),
+                [AgentEvent::AuthRequired, AgentEvent::AuthRestored]
+            ));
+        });
+    }
+
+    #[test]
+    fn partial_auth_failure_resets_stream_before_automatic_resume() {
+        smol::block_on(async {
+            let state = Arc::new(ReauthState::default());
+            let provider = ReauthProvider {
+                state: Arc::clone(&state),
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let (_answer_tx, answer_rx) = flume::unbounded();
+            let mut agent =
+                agent.with_user_response_rx(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            let events: Vec<_> = event_rx.try_iter().map(|event| event.event).collect();
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    AgentEvent::TextDelta { text },
+                    AgentEvent::StreamReset,
+                    AgentEvent::AuthRequired,
+                    AgentEvent::AuthRestored,
+                    AgentEvent::TurnComplete(_),
+                    AgentEvent::Done { .. }
+                ] if text == PARTIAL_RESPONSE
+            ));
+            assert_eq!(state.stream_calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn terminal_partial_auth_failure_still_resets_stream() {
+        smol::block_on(async {
+            let state = Arc::new(ReauthState::default());
+            let provider = ReauthProvider { state };
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.reauth_attempts = MAX_REAUTH_ATTEMPTS;
+
+            let Err(error) = agent.wait_for_reauth(auth_error(), true).await else {
+                panic!("{EXPECTED_AUTH_ERROR}");
+            };
+            assert!(matches!(
+                error,
+                AgentError::Api {
+                    status: AUTH_ERROR_STATUS,
+                    ..
+                }
+            ));
+            drop(agent);
+
+            let events = event_rx
+                .try_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>();
+            assert!(matches!(events.as_slice(), [AgentEvent::StreamReset]));
+        });
     }
 
     #[test]

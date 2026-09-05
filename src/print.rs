@@ -283,7 +283,9 @@ pub fn run(
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
             | AgentEvent::SessionTitle { .. }
+            | AgentEvent::StreamReset
             | AgentEvent::AuthRequired
+            | AgentEvent::AuthRestored
             | AgentEvent::PermissionRequest(_)
             | AgentEvent::PermissionRequestResolved { .. }
             | AgentEvent::SubagentProgress { .. }

@@ -1728,6 +1728,7 @@ impl EventPump {
             | AgentEvent::CompactionDone
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::AuthRestored
             | AgentEvent::SubagentProgress { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
@@ -1735,6 +1736,12 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::StreamReset => {
+                if self.include_partial_messages {
+                    let events = self.synth.finish_message(&TokenUsage::default());
+                    self.emit_stream(events)?;
+                }
+            }
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalFinished { .. }
             | AgentEvent::GoalDeferred { .. }
@@ -1748,6 +1755,10 @@ impl EventPump {
                 message,
                 delay_ms,
             } => {
+                if self.include_partial_messages {
+                    let events = self.synth.finish_message(&TokenUsage::default());
+                    self.emit_stream(events)?;
+                }
                 self.writer.emit_system(
                     "api_retry",
                     serde_json::json!({
@@ -2552,6 +2563,49 @@ mod tests {
     fn finish_message_before_start_is_empty() {
         let mut synth = StreamSynth::new();
         assert!(synth.finish_message(&TokenUsage::default()).is_empty());
+    }
+
+    #[test]
+    fn stream_reset_closes_the_partial_sdk_message() {
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        pump.include_partial_messages = true;
+        pump.handle(Envelope {
+            event: AgentEvent::TextDelta {
+                text: "partial".into(),
+            },
+            subagent: None,
+            run_id: 0,
+        })
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::StreamReset,
+            subagent: None,
+            run_id: 0,
+        })
+        .unwrap();
+
+        let event_types = out_rx
+            .try_iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(&line).unwrap()["event"]["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert!(pump.synth.finish_message(&TokenUsage::default()).is_empty());
     }
 
     #[test]

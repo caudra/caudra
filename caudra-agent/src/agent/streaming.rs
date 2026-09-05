@@ -36,6 +36,7 @@ fn canonicalize_tool_names(message: &mut Message) {
 struct ForwardedStream {
     streamed: String,
     reasoning: Vec<ForwardedReasoning>,
+    forwarded: bool,
 }
 
 /// What one fragment changed on screen, if anything.
@@ -147,6 +148,7 @@ async fn forward_provider_events(
 ) -> ForwardedStream {
     let mut streamed = String::new();
     let mut reasoning = Vec::new();
+    let mut forwarded = false;
     let mut reasoning_text = String::new();
     let mut run_started: Option<Instant> = None;
     let mut pending_inputs: HashMap<String, PendingInput> = HashMap::new();
@@ -198,8 +200,11 @@ async fn forward_provider_events(
                 cache,
             },
         };
-        if event_tx.is_some_and(|event_tx| event_tx.send(ae).is_err()) {
-            break;
+        if let Some(event_tx) = event_tx {
+            if event_tx.send(ae).is_err() {
+                break;
+            }
+            forwarded = true;
         }
     }
     if let Some(started) = run_started {
@@ -211,6 +216,7 @@ async fn forward_provider_events(
     ForwardedStream {
         streamed,
         reasoning,
+        forwarded,
     }
 }
 
@@ -244,6 +250,10 @@ pub(crate) enum StreamError {
         streamed: String,
         reasoning: Vec<ForwardedReasoning>,
     },
+    Auth {
+        error: AgentError,
+        forwarded: bool,
+    },
     Other(AgentError),
 }
 
@@ -257,6 +267,7 @@ impl From<StreamError> for AgentError {
     fn from(e: StreamError) -> Self {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
+            StreamError::Auth { error, .. } => error,
             StreamError::Other(e) => e,
         }
     }
@@ -348,6 +359,7 @@ async fn stream_with_retry_inner(
         let ForwardedStream {
             streamed,
             reasoning,
+            forwarded,
         } = forwarder.await;
         match result {
             Ok(mut r) => {
@@ -403,6 +415,12 @@ async fn stream_with_retry_inner(
             }
             Err(e) => {
                 emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                if e.is_auth_error() {
+                    return Err(StreamError::Auth {
+                        error: e,
+                        forwarded,
+                    });
+                }
                 return Err(e.into());
             }
         }

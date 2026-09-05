@@ -286,6 +286,10 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async { Ok(false) })
     }

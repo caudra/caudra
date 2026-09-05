@@ -53,6 +53,7 @@ pub enum ChatEventResult {
         request_id: String,
     },
     AuthRequired,
+    AuthRestored,
     Question(Box<QuestionEvent>),
 }
 
@@ -213,7 +214,9 @@ impl Chat {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
             AgentEvent::QueueDrained | AgentEvent::SessionTitle { .. } => {}
-            AgentEvent::Retry { .. } | AgentEvent::SubagentProgress { .. } => {
+            AgentEvent::StreamReset
+            | AgentEvent::Retry { .. }
+            | AgentEvent::SubagentProgress { .. } => {
                 unreachable!("handled before handle_event")
             }
             AgentEvent::Done { .. } => {
@@ -232,6 +235,9 @@ impl Chat {
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
+            }
+            AgentEvent::AuthRestored => {
+                return ChatEventResult::AuthRestored;
             }
             AgentEvent::Question(event) => {
                 return ChatEventResult::Question(event);

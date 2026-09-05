@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,13 +7,16 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::{StateDir, StorageError, atomic_write_permissions, exclusive_state_lock};
+use crate::{
+    StateDir, StorageError, atomic_write_permissions, exclusive_state_lock,
+    try_exclusive_state_lock,
+};
 
 const AUTH_DIR: &str = "auth";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access: String,
     pub refresh: String,
@@ -82,9 +86,16 @@ fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
 }
 
 fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|d| serde_json::from_str(&d).ok())
+    try_load_auth(path).ok().flatten()
+}
+
+fn try_load_auth<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageError> {
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_str(&data)?))
 }
 
 fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
@@ -109,6 +120,13 @@ pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
     load_auth(&auth_path(dir, provider))
 }
 
+pub fn try_load_tokens(
+    dir: &StateDir,
+    provider: &str,
+) -> Result<Option<OAuthTokens>, StorageError> {
+    try_load_auth(&auth_path(dir, provider))
+}
+
 pub fn save_tokens(
     dir: &StateDir,
     provider: &str,
@@ -123,6 +141,18 @@ pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageErro
 
 pub fn lock_provider_auth(dir: &StateDir, provider: &str) -> Result<File, StorageError> {
     exclusive_state_lock(
+        &dir.persistent_path()
+            .join(AUTH_DIR)
+            .join(format!("{provider}.lock")),
+        AUTH_FILE_MODE,
+    )
+}
+
+pub fn try_lock_provider_auth(
+    dir: &StateDir,
+    provider: &str,
+) -> Result<Option<File>, StorageError> {
+    try_exclusive_state_lock(
         &dir.persistent_path()
             .join(AUTH_DIR)
             .join(format!("{provider}.lock")),

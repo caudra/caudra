@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use caudra_storage::StateDir;
+use caudra_storage::auth::OAuthTokens;
 use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde::Deserialize;
@@ -49,6 +51,17 @@ const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
 
+#[derive(Clone, PartialEq, Eq)]
+struct AuthSnapshot {
+    resolved: ResolvedAuth,
+    oauth_tokens: Option<OAuthTokens>,
+}
+
+struct AuthState {
+    resolved: Arc<Mutex<ResolvedAuth>>,
+    oauth_tokens: Option<OAuthTokens>,
+}
+
 fn is_codex_model(model_id: &str) -> bool {
     coding_plan_context_window(model_id).is_some()
 }
@@ -94,7 +107,10 @@ struct CodexUsageWindow {
 
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
+    auth_state: Mutex<AuthState>,
+    auth_update: async_lock::Mutex<()>,
+    rejected_auth_credentials: Mutex<HashSet<String>>,
+    model_context_windows: Mutex<HashMap<String, u32>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
     /// Env / `providers.toml` override for the platform API, resolved once at
@@ -106,12 +122,18 @@ pub struct OpenAi {
 impl OpenAi {
     pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
-        let resolved = auth::resolve(&storage)?;
+        let (resolved, oauth_tokens) = auth::resolve_with_tokens(&storage)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
             resolved_base_url: resolve_openai_base_url(),
             compat,
-            auth: Arc::new(Mutex::new(resolved)),
+            auth_state: Mutex::new(AuthState {
+                resolved: Arc::new(Mutex::new(resolved)),
+                oauth_tokens,
+            }),
+            auth_update: async_lock::Mutex::new(()),
+            rejected_auth_credentials: Mutex::new(HashSet::new()),
+            model_context_windows: Mutex::new(HashMap::new()),
             storage: Some(storage),
             system_prefix: None,
         })
@@ -124,7 +146,13 @@ impl OpenAi {
         Self {
             resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
+            auth_state: Mutex::new(AuthState {
+                resolved: auth,
+                oauth_tokens: None,
+            }),
+            auth_update: async_lock::Mutex::new(()),
+            rejected_auth_credentials: Mutex::new(HashSet::new()),
+            model_context_windows: Mutex::new(HashMap::new()),
             storage: None,
             system_prefix: None,
         }
@@ -135,77 +163,235 @@ impl OpenAi {
         self
     }
 
-    fn current_auth(&self) -> ResolvedAuth {
-        self.auth.lock().unwrap().clone()
+    fn auth_snapshot(&self) -> AuthSnapshot {
+        let state = self.auth_state.lock().unwrap();
+        let resolved = state.resolved.lock().unwrap().clone();
+        AuthSnapshot {
+            resolved,
+            oauth_tokens: state.oauth_tokens.clone(),
+        }
     }
 
     fn is_oauth(&self) -> bool {
-        self.storage.as_ref().is_some_and(auth::is_oauth)
+        self.auth_snapshot().oauth_tokens.is_some()
     }
 
-    async fn refresh_oauth(&self) -> Result<(), AgentError> {
-        let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
-            message: "OAuth refresh not available for externally-managed auth".into(),
-        })?;
-        let resolved =
-            smol::unblock(move || {
-                let tokens = caudra_storage::auth::load_tokens(&storage, auth::PROVIDER)
-                    .ok_or_else(|| AgentError::Api {
-                        status: 401,
-                        message: "OpenAI OAuth tokens not found on disk".into(),
-                    })?;
-                match auth::refresh_tokens(&tokens) {
-                    Ok(fresh) => {
-                        caudra_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                        Ok(auth::build_oauth_resolved(&fresh))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                        let _ = caudra_storage::auth::delete_tokens(&storage, auth::PROVIDER);
-                        Err(e)
-                    }
-                }
-            })
-            .await?;
-        *self.auth.lock().unwrap() = resolved;
-        debug!("refreshed OpenAI OAuth token");
-        Ok(())
+    fn rejected_auth_credentials(&self) -> Vec<String> {
+        self.rejected_auth_credentials
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 
-    async fn with_oauth_retry<T, F, Fut>(&self, f: F) -> Result<T, AgentError>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, AgentError>>,
-    {
-        let result = f().await;
-        if self.is_oauth()
-            && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
-        {
-            return f().await;
+    fn mark_auth_rejected(&self, credential: Option<String>) {
+        if let Some(credential) = credential {
+            self.rejected_auth_credentials
+                .lock()
+                .unwrap()
+                .insert(credential);
         }
-        result
     }
 
-    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
-        // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
-        if let Some(storage) = self.storage.as_ref()
-            && let Some(tokens) = caudra_storage::auth::load_tokens(storage, auth::PROVIDER)
-        {
-            return Ok(auth::build_coding_plan_resolved(&tokens));
+    fn auth_replacement_available(&self, snapshot: &AuthSnapshot) -> bool {
+        bearer_token(&snapshot.resolved).is_some_and(|access| {
+            !self
+                .rejected_auth_credentials
+                .lock()
+                .unwrap()
+                .contains(&access)
+        })
+    }
+
+    fn install_oauth_tokens(&self, tokens: &OAuthTokens) {
+        let mut state = self.auth_state.lock().unwrap();
+        *state.resolved.lock().unwrap() = auth::build_oauth_resolved(tokens);
+        state.oauth_tokens = Some(tokens.clone());
+        drop(state);
+        let mut rejected = self.rejected_auth_credentials.lock().unwrap();
+        if !rejected.contains(&tokens.access) {
+            rejected.clear();
         }
-        // Fall back to standard API key via the Responses API. Env /
-        // providers.toml base_url overrides the platform API only, never the
-        // ChatGPT backend above.
-        let mut auth = self.current_auth();
-        if auth.base_url.is_none() {
-            auth.base_url = self
+    }
+
+    fn install_resolved_auth(&self, resolved: ResolvedAuth, oauth_tokens: Option<OAuthTokens>) {
+        let mut state = self.auth_state.lock().unwrap();
+        *state.resolved.lock().unwrap() = resolved;
+        state.oauth_tokens = oauth_tokens;
+    }
+
+    fn request_auth(&self, snapshot: &AuthSnapshot, coding_plan: bool) -> ResolvedAuth {
+        if !coding_plan {
+            return snapshot.resolved.clone();
+        }
+        if let Some(tokens) = &snapshot.oauth_tokens {
+            return auth::build_coding_plan_resolved(tokens);
+        }
+        let mut resolved = snapshot.resolved.clone();
+        if resolved.base_url.is_none() {
+            resolved.base_url = self
                 .resolved_base_url
                 .clone()
                 .or_else(|| Some(CONFIG.base_url.into()));
         }
-        Ok(auth)
+        resolved
     }
+
+    async fn refresh_oauth(
+        &self,
+        mut rejected_accesses: Vec<String>,
+    ) -> Result<AuthSnapshot, AgentError> {
+        let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
+            message: "OAuth refresh not available for externally-managed auth".into(),
+        })?;
+        let _update = self.auth_update.lock().await;
+        let current = self.auth_snapshot();
+        if current.oauth_tokens.is_none() {
+            return Ok(current);
+        }
+        for access in self.rejected_auth_credentials() {
+            if !rejected_accesses.contains(&access) {
+                rejected_accesses.push(access);
+            }
+        }
+        let tokens =
+            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses)).await?;
+        self.install_oauth_tokens(&tokens);
+        debug!("refreshed OpenAI OAuth token");
+        Ok(self.auth_snapshot())
+    }
+
+    async fn auth_for_request(&self) -> Result<AuthSnapshot, AgentError> {
+        let snapshot = self.auth_snapshot();
+        let Some(storage) = self
+            .storage
+            .clone()
+            .filter(|_| snapshot.oauth_tokens.is_some())
+        else {
+            return Ok(snapshot);
+        };
+        let _update = self.auth_update.lock().await;
+        let current = self.auth_snapshot();
+        if current.oauth_tokens.is_none() {
+            return Ok(current);
+        }
+        let attempted_access = bearer_token(&current.resolved);
+        let rejected_accesses = self.rejected_auth_credentials();
+        let tokens =
+            smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses))
+                .await
+                .inspect_err(|error| {
+                    if error.is_auth_error() {
+                        self.mark_auth_rejected(attempted_access);
+                    }
+                    warn!(%error, "proactive OpenAI OAuth refresh failed");
+                })?;
+        self.install_oauth_tokens(&tokens);
+        Ok(self.auth_snapshot())
+    }
+
+    async fn with_oauth_retry<T, F, Fut>(
+        &self,
+        coding_plan: bool,
+        operation: F,
+    ) -> Result<T, AgentError>
+    where
+        F: Fn(ResolvedAuth) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AgentError>>,
+    {
+        let snapshot = self.auth_for_request().await?;
+        let oauth = snapshot.oauth_tokens.is_some();
+        let request_auth = self.request_auth(&snapshot, coding_plan);
+        let attempted_access = bearer_token(&request_auth);
+        let result = operation(request_auth).await;
+        let Err(error) = result else {
+            return result;
+        };
+        if error.is_auth_error() {
+            self.mark_auth_rejected(attempted_access.clone());
+        }
+        if !oauth || !error.is_auth_error() {
+            return Err(error);
+        }
+        let retry_snapshot = self.refresh_oauth(self.rejected_auth_credentials()).await?;
+        let retry_auth = self.request_auth(&retry_snapshot, coding_plan);
+        let retry_access = bearer_token(&retry_auth);
+        let retry = operation(retry_auth).await;
+        if matches!(&retry, Err(error) if error.is_auth_error()) {
+            self.mark_auth_rejected(retry_access);
+        }
+        retry
+    }
+
+    async fn with_oauth_stream_retry<F, Fut>(
+        &self,
+        coding_plan: bool,
+        event_tx: &Sender<ProviderEvent>,
+        operation: F,
+    ) -> Result<StreamResponse, AgentError>
+    where
+        F: Fn(ResolvedAuth, Sender<ProviderEvent>) -> Fut,
+        Fut: std::future::Future<Output = Result<StreamResponse, AgentError>>,
+    {
+        let snapshot = self.auth_for_request().await?;
+        let oauth = snapshot.oauth_tokens.is_some();
+        let request_auth = self.request_auth(&snapshot, coding_plan);
+        let attempted_access = bearer_token(&request_auth);
+        if !oauth {
+            let result = operation(request_auth, event_tx.clone()).await;
+            if matches!(&result, Err(error) if error.is_auth_error()) {
+                self.mark_auth_rejected(attempted_access);
+            }
+            return result;
+        }
+
+        let (relay_tx, relay_rx) = flume::unbounded();
+        let attempt = operation(request_auth, relay_tx);
+        let forward = async move {
+            let mut forwarded = 0usize;
+            while let Ok(event) = relay_rx.recv_async().await {
+                forwarded += 1;
+                if event_tx.send_async(event).await.is_err() {
+                    break;
+                }
+            }
+            forwarded
+        };
+        let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
+        let Err(error) = result else {
+            return result;
+        };
+        if !error.is_auth_error() {
+            return Err(error);
+        }
+        self.mark_auth_rejected(attempted_access);
+        if forwarded != 0 {
+            return Err(error);
+        }
+
+        let retry_snapshot = self.refresh_oauth(self.rejected_auth_credentials()).await?;
+        let retry_auth = self.request_auth(&retry_snapshot, coding_plan);
+        let retry_access = bearer_token(&retry_auth);
+        let retry = operation(retry_auth, event_tx.clone()).await;
+        if matches!(&retry, Err(error) if error.is_auth_error()) {
+            self.mark_auth_rejected(retry_access);
+        }
+        retry
+    }
+}
+
+fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
+    auth.headers.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case("authorization")
+            .then(|| {
+                value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+            })
+            .flatten()
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn usage_percentage(percentage: f64) -> Option<u32> {
@@ -293,28 +479,32 @@ impl Provider for OpenAi {
                 super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
-                    .with_oauth_retry(|| async {
-                        let codex_auth = self.codex_auth()?;
-                        super::responses::do_stream(
-                            self.compat.client(),
-                            model,
-                            &body,
-                            event_tx,
-                            &codex_auth,
-                            stream_timeout,
-                        )
-                        .await
+                    .with_oauth_stream_retry(true, event_tx, |codex_auth, attempt_tx| {
+                        let body = body.clone();
+                        async move {
+                            super::responses::do_stream(
+                                self.compat.client(),
+                                model,
+                                &body,
+                                &attempt_tx,
+                                &codex_auth,
+                                stream_timeout,
+                            )
+                            .await
+                        }
                     })
                     .await;
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking.apply_reasoning_effort(&mut body, model);
-            self.with_oauth_retry(|| async {
-                let auth = self.current_auth();
-                self.compat
-                    .do_stream(model, &[], &body, event_tx, &auth)
-                    .await
+            self.with_oauth_stream_retry(false, event_tx, |auth, attempt_tx| {
+                let body = body.clone();
+                async move {
+                    self.compat
+                        .do_stream(model, &[], &body, &attempt_tx, &auth)
+                        .await
+                }
             })
             .await
         })
@@ -329,7 +519,7 @@ impl Provider for OpenAi {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async {
+        Box::pin(async move {
             if self.is_oauth() {
                 let models = super::models()
                     .iter()
@@ -339,8 +529,7 @@ impl Provider for OpenAi {
                     .collect();
                 return Ok(models);
             }
-            self.with_oauth_retry(|| async {
-                let auth = self.current_auth();
+            self.with_oauth_retry(false, |auth| async move {
                 self.compat.do_list_models(&auth).await
             })
             .await
@@ -348,12 +537,11 @@ impl Provider for OpenAi {
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
-        Box::pin(async {
+        Box::pin(async move {
             if !self.is_oauth() {
                 return Ok(None);
             }
-            self.with_oauth_retry(|| async {
-                let auth = self.codex_auth()?;
+            self.with_oauth_retry(true, |auth| async move {
                 let response = self.compat.get_text(&auth, USAGE_URL).await?;
                 Ok(Some(parse_usage(&response)?))
             })
@@ -364,9 +552,15 @@ impl Provider for OpenAi {
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
-                self.refresh_oauth().await
+                let mut rejected = self.rejected_auth_credentials();
+                if rejected.is_empty()
+                    && let Some(access) = bearer_token(&self.auth_snapshot().resolved)
+                {
+                    rejected.push(access);
+                }
+                self.refresh_oauth(rejected).await.map(|_| ())
             } else {
-                Ok(())
+                self.reload_auth().await
             }
         })
     }
@@ -376,30 +570,61 @@ impl Provider for OpenAi {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
-            *self.auth.lock().unwrap() = resolved;
+            let _update = self.auth_update.lock().await;
+            let (resolved, oauth_tokens) =
+                smol::unblock(move || auth::resolve_with_tokens(&storage)).await?;
+            self.install_resolved_auth(resolved, oauth_tokens);
+            let snapshot = self.auth_snapshot();
+            let mut rejected = self.rejected_auth_credentials.lock().unwrap();
+            if bearer_token(&snapshot.resolved).is_none_or(|access| !rejected.contains(&access)) {
+                rejected.clear();
+            }
             debug!("reloaded OpenAI auth from storage");
             Ok(())
         })
     }
 
+    fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            let previous = self.auth_snapshot();
+            self.reload_auth().await?;
+            let current = self.auth_snapshot();
+            Ok(previous != current || self.auth_replacement_available(&current))
+        })
+    }
+
     fn adjust_model(&self, model: &mut Model) {
+        let baseline_context_window = *self
+            .model_context_windows
+            .lock()
+            .unwrap()
+            .entry(model.id.clone())
+            .or_insert(model.context_window);
         if self.is_oauth()
-            && let Some(context_window) = coding_plan_context_window(&model.id)
+            && let Some(plan_context_window) = coding_plan_context_window(&model.id)
         {
-            model.context_window = model.context_window.min(context_window);
+            model.context_window = baseline_context_window.min(plan_context_window);
+        } else {
+            model.context_window = baseline_context_window;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::json;
     use test_case::test_case;
 
     use super::super::responses;
     use super::*;
     use crate::ThinkingConfig;
+
+    const TEST_ACCESS: &str = "test-access";
+    const TEST_REFRESH: &str = "test-refresh";
+    const TEST_AUTH_STATUS: u16 = 401;
+    const TEST_AUTH_ERROR: &str = "expired";
 
     fn effort(level: &str) -> ThinkingConfig {
         ThinkingConfig::Effort(level.into())
@@ -422,6 +647,46 @@ mod tests {
     #[test_case("gpt-5.4-nano", None)]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
         assert_eq!(coding_plan_context_window(model_id), expected);
+    }
+
+    #[test]
+    fn coding_plan_context_window_is_restored_after_oauth() {
+        let provider = OpenAi::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
+            crate::providers::Timeouts::default(),
+        );
+        let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+        let baseline_context_window = model.context_window;
+        provider.adjust_model(&mut model);
+
+        provider.auth_state.lock().unwrap().oauth_tokens = Some(OAuthTokens {
+            access: TEST_ACCESS.into(),
+            refresh: TEST_REFRESH.into(),
+            expires: u64::MAX,
+            account_id: None,
+        });
+        provider.adjust_model(&mut model);
+        assert_eq!(
+            model.context_window,
+            baseline_context_window.min(coding_plan_context_window(&model.id).unwrap())
+        );
+
+        provider.auth_state.lock().unwrap().oauth_tokens = None;
+        provider.adjust_model(&mut model);
+        assert_eq!(model.context_window, baseline_context_window);
+    }
+
+    #[test]
+    fn replacement_auth_remains_visible_to_all_waiters() {
+        let provider = OpenAi::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
+            crate::providers::Timeouts::default(),
+        );
+        provider.mark_auth_rejected(Some(TEST_ACCESS.into()));
+        assert!(!provider.auth_replacement_available(&provider.auth_snapshot()));
+
+        provider.install_resolved_auth(ResolvedAuth::bearer("replacement"), None);
+        assert!(provider.auth_replacement_available(&provider.auth_snapshot()));
     }
 
     #[test_case("gpt-5.3-codex", ThinkingConfig::Adaptive, None ; "adaptive_lets_the_api_decide")]
@@ -468,6 +733,55 @@ mod tests {
                 "{UNDECLARED}: {model_id}",
             );
         }
+    }
+
+    #[test]
+    fn stream_auth_error_after_event_is_not_retried() {
+        smol::block_on(async {
+            let provider = OpenAi::with_auth(
+                Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
+                crate::providers::Timeouts::default(),
+            );
+            provider.auth_state.lock().unwrap().oauth_tokens = Some(OAuthTokens {
+                access: TEST_ACCESS.into(),
+                refresh: TEST_REFRESH.into(),
+                expires: u64::MAX,
+                account_id: None,
+            });
+            let calls = AtomicUsize::new(0);
+            let (event_tx, event_rx) = flume::unbounded();
+
+            let error = provider
+                .with_oauth_stream_retry(false, &event_tx, |_, attempt_tx| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        attempt_tx
+                            .send(ProviderEvent::TextDelta {
+                                text: "partial".into(),
+                            })
+                            .unwrap();
+                        Err(AgentError::Api {
+                            status: TEST_AUTH_STATUS,
+                            message: TEST_AUTH_ERROR.into(),
+                        })
+                    }
+                })
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                AgentError::Api {
+                    status: TEST_AUTH_STATUS,
+                    ..
+                }
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                event_rx.recv().unwrap(),
+                ProviderEvent::TextDelta { .. }
+            ));
+        });
     }
 
     #[test]

@@ -725,6 +725,7 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
 }
 
 pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
+    let provider_model = params.model.clone();
     if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
         warn!(%error, "failed to adjust headless model before setup");
     }
@@ -781,7 +782,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         let working_dir_path = params.initial_wd.clone();
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
-            let mut model = params.model;
+            let mut model = provider_model;
             let provider: Arc<dyn Provider> =
                 match provider::from_model_async(&mut model, params.timeouts).await {
                     Ok(p) => Arc::from(p),
@@ -935,9 +936,6 @@ impl PreparedInteractive {
 pub async fn prepare_interactive(
     mut params: InteractiveParams,
 ) -> Result<PreparedInteractive, InteractiveStartError> {
-    if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
-        warn!(%error, "failed to adjust interactive model before setup");
-    }
     let history = History::restored(std::mem::take(&mut params.initial_history))
         .map_err(|error| InteractiveStartError(format!("Failed to restore history: {error}")))?;
     let mut model = params.model.clone();

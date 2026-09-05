@@ -2,13 +2,16 @@ use std::time::Duration;
 use std::{env, thread};
 
 use caudra_storage::StateDir;
-use caudra_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use caudra_storage::auth::{
+    OAuthTokens, delete_tokens, lock_provider_auth, now_millis, save_tokens, try_load_tokens,
+};
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, VersionNegotiation};
 use serde::Deserialize;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::AgentError;
+use crate::providers::oauth::{self, RefreshReason};
 use crate::providers::{ResolvedAuth, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,7 +42,8 @@ struct DeviceTokenResponse {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
     expires_in: Option<u64>,
@@ -203,18 +207,40 @@ fn exchange_device_token(device_token: &DeviceTokenResponse) -> Result<TokenResp
     serde_json::from_str(&body_text).map_err(Into::into)
 }
 
-fn into_oauth_tokens(resp: TokenResponse) -> OAuthTokens {
-    let account_id = extract_account_id_from_tokens(&resp);
+fn into_oauth_tokens(
+    resp: TokenResponse,
+    fallback: Option<&OAuthTokens>,
+) -> Result<OAuthTokens, AgentError> {
+    if resp.access_token.is_empty() {
+        return Err(AgentError::Config {
+            message: "OpenAI token response did not include an access token".into(),
+        });
+    }
+    let account_id = extract_account_id_from_tokens(&resp)
+        .or_else(|| fallback.and_then(|tokens| tokens.account_id.clone()));
+    let refresh = resp
+        .refresh_token
+        .filter(|token| !token.is_empty())
+        .or_else(|| fallback.map(|tokens| tokens.refresh.clone()))
+        .ok_or_else(|| AgentError::Config {
+            message: "OpenAI token response did not include a refresh token".into(),
+        })?;
     let expires = now_millis() + resp.expires_in.unwrap_or(3600) * 1000;
-    OAuthTokens {
+    Ok(OAuthTokens {
         access: resp.access_token,
-        refresh: resp.refresh_token,
+        refresh,
         expires,
         account_id,
-    }
+    })
 }
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+    if tokens.refresh.is_empty() {
+        return Err(AgentError::Api {
+            status: 401,
+            message: "OpenAI credentials do not include a refresh token".into(),
+        });
+    }
     let expired = tokens.is_expired();
     debug!(expired, "refreshing OpenAI OAuth tokens");
 
@@ -231,20 +257,48 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body.into_bytes())?;
 
-    let mut resp = client.send(request).map_err(|e| AgentError::Config {
-        message: format!("OpenAI token refresh: {e}"),
-    })?;
+    let mut resp = client.send(request)?;
 
-    if resp.status().as_u16() != 200 {
+    let status = resp.status().as_u16();
+    if status != 200 {
         let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
-        return Err(AgentError::Config {
-            message: format!("OpenAI token refresh failed: {body_text}"),
+        return Err(AgentError::Api {
+            status: oauth_error_status(status, &body_text),
+            message: format!("OpenAI token refresh failed ({status}): {body_text}"),
         });
     }
 
     let body_text = resp.text()?;
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
-    Ok(into_oauth_tokens(token_resp))
+    into_oauth_tokens(token_resp, Some(tokens))
+}
+
+fn oauth_error_code(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("error")
+        .and_then(|error| error.as_str().or_else(|| error.get("type")?.as_str()))
+        .map(ToOwned::to_owned)
+}
+
+fn oauth_error_status(status: u16, body: &str) -> u16 {
+    if oauth_error_code(body).as_deref() == Some("invalid_grant") {
+        401
+    } else {
+        status
+    }
+}
+
+pub(crate) fn refresh_from_storage(
+    storage: &StateDir,
+    rejected_accesses: &[String],
+) -> Result<OAuthTokens, AgentError> {
+    let reason = if rejected_accesses.is_empty() {
+        RefreshReason::Proactive
+    } else {
+        RefreshReason::Rejected(rejected_accesses)
+    };
+    oauth::refresh_from_storage(storage, PROVIDER, reason, refresh_tokens)
 }
 
 pub(crate) const CODING_PLAN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -267,43 +321,41 @@ pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
     }
 }
 
-pub(crate) fn is_oauth(dir: &StateDir) -> bool {
-    load_tokens(dir, PROVIDER).is_some()
+pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+    resolve_with_tokens(dir).map(|(resolved, _)| resolved)
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
-    if let Some(tokens) = load_tokens(dir, PROVIDER) {
-        if !tokens.is_expired() {
-            debug!("using OpenAI OAuth authentication");
-            return Ok(build_oauth_resolved(&tokens));
-        }
-        match refresh_tokens(&tokens) {
-            Ok(fresh) => {
-                save_tokens(dir, PROVIDER, &fresh)?;
-                debug!("using OpenAI OAuth authentication (refreshed)");
-                return Ok(build_oauth_resolved(&fresh));
-            }
-            Err(e) => {
-                warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                delete_tokens(dir, PROVIDER).ok();
-            }
-        }
+pub(crate) fn resolve_with_tokens(
+    dir: &StateDir,
+) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {
+    if let Some(tokens) = try_load_tokens(dir, PROVIDER)? {
+        debug!(
+            expired = tokens.is_expired(),
+            "using OpenAI OAuth authentication"
+        );
+        return Ok((build_oauth_resolved(&tokens), Some(tokens)));
     }
 
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         debug!("using OpenAI API key authentication");
-        return Ok(ResolvedAuth {
-            base_url: None,
-            headers: vec![("authorization".into(), format!("Bearer {key}"))],
-        });
+        return Ok((
+            ResolvedAuth {
+                base_url: None,
+                headers: vec![("authorization".into(), format!("Bearer {key}"))],
+            },
+            None,
+        ));
     }
 
     if let Some(creds) = caudra_storage::auth::load_provider_credentials(dir, PROVIDER) {
         debug!("using OpenAI saved API key");
-        return Ok(ResolvedAuth {
-            base_url: None,
-            headers: vec![("authorization".into(), format!("Bearer {}", creds.api_key))],
-        });
+        return Ok((
+            ResolvedAuth {
+                base_url: None,
+                headers: vec![("authorization".into(), format!("Bearer {}", creds.api_key))],
+            },
+            None,
+        ));
     }
 
     Err(AgentError::Config {
@@ -328,13 +380,15 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
         e
     })?;
 
-    let tokens = into_oauth_tokens(token_resp);
+    let tokens = into_oauth_tokens(token_resp, None)?;
+    let _lock = lock_provider_auth(dir, PROVIDER)?;
     save_tokens(dir, PROVIDER, &tokens)?;
     println!("Authenticated successfully.");
     Ok(())
 }
 
 pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
+    let _lock = lock_provider_auth(dir, PROVIDER)?;
     if delete_tokens(dir, PROVIDER)? {
         println!("Logged out of OpenAI.");
     } else {
@@ -346,6 +400,7 @@ pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn extract_account_id_from_jwt() {
@@ -363,5 +418,63 @@ mod tests {
 
         assert_eq!(extract_account_id("not.a.jwt"), None);
         assert_eq!(extract_account_id("invalid"), None);
+    }
+
+    #[test]
+    fn refresh_response_preserves_refresh_token_and_account_id() {
+        let current = OAuthTokens {
+            access: "old-access".into(),
+            refresh: "old-refresh".into(),
+            expires: 0,
+            account_id: Some("account".into()),
+        };
+        let refreshed = into_oauth_tokens(
+            TokenResponse {
+                access_token: "new-access".into(),
+                refresh_token: None,
+                id_token: None,
+                expires_in: Some(60),
+            },
+            Some(&current),
+        )
+        .unwrap();
+
+        assert_eq!(refreshed.refresh, "old-refresh");
+        assert_eq!(refreshed.account_id.as_deref(), Some("account"));
+    }
+
+    #[test]
+    fn invalid_grant_is_an_authentication_error() {
+        assert_eq!(
+            oauth_error_status(
+                400,
+                r#"{"error":"invalid_grant","error_description":"invalid refresh"}"#,
+            ),
+            401
+        );
+    }
+
+    #[test]
+    fn expired_tokens_do_not_refresh_during_resolution() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        save_tokens(
+            &storage,
+            PROVIDER,
+            &OAuthTokens {
+                access: "expired-access".into(),
+                refresh: "refresh".into(),
+                expires: 0,
+                account_id: None,
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve(&storage).unwrap();
+
+        assert_eq!(
+            resolved.headers,
+            vec![("authorization".into(), "Bearer expired-access".into())]
+        );
     }
 }

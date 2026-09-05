@@ -1069,7 +1069,9 @@ pub enum AgentEvent {
         request_id: String,
         source_request_id: String,
     },
+    StreamReset,
     AuthRequired,
+    AuthRestored,
     Nudge,
     /// A subagent's progress moved. Only ever stamped with [`SubagentInfo`],
     /// so the parent knows which task header to update.

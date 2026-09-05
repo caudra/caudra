@@ -8,8 +8,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
-    OAuthTokens, delete_provider_credentials, delete_tokens, load_tokens, lock_provider_auth,
-    now_millis, save_tokens,
+    OAuthTokens, delete_provider_credentials, delete_tokens, lock_provider_auth, now_millis,
+    save_tokens, try_load_tokens,
 };
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::AgentError;
+use crate::providers::oauth::{self, RefreshReason};
 use crate::providers::{ResolvedAuth, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,19 +99,32 @@ fn post_token(body: &impl Serialize) -> Result<TokenResponse, AgentError> {
             format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"),
         )
         .body(serde_json::to_vec(body)?)?;
-    let mut response = http_client()?
-        .send(request)
-        .map_err(|error| AgentError::Config {
-            message: format!("Anthropic OAuth request: {error}"),
-        })?;
+    let mut response = http_client()?.send(request)?;
     let status = response.status().as_u16();
     let text = response.text().unwrap_or_default();
     if status != 200 {
-        return Err(AgentError::Config {
+        return Err(AgentError::Api {
+            status: oauth_error_status(status, &text),
             message: oauth_error(status, &text),
         });
     }
     serde_json::from_str(&text).map_err(AgentError::from)
+}
+
+fn oauth_error_code(body: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("error")
+        .and_then(|error| error.as_str().or_else(|| error.get("type")?.as_str()))
+        .map(ToOwned::to_owned)
+}
+
+fn oauth_error_status(status: u16, body: &str) -> u16 {
+    if oauth_error_code(body).as_deref() == Some("invalid_grant") {
+        401
+    } else {
+        status
+    }
 }
 
 fn oauth_error(status: u16, body: &str) -> String {
@@ -185,47 +199,26 @@ pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
     }
 }
 
-pub(crate) fn resolve_oauth(storage: &StateDir) -> Result<Option<ResolvedAuth>, AgentError> {
-    let Some(tokens) = load_tokens(storage, PROVIDER) else {
-        return Ok(None);
-    };
-    if !tokens.is_expired() {
-        debug!("using Anthropic OAuth authentication");
-        return Ok(Some(build_oauth_resolved(&tokens)));
-    }
-    match refresh_from_storage(storage, None) {
-        Ok(fresh) => Ok(Some(build_oauth_resolved(&fresh))),
-        Err(error) if !tokens.is_hard_expired() => {
-            warn!(%error, "Anthropic OAuth refresh failed; using still-valid access token");
-            Ok(Some(build_oauth_resolved(&tokens)))
-        }
-        Err(error) => Err(error),
-    }
+pub(crate) fn load_oauth_tokens(storage: &StateDir) -> Result<Option<OAuthTokens>, AgentError> {
+    Ok(try_load_tokens(storage, PROVIDER)?)
 }
 
 pub(crate) fn refresh_from_storage(
     storage: &StateDir,
-    rejected_access: Option<&str>,
+    rejected_accesses: &[String],
 ) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_provider_auth(storage, PROVIDER)?;
-    let tokens = load_tokens(storage, PROVIDER).ok_or_else(|| AgentError::Api {
-        status: 401,
-        message: "Anthropic OAuth tokens not found on disk".into(),
-    })?;
-    if rejected_access.is_some_and(|rejected| rejected != tokens.access) {
-        return Ok(tokens);
-    }
-    if rejected_access.is_none() && !tokens.is_expired() {
-        return Ok(tokens);
-    }
-    let fresh = refresh_tokens(&tokens)?;
-    save_tokens(storage, PROVIDER, &fresh)?;
-    Ok(fresh)
+    let reason = if rejected_accesses.is_empty() {
+        RefreshReason::Proactive
+    } else {
+        RefreshReason::Rejected(rejected_accesses)
+    };
+    oauth::refresh_from_storage(storage, PROVIDER, reason, refresh_tokens)
 }
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
-        return Err(AgentError::Config {
+        return Err(AgentError::Api {
+            status: 401,
             message: "Anthropic credentials do not include a refresh token".into(),
         });
     }
@@ -538,6 +531,7 @@ fn config_error(message: &str) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn authorization_url_contains_required_fields() {
@@ -624,5 +618,36 @@ mod tests {
         .unwrap();
         assert!(refresh.get("scope").is_none());
         assert_eq!(refresh["refresh_token"], "refresh");
+    }
+
+    #[test]
+    fn invalid_grant_is_an_authentication_error() {
+        assert_eq!(
+            oauth_error_status(
+                400,
+                r#"{"error":"invalid_grant","error_description":"invalid refresh"}"#,
+            ),
+            401
+        );
+    }
+
+    #[test]
+    fn expired_tokens_do_not_refresh_during_resolution() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let tokens = OAuthTokens {
+            access: "expired-access".into(),
+            refresh: "refresh".into(),
+            expires: 0,
+            account_id: None,
+        };
+        save_tokens(&storage, PROVIDER, &tokens).unwrap();
+
+        let resolved = build_oauth_resolved(&load_oauth_tokens(&storage).unwrap().unwrap());
+
+        assert_eq!(
+            resolved.headers,
+            vec![("authorization".into(), "Bearer expired-access".into())]
+        );
     }
 }

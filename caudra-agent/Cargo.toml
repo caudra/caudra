@@ -43,6 +43,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 url = { workspace = true }
 getrandom = { workspace = true }
+fastrand = { workspace = true }
 
 
 [dev-dependencies]
