@@ -1100,6 +1100,8 @@ impl Workbench {
             KeyCode::Down => self.palette.move_selection(1),
             KeyCode::PageUp => self.palette.move_selection(-page),
             KeyCode::PageDown => self.palette.move_selection(page),
+            KeyCode::Home => self.palette.select_first(),
+            KeyCode::End => self.palette.select_last(),
             KeyCode::Backspace if typing => {
                 let mut query = self.palette.query().to_owned();
                 query.pop();

@@ -97,6 +97,14 @@ impl QuickOpen {
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected = self.matches.len().saturating_sub(1);
+    }
+
     pub fn select_index(&mut self, index: usize) {
         if self.matches.is_empty() {
             return;
@@ -168,6 +176,7 @@ mod tests {
 
     const NOT_FOUND: &str = "the file typed for is not among the matches";
     const WRONG_ORDER: &str = "the closest match must come first";
+    const WRONG_END: &str = "the selection did not land on the end of the list it was sent to";
 
     fn fixture() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -194,6 +203,29 @@ mod tests {
         let (_tmp, palette) = opened();
         assert_eq!(palette.len(), 3, "{NOT_FOUND}");
         assert!(palette.len() <= MAX_MATCHES);
+    }
+
+    #[test]
+    fn home_and_end_reach_both_ends_of_the_matches() {
+        let (_tmp, mut palette) = opened();
+
+        palette.select_last();
+        assert_eq!(palette.selected_index(), palette.len() - 1, "{WRONG_END}");
+        palette.select_first();
+        assert_eq!(palette.selected_index(), 0, "{WRONG_END}");
+    }
+
+    /// Both ends of nothing are the same place, and neither may reach for a
+    /// row that is not there.
+    #[test]
+    fn home_and_end_hold_still_with_nothing_to_select() {
+        let (_tmp, mut palette) = opened();
+        palette.set_query("nosuchfile".to_owned());
+
+        palette.select_last();
+        assert_eq!(palette.selected_index(), 0, "{WRONG_END}");
+        palette.select_first();
+        assert_eq!(palette.selected_index(), 0, "{WRONG_END}");
     }
 
     #[test]
