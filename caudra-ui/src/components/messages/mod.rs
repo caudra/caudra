@@ -15,7 +15,7 @@ use super::tool_display::{
     thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
+    DisplayMessage, DisplayRole, DisplaySource, LiveBody, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_delta,
     code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
     review,
@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use caudra_agent::tools::ToolEffect;
+use caudra_agent::types::{ToolBodyDelta, ToolBodyField};
 use caudra_agent::{
     BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration,
@@ -622,6 +623,34 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+/// Grows the body a streaming call is writing. The argument the text belongs
+/// to is what decides the shape, so a card needs to know nothing about which
+/// tool it is drawing.
+fn extend_live_body(body: &mut Option<LiveBody>, delta: ToolBodyDelta) {
+    let ToolBodyDelta { field, text } = delta;
+    let slot = match (field, body.get_or_insert_with(|| empty_live_body(field))) {
+        (ToolBodyField::Content, LiveBody::Code(code)) => code,
+        (ToolBodyField::PatchText, LiveBody::Patch(patch)) => patch,
+        (ToolBodyField::OldString, LiveBody::Replace { before, .. }) => before,
+        (ToolBodyField::NewString, LiveBody::Replace { after, .. }) => after,
+        // One call writes one shape, so a field belonging to another shape is
+        // not this call's to grow.
+        _ => return,
+    };
+    slot.push_str(&text);
+}
+
+fn empty_live_body(field: ToolBodyField) -> LiveBody {
+    match field {
+        ToolBodyField::Content => LiveBody::Code(String::new()),
+        ToolBodyField::PatchText => LiveBody::Patch(String::new()),
+        ToolBodyField::OldString | ToolBodyField::NewString => LiveBody::Replace {
+            before: String::new(),
+            after: String::new(),
+        },
+    }
+}
+
 /// What the reader asked of one card, overriding whatever the view mode would
 /// have drawn. There is no entry for the budgeted middle: that is where a card
 /// rests, never where a click lands.
@@ -1055,6 +1084,21 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
+    /// The change a still-streaming call is writing. `ToolStart` drops it for
+    /// the call's real output, so it only ever fills the wait.
+    pub fn tool_input_body(&mut self, tool_id: &str, deltas: Vec<ToolBodyDelta>) {
+        if deltas.is_empty() {
+            return;
+        }
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        for delta in deltas {
+            extend_live_body(&mut msg.live_body, delta);
+        }
+        self.rebuild_tool_segment(tool_id);
+    }
+
     pub fn tool_start(&mut self, event: ToolStartEvent) {
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
@@ -1065,6 +1109,7 @@ impl MessagesPanel {
             msg.tool_input = event.input.map(Arc::new);
             msg.tool_raw_input = event.raw_input.map(Arc::new);
             msg.tool_output = event.output.map(Arc::new);
+            msg.live_body = None;
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
             self.rebuild_tool_segment(&event.id);
@@ -1216,6 +1261,7 @@ impl MessagesPanel {
         if let Some(progress) = &mut msg.progress {
             progress.settle();
         }
+        msg.live_body = None;
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation

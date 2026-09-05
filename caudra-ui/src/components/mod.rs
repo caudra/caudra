@@ -600,6 +600,20 @@ impl ToolProgress {
     }
 }
 
+/// The change a file-mutating call is writing, as far as its arguments have
+/// arrived. Transient by construction: the call's real output replaces it the
+/// moment the tool starts, and nothing here is ever stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveBody {
+    /// A whole file being written.
+    Code(String),
+    /// A match and the text growing in its place.
+    Replace { before: String, after: String },
+    /// A patch in the source form the model writes, which is not a unified
+    /// diff and cannot be numbered like one.
+    Patch(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
     pub role: DisplayRole,
@@ -609,6 +623,8 @@ pub struct DisplayMessage {
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
     pub live_output: Option<String>,
+    /// Only ever set while the call's arguments are still arriving.
+    pub live_body: Option<LiveBody>,
     pub annotation: Option<String>,
     /// How the subagent behind this tool call is getting on. Absent for every
     /// other tool, and for a restored one: it is live chrome, like
@@ -639,6 +655,7 @@ impl DisplayMessage {
             tool_raw_input: None,
             tool_output: None,
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -662,6 +679,7 @@ impl DisplayMessage {
             tool_raw_input: None,
             tool_output: None,
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: Some(plan_path),

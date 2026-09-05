@@ -66,18 +66,12 @@ const BLOB_KEYS: &[&str] = &[
 /// it so the preview does not jump when the real header replaces it.
 const PATH_KEYS: &[&str] = &["filePath", "path"];
 
-/// Tools whose argument is a file body. They are the only calls long enough
-/// for how much has arrived to be worth saying, and the only ones where every
-/// newline in the arguments belongs to that body, so the count needs no
-/// scoping to a key.
-const SIZED_TOOLS: &[&str] = &["file_write", "file_apply_patch"];
-
 /// Below this there is no wait to narrate, and a counter that appears and
 /// vanishes is worse than none.
-const SIZE_MIN_LINES: usize = 20;
-/// Coarse enough that the digits stay readable and the row is rebuilt a tenth
+const SIZE_MIN_LINES: usize = 5;
+/// Coarse enough that the digits stay readable and the row is rebuilt a fifth
 /// as often. The exact prefix length is not information; that it grows is.
-const SIZE_STEP_LINES: usize = 10;
+const SIZE_STEP_LINES: usize = 5;
 /// Honest about being a floor: the body is still being written.
 const SIZE_SUFFIX: &str = "+ lines";
 
@@ -96,7 +90,7 @@ pub(crate) struct Preview {
 
 /// Compares tool and argument names the way the wire spells them: `filePath`,
 /// `file_path`, and `FilePath` are one key.
-fn same_key(left: &str, right: &str) -> bool {
+pub(super) fn same_key(left: &str, right: &str) -> bool {
     let normalized = |key: &str| {
         key.chars()
             .filter(|c| *c != '_')
@@ -111,7 +105,7 @@ fn same_key(left: &str, right: &str) -> bool {
 /// dropped one at a time rather than the name matched as a bare suffix: the
 /// qualifier has to end where the tool name begins, and an unrelated
 /// `myfile_read` cannot pass for `file_read`.
-fn candidates(tool: &str) -> impl Iterator<Item = &str> {
+pub(super) fn candidates(tool: &str) -> impl Iterator<Item = &str> {
     std::iter::successors(Some(tool), |rest| {
         rest.split_once(QUALIFIER).map(|(_, tail)| tail)
     })
@@ -129,16 +123,9 @@ fn rule(tool: &str) -> Rule {
     Rule::Generic
 }
 
-/// Whether a tool's arguments are worth counting as they arrive.
-pub(crate) fn counts_size(tool: &str) -> bool {
-    candidates(tool).any(|rest| SIZED_TOOLS.iter().any(|name| same_key(name, rest)))
-}
-
-/// What to show for a body that has produced `newlines` so far, or `None`
-/// while there is too little of it for the count to be worth a row. Reports
-/// `newlines + 1` so it lands on the same number the finished annotation does.
-pub(crate) fn size_label(newlines: usize) -> Option<String> {
-    let lines = newlines + 1;
+/// What to show for a body of `lines` so far, or `None` while there is too
+/// little of it for the count to be worth a row.
+pub(crate) fn size_label(lines: usize) -> Option<String> {
     (lines >= SIZE_MIN_LINES).then(|| format!("{}{SIZE_SUFFIX}", lines - lines % SIZE_STEP_LINES))
 }
 
@@ -361,7 +348,7 @@ impl<'a> Scanner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PREVIEW_SCAN_CAP, Preview, counts_size, preview_for, size_label};
+    use super::{PREVIEW_SCAN_CAP, Preview, preview_for, size_label};
     use test_case::test_case;
 
     const EDIT: &str = "file_edit";
@@ -434,21 +421,12 @@ mod tests {
         assert_eq!(text_of(SHELL, &json), None);
     }
 
-    #[test_case(18, None ; "one_line_below_the_threshold")]
-    #[test_case(19, Some("20+ lines") ; "exactly_at_the_threshold")]
-    #[test_case(24, Some("20+ lines") ; "floored_back_to_the_step")]
-    #[test_case(29, Some("30+ lines") ; "the_next_step")]
-    fn a_streamed_size_is_a_floor(newlines: usize, expected: Option<&str>) {
-        assert_eq!(size_label(newlines).as_deref(), expected);
-    }
-
-    #[test_case("file_write", true ; "write_is_counted")]
-    #[test_case("file_apply_patch", true ; "patch_is_counted")]
-    #[test_case("mcp_File_write", true ; "a_qualified_write_is_counted")]
-    #[test_case(EDIT, false ; "edit_is_not_counted")]
-    #[test_case(SHELL, false ; "shell_is_not_counted")]
-    fn only_body_tools_are_counted(tool: &str, expected: bool) {
-        assert_eq!(counts_size(tool), expected);
+    #[test_case(4, None ; "one_line_below_the_threshold")]
+    #[test_case(5, Some("5+ lines") ; "exactly_at_the_threshold")]
+    #[test_case(9, Some("5+ lines") ; "floored_back_to_the_step")]
+    #[test_case(10, Some("10+ lines") ; "the_next_step")]
+    fn a_streamed_size_is_a_floor(lines: usize, expected: Option<&str>) {
+        assert_eq!(size_label(lines).as_deref(), expected);
     }
 
     #[test]

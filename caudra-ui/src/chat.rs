@@ -153,8 +153,15 @@ impl Chat {
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
             AgentEvent::ToolInputDelta {
-                id, preview, size, ..
-            } => self.messages_panel.tool_input_preview(&id, preview, size),
+                id,
+                preview,
+                size,
+                body,
+                ..
+            } => {
+                self.messages_panel.tool_input_preview(&id, preview, size);
+                self.messages_panel.tool_input_body(&id, body);
+            }
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
@@ -736,6 +743,7 @@ pub fn history_to_display(
                     tool_raw_input: Some(Arc::new(input.clone())),
                     tool_output,
                     live_output: None,
+                    live_body: None,
                     annotation,
                     progress: None,
                     plan_path: None,

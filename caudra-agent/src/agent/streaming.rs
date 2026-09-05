@@ -10,8 +10,10 @@ use caudra_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
+use super::tool_body::BodyStream;
 use super::tool_preview;
 use crate::cancel::CancelToken;
+use crate::types::ToolBodyDelta;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -44,6 +46,7 @@ struct ForwardedStream {
 struct Changed {
     preview: Option<String>,
     size: Option<String>,
+    body: Vec<ToolBodyDelta>,
 }
 
 /// The argument JSON of one tool call as it arrives, kept only until the
@@ -56,27 +59,44 @@ struct PendingInput {
     /// what is worth scanning. Nothing more is parsed after this.
     settled: bool,
     /// Present only for the tools whose argument is a file body, so nothing is
-    /// counted that will not be shown.
-    size: Option<SizeCounter>,
+    /// decoded that will not be shown.
+    body: Option<BodyStream>,
+    /// The last size published, so a body does not repaint the row per token.
+    size: Option<String>,
 }
 
 impl PendingInput {
     fn new(name: String) -> Self {
         Self {
-            size: tool_preview::counts_size(&name).then(SizeCounter::default),
+            body: BodyStream::new(&name),
             name,
             json: String::new(),
             preview: None,
             settled: false,
+            size: None,
         }
     }
 
     /// The headline settles long before a file body finishes arriving, so the
-    /// counter keeps reading fragments the preview has stopped caring about.
+    /// body reader keeps taking fragments the preview has stopped caring about.
     fn absorb(&mut self, delta: &str) -> Changed {
+        let preview = self.absorb_preview(delta);
+        let Some(stream) = self.body.as_mut() else {
+            return Changed {
+                preview,
+                ..Changed::default()
+            };
+        };
+        let body = stream.absorb(delta);
+        let size = tool_preview::size_label(stream.lines())
+            .filter(|label| self.size.as_ref() != Some(label));
+        if let Some(size) = &size {
+            self.size = Some(size.clone());
+        }
         Changed {
-            preview: self.absorb_preview(delta),
-            size: self.size.as_mut().and_then(|size| size.absorb(delta)),
+            preview,
+            size,
+            body,
         }
     }
 
@@ -97,37 +117,6 @@ impl PendingInput {
         changed.then(|| {
             self.preview = Some(preview.text.clone());
             preview.text
-        })
-    }
-}
-
-/// Counts the newlines in a body as its fragments go past, retaining none of
-/// it. A content newline is the escape `\n`, but `\\n` is an escaped backslash
-/// followed by a literal `n` and is not one, so the escape state has to be
-/// tracked rather than the two characters counted.
-#[derive(Default)]
-struct SizeCounter {
-    newlines: usize,
-    /// An escape can straddle two fragments, so a fragment ending on a lone
-    /// backslash carries it to the next.
-    escaped: bool,
-    shown: Option<String>,
-}
-
-impl SizeCounter {
-    fn absorb(&mut self, delta: &str) -> Option<String> {
-        for c in delta.chars() {
-            if self.escaped {
-                self.newlines += usize::from(c == 'n');
-                self.escaped = false;
-            } else {
-                self.escaped = c == '\\';
-            }
-        }
-        let label = tool_preview::size_label(self.newlines)?;
-        (self.shown.as_deref() != Some(label.as_str())).then(|| {
-            self.shown = Some(label.clone());
-            label
         })
     }
 }
@@ -188,6 +177,7 @@ async fn forward_provider_events(
                     delta,
                     preview: changed.preview,
                     size: changed.size,
+                    body: changed.body,
                 }
             }
             ProviderEvent::PromptProgress {
@@ -484,11 +474,11 @@ mod tests {
 
     const WRITE: &str = "file_write";
     /// A body long enough to cross the first step and reach the second.
-    const STEPPED_LINES: usize = 29;
-    const THRESHOLD_LINES: usize = 19;
-    const SHORT_LINES: usize = 18;
-    const FIRST_STEP: &str = "20+ lines";
-    const SECOND_STEP: &str = "30+ lines";
+    const STEPPED_LINES: usize = 9;
+    const THRESHOLD_LINES: usize = 4;
+    const SHORT_LINES: usize = 3;
+    const FIRST_STEP: &str = "5+ lines";
+    const SECOND_STEP: &str = "10+ lines";
     /// The escape a body newline arrives as, and the pair that only looks like
     /// one: a backslash that is itself escaped, then a literal `n`.
     const NEWLINE: &str = r"\n";
@@ -540,6 +530,18 @@ mod tests {
                 AgentEvent::ToolInputDelta { size, .. } => size,
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The decoded body, reassembled the way a reader accumulates it.
+    fn published_body(tool: &str, fragments: &[&str]) -> String {
+        deltas(tool, fragments)
+            .into_iter()
+            .flat_map(|event| match event {
+                AgentEvent::ToolInputDelta { body, .. } => body,
+                _ => Vec::new(),
+            })
+            .map(|delta| delta.text)
             .collect()
     }
 
@@ -619,7 +621,27 @@ mod tests {
 
     #[test]
     fn a_tool_with_no_body_to_count_publishes_no_size() {
-        assert!(sizes("file_edit", &body(STEPPED_LINES)).is_empty());
+        assert!(sizes("shell", &body(STEPPED_LINES)).is_empty());
+    }
+
+    /// An edit is as long a wait as a write, and the header is the only place
+    /// that says so before the call runs.
+    #[test]
+    fn an_edit_is_counted_too() {
+        let mut fragments = vec![r#"{"filePath": "a.rs", "oldString": "gone", "newString": "one"#];
+        fragments.extend(std::iter::repeat_n(NEWLINE, STEPPED_LINES));
+        assert_eq!(sizes("file_edit", &fragments), [FIRST_STEP, SECOND_STEP]);
+    }
+
+    #[test]
+    fn a_body_is_published_as_it_is_decoded() {
+        let fragments = [r#"{"filePath": "a.rs", "content": "fn x"#, r#"() {}"}"#];
+        assert_eq!(published_body(WRITE, &fragments), "fn x() {}");
+    }
+
+    #[test]
+    fn a_tool_with_no_body_publishes_none() {
+        assert!(published_body("shell", &[r#"{"command": "ls"}"#]).is_empty());
     }
 
     #[test]

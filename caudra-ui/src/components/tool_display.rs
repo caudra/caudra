@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolProgress, ToolStatus};
+use super::{DisplayMessage, LiveBody, ToolProgress, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -948,6 +948,20 @@ impl ToolLineBuilder {
         }
     }
 
+    /// Takes the place `push_code_content` would fill, because the call it
+    /// belongs to has no output yet and its arguments are the only record of
+    /// what it is about to do.
+    fn push_live_body(&mut self, body: &LiveBody) {
+        let (lines, truncation) = code_view::render_live_body(body, self.limits.budget);
+        self.truncation |= truncation;
+        let start = self.lines.len();
+        for mut line in lines {
+            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            self.lines.push(line);
+        }
+        self.content_range = (start, self.lines.len());
+    }
+
     fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
         if resolved.text.is_none() {
             return;
@@ -1268,6 +1282,7 @@ pub fn build_tool_lines(
         b.truncation = msg.render_snapshot.is_some()
             || msg.tool_input.is_some()
             || msg.tool_output.is_some()
+            || msg.live_body.is_some()
             || body.is_some_and(|body| !body.trim().is_empty());
         return b.finish(
             msg.tool_input.clone(),
@@ -1276,14 +1291,17 @@ pub fn build_tool_lines(
         );
     }
     let has_snapshot = msg.render_snapshot.is_some();
-    b.push_code_content(
-        msg.tool_input.as_deref(),
-        if has_snapshot {
-            None
-        } else {
-            msg.tool_output.as_deref()
-        },
-    );
+    match msg.live_body.as_ref().filter(|_| !has_snapshot) {
+        Some(live) => b.push_live_body(live),
+        None => b.push_code_content(
+            msg.tool_input.as_deref(),
+            if has_snapshot {
+                None
+            } else {
+                msg.tool_output.as_deref()
+            },
+        ),
+    }
     let show_output = if let Some(ref snapshot) = msg.render_snapshot {
         let search_text = msg
             .tool_output
@@ -1554,6 +1572,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: output.map(Arc::new),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -1856,6 +1875,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -1955,6 +1975,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -2048,6 +2069,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -2366,6 +2388,7 @@ mod tests {
             tool_raw_input: None,
             tool_output,
             live_output,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -2491,6 +2514,7 @@ mod tests {
                 instructions,
             })),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -2784,6 +2808,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,
@@ -2827,6 +2852,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: None,
             live_output: None,
+            live_body: None,
             annotation: None,
             progress: None,
             plan_path: None,

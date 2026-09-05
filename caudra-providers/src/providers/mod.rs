@@ -145,11 +145,20 @@ impl SseErrorPayload {
     }
 }
 
+/// One SSE line, or `None` at end of stream.
+///
+/// The yield is what makes a stream a stream. A buffered reader answers every
+/// line already in its buffer without parking, and sending an event on an
+/// unbounded channel never parks either, so a parser that only awaits these two
+/// keeps the executor thread for a whole network read. Everything downstream —
+/// the event forwarder, the OAuth relay sharing this task — then advances once
+/// per read instead of once per event, and the reader sees a burst.
 pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     lines: &mut futures_lite::io::Lines<R>,
     deadline: &mut Instant,
     stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
+    futures_lite::future::yield_now().await;
     let remaining = deadline.saturating_duration_since(Instant::now());
     let result = futures_lite::future::or(
         async { lines.next().await.transpose().map_err(AgentError::from) },
@@ -287,9 +296,18 @@ impl KeyPool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
+
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    /// More lines than the reader may consume before the competing task runs.
+    const BUFFERED_SSE_LINES: usize = 8;
+    const EXPECT_INTERLEAVED: &str =
+        "a reader with buffered lines must let another task on its thread run";
 
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
@@ -326,12 +344,55 @@ mod tests {
         smol::block_on(async {
             let mut lines = NeverReader.lines();
             let mut past = Instant::now() - Duration::from_secs(1);
-            let stream_timeout = Duration::from_secs(300);
-            let err = next_sse_line(&mut lines, &mut past, stream_timeout)
+            let err = next_sse_line(&mut lines, &mut past, STREAM_TIMEOUT)
                 .await
                 .unwrap_err();
             assert!(matches!(err, AgentError::Timeout { .. }));
         })
+    }
+
+    /// A whole response already in the buffer, on a one-thread executor: the
+    /// competing task stands in for the event forwarder, which is what turns
+    /// deltas into a live count instead of one burst at the end of the read.
+    #[test]
+    fn next_sse_line_lets_another_task_run_between_buffered_lines() {
+        let ex = smol::LocalExecutor::new();
+        let other_ran = Rc::new(Cell::new(false));
+        let read_when_other_ran = Rc::new(Cell::new(usize::MAX));
+
+        let reader = ex.spawn({
+            let other_ran = Rc::clone(&other_ran);
+            let read_when_other_ran = Rc::clone(&read_when_other_ran);
+            async move {
+                let body = "data: {}\n".repeat(BUFFERED_SSE_LINES);
+                let mut lines = futures_lite::io::Cursor::new(body).lines();
+                let mut deadline = Instant::now() + STREAM_TIMEOUT;
+                let mut read = 0;
+                while next_sse_line(&mut lines, &mut deadline, STREAM_TIMEOUT)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    read += 1;
+                    if other_ran.get() && read_when_other_ran.get() == usize::MAX {
+                        read_when_other_ran.set(read);
+                    }
+                }
+                read
+            }
+        });
+        let other = ex.spawn(async move { other_ran.set(true) });
+
+        let read = smol::block_on(ex.run(async {
+            let read = reader.await;
+            other.await;
+            read
+        }));
+        assert_eq!(read, BUFFERED_SSE_LINES);
+        assert!(
+            read_when_other_ran.get() < BUFFERED_SSE_LINES,
+            "{EXPECT_INTERLEAVED}"
+        );
     }
 
     #[test]

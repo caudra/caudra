@@ -6,7 +6,7 @@ use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncatio
 use crate::theme;
 
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
-use super::{ToolProgress, is_collapsible};
+use super::{LiveBody, ToolProgress, is_collapsible};
 use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -38,6 +38,10 @@ const QUEUED_ANNOTATION: &str = "queued";
 const UNCONSTRAINED_WIDTH: u16 = 0;
 const GREP_COUNT_SEP: &str = " \u{b7} ";
 const GREP_SUMMARY_INDENT: &str = "  ";
+/// What opens a structural line of the patch language, as opposed to a line of
+/// the change itself.
+const PATCH_ENVELOPE: &str = "*** ";
+const PATCH_CONTEXT: &str = "@@";
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -659,6 +663,55 @@ fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
         lines.extend(render_unified_patch(&file.patch));
     }
     lines
+}
+
+/// The patch language the model writes, coloured but not numbered.
+/// [`render_unified_patch`] cannot be reused: it numbers from
+/// `@@ -a,b +c,d @@` headers and this form has none, so the envelope keeps its
+/// own lines and only the changed ones take the diff colours.
+fn render_patch_source(patch: &str) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    patch
+        .lines()
+        .map(|raw| {
+            let style = if raw.starts_with(PATCH_ENVELOPE) || raw.starts_with(PATCH_CONTEXT) {
+                theme.tool_dim
+            } else if raw.starts_with('-') {
+                theme.diff_old
+            } else if raw.starts_with('+') {
+                theme.diff_new
+            } else {
+                theme.code_block
+            };
+            Line::from(Span::styled(
+                caudra_highlight::normalize_text(raw),
+                style.patch(theme.code_block),
+            ))
+        })
+        .collect()
+}
+
+/// The change a call is still writing, drawn the way the finished call will
+/// draw it and bounded the way the finished call is bounded, so the card does
+/// not reflow when the tool starts.
+///
+/// Nothing here is highlighted. A file cut off mid-token leaves the parser in
+/// a state the rest of the file has not justified yet, which is the same
+/// reason a patch hunk is never highlighted either.
+///
+/// A whole file only materialises the rows it can show, because this runs once
+/// per fragment and copying the file each time would cost its length squared.
+/// The other two arms are a replacement and a patch, which are the size of the
+/// change rather than of the file.
+pub(crate) fn render_live_body(body: &LiveBody, max_lines: usize) -> (Vec<Line<'static>>, bool) {
+    match body {
+        LiveBody::Code(text) => {
+            let shown: Vec<String> = text.lines().take(max_lines).map(String::from).collect();
+            render_code(None, 1, &shown, text.lines().count(), max_lines)
+        }
+        LiveBody::Replace { before, after } => (render_diff(None, before, after), false),
+        LiveBody::Patch(text) => (render_patch_source(text), false),
+    }
 }
 
 /// How many rows the full rendering would take. Counted rather than rendered,

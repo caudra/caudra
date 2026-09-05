@@ -7,6 +7,7 @@ mod run;
 mod streaming;
 pub mod subagent;
 mod title;
+mod tool_body;
 pub mod tool_dispatch;
 mod tool_preview;
 
