@@ -14,6 +14,9 @@ pub struct WorkbenchStyles {
     pub border: Style,
     pub title: Style,
     pub selected: Style,
+    /// What the pointer is resting on. Never painted over an already selected
+    /// row, so the two are not asked to mean different things at once.
+    pub hover: Style,
     pub accent: Style,
     pub directory: Style,
     pub tab_active: Style,
@@ -47,6 +50,7 @@ impl Default for WorkbenchStyles {
             border: dim,
             title: text.add_modifier(Modifier::BOLD),
             selected: Style::default().add_modifier(Modifier::REVERSED),
+            hover: Style::default().add_modifier(Modifier::REVERSED),
             accent: Style::default().fg(Color::Cyan),
             directory: Style::default().fg(Color::Blue),
             tab_active: text.add_modifier(Modifier::BOLD),

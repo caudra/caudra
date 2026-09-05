@@ -19,6 +19,7 @@ pub(crate) fn styles() -> WorkbenchStyles {
         border: t.panel_border,
         title: t.panel_title,
         selected: t.item_selected,
+        hover: Style::new().add_modifier(Modifier::REVERSED),
         accent: t.accent,
         directory: t.tool_path,
         tab_active: t.active,

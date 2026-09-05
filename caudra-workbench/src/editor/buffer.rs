@@ -154,6 +154,41 @@ impl Buffer {
         self.goal_col = None;
     }
 
+    /// Takes the run under `cursor`: the word it is inside, or the gap between
+    /// two words when it is not on one. This is what a double click means.
+    pub fn select_word_at(&mut self, cursor: Cursor) {
+        let cursor = self.clamp(cursor);
+        let chars: Vec<char> = self.line(cursor.line).chars().collect();
+        let Some(&under) = chars.get(cursor.col) else {
+            self.set_cursor(cursor, false);
+            return;
+        };
+        let wanted = is_word(under);
+        let start = chars[..cursor.col]
+            .iter()
+            .rposition(|ch| is_word(*ch) != wanted)
+            .map_or(0, |index| index + 1);
+        let end = chars[cursor.col..]
+            .iter()
+            .position(|ch| is_word(*ch) != wanted)
+            .map_or(chars.len(), |offset| cursor.col + offset);
+        self.anchor = Some(Cursor::new(cursor.line, start));
+        self.cursor = Cursor::new(cursor.line, end);
+        self.goal_col = None;
+    }
+
+    /// Takes a whole line, newline included where there is one, which is what
+    /// a triple click means.
+    pub fn select_line_at(&mut self, line: usize) {
+        let line = line.min(self.line_count() - 1);
+        self.anchor = Some(Cursor::new(line, 0));
+        self.cursor = match line + 1 < self.line_count() {
+            true => Cursor::new(line + 1, 0),
+            false => Cursor::new(line, self.line_len(line)),
+        };
+        self.goal_col = None;
+    }
+
     pub fn set_cursor(&mut self, cursor: Cursor, extend: bool) {
         self.begin_move(extend);
         self.cursor = self.clamp(cursor);
@@ -508,10 +543,10 @@ impl Buffer {
         }
         let chars: Vec<char> = self.line(cursor.line).chars().collect();
         let mut col = cursor.col;
-        while col > 0 && !chars[col - 1].is_alphanumeric() && chars[col - 1] != '_' {
+        while col > 0 && !is_word(chars[col - 1]) {
             col -= 1;
         }
-        while col > 0 && (chars[col - 1].is_alphanumeric() || chars[col - 1] == '_') {
+        while col > 0 && is_word(chars[col - 1]) {
             col -= 1;
         }
         Cursor::new(cursor.line, col)
@@ -524,14 +559,20 @@ impl Buffer {
         }
         let chars: Vec<char> = self.line(cursor.line).chars().collect();
         let mut col = cursor.col;
-        while col < len && (chars[col].is_alphanumeric() || chars[col] == '_') {
+        while col < len && is_word(chars[col]) {
             col += 1;
         }
-        while col < len && !chars[col].is_alphanumeric() && chars[col] != '_' {
+        while col < len && !is_word(chars[col]) {
             col += 1;
         }
         Cursor::new(cursor.line, col)
     }
+}
+
+/// What counts as one word to word motion and to a double click, so the two
+/// never disagree about where a word ends.
+fn is_word(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 fn slice(line: &str, range: Range<usize>) -> String {
@@ -562,6 +603,8 @@ mod tests {
     const SELECTION_ORDER: &str =
         "a selection must read in document order whichever way it was made";
     const NO_CONVERT: &str = "a tab-indented file must not be silently converted to spaces";
+    const WRONG_WORD: &str = "a double click did not take the run under the pointer";
+    const WRONG_LINE: &str = "a triple click did not take the line under the pointer";
 
     fn buffer(text: &str) -> Buffer {
         Buffer::new(text.split('\n').map(str::to_owned).collect())
@@ -572,6 +615,60 @@ mod tests {
         let buffer = Buffer::new(Vec::new());
         assert_eq!(buffer.line_count(), 1);
         assert_eq!(buffer.text(), "");
+    }
+
+    #[test_case(0, "one" ; "the first character of a word takes the word")]
+    #[test_case(1, "one" ; "the middle of a word takes the word")]
+    #[test_case(2, "one" ; "the last character of a word takes the word")]
+    #[test_case(3, "  " ; "a gap between words takes the gap")]
+    #[test_case(5, "two_2" ; "digits and underscores belong to the word")]
+    #[test_case(10, "(" ; "punctuation is its own run")]
+    fn a_double_click_takes_the_run_under_it(col: usize, expected: &str) {
+        let mut buffer = buffer("one  two_2(three");
+
+        buffer.select_word_at(Cursor::new(0, col));
+
+        assert_eq!(
+            buffer.selected_text().as_deref(),
+            Some(expected),
+            "{WRONG_WORD}"
+        );
+    }
+
+    #[test]
+    fn a_double_click_past_the_end_of_a_line_selects_nothing() {
+        let mut buffer = buffer("one\ntwo");
+
+        buffer.select_word_at(Cursor::new(0, 3));
+
+        assert!(!buffer.has_selection(), "{WRONG_WORD}");
+        assert_eq!(buffer.cursor(), Cursor::new(0, 3), "{WRONG_WORD}");
+    }
+
+    #[test_case(0, "one\n" ; "a line before the last takes its newline too")]
+    #[test_case(2, "three" ; "the last line has no newline to take")]
+    fn a_triple_click_takes_the_whole_line(line: usize, expected: &str) {
+        let mut buffer = buffer("one\ntwo\nthree");
+
+        buffer.select_line_at(line);
+
+        assert_eq!(
+            buffer.selected_text().as_deref(),
+            Some(expected),
+            "{WRONG_LINE}"
+        );
+    }
+
+    /// The pointer only ever moves the cursor and the anchor, so this is what
+    /// makes cut and delete work over a selection the mouse made.
+    #[test]
+    fn deleting_over_a_pointer_selection_removes_exactly_it() {
+        let mut buffer = buffer("one two three");
+
+        buffer.select_word_at(Cursor::new(0, 5));
+        buffer.delete();
+
+        assert_eq!(buffer.text(), "one  three", "{WRONG_WORD}");
     }
 
     #[test_case("hello",           Cursor::new(0, 0), "X",    "Xhello"          ; "at_start")]

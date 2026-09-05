@@ -97,6 +97,13 @@ impl QuickOpen {
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
+    pub fn select_index(&mut self, index: usize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.matches.len() - 1);
+    }
+
     pub fn clamp_scroll(&mut self, viewport: usize) {
         if viewport == 0 {
             return;

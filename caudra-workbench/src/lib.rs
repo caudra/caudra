@@ -11,6 +11,7 @@ mod chrome;
 mod editor;
 mod fs;
 pub mod keys;
+mod pointer;
 mod quick_open;
 mod scm;
 mod search;
@@ -22,6 +23,7 @@ pub use style::WorkbenchStyles;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -32,9 +34,11 @@ use editor::Tab;
 use editor::buffer::Cursor;
 use fs::tree::Tree;
 use fs::watch::Watch;
+use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::Scm;
 use search::Search;
+use view::{TabHit, Toggle};
 
 const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 const MIN_SIDEBAR_WIDTH: u16 = 16;
@@ -43,6 +47,8 @@ const MIN_EDITOR_WIDTH: u16 = 24;
 const SEPARATOR_WIDTH: u16 = 1;
 const STATUS_HEIGHT: u16 = 1;
 const SCROLL_LINES: isize = 3;
+/// How far one tick of a drag that has run off the buffer scrolls it.
+const EDGE_SCROLL_LINES: isize = 1;
 const SIDEBAR_STEP: i16 = 2;
 const STAGED: &str = "index";
 const WORKING: &str = "worktree";
@@ -57,13 +63,17 @@ pub enum SidebarView {
 }
 
 impl SidebarView {
+    /// What the header switcher paints. All three together have to fit
+    /// [`MIN_SIDEBAR_WIDTH`], so these are short rather than descriptive.
     const fn title(self) -> &'static str {
         match self {
-            Self::Explorer => "Explorer",
-            Self::SourceControl => "Source Control",
-            Self::Search => "Search",
+            Self::Explorer => "FILES",
+            Self::SourceControl => "GIT",
+            Self::Search => "FIND",
         }
     }
+
+    const ALL: [Self; 3] = [Self::Explorer, Self::SourceControl, Self::Search];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,6 +129,25 @@ struct PaneRects {
     /// open find bar already taken out.
     text: Rect,
     status: Rect,
+    /// The sidebar's one-row title, which doubles as the view switcher.
+    header: Rect,
+    /// Whichever list the sidebar is showing, with that view's own prompts
+    /// already taken out. Search puts three rows above its results, so an
+    /// offset measured from the sidebar itself would land three rows short.
+    rows: Rect,
+    /// The search view's case, word and regex buttons, empty in every other
+    /// view.
+    toggles: Rect,
+}
+
+/// What the held left button is doing, which the pointer cannot tell from
+/// position alone once a drag wanders out of the pane it started in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Drag {
+    #[default]
+    None,
+    Separator,
+    Text,
 }
 
 pub struct Workbench {
@@ -144,9 +173,18 @@ pub struct Workbench {
     /// Files that changed on disk while the workbench was open, which in
     /// practice is what Caudra wrote underneath it.
     touched: HashSet<PathBuf>,
-    /// Set while the pointer is dragging the separator, so a drag that wanders
-    /// off it keeps resizing instead of selecting a row.
-    resizing: bool,
+    /// What the held left button is doing, so a drag that wanders out of the
+    /// pane it started in keeps doing it.
+    drag: Drag,
+    /// Where the last drag reached, which is what tells a text drag it has run
+    /// off the top or the bottom of the buffer and should scroll.
+    drag_at: (u16, u16),
+    /// Consecutive presses on one cell, which is how a double click is told
+    /// from two single ones.
+    clicks: Clicks,
+    /// Where the pointer is resting, so every pane can paint what a click
+    /// would hit. `None` until the pointer first moves.
+    hover: Option<(u16, u16)>,
     /// Cut and copy also leave through [`WorkbenchAction::Copy`], but the host
     /// cannot read the system clipboard back, so paste comes from here.
     clipboard: String,
@@ -174,7 +212,10 @@ impl Workbench {
             search: Search::default(),
             watch: None,
             touched: HashSet::new(),
-            resizing: false,
+            drag: Drag::None,
+            drag_at: (0, 0),
+            clicks: Clicks::default(),
+            hover: None,
             clipboard: String::new(),
             goto: None,
             flash: None,
@@ -224,7 +265,7 @@ impl Workbench {
     /// Whether a background worker owes an answer, so the host knows to look
     /// again rather than sleeping until the next key.
     pub fn is_busy(&self) -> bool {
-        self.search.is_running()
+        self.search.is_running() || self.edge_scroll_delta() != 0
     }
 
     /// Drains whatever the background workers have produced. Reports whether
@@ -232,7 +273,8 @@ impl Workbench {
     pub fn tick(&mut self) -> (bool, Option<String>) {
         let watched = self.absorb_changes();
         let searched = self.search.tick();
-        (watched || searched, self.flash.take())
+        let scrolled = self.edge_scroll();
+        (watched || searched || scrolled, self.flash.take())
     }
 
     /// Folds what moved on disk into the panes: tabs catch up or raise a
@@ -332,23 +374,26 @@ impl Workbench {
         let delta = match event.kind {
             MouseEventKind::ScrollUp => -SCROLL_LINES,
             MouseEventKind::ScrollDown => SCROLL_LINES,
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.resizing = self
-                    .panes
-                    .separator
-                    .is_some_and(|rect| rect.contains(at.into()));
-                if !self.resizing {
-                    self.click(at);
-                }
+            MouseEventKind::Moved => {
+                self.hover = Some(at);
                 return WorkbenchAction::Consumed;
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.resizing => {
-                let start = self.panes.sidebar.map_or(0, |rect| rect.x);
-                self.set_sidebar_width(at.0.saturating_sub(start));
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.hover = Some(at);
+                let clicks = self.clicks.press(at, Instant::now());
+                self.press(at, clicks);
+                return WorkbenchAction::Consumed;
+            }
+            MouseEventKind::Down(MouseButton::Middle) => {
+                self.close_under(at);
+                return WorkbenchAction::Consumed;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.drag_to(at);
                 return WorkbenchAction::Consumed;
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.resizing = false;
+                self.drag = Drag::None;
                 return WorkbenchAction::Consumed;
             }
             _ => return WorkbenchAction::Passthrough,
@@ -373,51 +418,229 @@ impl Workbench {
         WorkbenchAction::Consumed
     }
 
-    fn click(&mut self, at: (u16, u16)) {
+    /// A left press, told how many landed on this cell in a row. The panes are
+    /// tried in painting order, so the palette gets the press it is covering.
+    fn press(&mut self, at: (u16, u16), clicks: u8) {
         let position = at.into();
-        if self.panes.tabs.contains(position) {
-            self.focus = Focus::Editor;
-            if let Some(index) = view::tab_at(&self.editor, at.0, self.panes.tabs.x) {
-                self.editor.select(index);
-                self.reveal_active();
+        if self.palette.is_open() {
+            if self.panes.palette.contains(position) {
+                self.open_palette_row((at.1 - self.panes.palette.y) as usize);
             }
             return;
         }
         if self
             .panes
-            .sidebar
+            .separator
             .is_some_and(|rect| rect.contains(position))
         {
-            let header = self.panes.sidebar.map_or(0, |rect| rect.y + 1);
-            self.focus = Focus::Sidebar;
-            if at.1 >= header {
-                let offset = (at.1 - header) as usize;
-                match self.sidebar {
-                    SidebarView::Explorer => {
-                        self.tree.select_index(self.tree.scroll() + offset);
-                    }
-                    SidebarView::SourceControl => {
-                        self.scm.select_index(self.scm.scroll() + offset);
-                    }
-                    SidebarView::Search => {
-                        self.search.select_index(self.search.scroll() + offset);
-                    }
+            self.drag = Drag::Separator;
+            return;
+        }
+        if self.panes.tabs.contains(position) {
+            self.focus = Focus::Editor;
+            if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs.x) {
+                self.hit_tab(hit);
+            }
+            return;
+        }
+        if self.panes.header.contains(position) {
+            if let Some(view) = view::header_at(at.0, self.panes.header.x) {
+                self.focus = Focus::Sidebar;
+                self.sidebar = view;
+            }
+            return;
+        }
+        if self.panes.toggles.contains(position) {
+            if let Some(toggle) = view::toggle_at(at.0, self.panes.toggles.x) {
+                self.focus = Focus::Sidebar;
+                match toggle {
+                    Toggle::Case => self.search.toggle_case(),
+                    Toggle::Word => self.search.toggle_word(),
+                    Toggle::Regex => self.search.toggle_regex(),
                 }
             }
             return;
         }
-        if !self.panes.text.contains(position) {
+        if self.panes.rows.contains(position) {
+            self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
             return;
         }
+        if self.panes.text.contains(position) {
+            self.press_text(at, clicks);
+        }
+    }
+
+    /// A press on the sidebar's list. One click picks a row out, and a second
+    /// does whatever `Enter` would have done to it.
+    fn press_row(&mut self, offset: usize, clicks: u8) {
+        self.focus = Focus::Sidebar;
+        match self.sidebar {
+            SidebarView::Explorer => {
+                self.tree.select_index(self.tree.scroll() + offset);
+                let directory = self.tree.selected().is_some_and(fs::tree::Row::is_dir);
+                match (clicks, directory) {
+                    // A folder opens on the first click, the way every file
+                    // manager does it, so a second one is left alone rather
+                    // than closing what the first opened.
+                    (1, true) => drop(self.tree.toggle_selected()),
+                    (2, false) => self.open_selected(),
+                    _ => {}
+                }
+            }
+            SidebarView::SourceControl => {
+                self.scm.select_index(self.scm.scroll() + offset);
+                if clicks == 2 {
+                    self.open_diff();
+                }
+            }
+            SidebarView::Search => {
+                self.search.select_index(self.search.scroll() + offset);
+                if clicks == 2 {
+                    self.open_search_selection();
+                }
+            }
+        }
+    }
+
+    /// A press on the buffer. One click drops the cursor and starts a drag,
+    /// two take the word under it, three take the whole line.
+    fn press_text(&mut self, at: (u16, u16), clicks: u8) {
         self.focus = Focus::Editor;
-        let text = self.panes.text;
+        let Some(cursor) = self.cursor_at(at) else {
+            return;
+        };
+        if clicks == 1 {
+            self.drag = Drag::Text;
+            self.drag_at = at;
+        }
         let Some(tab) = self.editor.active_mut() else {
             return;
         };
-        let line = (tab.scroll() + (at.1 - text.y) as usize).min(tab.buffer.line_count() - 1);
-        let column = tab.h_scroll() + (at.0 - text.x) as usize;
-        let col = editor::render::char_index(tab.buffer.line(line), column);
-        tab.buffer.set_cursor(Cursor::new(line, col), false);
+        match clicks {
+            1 => tab.buffer.set_cursor(cursor, false),
+            2 => tab.buffer.select_word_at(cursor),
+            _ => tab.buffer.select_line_at(cursor.line),
+        }
+    }
+
+    /// A palette row is a menu entry rather than a tree node, so one click
+    /// takes it.
+    fn open_palette_row(&mut self, offset: usize) {
+        self.palette.select_index(self.palette.scroll() + offset);
+        let chosen = self.palette.selected(&self.root);
+        self.palette.close();
+        if let Some(path) = chosen {
+            self.open_path(&path);
+        }
+    }
+
+    fn hit_tab(&mut self, hit: TabHit) {
+        if hit.close {
+            self.close_at(hit.index);
+            return;
+        }
+        self.editor.select(hit.index);
+        self.reveal_active();
+    }
+
+    fn close_under(&mut self, at: (u16, u16)) {
+        if !self.panes.tabs.contains(at.into()) {
+            return;
+        }
+        if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs.x) {
+            self.focus = Focus::Editor;
+            self.close_at(hit.index);
+        }
+    }
+
+    /// Closing through the same guard the keyboard uses, so an unsaved tab
+    /// refuses the pointer too.
+    fn close_at(&mut self, index: usize) {
+        self.editor.select(index);
+        self.close_tab();
+    }
+
+    fn drag_to(&mut self, at: (u16, u16)) {
+        match self.drag {
+            Drag::Separator => {
+                let start = self.panes.sidebar.map_or(0, |rect| rect.x);
+                self.set_sidebar_width(at.0.saturating_sub(start));
+            }
+            Drag::Text => {
+                self.drag_at = at;
+                self.extend_to(at);
+            }
+            Drag::None => {}
+        }
+    }
+
+    fn extend_to(&mut self, at: (u16, u16)) {
+        let Some(cursor) = self.cursor_at(at) else {
+            return;
+        };
+        if let Some(tab) = self.editor.active_mut() {
+            tab.buffer.set_cursor(cursor, true);
+        }
+    }
+
+    /// The buffer position under `at`, which a drag may have carried outside
+    /// the text pane entirely.
+    fn cursor_at(&self, at: (u16, u16)) -> Option<Cursor> {
+        let text = self.panes.text;
+        if text.width == 0 || text.height == 0 {
+            return None;
+        }
+        let tab = self.editor.active()?;
+        let row = at.1.clamp(text.y, text.bottom() - 1);
+        let column = at.0.clamp(text.x, text.right() - 1);
+        let line = (tab.scroll() + (row - text.y) as usize).min(tab.buffer.line_count() - 1);
+        let reached = tab.h_scroll() + (column - text.x) as usize;
+        let col = editor::render::char_index(tab.buffer.line(line), reached);
+        Some(Cursor::new(line, col))
+    }
+
+    /// How far a text drag that has run off the pane wants to scroll. Zero
+    /// while the pointer is still inside it, or while nothing is dragging.
+    fn edge_scroll_delta(&self) -> isize {
+        if self.drag != Drag::Text {
+            return 0;
+        }
+        let text = self.panes.text;
+        match self.drag_at.1 {
+            row if row < text.y => -EDGE_SCROLL_LINES,
+            row if row >= text.bottom() => EDGE_SCROLL_LINES,
+            _ => 0,
+        }
+    }
+
+    /// Scrolls a drag that has run off the pane and carries the selection with
+    /// it. Reports whether anything moved.
+    fn edge_scroll(&mut self) -> bool {
+        let delta = self.edge_scroll_delta();
+        if delta == 0 {
+            return false;
+        }
+        let rows = self.panes.text.height as usize;
+        let Some(tab) = self.editor.active_mut() else {
+            return false;
+        };
+        let before = tab.scroll();
+        tab.scroll_by(delta, rows);
+        if tab.scroll() == before {
+            return false;
+        }
+        self.extend_to(self.drag_at);
+        true
+    }
+
+    /// The pointer's position while it rests inside `rect`.
+    fn hovering(&self, rect: Rect) -> Option<(u16, u16)> {
+        self.hover.filter(|at| rect.contains((*at).into()))
+    }
+
+    /// Which row of `rect` the pointer is resting on.
+    fn hovered_row(&self, rect: Rect) -> Option<usize> {
+        self.hovering(rect).map(|at| (at.1 - rect.y) as usize)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> WorkbenchAction {
@@ -790,6 +1013,10 @@ impl Workbench {
             self.flash = self.search.error().map(str::to_owned);
             return;
         }
+        self.open_search_selection();
+    }
+
+    fn open_search_selection(&mut self) {
         let Some((path, line)) = self.search.selection() else {
             return;
         };
@@ -1001,9 +1228,7 @@ impl Workbench {
     }
 
     fn sidebar_rows(&self) -> usize {
-        self.panes
-            .sidebar
-            .map_or(0, |rect| rect.height.saturating_sub(1) as usize)
+        self.panes.rows.height as usize
     }
 
     /// The layout clamps again against the room a frame actually has, so this
@@ -1021,13 +1246,9 @@ fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
     let room = MIN_SIDEBAR_WIDTH + SEPARATOR_WIDTH + MIN_EDITOR_WIDTH;
     if collapsed || body.width < room {
         return PaneRects {
-            sidebar: None,
-            separator: None,
             editor: body,
-            tabs: Rect::default(),
-            palette: Rect::default(),
-            text: Rect::default(),
             status,
+            ..PaneRects::default()
         };
     }
     let width = sidebar_width.clamp(
@@ -1044,30 +1265,30 @@ fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
         sidebar: Some(sidebar),
         separator: Some(separator),
         editor,
-        tabs: Rect::default(),
-        palette: Rect::default(),
-        text: Rect::default(),
         status,
+        ..PaneRects::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cursor, Focus, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SIDEBAR_WIDTH, SCROLL_LINES,
-        SidebarView, Workbench, WorkbenchAction, WorkbenchStyles, keys, layout,
+        Cursor, Drag, EDGE_SCROLL_LINES, Focus, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
+        MIN_SIDEBAR_WIDTH, SCROLL_LINES, SidebarView, Toggle, Workbench, WorkbenchAction,
+        WorkbenchStyles, keys, layout,
     };
     use crate::fs::tree::GitMark;
     use crate::scm::Listing;
     use crate::search;
-    use crate::view::NOT_A_REPOSITORY;
+    use crate::view::{NOT_A_REPOSITORY, TabHit, header_at, tab_at, toggle_at};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Cell;
+    use ratatui::buffer::{Buffer as Surface, Cell};
     use ratatui::layout::Rect;
+    use ratatui::style::Style;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1096,6 +1317,7 @@ mod tests {
     const LOST_EDIT: &str = "a reload threw away work the user had not saved";
     const WRONG_WIDTH: &str = "the sidebar is not the width it was asked for";
     const WRONG_LAYOUT: &str = "the workbench did not come back the way it was left";
+    const WRONG_HOVER: &str = "the row under the pointer is not marked the way it should be";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1122,20 +1344,55 @@ mod tests {
         mouse(MouseEventKind::ScrollDown, column, row)
     }
 
-    /// Paints one frame and hands back what it says, which is also what fills
-    /// in the pane geometry the mouse tests measure against.
-    fn draw(workbench: &mut Workbench, width: u16, height: u16) -> String {
+    fn moved(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Moved, column, row)
+    }
+
+    fn drag(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Drag(MouseButton::Left), column, row)
+    }
+
+    fn release(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    fn middle_click(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Middle), column, row)
+    }
+
+    /// Paints one frame, which is also what fills in the pane geometry the
+    /// mouse tests measure themselves against.
+    fn paint(workbench: &mut Workbench, width: u16, height: u16) -> Surface {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
         terminal
             .draw(|frame| workbench.view(frame, frame.area()))
             .expect("a frame");
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn draw(workbench: &mut Workbench, width: u16, height: u16) -> String {
+        paint(workbench, width, height)
             .content()
             .iter()
             .map(Cell::symbol)
             .collect()
+    }
+
+    /// How one cell is painted, which is how the hover tests tell a highlight
+    /// from the row it sits on.
+    fn cell_style(workbench: &mut Workbench, at: (u16, u16)) -> Style {
+        paint(workbench, 80, 24)[at].style()
+    }
+
+    /// The column a tab's close mark landed on, found the same way the pointer
+    /// finds it.
+    fn close_column(workbench: &Workbench, index: usize) -> u16 {
+        let tabs = workbench.panes.tabs;
+        (tabs.x..tabs.right())
+            .find(|column| {
+                tab_at(&workbench.editor, *column, tabs.x) == Some(TabHit { index, close: true })
+            })
+            .expect("a close mark on the tab")
     }
 
     fn workbench() -> Workbench {
@@ -1384,7 +1641,7 @@ mod tests {
 
         let painted = draw(&mut workbench, 80, 24);
 
-        for expected in ["EXPLORER", "sub", "a.txt", "one", "three"] {
+        for expected in ["FILES", "GIT", "FIND", "sub", "a.txt", "one", "three"] {
             assert!(painted.contains(expected), "{NOT_PAINTED}: {expected}");
         }
         assert!(workbench.panes.text.height > 0, "{NOT_PAINTED}: text pane");
@@ -1883,11 +2140,7 @@ mod tests {
         let separator = workbench.panes.separator.expect("a separator");
 
         workbench.handle_mouse(click(separator.x, separator.y));
-        workbench.handle_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            separator.x + 10,
-            separator.y,
-        ));
+        workbench.handle_mouse(drag(separator.x + 10, separator.y));
 
         assert_eq!(workbench.sidebar_width, separator.x + 10, "{WRONG_WIDTH}");
     }
@@ -1963,11 +2216,249 @@ mod tests {
         workbench.handle_mouse(click(separator.x, separator.y + 3));
 
         assert_eq!(workbench.tree.selected_index(), before, "{WRONG_CLICK}");
-        workbench.handle_mouse(mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            separator.x,
-            separator.y,
-        ));
-        assert!(!workbench.resizing, "{WRONG_CLICK}");
+        workbench.handle_mouse(release(separator.x, separator.y));
+        assert_eq!(workbench.drag, Drag::None, "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn a_file_opens_on_the_second_click_rather_than_the_first() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        assert!(workbench.editor.active().is_none(), "{WRONG_CLICK}");
+
+        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).title,
+            "a.txt",
+            "{WRONG_CLICK}"
+        );
+    }
+
+    /// Folders are the one row a single click acts on, which is what every file
+    /// manager does.
+    #[test]
+    fn a_directory_opens_on_the_first_click() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let before = workbench.tree.rows().len();
+
+        workbench.handle_mouse(click(rows.x + 1, rows.y));
+
+        assert!(workbench.tree.rows().len() > before, "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn dragging_across_the_buffer_selects_what_it_crossed() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.x + 2, text.y + 1));
+        workbench.handle_mouse(release(text.x + 2, text.y + 1));
+
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some("one\ntw"),
+            "{WRONG_CLICK}"
+        );
+        assert_eq!(workbench.drag, Drag::None, "{WRONG_CLICK}");
+    }
+
+    #[test_case(2, "one" ; "a second click takes the word")]
+    #[test_case(3, "one\n" ; "a third takes the whole line")]
+    fn clicking_again_in_the_buffer_widens_what_is_selected(presses: u8, expected: &str) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+
+        for _ in 0..presses {
+            workbench.handle_mouse(click(text.x + 1, text.y));
+        }
+
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some(expected),
+            "{WRONG_CLICK}"
+        );
+    }
+
+    #[test]
+    fn a_drag_only_scrolls_once_it_has_left_the_buffer() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+
+        for (row, expected) in [
+            (text.y, 0),
+            (text.y - 1, -EDGE_SCROLL_LINES),
+            (text.bottom(), EDGE_SCROLL_LINES),
+        ] {
+            workbench.handle_mouse(drag(text.x, row));
+            assert_eq!(workbench.edge_scroll_delta(), expected, "{WRONG_CLICK}");
+        }
+
+        workbench.handle_mouse(release(text.x, text.bottom()));
+        assert_eq!(workbench.edge_scroll_delta(), 0, "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn a_tick_carries_a_drag_that_ran_off_the_buffer_along_with_it() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let lines: String = (1..=50).map(|number| format!("line {number}\n")).collect();
+        fs::write(dir.path().join("long.txt"), lines).expect("a file");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        workbench.handle_key(key(KeyCode::Enter));
+        draw(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.x, text.bottom()));
+        let reached = workbench.selected_text().expect("a selection").len();
+        assert!(workbench.is_busy(), "{WRONG_CLICK}");
+
+        let (changed, _) = workbench.tick();
+
+        assert!(changed, "{WRONG_CLICK}");
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).scroll(),
+            1,
+            "{WRONG_CLICK}"
+        );
+        assert!(
+            workbench.selected_text().expect("a selection").len() > reached,
+            "{WRONG_CLICK}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_tabs_close_mark_closes_it() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+
+        workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
+
+        assert!(workbench.editor.tabs().is_empty(), "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn the_close_mark_refuses_a_tab_with_unsaved_work() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('x')));
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+
+        workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
+
+        assert_eq!(workbench.editor.tabs().len(), 1, "{WRONG_CLICK}");
+        assert!(workbench.flash.is_some(), "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn a_middle_click_closes_the_tab_under_it() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+
+        workbench.handle_mouse(middle_click(tabs.x + 1, tabs.y));
+
+        assert!(workbench.editor.tabs().is_empty(), "{WRONG_CLICK}");
+    }
+
+    #[test_case(SidebarView::SourceControl ; "the second segment switches to source control")]
+    #[test_case(SidebarView::Search ; "the third segment switches to search")]
+    fn a_click_on_a_header_segment_switches_the_view(expected: SidebarView) {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let header = workbench.panes.header;
+        let column = (header.x..header.right())
+            .find(|column| header_at(*column, header.x) == Some(expected))
+            .expect("a segment for the view");
+
+        workbench.handle_mouse(click(column, header.y));
+
+        assert_eq!(workbench.sidebar_view(), expected, "{WRONG_PANE}");
+    }
+
+    #[test]
+    fn a_click_on_a_search_toggle_turns_it_on() {
+        let (_dir, mut workbench) = project();
+        workbench.handle_key(alt(keys::VIEW_SEARCH.code));
+        draw(&mut workbench, 80, 24);
+        let toggles = workbench.panes.toggles;
+        let column = (toggles.x..toggles.right())
+            .find(|column| toggle_at(*column, toggles.x) == Some(Toggle::Regex))
+            .expect("a regex button");
+
+        workbench.handle_mouse(click(column, toggles.y));
+
+        assert!(workbench.search.query().regex, "{WRONG_CLICK}");
+    }
+
+    /// The search view keeps three rows above its results, which an offset
+    /// measured from the sidebar itself lands short of.
+    #[test]
+    fn a_click_on_a_search_hit_selects_the_hit_under_it() {
+        let (dir, mut workbench) = project();
+        search_for(&mut workbench, "three");
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        assert_eq!(workbench.search.selected_index(), 1, "{WRONG_CLICK}");
+
+        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.path, dir.path().join("a.txt"), "{NO_TAB}");
+        assert_eq!(tab.buffer.cursor().line, 2, "{WRONG_LINE}");
+    }
+
+    #[test]
+    fn the_pointer_marks_the_row_it_is_resting_on() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let unselected = (rows.x + 1, rows.y + 1);
+        let plain = cell_style(&mut workbench, unselected);
+
+        workbench.handle_mouse(moved(unselected.0, unselected.1));
+
+        assert_ne!(
+            cell_style(&mut workbench, unselected),
+            plain,
+            "{WRONG_HOVER}"
+        );
+    }
+
+    /// The selected row already stands out, so a hover on top of it would be
+    /// two highlights arguing over one cell.
+    #[test]
+    fn the_pointer_leaves_the_selected_row_alone() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let selected = (rows.x + 1, rows.y);
+        let before = cell_style(&mut workbench, selected);
+
+        workbench.handle_mouse(moved(selected.0, selected.1));
+
+        assert_eq!(
+            cell_style(&mut workbench, selected),
+            before,
+            "{WRONG_HOVER}"
+        );
     }
 }

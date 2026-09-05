@@ -16,7 +16,8 @@ Press `Alt+E` to open it, or run `/workbench`. `Esc` or `Alt+E` goes back to the
 A sidebar on the left, tabs and a buffer on the right, one status row along the bottom.
 
 ```
-┌─ Explorer ──────┬─ a.txt × ─ b.rs ──────────────┐
+┌─────────────────┬───────────────────────────────┐
+│ FILES GIT FIND  │  a.txt ×  ●b.rs ×             │
 │  sub/           │  1  one                       │
 │  a.txt        M │  2  two                       │
 │  b.rs         U │  3  three                     │
@@ -27,11 +28,34 @@ A sidebar on the left, tabs and a buffer on the right, one status row along the 
 
 `Ctrl+B` hides the sidebar. `Alt+-` and `Alt+=` change its width, and you can drag the divider with the mouse. On a terminal too narrow for both panes the sidebar drops out and the editor keeps the room.
 
-`Tab` and `Shift+Tab` move between the sidebar and the editor. `Alt+1`, `Alt+2`, and `Alt+3` switch the sidebar to the explorer, source control, or search, and put the cursor there.
+`Tab` and `Shift+Tab` move between the sidebar and the editor. `Alt+1`, `Alt+2`, and `Alt+3` switch the sidebar to the explorer, source control, or search, and put the cursor there. The `FILES`, `GIT`, and `FIND` labels in the sidebar header do the same thing with the mouse.
+
+## Mouse
+
+The workbench takes the mouse the way an IDE does.
+
+| Action | Result |
+|--------|--------|
+| Click a file | Select it |
+| Click the same file again | Open it |
+| Click a folder | Expand or collapse it |
+| Click a tab | Switch to it |
+| Click the `×` on a tab | Close it |
+| Middle-click a tab | Close it |
+| Click `FILES`, `GIT`, or `FIND` | Switch the sidebar view |
+| Click `Aa`, `ab`, or `.*` | Turn that search toggle on or off |
+| Drag the divider | Resize the sidebar |
+| Wheel over a pane | Scroll that pane |
+
+In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. `Ctrl+C`, `Ctrl+X`, and `Backspace` then work on that selection.
+
+Source control and search rows follow the explorer: one click selects, a second opens the diff or the match. Rows in the `Ctrl+P` file picker open on the first click, because a picker is a menu rather than a tree.
+
+Whatever the pointer rests on is highlighted, so you can see what a click would hit. A row that is already selected is left as it is.
 
 ## Explorer
 
-Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files.
+Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files. The [mouse](#mouse) does the same with one click on a folder and two on a file.
 
 Rows carry two marks. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
 
@@ -39,7 +63,7 @@ Rows carry two marks. On the right, the source control letter for that path: `M`
 
 ## Editor
 
-Tabs sit above the buffer. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. A tab with unsaved changes refuses to close and says so in the status row.
+Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. A tab with unsaved changes refuses to close and says so in the status row, whichever way you ask.
 
 Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` and `Ctrl+X` copy and cut to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
 

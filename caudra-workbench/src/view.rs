@@ -52,12 +52,28 @@ const FIND_PROMPT: &str = "Find: ";
 const GOTO_PROMPT: &str = "Go to line: ";
 const NO_MATCHES: &str = "No results";
 const TAB_GAP: &str = " ";
+const CLOSE_MARK: &str = "\u{d7}";
+/// The search buttons in the order [`toggle_row`] paints them, which is also
+/// the order [`toggle_at`] measures.
+const TOGGLES: [(Toggle, &str); 3] = [
+    (Toggle::Case, CASE_TOGGLE),
+    (Toggle::Word, WORD_TOGGLE),
+    (Toggle::Regex, REGEX_TOGGLE),
+];
 const PALETTE_PROMPT: &str = "> ";
 const PALETTE_WIDTH: u16 = 72;
 const PALETTE_ROWS: usize = 10;
 /// The query row and the rule under the list.
 const PALETTE_CHROME: u16 = 2;
 const HORIZONTAL: &str = "\u{2500}";
+
+/// One of the search view's three buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Toggle {
+    Case,
+    Word,
+    Regex,
+}
 
 impl Workbench {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
@@ -79,12 +95,8 @@ impl Workbench {
     fn render_sidebar(&mut self, buf: &mut Surface, area: Rect) {
         let [header, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.panes.header = header;
         let focused = self.focus == Focus::Sidebar;
-        let title = if focused {
-            self.styles.title
-        } else {
-            self.styles.dim
-        };
         let context = match self.sidebar {
             SidebarView::SourceControl => self.scm.head().unwrap_or_default().to_owned(),
             _ => self
@@ -93,11 +105,32 @@ impl Workbench {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         };
+        let pointed = self
+            .hovering(header)
+            .and_then(|at| header_at(at.0, header.x));
+        let switcher = SidebarView::ALL
+            .into_iter()
+            .flat_map(|view| {
+                let active = view == self.sidebar;
+                let mut style = match (active, focused) {
+                    (true, true) => self.styles.title,
+                    (true, false) => self.styles.text,
+                    (false, _) => self.styles.dim,
+                };
+                if pointed == Some(view) && !active {
+                    style = style.patch(self.styles.hover);
+                }
+                [
+                    Span::styled(TAB_GAP, self.styles.background),
+                    Span::styled(view.title(), style),
+                ]
+            })
+            .collect();
         chrome::render_line(
             buf,
             header,
             chrome::status_line(
-                vec![Span::styled(self.sidebar.title().to_uppercase(), title)],
+                switcher,
                 vec![Span::styled(context, self.styles.dim)],
                 header.width,
                 self.styles.dim,
@@ -145,12 +178,17 @@ impl Workbench {
                 ),
             );
         }
+        self.panes.toggles = toggles;
+        let pointed = self
+            .hovering(toggles)
+            .and_then(|at| toggle_at(at.0, toggles.x));
         chrome::render_line(
             buf,
             toggles,
-            toggle_row(&self.search, &self.styles, toggles.width),
+            toggle_row(&self.search, pointed, &self.styles, toggles.width),
         );
 
+        self.panes.rows = body;
         let height = body.height as usize;
         self.search.clamp_scroll(height);
         if !self.search.has_results() {
@@ -167,6 +205,7 @@ impl Workbench {
         let scroll = self.search.scroll();
         let selected = self.search.selected_index();
         let root = self.root.clone();
+        let pointed = self.hovered_row(body);
         for (offset, row) in self
             .search
             .rows()
@@ -175,19 +214,15 @@ impl Workbench {
             .take(height)
             .enumerate()
         {
-            let line = search_row(
-                &self.search,
-                *row,
-                &root,
-                focused && scroll + offset == selected,
-                &self.styles,
-                body.width,
-            );
+            let chosen = focused && scroll + offset == selected;
+            let line = search_row(&self.search, *row, &root, chosen, &self.styles, body.width);
+            let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(body, offset), line);
         }
     }
 
     fn render_scm(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
+        self.panes.rows = area;
         let height = area.height as usize;
         self.scm.clamp_scroll(height);
         if self.scm.rows().is_empty() {
@@ -201,19 +236,17 @@ impl Workbench {
         }
         let scroll = self.scm.scroll();
         let selected = self.scm.selected_index();
+        let pointed = self.hovered_row(area);
         for (offset, row) in self.scm.rows().iter().skip(scroll).take(height).enumerate() {
-            let line = scm_row(
-                &self.scm,
-                *row,
-                focused && scroll + offset == selected,
-                &self.styles,
-                area.width,
-            );
+            let chosen = focused && scroll + offset == selected;
+            let line = scm_row(&self.scm, *row, chosen, &self.styles, area.width);
+            let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(area, offset), line);
         }
     }
 
     fn render_tree(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
+        self.panes.rows = area;
         let height = area.height as usize;
         self.tree.clamp_scroll(height);
         if self.tree.rows().is_empty() {
@@ -222,6 +255,7 @@ impl Workbench {
         }
         let scroll = self.tree.scroll();
         let selected = self.tree.selected_index();
+        let pointed = self.hovered_row(area);
         for (offset, row) in self
             .tree
             .rows()
@@ -230,12 +264,9 @@ impl Workbench {
             .take(height)
             .enumerate()
         {
-            let line = tree_row(
-                row,
-                focused && scroll + offset == selected,
-                &self.styles,
-                area.width,
-            );
+            let chosen = focused && scroll + offset == selected;
+            let line = tree_row(row, chosen, &self.styles, area.width);
+            let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(area, offset), line);
         }
     }
@@ -294,6 +325,7 @@ impl Workbench {
         );
         let scroll = self.palette.scroll();
         let selected = self.palette.selected_index();
+        let pointed = self.hovered_row(rows);
         for (offset, path) in self
             .palette
             .rows()
@@ -301,10 +333,14 @@ impl Workbench {
             .take(rows.height as usize)
             .enumerate()
         {
-            let style = match scroll + offset == selected {
+            let chosen = scroll + offset == selected;
+            let mut style = match chosen {
                 true => self.styles.selected,
                 false => self.styles.dim,
             };
+            if pointed == Some(offset) && !chosen {
+                style = style.patch(self.styles.hover);
+            }
             chrome::render_line(
                 buf,
                 line_at(rows, offset),
@@ -326,18 +362,31 @@ impl Workbench {
 
     fn render_tabs(&mut self, buf: &mut Surface, area: Rect) {
         let active = self.editor.active_index();
+        let pointed = self
+            .hovering(area)
+            .and_then(|at| tab_at(&self.editor, at.0, area.x));
         let mut spans = Vec::new();
         for (index, tab) in self.editor.tabs().iter().enumerate() {
-            let style = if index == active {
+            let under = pointed.filter(|hit| hit.index == index);
+            let mut style = if index == active {
                 self.styles.tab_active
             } else {
                 self.styles.tab_inactive
+            };
+            if under.is_some() && index != active {
+                style = style.patch(self.styles.hover);
+            }
+            let close = match under.is_some_and(|hit| hit.close) {
+                true => self.styles.accent.patch(self.styles.hover),
+                false => self.styles.dim,
             };
             spans.push(Span::styled(TAB_GAP, self.styles.background));
             if tab.is_dirty() {
                 spans.push(Span::styled(DIRTY_MARK, self.styles.accent));
             }
             spans.push(Span::styled(format!("{}{TAB_GAP}", tab.title), style));
+            spans.push(Span::styled(CLOSE_MARK, close));
+            spans.push(Span::styled(TAB_GAP, self.styles.background));
         }
         chrome::render_line(buf, area, Line::from(spans));
     }
@@ -490,19 +539,83 @@ impl Workbench {
     }
 }
 
-/// Which tab a click at `column` landed on, measured the same way
-/// [`Workbench::render_tabs`] lays them out.
-pub(crate) fn tab_at(editor: &Editor, column: u16, origin: u16) -> Option<usize> {
+/// Where a click on the tab strip landed. The close mark is its own target, so
+/// reaching for it never selects the tab instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TabHit {
+    pub(crate) index: usize,
+    pub(crate) close: bool,
+}
+
+/// One tab's width, which is the only description of how
+/// [`Workbench::render_tabs`] lays a tab out.
+fn tab_width(tab: &Tab) -> usize {
+    TAB_GAP.len() * 3
+        + usize::from(tab.is_dirty())
+        + tab.title.chars().count()
+        + CLOSE_MARK.chars().count()
+}
+
+/// Which tab a click at `column` landed on, and whether it landed on that
+/// tab's close mark.
+pub(crate) fn tab_at(editor: &Editor, column: u16, origin: u16) -> Option<TabHit> {
     let mut left = column.checked_sub(origin)? as usize;
     for (index, tab) in editor.tabs().iter().enumerate() {
-        let width =
-            TAB_GAP.len() + usize::from(tab.is_dirty()) + tab.title.chars().count() + TAB_GAP.len();
+        let width = tab_width(tab);
         if left < width {
-            return Some(index);
+            let close = left == width - TAB_GAP.len() - CLOSE_MARK.chars().count();
+            return Some(TabHit { index, close });
         }
         left -= width;
     }
     None
+}
+
+/// Which view the switcher segment at `column` selects, measured the same way
+/// [`Workbench::render_sidebar`] lays them out. The gaps between them are not
+/// buttons.
+pub(crate) fn header_at(column: u16, origin: u16) -> Option<SidebarView> {
+    let mut left = column.checked_sub(origin)? as usize;
+    for view in SidebarView::ALL {
+        let width = TAB_GAP.len() + view.title().len();
+        if left < width {
+            return (left >= TAB_GAP.len()).then_some(view);
+        }
+        left -= width;
+    }
+    None
+}
+
+/// Which search button a click at `column` landed on, measured the same way
+/// [`toggle_row`] lays them out.
+pub(crate) fn toggle_at(column: u16, origin: u16) -> Option<Toggle> {
+    let mut left = column.checked_sub(origin)? as usize;
+    for (toggle, label) in TOGGLES {
+        let width = TAB_GAP.len() + label.len();
+        if left < width {
+            return (left >= TAB_GAP.len()).then_some(toggle);
+        }
+        left -= width;
+    }
+    None
+}
+
+/// Paints the pointer's own highlight over a row it is resting on, keeping the
+/// colours the row already earned rather than replacing them.
+fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Line<'static> {
+    if !hovered {
+        return line;
+    }
+    let base = line.style.patch(styles.hover);
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.patch(styles.hover);
+            span.style(style)
+        })
+        .collect();
+    Line::from(spans).style(base)
 }
 
 fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
@@ -645,21 +758,31 @@ fn field_row(
     Line::from(spans)
 }
 
-fn toggle_row(search: &Search, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
+fn toggle_row(
+    search: &Search,
+    pointed: Option<Toggle>,
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
     let query = search.query();
-    let left = [
-        (CASE_TOGGLE, query.case_sensitive),
-        (WORD_TOGGLE, query.whole_word),
-        (REGEX_TOGGLE, query.regex),
-    ]
-    .into_iter()
-    .flat_map(|(label, on)| {
-        [
-            Span::styled(TAB_GAP, styles.background),
-            Span::styled(label, if on { styles.selected } else { styles.dim }),
-        ]
-    })
-    .collect();
+    let left = TOGGLES
+        .into_iter()
+        .flat_map(|(toggle, label)| {
+            let on = match toggle {
+                Toggle::Case => query.case_sensitive,
+                Toggle::Word => query.whole_word,
+                Toggle::Regex => query.regex,
+            };
+            let mut style = if on { styles.selected } else { styles.dim };
+            if pointed == Some(toggle) && !on {
+                style = style.patch(styles.hover);
+            }
+            [
+                Span::styled(TAB_GAP, styles.background),
+                Span::styled(label, style),
+            ]
+        })
+        .collect();
 
     let (hits, files) = search.counts();
     let summary = match (search.is_running(), search.has_results()) {
@@ -865,4 +988,88 @@ fn hints(pairs: &[(&'static str, &'static str)], styles: &WorkbenchStyles) -> Ve
         spans.push(Span::styled(format!(" {label}"), styles.dim));
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use test_case::test_case;
+
+    use super::{Editor, SidebarView, Tab, TabHit, Toggle, header_at, tab_at, toggle_at};
+
+    const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
+    const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
+    const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
+
+    /// Two two-column titles, so every tab spans ` ab \u{d7} ` and the second
+    /// starts where the first ended.
+    fn editor(dirty: bool) -> Editor {
+        let mut editor = Editor::default();
+        for title in ["ab", "cd"] {
+            let mut tab = Tab::synthetic(
+                Path::new(title),
+                title.to_owned(),
+                vec![String::new()],
+                Vec::new(),
+                0,
+            );
+            if dirty {
+                let edit = tab.buffer.insert("x");
+                tab.record(edit);
+            }
+            editor.push(tab);
+        }
+        editor
+    }
+
+    #[test_case(0, Some(TabHit { index: 0, close: false }) ; "the gap in front of a tab still selects it")]
+    #[test_case(1, Some(TabHit { index: 0, close: false }) ; "the title selects its tab")]
+    #[test_case(4, Some(TabHit { index: 0, close: true }) ; "the close mark is its own target")]
+    #[test_case(5, Some(TabHit { index: 0, close: false }) ; "the gap after the close mark is not it")]
+    #[test_case(6, Some(TabHit { index: 1, close: false }) ; "the next tab starts where the last ended")]
+    #[test_case(10, Some(TabHit { index: 1, close: true }) ; "every tab has its own close mark")]
+    #[test_case(12, None ; "past the last tab is nothing")]
+    fn a_column_falls_on_the_tab_the_strip_painted(column: u16, expected: Option<TabHit>) {
+        assert_eq!(tab_at(&editor(false), column, 0), expected, "{WRONG_TAB}");
+    }
+
+    #[test]
+    fn a_dirty_mark_shifts_the_close_mark_along_with_the_title() {
+        assert_eq!(
+            tab_at(&editor(true), 5, 0),
+            Some(TabHit {
+                index: 0,
+                close: true
+            }),
+            "{WRONG_TAB}"
+        );
+    }
+
+    #[test]
+    fn the_origin_is_taken_off_before_the_strip_is_measured() {
+        let editor = editor(false);
+
+        assert_eq!(tab_at(&editor, 9, 0), tab_at(&editor, 12, 3), "{WRONG_TAB}");
+        assert_eq!(tab_at(&editor, 2, 3), None, "{WRONG_TAB}");
+    }
+
+    #[test_case(0, None ; "the gap in front of a segment is not a button")]
+    #[test_case(1, Some(SidebarView::Explorer) ; "the first label switches to the explorer")]
+    #[test_case(5, Some(SidebarView::Explorer) ; "the whole label is the button")]
+    #[test_case(7, Some(SidebarView::SourceControl) ; "the second label switches to source control")]
+    #[test_case(11, Some(SidebarView::Search) ; "the third label switches to search")]
+    #[test_case(15, None ; "past the last label is nothing")]
+    fn a_column_falls_on_the_view_the_header_painted(column: u16, expected: Option<SidebarView>) {
+        assert_eq!(header_at(column, 0), expected, "{WRONG_VIEW}");
+    }
+
+    #[test_case(0, None ; "the gap in front of a button is not it")]
+    #[test_case(1, Some(Toggle::Case) ; "the first label toggles case")]
+    #[test_case(4, Some(Toggle::Word) ; "the second label toggles whole word")]
+    #[test_case(7, Some(Toggle::Regex) ; "the third label toggles regex")]
+    #[test_case(9, None ; "past the last label is nothing")]
+    fn a_column_falls_on_the_button_the_row_painted(column: u16, expected: Option<Toggle>) {
+        assert_eq!(toggle_at(column, 0), expected, "{WRONG_TOGGLE}");
+    }
 }
