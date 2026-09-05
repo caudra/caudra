@@ -22,12 +22,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::scrollbar::render_vertical_scrollbar;
-use super::{apply_scroll_delta, hover_style, visual_line_count};
+use super::{apply_scroll_delta, hover_style};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
+const SPACE: char = ' ';
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const ADMISSION_SEPARATOR: &str = "  ";
@@ -283,7 +284,7 @@ impl InputBox {
             self.buffer
                 .lines()
                 .iter()
-                .map(|line| visual_line_count(line.width(), ew) as u16),
+                .map(|line| wrap_row_count(line, ew, false) as u16),
         )
     }
 
@@ -456,26 +457,21 @@ impl InputBox {
         }
     }
 
-    fn visual_cursor_y(&self, ew: usize) -> u16 {
-        let lines_above: u16 = self
-            .buffer
-            .lines()
+    fn visual_cursor_y(&self, ew: usize, cursor_visible: bool) -> u16 {
+        let lines = self.buffer.lines();
+        let rows_above: usize = lines
             .iter()
             .take(self.buffer.y())
-            .map(|line| visual_line_count(line.width(), ew) as u16)
+            .map(|line| wrap_row_count(line, ew, false))
             .sum();
 
-        let wrap_row = {
-            let line = &self.buffer.lines()[self.buffer.y()];
-            let cursor_col: usize = line
-                .chars()
-                .take(self.buffer.x())
-                .map(|c| c.width().unwrap_or(1))
-                .sum();
-            cursor_col.checked_div(ew).unwrap_or(0) as u16
-        };
+        let chars: Vec<char> = lines[self.buffer.y()].chars().collect();
+        let wrap_row = wrap_ranges(&chars, ew, cursor_visible)
+            .iter()
+            .rposition(|&(start, _)| self.buffer.x() >= start)
+            .unwrap_or(0);
 
-        lines_above + wrap_row
+        (rows_above + wrap_row) as u16
     }
 
     pub fn view(
@@ -494,7 +490,7 @@ impl InputBox {
         let cursor_visible = focused && focused_paste.is_none();
 
         if self.follow_cursor {
-            let visual_cursor_y = self.visual_cursor_y(ew);
+            let visual_cursor_y = self.visual_cursor_y(ew, cursor_visible);
             if visual_cursor_y < self.scroll_y {
                 self.scroll_y = visual_cursor_y;
             } else if visual_cursor_y >= self.scroll_y + content_height {
@@ -690,7 +686,7 @@ impl InputBox {
 
             let is_cursor_line =
                 buf_line_idx == cursor_line && focused && self.buffer.focused_paste().is_none();
-            let ranges = wrap_ranges(&widths, ew, is_cursor_line);
+            let ranges = wrap_ranges(&chars, ew, is_cursor_line);
 
             let n_visual_rows = ranges.len();
 
@@ -855,9 +851,8 @@ fn wrap_line(
     shell_spans: Option<&[Span<'static>]>,
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
-    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
 
-    wrap_ranges(&widths, ew, is_cursor_line)
+    wrap_ranges(&chars, ew, is_cursor_line)
         .into_iter()
         .enumerate()
         .map(|(row, (start, end))| {
@@ -889,29 +884,48 @@ fn wrap_line(
         .collect()
 }
 
-/// Split a line (given per-char display widths) into wrapped row ranges of
-/// char indices, exactly as it is rendered: an extra empty row is appended
-/// when the cursor sits past a completely full last row.
-fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
+/// Split a line into wrapped row ranges of char indices, exactly as it is
+/// rendered: a row breaks after the last space that fits so a word is never
+/// split, a run too long for any row breaks on a char boundary, and an extra
+/// empty row is appended when the cursor sits past a completely full last row.
+///
+/// A trailing space is allowed past the right margin rather than pushed onto
+/// the next row, so a wrapped word starts flush instead of indented. Ranges
+/// tile the line contiguously, which is what lets the click hit-test and the
+/// cursor's visual row read this one function.
+fn wrap_ranges(chars: &[char], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
     let row_width = ew.max(1);
+    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut row_start = 0;
     let mut row_col = 0;
+    let mut after_space = None;
     for (i, &w) in widths.iter().enumerate() {
-        if row_col + w > row_width && row_col > 0 {
-            ranges.push((row_start, i));
-            row_start = i;
-            row_col = 0;
+        let is_space = chars[i] == SPACE;
+        if !is_space && row_col + w > row_width && row_col > 0 {
+            let end = after_space.filter(|&end| end > row_start).unwrap_or(i);
+            ranges.push((row_start, end));
+            row_start = end;
+            row_col = widths[end..i].iter().sum();
+            after_space = None;
+        }
+        if is_space {
+            after_space = Some(i + 1);
         }
         row_col += w;
     }
-    if row_start < widths.len() || ranges.is_empty() {
-        ranges.push((row_start, widths.len()));
+    if row_start < chars.len() || ranges.is_empty() {
+        ranges.push((row_start, chars.len()));
     }
     if is_cursor_line && row_col + 1 > row_width {
-        ranges.push((widths.len(), widths.len()));
+        ranges.push((chars.len(), chars.len()));
     }
     ranges
+}
+
+fn wrap_row_count(line: &str, ew: usize, is_cursor_line: bool) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    wrap_ranges(&chars, ew, is_cursor_line).len()
 }
 
 fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
@@ -995,13 +1009,7 @@ fn total_visual_lines(buffer: &InputDocument, ew: usize, cursor_visible: bool) -
         .lines()
         .iter()
         .enumerate()
-        .map(|(i, line)| {
-            let mut text_len = line.width();
-            if cursor_visible && i == cursor_y {
-                text_len += 1;
-            }
-            visual_line_count(text_len, ew)
-        })
+        .map(|(i, line)| wrap_row_count(line, ew, cursor_visible && i == cursor_y))
         .sum()
 }
 
@@ -1708,5 +1716,63 @@ mod tests {
         type_text(&mut input, "xy");
         input.buffer.set_cursor(0, 8);
         input.click_position(area(10), row, col, focused)
+    }
+
+    const ROW_SEPARATOR: &str = "|";
+    const BORDER_ROWS: u16 = 2;
+    const HEIGHT_MSG: &str = "the box must be as tall as the rows the wrap produces";
+    const FIXTURE_MSG: &str = "the fixture must wrap into more rows than a plain fill would";
+
+    fn wrapped_rows(text: &str, ew: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        wrap_ranges(&chars, ew, false)
+            .into_iter()
+            .map(|(start, end)| chars[start..end].iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(ROW_SEPARATOR)
+    }
+
+    #[test_case("hello", 8 => "hello"; "a line that fits keeps one row")]
+    #[test_case("", 8 => ""; "an empty line still has one row")]
+    #[test_case("hello world", 8 => "hello |world"; "a word moves whole onto the next row")]
+    #[test_case("one two three", 8 => "one two |three"; "the break is the last space that fits")]
+    #[test_case("abcdefghij", 8 => "abcdefgh|ij"; "a run too long for a row breaks on a char")]
+    #[test_case("ab cdefghijkl", 8 => "ab |cdefghij|kl"; "an over-long word breaks after the space before it")]
+    fn wrap_ranges_breaks_on_words(text: &str, ew: usize) -> String {
+        wrapped_rows(text, ew)
+    }
+
+    #[test]
+    fn height_matches_the_rows_the_wrap_produces() {
+        let width: u16 = 24;
+        let ew = effective_width(composer_content_width(width) as usize);
+        let word = "a".repeat(ew / 2 + 1);
+        let text = [word.as_str(); 4].join(" ");
+
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, &text);
+
+        let rows = wrap_row_count(&text, ew, true);
+        assert!(rows > text.len().div_ceil(ew), "{FIXTURE_MSG}");
+        assert_eq!(
+            input.height(width),
+            rows as u16 + BORDER_ROWS,
+            "{HEIGHT_MSG}"
+        );
+    }
+
+    #[test_case((1, 0) => Some((0, 6)); "continuation row starts at the wrapped word")]
+    #[test_case((1, 4) => Some((0, 10)); "the last char of the wrapped word is reachable")]
+    fn click_position_word_wrapped_line((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        // ew 8: "hello world" wraps as "hello " then "world".
+        single_line("hello world").click_position(area(10), row, col, true)
+    }
+
+    #[test_case(5 => 0; "a cursor before the break stays on the first row")]
+    #[test_case(6 => 1; "a cursor on the wrapped word sits on its row")]
+    fn visual_cursor_y_follows_the_wrapped_word(cursor_x: usize) -> u16 {
+        let mut input = single_line("hello world");
+        input.buffer.set_cursor(0, cursor_x);
+        input.visual_cursor_y(8, true)
     }
 }
