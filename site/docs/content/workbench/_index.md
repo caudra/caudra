@@ -9,7 +9,7 @@ group = "Guides"
 
 The workbench is a file explorer, tabbed editor, source control view, and project search, laid out the way an IDE lays them out. It takes over the terminal beside the transcript, so you can read a file, stage a change, or point the agent at an exact line without leaving Caudra.
 
-Press `Alt+E` to open it, or run `/workbench`. `Esc` or `Alt+E` goes back to the transcript. The session keeps running while the workbench is on screen.
+Press `Alt+E` to open it, or run `/workbench`. `Esc` or `Alt+E` goes back to the transcript. `Esc` drops a live selection in the editor first, so leaving from one takes a second press, while `Alt+E` always leaves at once. The session keeps running while the workbench is on screen.
 
 ## Layout
 

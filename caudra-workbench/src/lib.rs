@@ -936,6 +936,16 @@ impl Workbench {
 
     fn global_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
         if keys::CLOSE.matches(key) {
+            // Everything else that owns `Esc` has already been offered it, so
+            // this is the last thing between the key and leaving. A live
+            // selection is the editor's own transient state and goes first.
+            if self.focus == Focus::Editor
+                && let Some(tab) = self.editor.active_mut()
+                && tab.buffer.has_selection()
+            {
+                tab.buffer.clear_selection();
+                return Some(WorkbenchAction::Consumed);
+            }
             return Some(WorkbenchAction::Close);
         }
         if keys::TOGGLE_SIDEBAR.matches(key) {
@@ -1784,6 +1794,7 @@ mod tests {
     const IDLE_CLICK_COPIED: &str = "a press that selected nothing copied anyway";
     const KEPT_CLIPBOARD: &str = "what was copied before";
     const NOT_STEPPED: &str = "the find keys did not walk to the match they were pointed at";
+    const ESC_LEFT: &str = "esc left the workbench instead of dropping the selection it was in";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1936,6 +1947,40 @@ mod tests {
         let mut workbench = workbench();
         let action = workbench.handle_key(key(KeyCode::Esc));
         assert_eq!(action, WorkbenchAction::Close);
+    }
+
+    /// The sidebar has no selection of its own to drop, so `Esc` there means
+    /// what it always did on the first press.
+    #[test_case(Focus::Editor, WorkbenchAction::Consumed ; "the editor drops its selection first")]
+    #[test_case(Focus::Sidebar, WorkbenchAction::Close ; "the sidebar leaves anyway")]
+    fn esc_drops_a_live_selection_before_it_leaves(focus: Focus, expected: WorkbenchAction) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
+        workbench.focus = focus;
+
+        assert_eq!(workbench.handle_key(key(KeyCode::Esc)), expected, "{ESC_LEFT}");
+        assert_eq!(
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .buffer
+                .has_selection(),
+            expected == WorkbenchAction::Close,
+            "{ESC_LEFT}"
+        );
+    }
+
+    #[test]
+    fn a_second_esc_leaves_once_the_selection_is_gone() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
+
+        workbench.handle_key(key(KeyCode::Esc));
+        let action = workbench.handle_key(key(KeyCode::Esc));
+        assert_eq!(action, WorkbenchAction::Close, "{ESC_LEFT}");
     }
 
     #[test]

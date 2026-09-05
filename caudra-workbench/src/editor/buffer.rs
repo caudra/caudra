@@ -148,6 +148,10 @@ impl Buffer {
         Some(self.text_between(start, end))
     }
 
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
     pub fn select_all(&mut self) {
         self.anchor = Some(Cursor::default());
         self.cursor = self.end_of_document();
