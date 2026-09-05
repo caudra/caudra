@@ -168,6 +168,7 @@ const UPDATE: Inflection = ("Update", "Updating", "Updated");
 const LOAD: Inflection = ("Load", "Loading", "Loaded");
 const ASK: Inflection = ("Ask", "Asking", "Asked");
 const VIEW: Inflection = ("View", "Viewing", "Viewed");
+const DRAW: Inflection = ("Generate", "Generating", "Generated");
 /// A store reached by sub-command. The verb is the `command` argument, which
 /// the `[k=v]` suffix already shows, so the row names the store instead.
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
@@ -197,6 +198,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("memory", '⚙', MEMORY, &[]),
     tool_row("sessions", '⚙', SESSIONS, &[]),
     tool_row("view_image", '→', VIEW, &["path"]),
+    tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
 
 const fn tool_row(

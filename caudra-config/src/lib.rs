@@ -113,6 +113,7 @@ pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
 /// interactive surfaces. Workcell owns everything protocol-neutral.
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "batch",
+    "image_generate",
     "memory",
     "question",
     "skill",
@@ -142,6 +143,7 @@ pub const FILE_WRITE_TOOLS: &[&str] = &[
     "file_apply_patch",
     "file_edit",
     "file_write",
+    "image_generate",
     "write",
     "edit",
     "multiedit",
@@ -1248,7 +1250,13 @@ impl ToolOutputLines {
         ("read", &["file_read"]),
         (
             "write",
-            &["file_write", "file_edit", "file_apply_patch", "memory"],
+            &[
+                "file_write",
+                "file_edit",
+                "file_apply_patch",
+                "image_generate",
+                "memory",
+            ],
         ),
         ("web", &["webfetch", "websearch"]),
         (

@@ -10,6 +10,7 @@
 //! the Lua thread on every load, click, and theme change.
 
 pub mod batch;
+pub mod image_generate;
 pub mod memory;
 pub mod question;
 pub mod skill;
@@ -48,6 +49,11 @@ fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
             batch::BatchTool,
             ToolEffect::Orchestrator,
             batch::DESCRIPTION,
+        ),
+        entry(
+            image_generate::ImageGenerate,
+            ToolEffect::Mutating,
+            image_generate::DESCRIPTION,
         ),
         entry(
             memory::MemoryTool,

@@ -124,7 +124,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `index` | 3 | `index` |
 | `grep` | 3 | `file_grep`, `file_glob` |
 | `read` | 3 | `file_read` |
-| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `memory` |
+| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory` |
 | `web` | 3 | `webfetch`, `websearch` |
 | `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output_grep`, `tool_output_read`, `view_image` |
 

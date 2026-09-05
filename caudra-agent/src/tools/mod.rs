@@ -7,6 +7,7 @@
 
 mod file_tracker;
 pub mod grep;
+mod image_bytes;
 pub mod interpreter_bridge;
 pub mod native;
 mod path_locks;
@@ -236,6 +237,7 @@ impl ToolFilter {
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
+        exclude.extend(credential_exclusions());
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude).with_internal_companions()
     }
@@ -248,6 +250,29 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
         &[]
     } else {
         &[VIEW_IMAGE_TOOL_NAME]
+    }
+}
+
+/// Same gate for tools that need a credential the user may not have. Offering
+/// `image_generate` to someone with no ChatGPT subscription only buys a tool
+/// call that always fails. Read every time rather than cached: logging in
+/// mid-session is the expected recovery from that tool's own error message.
+pub fn credential_exclusions() -> &'static [&'static str] {
+    exclusions_without(openai_subscription_available())
+}
+
+fn openai_subscription_available() -> bool {
+    caudra_storage::StateDir::resolve()
+        .is_ok_and(|dir| caudra_storage::auth::load_tokens(&dir, OPENAI_PROVIDER_SLUG).is_some())
+}
+
+/// Split from the lookup so the policy is testable without depending on
+/// whether the machine running the tests happens to be logged in.
+fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
+    if openai_subscription {
+        &[]
+    } else {
+        &[IMAGE_GENERATE_TOOL_NAME]
     }
 }
 
@@ -266,6 +291,9 @@ pub const FILE_GLOB_TOOL_NAME: &str = "file_glob";
 pub const FILE_GREP_TOOL_NAME: &str = "file_grep";
 pub const FILE_READ_TOOL_NAME: &str = "file_read";
 pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
+pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
+/// The only backend `image_generate` can reach today.
+const OPENAI_PROVIDER_SLUG: &str = "openai";
 pub const INDEX_TOOL_NAME: &str = "index";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
@@ -853,6 +881,17 @@ mod tests {
         assert!(
             filter.matches(FILE_READ_TOOL_NAME),
             "unrelated tools stay enabled"
+        );
+    }
+
+    #[test_case(true  ; "subscribed_user_is_offered_image_generate")]
+    #[test_case(false ; "unsubscribed_user_never_learns_it_exists")]
+    fn image_generate_is_gated_on_an_openai_subscription(subscribed: bool) {
+        let excluded = exclusions_without(subscribed);
+        assert_eq!(
+            excluded.contains(&IMAGE_GENERATE_TOOL_NAME),
+            !subscribed,
+            "a tool that can only fail must not be advertised"
         );
     }
 

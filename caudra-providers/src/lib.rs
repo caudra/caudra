@@ -31,6 +31,7 @@ pub use providers::catalog::{
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
+pub use providers::openai::images as openai_images;
 pub use providers::xai::auth as xai_auth;
 pub use types::{
     ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, ImageMediaType,

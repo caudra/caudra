@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 21 built-in tools in this reference (21 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 22 built-in tools in this reference (22 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -209,6 +209,20 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
+
+## Media
+
+### `image_generate` {#image_generate}
+
+Generate a raster image from a text prompt and save it as a PNG. Use for AI-created bitmap visuals: illustrations, textures, sprites, photos, and mockups. Requires a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan, not API credits.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | string | yes | Description of the image to generate. |
+| `out` | string | yes | Output file path, relative to the project directory unless absolute. Written as a PNG. |
+| `quality` | string | no | Generation quality. Defaults to auto. |
+| `size` | string | no | Image size, either `auto` or `WIDTHxHEIGHT`. Width and height must be multiples of 16, the long edge at most 3840, the long-to-short ratio at most 3:1, and the total between 655,360 and 8,294,400 pixels. |
+| `images` | array | no | Reference image paths, relative to the project directory unless absolute. |
 
 ## Web
 

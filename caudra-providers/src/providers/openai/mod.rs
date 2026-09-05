@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod images;
 mod platform;
 pub(crate) mod responses;
 
