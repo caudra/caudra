@@ -36,8 +36,7 @@ The workbench takes the mouse the way an IDE does.
 
 | Action | Result |
 |--------|--------|
-| Click a file | Select it |
-| Click the same file again | Open it |
+| Click a file | Open it |
 | Click a folder | Expand or collapse it |
 | Click a tab | Switch to it |
 | Click the `×` on a tab | Close it |
@@ -50,15 +49,15 @@ The workbench takes the mouse the way an IDE does.
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
 
-In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. `Ctrl+C`, `Ctrl+X`, and `Backspace` then work on that selection.
+In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. Letting go puts whatever is selected on the system clipboard, so `Ctrl+C` is a second way rather than the only one. `Ctrl+X` and `Backspace` also work on that selection.
 
-Source control and search rows follow the explorer: one click selects, a second opens the diff or the match. Rows in the `Ctrl+P` file picker open on the first click, because a picker is a menu rather than a tree.
+Source control and search rows follow the explorer, and so do the `Ctrl+P` file picker's: one click does whatever `Enter` would have done to that row, so a folder or a section folds and everything else opens.
 
 Whatever the pointer rests on is highlighted, so you can see what a click would hit. A row that is already selected is left as it is.
 
 ## Explorer
 
-Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files. The [mouse](#mouse) does the same with one click on a folder and two on a file.
+Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files. One click of the [mouse](#mouse) does the same as `Enter`.
 
 Rows carry two marks. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
 
@@ -66,7 +65,7 @@ Rows carry two marks. On the right, the source control letter for that path: `M`
 
 ## Editor
 
-Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. A tab with unsaved changes refuses to close and says so in the status row, whichever way you ask.
+Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
 
 Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` and `Ctrl+X` copy and cut to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
 

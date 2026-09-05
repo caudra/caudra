@@ -58,6 +58,9 @@ const SECTION_HEADER_ROWS: u16 = 1;
 const SECTION_STEP: i16 = 1;
 const STAGED: &str = "index";
 const WORKING: &str = "worktree";
+const SAVE_LABEL: &str = "Save";
+const DISCARD_LABEL: &str = "Don't Save";
+const CANCEL_LABEL: &str = "Cancel";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -171,6 +174,8 @@ struct PaneRects {
     tabs: Rect,
     /// The rows the quick open palette listed, empty when it is closed.
     palette: Rect,
+    /// The unsaved-changes dialog's button row, empty when it is closed.
+    confirm: Rect,
     /// The buffer's own rows and columns, with the tab bar, the gutter and any
     /// open find bar already taken out.
     text: Rect,
@@ -195,6 +200,45 @@ struct PaneRects {
 struct SectionRect {
     header: Rect,
     body: Rect,
+}
+
+/// One of the three answers to a tab that was asked to close while it still
+/// had unsaved edits, in the order they are painted and measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+impl Choice {
+    const ALL: [Choice; 3] = [Choice::Save, Choice::Discard, Choice::Cancel];
+
+    fn label(self) -> &'static str {
+        match self {
+            Choice::Save => SAVE_LABEL,
+            Choice::Discard => DISCARD_LABEL,
+            Choice::Cancel => CANCEL_LABEL,
+        }
+    }
+
+    /// The letter that picks this answer outright, which is the first one of
+    /// its label so nothing has to be memorised.
+    fn accelerator(self) -> char {
+        match self {
+            Choice::Save => 's',
+            Choice::Discard => 'd',
+            Choice::Cancel => 'c',
+        }
+    }
+
+    /// The neighbouring answer, stopping at both ends rather than wrapping so
+    /// a held arrow key cannot walk past `Cancel` back onto `Save`.
+    fn step(self, delta: isize) -> Self {
+        let at = Self::ALL.iter().position(|choice| *choice == self);
+        let reached = at.unwrap_or_default().saturating_add_signed(delta);
+        Self::ALL[reached.min(Self::ALL.len() - 1)]
+    }
 }
 
 /// What the held left button is doing, which the pointer cannot tell from
@@ -253,6 +297,11 @@ pub struct Workbench {
     /// cannot read the system clipboard back, so paste comes from here.
     clipboard: String,
     goto: Option<String>,
+    /// The answer under the cursor while a tab is being asked whether to close
+    /// with unsaved edits. Which tab is not kept: [`Workbench::close_at`]
+    /// selects it before asking, and the dialog is modal, so nothing can move
+    /// the active one underneath it.
+    confirm: Option<Choice>,
     flash: Option<String>,
 }
 
@@ -283,6 +332,7 @@ impl Workbench {
             hover: None,
             clipboard: String::new(),
             goto: None,
+            confirm: None,
             flash: None,
         }
     }
@@ -475,8 +525,10 @@ impl Workbench {
                 return WorkbenchAction::Consumed;
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.release();
-                return WorkbenchAction::Consumed;
+                return match self.release() {
+                    Some(text) => WorkbenchAction::Copy(text),
+                    None => WorkbenchAction::Consumed,
+                };
             }
             _ => return WorkbenchAction::Passthrough,
         };
@@ -524,6 +576,14 @@ impl Workbench {
     /// tried in painting order, so the palette gets the press it is covering.
     fn press(&mut self, at: (u16, u16), clicks: u8) {
         let position = at.into();
+        if self.confirm.is_some() {
+            if self.panes.confirm.contains(position)
+                && let Some(choice) = view::confirm_at(at.0, self.panes.confirm.x)
+            {
+                self.resolve_close(choice);
+            }
+            return;
+        }
         if self.palette.is_open() {
             if self.panes.palette.contains(position) {
                 self.open_palette_row((at.1 - self.panes.palette.y) as usize);
@@ -568,11 +628,11 @@ impl Workbench {
             }
             return;
         }
-        if self.sidebar == SidebarView::SourceControl && self.press_scm(at, clicks) {
+        if self.sidebar == SidebarView::SourceControl && self.press_scm(at) {
             return;
         }
         if self.panes.rows.contains(position) {
-            self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
+            self.press_row((at.1 - self.panes.rows.y) as usize);
             return;
         }
         if self.panes.text.contains(position) {
@@ -582,7 +642,7 @@ impl Workbench {
 
     /// A press somewhere in the source control pane. Reports whether it landed
     /// on a section, so the caller can go on trying the other panes.
-    fn press_scm(&mut self, at: (u16, u16), clicks: u8) -> bool {
+    fn press_scm(&mut self, at: (u16, u16)) -> bool {
         if let Some(index) = self.header_under(at) {
             self.focus = Focus::Sidebar;
             self.scm.select(Section::ALL[index], None);
@@ -601,13 +661,7 @@ impl Workbench {
         if cursor.section != section || cursor.row != Some(row) {
             return true;
         }
-        // A folder opens on the first click, the way the explorer does it, and
-        // a file or a commit opens on the second.
-        match clicks {
-            1 => drop(self.scm.toggle_fold()),
-            2 => self.open_scm_selection(),
-            _ => {}
-        }
+        self.activate_scm();
         true
     }
 
@@ -628,29 +682,32 @@ impl Workbench {
             .map(|index| (Section::ALL[index], self.panes.sections[index].body))
     }
 
-    /// A press on the sidebar's list. One click picks a row out, and a second
-    /// does whatever `Enter` would have done to it.
-    fn press_row(&mut self, offset: usize, clicks: u8) {
+    /// A press on the sidebar's list, which does whatever `Enter` would have
+    /// done to the row under it.
+    fn press_row(&mut self, offset: usize) {
         self.focus = Focus::Sidebar;
         match self.sidebar {
             SidebarView::Explorer => {
-                self.tree.select_index(self.tree.scroll() + offset);
-                let directory = self.tree.selected().is_some_and(fs::tree::Row::is_dir);
-                match (clicks, directory) {
-                    // A folder opens on the first click, the way every file
-                    // manager does it, so a second one is left alone rather
-                    // than closing what the first opened.
-                    (1, true) => drop(self.tree.toggle_selected()),
-                    (2, false) => self.open_selected(),
-                    _ => {}
+                let row = self.tree.scroll() + offset;
+                self.tree.select_index(row);
+                // Selecting refuses a row past the end, so the empty space
+                // under a short list opens nothing rather than whatever the
+                // cursor happened to be left on.
+                if self.tree.selected_index() != row {
+                    return;
+                }
+                match self.tree.selected().is_some_and(fs::tree::Row::is_dir) {
+                    true => drop(self.tree.toggle_selected()),
+                    false => self.open_selected(),
                 }
             }
             // Source control routes through `press_scm`: its rows belong to a
             // section rather than to one list filling the sidebar.
             SidebarView::SourceControl => {}
             SidebarView::Search => {
-                self.search.select_index(self.search.scroll() + offset);
-                if clicks == 2 {
+                let row = self.search.scroll() + offset;
+                self.search.select_index(row);
+                if self.search.selected_index() == row {
                     self.open_search_selection();
                 }
             }
@@ -709,10 +766,16 @@ impl Workbench {
     }
 
     /// Closing through the same guard the keyboard uses, so an unsaved tab
-    /// refuses the pointer too.
+    /// asks the pointer the same question it asks the keyboard.
     fn close_at(&mut self, index: usize) {
         self.editor.select(index);
-        self.close_tab();
+        match self.editor.active().is_some_and(Tab::is_dirty) {
+            true => self.confirm = Some(Choice::Save),
+            false => {
+                self.editor.close_active();
+                self.reveal_active();
+            }
+        }
     }
 
     fn drag_to(&mut self, at: (u16, u16)) {
@@ -750,13 +813,26 @@ impl Workbench {
 
     /// The button came back up. A press that never moved was a click, which is
     /// how one press on a section header both folds it and resizes it.
-    fn release(&mut self) {
+    ///
+    /// Reports whatever selection the press leaves behind in the buffer, which
+    /// the caller puts on the system clipboard. The workbench holds the mouse
+    /// while it is open, so the terminal underneath can no longer copy a
+    /// selection the way it would from the transcript.
+    fn release(&mut self) -> Option<String> {
         if let Drag::Section(index) = self.drag
             && self.drag_at == self.drag_from
         {
             self.scm.toggle_collapsed(Section::ALL[index]);
         }
         self.drag = Drag::None;
+        if !self.panes.text.contains(self.drag_from.into()) {
+            return None;
+        }
+        // A plain click collapses the selection, so an idle press never
+        // clobbers what was copied before it.
+        let text = self.selected_text()?;
+        self.clipboard = text.clone();
+        Some(text)
     }
 
     fn extend_to(&mut self, at: (u16, u16)) {
@@ -837,6 +913,9 @@ impl Workbench {
             return WorkbenchAction::Passthrough;
         }
         self.flash = None;
+        if let Some(action) = self.confirm_key(key) {
+            return action;
+        }
         if let Some(action) = self.palette_key(key) {
             return action;
         }
@@ -1032,6 +1111,31 @@ impl Workbench {
                 self.palette.set_query(query);
             }
             _ => return None,
+        }
+        Some(WorkbenchAction::Consumed)
+    }
+
+    /// The unsaved-changes dialog owns every key while it is up, and is asked
+    /// first so `Esc` answers it rather than closing the workbench out from
+    /// under the question.
+    fn confirm_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
+        let choice = self.confirm?;
+        match key.code {
+            KeyCode::Esc => self.confirm = None,
+            KeyCode::Left | KeyCode::BackTab => self.confirm = Some(choice.step(-1)),
+            KeyCode::Right | KeyCode::Tab => self.confirm = Some(choice.step(1)),
+            KeyCode::Enter => self.resolve_close(choice),
+            // Modifiers are ruled out so `Ctrl+C` over a live selection cannot
+            // be read as the `Cancel` accelerator.
+            KeyCode::Char(typed) if key.modifiers == KeyModifiers::NONE => {
+                if let Some(picked) = Choice::ALL
+                    .into_iter()
+                    .find(|choice| choice.accelerator() == typed.to_ascii_lowercase())
+                {
+                    self.resolve_close(picked);
+                }
+            }
+            _ => {}
         }
         Some(WorkbenchAction::Consumed)
     }
@@ -1389,13 +1493,21 @@ impl Workbench {
     }
 
     fn close_tab(&mut self) {
-        match self.editor.active().is_some_and(editor::Tab::is_dirty) {
-            true => self.flash = Some(format!("{} has unsaved changes", self.active_title())),
-            false => {
-                self.editor.close_active();
-                self.reveal_active();
-            }
+        self.close_at(self.editor.active_index());
+    }
+
+    /// Acts on the answer the dialog was given. A save that fails keeps the tab
+    /// open with the reason in the status row, because throwing the buffer away
+    /// after failing to write it is the one outcome nobody asked for.
+    fn resolve_close(&mut self, choice: Choice) {
+        self.confirm = None;
+        match choice {
+            Choice::Cancel => return,
+            Choice::Save if !self.save_active() => return,
+            _ => {}
         }
+        self.editor.close_active();
+        self.reveal_active();
     }
 
     /// Keeps the tree on whatever the editor is showing, so the sidebar never
@@ -1407,14 +1519,17 @@ impl Workbench {
         self.tree.reveal(&path);
     }
 
-    fn save_active(&mut self) {
+    /// Reports whether the write landed, which is what tells the unsaved-changes
+    /// dialog that closing the tab is now safe.
+    fn save_active(&mut self) -> bool {
         let Some(tab) = self.editor.active_mut() else {
-            return;
+            return false;
         };
         self.flash = match tab.save() {
-            Ok(()) => None,
+            Ok(()) => return true,
             Err(error) => Some(error.to_string()),
         };
+        false
     }
 
     fn active_title(&self) -> String {
@@ -1587,13 +1702,16 @@ fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [Sectio
 #[cfg(test)]
 mod tests {
     use super::{
-        Cursor, Drag, EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
-        MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle,
-        Workbench, WorkbenchAction, WorkbenchStyles, keys, layout, layout_sections, scm,
+        Choice, Cursor, Drag, EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH,
+        MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES, ScmLayout, Section,
+        SidebarView, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys, layout,
+        layout_sections, scm,
     };
     use crate::fs::tree::GitMark;
     use crate::search;
-    use crate::view::{NOT_A_REPOSITORY, TabHit, header_at, mode_at, tab_at, toggle_at};
+    use crate::view::{
+        NOT_A_REPOSITORY, TabHit, confirm_at, header_at, mode_at, tab_at, toggle_at,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -1636,6 +1754,17 @@ mod tests {
     const WRONG_GEOMETRY: &str = "the sections did not divide the room the way they were asked to";
     const WRONG_ROW: &str = "the pointer did not act on the row it was pointing at";
     const LAYOUT_LOST: &str = "the source control layout did not come back the way it was left";
+    const UNASKED_CLOSE: &str = "a tab was closed over unsaved work without asking";
+    const NOT_ASKED: &str = "closing an edited tab must raise the unsaved-changes dialog";
+    const POINTLESS_QUESTION: &str = "a tab with nothing to lose must close without a question";
+    const ANSWER_IGNORED: &str = "the dialog did not do what it was answered";
+    const ESC_ESCAPED: &str = "esc answered past the dialog instead of into it";
+    const SAVE_LOST_WORK: &str = "a tab was closed after the save that should have kept it failed";
+    const WRONG_ANSWER: &str = "the highlighted answer is not the one the keys walked to";
+    const MODAL_LEAKED: &str = "a press reached the panes behind the dialog";
+    const SELECTION_UNCOPIED: &str = "a finished selection never reached the clipboard";
+    const IDLE_CLICK_COPIED: &str = "a press that selected nothing copied anyway";
+    const KEPT_CLIPBOARD: &str = "what was copied before";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1711,6 +1840,14 @@ mod tests {
                 tab_at(&workbench.editor, *column, tabs.x) == Some(TabHit { index, close: true })
             })
             .expect("a close mark on the tab")
+    }
+
+    /// The column an answer landed on, found the same way the pointer finds it.
+    fn answer_column(workbench: &Workbench, answer: Choice) -> u16 {
+        let answers = workbench.panes.confirm;
+        (answers.x..answers.right())
+            .find(|column| confirm_at(*column, answers.x) == Some(answer))
+            .expect("an answer in the dialog")
     }
 
     fn workbench() -> Workbench {
@@ -1837,15 +1974,132 @@ mod tests {
     }
 
     #[test]
-    fn a_dirty_tab_refuses_to_close_and_says_so() {
+    fn alt_w_on_a_dirty_tab_asks_before_closing() {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
 
         workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
 
-        assert_eq!(workbench.editor.tabs().len(), 1, "a dirty tab must survive");
-        assert!(workbench.flash.is_some(), "the refusal must be explained");
+        assert_eq!(workbench.editor.tabs().len(), 1, "{UNASKED_CLOSE}");
+        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+    }
+
+    #[test]
+    fn the_dialog_paints_the_file_and_every_answer() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        let frame = draw(&mut workbench, 80, 24);
+
+        assert!(frame.contains("a.txt has unsaved changes"), "{NOT_PAINTED}");
+        for answer in Choice::ALL {
+            assert!(frame.contains(answer.label()), "{NOT_PAINTED}");
+        }
+    }
+
+    #[test]
+    fn a_clean_tab_closes_with_no_question() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        assert!(workbench.editor.tabs().is_empty(), "{POINTLESS_QUESTION}");
+        assert_eq!(workbench.confirm, None, "{POINTLESS_QUESTION}");
+    }
+
+    #[test]
+    fn saving_from_the_dialog_writes_the_file_and_closes_the_tab() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert!(workbench.editor.tabs().is_empty(), "{ANSWER_IGNORED}");
+        assert_eq!(workbench.confirm, None, "{ANSWER_IGNORED}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).expect("the saved file"),
+            "Xone\ntwo\nthree\n",
+            "{ANSWER_IGNORED}"
+        );
+    }
+
+    #[test]
+    fn discarding_from_the_dialog_closes_the_tab_and_leaves_the_file_alone() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert!(workbench.editor.tabs().is_empty(), "{ANSWER_IGNORED}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).expect("the untouched file"),
+            "one\ntwo\nthree\n",
+            "{ANSWER_IGNORED}"
+        );
+    }
+
+    #[test_case(key(KeyCode::Char(Choice::Cancel.accelerator())) ; "the cancel accelerator")]
+    #[test_case(key(KeyCode::Esc) ; "esc")]
+    fn cancelling_the_dialog_keeps_the_tab_and_its_edits(answer: KeyEvent) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        let action = workbench.handle_key(answer);
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{ESC_ESCAPED}");
+        assert_eq!(workbench.confirm, None, "{ANSWER_IGNORED}");
+        assert_eq!(workbench.editor.tabs().len(), 1, "{ANSWER_IGNORED}");
+        assert!(
+            workbench.editor.active().expect(NO_TAB).is_dirty(),
+            "{ANSWER_IGNORED}"
+        );
+    }
+
+    #[test]
+    fn a_save_that_fails_keeps_the_tab_open_and_says_why() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        // Nothing can be written over a directory, whichever way the save goes
+        // about it.
+        let path = dir.path().join("a.txt");
+        fs::remove_file(&path).expect("the file to go");
+        fs::create_dir(&path).expect("a directory in its place");
+
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(workbench.editor.tabs().len(), 1, "{SAVE_LOST_WORK}");
+        assert!(
+            workbench.editor.active().expect(NO_TAB).is_dirty(),
+            "{SAVE_LOST_WORK}"
+        );
+        assert!(workbench.flash.is_some(), "{SAVE_LOST_WORK}");
+    }
+
+    #[test_case(KeyCode::Left, Choice::Save ; "left stops on the first answer")]
+    #[test_case(KeyCode::Right, Choice::Cancel ; "right stops on the last")]
+    fn the_arrows_walk_the_answers_and_stop_at_both_ends(code: KeyCode, expected: Choice) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+
+        for _ in 0..Choice::ALL.len() + 1 {
+            workbench.handle_key(key(code));
+        }
+
+        assert_eq!(workbench.confirm, Some(expected), "{WRONG_ANSWER}");
     }
 
     #[test]
@@ -2505,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_folder_folds_it_and_a_click_on_a_file_only_selects() {
+    fn a_click_on_a_folder_folds_it() {
         let (_dir, mut workbench) = nested_repository();
         paint(&mut workbench, 80, 24);
         let body = body_of(&workbench, Section::Unstaged);
@@ -2515,6 +2769,25 @@ mod tests {
 
         assert!(
             workbench.scm.rows(Section::Unstaged).len() < before,
+            "{WRONG_ROW}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_change_opens_its_diff() {
+        let (_dir, mut workbench) = repository();
+        paint(&mut workbench, 80, 24);
+        let body = body_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(click(body.x + 1, body.y));
+
+        assert!(
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .diff_kinds()
+                .is_some(),
             "{WRONG_ROW}"
         );
     }
@@ -2884,15 +3157,13 @@ mod tests {
     }
 
     #[test]
-    fn a_file_opens_on_the_second_click_rather_than_the_first() {
+    fn a_file_opens_on_the_first_click() {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
 
         workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
-        assert!(workbench.editor.active().is_none(), "{WRONG_CLICK}");
 
-        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
         assert_eq!(
             workbench.editor.active().expect(NO_TAB).title,
             "a.txt",
@@ -2900,8 +3171,18 @@ mod tests {
         );
     }
 
-    /// Folders are the one row a single click acts on, which is what every file
-    /// manager does.
+    #[test]
+    fn a_press_under_the_last_row_opens_nothing() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let below = rows.y + workbench.tree.rows().len() as u16;
+
+        workbench.handle_mouse(click(rows.x + 1, below));
+
+        assert!(workbench.editor.active().is_none(), "{WRONG_CLICK}");
+    }
+
     #[test]
     fn a_directory_opens_on_the_first_click() {
         let (_dir, mut workbench) = project();
@@ -2931,6 +3212,72 @@ mod tests {
             "{WRONG_CLICK}"
         );
         assert_eq!(workbench.drag, Drag::None, "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn releasing_a_drag_hands_the_selection_to_the_clipboard() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.x + 2, text.y + 1));
+        let action = workbench.handle_mouse(release(text.x + 2, text.y + 1));
+
+        assert_eq!(
+            action,
+            WorkbenchAction::Copy("one\ntw".to_owned()),
+            "{SELECTION_UNCOPIED}"
+        );
+        assert_eq!(workbench.clipboard, "one\ntw", "{SELECTION_UNCOPIED}");
+    }
+
+    #[test]
+    fn releasing_a_double_click_hands_over_the_word_it_took() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x + 1, text.y));
+        workbench.handle_mouse(click(text.x + 1, text.y));
+        let action = workbench.handle_mouse(release(text.x + 1, text.y));
+
+        assert_eq!(
+            action,
+            WorkbenchAction::Copy("one".to_owned()),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn a_press_that_selected_nothing_leaves_the_clipboard_alone() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        draw(&mut workbench, 80, 24);
+        let text = workbench.panes.text;
+        workbench.clipboard = KEPT_CLIPBOARD.to_owned();
+
+        workbench.handle_mouse(click(text.x + 1, text.y));
+        let action = workbench.handle_mouse(release(text.x + 1, text.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{IDLE_CLICK_COPIED}");
+        assert_eq!(workbench.clipboard, KEPT_CLIPBOARD, "{IDLE_CLICK_COPIED}");
+    }
+
+    #[test]
+    fn a_release_that_started_outside_the_buffer_copies_nothing() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(click(rows.x, rows.y));
+        let action = workbench.handle_mouse(release(rows.x, rows.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{IDLE_CLICK_COPIED}");
     }
 
     #[test_case(2, "one" ; "a second click takes the word")]
@@ -3016,7 +3363,7 @@ mod tests {
     }
 
     #[test]
-    fn the_close_mark_refuses_a_tab_with_unsaved_work() {
+    fn the_close_mark_asks_before_dropping_unsaved_work() {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('x')));
@@ -3025,8 +3372,39 @@ mod tests {
 
         workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
 
-        assert_eq!(workbench.editor.tabs().len(), 1, "{WRONG_CLICK}");
-        assert!(workbench.flash.is_some(), "{WRONG_CLICK}");
+        assert_eq!(workbench.editor.tabs().len(), 1, "{UNASKED_CLOSE}");
+        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+    }
+
+    #[test_case(Choice::Discard, 0 ; "a click on don't save closes the tab")]
+    #[test_case(Choice::Cancel, 1 ; "a click on cancel keeps it")]
+    fn a_click_answers_the_dialog(answer: Choice, remaining: usize) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('x')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        draw(&mut workbench, 80, 24);
+        let answers = workbench.panes.confirm;
+
+        workbench.handle_mouse(click(answer_column(&workbench, answer), answers.y));
+
+        assert_eq!(workbench.editor.tabs().len(), remaining, "{ANSWER_IGNORED}");
+        assert_eq!(workbench.confirm, None, "{ANSWER_IGNORED}");
+    }
+
+    #[test]
+    fn a_click_outside_the_dialog_leaves_the_question_standing() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('x')));
+        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(click(rows.x, rows.y));
+
+        assert_eq!(workbench.confirm, Some(Choice::Save), "{MODAL_LEAKED}");
+        assert_eq!(workbench.focus, Focus::Editor, "{MODAL_LEAKED}");
     }
 
     #[test]
@@ -3081,9 +3459,8 @@ mod tests {
         let rows = workbench.panes.rows;
 
         workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
-        assert_eq!(workbench.search.selected_index(), 1, "{WRONG_CLICK}");
 
-        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        assert_eq!(workbench.search.selected_index(), 1, "{WRONG_CLICK}");
         let tab = workbench.editor.active().expect(NO_TAB);
         assert_eq!(tab.path, dir.path().join("a.txt"), "{NO_TAB}");
         assert_eq!(tab.buffer.cursor().line, 2, "{WRONG_LINE}");

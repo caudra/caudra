@@ -23,7 +23,7 @@ use crate::scm::{Row as ScmRow, Scm, Section};
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout, layout_sections,
+    Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout, layout_sections,
 };
 
 const HINT_GAP: &str = "  ";
@@ -78,6 +78,12 @@ const PALETTE_ROWS: usize = 10;
 /// The query row and the rule under the list.
 const PALETTE_CHROME: u16 = 2;
 const HORIZONTAL: &str = "\u{2500}";
+const UNSAVED_QUESTION: &str = " has unsaved changes";
+/// A rule, the question, the answers, and a rule under them.
+const CONFIRM_ROWS: u16 = 4;
+/// One column of air either side of the widest row.
+const CONFIRM_PADDING: u16 = 1;
+const CONFIRM_HINTS: [(&str, &str); 2] = [(ENTER_LABEL, "choose"), (keys::CLOSE.label, "cancel")];
 
 /// One of the search view's three buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +354,7 @@ impl Workbench {
             self.render_prompt(buf, bar, &label, &input);
         }
         self.render_palette(buf, area);
+        self.render_confirm(buf, area);
     }
 
     /// Drawn over the editor rather than beside it, because it is a question
@@ -419,6 +426,76 @@ impl Workbench {
                 self.styles.border,
             )),
         );
+    }
+
+    /// The unsaved-changes dialog, drawn over the middle of the editor because
+    /// it is a question about the buffer underneath it and nothing else may be
+    /// answered until it is.
+    fn render_confirm(&mut self, buf: &mut Surface, area: Rect) {
+        let Some(choice) = self.confirm else {
+            self.panes.confirm = Rect::default();
+            return;
+        };
+        let question = format!("{}{UNSAVED_QUESTION}", self.active_title());
+        let content = question.width().max(answers_width()) as u16;
+        let width = (content + CONFIRM_PADDING * 2).min(area.width);
+        let height = CONFIRM_ROWS.min(area.height);
+        let panel = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        chrome::fill(buf, panel, self.styles.background);
+
+        let [top, prompt, answers, bottom] =
+            Layout::vertical([Constraint::Length(1); CONFIRM_ROWS as usize]).areas(panel);
+        for rule in [top, bottom] {
+            chrome::render_line(
+                buf,
+                rule,
+                Line::from(Span::styled(
+                    HORIZONTAL.repeat(rule.width as usize),
+                    self.styles.border,
+                )),
+            );
+        }
+
+        let inner = Rect {
+            x: panel.x + CONFIRM_PADDING,
+            width: panel.width.saturating_sub(CONFIRM_PADDING * 2),
+            ..prompt
+        };
+        chrome::render_line(
+            buf,
+            inner,
+            Line::from(Span::styled(
+                chrome::fit(&question, inner.width as usize),
+                self.styles.text,
+            )),
+        );
+
+        self.panes.confirm = Rect {
+            y: answers.y,
+            ..inner
+        };
+        let pointed = self
+            .hovering(self.panes.confirm)
+            .and_then(|at| confirm_at(at.0, self.panes.confirm.x));
+        let mut spans = Vec::new();
+        for answer in Choice::ALL {
+            let chosen = answer == choice;
+            let mut style = match chosen {
+                true => self.styles.selected,
+                false => self.styles.dim,
+            };
+            if pointed == Some(answer) && !chosen {
+                style = style.patch(self.styles.hover);
+            }
+            spans.push(Span::styled(TAB_GAP, self.styles.background));
+            spans.push(Span::styled(answer.label(), style));
+        }
+        chrome::render_line(buf, self.panes.confirm, Line::from(spans));
     }
 
     fn render_tabs(&mut self, buf: &mut Surface, area: Rect) {
@@ -556,6 +633,9 @@ impl Workbench {
 
     /// What the status bar offers, which is whatever the focused pane can do.
     fn status_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.confirm.is_some() {
+            return CONFIRM_HINTS.to_vec();
+        }
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::SourceControl {
             let other = match self.scm.is_flat() {
                 true => TREE_HINT,
@@ -643,6 +723,31 @@ pub(crate) fn header_at(column: u16, origin: u16) -> Option<SidebarView> {
         let width = TAB_GAP.len() + view.title().len();
         if left < width {
             return (left >= TAB_GAP.len()).then_some(view);
+        }
+        left -= width;
+    }
+    None
+}
+
+/// One answer's width, which is the only description of how
+/// [`Workbench::render_confirm`] lays the row out.
+fn answer_width(answer: Choice) -> usize {
+    TAB_GAP.len() + answer.label().width()
+}
+
+fn answers_width() -> usize {
+    Choice::ALL.into_iter().map(answer_width).sum()
+}
+
+/// Which answer a click at `column` landed on, measured the same way
+/// [`Workbench::render_confirm`] lays them out. The gaps between them are not
+/// buttons.
+pub(crate) fn confirm_at(column: u16, origin: u16) -> Option<Choice> {
+    let mut left = column.checked_sub(origin)? as usize;
+    for answer in Choice::ALL {
+        let width = answer_width(answer);
+        if left < width {
+            return (left >= TAB_GAP.len()).then_some(answer);
         }
         left -= width;
     }
