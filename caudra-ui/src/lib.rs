@@ -13,6 +13,8 @@ mod color_compat;
 mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
+mod exit_summary;
+pub use exit_summary::ExitSummary;
 mod highlight;
 pub use highlight::highlight_ansi;
 mod herdr;
@@ -105,7 +107,7 @@ pub struct SessionTab {
 /// session so the caller reopens everything without re-reading from disk.
 pub enum RunOutcome {
     Exit {
-        session_id: Option<CaudraId>,
+        summary: Option<ExitSummary>,
         code: ExitCode,
     },
     Reload {
@@ -127,11 +129,21 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             focused: report.focused,
         },
         exit => {
-            let session_id = report
+            let summary = report
                 .tabs
                 .get(report.focused)
                 .filter(|tab| app::session_has_content(&tab.session))
-                .map(|tab| tab.session.id);
+                .map(|tab| {
+                    let others = report
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter(|&(index, other)| {
+                            index != report.focused && app::session_has_content(&other.session)
+                        })
+                        .count();
+                    ExitSummary::new(&tab.session, report.run_time, others)
+                });
             let started = Instant::now();
             drop(report);
             tracing::info!(
@@ -139,7 +151,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
                 "session buffers dropped"
             );
             RunOutcome::Exit {
-                session_id,
+                summary,
                 code: exit.code(),
             }
         }

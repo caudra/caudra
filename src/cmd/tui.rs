@@ -22,7 +22,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{SessionDatabase, SessionLease};
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
-use caudra_ui::{AppSession, HerdrReporter, RunOutcome, SessionTab};
+use caudra_ui::{AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionTab};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -637,9 +637,10 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         .context("run UI")?;
 
         match outcome {
-            RunOutcome::Exit { session_id, code } => {
-                if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  caudra -s {session_id}");
+            RunOutcome::Exit { summary, code } => {
+                if let Some(summary) = summary {
+                    let rich = io::stderr().is_terminal() && !cli.exit_on_done;
+                    eprint!("{}", exit_report(&summary, rich));
                 }
                 let started = Instant::now();
                 drop(sweeper);
@@ -702,6 +703,16 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// A redirected stderr and `--exit-on-done` both belong to a script, which
+/// wants the one line it can act on rather than the block.
+fn exit_report(summary: &ExitSummary, rich: bool) -> String {
+    if rich {
+        summary.banner()
+    } else {
+        summary.resume_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +723,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const TEST_MODEL: &str = "test/model";
+    const TEST_CWD: &str = "/tmp";
+    const EXIT_RUN_TIME: Duration = Duration::from_secs(90);
+    const SCRIPTABLE: &str = "a redirected stderr gets one line a script can act on";
+    const BLOCK: &str = "a terminal gets the full block, not the fallback line";
     const DUPLICATE_TAB_WARNING: &str = "is duplicated";
     const MISSING_TAB_WARNING: &str = "no longer exists";
     const WRONG_CWD_WARNING: &str = "belongs to";
@@ -721,6 +736,18 @@ mod tests {
         let id = session.id;
         session.save(storage).unwrap();
         id
+    }
+
+    /// The block is for a human watching the terminal; anything else reading
+    /// stderr wants the resume command on a line of its own.
+    #[test]
+    fn exit_report_answers_the_destination_it_is_written_to() {
+        let session = AppSession::new(TEST_MODEL, TEST_CWD);
+        let summary = ExitSummary::new(&session, EXIT_RUN_TIME, 0);
+
+        let plain = exit_report(&summary, false);
+        assert_eq!(plain.lines().count(), 1, "{SCRIPTABLE}");
+        assert!(exit_report(&summary, true).lines().count() > 1, "{BLOCK}");
     }
 
     /// `second_saw_first` requires both joins: `defer` joining the first

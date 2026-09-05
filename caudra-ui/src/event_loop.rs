@@ -91,6 +91,9 @@ pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
     pub tabs: Vec<SessionTab>,
     pub focused: usize,
+    /// This generation only: `/reload` builds a new loop, so a reloaded run
+    /// reports the time since the reload rather than since launch.
+    pub run_time: Duration,
 }
 
 pub struct EventLoopParams {
@@ -715,6 +718,7 @@ pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
     focused: usize,
+    started: Instant,
     last_focused: Option<CaudraId>,
     last_workspace_tabs: Option<WorkspaceTabsSnapshot>,
     terminal_focused: bool,
@@ -959,6 +963,7 @@ impl<'t> EventLoop<'t> {
             terminal,
             sessions: runtimes,
             focused,
+            started: Instant::now(),
             last_focused: None,
             last_workspace_tabs: None,
             terminal_focused: false,
@@ -2647,6 +2652,7 @@ impl<'t> EventLoop<'t> {
             exit,
             tabs,
             focused: self.focused,
+            run_time: self.started.elapsed(),
         }
     }
 }
