@@ -5591,6 +5591,102 @@ fn a_batch_that_finished_does_not_draw_the_roster_it_started_with() {
     );
 }
 
+const FOLD_MARK: &str = "\u{2026}";
+const QUEUED_MARK: &str = "(queued)";
+
+/// The mark says a body is being withheld, so a child with nothing to withhold
+/// must not carry it. A dispatched child that has not answered yet drew one,
+/// which reads as a result the reader is being kept from.
+#[test_case(true, true ; "a child with output offers it")]
+#[test_case(false, false ; "a child with none promises nothing")]
+fn only_a_child_hiding_something_says_so(has_output: bool, expected: bool) {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut child = batch_child("task", "a");
+    if !has_output {
+        child.output = None;
+    }
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+
+    assert_eq!(
+        seg_text(&panel, "t1").contains(FOLD_MARK),
+        expected,
+        "the fold mark promises a body"
+    );
+}
+
+/// A batch cut short leaves children that never ran. They are drawn in the
+/// same plain tense a failure is, so with nothing to separate them the roster
+/// reads as a batch that went wrong rather than one that stopped early.
+#[test_case(caudra_agent::BatchToolStatus::Pending, true ; "queued")]
+#[test_case(caudra_agent::BatchToolStatus::Error, false ; "failed")]
+fn a_child_that_never_ran_is_not_read_as_one_that_failed(
+    status: caudra_agent::BatchToolStatus,
+    expected: bool,
+) {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let child = caudra_agent::BatchToolEntry {
+        status,
+        output: None,
+        ..batch_child("task", "a")
+    };
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert_eq!(
+        text.contains(QUEUED_MARK),
+        expected,
+        "a queued child says so: {text:?}"
+    );
+}
+
+/// A child answering in markdown was shown as source, so a subagent's report
+/// arrived with its syntax on screen instead of what it said. Every other
+/// body here is painted; this one was lumped in with plain text.
+#[test]
+fn a_child_that_answered_in_markdown_is_painted_not_quoted() {
+    const HEADING: &str = "Findings";
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let child = caudra_agent::BatchToolEntry {
+        output: Some(ToolOutput::Markdown(
+            format!("## {HEADING}\n\nthe **answer**").into(),
+        )),
+        ..batch_child("task", "a")
+    };
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    let area = Rect::new(0, 0, 80, 24);
+    render(&mut panel, 80, 24);
+    assert!(panel.handle_click(batch_child_row(&panel, 0), area));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains(HEADING), "the heading survives: {text:?}");
+    assert!(!text.contains("##"), "the syntax does not: {text:?}");
+    assert!(!text.contains("**"), "the syntax does not: {text:?}");
+}
+
 const CHILD_ARGS_MSG: &str = "a batch child names the inputs its header omits, as a row does";
 
 /// A child row showed only the header, so the batch hid exactly the arguments

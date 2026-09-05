@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::highlight::{fallback_span, highlight_line};
-use crate::markdown::{expand_notice, should_truncate, truncation_notice};
+use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncation_notice};
 use crate::theme;
 
 use super::ToolProgress;
@@ -32,6 +32,9 @@ const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
+const QUEUED_ANNOTATION: &str = "queued";
+/// What the markdown renderer calls a width it should not wrap to.
+const UNCONSTRAINED_WIDTH: u16 = 0;
 const GREP_COUNT_SEP: &str = " \u{b7} ";
 const GREP_SUMMARY_INDENT: &str = "  ";
 
@@ -477,7 +480,7 @@ fn render_batch(
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
-        if !open {
+        if !open && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
@@ -496,19 +499,36 @@ fn render_batch(
     (lines, rows)
 }
 
+/// Whether opening this child would show anything, which is what the folded
+/// mark promises. Answered from the output rather than by rendering one: a
+/// folded child is redrawn as often as the card is, and the body it is hiding
+/// may be long.
+fn holds_a_body(entry: &BatchToolEntry) -> bool {
+    entry
+        .output
+        .as_ref()
+        .is_some_and(|output| !output.is_empty_result())
+}
+
 /// What a child row reports after its arguments. `batch` carries only the
 /// annotation the dispatch returned, which is `None` for every tool that lets
 /// its output speak instead, so a child lost the count its standalone row
 /// shows: a grep of thirty files named no matches at all. A failure is left
 /// out because its output is the error text, which the body already draws in
 /// full and which reduces to a line count here.
+///
+/// A child that has not started says so. It reads the same as a failure
+/// otherwise: both are drawn in the plain tense, so with nothing to separate
+/// them a batch cut short looks like a batch that went wrong.
 fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
     if let Some(annotation) = &entry.annotation {
         return Some(annotation.clone());
     }
-    (entry.status == BatchToolStatus::Success)
-        .then(|| entry.output.as_ref().and_then(ToolOutput::annotation))
-        .flatten()
+    match entry.status {
+        BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
+        BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
+        BatchToolStatus::Running | BatchToolStatus::Error => None,
+    }
 }
 
 /// How a dispatched child is getting on. A settled child is described by its
@@ -548,12 +568,34 @@ fn child_body(
         return text_lines(output.map_or(String::new(), ToolOutput::as_text));
     }
     match output {
-        Some(ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)) => {
-            text_lines(text.text.clone())
-        }
+        Some(ToolOutput::Markdown(text)) => markdown_lines(&text.text),
+        Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => text_lines(text.text.clone()),
         Some(ToolOutput::Shell(shell)) => text_lines(shell.raw_text()),
         other => render_tool_content(entry.input.as_ref(), other, highlight, limits.clone()).lines,
     }
+}
+
+/// A child that answered in markdown is answering, not quoting: a subagent's
+/// report and a skill's instructions are prose, and showing them as source
+/// puts the syntax on screen instead of what it says.
+///
+/// Rendered unconstrained, like every other body here. A child is built once
+/// for every width, since the highlight worker is handed no width and its
+/// answer is spliced back over whatever the terminal has since become. Zero is
+/// the renderer's own word for that, and costs only a horizontal rule, which
+/// has nothing left to fill.
+fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let style = theme::current().assistant;
+    let (painted, _) = text_to_painted(
+        text,
+        "",
+        style,
+        style,
+        UNCONSTRAINED_WIDTH,
+        Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        Vec::new(),
+    );
+    painted.lines
 }
 
 fn text_lines(text: String) -> Vec<Line<'static>> {
