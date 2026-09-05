@@ -14,6 +14,9 @@ mod path_locks;
 pub mod registry;
 pub mod schema;
 
+pub use caudra_config::{
+    INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool, is_tool_enabled,
+};
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use path_locks::{PathGuards, PathLocks};
 pub use registry::{
@@ -276,12 +279,6 @@ fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
     }
 }
 
-/// A tool is enabled unless named in `disabled_tools` (config, or the raw
-/// list a Lua caller holds, e.g. `caudra.api.get_tools`).
-pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
-    INTERNAL_COMPANION_TOOL_NAMES.contains(&name) || !disabled_tools.iter().any(|s| s == name)
-}
-
 pub const BATCH_TOOL_NAME: &str = "batch";
 pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
@@ -303,8 +300,6 @@ pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_GREP_TOOL_NAME: &str = "tool_output_grep";
 pub const TOOL_OUTPUT_READ_TOOL_NAME: &str = "tool_output_read";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
-pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] =
-    &[TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME];
 
 /// Containers own nested tool calls: their result is the list of children
 /// rather than output of their own. Callers use this to follow the children
@@ -629,26 +624,6 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
         result.push_str(TRUNCATED_MARKER);
     }
     result
-}
-
-pub fn is_builtin_tool(name: &str) -> bool {
-    all_builtin_tool_names().contains(&name)
-}
-
-/// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
-/// that stay enabled regardless of `disabled_tools`, which is orthogonal to
-/// who implements them. Dedupe so `--help` never prints a name twice.
-pub fn all_builtin_tool_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = caudra_config::WORKCELL_NATIVE_TOOL_NAMES
-        .iter()
-        .chain(caudra_config::CAUDRA_NATIVE_TOOL_NAMES.iter())
-        .chain(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.iter())
-        .chain(INTERNAL_COMPANION_TOOL_NAMES.iter())
-        .copied()
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
 }
 
 use caudra_providers::{Message, ProviderEvent, StreamResponse};

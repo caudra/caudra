@@ -9,9 +9,10 @@ use std::process::ExitCode;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use caudra_config::Config;
 use caudra_storage::{EphemeralRoot, StateDir};
 
-use crate::cli::{AuthAction, Cli, Command, McpAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, normalize_tool_name};
 use crate::update;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
@@ -40,6 +41,41 @@ fn register_builtin_tools(cwd: &Path) -> Result<caudra_workcell::WorkcellHost> {
         eprintln!("warning: {warning}");
     }
     Ok(host)
+}
+
+/// Every entry point resolves config here, so the CLI tool flags cannot apply
+/// in the TUI and silently go missing from `caudra tools`.
+fn load_config(plugin_host: &caudra_lua::PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
+    let raw_config = plugin_host
+        .load_init_files_or_skip(cli.no_plugins, cwd)
+        .context("load init.lua files")?;
+
+    let mut config = raw_config
+        .unwrap_or_default()
+        .into_config(cli.no_rtk)
+        .context("invalid config")?;
+    config.permissions = caudra_config::load_permissions(cwd);
+
+    if cli.yolo || config.always_yolo {
+        config.permissions.yolo = true;
+    }
+    if !cli.allowed_tools.is_empty() {
+        config.agent.allowed_tools = cli
+            .allowed_tools
+            .iter()
+            .map(|t| normalize_tool_name(t))
+            .collect::<Result<Vec<_>>>()?;
+    }
+    if !cli.disallowed_tools.is_empty() {
+        config.agent.disabled_tools.extend(
+            cli.disallowed_tools
+                .iter()
+                .map(|t| normalize_tool_name(t))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    config.validate()?;
+    Ok(config)
 }
 
 /// Notes live outside the project, where every effectful tool would otherwise
@@ -109,6 +145,14 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
                 cli.no_jit,
                 cli.system_prompt_profile,
             )?;
+        }
+        Some(Command::Tools {
+            enabled_only,
+            json,
+            names,
+            schemas,
+        }) => {
+            subcmd::tools(&cli, enabled_only, json, names, schemas)?;
         }
         Some(Command::Storage { action }) => {
             storage::run(action, cli.no_plugins, cli.no_jit)?;

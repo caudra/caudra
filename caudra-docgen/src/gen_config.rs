@@ -424,6 +424,12 @@ All fields are optional. Typos in field names cause an error right away.
          Each feature checks its own options at startup. A typo, a wrong \
          type, or an unknown plugin name gives you a clear error right \
          away.\n\n\
+         `enabled = false` turns off the tools that key produced, under the \
+         names they are registered with today, so `plugins.bash` turns off \
+         `shell` and `plugins.edit` turns off `file_edit` and \
+         `file_apply_patch`. To name a tool directly, use \
+         `agent.disabled_tools`, described in \
+         [Disabling tools](/docs/tools/#disabling-tools).\n\n\
          The edit plugin's extra tools are options too: \
          `plugins.edit = {{ multiedit = false, insert_lines = true }}`.\n\n\
          This table is for bundled plugins only. Your own plugins go in \

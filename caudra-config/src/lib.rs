@@ -106,6 +106,23 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
+/// [`DEFAULT_BUILTINS`] keys whose Lua plugin registered its tool under a
+/// different name than the native tool that replaced it. `enabled = false` has
+/// to disable what the user means, not the historical plugin id.
+const LEGACY_PLUGIN_TOOLS: &[(&str, &[&str])] = &[
+    ("bash", &["shell"]),
+    ("edit", &["file_edit", "file_apply_patch"]),
+    ("glob", &["file_glob"]),
+    ("grep", &["file_grep"]),
+    ("read", &["file_read"]),
+    ("write", &["file_write"]),
+];
+
+/// [`DEFAULT_BUILTINS`] keys that never produced a tool of their own, or whose
+/// tools are internal companions. Disabling them is a no-op, so their names
+/// stay out of the resolved list instead of sitting in it matching nothing.
+const TOOLLESS_PLUGINS: &[&str] = &["list", "sessions", "tool_output"];
+
 /// Which of [`DEFAULT_BUILTINS`] production still loads from Lua. Empty: every
 /// built-in is native now. The sources stay in the tree as Lua-API coverage
 /// and as worked examples for plugin authors, so tests and docgen can still
@@ -141,6 +158,87 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "code_execution",
     "execution_environment",
 ];
+
+/// Tools the agent reaches for on its own to page through an oversized result.
+/// They stay enabled whatever the filters say, or a truncated result becomes
+/// unreadable.
+pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output_grep", "tool_output_read"];
+
+/// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
+/// that stay enabled regardless of `disabled_tools`, which is orthogonal to
+/// who implements them. Dedupe so `--help` never prints a name twice.
+pub fn all_builtin_tool_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = WORKCELL_NATIVE_TOOL_NAMES
+        .iter()
+        .chain(CAUDRA_NATIVE_TOOL_NAMES)
+        .chain(ACTIVE_DEFAULT_LUA_PLUGINS)
+        .chain(INTERNAL_COMPANION_TOOL_NAMES)
+        .copied()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+pub fn is_builtin_tool(name: &str) -> bool {
+    all_builtin_tool_names().contains(&name)
+}
+
+/// A tool is enabled unless named in `disabled_tools` (config, CLI, or the raw
+/// list a Lua caller holds, e.g. `caudra.api.get_tools`).
+pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
+    INTERNAL_COMPANION_TOOL_NAMES.contains(&name)
+        || !disabled_tools
+            .iter()
+            .any(|pattern| tool_pattern_matches(pattern, name))
+}
+
+/// Entries in a disabled list are exact tool names, except `server.*`, which
+/// covers every tool an MCP server publishes. Built-in names never contain a
+/// dot, so one list holds both kinds without ambiguity.
+pub fn tool_pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
+}
+
+/// Which tools a `plugins.<name>` key disables. Empty for the keys that never
+/// registered a tool of their own.
+fn plugin_tools(plugin: &str) -> &'static [&'static str] {
+    if let Some((_, tools)) = LEGACY_PLUGIN_TOOLS.iter().find(|(name, _)| *name == plugin) {
+        tools
+    } else if TOOLLESS_PLUGINS.contains(&plugin) {
+        &[]
+    } else {
+        DEFAULT_BUILTINS
+            .iter()
+            .find(|builtin| **builtin == plugin)
+            .map(std::slice::from_ref)
+            .unwrap_or_default()
+    }
+}
+
+/// A disabled list accepts a built-in tool name, an MCP `server.tool`, or a
+/// whole server as `server.*`. A bare `*` is refused: silently dropping every
+/// tool is never what a config meant to say.
+pub fn is_disableable_tool(tool: &str) -> bool {
+    match ToolKey::parse(tool) {
+        Ok(ToolKey::Native(name)) => is_builtin_tool(&name),
+        Ok(ToolKey::McpTool { .. } | ToolKey::McpServer { .. }) => true,
+        Ok(ToolKey::Wildcard) | Err(_) => false,
+    }
+}
+
+fn validate_disabled_tool(tool: &str) -> Result<(), ConfigError> {
+    if is_disableable_tool(tool) {
+        return Ok(());
+    }
+    Err(ConfigError::UnknownTool {
+        tool: tool.to_owned(),
+        valid: all_builtin_tool_names().join(", "),
+    })
+}
 
 pub const FILE_WRITE_TOOLS: &[&str] = &[
     "file_apply_patch",
@@ -232,6 +330,11 @@ pub enum ConfigError {
          (bundled plugins: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
+    #[error(
+        "invalid config: agent.disabled_tools: no tool is named \"{tool}\" \
+         (built-in tools: {valid}; MCP tools use `server.tool` or `server.*`)"
+    )]
+    UnknownTool { tool: String, valid: String },
     /// A `plugins.<name>` table whose tool is now native: the key is kept for
     /// compatibility, but Rust validates it instead of the plugin.
     #[error("invalid config: plugins.{plugin}.{field}: {message}")]
@@ -336,12 +439,7 @@ impl RawConfig {
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
         let skill_plugin_dev = self.skill_plugin_dev()?;
-        let disabled_tools: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|(_, cfg)| cfg.enabled == Some(false))
-            .map(|(name, _)| name.clone())
-            .collect();
+        let disabled_tools = self.resolve_disabled_tools()?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -383,6 +481,32 @@ impl RawConfig {
             });
         }
         Ok(())
+    }
+
+    /// One resolved kill switch: what `agent.disabled_tools` names, plus every
+    /// plugin turned off in the `plugins` table mapped to the names its tools
+    /// are actually registered under.
+    fn resolve_disabled_tools(&self) -> Result<Vec<String>, ConfigError> {
+        let mut disabled: Vec<String> = Vec::new();
+        for tool in self.agent.disabled_tools.iter().flatten() {
+            validate_disabled_tool(tool)?;
+            if !disabled.contains(tool) {
+                disabled.push(tool.clone());
+            }
+        }
+        let mut turned_off: Vec<&str> = self
+            .plugins
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled == Some(false))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        turned_off.sort_unstable();
+        for tool in turned_off.into_iter().flat_map(plugin_tools) {
+            if !disabled.iter().any(|name| name == tool) {
+                disabled.push((*tool).to_owned());
+            }
+        }
+        Ok(disabled)
     }
 
     /// Rejects any key a native tool does not declare, so a typo in a
@@ -673,6 +797,7 @@ pub struct AgentFileConfig {
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub shell_output_filter: Option<bool>,
+    pub disabled_tools: Option<Vec<String>>,
 }
 
 impl AgentFileConfig {
@@ -691,6 +816,11 @@ impl AgentFileConfig {
             stale_read_check,
             shell_output_filter
         );
+        // Restriction only, unlike every other list here: a project must not be
+        // able to hand itself back a tool the global config took away.
+        if let Some(overlay) = overlay.disabled_tools {
+            self.disabled_tools.get_or_insert_default().extend(overlay);
+        }
     }
 }
 
@@ -1361,7 +1491,12 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
-    #[config(default = "None", ty = "u32 | string", default_doc = "20%, or 10% when the model's window excludes output", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
+    #[config(
+        default = "None",
+        ty = "u32 | string",
+        default_doc = "20%, or 10% when the model's window excludes output",
+        desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")"
+    )]
     pub compaction_buffer: Option<CompactionBuffer>,
 
     #[config(
@@ -1405,7 +1540,12 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
-    #[config(skip, default = "Vec::new()")]
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one"
+    )]
     pub disabled_tools: Vec<String>,
 
     #[config(skip, default = DEFAULT_INDEX_MAX_FILE_SIZE_MB)]
@@ -3934,6 +4074,126 @@ mod tests {
             serde_json::json!(180),
             "opts survive for when the plugin is re-enabled"
         );
+    }
+
+    const PLUGIN_TOOL_DRIFT: &str = "a plugins.<name> key must map to registered tools or be \
+                                     listed in TOOLLESS_PLUGINS";
+
+    #[test_case("bash", &["shell"] ; "bash_disables_shell")]
+    #[test_case("edit", &["file_edit", "file_apply_patch"] ; "edit_disables_both_edit_tools")]
+    #[test_case("read", &["file_read"] ; "read_disables_file_read")]
+    #[test_case("index", &["index"] ; "name_matching_the_tool_passes_through")]
+    fn disabled_plugin_disables_the_tools_it_was_replaced_by(plugin: &str, expected: &[&str]) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[plugins.{plugin}]\nenabled = false\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.disabled_tools, expected);
+    }
+
+    #[test_case("list" ; "list")]
+    #[test_case("sessions" ; "sessions")]
+    #[test_case("tool_output" ; "tool_output")]
+    fn disabling_a_toolless_plugin_names_no_tool(plugin: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[plugins.{plugin}]\nenabled = false\n")).unwrap();
+        assert!(
+            raw.into_config(false)
+                .unwrap()
+                .agent
+                .disabled_tools
+                .is_empty()
+        );
+    }
+
+    #[test_case("shell" ; "builtin")]
+    #[test_case("github.create_issue" ; "mcp_tool")]
+    #[test_case("github.*" ; "mcp_server")]
+    fn agent_disabled_tools_accepts(tool: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[agent]\ndisabled_tools = [\"{tool}\"]\n")).unwrap();
+        assert_eq!(raw.into_config(false).unwrap().agent.disabled_tools, [tool]);
+    }
+
+    #[test_case("file_wrte" ; "typo")]
+    #[test_case("bash" ; "legacy_plugin_id_is_not_a_tool")]
+    #[test_case("*" ; "bare_wildcard")]
+    fn agent_disabled_tools_rejects_unknown_name(tool: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[agent]\ndisabled_tools = [\"{tool}\"]\n")).unwrap();
+        let error = raw
+            .into_config(false)
+            .err()
+            .expect("unknown tool")
+            .to_string();
+        assert!(error.contains("no tool is named"), "{error}");
+    }
+
+    #[test]
+    fn project_disabled_tools_extend_global_and_cannot_reenable() {
+        let mut merged: RawConfig =
+            toml::from_str("[agent]\ndisabled_tools = [\"shell\"]\n").unwrap();
+        merged.merge(toml::from_str("[agent]\ndisabled_tools = [\"websearch\"]\n").unwrap());
+        assert_eq!(
+            merged.into_config(false).unwrap().agent.disabled_tools,
+            ["shell", "websearch"]
+        );
+    }
+
+    #[test]
+    fn a_project_without_the_key_keeps_the_global_list() {
+        let mut merged: RawConfig =
+            toml::from_str("[agent]\ndisabled_tools = [\"shell\"]\n").unwrap();
+        merged.merge(toml::from_str("[agent]\nstale_read_check = false\n").unwrap());
+        assert_eq!(
+            merged.into_config(false).unwrap().agent.disabled_tools,
+            ["shell"]
+        );
+    }
+
+    #[test]
+    fn cli_and_config_entries_are_deduplicated() {
+        let raw: RawConfig = toml::from_str(
+            "[agent]\ndisabled_tools = [\"shell\"]\n\n[plugins.bash]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.disabled_tools,
+            ["shell"]
+        );
+    }
+
+    #[test]
+    fn every_default_builtin_maps_to_a_tool_or_is_listed_as_toolless() {
+        for plugin in DEFAULT_BUILTINS {
+            let tools = plugin_tools(plugin);
+            if TOOLLESS_PLUGINS.contains(plugin) {
+                assert!(tools.is_empty(), "{PLUGIN_TOOL_DRIFT}: {plugin}");
+                continue;
+            }
+            assert!(!tools.is_empty(), "{PLUGIN_TOOL_DRIFT}: {plugin}");
+            for tool in tools {
+                assert!(
+                    is_builtin_tool(tool),
+                    "{PLUGIN_TOOL_DRIFT}: {plugin} -> {tool}"
+                );
+            }
+        }
+    }
+
+    #[test_case("shell", "shell", true ; "exact")]
+    #[test_case("shell", "file_read", false ; "different_name")]
+    #[test_case("github.*", "github.create_issue", true ; "server_wildcard")]
+    #[test_case("github.*", "gitlab.create_issue", false ; "other_server")]
+    #[test_case("github.create_issue", "github.create_issue", true ; "qualified_exact")]
+    fn tool_pattern_matching(pattern: &str, name: &str, expected: bool) {
+        assert_eq!(tool_pattern_matches(pattern, name), expected);
+    }
+
+    #[test]
+    fn internal_companions_cannot_be_disabled() {
+        for name in INTERNAL_COMPANION_TOOL_NAMES {
+            assert!(is_tool_enabled(&[(*name).to_owned()], name));
+        }
     }
 
     #[test]

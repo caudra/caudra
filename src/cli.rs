@@ -4,7 +4,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use caudra_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use caudra_agent::tools::all_builtin_tool_names;
+use caudra_config::is_disableable_tool;
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 
 use crate::print::OutputFormat;
@@ -47,7 +48,7 @@ pub struct Cli {
     pub images: Vec<PathBuf>,
 
     /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub model: Option<String>,
 
     /// Include full turn-by-turn messages in --print output
@@ -75,7 +76,7 @@ pub struct Cli {
     pub no_commands: bool,
 
     /// Disable model-facing shell output filtering.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_rtk: bool,
 
     /// Skip user `init.lua` files (global and project). The Lua host stays
@@ -83,11 +84,11 @@ pub struct Cli {
     /// this to recover from a broken `init.lua` or keymap override. Only Lua
     /// `init.lua` files are affected; `permissions.toml`, custom commands,
     /// and env files load as usual.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_plugins: bool,
 
     /// Run plugin Lua on the interpreter with full debug info (no native codegen)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_jit: bool,
 
     /// Skip all permission prompts (allow everything)
@@ -99,11 +100,21 @@ pub struct Cli {
     pub exit_on_done: bool,
 
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
-    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        visible_alias = "allowedTools",
+        global = true
+    )]
     pub allowed_tools: Vec<String>,
 
     /// Disallowed tools (comma-separated).
-    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        visible_alias = "disallowedTools",
+        global = true
+    )]
     pub disallowed_tools: Vec<String>,
 
     /// Session ID for SDK mode
@@ -264,6 +275,23 @@ pub enum Command {
         /// With --tools: show only tool names, one per line
         #[arg(long, requires = "tools")]
         names: bool,
+    },
+    /// List every tool with the config and CLI rules applied
+    ///
+    /// Unrelated to the `--tools` compatibility flag, which is ignored.
+    Tools {
+        /// Omit the tools that are turned off
+        #[arg(long)]
+        enabled_only: bool,
+        /// Full records as JSON
+        #[arg(long, conflicts_with_all = ["names", "schemas"])]
+        json: bool,
+        /// Tool names only, one per line
+        #[arg(long, conflicts_with_all = ["json", "schemas"])]
+        names: bool,
+        /// The tool definitions as the provider receives them
+        #[arg(long, conflicts_with_all = ["json", "names"])]
+        schemas: bool,
     },
     /// Inspect and maintain session storage
     Storage {
@@ -510,21 +538,28 @@ pub enum AuthMethod {
     ApiKey,
 }
 
+/// MCP names arrive already qualified (`server.tool`, `server.*`) and are
+/// case-sensitive, so only bare built-in names get the PascalCase rewrite.
 pub fn normalize_tool_name(name: &str) -> Result<String> {
-    let mut result = String::with_capacity(name.len() + 4);
-    for (i, c) in name.chars().enumerate() {
-        if c.is_ascii_uppercase() {
-            if i > 0 {
-                result.push('_');
+    let result = if name.contains('.') {
+        name.to_owned()
+    } else {
+        let mut result = String::with_capacity(name.len() + 4);
+        for (i, c) in name.chars().enumerate() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    result.push('_');
+                }
+                result.push(c.to_ascii_lowercase());
+            } else {
+                result.push(c);
             }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
         }
-    }
-    if !is_builtin_tool(&result) {
+        result
+    };
+    if !is_disableable_tool(&result) {
         bail!(
-            "unknown tool '{}'. Valid tools: {}",
+            "unknown tool '{}'. Valid tools: {} (MCP tools use `server.tool` or `server.*`)",
             name,
             all_builtin_tool_names().join(", ")
         );

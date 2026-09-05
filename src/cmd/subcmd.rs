@@ -6,16 +6,22 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
-use caudra_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
-use caudra_agent::tools::{RegisteredTool, ToolRegistry, is_tool_enabled};
+use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
+use caudra_agent::tools::{
+    DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
+    capability_exclusions, credential_exclusions, is_tool_enabled,
+};
 use caudra_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use caudra_config::{Config, load_env_files, load_permissions};
+use caudra_config::{
+    AgentConfig, Config, DefaultEffect, PermissionsConfig, ToolKey, load_env_files,
+    load_permissions,
+};
 use caudra_lua::PluginHost;
 use caudra_providers::provider::fetch_all_models;
-use caudra_providers::{ProviderData, catalog_providers};
+use caudra_providers::{Model, ProviderData, Timeouts, catalog_providers};
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
@@ -24,7 +30,8 @@ use caudra_storage::auth::{
 };
 use caudra_storage::model::persist_model;
 
-use crate::cli::AuthMethod;
+use crate::cli::{AuthMethod, Cli, normalize_tool_name};
+use crate::setup::resolve_model;
 
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
@@ -742,6 +749,239 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+const SOURCE_MCP: &str = "mcp";
+/// `permissions.toml` still accepts the pre-rename section for the shell tool.
+const LEGACY_SHELL_KEY: &str = "bash";
+const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
+const REASON_CONFIG: &str = "disabled by config";
+const REASON_NO_VISION: &str = "model has no vision support";
+const REASON_NOT_ALLOWED: &str = "not in --allowed-tools";
+const REASON_COMPANION: &str = "always on (internal companion)";
+const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
+const REASON_DEFERRED: &str = "deferred behind tool_search";
+
+#[derive(serde::Serialize)]
+struct ToolRow {
+    name: String,
+    source: String,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission: Option<&'static str>,
+}
+
+/// Why a built-in would not reach the model, in the order a user would ask:
+/// what they typed, then what their config says, then what the model and the
+/// allow list leave behind. An enabled tool only earns a note when something
+/// asked for it to be off and did not get it.
+fn builtin_note(
+    name: &str,
+    enabled: bool,
+    cli_disallowed: &[String],
+    config: &AgentConfig,
+    model: &Model,
+) -> Option<&'static str> {
+    let named_off = cli_disallowed.iter().any(|tool| tool == name);
+    let config_off = config.disabled_tools.iter().any(|tool| tool == name);
+    if enabled {
+        return (named_off || config_off).then_some(REASON_COMPANION);
+    }
+    if named_off {
+        return Some(REASON_DISALLOWED_FLAG);
+    }
+    if config_off {
+        return Some(REASON_CONFIG);
+    }
+    if capability_exclusions(model).contains(&name) {
+        return Some(REASON_NO_VISION);
+    }
+    if credential_exclusions().contains(&name) {
+        return Some(REASON_NO_SUBSCRIPTION);
+    }
+    (!config.allowed_tools.is_empty()).then_some(REASON_NOT_ALLOWED)
+}
+
+fn permission_default(permissions: &PermissionsConfig, keys: &[ToolKey]) -> Option<&'static str> {
+    let effect = keys
+        .iter()
+        .find_map(|key| permissions.tool_defaults.get(key))?;
+    match effect {
+        DefaultEffect::Allow => Some("allow"),
+        DefaultEffect::Deny => Some("deny"),
+        DefaultEffect::Prompt => None,
+    }
+}
+
+fn builtin_rows(
+    registry: &ToolRegistry,
+    filter: &ToolFilter,
+    config: &Config,
+    cli_disallowed: &[String],
+    model: &Model,
+) -> Vec<ToolRow> {
+    let mut rows: Vec<ToolRow> = registry
+        .iter()
+        .iter()
+        .map(|entry| {
+            let name = entry.name();
+            let keys = match name {
+                SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
+                _ => vec![ToolKey::native(name)],
+            };
+            let enabled = filter.matches(name);
+            ToolRow {
+                name: name.to_owned(),
+                source: entry.source.as_log_field().into_owned(),
+                enabled,
+                note: builtin_note(name, enabled, cli_disallowed, &config.agent, model),
+                permission: permission_default(&config.permissions, &keys),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<ToolRow> {
+    let Some(mcp) = mcp else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ToolRow> = mcp
+        .tool_inventory()
+        .into_iter()
+        .map(|tool| {
+            let keys = [
+                ToolKey::parse(&tool.qualified_name),
+                ToolKey::parse(&format!("{}.*", tool.server)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            ToolRow {
+                enabled: !tool.disabled,
+                note: match (tool.disabled, tool.deferred) {
+                    (true, _) => Some(REASON_CONFIG),
+                    (false, true) => Some(REASON_DEFERRED),
+                    _ => None,
+                },
+                permission: permission_default(permissions, &keys),
+                source: format!("{SOURCE_MCP}:{}", tool.server),
+                name: tool.wire_name,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn print_group(heading: &str, rows: &[ToolRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+    println!("{heading}");
+    for row in rows {
+        let state = if row.enabled { "on " } else { "off" };
+        let mut detail = row.note.map(str::to_owned).unwrap_or_default();
+        if let Some(permission) = row.permission {
+            if !detail.is_empty() {
+                detail.push_str(", ");
+            }
+            detail.push_str(&format!("permission: {permission}"));
+        }
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("  ({detail})")
+        };
+        println!(
+            "  {state}  {:width$}  {}{detail}",
+            row.name,
+            row.source,
+            width = width
+        );
+    }
+    println!();
+}
+
+pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bool) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    load_env_files(&cwd);
+    let _workcell_host = super::register_builtin_tools(&cwd)?;
+
+    let reg = ToolRegistry::global_arc();
+    let mut host =
+        PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
+    let config = super::load_config(&host, cli, &cwd)?;
+    super::configure_native_tools(&config.agent);
+    super::install_native_permission_rules(&host.plugin_rules(), &cwd);
+    host.load_production_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let mut model = resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
+    caudra_providers::provider::adjust_model(&mut model, Timeouts::default())?;
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+
+    let (mcp_handle, mcp_errors) = smol::block_on(caudra_agent::mcp::start_connected(&cwd));
+    if !mcp_errors.is_empty() {
+        eprintln!("warning: {mcp_errors}");
+    }
+    let mcp = mcp_handle.map(|handle| {
+        McpSession::new(handle, &[]).with_disabled_tools(&config.agent.disabled_tools)
+    });
+
+    if schemas {
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        let mut defs = reg.definitions(
+            &caudra_agent::template::env_vars(),
+            &ctx,
+            model.supports_tool_examples(),
+        );
+        if let Some(mcp) = &mcp {
+            mcp.extend_tools(&mut defs);
+        }
+        println!("{}", serde_json::to_string_pretty(&defs)?);
+        return Ok(());
+    }
+
+    let cli_disallowed = cli
+        .disallowed_tools
+        .iter()
+        .map(|tool| normalize_tool_name(tool))
+        .collect::<Result<Vec<_>>>()?;
+    let mut builtin = builtin_rows(reg, &filter, &config, &cli_disallowed, &model);
+    let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
+    if enabled_only {
+        builtin.retain(|row| row.enabled);
+        mcp_tools.retain(|row| row.enabled);
+    }
+
+    if names {
+        for row in builtin.iter().chain(&mcp_tools) {
+            println!("{}", row.name);
+        }
+    } else if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model": model.spec(),
+                "builtin": builtin,
+                "mcp": mcp_tools,
+            }))?
+        );
+    } else {
+        print_group("Built-in", &builtin);
+        print_group("MCP", &mcp_tools);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prompt(
     variant: &crate::cli::PromptVariant,
@@ -897,6 +1137,69 @@ mod auth_tests {
     #[test]
     fn oauth_method_rejects_non_subscription_provider() {
         assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+    use test_case::test_case;
+
+    const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+
+    fn agent_config(disabled: &[&str], allowed: &[&str]) -> caudra_config::AgentConfig {
+        caudra_config::AgentConfig {
+            disabled_tools: disabled.iter().map(|t| (*t).to_string()).collect(),
+            allowed_tools: allowed.iter().map(|t| (*t).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn note(
+        name: &str,
+        enabled: bool,
+        cli: &[&str],
+        config: &caudra_config::AgentConfig,
+    ) -> Option<&'static str> {
+        let cli: Vec<String> = cli.iter().map(|t| (*t).to_string()).collect();
+        let model = caudra_providers::Model::from_spec(MODEL_SPEC).unwrap();
+        builtin_note(name, enabled, &cli, config, &model)
+    }
+
+    #[test]
+    fn a_config_disabled_tool_says_so() {
+        let config = agent_config(&["shell"], &[]);
+        assert_eq!(note("shell", false, &[], &config), Some(REASON_CONFIG));
+    }
+
+    /// The flag wins the explanation: it is the thing the user just typed.
+    #[test]
+    fn a_flag_disabled_tool_names_the_flag() {
+        let config = agent_config(&["shell"], &[]);
+        assert_eq!(
+            note("shell", false, &["shell"], &config),
+            Some(REASON_DISALLOWED_FLAG)
+        );
+    }
+
+    #[test]
+    fn a_tool_outside_the_allow_list_says_so() {
+        let config = agent_config(&[], &["file_read"]);
+        assert_eq!(note("shell", false, &[], &config), Some(REASON_NOT_ALLOWED));
+    }
+
+    #[test]
+    fn an_ordinary_enabled_tool_has_no_note() {
+        assert_eq!(note("shell", true, &[], &agent_config(&[], &[])), None);
+    }
+
+    /// Naming a companion is not an error, but the report has to say the
+    /// request did not take.
+    #[test_case("tool_output_read" ; "read")]
+    #[test_case("tool_output_grep" ; "grep")]
+    fn a_companion_asked_to_turn_off_stays_on_with_a_note(name: &str) {
+        let config = agent_config(&[name], &[]);
+        assert_eq!(note(name, true, &[], &config), Some(REASON_COMPANION));
     }
 }
 

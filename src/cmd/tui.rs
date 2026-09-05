@@ -14,7 +14,7 @@ use color_eyre::eyre::Context;
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::ToolRegistry;
-use caudra_config::{Config, RetentionConfig, load_env_files, load_permissions};
+use caudra_config::{Config, RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::StateDir;
@@ -24,7 +24,8 @@ use caudra_storage::sessions::{SessionDatabase, SessionLease};
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_ui::{AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionTab};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
+use crate::cmd::load_config;
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -147,38 +148,6 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     }
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     command::discover_commands(&cwd)
-}
-
-fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
-    let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(cli.no_rtk)
-        .context("invalid config")?;
-    config.permissions = load_permissions(cwd);
-
-    if cli.yolo || config.always_yolo {
-        config.permissions.yolo = true;
-    }
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-    }
-    config.validate()?;
-    Ok(config)
 }
 
 fn config_or_fallback<T>(

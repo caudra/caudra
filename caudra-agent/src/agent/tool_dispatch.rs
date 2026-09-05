@@ -49,6 +49,7 @@ impl Emit<'_> {
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
@@ -181,6 +182,12 @@ async fn run_inner(
         }
     };
 
+    // Before the read-only gate: a tool the config turned off should say so
+    // even when the mode would have refused it for another reason.
+    if entry.is_none() && local.is_none() && mcp.is_some_and(|mcp| mcp.is_disabled(mcp_lookup)) {
+        return done_error(format!("tool {mcp_lookup} {TOOL_DISABLED_SUFFIX}"));
+    }
+
     if ctx.policy().is_read_only() {
         let allowed = if let Some(local) = local {
             local.effect.is_safe_in_read_only()
@@ -196,7 +203,7 @@ async fn run_inner(
     }
 
     if (local.is_some() || entry.is_some()) && !ctx.tool_filter.matches(name) {
-        return done_error(format!("tool {name} is disabled for the current agent"));
+        return done_error(format!("tool {name} {TOOL_DISABLED_SUFFIX}"));
     }
     if let Some(local) = local {
         return run_local_tool(local, id, name, input, ctx, emit).await;
@@ -1241,6 +1248,34 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
+        });
+    }
+
+    /// A name the model kept from earlier in the history must not slip past a
+    /// tool the config has since turned off.
+    #[test_case("srv.fetch_issue" ; "qualified_name")]
+    #[test_case("srv.*" ; "server_wildcard")]
+    fn disabled_mcp_tool_from_history_is_refused(disabled: &str) {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")])
+                .with_disabled_tools(&[disabled.to_owned()]);
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                "srv__fetch_issue",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert!(
+                done.output.as_text().contains(TOOL_DISABLED_SUFFIX),
+                "{}",
+                done.output.as_text()
+            );
         });
     }
 

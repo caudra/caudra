@@ -94,7 +94,9 @@ impl AgentLoop {
             .as_ref()
             .map(|history| history.as_slice())
             .unwrap_or_default();
-        let mcp = mcp_handle.map(|h| McpSession::new(h, initial_messages));
+        let mcp = mcp_handle.map(|h| {
+            McpSession::new(h, initial_messages).with_disabled_tools(&config.disabled_tools)
+        });
         let (history, history_restore_error) = match restored_history {
             Ok(history) => (history.with_mirror(shared_history), None),
             Err(error) => (History::default(), Some(error.to_string())),

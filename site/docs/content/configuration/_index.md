@@ -142,6 +142,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with a small model |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
+| `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 
 ### `provider`
 
@@ -216,6 +217,8 @@ Every field also has an environment variable, shown in the Env column, and the v
 The `plugins` table turns bundled features and plugins on or off and passes options to them. All bundled features are on by default. Set `enabled = false` to turn one off.
 
 Each feature checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
+
+`enabled = false` turns off the tools that key produced, under the names they are registered with today, so `plugins.bash` turns off `shell` and `plugins.edit` turns off `file_edit` and `file_apply_patch`. To name a tool directly, use `agent.disabled_tools`, described in [Disabling tools](/docs/tools/#disabling-tools).
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`.
 

@@ -762,7 +762,10 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         params.system_prompt_profile.as_deref(),
     );
 
-    let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
+    let mcp = params
+        .mcp_handle
+        .clone()
+        .map(|h| McpSession::new(h, &[]).with_disabled_tools(&params.config.disabled_tools));
     let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -1001,10 +1004,9 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
     );
 
     let initial_messages = history.as_slice();
-    let mcp = params
-        .mcp_handle
-        .clone()
-        .map(|h| McpSession::new(h, initial_messages));
+    let mcp = params.mcp_handle.clone().map(|h| {
+        McpSession::new(h, initial_messages).with_disabled_tools(&params.config.disabled_tools)
+    });
     let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let session_ref = params.session_id.clone();

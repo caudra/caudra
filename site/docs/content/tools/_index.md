@@ -11,6 +11,22 @@ Caudra ships with 22 built-in tools in this reference (22 on by default, 0 opt-i
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
+## Disabling tools
+
+`agent.disabled_tools` withholds a tool from the model. Entries are built-in tool names, an MCP tool as `server.tool`, or a whole MCP server as `server.*`. An unknown name fails at startup with the list of valid names. A project list extends the global one, so a project can restrict further and cannot re-enable what the global config turned off.
+
+```lua
+caudra.setup({
+    agent = { disabled_tools = { "shell", "file_write", "github.*" } },
+})
+```
+
+`--disallowed-tools` does the same for one run and accepts the same names. `plugins.<name>.enabled = false` still works and maps to the tools that plugin was replaced by, so `plugins.bash` turns off `shell`.
+
+`tool_output_grep` and `tool_output_read` stay available whatever the lists say. The agent calls them on its own to page through a truncated result.
+
+Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
+
 ## File Operations
 
 ### `file_read` {#file_read}

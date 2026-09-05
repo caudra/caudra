@@ -292,6 +292,15 @@ pub struct McpSnapshot {
     pub generation: u64,
 }
 
+/// How one MCP tool would reach the model on the next request.
+pub struct McpToolStatus {
+    pub qualified_name: String,
+    pub wire_name: String,
+    pub server: String,
+    pub disabled: bool,
+    pub deferred: bool,
+}
+
 /// Read-only view of the latest published `McpSnapshot`. Handing this out instead of the
 /// raw `ArcSwap` keeps outside code from publishing snapshots of its own.
 #[derive(Clone)]
@@ -362,6 +371,10 @@ pub struct McpHandle {
 pub struct McpSession {
     handle: McpHandle,
     loaded: Arc<Mutex<HashSet<Arc<str>>>>,
+    /// The MCP-qualified entries of config's `disabled_tools`. Held here rather
+    /// than in `ToolFilter` because MCP definitions are appended after the
+    /// registry filter has already run.
+    disabled: Arc<[String]>,
 }
 
 impl std::ops::Deref for McpSession {
@@ -389,12 +402,72 @@ impl McpSession {
         Self {
             handle,
             loaded: Arc::new(Mutex::new(loaded)),
+            disabled: Arc::from([]),
         }
+    }
+
+    /// Config's `disabled_tools`, keeping only what can name an MCP tool.
+    /// Built-in names are already handled by `ToolFilter`.
+    pub fn with_disabled_tools(mut self, disabled_tools: &[String]) -> Self {
+        self.disabled = disabled_tools
+            .iter()
+            .filter(|name| name.contains(SEPARATOR))
+            .cloned()
+            .collect();
+        self
+    }
+
+    pub fn is_disabled(&self, qualified_name: &str) -> bool {
+        self.disabled
+            .iter()
+            .any(|pattern| caudra_config::tool_pattern_matches(pattern, qualified_name))
+    }
+
+    /// Measured against the enabled tools only: turning tools off must be able
+    /// to bring a server back under the threshold.
+    fn deferring(&self, idx: &ToolIndex) -> bool {
+        idx.descriptors
+            .iter()
+            .filter(|d| !d.always_load && !self.is_disabled(&d.qualified_name))
+            .count()
+            > self.handle.defer_tools
+    }
+
+    /// Every MCP tool this session knows of and how it would reach the model.
+    /// `extend_tools` stays the request path; this one is for reporting.
+    pub fn tool_inventory(&self) -> Vec<McpToolStatus> {
+        let idx = self.handle.index.load();
+        let defer = self.deferring(&idx);
+        let loaded = self.lock_loaded();
+        idx.descriptors
+            .iter()
+            .map(|d| {
+                let disabled = self.is_disabled(&d.qualified_name);
+                let (server, _) = d
+                    .qualified_name
+                    .split_once(SEPARATOR)
+                    .unwrap_or((UNKNOWN_MCP, &d.qualified_name));
+                McpToolStatus {
+                    server: server.to_owned(),
+                    wire_name: d.wire_name().to_owned(),
+                    deferred: !disabled
+                        && defer
+                        && !d.always_load
+                        && !loaded.contains(&*d.qualified_name),
+                    qualified_name: d.qualified_name.to_string(),
+                    disabled,
+                }
+            })
+            .collect()
     }
 
     /// A view over the same handle with no loads, for a new (sub)session.
     pub fn fresh(&self) -> Self {
-        Self::new(self.handle.clone(), &[])
+        Self {
+            handle: self.handle.clone(),
+            loaded: Arc::new(Mutex::new(HashSet::new())),
+            disabled: Arc::clone(&self.disabled),
+        }
     }
 
     /// Append this request's MCP definitions: loaded and `always_load`
@@ -414,11 +487,15 @@ impl McpSession {
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
         let idx = self.handle.index.load();
-        let defer =
-            idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
+        let enabled = || {
+            idx.descriptors
+                .iter()
+                .filter(|d| !self.is_disabled(&d.qualified_name))
+        };
+        let defer = self.deferring(&idx);
         let loaded = self.lock_loaded();
         let mut deferred: Vec<&ToolDescriptor> = Vec::new();
-        for d in idx.descriptors.iter() {
+        for d in enabled() {
             if existing.contains(d.wire_name()) {
                 continue;
             }
@@ -457,7 +534,7 @@ impl McpSession {
         let mut matches: Vec<(bool, usize, &ToolDescriptor)> = idx
             .descriptors
             .iter()
-            .filter(|d| !d.always_load)
+            .filter(|d| !d.always_load && !self.is_disabled(&d.qualified_name))
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);
@@ -2147,6 +2224,58 @@ mod tests {
         let mut tools = json!([]);
         handle.extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
+    }
+
+    #[test_case(&["srv.tool".to_owned()] ; "qualified_name")]
+    #[test_case(&["srv.*".to_owned()] ; "server_wildcard")]
+    fn extend_tools_drops_disabled_tools(disabled: &[String]) {
+        let (_inner, session) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
+        let mut tools = json!([]);
+        session
+            .with_disabled_tools(disabled)
+            .extend_tools(&mut tools);
+        assert!(tool_names(&tools).is_empty());
+    }
+
+    /// A disabled tool must not surface as a name in the catalog either: that
+    /// is the whole point of turning it off.
+    #[test]
+    fn a_disabled_tool_stays_out_of_the_search_catalog() {
+        let (_inner, session) = setup(vec![
+            fake_entry("srv", FakeTransport::new()),
+            fake_entry("other", FakeTransport::new()),
+        ]);
+        let session = session.with_disabled_tools(&["srv.*".to_owned()]);
+        let mut tools = json!([]);
+        session.extend_tools(&mut tools);
+
+        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+        let catalog = tools[0]["description"].as_str().unwrap();
+        assert!(catalog.contains("other"), "{catalog}");
+        assert!(!catalog.contains("srv"), "{catalog}");
+        assert!(
+            session
+                .search_tools("tool")
+                .unwrap()
+                .contains("other__tool"),
+            "search must not reach a disabled tool"
+        );
+    }
+
+    #[test]
+    fn disabling_tools_can_bring_a_server_back_under_the_defer_threshold() {
+        let (_inner, session) = setup_with_defer(
+            vec![
+                fake_entry("srv", FakeTransport::new()),
+                fake_entry("other", FakeTransport::new()),
+            ],
+            1,
+        );
+        let mut tools = json!([]);
+        session
+            .with_disabled_tools(&["srv.*".to_owned()])
+            .extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec!["other__tool"]);
     }
 
     #[test]

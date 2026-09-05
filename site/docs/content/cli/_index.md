@@ -70,6 +70,8 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 
 `--allowed-tools` / `--disallowed-tools` accept PascalCase (`FileRead,FileEdit,Shell`) or snake_case (`file_read,file_edit,shell`). Caudra converts PascalCase to snake_case and checks the result against the built-in tool names. Unknown names fail with the complete list of valid names.
 
+`--disallowed-tools` also takes MCP names: `github.create_issue` for one tool, `github.*` for a server. Those keep their exact spelling. The persistent form of the same list is `agent.disabled_tools`, described in [Disabling tools](/docs/tools/#disabling-tools).
+
 ### Permission modes (SDK)
 
 | Mode | Effect |
@@ -133,7 +135,7 @@ caudra --ephemeral acp
 caudra --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags such as `--ephemeral` and `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. `--ephemeral` must come before the subcommand. `-m`, `--no-jit`, `--no-plugins`, `--no-rtk`, `--allowed-tools`, and `--disallowed-tools` work on either side.
 
 ### `caudra index`
 
@@ -154,7 +156,22 @@ caudra prompt --tools          # tool definitions as JSON
 caudra prompt --tools --names  # tool names only, one per line
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants.
+Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants. For the tool surface, prefer `caudra tools`: it applies `--allowed-tools` and `--disallowed-tools`, and it includes MCP.
+
+### `caudra tools`
+
+```bash
+caudra tools                                  # every tool, on or off, with the reason
+caudra tools --enabled-only                   # only what the model will see
+caudra tools --names                          # names, one per line
+caudra tools --json                           # full records
+caudra tools --schemas                        # definitions as the provider receives them
+caudra tools --disallowed-tools shell         # preview a change before you run it
+```
+
+Resolves config the way a real run does, so the output reflects `agent.disabled_tools`, the plugin table, `--allowed-tools`, `--disallowed-tools`, and the model you select with `-m`. Built-in tools come first, then MCP tools grouped by server. MCP servers connect on every run, so a slow or failed server shows its status instead of its tools.
+
+A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, or `no ChatGPT subscription`. MCP tools also report `deferred behind tool_search`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 
 ### `caudra storage`
 
