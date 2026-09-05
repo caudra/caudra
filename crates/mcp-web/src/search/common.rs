@@ -45,6 +45,9 @@ pub(super) fn safe_transport_error(error: WebHttpError, timeout: u64) -> String 
     // include request headers. Only explicitly allowlisted text reaches output.
     match error {
         WebHttpError::Timeout => format!("Request timed out after {timeout} seconds"),
+        WebHttpError::ProxyRejected => {
+            "Search backend request was refused by the outbound proxy.".to_owned()
+        }
         WebHttpError::Cancelled
         | WebHttpError::Rejected(_)
         | WebHttpError::RedirectRejected

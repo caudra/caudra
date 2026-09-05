@@ -173,6 +173,9 @@ fn map_http_error(error: WebHttpError, timeout: u64) -> WebfetchError {
         WebHttpError::Rejected(message) => {
             WebfetchError::Operation(format!("URL is blocked by network safety rules: {message}"))
         }
+        WebHttpError::ProxyRejected => WebfetchError::Operation(
+            "The outbound proxy refused this request; the target is not permitted.".to_owned(),
+        ),
         WebHttpError::RedirectRejected | WebHttpError::RequestFailed => {
             WebfetchError::Operation("webfetch request failed.".to_owned())
         }

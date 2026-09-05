@@ -23,7 +23,7 @@ use uuid::Uuid;
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeToolGroup};
 use workcell_mcp_files::FileToolGroup;
 use workcell_mcp_shell::{ShellPermissionPolicy, ShellToolGroup};
-use workcell_mcp_web::{WebToolGroup, WebsearchExecutionConfiguration};
+use workcell_mcp_web::{ProxyConfiguration, WebToolGroup, WebsearchExecutionConfiguration};
 
 use crate::{
     cli::ToolGroup,
@@ -60,6 +60,7 @@ pub struct ToolConfiguration<'a> {
     pub allow_write: bool,
     pub web: WebsearchExecutionConfiguration,
     pub web_icons: bool,
+    pub proxy: ProxyConfiguration,
     pub shell_policy: ShellPermissionPolicy,
     pub shell_output_filter: bool,
     pub code: CodeConfiguration<'a>,
@@ -127,7 +128,7 @@ impl WorkcellServer {
         };
         let web = groups
             .contains(&ToolGroup::Web)
-            .then(|| WebToolGroup::production_with_source_icons(tools.web, tools.web_icons));
+            .then(|| WebToolGroup::production_with_proxy(tools.web, tools.web_icons, &tools.proxy));
         let shell = if groups.contains(&ToolGroup::Shell) {
             Some(
                 ShellToolGroup::with_policy(
@@ -571,6 +572,7 @@ mod tests {
             allow_write: false,
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
+            proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
             code: CodeConfiguration {

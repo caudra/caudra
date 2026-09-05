@@ -37,6 +37,7 @@ pub async fn run(
             allow_write: options.allow_write,
             web,
             web_icons: options.web_icons,
+            proxy: options.proxy,
             shell_policy,
             shell_output_filter: options.shell_output_filter,
             code: CodeConfiguration {

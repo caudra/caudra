@@ -1,6 +1,9 @@
 use std::{collections::HashSet, fmt, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
+// Outbound proxy policy lives in `workcell-net` and is re-exported by the web
+// crate, which is the only group that performs egress.
+use workcell_mcp_web::ProxyConfiguration;
 
 use crate::environment::StartupEnvironment;
 
@@ -92,6 +95,18 @@ pub struct RawOptions {
     #[arg(long)]
     pub web_icons: bool,
 
+    /// Route web tool egress through this proxy, overriding the environment.
+    #[arg(long)]
+    pub http_proxy: Option<String>,
+
+    /// Hosts and address blocks that bypass the proxy, overriding NO_PROXY.
+    #[arg(long)]
+    pub no_proxy: Option<String>,
+
+    /// Ignore any configured or ambient proxy and dial every target directly.
+    #[arg(long, conflicts_with_all = ["http_proxy", "no_proxy"])]
+    pub no_http_proxy: bool,
+
     /// Load an immutable shell allow/deny policy from a TOML file.
     #[arg(long)]
     pub shell_policy: Option<PathBuf>,
@@ -163,6 +178,7 @@ pub struct CliOptions {
     pub groups: Vec<ToolGroup>,
     pub allow_write: bool,
     pub web_icons: bool,
+    pub proxy: ProxyConfiguration,
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
     pub shell_output_filter: bool,
@@ -188,6 +204,14 @@ impl fmt::Debug for CliOptions {
             .field("groups", &self.groups)
             .field("allow_write", &self.allow_write)
             .field("web_icons", &self.web_icons)
+            .field(
+                "proxy",
+                &if self.proxy.is_direct() {
+                    "direct"
+                } else {
+                    "[CONFIGURED]"
+                },
+            )
             .field(
                 "shell_policy_file",
                 &self.shell_policy_file.as_ref().map(|_| "[CONFIGURED]"),
@@ -231,6 +255,8 @@ pub enum CliError {
     RootWithoutLocalTools,
     AllowWriteRequiresFiles,
     WebIconsRequireWeb,
+    InvalidProxy,
+    ProxyOptionRequiresWeb,
     ShellOptionRequiresShell,
     CodeOptionRequiresCode,
     HttpOptionRequiresHttp,
@@ -256,6 +282,12 @@ impl fmt::Display for CliError {
                 "--allow-write requires the files or transfer tool group"
             }
             Self::WebIconsRequireWeb => "--web-icons requires the web tool group",
+            Self::InvalidProxy => {
+                "the outbound proxy must be an http or https URL, and any NO_PROXY address block must be valid"
+            }
+            Self::ProxyOptionRequiresWeb => {
+                "--http-proxy, --no-proxy, and --no-http-proxy require the web tool group"
+            }
             Self::ShellOptionRequiresShell => {
                 "--shell-policy, --yolo, and --no-shell-output-filter require the shell tool group"
             }
@@ -403,6 +435,14 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let explicit_proxy_options =
+            self.http_proxy.is_some() || self.no_proxy.is_some() || self.no_http_proxy;
+        let proxy = resolve_proxy(
+            environment,
+            self.http_proxy.as_deref(),
+            self.no_proxy.as_deref(),
+            self.no_http_proxy,
+        )?;
         let modern_only = if self.modern_only {
             true
         } else {
@@ -449,6 +489,12 @@ impl RawOptions {
         if web_icons && !groups.contains(&ToolGroup::Web) {
             return Err(CliError::WebIconsRequireWeb);
         }
+        // Ambient proxy variables belong to the whole environment, so they are
+        // only ignored without the web group. An explicit flag is a statement
+        // about this process and is an error when nothing would honor it.
+        if explicit_proxy_options && !groups.contains(&ToolGroup::Web) {
+            return Err(CliError::ProxyOptionRequiresWeb);
+        }
         if !groups.contains(&ToolGroup::Shell)
             && (explicit_shell_options || shell_policy_file.is_some() || yolo)
         {
@@ -486,6 +532,7 @@ impl RawOptions {
             groups,
             allow_write: self.allow_write,
             web_icons,
+            proxy,
             shell_policy_file,
             yolo,
             shell_output_filter,
@@ -503,6 +550,82 @@ impl RawOptions {
             max_transfer_bytes,
         })
     }
+}
+
+/// Resolve the outbound proxy for web tools.
+///
+/// Conventional variables are honored so a sandbox that already exports them to
+/// every guest process does not need Workcell-specific wiring. They are read
+/// exactly once, here: the shell tool changes only its children's environment,
+/// never this process's, so the selection cannot be influenced at runtime.
+///
+/// A malformed value is a startup error rather than a fall back to direct. Under
+/// an enforcing sandbox, silently dialling around the proxy is the one outcome
+/// that looks like an egress bypass.
+fn resolve_proxy(
+    environment: &StartupEnvironment,
+    explicit: Option<&str>,
+    explicit_bypass: Option<&str>,
+    disabled: bool,
+) -> Result<ProxyConfiguration, CliError> {
+    resolve_proxy_with(
+        |name| environment_value(environment, name),
+        explicit,
+        explicit_bypass,
+        disabled,
+    )
+}
+
+fn resolve_proxy_with<F>(
+    mut read: F,
+    explicit: Option<&str>,
+    explicit_bypass: Option<&str>,
+    disabled: bool,
+) -> Result<ProxyConfiguration, CliError>
+where
+    F: FnMut(&str) -> Result<Option<String>, CliError>,
+{
+    if disabled {
+        return Ok(ProxyConfiguration::direct());
+    }
+    let bypass = match explicit_bypass {
+        Some(value) => Some(value.to_owned()),
+        None => first_value(
+            &mut read,
+            &["WORKCELL_MCP_NO_PROXY", "NO_PROXY", "no_proxy"],
+        )?,
+    };
+    let configured = match explicit {
+        Some(value) => Some(value.to_owned()),
+        None => first_value(&mut read, &["WORKCELL_MCP_HTTP_PROXY"])?,
+    };
+    if let Some(value) = configured {
+        return ProxyConfiguration::from_values(None, None, Some(&value), bypass.as_deref())
+            .map_err(|_| CliError::InvalidProxy);
+    }
+    // Per-scheme values win over the catch-all, and uppercase wins over lower.
+    let all = first_value(&mut read, &["ALL_PROXY", "all_proxy"])?;
+    let http = first_value(&mut read, &["HTTP_PROXY", "http_proxy"])?;
+    let https = first_value(&mut read, &["HTTPS_PROXY", "https_proxy"])?;
+    ProxyConfiguration::from_values(
+        http.as_deref(),
+        https.as_deref(),
+        all.as_deref(),
+        bypass.as_deref(),
+    )
+    .map_err(|_| CliError::InvalidProxy)
+}
+
+fn first_value<F>(read: &mut F, names: &[&str]) -> Result<Option<String>, CliError>
+where
+    F: FnMut(&str) -> Result<Option<String>, CliError>,
+{
+    for name in names {
+        if let Some(value) = read(name)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn default_code_worker_cache() -> Option<PathBuf> {
@@ -721,6 +844,141 @@ mod tests {
             RawOptions::try_parse_from(["workcell-mcp", "--tool-group", "web", "--web-icons"])
                 .unwrap();
         assert!(raw.resolve(&environment).unwrap().web_icons);
+    }
+
+    fn proxy_from(values: &[(&str, &str)]) -> Result<ProxyConfiguration, CliError> {
+        resolve_proxy_with(
+            |name| {
+                Ok(values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned()))
+            },
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn proxies(configuration: &ProxyConfiguration, url: &str) -> bool {
+        !matches!(
+            configuration.route(&url::Url::parse(url).unwrap()),
+            workcell_mcp_web::ProxyRoute::Direct
+        )
+    }
+
+    /// A sandbox exports the conventional variables to every guest process, so
+    /// honoring them is what makes the web tools work under egress enforcement.
+    #[test]
+    fn conventional_environment_variables_configure_the_proxy() {
+        let configuration = proxy_from(&[("HTTPS_PROXY", "http://proxy.internal:8080")]).unwrap();
+        assert!(proxies(&configuration, "https://example.com/"));
+        assert!(!proxies(&configuration, "http://example.com/"));
+
+        let configuration = proxy_from(&[("ALL_PROXY", "http://proxy.internal:8080")]).unwrap();
+        assert!(proxies(&configuration, "https://example.com/"));
+        assert!(proxies(&configuration, "http://example.com/"));
+
+        let configuration = proxy_from(&[("https_proxy", "http://proxy.internal:8080")]).unwrap();
+        assert!(proxies(&configuration, "https://example.com/"));
+
+        assert!(proxy_from(&[]).unwrap().is_direct());
+    }
+
+    #[test]
+    fn proxy_resolution_follows_a_fixed_precedence() {
+        let bypassed = proxy_from(&[
+            ("HTTPS_PROXY", "http://ambient.internal:8080"),
+            ("NO_PROXY", "internal.example.com"),
+        ])
+        .unwrap();
+        assert!(!proxies(&bypassed, "https://internal.example.com/"));
+        assert!(proxies(&bypassed, "https://example.com/"));
+
+        // A Workcell-specific value overrides the ambient environment entirely.
+        let workcell = proxy_from(&[
+            ("HTTPS_PROXY", "http://ambient.internal:8080"),
+            ("WORKCELL_MCP_HTTP_PROXY", "http://chosen.internal:3128"),
+            ("NO_PROXY", "example.com"),
+            ("WORKCELL_MCP_NO_PROXY", "other.example.com"),
+        ])
+        .unwrap();
+        assert!(proxies(&workcell, "https://example.com/"));
+        assert!(!proxies(&workcell, "https://other.example.com/"));
+
+        // An explicit flag outranks every variable, and the opt-out outranks it.
+        let flag = resolve_proxy_with(
+            |_| Ok(Some("http://ambient.internal:8080".to_owned())),
+            Some("http://flag.internal:3128"),
+            Some("flagged.example.com"),
+            false,
+        )
+        .unwrap();
+        assert!(!proxies(&flag, "https://flagged.example.com/"));
+        assert!(proxies(&flag, "https://example.com/"));
+
+        let disabled = resolve_proxy_with(
+            |_| Ok(Some("http://ambient.internal:8080".to_owned())),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(disabled.is_direct());
+    }
+
+    /// Falling back to a direct dial would look like an egress bypass attempt
+    /// to an enforcing sandbox, so an unusable value stops startup instead.
+    #[test]
+    fn an_unusable_proxy_value_fails_startup() {
+        for values in [
+            [("HTTPS_PROXY", "socks5://proxy.internal:1080")],
+            [("ALL_PROXY", "not a url")],
+            [("WORKCELL_MCP_HTTP_PROXY", "ftp://proxy.internal")],
+        ] {
+            assert_eq!(proxy_from(&values).unwrap_err(), CliError::InvalidProxy);
+        }
+        assert_eq!(
+            proxy_from(&[
+                ("HTTPS_PROXY", "http://proxy.internal:8080"),
+                ("NO_PROXY", "10.0.0.0/99"),
+            ])
+            .unwrap_err(),
+            CliError::InvalidProxy
+        );
+    }
+
+    #[test]
+    fn proxy_flags_require_the_web_group_and_stay_redacted() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "files",
+            "--http-proxy",
+            "http://proxy.internal:8080",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::ProxyOptionRequiresWeb
+        );
+
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--tool-group",
+            "web",
+            "--http-proxy",
+            "http://operator:hunter2@proxy.internal:8080",
+        ])
+        .unwrap();
+        let options = raw.resolve(&environment).unwrap();
+        assert!(!options.proxy.is_direct());
+        let rendered = format!("{options:?}");
+        assert!(rendered.contains("proxy: \"[CONFIGURED]\""));
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("proxy.internal"));
     }
 
     #[test]

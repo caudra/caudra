@@ -16,7 +16,9 @@ use crate::types::{
     WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode, WebsearchInput,
     WebsearchOutput,
 };
-use crate::{WebToolDependencies, WebsearchBackend, WebsearchExecutionConfiguration};
+use crate::{
+    ProxyConfiguration, WebToolDependencies, WebsearchBackend, WebsearchExecutionConfiguration,
+};
 
 pub struct PreparedWebsearch {
     pub permission_query: String,
@@ -81,6 +83,20 @@ impl WebToolGroup {
         configuration: WebsearchExecutionConfiguration,
         source_icons_enabled: bool,
     ) -> Self {
+        Self::production_with_proxy(
+            configuration,
+            source_icons_enabled,
+            &ProxyConfiguration::direct(),
+        )
+    }
+
+    /// Construct production dependencies that route egress through `proxy`.
+    #[must_use]
+    pub fn production_with_proxy(
+        configuration: WebsearchExecutionConfiguration,
+        source_icons_enabled: bool,
+        proxy: &ProxyConfiguration,
+    ) -> Self {
         Self {
             configuration: Arc::new(RwLock::new(WebsearchConfigurationState {
                 fallback: configuration.clone(),
@@ -88,7 +104,7 @@ impl WebToolGroup {
                 source: WebsearchConfigurationSource::Environment,
                 revision: 0,
             })),
-            dependencies: WebToolDependencies::production_with_source_icons(source_icons_enabled),
+            dependencies: WebToolDependencies::production_with_proxy(source_icons_enabled, proxy),
         }
     }
 

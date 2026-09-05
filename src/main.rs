@@ -45,6 +45,8 @@ async fn main() -> ExitCode {
         tool_groups = ?options.groups.iter().map(|group| group.as_str()).collect::<Vec<_>>(),
         allow_write = options.allow_write,
         web_icons = options.web_icons,
+        // Only the presence of a proxy is disclosed; its URL is operator topology.
+        outbound_proxy = !options.proxy.is_direct(),
         shell_policy_configured = options.shell_policy_file.is_some(),
         shell_yolo = options.yolo,
         // The worker path is operator configuration and is never logged, only its presence.

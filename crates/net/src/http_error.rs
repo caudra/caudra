@@ -17,7 +17,10 @@ pub enum NetError {
     EmptyDnsAnswer(String),
     /// The one-hop transport failed.
     #[error(transparent)]
-    Transport(#[from] TransportError),
+    Transport(TransportError),
+    /// The configured outbound proxy refused or could not complete the hop.
+    #[error("outbound proxy request failed: {0}")]
+    Proxy(String),
     /// A redirect omitted `Location` or exceeded the configured hop count.
     #[error("invalid redirect: {0}")]
     Redirect(String),
@@ -27,6 +30,17 @@ pub enum NetError {
     /// The caller cancelled the operation.
     #[error("network operation was cancelled")]
     Cancelled,
+}
+
+/// A proxy refusal is a policy decision, so it is reported as its own variant
+/// rather than an anonymous transport failure the caller would retry.
+impl From<TransportError> for NetError {
+    fn from(error: TransportError) -> Self {
+        if error.is_proxy() {
+            return Self::Proxy(error.to_string());
+        }
+        Self::Transport(error)
+    }
 }
 
 impl NetError {

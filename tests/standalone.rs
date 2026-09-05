@@ -12,7 +12,7 @@ use workcell_mcp::{
 };
 use workcell_mcp_code::{CodeConfiguration, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
-use workcell_mcp_web::WebsearchExecutionConfiguration;
+use workcell_mcp_web::{ProxyConfiguration, WebsearchExecutionConfiguration};
 
 const ACCEPT: &str = "application/json, text/event-stream";
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -54,6 +54,7 @@ async fn fixture_server_with_options(
             allow_write: false,
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
+            proxy: ProxyConfiguration::direct(),
             shell_policy,
             shell_output_filter: true,
             code: CodeConfiguration {
@@ -1044,6 +1045,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             allow_write: true,
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
+            proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
             code: CodeConfiguration {
@@ -1145,6 +1147,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                 allow_write,
                 web: WebsearchExecutionConfiguration::unconfigured(),
                 web_icons: false,
+                proxy: ProxyConfiguration::direct(),
                 shell_policy: ShellPermissionPolicy::restricted(),
                 shell_output_filter: true,
                 code: CodeConfiguration {
@@ -1204,6 +1207,7 @@ async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_cre
             allow_write: true,
             web: WebsearchExecutionConfiguration::unconfigured(),
             web_icons: false,
+            proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
             code: CodeConfiguration {

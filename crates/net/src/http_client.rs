@@ -9,8 +9,8 @@ use url::Url;
 
 use crate::deadline::sleep_until_or_cancel;
 use crate::{
-    DnsResolver, HttpTransport, NetError, ReqwestTransport, RetryPolicy, TokioDnsResolver,
-    UrlPolicy,
+    DnsResolver, HttpTransport, NetError, ProxyConfiguration, ReqwestTransport, RetryPolicy,
+    TokioDnsResolver, UrlPolicy,
 };
 
 const DEFAULT_MAX_REDIRECTS: usize = 5;
@@ -68,6 +68,7 @@ pub struct HttpClient {
     pub(crate) policy: UrlPolicy,
     pub(crate) resolver: Arc<dyn DnsResolver>,
     pub(crate) transport: Arc<dyn HttpTransport>,
+    pub(crate) proxy: ProxyConfiguration,
 }
 
 impl Default for HttpClient {
@@ -98,7 +99,19 @@ impl HttpClient {
             policy,
             resolver,
             transport,
+            proxy: ProxyConfiguration::direct(),
         }
+    }
+
+    /// Route matching hops through an operator-configured outbound proxy.
+    ///
+    /// Hostname, scheme, credential, and IP-literal policy still apply. What a
+    /// proxied hop gives up is local resolution and connector pinning, because
+    /// the proxy performs the lookup and therefore owns the address decision.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: ProxyConfiguration) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// Return the URL policy used for initial and redirect targets.

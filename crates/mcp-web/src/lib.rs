@@ -43,6 +43,8 @@ pub use types::{
     TimeRange, WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfAttachment,
     WebfetchPdfMode, WebsearchInput, WebsearchOutput, WebsearchResult,
 };
+// Re-exported so a host configuring outbound egress needs only this crate.
+pub use workcell_net::{ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint, ProxyRoute};
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 
 /// Stable crate marker retained for consumers that used the scaffold.

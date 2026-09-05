@@ -9,8 +9,8 @@ use http::{HeaderMap, Method, StatusCode};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use workcell_net::{
-    FetchOptions, HttpClient, NetError, OperatorConfiguredPolicy, ReqwestTransport, RetryPolicy,
-    TokioDnsResolver, UrlPolicy,
+    FetchOptions, HttpClient, NetError, OperatorConfiguredPolicy, ProxyConfiguration, ProxyRoute,
+    ReqwestTransport, RetryPolicy, TokioDnsResolver, UrlPolicy,
 };
 
 /// Trust/policy mode for an injected HTTP request.
@@ -97,6 +97,8 @@ pub enum WebHttpError {
     Rejected(String),
     #[error("provider redirect was rejected")]
     RedirectRejected,
+    #[error("the outbound proxy refused the request")]
+    ProxyRejected,
     #[error("HTTP request failed")]
     RequestFailed,
 }
@@ -108,11 +110,12 @@ pub trait WebHttpTransport: Send + Sync {
 
 /// Production adapter. Public and operator GETs use `workcell-net`; only the
 /// provider-owned fixed HTTPS origins use reqwest directly because they require
-/// no-proxy/no-redirect handling or methods outside the current bounded GET API.
+/// redirect handling or methods outside the current bounded GET API.
 #[derive(Clone)]
 pub struct ProductionWebHttpTransport {
     public: HttpClient,
     operator: HttpClient,
+    proxy: ProxyConfiguration,
 }
 
 impl Default for ProductionWebHttpTransport {
@@ -124,6 +127,12 @@ impl Default for ProductionWebHttpTransport {
 impl ProductionWebHttpTransport {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_proxy(ProxyConfiguration::direct())
+    }
+
+    /// Route every outbound web request through an operator-configured proxy.
+    #[must_use]
+    pub fn with_proxy(proxy: ProxyConfiguration) -> Self {
         let operator = HttpClient::new(
             UrlPolicy::OperatorConfigured(OperatorConfiguredPolicy {
                 allow_non_public_ips: true,
@@ -132,10 +141,12 @@ impl ProductionWebHttpTransport {
             }),
             Arc::new(TokioDnsResolver),
             Arc::new(ReqwestTransport),
-        );
+        )
+        .with_proxy(proxy.clone());
         Self {
-            public: HttpClient::public_internet(),
+            public: HttpClient::public_internet().with_proxy(proxy.clone()),
             operator,
+            proxy,
         }
     }
 
@@ -169,7 +180,10 @@ impl ProductionWebHttpTransport {
         })
     }
 
-    async fn pinned_provider(request: WebHttpRequest) -> Result<WebHttpResponse, WebHttpError> {
+    async fn pinned_provider(
+        &self,
+        request: WebHttpRequest,
+    ) -> Result<WebHttpResponse, WebHttpError> {
         if request.url.scheme() != "https"
             || request.url.host().is_none()
             || !request.url.username().is_empty()
@@ -181,13 +195,18 @@ impl ProductionWebHttpTransport {
             return Err(WebHttpError::RequestFailed);
         }
         // These are fixed provider-controlled origins, not model-selected URLs.
-        // Automatic redirects and environment proxies remain disabled so the
-        // API key cannot be forwarded to an attacker-selected destination.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| WebHttpError::RequestFailed)?;
+        // Automatic redirects and ambient environment proxies remain disabled so
+        // the API key cannot be forwarded to an attacker-selected destination.
+        // A configured proxy is an operator decision, and because these origins
+        // are HTTPS it observes only the CONNECT target, never the credential.
+        let route = self.proxy.route(&request.url);
+        let proxied = matches!(route, ProxyRoute::Proxy(_));
+        let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let builder = match route {
+            ProxyRoute::Proxy(endpoint) => endpoint.apply(builder),
+            ProxyRoute::Direct => builder.no_proxy(),
+        };
+        let client = builder.build().map_err(|_| WebHttpError::RequestFailed)?;
         let operation = async {
             let mut builder = client
                 .request(request.method, request.url.clone())
@@ -195,10 +214,13 @@ impl ProductionWebHttpTransport {
             if let Some(body) = request.body {
                 builder = builder.body(body);
             }
-            let response = builder
-                .send()
-                .await
-                .map_err(|_| WebHttpError::RequestFailed)?;
+            let response = builder.send().await.map_err(|error| {
+                if proxied && error.is_connect() {
+                    WebHttpError::ProxyRejected
+                } else {
+                    WebHttpError::RequestFailed
+                }
+            })?;
             if response.status().is_redirection() {
                 return Err(WebHttpError::RedirectRejected);
             }
@@ -242,7 +264,7 @@ impl WebHttpTransport for ProductionWebHttpTransport {
         match request.kind {
             WebHttpRequestKind::PublicGet => Self::get(&self.public, request).await,
             WebHttpRequestKind::OperatorGet => Self::get(&self.operator, request).await,
-            WebHttpRequestKind::PinnedProvider => Self::pinned_provider(request).await,
+            WebHttpRequestKind::PinnedProvider => self.pinned_provider(request).await,
         }
     }
 }
@@ -252,6 +274,7 @@ fn map_net_error(error: NetError) -> WebHttpError {
         NetError::Cancelled => WebHttpError::Cancelled,
         NetError::Timeout => WebHttpError::Timeout,
         NetError::Policy(error) => WebHttpError::Rejected(error.to_string()),
+        NetError::Proxy(_) => WebHttpError::ProxyRejected,
         _ => WebHttpError::RequestFailed,
     }
 }

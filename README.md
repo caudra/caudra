@@ -302,6 +302,35 @@ Source-icon resolution is disabled by default for both `websearch` and `webfetch
 `--web-icons` or `WORKCELL_WEB_ICONS=true`. Opting in may issue additional requests to result/page
 origins and embeds verified `iconUrl` and `iconDataUrl` fields in structured output.
 
+### Outbound proxy
+
+Web tools honor the conventional proxy environment, so a sandbox that permits egress only through an
+enforcing proxy needs no Workcell-specific configuration. Every outbound path is covered: `webfetch`,
+every `websearch` backend, and source icons.
+
+| Setting | Effect |
+| --- | --- |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` | Per-scheme proxy; the per-scheme value wins over `ALL_PROXY`, and uppercase wins over lowercase |
+| `NO_PROXY` | Comma-separated bypass list: `*`, domains and their subdomains, IP literals, and `10.0.0.0/8`-style blocks |
+| `WORKCELL_MCP_HTTP_PROXY`, `WORKCELL_MCP_NO_PROXY` | Workcell-specific values that override the ambient environment |
+| `--http-proxy`, `--no-proxy` | Flags that override every variable |
+| `--no-http-proxy` | Ignore all of the above and dial directly |
+
+Values are read once at startup, so a shell command cannot change the selection: it alters only its
+own children's environment. A malformed proxy value stops startup rather than falling back to a
+direct dial, because under enforcement that fallback would look like an egress bypass. Only `http`
+and `https` proxies are supported; `socks5` is rejected explicitly.
+
+A proxied request is not resolved locally. Workcell still rejects non-HTTP schemes, URL credentials,
+`localhost` and other special-use names, and non-public IP literals before contacting the proxy, but
+the address decision for a hostname — including DNS rebinding defense — belongs to the proxy. Use one
+that re-checks the resolved address before dialling. Hosts matched by a bypass rule keep the full
+direct path, including resolution and connector pinning.
+
+TLS is verified through the platform verifier, so an intercepting proxy needs its CA in the
+container's trust store. Without interception, a proxy sees only `CONNECT host:443` for HTTPS
+targets and never a search provider's API key.
+
 Use `--env-file path/to/server.env` to load defaults. Configuration precedence is CLI, process
 environment, selected dotenv file, then built-in defaults. Secret values are redacted from debug
 representations and logs.
@@ -812,7 +841,8 @@ content.
 
 - `url` is required and must use HTTP or HTTPS. Public HTTP input is upgraded to HTTPS before the
   request. Every resolved address and up to five redirect targets are checked against outbound URL,
-  DNS, and SSRF policy.
+  DNS, and SSRF policy. Under a configured proxy the hostname is resolved by the proxy instead, and
+  the URL, scheme, credential, special-use-name, and IP-literal checks still run locally.
 - `format` accepts `markdown`, `text`, or `html` and defaults to `markdown`. For HTML pages, Markdown and
   text modes use readability-oriented extraction and remove scripts, styles, iframes, and framework
   payloads. HTML mode returns bounded raw HTML while still deriving safe title and extraction metadata.

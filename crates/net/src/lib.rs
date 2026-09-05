@@ -15,6 +15,7 @@ mod dns;
 mod http_client;
 mod http_error;
 mod policy;
+mod proxy;
 mod redirect;
 mod retry;
 mod transport;
@@ -25,16 +26,19 @@ mod classification_property_tests;
 mod http_client_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod proxy_tests;
 
 pub use classification::{HostClassification, IpClassification, classify_hostname, classify_ip};
 pub use dns::{DnsError, DnsResolver, TokioDnsResolver};
 pub use http_client::{BoundedResponse, FetchOptions, HttpClient};
 pub use http_error::NetError;
 pub use policy::{OperatorConfiguredPolicy, UrlPolicy, UrlPolicyError};
+pub use proxy::{ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint, ProxyRoute};
 pub use retry::{RetryPolicy, retry_after_delay};
 pub use transport::{
     BodyStream, HttpTransport, ReqwestTransport, TransportError, TransportRequest,
-    TransportResponse,
+    TransportResponse, TransportRoute,
 };
 
 /// The user agent used by generic Workcell network operations.

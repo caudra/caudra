@@ -15,10 +15,15 @@ SSRF protection is a per-hop operation, not a one-time string check. `HttpClient
 - body streaming
 - retries, deadlines, and cancellation
 
-The production transport disables automatic redirects and environment proxies. Each redirect is parsed,
-resolved, revalidated, and connected through the reviewed addresses. Cross-origin redirects rebuild
-headers from a safe allowlist so authorization, cookies, API keys, and custom credential headers are not
-forwarded.
+The production transport disables automatic redirects and ambient environment proxy detection. Each
+redirect is parsed, resolved, revalidated, and connected through the reviewed addresses. Cross-origin
+redirects rebuild headers from a safe allowlist so authorization, cookies, API keys, and custom
+credential headers are not forwarded.
+
+The route for each hop is chosen before any I/O. A direct hop resolves the hostname and pins every
+approved answer into the connector. A proxied hop does neither, because the proxy performs the lookup
+and therefore owns the address decision. `TransportRoute` makes that difference explicit so a direct
+hop can never reach the wire without pinned addresses.
 
 ## Public API
 
@@ -34,6 +39,8 @@ The main types are:
 | `HttpTransport`            | Injectable wire transport; production uses `ReqwestTransport`.                   |
 | `RetryPolicy`              | Bounded retry and backoff behavior.                                              |
 | `BoundedResponse`          | Status, headers, final URL, bounded body, and truncation state.                  |
+| `ProxyConfiguration`       | Immutable per-scheme proxy selection with `NO_PROXY`-style bypass rules.         |
+| `TransportRoute`           | Whether a hop is dialled directly with pinned addresses or through a proxy.      |
 
 `HttpClient::public_internet()` is the default for model- or user-selected URLs. Operator-configured
 policy is reserved for endpoints selected by trusted process configuration, such as a local SearXNG
@@ -49,6 +56,18 @@ instance.
 - Resolves all addresses and fails if any answer violates policy.
 - Pins validated addresses into the production connector.
 - Repeats validation for every redirect hop.
+
+## Proxied Hops
+
+`HttpClient::with_proxy` routes matching hops through an operator-configured proxy. Under an enforcing
+sandbox the guest cannot resolve names at all, so local resolution would fail closed before the proxy
+was ever reached.
+
+Every DNS-free check above still applies: scheme, URL credentials, special-use hostnames, and IP
+literals are rejected locally, before the proxy is contacted. What a proxied hop delegates is the
+address decision for a hostname, including rebinding defense. Deploy this only with a proxy that
+re-checks the resolved address before dialling. Hosts matched by a bypass rule keep the full direct
+path, resolution and pinning included.
 
 ## Resource Bounds
 

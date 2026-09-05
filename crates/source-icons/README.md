@@ -46,6 +46,8 @@ intermediate layers are bounded before publication.
 ## Network and Work Bounds
 
 - All DNS answers and redirects use `workcell-net` policy.
+- An `HttpClient` configured with a proxy carries that selection into icon requests, so they are not
+  the one outbound path an enforcing sandbox still drops.
 - Declared candidates, fallback candidates, path segments, URL length, fetch operations, redirects, and
   total wall time are bounded.
 - Icon requests disable retries and permit at most two redirects.

@@ -39,13 +39,14 @@ Search provider selection is immutable process configuration, never model-contro
 - Credentialed SearXNG endpoints require HTTPS.
 - Credential-free operator endpoints may intentionally resolve to private addresses.
 - Exa MCP calls only the fixed `https://mcp.exa.ai/mcp` origin with `web_search_exa`. It sends no
-  credential, disables redirects and environment proxies, bounds JSON/SSE parsing, ignores remote MCP
-  metadata, and normalizes only strict result fields. Search queries leave the process boundary.
+  credential, disables redirects and ambient environment proxies, bounds JSON/SSE parsing, ignores
+  remote MCP metadata, and normalizes only strict result fields. Search queries leave the process
+  boundary.
 - Direct Exa API remains available with an API key, a separate backend identity, a fixed HTTPS
   endpoint, and no credential forwarding to another origin.
 - Brave uses its provider-owned Web Search endpoint with `X-Subscription-Token`, no redirects, and no
-  environment proxy. Country, language, pagination, freshness, and safe-search values are lowered to
-  Brave-native query parameters.
+  ambient environment proxy. Country, language, pagination, freshness, and safe-search values are
+  lowered to Brave-native query parameters.
 - Kagi calls Kagi's first-party raw Search API with a bearer credential, exact JSON lowering, and no redirects.
 - SerpApi is an optional scraping intermediary. Its operator-selected Google or Bing engine is not
   official Google or Bing API access. Redirects are disabled and credentials remain confined to the
@@ -65,6 +66,10 @@ Search provider selection is immutable process configuration, never model-contro
 
 - Only HTTP and HTTPS inputs are accepted; plain HTTP input is upgraded before public execution.
 - Every DNS answer and redirect target is checked by `workcell-net` public-internet policy.
+- With `WebToolGroup::production_with_proxy`, every outbound path in this crate honors the operator's
+  proxy: webfetch, all search backends including the pinned provider origins, and source icons.
+  Because provider origins are HTTPS, a non-intercepting proxy sees only the CONNECT target and never
+  an API key. A proxied hop delegates address policy to the proxy, as described in `crates/net`.
 - General responses are limited to 5 MiB and PDFs to 6 MiB.
 - HTML supports raw HTML, readability-derived Markdown, and text extraction with bounded fallbacks.
 - Scripts, styles, iframes, and framework payloads are removed from extracted output.

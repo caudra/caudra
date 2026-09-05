@@ -4,7 +4,8 @@ mod icons;
 
 use std::sync::Arc;
 
-use workcell_net::{OperatorConfiguredPolicy, UrlPolicy};
+use workcell_net::{HttpClient, OperatorConfiguredPolicy, ProxyConfiguration, UrlPolicy};
+use workcell_source_icons::SourceIconResolver;
 
 use crate::pdf::{NativePdfExtractor, PdfExtractor};
 
@@ -40,9 +41,21 @@ impl WebToolDependencies {
 
     #[must_use]
     pub fn production_with_source_icons(source_icons_enabled: bool) -> Self {
+        Self::production_with_proxy(source_icons_enabled, &ProxyConfiguration::direct())
+    }
+
+    /// Production dependencies whose every outbound path honors `proxy`.
+    ///
+    /// Source icons are included deliberately: they are ordinary egress, and
+    /// leaving them direct would make icon lookups the one request an enforcing
+    /// sandbox still drops.
+    #[must_use]
+    pub fn production_with_proxy(source_icons_enabled: bool, proxy: &ProxyConfiguration) -> Self {
+        let icons =
+            SourceIconResolver::new(HttpClient::public_internet().with_proxy(proxy.clone()));
         Self {
-            http: Arc::new(ProductionWebHttpTransport::new()),
-            icons: Arc::new(ProductionIconProvider::default()),
+            http: Arc::new(ProductionWebHttpTransport::with_proxy(proxy.clone())),
+            icons: Arc::new(ProductionIconProvider::new(icons)),
             clock: Arc::new(SystemClock),
             pdf: Arc::new(NativePdfExtractor),
             webfetch_policy: UrlPolicy::PublicInternet,

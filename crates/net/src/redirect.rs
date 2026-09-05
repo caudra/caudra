@@ -8,8 +8,8 @@ use url::{Host, Url};
 use crate::body::read_bounded_body;
 use crate::deadline::{remaining, run_until};
 use crate::{
-    BoundedResponse, FetchOptions, HttpClient, NetError, TransportRequest, TransportResponse,
-    UrlPolicyError,
+    BoundedResponse, FetchOptions, HttpClient, NetError, ProxyRoute, TransportRequest,
+    TransportResponse, TransportRoute, UrlPolicyError,
 };
 
 const MAX_REDIRECTS: usize = 20;
@@ -77,12 +77,20 @@ impl HttpClient {
         // Every hop gets a fresh policy and DNS check. Validating only the first
         // URL would allow an otherwise public endpoint to redirect into a LAN.
         self.policy.validate_url(url)?;
-        let addresses = self.resolve_target(url, deadline, cancellation).await?;
+        // The route is decided per hop, not per operation: a redirect onto a
+        // bypassed host is dialled directly and pinned, and a redirect off one
+        // goes to the proxy.
+        let route = match self.proxy.route(url) {
+            ProxyRoute::Proxy(endpoint) => TransportRoute::Proxy { endpoint },
+            ProxyRoute::Direct => TransportRoute::Direct {
+                resolved_addresses: self.resolve_target(url, deadline, cancellation).await?,
+            },
+        };
         let request = TransportRequest {
             method: Method::GET,
             url: url.clone(),
             headers: headers.clone(),
-            resolved_addresses: addresses,
+            route,
             timeout: remaining(deadline)?,
         };
         Ok(run_until(deadline, cancellation, self.transport.execute(request)).await??)

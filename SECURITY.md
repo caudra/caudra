@@ -17,7 +17,24 @@ at `https://mcp.exa.ai/mcp`. A search call sends the query and network metadata 
 boundary. Exa is a third-party availability, privacy, terms, and supply-chain dependency and may apply
 anonymous rate limits. Set `WORKCELL_WEBSEARCH_BACKEND=disabled` to retain `webfetch` without search
 egress, or configure another backend. Workcell uses a fixed HTTPS origin, disables redirects and
-environment proxies, bounds responses, and treats remote MCP content and metadata as untrusted data.
+ambient environment proxies, bounds responses, and treats remote MCP content and metadata as
+untrusted data.
+
+Web tools honor an operator-configured outbound proxy, taken from the conventional proxy environment
+or from `--http-proxy`/`WORKCELL_MCP_HTTP_PROXY`, and covering `webfetch`, every `websearch` backend,
+and source icons. The selection is a startup snapshot: it is read once, and because a shell command
+changes only its own children's environment, no tool call can influence it. A malformed value stops
+startup instead of falling back to a direct dial.
+
+A proxied request is not resolved by Workcell. Scheme, URL-credential, special-use-hostname, and
+IP-literal policy still reject targets locally before the proxy is contacted, but the address
+decision for a hostname, including DNS rebinding defense, is delegated to the proxy. Deploy this only
+with a proxy that re-checks the resolved address before dialling. Hosts matched by a bypass rule keep
+the full direct path, including resolution and connector pinning.
+
+Provider origins are HTTPS, so a non-intercepting proxy observes only the `CONNECT` target and never a
+search credential. An intercepting proxy trusted by the container's certificate store terminates TLS
+and can read provider credentials and fetched content; that is an operator decision.
 
 Source-icon lookup is disabled by default. `--web-icons` or `WORKCELL_WEB_ICONS=true` opts in for both
 web tools and may issue additional page, icon-link, and fallback favicon requests to public origins.

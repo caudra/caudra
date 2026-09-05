@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     BodyStream, DnsError, DnsResolver, FetchOptions, HttpClient, HttpTransport, NetError,
-    OperatorConfiguredPolicy, RetryPolicy, TransportError, TransportRequest, TransportResponse,
-    UrlPolicy, UrlPolicyError,
+    OperatorConfiguredPolicy, ProxyConfiguration, RetryPolicy, TransportError, TransportRequest,
+    TransportResponse, TransportRoute, UrlPolicy, UrlPolicyError,
 };
 
 #[derive(Default)]
@@ -76,6 +76,13 @@ fn response(status: StatusCode, headers: HeaderMap, chunks: &[&'static [u8]]) ->
     }
 }
 
+fn pinned_addresses(request: &TransportRequest) -> Vec<IpAddr> {
+    match &request.route {
+        TransportRoute::Direct { resolved_addresses } => resolved_addresses.clone(),
+        TransportRoute::Proxy { .. } => panic!("expected a direct route"),
+    }
+}
+
 fn fixture(dns: FakeDns, responses: Vec<TransportResponse>) -> (HttpClient, Arc<FakeTransport>) {
     let transport = Arc::new(FakeTransport {
         responses: Mutex::new(responses.into_iter().map(Ok).collect()),
@@ -118,8 +125,8 @@ async fn follows_redirects_manually_and_revalidates_each_dns_answer() {
     let requests = transport.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[0].resolved_addresses,
-        requests[1].resolved_addresses
+        pinned_addresses(&requests[0]),
+        pinned_addresses(&requests[1])
     );
 }
 
@@ -413,4 +420,128 @@ async fn operator_policy_can_reach_injected_local_service() {
         .await
         .unwrap();
     assert_eq!(response.body, Bytes::from_static(b"ok"));
+}
+
+fn proxy_fixture(
+    bypass: Option<&str>,
+    dns: FakeDns,
+    responses: Vec<TransportResponse>,
+) -> (HttpClient, Arc<FakeTransport>) {
+    let (client, transport) = fixture(dns, responses);
+    let proxy =
+        ProxyConfiguration::from_values(None, None, Some("http://proxy.internal:8080"), bypass)
+            .unwrap();
+    (client.with_proxy(proxy), transport)
+}
+
+#[tokio::test]
+async fn a_proxied_hop_never_resolves_the_target_itself() {
+    // The whole point of proxy support: under enforcement the guest cannot
+    // resolve, so a lookup here would fail closed before the proxy is reached.
+    let dns = FakeDns::default();
+    let (client, transport) = proxy_fixture(
+        None,
+        dns,
+        vec![response(StatusCode::OK, HeaderMap::new(), &[b"body"])],
+    );
+    let result = client
+        .get("https://example.com/page", FetchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.body, Bytes::from_static(b"body"));
+
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0].route, TransportRoute::Proxy { .. }));
+}
+
+#[tokio::test]
+async fn a_bypassed_host_still_resolves_and_pins_every_answer() {
+    let dns = public_dns(&["internal.example.com"]);
+    let (client, transport) = proxy_fixture(
+        Some("internal.example.com"),
+        dns,
+        vec![response(StatusCode::OK, HeaderMap::new(), &[b"body"])],
+    );
+    client
+        .get("https://internal.example.com/page", FetchOptions::default())
+        .await
+        .unwrap();
+
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(
+        pinned_addresses(&requests[0]),
+        vec!["93.184.216.34".parse::<IpAddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn each_redirect_hop_selects_its_own_route() {
+    let mut redirect_headers = HeaderMap::new();
+    redirect_headers.insert(
+        http::header::LOCATION,
+        HeaderValue::from_static("https://cdn.example.org/icon.png"),
+    );
+    let (client, transport) = proxy_fixture(
+        Some("example.com"),
+        public_dns(&["example.com"]),
+        vec![
+            response(StatusCode::FOUND, redirect_headers, &[]),
+            response(StatusCode::OK, HeaderMap::new(), &[b"icon"]),
+        ],
+    );
+    client
+        .get("https://example.com/start", FetchOptions::default())
+        .await
+        .unwrap();
+
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests[0].route, TransportRoute::Direct { .. }));
+    assert!(matches!(requests[1].route, TransportRoute::Proxy { .. }));
+}
+
+#[tokio::test]
+async fn dns_free_policy_still_rejects_local_targets_under_a_proxy() {
+    for target in [
+        "http://localhost/admin",
+        "http://127.0.0.1/admin",
+        "http://[::1]/admin",
+        "http://169.254.169.254/latest/meta-data",
+    ] {
+        let (client, transport) = proxy_fixture(None, FakeDns::default(), vec![]);
+        let result = client.get(target, FetchOptions::default()).await;
+        assert!(
+            matches!(result, Err(NetError::Policy(_))),
+            "expected {target} to be rejected locally"
+        );
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_proxy_refusal_is_reported_as_policy_and_never_retried() {
+    let transport = Arc::new(FakeTransport {
+        responses: Mutex::new(VecDeque::from([
+            Err(TransportError::proxy(
+                "outbound proxy refused the connection",
+            )),
+            Ok(response(StatusCode::OK, HeaderMap::new(), &[b"body"])),
+        ])),
+        requests: Mutex::default(),
+    });
+    let client = HttpClient::new(
+        UrlPolicy::PublicInternet,
+        Arc::new(FakeDns::default()),
+        transport.clone(),
+    )
+    .with_proxy(
+        ProxyConfiguration::from_values(None, None, Some("http://proxy.internal:8080"), None)
+            .unwrap(),
+    );
+    let result = client
+        .get("https://example.com/page", FetchOptions::default())
+        .await;
+    assert!(matches!(result, Err(NetError::Proxy(_))));
+    assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
