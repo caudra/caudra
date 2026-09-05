@@ -950,6 +950,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt(wb::FIND_NEXT.label, wb::FIND_PREV.label),
+        description: "Next / previous match, with or without the find bar",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Multi(&[wb::COPY.label, wb::CUT.label, wb::PASTE.label]),
         description: "Copy / cut / paste",
         context: KeybindContext::WorkbenchEditor,

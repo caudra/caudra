@@ -56,6 +56,8 @@ pub const REVERT: Bind = bind!(KeyCode::Char('r'), CTRL, "Ctrl+R");
 pub const UNDO: Bind = bind!(KeyCode::Char('z'), CTRL, "Ctrl+Z");
 pub const REDO: Bind = bind!(KeyCode::Char('y'), CTRL, "Ctrl+Y");
 pub const FIND: Bind = bind!(KeyCode::Char('f'), CTRL, "Ctrl+F");
+pub const FIND_NEXT: Bind = bind!(KeyCode::F(3), NONE, "F3");
+pub const FIND_PREV: Bind = bind!(KeyCode::F(3), KeyModifiers::SHIFT, "Shift+F3");
 pub const GOTO_LINE: Bind = bind!(KeyCode::Char('g'), CTRL, "Ctrl+G");
 pub const SELECT_ALL: Bind = bind!(KeyCode::Char('a'), CTRL, "Ctrl+A");
 pub const KILL_LINE: Bind = bind!(KeyCode::Char('k'), CTRL, "Ctrl+K");
@@ -102,6 +104,8 @@ const GLOBAL_BINDS: &[Bind] = &[
     UNDO,
     REDO,
     FIND,
+    FIND_NEXT,
+    FIND_PREV,
     GOTO_LINE,
     SELECT_ALL,
     KILL_LINE,

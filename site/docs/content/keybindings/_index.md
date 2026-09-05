@@ -147,6 +147,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Editor | `Ctrl+R` | Discard edits and take what is on disk |
 | Workbench Editor | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | Workbench Editor | `Ctrl+F` / `Ctrl+G` | Find in file / go to line |
+| Workbench Editor | `F3` / `Shift+F3` | Next / previous match, with or without the find bar |
 | Workbench Editor | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | Workbench Editor | `Ctrl+A` | Select the whole buffer |
 | Workbench Editor | `Ctrl+K` | Delete to the end of the line |

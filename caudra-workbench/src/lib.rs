@@ -1070,6 +1070,22 @@ impl Workbench {
             self.focus = Focus::Editor;
             return Some(WorkbenchAction::Consumed);
         }
+        for (bind, delta) in [(keys::FIND_NEXT, 1), (keys::FIND_PREV, -1)] {
+            if bind.matches(key) {
+                let tab = self.editor.active_mut()?;
+                // Closing the bar drops the matches, so stepping from a closed
+                // one has to rescan before there is anything left to step to.
+                if tab.find.current().is_none() {
+                    let query = tab.find.query().to_owned();
+                    tab.set_find_query(query);
+                }
+                if let Some(found) = tab.find.step(delta) {
+                    tab.buffer.set_cursor(found.cursor(), false);
+                    self.follow_cursor();
+                }
+                return Some(WorkbenchAction::Consumed);
+            }
+        }
         if keys::GOTO_LINE.matches(key) {
             self.editor.active()?;
             self.goto = Some(String::new());
@@ -1767,6 +1783,7 @@ mod tests {
     const SELECTION_UNCOPIED: &str = "a finished selection never reached the clipboard";
     const IDLE_CLICK_COPIED: &str = "a press that selected nothing copied anyway";
     const KEPT_CLIPBOARD: &str = "what was copied before";
+    const NOT_STEPPED: &str = "the find keys did not walk to the match they were pointed at";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1868,6 +1885,10 @@ mod tests {
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         (dir, workbench)
+    }
+
+    fn cursor(workbench: &Workbench) -> Cursor {
+        workbench.editor.active().expect(NO_TAB).buffer.cursor()
     }
 
     /// Puts the cursor on `a.txt`, which is what the editing tests want open.
@@ -2134,6 +2155,34 @@ mod tests {
             workbench.editor.active().expect(NO_TAB).buffer.line_count() == 3,
             "closing find must not have typed into the buffer"
         );
+    }
+
+    /// `a.txt` holds three `e`s: one in `one` and two in `three`.
+    #[test]
+    fn f3_walks_the_matches_with_the_find_bar_closed() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(keys::FIND.code, KeyModifiers::CONTROL));
+        workbench.handle_key(key(KeyCode::Char('e')));
+        workbench.handle_key(key(KeyCode::Esc));
+        assert_eq!(cursor(&workbench), Cursor::new(0, 2), "{NOT_STEPPED}");
+
+        workbench.handle_key(key(keys::FIND_NEXT.code));
+        assert_eq!(cursor(&workbench), Cursor::new(2, 3), "{NOT_STEPPED}");
+        workbench.handle_key(key(keys::FIND_NEXT.code));
+        assert_eq!(cursor(&workbench), Cursor::new(2, 4), "{NOT_STEPPED}");
+        workbench.handle_key(KeyEvent::new(keys::FIND_PREV.code, KeyModifiers::SHIFT));
+        assert_eq!(cursor(&workbench), Cursor::new(2, 3), "{NOT_STEPPED}");
+    }
+
+    #[test]
+    fn f3_without_a_query_holds_still() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+
+        let action = workbench.handle_key(key(keys::FIND_NEXT.code));
+        assert_eq!(action, WorkbenchAction::Consumed);
+        assert_eq!(cursor(&workbench), Cursor::default(), "{NOT_STEPPED}");
     }
 
     #[test]
