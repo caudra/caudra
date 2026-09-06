@@ -868,8 +868,10 @@ impl Workbench {
         self.reveal_active();
     }
 
+    /// Held to the same modal rule as a left press: a question about one tab
+    /// cannot be answered by closing another one behind it.
     fn close_under(&mut self, at: (u16, u16)) {
-        if !self.panes.tabs.contains(at.into()) {
+        if self.confirm.is_some() || !self.panes.tabs.contains(at.into()) {
             return;
         }
         if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) {
@@ -4468,6 +4470,23 @@ mod tests {
         workbench.handle_mouse(middle_click(tabs.x + 1, tabs.y));
 
         assert!(workbench.editor.tabs().is_empty(), "{WRONG_CLICK}");
+    }
+
+    #[test]
+    fn a_middle_click_cannot_close_a_tab_behind_the_dialog() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('x')));
+        workbench.open_path(&dir.path().join("sub/b.txt"));
+        draw(&mut workbench, 80, 24);
+        let tabs = workbench.panes.tabs;
+        workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
+        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+
+        workbench.handle_mouse(middle_click(close_column(&workbench, 1), tabs.y));
+
+        assert_eq!(workbench.editor.tabs().len(), 2, "{MODAL_LEAKED}");
+        assert_eq!(workbench.confirm, Some(Choice::Save), "{MODAL_LEAKED}");
     }
 
     #[test_case(SidebarView::SourceControl ; "the second segment switches to source control")]
