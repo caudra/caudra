@@ -634,6 +634,19 @@ mod tests {
         assert_eq!(sizes(EDIT, &fragments), [FIRST_STEP, SECOND_STEP]);
     }
 
+    /// The case that left the header empty: an ordinary edit swaps a few lines
+    /// for a few lines, and neither side reaches the floor alone. The old side
+    /// also arrives first, so counting only the new one reports nothing until
+    /// the stream is nearly over.
+    #[test]
+    fn an_ordinary_edit_is_counted_across_both_sides() {
+        let fragments = [
+            r#"{"filePath": "a.rs", "oldString": "one\ntwo\nthree""#,
+            r#", "newString": "1\n2\n3"}"#,
+        ];
+        assert_eq!(sizes(EDIT, &fragments), [FIRST_STEP]);
+    }
+
     #[test]
     fn a_body_is_published_as_it_is_decoded() {
         let fragments = [r#"{"filePath": "a.rs", "content": "fn x"#, r#"() {}"}"#];

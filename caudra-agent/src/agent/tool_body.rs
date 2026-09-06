@@ -26,28 +26,31 @@ const LIVE_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Digits in a `\uXXXX` escape.
 const UNICODE_ESCAPE_DIGITS: u8 = 4;
 
-/// The tool, the one argument it spends its whole stream writing, and whether
-/// a card can draw that argument before the call runs. Every other tool leads
-/// with a path, a pattern or a query, and has nothing long enough to be worth
-/// showing or counting.
+/// The tool, the arguments it spends its whole stream writing, and whether a
+/// card can draw them before the call runs. Every other tool leads with a
+/// path, a pattern or a query, and has nothing long enough to be worth showing
+/// or counting.
 ///
-/// An edit counts only the side it is adding: the side it is replacing arrives
-/// first and says nothing about the size of the change.
-const BODY_ARGS: &[(&str, &str, bool)] = &[
-    ("file_write", "content", true),
-    ("file_edit", "newString", false),
-    ("file_apply_patch", "patchText", false),
+/// An edit counts both of its sides. The count answers how long the wait is,
+/// not how big the change is, and the side being replaced is half of that
+/// wait: it arrives first, so counting only the new side leaves the header
+/// empty until the last stretch of the stream, and empty for good on every
+/// edit whose replacement is shorter than the floor `size_label` applies.
+const BODY_ARGS: &[(&str, &[&str], bool)] = &[
+    ("file_write", &["content"], true),
+    ("file_edit", &["oldString", "newString"], false),
+    ("file_apply_patch", &["patchText"], false),
 ];
 
-/// The argument `tool` writes and whether it is published, `None` for a tool
-/// with no body. Names are matched the way [`super::tool_preview`] matches
-/// them, so `mcp_File_write` and `file_write` resolve alike.
-fn body_arg(tool: &str) -> Option<(&'static str, bool)> {
+/// The arguments `tool` writes and whether they are published, `None` for a
+/// tool with no body. Names are matched the way [`super::tool_preview`]
+/// matches them, so `mcp_File_write` and `file_write` resolve alike.
+fn body_arg(tool: &str) -> Option<(&'static [&'static str], bool)> {
     candidates(tool).find_map(|rest| {
         BODY_ARGS
             .iter()
             .find(|(name, ..)| same_key(name, rest))
-            .map(|(_, key, publish)| (*key, *publish))
+            .map(|(_, keys, publish)| (*keys, *publish))
     })
 }
 
@@ -139,11 +142,11 @@ enum State {
 /// The body of one tool call as its argument fragments arrive, retaining only
 /// what has not been handed to the caller yet.
 pub(super) struct BodyStream {
-    key: &'static str,
+    keys: &'static [&'static str],
     publish: bool,
     state: State,
     string: StringReader,
-    /// The member name being read, against [`Self::key`].
+    /// The member name being read, against [`Self::keys`].
     member: String,
     newlines: usize,
     /// Decoded bytes handed out so far, against [`LIVE_BODY_MAX_BYTES`].
@@ -153,9 +156,9 @@ pub(super) struct BodyStream {
 impl BodyStream {
     /// `None` for a tool with no body worth reading.
     pub(super) fn new(tool: &str) -> Option<Self> {
-        let (key, publish) = body_arg(tool)?;
+        let (keys, publish) = body_arg(tool)?;
         Some(Self {
-            key,
+            keys,
             publish,
             state: State::Open,
             string: StringReader::default(),
@@ -216,7 +219,7 @@ impl BodyStream {
             State::Value => {
                 self.string = StringReader::default();
                 match c {
-                    '"' => match same_key(self.key, &self.member) {
+                    '"' => match self.keys.iter().any(|key| same_key(key, &self.member)) {
                         true => State::Body,
                         false => State::SkipString(0),
                     },
@@ -268,9 +271,9 @@ mod tests {
     const WRITE: &str = "file_write";
     const EDIT: &str = "file_edit";
     const PATCH: &str = "file_apply_patch";
-    const CONTENT_KEY: &str = "content";
-    const NEW_STRING_KEY: &str = "newString";
-    const PATCH_TEXT_KEY: &str = "patchText";
+    const CONTENT_KEYS: &[&str] = &["content"];
+    const EDIT_KEYS: &[&str] = &["oldString", "newString"];
+    const PATCH_TEXT_KEYS: &[&str] = &["patchText"];
 
     /// Everything the fragments published, in arrival order.
     fn published(tool: &str, fragments: &[&str]) -> String {
@@ -290,12 +293,12 @@ mod tests {
         stream
     }
 
-    #[test_case(WRITE, Some((CONTENT_KEY, true)) ; "a_write_publishes_its_content")]
-    #[test_case("mcp_File_write", Some((CONTENT_KEY, true)) ; "a_qualified_name_resolves")]
-    #[test_case(EDIT, Some((NEW_STRING_KEY, false)) ; "an_edit_reads_its_new_side_only")]
-    #[test_case(PATCH, Some((PATCH_TEXT_KEY, false)) ; "a_patch_reads_its_envelope")]
+    #[test_case(WRITE, Some((CONTENT_KEYS, true)) ; "a_write_publishes_its_content")]
+    #[test_case("mcp_File_write", Some((CONTENT_KEYS, true)) ; "a_qualified_name_resolves")]
+    #[test_case(EDIT, Some((EDIT_KEYS, false)) ; "an_edit_reads_both_sides")]
+    #[test_case(PATCH, Some((PATCH_TEXT_KEYS, false)) ; "a_patch_reads_its_envelope")]
     #[test_case("shell", None ; "a_tool_with_no_body")]
-    fn a_tools_body_argument(tool: &str, expected: Option<(&str, bool)>) {
+    fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], bool)>) {
         assert_eq!(body_arg(tool), expected);
         assert_eq!(BodyStream::new(tool).is_some(), expected.is_some());
     }
@@ -382,12 +385,23 @@ mod tests {
         assert_eq!(counted(EDIT, &fragments).lines(), 2);
     }
 
-    /// The side being replaced arrives first and says nothing about the size
-    /// of the change, so counting it would make the header jump.
+    /// The side being replaced is half the wait, and it arrives first. An edit
+    /// counting only its new side reports nothing until the last stretch of
+    /// the stream, and nothing at all when the replacement is short: this is
+    /// the case that left the header empty on an ordinary edit.
     #[test]
-    fn an_edits_old_side_is_not_counted() {
-        let stream = counted(EDIT, &[r#"{"oldString": "one\ntwo\nthree", "#]);
-        assert_eq!(stream.lines(), 1);
+    fn an_edits_two_sides_are_counted_together() {
+        let old = counted(EDIT, &[r#"{"oldString": "one\ntwo\nthree"#]);
+        assert_eq!(old.lines(), 3);
+
+        let both = counted(
+            EDIT,
+            &[
+                r#"{"oldString": "one\ntwo\nthree""#,
+                r#", "newString": "1\n2\n3"}"#,
+            ],
+        );
+        assert_eq!(both.lines(), 5);
     }
 
     #[test]
