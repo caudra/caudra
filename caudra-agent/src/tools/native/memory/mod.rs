@@ -8,6 +8,10 @@
 mod notes;
 pub mod paths;
 
+/// Re-exported so the `/memory` picker renders counts through the same
+/// formatter the tool output uses, rather than growing its own.
+pub use notes::token_label;
+
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -193,7 +197,7 @@ fn string_field(input: &Value, name: &str) -> Option<String> {
 /// appears once per tag, which is how the picker groups them.
 pub struct BrowseEntry {
     pub name: String,
-    pub size: u64,
+    pub tokens: u32,
     pub tag: String,
     /// Notes sharing this tag, for the group header.
     pub tag_count: usize,
@@ -218,9 +222,9 @@ fn browse_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> (Vec<BrowseEntry>, 
             group
                 .files
                 .into_iter()
-                .map(move |(name, size)| BrowseEntry {
+                .map(move |(name, tokens)| BrowseEntry {
                     name,
-                    size,
+                    tokens,
                     tag: tag.clone(),
                     tag_count: count,
                 })
@@ -350,8 +354,8 @@ impl MemoryCall {
         let mut lines = Vec::new();
         for group in &matching {
             lines.push(format!("{} ({})", group.tag, group.files.len()));
-            for (name, size) in &group.files {
-                lines.push(format!("  - {name} ({size} bytes)"));
+            for (name, tokens) in &group.files {
+                lines.push(format!("  - {name} ({})", notes::token_label(*tokens)));
             }
             lines.push(String::new());
         }
@@ -371,7 +375,7 @@ impl MemoryCall {
             .filter(|n| n.tags.iter().any(|t| wanted.contains(t)))
         {
             match fs::read_to_string(dir.join(&note.name)) {
-                Ok(content) => entries.push(notes::format_entry(&note.name, note.size, &content)),
+                Ok(content) => entries.push(notes::format_entry(&note.name, &content)),
                 Err(error) => read_warnings.push(format!("{}: {error}", note.name)),
             }
         }
@@ -400,7 +404,7 @@ impl MemoryCall {
         let content = fs::read_to_string(&path).map_err(|error| format!("read error: {error}"))?;
         let name = self.path.clone().unwrap_or_default();
         Ok(notes::cap(
-            notes::format_entry(&name, content.len() as u64, &content),
+            notes::format_entry(&name, &content),
             notes::CAP_HINT_REWRITE,
         ))
     }
@@ -677,7 +681,10 @@ mod tests {
         }
         let out = run(json!({ "command": "list" }), temp.path()).unwrap();
         assert!(out.contains("shared (2)"), "{out}");
-        assert!(out.contains("  - a.md"), "{out}");
+        assert!(
+            out.contains(&format!("  - a.md ({})", notes::token_label(1))),
+            "{out}"
+        );
     }
 
     #[test]

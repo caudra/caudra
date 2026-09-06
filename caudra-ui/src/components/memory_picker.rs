@@ -4,7 +4,7 @@
 //! it. The tag is the section header, so the list reads as the same index the
 //! system prompt advertises.
 
-use caudra_agent::tools::native::memory::BrowseEntry;
+use caudra_agent::tools::native::memory::{self, BrowseEntry};
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -214,7 +214,7 @@ fn build_items(entries: Vec<BrowseEntry>) -> Vec<MemoryItem> {
         .into_iter()
         .map(|entry| MemoryItem {
             name: entry.name,
-            detail: format!("({} bytes)", entry.size),
+            detail: format!("({})", memory::token_label(entry.tokens)),
             section: format!("{} ({})", entry.tag, entry.tag_count),
         })
         .collect()
@@ -229,7 +229,7 @@ mod tests {
     fn entry(name: &str, tag: &str, tag_count: usize) -> BrowseEntry {
         BrowseEntry {
             name: name.into(),
-            size: 10,
+            tokens: 10,
             tag: tag.into(),
             tag_count,
         }
@@ -246,7 +246,7 @@ mod tests {
         let items = build_items(vec![entry("a.md", "arch", 3)]);
         assert_eq!(items[0].section(), Some("arch (3)"));
         assert_eq!(items[0].label(), "a.md");
-        assert_eq!(items[0].detail(), Some("(10 bytes)"));
+        assert_eq!(items[0].detail(), Some("(~10 tokens)"));
     }
 
     #[test]

@@ -6,8 +6,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use caudra_providers::{estimate_tokens, format_tokens};
 
 pub const MAX_TAGS: usize = 50;
 pub const MAX_FILE_BYTES: usize = 20 * 1024;
@@ -25,10 +27,13 @@ const READ_REJECT_PREFIX: &str = "warning: ignored invalid tag(s): ";
 const UNREADABLE_PREFIX: &str = "warning: unreadable memory files: ";
 const UNTAGGED: &str = "untagged";
 const FRONTMATTER_FENCE: &str = "---";
+/// Marks the count as an estimate: o200k is exact only for OpenAI models.
+const TOKEN_ESTIMATE_MARKER: &str = "~";
+const TOKEN_SUFFIX: &str = " tokens";
 
 pub struct Note {
     pub name: String,
-    pub size: u64,
+    pub tokens: u32,
     pub tags: Vec<String>,
 }
 
@@ -36,7 +41,7 @@ pub struct Note {
 /// tag line leads with the ones worth reusing.
 pub struct TagGroup {
     pub tag: String,
-    pub files: Vec<(String, u64)>,
+    pub files: Vec<(String, u32)>,
 }
 
 /// Coerces rather than rejects: any run of non-alphanumerics becomes `_`.
@@ -190,58 +195,75 @@ pub fn scan(dir: &Path, cache: &mut TagCache) -> (Vec<Note>, Vec<String>) {
 
     let (mut notes, mut warnings) = (Vec::new(), Vec::new());
     for (name, size, mtime) in files {
-        match cache.tags(dir, &name, size, mtime) {
-            Ok(tags) => notes.push(Note { name, size, tags }),
+        match cache.measure(dir, &name, size, mtime) {
+            Ok((tags, tokens)) => notes.push(Note { name, tokens, tags }),
             Err(error) => warnings.push(format!("{name}: {error}")),
         }
     }
     (notes, warnings)
 }
 
-/// Keyed on size and mtime so an unchanged file is never re-read. Failures are
-/// never cached: a transient error must not pin a stem tag forever.
+/// Keyed on size and mtime so an unchanged file is never re-read, which also
+/// keeps it from being re-tokenized. Failures are never cached: a transient
+/// error must not pin a stem tag forever.
 #[derive(Default)]
 pub struct TagCache {
-    entries: BTreeMap<std::path::PathBuf, (u64, SystemTime, Vec<String>)>,
+    entries: BTreeMap<PathBuf, CacheEntry>,
+}
+
+struct CacheEntry {
+    size: u64,
+    mtime: SystemTime,
+    tags: Vec<String>,
+    tokens: u32,
 }
 
 impl TagCache {
-    fn tags(
+    fn measure(
         &mut self,
         dir: &Path,
         name: &str,
         size: u64,
         mtime: Option<SystemTime>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, u32), String> {
         let path = dir.join(name);
         if let Some(mtime) = mtime
-            && let Some((cached_size, cached_mtime, tags)) = self.entries.get(&path)
-            && *cached_size == size
-            && *cached_mtime == mtime
+            && let Some(cached) = self.entries.get(&path)
+            && cached.size == size
+            && cached.mtime == mtime
         {
-            return Ok(tags.clone());
+            return Ok((cached.tags.clone(), cached.tokens));
         }
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        let (frontmatter, _) = parse_frontmatter(&content);
+        let (frontmatter, body) = parse_frontmatter(&content);
         let tags =
             tags_from_frontmatter(frontmatter.as_ref()).unwrap_or_else(|| vec![stem_tag(name)]);
+        let tokens = estimate_tokens(body);
         if let Some(mtime) = mtime {
-            self.entries.insert(path, (size, mtime, tags.clone()));
+            self.entries.insert(
+                path,
+                CacheEntry {
+                    size,
+                    mtime,
+                    tags: tags.clone(),
+                    tokens,
+                },
+            );
         }
-        Ok(tags)
+        Ok((tags, tokens))
     }
 }
 
 /// Most-used tag first so the prompt's truncated tag line keeps the tags that
 /// actually organize the project; name breaks ties for a stable order.
 pub fn group_by_tag(notes: &[Note]) -> Vec<TagGroup> {
-    let mut by_tag: BTreeMap<&str, Vec<(String, u64)>> = BTreeMap::new();
+    let mut by_tag: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
     for note in notes {
         for tag in &note.tags {
             by_tag
                 .entry(tag)
                 .or_default()
-                .push((note.name.clone(), note.size));
+                .push((note.name.clone(), note.tokens));
         }
     }
     let mut groups: Vec<_> = by_tag
@@ -290,7 +312,19 @@ pub fn encode_frontmatter(tags: &[String]) -> String {
     format!("---\n{yaml}---\n")
 }
 
-pub fn format_entry(name: &str, size: u64, content: &str) -> String {
+/// Renders an estimated token count. The marker is not decoration: o200k is
+/// exact only for OpenAI models, so the number is an estimate everywhere else.
+pub fn token_label(tokens: u32) -> String {
+    format!(
+        "{TOKEN_ESTIMATE_MARKER}{}{TOKEN_SUFFIX}",
+        format_tokens(tokens)
+    )
+}
+
+/// Counts the body rather than the file: frontmatter is stripped here and never
+/// reaches the model, so charging the reader for it would overstate every
+/// tagged note.
+pub fn format_entry(name: &str, content: &str) -> String {
     let (frontmatter, body) = parse_frontmatter(content);
     let tags = tags_from_frontmatter(frontmatter.as_ref()).unwrap_or_default();
     let suffix = if tags.is_empty() {
@@ -298,7 +332,7 @@ pub fn format_entry(name: &str, size: u64, content: &str) -> String {
     } else {
         format!(" [{}]", tags.join(", "))
     };
-    format!("{name} ({size} bytes){suffix}\n\n{body}")
+    format!("{name} ({}){suffix}\n\n{body}", token_label(estimate_tokens(body)))
 }
 
 pub fn join_parts(separator: &str, parts: &[Option<String>]) -> String {
@@ -454,8 +488,9 @@ mod tests {
     }
 
     /// Re-reading every note on every prompt build would make the tag line cost
-    /// scale with the project's history. Driven through the cache directly so
-    /// the test controls the mtime instead of racing the filesystem clock.
+    /// scale with the project's history, and would re-tokenize every body.
+    /// Driven through the cache directly so the test controls the mtime
+    /// instead of racing the filesystem clock.
     #[test]
     fn a_note_with_an_unchanged_stamp_is_not_reread() {
         let temp = tempfile::tempdir().unwrap();
@@ -464,22 +499,26 @@ mod tests {
         let size = std::fs::metadata(temp.path().join("a.md")).unwrap().len();
         let mut cache = TagCache::default();
         assert_eq!(
-            cache.tags(temp.path(), "a.md", size, Some(stamp)).unwrap(),
-            vec!["first"]
+            cache
+                .measure(temp.path(), "a.md", size, Some(stamp))
+                .unwrap(),
+            (vec!["first".to_owned()], 1)
         );
 
-        write_note(temp.path(), "a.md", "---\ntags: [secnd]\n---\nx");
+        write_note(temp.path(), "a.md", "---\ntags: [secnd]\n---\nlonger body here");
         assert_eq!(
-            cache.tags(temp.path(), "a.md", size, Some(stamp)).unwrap(),
-            vec!["first"],
-            "same size and stamp must not trigger a re-read"
+            cache
+                .measure(temp.path(), "a.md", size, Some(stamp))
+                .unwrap(),
+            (vec!["first".to_owned()], 1),
+            "same size and stamp must not trigger a re-read or a re-count"
         );
         assert_eq!(
             cache
-                .tags(temp.path(), "a.md", size, Some(SystemTime::now()))
+                .measure(temp.path(), "a.md", size, Some(SystemTime::now()))
                 .unwrap(),
-            vec!["secnd"],
-            "a new stamp must invalidate"
+            (vec!["secnd".to_owned()], estimate_tokens("longer body here")),
+            "a new stamp must invalidate both the tags and the count"
         );
     }
 
@@ -489,11 +528,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut cache = TagCache::default();
         let stamp = SystemTime::UNIX_EPOCH;
-        assert!(cache.tags(temp.path(), "gone.md", 1, Some(stamp)).is_err());
+        assert!(
+            cache
+                .measure(temp.path(), "gone.md", 1, Some(stamp))
+                .is_err()
+        );
         write_note(temp.path(), "gone.md", "---\ntags: [back]\n---\nx");
         assert_eq!(
-            cache.tags(temp.path(), "gone.md", 1, Some(stamp)).unwrap(),
-            vec!["back"]
+            cache
+                .measure(temp.path(), "gone.md", 1, Some(stamp))
+                .unwrap(),
+            (vec!["back".to_owned()], 1)
         );
     }
 
@@ -524,13 +569,38 @@ mod tests {
     }
 
     #[test]
-    fn a_formatted_entry_leads_with_its_name_size_and_tags() {
-        let entry = format_entry("a.md", 42, "---\ntags: [arch]\n---\nbody");
-        assert_eq!(entry, "a.md (42 bytes) [arch]\n\nbody");
+    fn a_formatted_entry_leads_with_its_name_token_count_and_tags() {
+        let entry = format_entry("a.md", "---\ntags: [arch]\n---\nbody");
+        assert_eq!(entry, format!("a.md ({}) [arch]\n\nbody", token_label(1)));
     }
 
     #[test]
     fn an_untagged_entry_omits_the_bracket() {
-        assert_eq!(format_entry("a.md", 4, "body"), "a.md (4 bytes)\n\nbody");
+        assert_eq!(
+            format_entry("a.md", "body"),
+            format!("a.md ({})\n\nbody", token_label(1))
+        );
+    }
+
+    /// Frontmatter is stripped before the model sees the note, so a bulky
+    /// header must not inflate the advertised cost of a small body.
+    #[test]
+    fn a_formatted_entry_counts_the_body_without_the_frontmatter() {
+        let tags: Vec<String> = (0..40).map(|i| format!("tag_number_{i}")).collect();
+        let content = format!("{}body", encode_frontmatter(&tags));
+        assert!(content.len() > 400, "frontmatter should dwarf the body");
+        assert_eq!(estimate_tokens("body"), 1);
+        assert!(
+            format_entry("a.md", &content).contains(&format!("a.md ({})", token_label(1))),
+            "{content}"
+        );
+    }
+
+    #[test_case(0, "~0 tokens" ; "an_empty_note_reports_zero")]
+    #[test_case(999, "~999 tokens" ; "counts_below_a_thousand_stay_exact")]
+    #[test_case(1_000, "~1.0k tokens" ; "a_thousand_switches_to_the_k_suffix")]
+    #[test_case(1_304, "~1.3k tokens" ; "larger_counts_round_to_one_decimal")]
+    fn token_label_formats(tokens: u32, expected: &str) {
+        assert_eq!(token_label(tokens), expected);
     }
 }

@@ -7,6 +7,7 @@ pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+pub mod tokens;
 pub(crate) mod types;
 
 pub use caudra_storage::sessions::add_cost;
@@ -33,6 +34,7 @@ pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::openai::images as openai_images;
 pub use providers::xai::auth as xai_auth;
+pub use tokens::estimate_tokens;
 pub use types::{
     ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, ImageMediaType,
     ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent, ProviderUsage,

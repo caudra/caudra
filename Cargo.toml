@@ -122,6 +122,7 @@ strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+tiktoken-rs = "0.12"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson", "hybrid", "unicode-perl", "unicode-word-boundary"] }
 gix = { version = "0.87", default-features = false, features = [
     "sha1",
