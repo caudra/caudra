@@ -47,6 +47,7 @@ The workbench takes the mouse the way an IDE does.
 | Click a source control header | Fold or unfold that section |
 | Click `+` or `-` on a source control row | Stage or unstage that path |
 | Click `↗` on a staged file | Open the file instead of its diff |
+| Click `↺` twice on an unstaged file | Discard its changes |
 | Drag a source control header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
@@ -112,7 +113,7 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 
 Each header carries a chevron, a title, and how many rows the section holds. `Space` on a header stages or unstages every path the section lists, so one press empties `CHANGES` into `STAGED CHANGES`.
 
-Resting the pointer on a row brings up what it can do, to the left of the git letter. A row under `CHANGES` offers `+` to stage it, and one under `STAGED CHANGES` offers `-` to unstage it. Both work on a folder as well as a file, and on the header, where they cover the whole section. A staged file also offers `↗`, which opens the file itself rather than the diff a plain click gives you.
+Resting the pointer on a row brings up what it can do, to the left of the git letter. A row under `CHANGES` offers `+` to stage it, and one under `STAGED CHANGES` offers `-` to unstage it. Both work on a folder as well as a file, and on the header, where they cover the whole section. A staged file also offers `↗`, which opens the file itself rather than the diff a plain click gives you. An unstaged file offers `↺`, which discards its changes. That one is destructive, so it takes two clicks: the first says what it is about to throw away in the status row, and anything else you click cancels it.
 
 Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Ctrl+X ↑` and `Ctrl+X ↓` do the same from the keyboard.
 
@@ -129,7 +130,7 @@ Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first par
 | `Left` / `Right` | Fold and unfold a folder or a section |
 | `Ctrl+X ↑` / `Ctrl+X ↓` | Resize the section the cursor is in |
 
-Diffs and commits open as read-only tabs. Discarding is destructive, asks for a second press of the same key, and works on one file at a time even when the cursor is on a folder.
+Diffs and commits open as read-only tabs. Discarding is destructive, asks for a second press of the same key or a second click of `↺`, and works on one file at a time even when the cursor is on a folder.
 
 Caudra reads and writes the repository directly with [gix](https://github.com/GitoxideLabs/gitoxide), so nothing here shells out to `git`. Staging works on whole files. Hunk-level staging, committing, and branch operations are not part of this view, so use the terminal or ask the agent.
 

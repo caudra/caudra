@@ -71,6 +71,7 @@ pub(crate) const MORE_RIGHT: &str = "\u{203a}";
 pub(crate) const STAGE_MARK: &str = "+";
 pub(crate) const UNSTAGE_MARK: &str = "-";
 pub(crate) const OPEN_MARK: &str = "\u{2197}";
+pub(crate) const REVERT_MARK: &str = "\u{21ba}";
 const CONTROL_GAP: &str = " ";
 /// One control and the gap in front of it, which is the step both the painted
 /// strip and [`control_at`] take.
@@ -80,6 +81,7 @@ const CONTROL_WIDTH: u16 = CONTROL_GAP.len() as u16 + 1;
 const CHANGE_TRAILING: u16 = 2;
 const STAGE_ONLY: [Control; 1] = [Control::Stage];
 const OPEN_AND_STAGE: [Control; 2] = [Control::Open, Control::Stage];
+const REVERT_AND_STAGE: [Control; 2] = [Control::Revert, Control::Stage];
 const SCROLLBAR_WIDTH: u16 = 1;
 /// Narrower than this and the bar would be all there is left of the pane.
 const SCROLLBAR_MIN_WIDTH: u16 = 2;
@@ -883,11 +885,16 @@ pub(crate) enum Control {
     Open,
     /// Stages or unstages, which is one action read from where the row sits.
     Stage,
+    /// Throws the working tree's edits away, which only an unstaged change has
+    /// to throw.
+    Revert,
 }
 
 /// The controls a row offers, left to right, and the only description of them.
 /// `None` asks about the section header. A section that cannot be staged and a
-/// commit offer nothing, so nothing can be clicked on them either.
+/// commit offer nothing, so nothing can be clicked on them either. Only an
+/// unstaged file has working tree edits to throw away, and only a staged one
+/// keeps the working tree copy behind its diff.
 pub(crate) fn scm_controls(section: Section, row: Option<ScmRow>) -> &'static [Control] {
     if !section.is_changes() {
         return &[];
@@ -895,6 +902,7 @@ pub(crate) fn scm_controls(section: Section, row: Option<ScmRow>) -> &'static [C
     match row {
         Some(ScmRow::Commit(_)) => &[],
         Some(ScmRow::Change { .. }) if section == Section::Staged => &OPEN_AND_STAGE,
+        Some(ScmRow::Change { .. }) => &REVERT_AND_STAGE,
         _ => &STAGE_ONLY,
     }
 }
@@ -947,6 +955,7 @@ fn control_spans(staged: bool, controls: &[Control], style: Style) -> Vec<Span<'
         .map(|control| {
             let mark = match control {
                 Control::Open => OPEN_MARK,
+                Control::Revert => REVERT_MARK,
                 Control::Stage if staged => UNSTAGE_MARK,
                 Control::Stage => STAGE_MARK,
             };
@@ -1703,7 +1712,7 @@ mod tests {
 
     #[test_case(Section::Unstaged, None => vec![Control::Stage] ; "an unstaged header stages everything")]
     #[test_case(Section::Staged, None => vec![Control::Stage] ; "a staged header unstages everything")]
-    #[test_case(Section::Unstaged, Some(CHANGE) => vec![Control::Stage] ; "an unstaged file only stages")]
+    #[test_case(Section::Unstaged, Some(CHANGE) => vec![Control::Revert, Control::Stage] ; "an unstaged file also reverts")]
     #[test_case(Section::Staged, Some(CHANGE) => vec![Control::Open, Control::Stage] ; "a staged file also opens")]
     #[test_case(Section::Staged, Some(FOLDER) => vec![Control::Stage] ; "a folder never opens, having no file to open")]
     #[test_case(Section::Graph, None => Vec::<Control>::new() ; "the graph stages nothing")]

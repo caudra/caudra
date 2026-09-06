@@ -693,7 +693,9 @@ impl Workbench {
             let section = Section::ALL[index];
             self.focus = Focus::Sidebar;
             self.scm.select(section, None);
-            if let Some(control) = self.header_control(at, section, index) {
+            let control = self.header_control(at, section, index);
+            self.disarm_unless_revert(control);
+            if let Some(control) = control {
                 self.run_scm_control(control);
                 return true;
             }
@@ -709,6 +711,7 @@ impl Workbench {
         let row = self.scm.scroll(section) + (at.1 - body.y) as usize;
         let control = self.row_control(at, section, body, row);
         self.scm.select(section, Some(row));
+        self.disarm_unless_revert(control);
         if let Some(control) = control {
             self.run_scm_control(control);
             return true;
@@ -719,6 +722,14 @@ impl Workbench {
         }
         self.activate_scm();
         true
+    }
+
+    /// Cancels an armed discard, which every press but the one that confirms it
+    /// does, the same way every key but [`keys::DISCARD`] does.
+    fn disarm_unless_revert(&mut self, control: Option<Control>) {
+        if control != Some(Control::Revert) {
+            self.scm.disarm();
+        }
     }
 
     /// The control a press on a section header landed on, measured against the
@@ -756,6 +767,7 @@ impl Workbench {
     fn run_scm_control(&mut self, control: Control) {
         match control {
             Control::Stage => self.stage_selected(),
+            Control::Revert => self.discard_change(),
             Control::Open => {
                 let Some(path) = self.scm.selected_change().map(|change| change.path.clone())
                 else {
@@ -1553,8 +1565,9 @@ impl Workbench {
             Ok(scm::Discard::Nothing) => {}
             Ok(scm::Discard::Armed(relative)) => {
                 self.flash = Some(format!(
-                    "Press {} again to discard changes to {relative}",
-                    keys::DISCARD.label
+                    "Discard changes to {relative}? Press {} or click {} to confirm.",
+                    keys::DISCARD.label,
+                    view::REVERT_MARK,
                 ));
             }
             Ok(scm::Discard::Done(relative)) => {
@@ -1932,8 +1945,8 @@ mod tests {
     use crate::fs::tree::GitMark;
     use crate::search;
     use crate::view::{
-        Control, MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, OPEN_MARK, STAGE_MARK, TabHit,
-        UNSTAGE_MARK, confirm_at, header_at, mode_at, tab_at, toggle_at, visible_range,
+        Control, MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, OPEN_MARK, REVERT_MARK, STAGE_MARK,
+        TabHit, UNSTAGE_MARK, confirm_at, header_at, mode_at, tab_at, toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1946,7 +1959,7 @@ mod tests {
     use ratatui::style::Style;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1965,7 +1978,7 @@ mod tests {
     const CHANGE_MISSING: &str = "the change the test made is not under the cursor";
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
-    const DISCARD_UNARMED: &str = "a discard must take exactly two presses of the same key";
+    const DISCARD_UNARMED: &str = "a discard must take exactly two goes at the same row";
     const NO_HITS: &str = "the search did not find what the fixture put there";
     const WRONG_LINE: &str = "the editor did not land on the line the match was on";
     const STALE_RESULTS: &str = "the pane disagrees about whether its results are current";
@@ -2015,6 +2028,9 @@ mod tests {
     const WIDE_LINE_COLUMNS: usize = 400;
     /// Short enough to fit any pane here, so it never wraps itself.
     const SHORT_LINE: &str = "tail";
+    /// What [`repository`] commits, and so what a discard has to bring back.
+    const INDEXED_TEXT: &str = "one\ntwo\nthree\n";
+    const REWRITTEN_TEXT: &str = "ruined\n";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3017,7 +3033,7 @@ mod tests {
     fn repository() -> (TempDir, Workbench) {
         let dir = TempDir::new().expect("a temporary directory");
         gix::init(dir.path()).expect("a repository");
-        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("a file");
+        fs::write(dir.path().join("a.txt"), INDEXED_TEXT).expect("a file");
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
@@ -3196,7 +3212,7 @@ mod tests {
         let (dir, mut workbench) = repository();
         let path = dir.path().join("a.txt");
         workbench.handle_key(key(KeyCode::Char(' ')));
-        fs::write(&path, "ruined\n").expect("a rewritten file");
+        fs::write(&path, REWRITTEN_TEXT).expect("a rewritten file");
         workbench.handle_key(key(KeyCode::F(5)));
         workbench.handle_key(key(KeyCode::Down));
         assert_eq!(
@@ -3208,14 +3224,14 @@ mod tests {
         workbench.handle_key(key(KeyCode::Char('x')));
         assert_eq!(
             fs::read_to_string(&path).expect("the file"),
-            "ruined\n",
+            REWRITTEN_TEXT,
             "{DISCARD_UNARMED}"
         );
 
         workbench.handle_key(key(KeyCode::Char('x')));
         assert_eq!(
             fs::read_to_string(&path).expect("the file"),
-            "one\ntwo\nthree\n",
+            INDEXED_TEXT,
             "{DISCARD_UNARMED}"
         );
     }
@@ -3225,7 +3241,7 @@ mod tests {
         let (dir, mut workbench) = repository();
         let path = dir.path().join("a.txt");
         workbench.handle_key(key(KeyCode::Char(' ')));
-        fs::write(&path, "ruined\n").expect("a rewritten file");
+        fs::write(&path, REWRITTEN_TEXT).expect("a rewritten file");
         workbench.handle_key(key(KeyCode::F(5)));
         workbench.handle_key(key(KeyCode::Down));
 
@@ -3236,7 +3252,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&path).expect("the file"),
-            "ruined\n",
+            REWRITTEN_TEXT,
             "{DISCARD_UNARMED}"
         );
     }
@@ -3440,6 +3456,79 @@ mod tests {
                 .diff_kinds()
                 .is_none(),
             "{CONTROL_IGNORED}: a diff opened instead of the file"
+        );
+    }
+
+    /// A staged file rewritten underneath its index entry, which is the only
+    /// shape of change a revert has anything to restore from.
+    fn rewritten(workbench: &mut Workbench) -> PathBuf {
+        let path = workbench.root.join("a.txt");
+        workbench.scm.stage_path("a.txt").expect("staging");
+        fs::write(&path, REWRITTEN_TEXT).expect("a rewritten file");
+        workbench.scm.refresh();
+        draw(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        path
+    }
+
+    #[test]
+    fn an_unstaged_row_offers_to_throw_its_edits_away() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+
+        let painted = hovered_row(&mut workbench, Section::Unstaged, 0);
+
+        assert!(painted.contains(REVERT_MARK), "{NO_CONTROL}: {painted:?}");
+    }
+
+    #[test]
+    fn a_staged_row_offers_no_revert_having_nothing_unrecorded_to_lose() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+
+        let painted = hovered_row(&mut workbench, Section::Staged, 0);
+
+        assert!(
+            !painted.contains(REVERT_MARK),
+            "{STRAY_CONTROL}: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_revert_control_takes_two_clicks_and_restores_the_indexed_content() {
+        let (_dir, mut workbench) = repository();
+        let path = rewritten(&mut workbench);
+        let at = control_on_row(&workbench, Section::Unstaged, 0, Control::Revert);
+
+        workbench.handle_mouse(click(at.0, at.1));
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file"),
+            REWRITTEN_TEXT,
+            "{DISCARD_UNARMED}"
+        );
+
+        workbench.handle_mouse(click(at.0, at.1));
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file"),
+            INDEXED_TEXT,
+            "{DISCARD_UNARMED}"
+        );
+    }
+
+    #[test]
+    fn a_click_off_the_revert_control_cancels_it() {
+        let (_dir, mut workbench) = repository();
+        let path = rewritten(&mut workbench);
+        let at = control_on_row(&workbench, Section::Unstaged, 0, Control::Revert);
+        let header = header_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(click(at.0, at.1));
+        workbench.handle_mouse(click(header.x, header.y));
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file"),
+            REWRITTEN_TEXT,
+            "{DISCARD_UNARMED}"
         );
     }
 
