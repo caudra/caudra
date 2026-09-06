@@ -10,9 +10,13 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::app::App;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
+use crate::components::hover_style;
+use crate::components::input::top_right_hint_area;
 use crate::components::keybindings::leader;
 use crate::components::task_picker::TaskPickerAction;
 use crate::components::{Action, DisplayRole};
@@ -21,6 +25,8 @@ use crate::theme;
 
 pub(crate) const MAIN_TASK_ID: &str = "main";
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
+const TASK_HINT_PAD: &str = " ";
+const TASK_HINT_KEY_GAP: &str = " ";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -173,18 +179,50 @@ impl App {
 
     /// Opening a subagent puts its transcript where the main chat was, so this
     /// hint advertises the picker as the way back out to every other task.
-    pub(crate) fn task_hint_line(&self) -> Option<Line<'static>> {
+    ///
+    /// The hint renders right-aligned into [`top_right_hint_area`], so its hit
+    /// region is derived the same way rather than read back off the frame. The
+    /// padding on either side is separator rather than control, so it neither
+    /// takes the click nor lights up under the pointer. A region too narrow to
+    /// hold the hint leaves a zero-width rect, which no pointer can be inside.
+    pub(crate) fn task_hint(&self, area: Rect) -> Option<(Line<'static>, Rect)> {
         let count = self.task_states().count();
         if count == 0 {
             return None;
         }
         let t = theme::current();
         let noun = if count == 1 { "task" } else { "tasks" };
-        Some(Line::from(vec![
-            Span::styled(format!(" {count} {noun} "), Style::new().fg(t.foreground)),
-            Span::styled(leader::TASKS.label, t.keybind_key),
-            Span::raw(" "),
-        ]))
+        let count_text = format!("{count} {noun}");
+        let control_width =
+            count_text.width() + TASK_HINT_KEY_GAP.width() + leader::TASKS.label.width();
+        let line = Line::from(vec![
+            Span::raw(TASK_HINT_PAD),
+            Span::styled(
+                count_text,
+                hover_style(Style::new().fg(t.foreground), self.task_hint_hover),
+            ),
+            Span::styled(
+                format!("{TASK_HINT_KEY_GAP}{}", leader::TASKS.label),
+                hover_style(t.keybind_key, self.task_hint_hover),
+            ),
+            Span::raw(TASK_HINT_PAD),
+        ]);
+
+        let hint_area = top_right_hint_area(area);
+        let full_width = control_width + TASK_HINT_PAD.width() * 2;
+        let left = if full_width <= hint_area.width as usize {
+            hint_area.right().saturating_sub(full_width as u16)
+        } else {
+            hint_area.x
+        };
+        let x = left.saturating_add(TASK_HINT_PAD.width() as u16);
+        let hit = Rect::new(
+            x,
+            hint_area.y,
+            (control_width as u16).min(hint_area.right().saturating_sub(x)),
+            hint_area.height.min(1),
+        );
+        Some((line, hit))
     }
 
     fn preview_task(&mut self, id: &str) {

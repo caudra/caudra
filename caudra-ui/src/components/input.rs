@@ -813,7 +813,7 @@ pub(crate) fn admission_hint(
     (Line::from(spans), hits)
 }
 
-fn top_right_hint_area(area: Rect) -> Rect {
+pub(crate) fn top_right_hint_area(area: Rect) -> Rect {
     let content_area = content_area(area);
     Rect::new(
         content_area.x,

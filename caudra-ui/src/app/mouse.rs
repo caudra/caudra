@@ -235,12 +235,14 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.admission_mouse_down = None;
+                self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
                 self.link_mouse_down = None;
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
+                    self.task_hint_mouse_down = self.task_hint_hit_at(event.row, event.column);
                     self.status_mouse_down = self.status_hit_at(event.row, event.column);
                     self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
                     if self.queue_mouse_down.is_none() {
@@ -303,6 +305,7 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.clear_control_hovers();
                 self.admission_mouse_down = None;
+                self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
@@ -318,7 +321,18 @@ impl App {
                     self.status_mouse_down = None;
                     self.message_mouse_down = None;
                     self.link_mouse_down = None;
+                    self.task_hint_mouse_down = false;
                     return self.handle_streaming_admission(pressed.admission);
+                }
+                if !self.has_modal_overlay()
+                    && std::mem::take(&mut self.task_hint_mouse_down)
+                    && self.task_hint_hit_at(event.row, event.column)
+                {
+                    self.queue_mouse_down = None;
+                    self.status_mouse_down = None;
+                    self.message_mouse_down = None;
+                    self.link_mouse_down = None;
+                    return self.tasks_browse();
                 }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
                     if !sel.is_empty() {
@@ -386,6 +400,7 @@ impl App {
                     }
                 }
                 self.admission_mouse_down = None;
+                self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_mouse_down = None;
@@ -399,6 +414,7 @@ impl App {
                 self.admission_hover = self
                     .admission_hit_at(event.row, event.column)
                     .map(|hit| hit.admission);
+                self.task_hint_hover = self.task_hint_hit_at(event.row, event.column);
                 self.queue_hover = self
                     .queue_hit_at(event.row, event.column)
                     .map(|hit| hit.target);
@@ -637,6 +653,10 @@ impl App {
             .copied()
     }
 
+    fn task_hint_hit_at(&self, row: u16, col: u16) -> bool {
+        self.task_hint_hit.contains(Position::new(col, row))
+    }
+
     fn status_hit_at(&self, row: u16, col: u16) -> Option<StatusBarHit> {
         let position = Position::new(col, row);
         self.status_hits
@@ -728,6 +748,7 @@ impl App {
 
     fn clear_control_hovers(&mut self) {
         self.admission_hover = None;
+        self.task_hint_hover = false;
         self.queue_hover = None;
         self.status_hover = None;
         self.input_box.clear_hover();

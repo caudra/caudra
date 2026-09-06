@@ -3198,6 +3198,86 @@ fn click_admission(app: &mut App, admission: caudra_agent::PromptAdmission) -> V
     ))
 }
 
+/// The hint only reaches the composer's top row once nothing louder wants it,
+/// so every task-hint test renders first and aims at where the frame put it.
+fn task_hint(app: &mut App) -> Rect {
+    const TASK_HINT_MISSING: &str = "task hint was not rendered";
+    app.status = Status::Idle;
+    let _ = rendered(app);
+    let hit = app.task_hint_hit;
+    assert!(hit.width > 0, "{TASK_HINT_MISSING}");
+    hit
+}
+
+#[test]
+fn clicking_the_task_hint_opens_the_task_picker() {
+    let mut app = app_with_subagent();
+    let hit = task_hint(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            hit.x,
+            hit.y
+        ))
+        .is_empty()
+    );
+
+    assert!(app.task_picker.is_open());
+}
+
+#[test]
+fn releasing_off_the_task_hint_leaves_the_picker_shut() {
+    let mut app = app_with_subagent();
+    let hit = task_hint(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+
+    assert!(!app.task_picker.is_open());
+}
+
+#[test]
+fn task_hint_hover_excludes_the_padding_around_it() {
+    let mut app = app_with_subagent();
+    let hit = task_hint(&mut app);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.x, hit.y));
+    assert!(app.task_hint_hover);
+
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        hit.x.saturating_sub(1),
+        hit.y,
+    ));
+    assert!(!app.task_hint_hover);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.right(), hit.y));
+    assert!(!app.task_hint_hover);
+}
+
+/// Streaming hands the same row to the admission controls, so the stale task
+/// hit has to go with the hint that no longer renders.
+#[test]
+fn the_task_hint_stops_taking_clicks_once_streaming_takes_the_row() {
+    let mut app = app_with_subagent();
+    let _ = task_hint(&mut app);
+
+    app.status = Status::Streaming;
+    let _ = rendered(&mut app);
+
+    assert_eq!(app.task_hint_hit, Rect::ZERO);
+}
+
 fn status_hit(
     app: &mut App,
     target: StatusBarHitTarget,

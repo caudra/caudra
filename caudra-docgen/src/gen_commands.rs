@@ -71,7 +71,7 @@ Stashing is for drafts you do not want to send yet. To line up prompts Caudra sh
 
 const TASKS: &str = r#"## Tasks
 
-Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
+Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`."#;
 

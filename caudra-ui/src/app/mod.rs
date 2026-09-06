@@ -99,7 +99,7 @@ use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
@@ -306,6 +306,11 @@ pub struct App {
     pub(super) admission_hits: Vec<AdmissionHit>,
     pub(super) admission_mouse_down: Option<AdmissionHit>,
     pub(super) admission_hover: Option<caudra_agent::PromptAdmission>,
+    /// Zero-sized whenever the task hint is not on screen, so the pointer
+    /// cannot land on a hint that a higher-priority one replaced.
+    pub(super) task_hint_hit: Rect,
+    pub(super) task_hint_mouse_down: bool,
+    pub(super) task_hint_hover: bool,
     pub(super) message_mouse_down: Option<MessageMouseDown>,
     pub(super) link_mouse_down: Option<Arc<str>>,
     pub status: Status,
@@ -467,6 +472,9 @@ impl App {
             admission_hits: Vec::new(),
             admission_mouse_down: None,
             admission_hover: None,
+            task_hint_hit: Rect::ZERO,
+            task_hint_mouse_down: false,
+            task_hint_hover: false,
             message_mouse_down: None,
             link_mouse_down: None,
             status: Status::Idle,

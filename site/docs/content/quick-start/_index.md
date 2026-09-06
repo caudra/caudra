@@ -96,7 +96,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `caudra --continue` resumes where you left off.
 - **Message actions.** Right-click a conversation message, or hold the left mouse button for half a second, to fork or revert there. See [Sessions, Forks, and Revert](/docs/sessions/) for history boundaries, file snapshots, conflicts, and unrevert.
 - **Queue and steering.** While Caudra works, `Enter` sends the prompt next, `Ctrl+X g` guides the current run, and `Ctrl+X x` stops and replaces it. See [Queue and Steering](/docs/queue/).
-- **Tasks.** Click a task call to inspect its subagent transcript. Send guidance from the task input while it runs, then click `[< Main]` to return. `/tasks` or `Ctrl+X` opens every task. Details in [Commands](/docs/commands/#tasks).
+- **Tasks.** Click a task call to inspect its subagent transcript. Send guidance from the task input while it runs, then click `[< Main]` to return. `/tasks`, `Ctrl+X a`, or the task count above the input opens every task. Details in [Commands](/docs/commands/#tasks).
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
 - **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
 - **Help.** `F1` lists every keybinding, or see [Keybindings](/docs/keybindings/).

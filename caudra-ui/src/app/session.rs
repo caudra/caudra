@@ -27,6 +27,7 @@ use caudra_storage::sessions::{
     StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
+use ratatui::layout::Rect;
 
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
@@ -428,6 +429,9 @@ impl App {
         self.admission_hits.clear();
         self.admission_mouse_down = None;
         self.admission_hover = None;
+        self.task_hint_hit = Rect::ZERO;
+        self.task_hint_mouse_down = false;
+        self.task_hint_hover = false;
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
         self.close_all_overlays();

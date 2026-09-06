@@ -45,6 +45,7 @@ impl App {
         self.sync_subagent_input_target();
         self.queue_hits.clear();
         self.admission_hits.clear();
+        self.task_hint_hit = Rect::ZERO;
         if self.workbench.is_open() {
             self.render_workbench(frame);
             return;
@@ -362,12 +363,20 @@ impl App {
                 self.admission_hits = hits;
                 Some(hint)
             } else {
-                (self.state.mode == Mode::Plan)
+                let panel = (self.state.mode == Mode::Plan)
                     .then(|| self.plan_form.hint_line())
                     .flatten()
-                    .or_else(|| self.todo_panel.hint_line())
-                    .or_else(|| self.task_hint_line())
-                    .or_else(|| self.lua_hint_line())
+                    .or_else(|| self.todo_panel.hint_line());
+                match panel {
+                    Some(hint) => Some(hint),
+                    None => match self.task_hint(layout.input_area) {
+                        Some((hint, hit)) => {
+                            self.task_hint_hit = hit;
+                            Some(hint)
+                        }
+                        None => self.lua_hint_line(),
+                    },
+                }
             };
             self.input_box.view(
                 frame,
