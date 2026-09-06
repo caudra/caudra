@@ -9,7 +9,7 @@ use caudra_providers::model_registry::CompactionTarget;
 use caudra_providers::provider::Provider;
 use caudra_providers::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, RequestOptions, Role, StopReason,
-    StreamResponse, TokenUsage,
+    StreamResponse, TokenUsage, estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -1040,27 +1040,33 @@ fn queued_message(display: &str) -> String {
     )
 }
 
-const CHARS_PER_TOKEN: usize = 4;
-
 /// Counts message content only. The system prompt and the tool schemas, a five
 /// figure baseline on a full tool set, stay invisible here, so never let this
 /// replace a context size the provider measured.
+///
+/// Counts rather than estimates from byte length. The ratio a byte heuristic
+/// assumes holds for prose and breaks on everything a tool returns: dense JSON
+/// costs about twice what its length suggests, so a heuristic hid the growth on
+/// exactly the turns that overflow.
 pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
-    if messages.is_empty() {
-        return 0;
-    }
-    let total_bytes: usize = messages
+    messages
         .iter()
         .flat_map(|m| &m.content)
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.len()),
-            ContentBlock::ToolResult { content, .. } => Some(content.len()),
-            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
-            _ => None,
-        })
-        .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+        .map(block_tokens)
+        .sum()
+}
+
+fn block_tokens(block: &ContentBlock) -> u32 {
+    match block {
+        ContentBlock::Text { text } => estimate_tokens_cached(text),
+        ContentBlock::ToolResult { content, .. } => estimate_tokens_cached(content),
+        ContentBlock::ToolUse { input, .. } => estimate_tokens_cached(&input.to_string()),
+        ContentBlock::Thinking { thinking, .. } => estimate_tokens_cached(thinking),
+        // Vision input is not free, and treating it as free let a screenshot
+        // enter the window costing nothing against the compaction trigger.
+        ContentBlock::Image { source } => crate::tools::image_bytes::token_estimate(source),
+        ContentBlock::RedactedThinking { data } => estimate_tokens_cached(data),
+    }
 }
 
 #[cfg(test)]

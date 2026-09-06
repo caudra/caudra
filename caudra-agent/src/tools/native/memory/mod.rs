@@ -8,15 +8,12 @@
 mod notes;
 pub mod paths;
 
-/// Re-exported so the `/memory` picker renders counts through the same
-/// formatter the tool output uses, rather than growing its own.
-pub use notes::token_label;
-
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use caudra_providers::token_label;
 use serde_json::Value;
 
 use crate::tools::registry::{
@@ -355,7 +352,7 @@ impl MemoryCall {
         for group in &matching {
             lines.push(format!("{} ({})", group.tag, group.files.len()));
             for (name, tokens) in &group.files {
-                lines.push(format!("  - {name} ({})", notes::token_label(*tokens)));
+                lines.push(format!("  - {name} ({})", token_label(*tokens)));
             }
             lines.push(String::new());
         }
@@ -682,7 +679,7 @@ mod tests {
         let out = run(json!({ "command": "list" }), temp.path()).unwrap();
         assert!(out.contains("shared (2)"), "{out}");
         assert!(
-            out.contains(&format!("  - a.md ({})", notes::token_label(1))),
+            out.contains(&format!("  - a.md ({})", token_label(1))),
             "{out}"
         );
     }

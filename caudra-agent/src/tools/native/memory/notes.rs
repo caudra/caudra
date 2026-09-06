@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use caudra_providers::{estimate_tokens, format_tokens};
+use caudra_providers::{estimate_tokens, token_label};
 
 pub const MAX_TAGS: usize = 50;
 pub const MAX_FILE_BYTES: usize = 20 * 1024;
@@ -27,9 +27,6 @@ const READ_REJECT_PREFIX: &str = "warning: ignored invalid tag(s): ";
 const UNREADABLE_PREFIX: &str = "warning: unreadable memory files: ";
 const UNTAGGED: &str = "untagged";
 const FRONTMATTER_FENCE: &str = "---";
-/// Marks the count as an estimate: o200k is exact only for OpenAI models.
-const TOKEN_ESTIMATE_MARKER: &str = "~";
-const TOKEN_SUFFIX: &str = " tokens";
 
 pub struct Note {
     pub name: String,
@@ -310,15 +307,6 @@ pub fn encode_frontmatter(tags: &[String]) -> String {
     let yaml = serde_yaml::to_string(&serde_json::json!({ "tags": tags }))
         .unwrap_or_else(|_| "tags: []\n".into());
     format!("---\n{yaml}---\n")
-}
-
-/// Renders an estimated token count. The marker is not decoration: o200k is
-/// exact only for OpenAI models, so the number is an estimate everywhere else.
-pub fn token_label(tokens: u32) -> String {
-    format!(
-        "{TOKEN_ESTIMATE_MARKER}{}{TOKEN_SUFFIX}",
-        format_tokens(tokens)
-    )
 }
 
 /// Counts the body rather than the file: frontmatter is stripped here and never

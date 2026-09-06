@@ -25,6 +25,39 @@ pub(super) const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 /// Decode-bomb guard: a tiny file can declare huge dimensions and balloon into
 /// gigabytes of RGBA. 50MP still covers any real camera photo.
 const MAX_PIXELS: u64 = 50_000_000;
+/// Pixels per token, the ratio Anthropic and OpenAI both document for vision
+/// input. Exact enough for a budget estimate; the wire cost is authoritative.
+const PIXELS_PER_TOKEN: u64 = 750;
+/// Base64 prefix decoded to reach an image header. PNG, GIF, and WebP declare
+/// dimensions in their first bytes; JPEG hides them behind an SOF marker that
+/// EXIF can push a long way in, so read generously rather than fall back.
+const HEADER_PROBE_BYTES: usize = 64 * 1024;
+/// Charged when the header will not parse. `MAX_EDGE` squared over the ratio,
+/// so an unreadable image is assumed to be a full-size one: a budget is better
+/// overshot than silently ignored.
+const UNKNOWN_IMAGE_TOKENS: u32 = ((MAX_EDGE as u64 * MAX_EDGE as u64) / PIXELS_PER_TOKEN) as u32;
+
+/// What an image block is worth against the context window.
+///
+/// Vision cost scales with pixels, not payload size, so this reads the header
+/// rather than the base64 length: a heavily compressed screenshot and a bloated
+/// one cost the same to send.
+pub(crate) fn token_estimate(source: &ImageSource) -> u32 {
+    let base64 = source.data.as_bytes();
+    // Whole 4-character groups only; a partial group is not decodable, and the
+    // header sits far enough forward that dropping a few bytes cannot matter.
+    let prefix = &base64[..base64.len().min(HEADER_PROBE_BYTES) / 4 * 4];
+    let Ok(bytes) = BASE64.decode(prefix) else {
+        return UNKNOWN_IMAGE_TOKENS;
+    };
+    match probe(&bytes) {
+        Ok((_, width, height)) => {
+            let tokens = u64::from(width) * u64::from(height) / PIXELS_PER_TOKEN;
+            u32::try_from(tokens).unwrap_or(u32::MAX).max(1)
+        }
+        Err(_) => UNKNOWN_IMAGE_TOKENS,
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct PreparedImage {
@@ -216,6 +249,33 @@ mod tests {
     const NOT_AN_IMAGE: &str = "is not an image";
     const TOO_LARGE: &str = "too large to view";
     const UNSUPPORTED: &str = "unsupported image format";
+
+    #[test_case(750, 1, 1 ; "one_token_per_pixels_per_token")]
+    #[test_case(750, 4, 4 ; "tokens_scale_with_area")]
+    #[test_case(100, 1, 1 ; "a_tiny_image_still_costs_a_token")]
+    fn token_estimate_scales_with_pixels(width: u32, height: u32, expected: u32) {
+        let source = source(ImageMediaType::Png, &png(width, height));
+        assert_eq!(token_estimate(&source), expected);
+    }
+
+    /// The bug this guards: vision input counted as zero, so a screenshot could
+    /// enter the context window without moving the compaction trigger at all.
+    #[test]
+    fn an_image_is_never_free() {
+        let source = source(ImageMediaType::Png, &png(MAX_EDGE, MAX_EDGE));
+        assert!(token_estimate(&source) > 0);
+        assert_eq!(token_estimate(&source), UNKNOWN_IMAGE_TOKENS);
+    }
+
+    /// A payload that will not parse must be charged, not waved through.
+    #[test]
+    fn an_unreadable_image_is_charged_the_fallback() {
+        let source = ImageSource {
+            media_type: ImageMediaType::Png,
+            data: "not base64 at all!!".into(),
+        };
+        assert_eq!(token_estimate(&source), UNKNOWN_IMAGE_TOKENS);
+    }
 
     #[test]
     fn small_png_passes_through_undownscaled() {

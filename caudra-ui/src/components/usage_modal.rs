@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use arc_swap::ArcSwapOption;
 
 use caudra_config::ClockFormat;
-use caudra_providers::{Model, ProviderUsage, TokenUsage, format_tokens, model_cost};
+use caudra_providers::{
+    Model, ProviderUsage, TokenUsage, format_tokens, format_tokens_u64, model_cost,
+};
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -371,12 +373,6 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         )));
     }
     lines
-}
-
-/// `format_tokens` takes the `u32` a session counts in; a lifetime total needs
-/// the wider one, and saturating keeps the display honest rather than wrapping.
-fn format_tokens_u64(value: u64) -> String {
-    format_tokens(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 fn totals_row(

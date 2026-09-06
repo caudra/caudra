@@ -7,6 +7,7 @@ use std::sync::Arc;
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
+use caudra_providers::format_tokens_u64;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::retention::{
@@ -93,9 +94,9 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
-                println!("database_bytes: {}", stats.database_bytes);
-                println!("wal_bytes: {}", stats.wal_bytes);
-                println!("shm_bytes: {}", stats.shm_bytes);
+                println!("database_bytes: {}", bytes(stats.database_bytes));
+                println!("wal_bytes: {}", bytes(stats.wal_bytes));
+                println!("shm_bytes: {}", bytes(stats.shm_bytes));
                 println!("page_size: {}", stats.page_size);
                 println!("page_count: {}", stats.page_count);
                 println!("freelist_count: {}", stats.freelist_count);
@@ -107,10 +108,13 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 println!("history_items: {}", stats.history_item_count);
                 println!("tool_outputs: {}", stats.tool_output_count);
                 println!("subagent_items: {}", stats.subagent_item_count);
-                println!("logical_bytes: {}", stats.logical_bytes);
-                println!("tool_output_file_bytes: {}", stats.tool_output_file_bytes);
-                println!("snapshot_bytes: {}", stats.snapshot_bytes);
-                println!("archive_bytes: {}", stats.archive_bytes);
+                println!("logical_bytes: {}", bytes(stats.logical_bytes));
+                println!(
+                    "tool_output_file_bytes: {}",
+                    bytes(stats.tool_output_file_bytes)
+                );
+                println!("snapshot_bytes: {}", bytes(stats.snapshot_bytes));
+                println!("archive_bytes: {}", bytes(stats.archive_bytes));
                 println!("pending_cleanup_jobs: {}", stats.pending_cleanup_jobs);
             }
         }
@@ -693,9 +697,9 @@ fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
             out,
             "{:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>COST_WIDTH$} {:>8}",
             truncate(&row.group, GROUP_WIDTH),
-            row.input,
-            row.output,
-            row.cache_read + row.cache_creation,
+            format_tokens_u64(row.input),
+            format_tokens_u64(row.output),
+            format_tokens_u64(row.cache_read + row.cache_creation),
             format!("${:.4}", row.cost),
             row.priced_turns + row.unpriced_turns,
         );

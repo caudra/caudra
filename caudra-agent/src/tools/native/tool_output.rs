@@ -17,6 +17,7 @@ use crate::tools::registry::{
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
 use crate::types::ToolOutput;
+use caudra_providers::{estimate_tokens, token_label};
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::{
     ToolOutputGrepResult, ToolOutputId, ToolOutputReadResult, ToolOutputStore,
@@ -352,10 +353,11 @@ fn format_read(output_id: &str, result: &ToolOutputReadResult, limit: usize) -> 
             )
         } else {
             format!(
-                "Tool output {output_id}: lines {}-{} of {} ({} bytes)",
+                "Tool output {output_id}: lines {}-{} of {} ({} shown, {} bytes stored)",
                 result.offset,
                 result.offset + lines.len() - 1,
                 result.total_lines,
+                token_label(estimate_tokens(&lines.join("\n"))),
                 result.total_bytes
             )
         };
@@ -508,6 +510,30 @@ mod tests {
         .unwrap();
         assert!(second.contains("lines 3-4 of 4"), "{second}");
         assert!(second.contains("three\nfour"), "{second}");
+    }
+
+    /// The size suffix was previously asserted only against the Lua mirror in
+    /// `plugins/tool_output`, so the native footer could change shape with the
+    /// suite still green. Pins both halves: what this page costs, and how much
+    /// output remains behind the ID.
+    #[test]
+    fn a_page_reports_its_own_token_cost_and_the_stored_byte_total() {
+        const TEXT: &str = "one\ntwo\nthree\nfour\n";
+        let f = fixture(TEXT);
+        let page = run(
+            &ToolOutputRead,
+            json!({ "output_id": &f.output_id, "limit": 2 }),
+            &f.ctx,
+        )
+        .unwrap();
+        assert!(
+            page.contains(&format!(
+                "lines 1-2 of 4 ({} shown, {} bytes stored)",
+                token_label(estimate_tokens("one\ntwo")),
+                TEXT.len()
+            )),
+            "{page}"
+        );
     }
 
     #[test]

@@ -568,6 +568,13 @@ async fn evaluator_request(
 fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) -> Vec<Message> {
     let mut messages = history.to_vec();
     let budget = model.context_window.saturating_mul(percent) / 100;
+    // Rescans the whole transcript per iteration. The token counts themselves
+    // are cached, so an iteration hashes the transcript rather than tokenizing
+    // it, but the walk is still proportional to its size. A running total is
+    // not worth the state here: `truncate_oldest_round` both drains the front
+    // and drops orphaned results from the messages that remain, so the
+    // bookkeeping would have to mirror two removal paths to stay correct, and
+    // this runs once per goal evaluation rather than per turn.
     while estimate_message_tokens(&messages) > budget && truncate_oldest_round(&mut messages) {}
     let omitted = history.len().saturating_sub(messages.len());
     if omitted > 0 {

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use caudra_providers::{
     ContentBlock, Message, Model, ReasoningTransport, ResponsesReasoning, Role,
 };
+use caudra_providers::estimate_tokens_cached;
 use serde_json::Value;
 
 use crate::tools::{TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME};
@@ -11,7 +12,6 @@ use crate::tools::{TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME};
 const PROTECTED_USER_TURNS: usize = 2;
 const PROTECTED_OLD_RESULT_TOKENS: usize = 40_000;
 const PRUNE_TRIGGER_TOKENS: usize = 20_000;
-const BYTES_PER_TOKEN: usize = 4;
 const READ_LIMIT: usize = 200;
 
 struct Candidate {
@@ -65,7 +65,9 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
                     Some(Candidate {
                         message_index,
                         block_index,
-                        estimated_tokens: estimate_tokens(content),
+                        // Cached: this walks the whole pre-protected history on
+                        // every request, and counting runs at 7-13 MB/s.
+                        estimated_tokens: estimate_tokens_cached(content) as usize,
                     })
                 })
         })
@@ -241,10 +243,6 @@ fn is_actual_user_turn(message: &Message) -> bool {
             .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
-fn estimate_tokens(content: &str) -> usize {
-    content.len().div_ceil(BYTES_PER_TOKEN)
-}
-
 #[cfg(test)]
 mod tests {
     use caudra_storage::id::CaudraId;
@@ -284,14 +282,23 @@ mod tests {
         }
     }
 
-    fn result(id: &str, size: usize, is_error: bool, with_ref: bool) -> Message {
+    /// One o200k token per repeat, so a fixture's token count is its repeat
+    /// count and the threshold cases stay exact rather than approximate.
+    const ONE_TOKEN: &str = " a";
+
+    fn content_of_tokens(tokens: usize) -> String {
+        ONE_TOKEN.repeat(tokens)
+    }
+
+    fn result(id: &str, tokens: usize, is_error: bool, with_ref: bool) -> Message {
+        let content = content_of_tokens(tokens);
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: id.into(),
-                content: id.repeat(size.div_ceil(id.len()))[..size].into(),
+                output_ref: with_ref.then(|| output_ref(content.len())),
+                content,
                 is_error,
-                output_ref: with_ref.then(|| output_ref(size)),
             }],
             ..Default::default()
         }
@@ -305,7 +312,7 @@ mod tests {
             tool_use("retained", "bash"),
             result(
                 "retained",
-                PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN,
+                PROTECTED_OLD_RESULT_TOKENS,
                 false,
                 true,
             ),
@@ -485,27 +492,25 @@ mod tests {
 
     #[test]
     fn prunes_only_after_retention_and_trigger_thresholds() {
-        let at_trigger = qualifying_history(PRUNE_TRIGGER_TOKENS * BYTES_PER_TOKEN);
+        let at_trigger = qualifying_history(PRUNE_TRIGGER_TOKENS);
         assert!(matches!(
             project(&at_trigger, &tools(true)),
             Cow::Borrowed(_)
         ));
 
-        let over_trigger = qualifying_history(PRUNE_TRIGGER_TOKENS * BYTES_PER_TOKEN + 1);
+        let over_trigger = qualifying_history(PRUNE_TRIGGER_TOKENS + 1);
         let projected = project(&over_trigger, &tools(true));
         assert!(matches!(&projected, Cow::Owned(_)));
         assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
-        let retained = "retained"
-            .repeat((PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN).div_ceil("retained".len()));
         assert_eq!(
             result_content(&projected, "retained"),
-            &retained[..PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN]
+            content_of_tokens(PROTECTED_OLD_RESULT_TOKENS)
         );
     }
 
     #[test]
     fn replacement_keeps_ref_and_call_order_with_retrieval_instructions() {
-        let history = qualifying_history(PRUNE_TRIGGER_TOKENS * BYTES_PER_TOKEN + 1);
+        let history = qualifying_history(PRUNE_TRIGGER_TOKENS + 1);
         let original_ref = match &history[2].content[0] {
             ContentBlock::ToolResult { output_ref, .. } => output_ref.clone().unwrap(),
             _ => unreachable!(),
@@ -539,7 +544,7 @@ mod tests {
 
     #[test]
     fn errors_missing_refs_and_retrieval_results_are_never_candidates() {
-        let large = (PRUNE_TRIGGER_TOKENS + 1) * BYTES_PER_TOKEN;
+        let large = PRUNE_TRIGGER_TOKENS + 1;
         let mut history = vec![Message::user("old request".into())];
         for (id, name, is_error, with_ref) in [
             ("error", "bash", true, true),
@@ -561,7 +566,7 @@ mod tests {
 
     #[test]
     fn latest_actual_user_loops_ignore_tool_results_observations_and_padding() {
-        let large = (PRUNE_TRIGGER_TOKENS + 1) * BYTES_PER_TOKEN;
+        let large = PRUNE_TRIGGER_TOKENS + 1;
         let mut history = qualifying_history(large);
         history.truncate(5);
         history.push(Message::user("recent request one".into()));
@@ -578,13 +583,13 @@ mod tests {
 
     #[test]
     fn retrieval_absent_leaves_qualifying_history_borrowed() {
-        let history = qualifying_history((PRUNE_TRIGGER_TOKENS + 1) * BYTES_PER_TOKEN);
+        let history = qualifying_history(PRUNE_TRIGGER_TOKENS + 1);
         assert!(matches!(project(&history, &tools(false)), Cow::Borrowed(_)));
     }
 
     #[test]
     fn projection_does_not_mutate_canonical_serialization() {
-        let history = qualifying_history((PRUNE_TRIGGER_TOKENS + 1) * BYTES_PER_TOKEN);
+        let history = qualifying_history(PRUNE_TRIGGER_TOKENS + 1);
         let before = serde_json::to_vec(&history).unwrap();
 
         let projected = project(&history, &tools(true));
@@ -600,7 +605,7 @@ mod tests {
             tool_use("huge", "bash"),
             result(
                 "huge",
-                PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN + 1,
+                PROTECTED_OLD_RESULT_TOKENS + 1,
                 false,
                 true,
             ),
@@ -620,19 +625,19 @@ mod tests {
             tool_use("older", "bash"),
             result(
                 "older",
-                (PRUNE_TRIGGER_TOKENS + 1) * BYTES_PER_TOKEN,
+                PRUNE_TRIGGER_TOKENS + 1,
                 false,
                 true,
             ),
             tool_use("oversized", "bash"),
             result(
                 "oversized",
-                PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN + 1,
+                PROTECTED_OLD_RESULT_TOKENS + 1,
                 false,
                 true,
             ),
             tool_use("newer", "bash"),
-            result("newer", BYTES_PER_TOKEN, false, true),
+            result("newer", 1, false, true),
             Message::user("recent request one".into()),
             Message::user("recent request two".into()),
         ];
@@ -644,9 +649,17 @@ mod tests {
         assert!(!result_content(&projected, "newer").starts_with("[Old tool result pruned."));
     }
 
+    /// CJK costs about one token per character while occupying three bytes, so
+    /// the byte heuristic this replaced valued it at three quarters of a token
+    /// per character. This fixture sits under the trigger by that measure and
+    /// over it by a real count; pruning it is the regression.
     #[test]
-    fn cjk_results_use_utf8_bytes_for_thresholds() {
-        let cjk = "界".repeat((PRUNE_TRIGGER_TOKENS * BYTES_PER_TOKEN).div_ceil("界".len()) + 1);
+    fn cjk_results_are_counted_by_tokens_not_by_bytes() {
+        let cjk = "界".repeat(PRUNE_TRIGGER_TOKENS + 5_000);
+        assert!(
+            cjk.len() / 4 < PRUNE_TRIGGER_TOKENS,
+            "fixture must look small to a bytes-per-token heuristic"
+        );
         let history = vec![
             Message::user("old request".into()),
             tool_use("cjk", "bash"),
@@ -663,7 +676,7 @@ mod tests {
             tool_use("retained", "bash"),
             result(
                 "retained",
-                PROTECTED_OLD_RESULT_TOKENS * BYTES_PER_TOKEN,
+                PROTECTED_OLD_RESULT_TOKENS,
                 false,
                 true,
             ),

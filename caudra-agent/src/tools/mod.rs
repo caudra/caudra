@@ -7,7 +7,7 @@
 
 mod file_tracker;
 pub mod grep;
-mod image_bytes;
+pub(crate) mod image_bytes;
 pub mod interpreter_bridge;
 pub mod native;
 mod path_locks;
