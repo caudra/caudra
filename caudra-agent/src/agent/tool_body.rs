@@ -3,8 +3,12 @@
 //! A call that rewrites a file is nearly all body: the path arrives in the
 //! first fragment and everything after it is the content, the patch, or the
 //! text a match is replaced with. Decoding that value as its fragments go past
-//! is what lets a card show the change being written instead of a spinner and
-//! a line count.
+//! is what lets the header say how much has arrived, and what lets a write show
+//! the file being written instead of a spinner and a line count.
+//!
+//! Only a whole file is worth drawing half-arrived. A replacement and a patch
+//! are legible as diffs and as nothing else, so their body is counted and
+//! dropped rather than published.
 //!
 //! The decode is resumable rather than a scan per fragment, which
 //! [`super::tool_preview`] can afford only because it gives up after a few
@@ -12,8 +16,6 @@
 //! it once per token is quadratic. Resuming also solves the problem a scan
 //! would have anyway, which is that a `\` escape or a `\uXXXX` sequence can
 //! straddle two fragments.
-
-use crate::types::{ToolBodyDelta, ToolBodyField};
 
 use super::tool_preview::{candidates, same_key};
 
@@ -24,30 +26,29 @@ const LIVE_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Digits in a `\uXXXX` escape.
 const UNICODE_ESCAPE_DIGITS: u8 = 4;
 
-/// The arguments each tool streams, in the order a call writes them. Every
-/// other tool leads with a path, a pattern or a query, and has nothing long
-/// enough to be worth showing before it runs.
-const BODY_FIELDS: &[(&str, &[ToolBodyField])] = &[
-    ("file_write", &[ToolBodyField::Content]),
-    (
-        "file_edit",
-        &[ToolBodyField::OldString, ToolBodyField::NewString],
-    ),
-    ("file_apply_patch", &[ToolBodyField::PatchText]),
+/// The tool, the one argument it spends its whole stream writing, and whether
+/// a card can draw that argument before the call runs. Every other tool leads
+/// with a path, a pattern or a query, and has nothing long enough to be worth
+/// showing or counting.
+///
+/// An edit counts only the side it is adding: the side it is replacing arrives
+/// first and says nothing about the size of the change.
+const BODY_ARGS: &[(&str, &str, bool)] = &[
+    ("file_write", "content", true),
+    ("file_edit", "newString", false),
+    ("file_apply_patch", "patchText", false),
 ];
 
-/// The arguments `tool` streams, empty for a tool with no body to show. Names
-/// are matched the way [`super::tool_preview`] matches them, so `mcp_File_write`
-/// and `file_write` resolve alike.
-fn body_fields(tool: &str) -> &'static [ToolBodyField] {
-    candidates(tool)
-        .find_map(|rest| {
-            BODY_FIELDS
-                .iter()
-                .find(|(name, _)| same_key(name, rest))
-                .map(|(_, fields)| *fields)
-        })
-        .unwrap_or_default()
+/// The argument `tool` writes and whether it is published, `None` for a tool
+/// with no body. Names are matched the way [`super::tool_preview`] matches
+/// them, so `mcp_File_write` and `file_write` resolve alike.
+fn body_arg(tool: &str) -> Option<(&'static str, bool)> {
+    candidates(tool).find_map(|rest| {
+        BODY_ARGS
+            .iter()
+            .find(|(name, ..)| same_key(name, rest))
+            .map(|(_, key, publish)| (*key, *publish))
+    })
 }
 
 /// One decoded character, or the fact that the escape it belongs to has not
@@ -124,8 +125,8 @@ enum State {
     Colon,
     /// Waiting for the first character of a value.
     Value,
-    /// Decoding the value of a wanted key.
-    Body(ToolBodyField),
+    /// Decoding the body.
+    Body,
     /// Discarding a string, which is either an unwanted value or one nested
     /// inside one, so its quotes and braces cannot be mistaken for structure.
     SkipString(usize),
@@ -138,37 +139,42 @@ enum State {
 /// The body of one tool call as its argument fragments arrive, retaining only
 /// what has not been handed to the caller yet.
 pub(super) struct BodyStream {
-    fields: &'static [ToolBodyField],
+    key: &'static str,
+    publish: bool,
     state: State,
     string: StringReader,
-    key: String,
+    /// The member name being read, against [`Self::key`].
+    member: String,
     newlines: usize,
     /// Decoded bytes handed out so far, against [`LIVE_BODY_MAX_BYTES`].
     emitted: usize,
 }
 
 impl BodyStream {
-    /// `None` for a tool with no body worth streaming.
+    /// `None` for a tool with no body worth reading.
     pub(super) fn new(tool: &str) -> Option<Self> {
-        let fields = body_fields(tool);
-        (!fields.is_empty()).then(|| Self {
-            fields,
+        let (key, publish) = body_arg(tool)?;
+        Some(Self {
+            key,
+            publish,
             state: State::Open,
             string: StringReader::default(),
-            key: String::new(),
+            member: String::new(),
             newlines: 0,
             emitted: 0,
         })
     }
 
-    /// What this fragment added, per argument. Usually empty or one entry; a
-    /// fragment that closes one argument and opens the next carries both.
-    pub(super) fn absorb(&mut self, delta: &str) -> Vec<ToolBodyDelta> {
-        let mut decoded = Vec::new();
+    /// What this fragment added to the body, `None` when it added nothing a
+    /// reader can use: a fragment outside the body, one that only advanced an
+    /// escape, or any fragment at all of a body that is counted rather than
+    /// drawn.
+    pub(super) fn absorb(&mut self, delta: &str) -> Option<String> {
+        let mut decoded = String::new();
         for c in delta.chars() {
             self.push(c, &mut decoded);
         }
-        decoded
+        (!decoded.is_empty()).then_some(decoded)
     }
 
     /// Lines of body decoded so far. A body whose last line has no newline of
@@ -178,7 +184,7 @@ impl BodyStream {
         self.newlines + 1
     }
 
-    fn push(&mut self, c: char, decoded: &mut Vec<ToolBodyDelta>) {
+    fn push(&mut self, c: char, decoded: &mut String) {
         self.state = match self.state {
             State::Done => State::Done,
             State::Open => match c {
@@ -187,7 +193,7 @@ impl BodyStream {
             },
             State::Member => match c {
                 '"' => {
-                    self.key.clear();
+                    self.member.clear();
                     self.string = StringReader::default();
                     State::Key
                 }
@@ -196,7 +202,7 @@ impl BodyStream {
             },
             State::Key => match self.string.push(c) {
                 Piece::Char(c) => {
-                    self.key.push(c);
+                    self.member.push(c);
                     State::Key
                 }
                 Piece::Pending => State::Key,
@@ -210,24 +216,24 @@ impl BodyStream {
             State::Value => {
                 self.string = StringReader::default();
                 match c {
-                    '"' => match self.wanted() {
-                        Some(field) => State::Body(field),
-                        None => State::SkipString(0),
+                    '"' => match same_key(self.key, &self.member) {
+                        true => State::Body,
+                        false => State::SkipString(0),
                     },
                     '{' | '[' => State::Skip(1),
                     _ => State::Skip(0),
                 }
             }
-            State::Body(field) => match self.string.push(c) {
+            State::Body => match self.string.push(c) {
                 Piece::Char(c) => {
                     self.newlines += usize::from(c == '\n');
-                    if self.emitted < LIVE_BODY_MAX_BYTES {
+                    if self.publish && self.emitted < LIVE_BODY_MAX_BYTES {
                         self.emitted += c.len_utf8();
-                        extend(decoded, field, c);
+                        decoded.push(c);
                     }
-                    State::Body(field)
+                    State::Body
                 }
-                Piece::Pending => State::Body(field),
+                Piece::Pending => State::Body,
                 Piece::End => State::Skip(0),
             },
             State::SkipString(depth) => match self.string.push(c) {
@@ -252,72 +258,51 @@ impl BodyStream {
             },
         };
     }
-
-    fn wanted(&self) -> Option<ToolBodyField> {
-        self.fields
-            .iter()
-            .copied()
-            .find(|field| same_key(field.key(), &self.key))
-    }
-}
-
-/// Keeps one entry per contiguous run of an argument, so a fragment wholly
-/// inside one body is a single push and a single allocation.
-fn extend(decoded: &mut Vec<ToolBodyDelta>, field: ToolBodyField, c: char) {
-    match decoded.last_mut() {
-        Some(last) if last.field == field => last.text.push(c),
-        _ => decoded.push(ToolBodyDelta {
-            field,
-            text: c.into(),
-        }),
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyStream, LIVE_BODY_MAX_BYTES, body_fields};
-    use crate::types::ToolBodyField;
+    use super::{BodyStream, LIVE_BODY_MAX_BYTES, body_arg};
     use test_case::test_case;
 
     const WRITE: &str = "file_write";
     const EDIT: &str = "file_edit";
     const PATCH: &str = "file_apply_patch";
+    const CONTENT_KEY: &str = "content";
+    const NEW_STRING_KEY: &str = "newString";
+    const PATCH_TEXT_KEY: &str = "patchText";
 
-    /// Everything the fragments decode into, per argument, in arrival order.
-    fn decode(tool: &str, fragments: &[&str]) -> Vec<(ToolBodyField, String)> {
+    /// Everything the fragments published, in arrival order.
+    fn published(tool: &str, fragments: &[&str]) -> String {
         let mut stream = BodyStream::new(tool).unwrap();
-        let mut out: Vec<(ToolBodyField, String)> = Vec::new();
-        for fragment in fragments {
-            for delta in stream.absorb(fragment) {
-                match out.last_mut() {
-                    Some(last) if last.0 == delta.field => last.1.push_str(&delta.text),
-                    _ => out.push((delta.field, delta.text)),
-                }
-            }
-        }
-        out
-    }
-
-    fn content(tool: &str, fragments: &[&str]) -> String {
-        decode(tool, fragments)
-            .into_iter()
-            .map(|(_, text)| text)
+        fragments
+            .iter()
+            .filter_map(|fragment| stream.absorb(fragment))
             .collect()
     }
 
-    #[test_case(WRITE, &[ToolBodyField::Content] ; "write_streams_its_content")]
-    #[test_case("mcp_File_write", &[ToolBodyField::Content] ; "a_qualified_name_resolves")]
-    #[test_case(EDIT, &[ToolBodyField::OldString, ToolBodyField::NewString] ; "edit_streams_both_sides")]
-    #[test_case(PATCH, &[ToolBodyField::PatchText] ; "patch_streams_its_envelope")]
-    #[test_case("shell", &[] ; "a_tool_with_no_body")]
-    fn a_tools_streamed_arguments(tool: &str, expected: &[ToolBodyField]) {
-        assert_eq!(body_fields(tool), expected);
-        assert_eq!(BodyStream::new(tool).is_some(), !expected.is_empty());
+    /// The stream after every fragment, for the counting a reader never sees.
+    fn counted(tool: &str, fragments: &[&str]) -> BodyStream {
+        let mut stream = BodyStream::new(tool).unwrap();
+        for fragment in fragments {
+            stream.absorb(fragment);
+        }
+        stream
+    }
+
+    #[test_case(WRITE, Some((CONTENT_KEY, true)) ; "a_write_publishes_its_content")]
+    #[test_case("mcp_File_write", Some((CONTENT_KEY, true)) ; "a_qualified_name_resolves")]
+    #[test_case(EDIT, Some((NEW_STRING_KEY, false)) ; "an_edit_reads_its_new_side_only")]
+    #[test_case(PATCH, Some((PATCH_TEXT_KEY, false)) ; "a_patch_reads_its_envelope")]
+    #[test_case("shell", None ; "a_tool_with_no_body")]
+    fn a_tools_body_argument(tool: &str, expected: Option<(&str, bool)>) {
+        assert_eq!(body_arg(tool), expected);
+        assert_eq!(BodyStream::new(tool).is_some(), expected.is_some());
     }
 
     #[test]
     fn a_body_is_decoded_across_fragments() {
-        let decoded = content(
+        let decoded = published(
             WRITE,
             &[r#"{"filePath": "a.rs", "content": "fn "#, r#"x() {}"}"#],
         );
@@ -326,74 +311,48 @@ mod tests {
 
     #[test]
     fn an_escape_split_across_fragments_is_one_character() {
-        let decoded = content(WRITE, &[r#"{"content": "a\"#, r#"nb"}"#]);
+        let decoded = published(WRITE, &[r#"{"content": "a\"#, r#"nb"}"#]);
         assert_eq!(decoded, "a\nb");
     }
 
     #[test]
     fn an_escaped_backslash_is_not_a_newline() {
-        let decoded = content(WRITE, &[r#"{"content": "a\\nb"}"#]);
+        let decoded = published(WRITE, &[r#"{"content": "a\\nb"}"#]);
         assert_eq!(decoded, r"a\nb");
     }
 
     #[test]
     fn a_unicode_escape_split_across_fragments_is_one_character() {
-        let decoded = content(WRITE, &[r#"{"content": "a\u00"#, r#"e9b"}"#]);
+        let decoded = published(WRITE, &[r#"{"content": "a\u00"#, r#"e9b"}"#]);
         assert_eq!(decoded, "aéb");
     }
 
     #[test]
     fn a_quote_inside_the_body_does_not_end_it() {
-        let decoded = content(WRITE, &[r#"{"content": "say \"hi\" now"}"#]);
+        let decoded = published(WRITE, &[r#"{"content": "say \"hi\" now"}"#]);
         assert_eq!(decoded, r#"say "hi" now"#);
     }
 
+    /// A fragment that only advances an escape has nothing for a reader, and
+    /// an empty repaint is worse than none.
     #[test]
-    fn the_two_sides_of_an_edit_arrive_in_order() {
-        let decoded = decode(
-            EDIT,
-            &[
-                r#"{"filePath": "a.rs", "oldString": "one"#,
-                r#"", "newString": "two"#,
-                r#""}"#,
-            ],
-        );
+    fn a_fragment_that_decodes_nothing_publishes_nothing() {
+        let mut stream = BodyStream::new(WRITE).unwrap();
+        assert_eq!(stream.absorb(r#"{"filePath":"#), None);
         assert_eq!(
-            decoded,
-            [
-                (ToolBodyField::OldString, "one".to_owned()),
-                (ToolBodyField::NewString, "two".to_owned()),
-            ]
+            stream.absorb(r#" "a.rs", "content": "a\"#),
+            Some("a".into())
         );
-    }
-
-    /// One fragment can close an argument and open the next, so a single delta
-    /// is not enough to carry a fragment.
-    #[test]
-    fn a_fragment_that_crosses_arguments_carries_both() {
-        let mut stream = BodyStream::new(EDIT).unwrap();
-        stream.absorb(r#"{"oldString": "a"#);
-        let crossing = stream.absorb(r#"b", "newString": "cd"#);
-        let carried: Vec<_> = crossing
-            .into_iter()
-            .map(|delta| (delta.field, delta.text))
-            .collect();
-        assert_eq!(
-            carried,
-            [
-                (ToolBodyField::OldString, "b".to_owned()),
-                (ToolBodyField::NewString, "cd".to_owned()),
-            ]
-        );
+        assert_eq!(stream.absorb("n"), Some("\n".into()));
     }
 
     #[test]
     fn an_unwanted_value_is_skipped_whole() {
-        let decoded = content(
-            EDIT,
+        let decoded = published(
+            WRITE,
             &[
-                r#"{"opts": {"newString": "decoy", "n": [1, 2]}, "#,
-                r#""replaceAll": true, "newString": "real"}"#,
+                r#"{"opts": {"content": "decoy", "n": [1, 2]}, "#,
+                r#""overwrite": true, "content": "real"}"#,
             ],
         );
         assert_eq!(decoded, "real");
@@ -401,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_brace_inside_a_skipped_string_does_not_break_depth() {
-        let decoded = content(WRITE, &[r#"{"opts": {"re": "a}b{c"}, "content": "real"}"#]);
+        let decoded = published(WRITE, &[r#"{"opts": {"re": "a}b{c"}, "content": "real"}"#]);
         assert_eq!(decoded, "real");
     }
 
@@ -414,6 +373,30 @@ mod tests {
         assert_eq!(stream.lines(), 3);
     }
 
+    /// The header is the only thing an edit shows while it streams, so the
+    /// count has to run even though nothing is published.
+    #[test]
+    fn an_edit_counts_lines_without_publishing_them() {
+        let fragments = [r#"{"oldString": "gone", "newString": "one"#, r"\ntwo"];
+        assert!(published(EDIT, &fragments).is_empty());
+        assert_eq!(counted(EDIT, &fragments).lines(), 2);
+    }
+
+    /// The side being replaced arrives first and says nothing about the size
+    /// of the change, so counting it would make the header jump.
+    #[test]
+    fn an_edits_old_side_is_not_counted() {
+        let stream = counted(EDIT, &[r#"{"oldString": "one\ntwo\nthree", "#]);
+        assert_eq!(stream.lines(), 1);
+    }
+
+    #[test]
+    fn a_patch_is_counted_without_being_published() {
+        let fragments = [r#"{"patchText": "*** Begin Patch\n+one"#];
+        assert!(published(PATCH, &fragments).is_empty());
+        assert_eq!(counted(PATCH, &fragments).lines(), 2);
+    }
+
     /// The count is what the header shows, so it has to outlive the point
     /// where carrying the text stops being useful.
     #[test]
@@ -423,13 +406,7 @@ mod tests {
         let line = format!(r"{}\n", "x".repeat(63));
         let lines = LIVE_BODY_MAX_BYTES / 64 + 8;
         let carried: usize = (0..lines)
-            .map(|_| {
-                stream
-                    .absorb(&line)
-                    .iter()
-                    .map(|delta| delta.text.len())
-                    .sum::<usize>()
-            })
+            .map(|_| stream.absorb(&line).map_or(0, |text| text.len()))
             .sum();
         assert_eq!(carried, LIVE_BODY_MAX_BYTES);
         assert_eq!(stream.lines(), lines + 1);

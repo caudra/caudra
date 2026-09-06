@@ -1,4 +1,4 @@
-use super::{DisplayMessage, LiveBody, ToolProgress, ToolStatus};
+use super::{DisplayMessage, ToolProgress, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -973,7 +973,7 @@ impl ToolLineBuilder {
     /// Takes the place `push_code_content` would fill, because the call it
     /// belongs to has no output yet and its arguments are the only record of
     /// what it is about to do.
-    fn push_live_body(&mut self, body: &LiveBody) {
+    fn push_live_body(&mut self, body: &str) {
         let (lines, truncation) = code_view::render_live_body(body, self.limits.budget);
         self.truncation |= truncation;
         let start = self.lines.len();

@@ -13,7 +13,6 @@ use tracing::warn;
 use super::tool_body::BodyStream;
 use super::tool_preview;
 use crate::cancel::CancelToken;
-use crate::types::ToolBodyDelta;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -46,7 +45,7 @@ struct ForwardedStream {
 struct Changed {
     preview: Option<String>,
     size: Option<String>,
-    body: Vec<ToolBodyDelta>,
+    body: Option<String>,
 }
 
 /// The argument JSON of one tool call as it arrives, kept only until the
@@ -58,8 +57,8 @@ struct PendingInput {
     /// The preview is final: either its value closed or the buffer outgrew
     /// what is worth scanning. Nothing more is parsed after this.
     settled: bool,
-    /// Present only for the tools whose argument is a file body, so nothing is
-    /// decoded that will not be shown.
+    /// Present only for the tools whose argument is a file body, which are the
+    /// only ones with a size worth narrating.
     body: Option<BodyStream>,
     /// The last size published, so a body does not repaint the row per token.
     size: Option<String>,
@@ -466,6 +465,7 @@ fn error_description(error: &AgentError) -> String {
 mod tests {
     use caudra_providers::Role;
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
 
@@ -473,6 +473,8 @@ mod tests {
     const TOOL_ID: &str = "toolu_1";
 
     const WRITE: &str = "file_write";
+    const EDIT: &str = "file_edit";
+    const PATCH: &str = "file_apply_patch";
     /// A body long enough to cross the first step and reach the second.
     const STEPPED_LINES: usize = 9;
     const THRESHOLD_LINES: usize = 4;
@@ -537,11 +539,10 @@ mod tests {
     fn published_body(tool: &str, fragments: &[&str]) -> String {
         deltas(tool, fragments)
             .into_iter()
-            .flat_map(|event| match event {
+            .filter_map(|event| match event {
                 AgentEvent::ToolInputDelta { body, .. } => body,
-                _ => Vec::new(),
+                _ => None,
             })
-            .map(|delta| delta.text)
             .collect()
     }
 
@@ -561,7 +562,7 @@ mod tests {
     #[test]
     fn a_settled_preview_ignores_the_rest_of_the_arguments() {
         let published = previews(
-            "file_edit",
+            EDIT,
             &[
                 r#"{"filePath": "a.rs""#,
                 r#", "oldString": "one""#,
@@ -630,7 +631,7 @@ mod tests {
     fn an_edit_is_counted_too() {
         let mut fragments = vec![r#"{"filePath": "a.rs", "oldString": "gone", "newString": "one"#];
         fragments.extend(std::iter::repeat_n(NEWLINE, STEPPED_LINES));
-        assert_eq!(sizes("file_edit", &fragments), [FIRST_STEP, SECOND_STEP]);
+        assert_eq!(sizes(EDIT, &fragments), [FIRST_STEP, SECOND_STEP]);
     }
 
     #[test]
@@ -642,6 +643,19 @@ mod tests {
     #[test]
     fn a_tool_with_no_body_publishes_none() {
         assert!(published_body("shell", &[r#"{"command": "ls"}"#]).is_empty());
+    }
+
+    /// A half-written diff is worse than the line count beside it, so these
+    /// two are counted into the header and nothing else.
+    #[test_case(EDIT, r#"{"filePath": "a.rs", "oldString": "one", "newString": "two"#
+        ; "an_edit_publishes_no_body")]
+    #[test_case(PATCH, r#"{"patchText": "*** Update File: a.rs\n-one\n+two"#
+        ; "a_patch_publishes_no_body")]
+    fn a_body_that_is_only_a_diff_is_counted_but_never_published(tool: &str, opening: &str) {
+        let mut fragments = vec![opening];
+        fragments.extend(std::iter::repeat_n(NEWLINE, STEPPED_LINES));
+        assert!(published_body(tool, &fragments).is_empty());
+        assert_eq!(sizes(tool, &fragments), [FIRST_STEP, SECOND_STEP]);
     }
 
     #[test]

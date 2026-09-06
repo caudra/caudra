@@ -963,38 +963,6 @@ impl From<Option<StopReason>> for DoneReason {
     }
 }
 
-/// The argument of a file-mutating call that carries the change itself, as
-/// opposed to the path or the flags around it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolBodyField {
-    Content,
-    OldString,
-    NewString,
-    PatchText,
-}
-
-impl ToolBodyField {
-    /// The argument this names, spelled the way the wire spells it.
-    pub(crate) fn key(self) -> &'static str {
-        match self {
-            Self::Content => "content",
-            Self::OldString => "oldString",
-            Self::NewString => "newString",
-            Self::PatchText => "patchText",
-        }
-    }
-}
-
-/// Newly decoded text of one still-arriving argument.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolBodyDelta {
-    pub field: ToolBodyField,
-    /// What this fragment added, not the value so far, so a body costs its own
-    /// length once across the stream rather than the square of it.
-    pub text: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -1022,11 +990,13 @@ pub enum AgentEvent {
         /// How much of a file body has arrived, e.g. `120+ lines`. `Some` only
         /// when the floor moved, which is once per step rather than per token.
         size: Option<String>,
-        /// The change itself as it is written, decoded out of `delta`. Empty
-        /// for every tool whose arguments are too short to be worth showing,
-        /// and once a body outgrows what a card can hold.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        body: Vec<ToolBodyDelta>,
+        /// What this fragment added to the file being written, decoded out of
+        /// `delta`. Only a whole-file write publishes a body: every other
+        /// change is legible as a diff and as nothing else, so it is counted
+        /// into `size` and drawn once the call has run. `None` once a body
+        /// outgrows what a card can hold.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
     },
     ToolStart(Box<ToolStartEvent>),
     /// `content` is the **full accumulated output** so far, not a delta.

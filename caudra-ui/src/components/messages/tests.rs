@@ -1158,17 +1158,19 @@ fn a_preview_fills_the_pending_header_until_the_real_summary_lands() {
     assert_eq!(panel.messages[0].text, "t1");
 }
 
+/// How far a body has got, as the header reports it while the call streams.
+const STREAMED_SIZE: &str = "20+ lines";
+
 #[test]
 fn a_streamed_size_lands_in_the_annotation_without_touching_the_header() {
     const HEADER: &str = "src/app.rs";
-    const SIZE: &str = "20+ lines";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_pending("t1".into(), "file_write");
     panel.tool_input_preview("t1", Some(HEADER.into()), None);
 
-    panel.tool_input_preview("t1", None, Some(SIZE.into()));
+    panel.tool_input_preview("t1", None, Some(STREAMED_SIZE.into()));
     assert_eq!(panel.messages[0].text, HEADER);
-    assert_eq!(panel.messages[0].annotation.as_deref(), Some(SIZE));
+    assert_eq!(panel.messages[0].annotation.as_deref(), Some(STREAMED_SIZE));
 }
 
 #[test]
@@ -1178,17 +1180,10 @@ fn a_preview_for_an_unknown_call_is_ignored() {
     assert!(panel.messages.is_empty());
 }
 
-fn body_delta(field: ToolBodyField, text: &str) -> Vec<ToolBodyDelta> {
-    vec![ToolBodyDelta {
-        field,
-        text: text.into(),
-    }]
-}
-
 fn streaming_write(panel: &mut MessagesPanel, fragments: &[&str]) {
     panel.tool_pending(TOOL_ID.into(), FILE_WRITE_TOOL_NAME);
     for fragment in fragments {
-        panel.tool_input_body(TOOL_ID, body_delta(ToolBodyField::Content, fragment));
+        panel.tool_input_body(TOOL_ID, Some((*fragment).into()));
     }
 }
 
@@ -1199,7 +1194,7 @@ fn a_streamed_write_grows_in_the_card() {
     let first = buffer_text(&render(&mut panel, 80, 24));
     assert!(first.contains("fn one() {}"), "{first}");
 
-    panel.tool_input_body(TOOL_ID, body_delta(ToolBodyField::Content, "fn two() {}\n"));
+    panel.tool_input_body(TOOL_ID, Some("fn two() {}\n".into()));
     let grown = buffer_text(&render(&mut panel, 80, 24));
     assert!(grown.contains("fn two() {}"), "{grown}");
 }
@@ -1227,42 +1222,23 @@ fn a_streamed_body_gives_way_to_the_real_output() {
     assert!(!shown.contains("fn streaming"), "{shown}");
 }
 
-/// An edit's two sides arrive one after the other, so the card can show the
-/// replacement as a diff before the tool has run.
-#[test]
-fn a_streamed_edit_is_drawn_as_a_diff() {
+/// A diff exists nowhere but the output the call has not produced yet, so
+/// these two narrate the wait with the header alone.
+#[test_case(FILE_EDIT_TOOL_NAME ; "edit")]
+#[test_case(FILE_APPLY_PATCH_TOOL_NAME ; "patch")]
+fn a_change_that_is_only_a_diff_streams_its_size_and_no_body(tool: &'static str) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_pending(TOOL_ID.into(), FILE_EDIT_TOOL_NAME);
-    panel.tool_input_body(TOOL_ID, body_delta(ToolBodyField::OldString, "let a = 1;"));
-    panel.tool_input_body(TOOL_ID, body_delta(ToolBodyField::NewString, "let a = 2;"));
+    panel.tool_pending(TOOL_ID.into(), tool);
+    panel.tool_input_preview(TOOL_ID, None, Some(STREAMED_SIZE.into()));
 
-    let shown = buffer_text(&render(&mut panel, 80, 24));
-    assert!(shown.contains("- let a = 1;"), "{shown}");
-    assert!(shown.contains("+ let a = 2;"), "{shown}");
-}
-
-#[test]
-fn a_streamed_patch_keeps_its_envelope_and_colours_its_changes() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_pending(TOOL_ID.into(), FILE_APPLY_PATCH_TOOL_NAME);
-    panel.tool_input_body(
-        TOOL_ID,
-        body_delta(
-            ToolBodyField::PatchText,
-            "*** Update File: a.rs\n@@ fn x\n-let a = 1;\n+let a = 2;\n",
-        ),
-    );
-
-    let shown = buffer_text(&render(&mut panel, 80, 24));
-    assert!(shown.contains("*** Update File: a.rs"), "{shown}");
-    assert!(shown.contains("-let a = 1;"), "{shown}");
-    assert!(shown.contains("+let a = 2;"), "{shown}");
+    assert_eq!(panel.messages[0].live_body, None);
+    assert!(buffer_text(&render(&mut panel, 80, 24)).contains(STREAMED_SIZE));
 }
 
 #[test]
 fn a_body_for_an_unknown_call_is_ignored() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_input_body(TOOL_ID, body_delta(ToolBodyField::Content, "orphan"));
+    panel.tool_input_body(TOOL_ID, Some("orphan".into()));
     assert!(panel.messages.is_empty());
 }
 
