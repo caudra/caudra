@@ -26,6 +26,7 @@ pub use mailbox::{MailboxError, SessionMailbox};
 pub mod command;
 pub mod diff;
 pub mod editable_queue;
+pub mod patch;
 pub mod permissions;
 pub mod prompt;
 pub mod snapshots;

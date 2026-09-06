@@ -87,13 +87,17 @@ impl PendingInput {
             };
         };
         let body = stream.absorb(delta);
-        let size = tool_preview::size_label(stream.lines())
-            .filter(|label| self.size.as_ref() != Some(label));
+        let label = tool_preview::size_label(stream.lines());
+        // A call earns its header one way or the other: a patch is named by
+        // the envelope its body reader decodes, everything else by the prefix
+        // of its arguments.
+        let named = stream.header();
+        let size = label.filter(|label| self.size.as_ref() != Some(label));
         if let Some(size) = &size {
             self.size = Some(size.clone());
         }
         Changed {
-            preview,
+            preview: named.and_then(|header| self.published(header)).or(preview),
             size,
             body,
         }
@@ -112,10 +116,15 @@ impl PendingInput {
         if self.settled {
             self.json = String::new();
         }
-        let changed = self.preview.as_deref() != Some(preview.text.as_str());
-        changed.then(|| {
-            self.preview = Some(preview.text.clone());
-            preview.text
+        self.published(preview.text)
+    }
+
+    /// `Some` only for a header that is not the one already on screen, so a
+    /// fragment costs a repaint only when it changed the row.
+    fn published(&mut self, header: String) -> Option<String> {
+        (self.preview.as_deref() != Some(header.as_str())).then(|| {
+            self.preview = Some(header.clone());
+            header
         })
     }
 }
@@ -645,6 +654,18 @@ mod tests {
             r#", "newString": "1\n2\n3"}"#,
         ];
         assert_eq!(sizes(EDIT, &fragments), [FIRST_STEP]);
+    }
+
+    /// A patch is named while it streams the way a write is, except that its
+    /// files come out of the envelope rather than an argument of their own.
+    #[test]
+    fn a_patch_names_its_files_as_they_arrive() {
+        let fragments = [
+            r#"{"patchText": "*** Begin Patch\n*** Update File: a.rs\n"#,
+            r"-one\n+two\n",
+            r#"*** Delete File: b.rs\n*** End Patch"}"#,
+        ];
+        assert_eq!(previews(PATCH, &fragments), ["a.rs", "a.rs, b.rs"]);
     }
 
     #[test]

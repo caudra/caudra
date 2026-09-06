@@ -332,7 +332,10 @@ pub fn format_entry(name: &str, content: &str) -> String {
     } else {
         format!(" [{}]", tags.join(", "))
     };
-    format!("{name} ({}){suffix}\n\n{body}", token_label(estimate_tokens(body)))
+    format!(
+        "{name} ({}){suffix}\n\n{body}",
+        token_label(estimate_tokens(body))
+    )
 }
 
 pub fn join_parts(separator: &str, parts: &[Option<String>]) -> String {
@@ -505,7 +508,11 @@ mod tests {
             (vec!["first".to_owned()], 1)
         );
 
-        write_note(temp.path(), "a.md", "---\ntags: [secnd]\n---\nlonger body here");
+        write_note(
+            temp.path(),
+            "a.md",
+            "---\ntags: [secnd]\n---\nlonger body here",
+        );
         assert_eq!(
             cache
                 .measure(temp.path(), "a.md", size, Some(stamp))
@@ -517,7 +524,10 @@ mod tests {
             cache
                 .measure(temp.path(), "a.md", size, Some(SystemTime::now()))
                 .unwrap(),
-            (vec!["secnd".to_owned()], estimate_tokens("longer body here")),
+            (
+                vec!["secnd".to_owned()],
+                estimate_tokens("longer body here")
+            ),
             "a new stamp must invalidate both the tags and the count"
         );
     }

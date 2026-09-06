@@ -8,7 +8,9 @@
 //!
 //! Only a whole file is worth drawing half-arrived. A replacement and a patch
 //! are legible as diffs and as nothing else, so their body is counted and
-//! dropped rather than published.
+//! dropped rather than published. A patch keeps one thing on its way past: the
+//! `*** Verb: path` lines of its envelope, which name the files it touches
+//! long before it has finished describing what it does to them.
 //!
 //! The decode is resumable rather than a scan per fragment, which
 //! [`super::tool_preview`] can afford only because it gives up after a few
@@ -18,40 +20,118 @@
 //! straddle two fragments.
 
 use super::tool_preview::{candidates, same_key};
+use crate::patch;
 
 /// Stops carrying a runaway body once no reader could follow it. Matches the
 /// cap on live shell output. The line count keeps going, so a huge write still
 /// reports that it is making progress.
 const LIVE_BODY_MAX_BYTES: usize = 64 * 1024;
+/// Room for the envelope lines a streaming patch is named by. A patch that
+/// declares more files than this holds collapsed to a bare count long ago, and
+/// `ToolStart` replaces whatever the header settled on.
+const ENVELOPE_MAX_BYTES: usize = 4 * 1024;
 /// Digits in a `\uXXXX` escape.
 const UNICODE_ESCAPE_DIGITS: u8 = 4;
 
-/// The tool, the arguments it spends its whole stream writing, and whether a
-/// card can draw them before the call runs. Every other tool leads with a
-/// path, a pattern or a query, and has nothing long enough to be worth showing
-/// or counting.
+/// What a card can do with a body before the call runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Body {
+    /// Drawn as it arrives: a whole file is legible half-written.
+    Drawn,
+    /// Counted and dropped: a diff is legible as a diff and as nothing else.
+    Counted,
+    /// Counted, and read for the envelope lines that name the files it
+    /// touches.
+    Named,
+}
+
+/// The tool, the arguments it spends its whole stream writing, and what a card
+/// can do with them before the call runs. Every other tool leads with a path,
+/// a pattern or a query, and has nothing long enough to be worth showing or
+/// counting.
 ///
 /// An edit counts both of its sides. The count answers how long the wait is,
 /// not how big the change is, and the side being replaced is half of that
 /// wait: it arrives first, so counting only the new side leaves the header
 /// empty until the last stretch of the stream, and empty for good on every
 /// edit whose replacement is shorter than the floor `size_label` applies.
-const BODY_ARGS: &[(&str, &[&str], bool)] = &[
-    ("file_write", &["content"], true),
-    ("file_edit", &["oldString", "newString"], false),
-    ("file_apply_patch", &["patchText"], false),
+const BODY_ARGS: &[(&str, &[&str], Body)] = &[
+    ("file_write", &["content"], Body::Drawn),
+    ("file_edit", &["oldString", "newString"], Body::Counted),
+    ("file_apply_patch", &["patchText"], Body::Named),
 ];
 
-/// The arguments `tool` writes and whether they are published, `None` for a
-/// tool with no body. Names are matched the way [`super::tool_preview`]
-/// matches them, so `mcp_File_write` and `file_write` resolve alike.
-fn body_arg(tool: &str) -> Option<(&'static [&'static str], bool)> {
+/// The arguments `tool` writes and what becomes of them, `None` for a tool
+/// with no body. Names are matched the way [`super::tool_preview`] matches
+/// them, so `mcp_File_write` and `file_write` resolve alike.
+fn body_arg(tool: &str) -> Option<(&'static [&'static str], Body)> {
     candidates(tool).find_map(|rest| {
         BODY_ARGS
             .iter()
             .find(|(name, ..)| same_key(name, rest))
-            .map(|(_, keys, publish)| (*keys, *publish))
+            .map(|(_, keys, body)| (*keys, *body))
     })
+}
+
+/// A patch's `*** Verb: path` lines as they are decoded, so its header can
+/// name files while the diff itself is still arriving.
+///
+/// Only those lines are kept. Everything else is dropped on the character that
+/// rules it out, which for an ordinary content line is its first, so the cost
+/// is the envelope rather than the patch.
+#[derive(Default)]
+struct Envelope {
+    lines: String,
+    /// Where the line being decoded starts, so a line that turns out not to
+    /// belong is dropped whole.
+    line_start: usize,
+    /// The line being decoded can no longer become an envelope line.
+    dropped: bool,
+    /// [`Self::lines`] gained a character since the header was last asked for.
+    grown: bool,
+}
+
+impl Envelope {
+    fn push(&mut self, c: char) {
+        if c == '\n' {
+            match self.line().starts_with(patch::MARKER) {
+                true => {
+                    self.lines.push('\n');
+                    self.line_start = self.lines.len();
+                }
+                false => self.lines.truncate(self.line_start),
+            }
+            self.dropped = false;
+            return;
+        }
+        if self.dropped || self.lines.len() >= ENVELOPE_MAX_BYTES {
+            return;
+        }
+        self.lines.push(c);
+        // The line so far and the marker stay prefixes of one another until
+        // the line proves otherwise, which is what admits `*`, `**` and `***`
+        // on their way to a header line the fragment has not finished.
+        let line = self.line();
+        if line.starts_with(patch::MARKER) || patch::MARKER.starts_with(line) {
+            self.grown = true;
+            return;
+        }
+        self.dropped = true;
+        self.lines.truncate(self.line_start);
+    }
+
+    fn line(&self) -> &str {
+        self.lines[self.line_start..].trim_start()
+    }
+
+    /// The header these lines name, `None` unless they grew since the last
+    /// call and name a file. A patch that has named none yet is left blank
+    /// rather than filled with the placeholder a finished header falls back
+    /// to and then replaced by the first path.
+    fn header(&mut self) -> Option<String> {
+        let grown = std::mem::take(&mut self.grown);
+        (grown && !patch::paths(&self.lines).is_empty()).then(|| patch::header(&self.lines))
+    }
 }
 
 /// One decoded character, or the fact that the escape it belongs to has not
@@ -143,7 +223,7 @@ enum State {
 /// what has not been handed to the caller yet.
 pub(super) struct BodyStream {
     keys: &'static [&'static str],
-    publish: bool,
+    body: Body,
     state: State,
     string: StringReader,
     /// The member name being read, against [`Self::keys`].
@@ -151,20 +231,22 @@ pub(super) struct BodyStream {
     newlines: usize,
     /// Decoded bytes handed out so far, against [`LIVE_BODY_MAX_BYTES`].
     emitted: usize,
+    envelope: Envelope,
 }
 
 impl BodyStream {
     /// `None` for a tool with no body worth reading.
     pub(super) fn new(tool: &str) -> Option<Self> {
-        let (keys, publish) = body_arg(tool)?;
+        let (keys, body) = body_arg(tool)?;
         Some(Self {
             keys,
-            publish,
+            body,
             state: State::Open,
             string: StringReader::default(),
             member: String::new(),
             newlines: 0,
             emitted: 0,
+            envelope: Envelope::default(),
         })
     }
 
@@ -185,6 +267,12 @@ impl BodyStream {
     /// newline count.
     pub(super) fn lines(&self) -> usize {
         self.newlines + 1
+    }
+
+    /// The files a patch has named so far, when that changed since the last
+    /// call. Always `None` for a body nothing reads an envelope out of.
+    pub(super) fn header(&mut self) -> Option<String> {
+        self.envelope.header()
     }
 
     fn push(&mut self, c: char, decoded: &mut String) {
@@ -230,9 +318,13 @@ impl BodyStream {
             State::Body => match self.string.push(c) {
                 Piece::Char(c) => {
                     self.newlines += usize::from(c == '\n');
-                    if self.publish && self.emitted < LIVE_BODY_MAX_BYTES {
-                        self.emitted += c.len_utf8();
-                        decoded.push(c);
+                    match self.body {
+                        Body::Drawn if self.emitted < LIVE_BODY_MAX_BYTES => {
+                            self.emitted += c.len_utf8();
+                            decoded.push(c);
+                        }
+                        Body::Named => self.envelope.push(c),
+                        Body::Drawn | Body::Counted => {}
                     }
                     State::Body
                 }
@@ -265,7 +357,7 @@ impl BodyStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyStream, LIVE_BODY_MAX_BYTES, body_arg};
+    use super::{Body, BodyStream, ENVELOPE_MAX_BYTES, LIVE_BODY_MAX_BYTES, body_arg};
     use test_case::test_case;
 
     const WRITE: &str = "file_write";
@@ -274,6 +366,9 @@ mod tests {
     const CONTENT_KEYS: &[&str] = &["content"];
     const EDIT_KEYS: &[&str] = &["oldString", "newString"];
     const PATCH_TEXT_KEYS: &[&str] = &["patchText"];
+    /// What a header reads once it stops naming files one by one.
+    const COUNTED_FILES: &str = " files";
+    const EXPECT_NAMED: &str = "a patch that declares files earns a header";
 
     /// Everything the fragments published, in arrival order.
     fn published(tool: &str, fragments: &[&str]) -> String {
@@ -293,12 +388,28 @@ mod tests {
         stream
     }
 
-    #[test_case(WRITE, Some((CONTENT_KEYS, true)) ; "a_write_publishes_its_content")]
-    #[test_case("mcp_File_write", Some((CONTENT_KEYS, true)) ; "a_qualified_name_resolves")]
-    #[test_case(EDIT, Some((EDIT_KEYS, false)) ; "an_edit_reads_both_sides")]
-    #[test_case(PATCH, Some((PATCH_TEXT_KEYS, false)) ; "a_patch_reads_its_envelope")]
+    /// Every header the fragments produce, in order, without the repeats a
+    /// reader drops.
+    fn headers(tool: &str, fragments: &[&str]) -> Vec<String> {
+        let mut stream = BodyStream::new(tool).unwrap();
+        let mut published: Vec<String> = Vec::new();
+        for fragment in fragments {
+            stream.absorb(fragment);
+            if let Some(header) = stream.header()
+                && published.last() != Some(&header)
+            {
+                published.push(header);
+            }
+        }
+        published
+    }
+
+    #[test_case(WRITE, Some((CONTENT_KEYS, Body::Drawn)) ; "a_write_publishes_its_content")]
+    #[test_case("mcp_File_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_qualified_name_resolves")]
+    #[test_case(EDIT, Some((EDIT_KEYS, Body::Counted)) ; "an_edit_reads_both_sides")]
+    #[test_case(PATCH, Some((PATCH_TEXT_KEYS, Body::Named)) ; "a_patch_reads_its_envelope")]
     #[test_case("shell", None ; "a_tool_with_no_body")]
-    fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], bool)>) {
+    fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], Body)>) {
         assert_eq!(body_arg(tool), expected);
         assert_eq!(BodyStream::new(tool).is_some(), expected.is_some());
     }
@@ -409,6 +520,77 @@ mod tests {
         let fragments = [r#"{"patchText": "*** Begin Patch\n+one"#];
         assert!(published(PATCH, &fragments).is_empty());
         assert_eq!(counted(PATCH, &fragments).lines(), 2);
+    }
+
+    /// The header is the only thing a patch shows while it streams, and the
+    /// files it declares are the part of it worth reading early.
+    #[test]
+    fn a_patch_names_its_files_as_they_arrive() {
+        let fragments = [
+            r#"{"patchText": "*** Begin Patch\n*** Update File: a.rs\n"#,
+            r"-one\n+two\n",
+            r#"*** Delete File: b.rs\n*** End Patch"}"#,
+        ];
+        assert_eq!(headers(PATCH, &fragments), ["a.rs", "a.rs, b.rs"]);
+    }
+
+    /// A path grows in the header the way a write's does, rather than the row
+    /// staying empty until the line it is on ends.
+    #[test]
+    fn a_path_is_named_before_its_line_ends() {
+        let fragments = [r#"{"patchText": "*** Begin Patch\n*** Update File: src/ap"#];
+        assert_eq!(headers(PATCH, &fragments), ["src/ap"]);
+    }
+
+    #[test]
+    fn an_envelope_line_split_across_fragments_is_still_named() {
+        let fragments = [r#"{"patchText": "*** Upda"#, r"te File: a.rs\n"];
+        assert_eq!(headers(PATCH, &fragments), ["a.rs"]);
+    }
+
+    /// A patch body can quote the envelope it lives in, so the line has to
+    /// start with the marker rather than merely contain it.
+    #[test]
+    fn a_content_line_quoting_the_marker_names_nothing() {
+        let fragments =
+            [r#"{"patchText": "*** Update File: a.rs\n+*** Add File: decoy.rs\n*** End Patch"}"#];
+        assert_eq!(headers(PATCH, &fragments), ["a.rs"]);
+    }
+
+    /// The placeholder a finished header falls back to would be a worse row
+    /// than none, and it would be replaced by the first path anyway.
+    #[test]
+    fn a_patch_that_has_named_nothing_shows_no_header() {
+        assert!(headers(PATCH, &[r#"{"patchText": "*** Begin Patch\n"#]).is_empty());
+    }
+
+    #[test_case(WRITE, r#"{"content": "*** Update File: a.rs\n"}"# ; "a_write_names_nothing")]
+    #[test_case(EDIT, r#"{"oldString": "*** Update File: a.rs\n"}"# ; "an_edit_names_nothing")]
+    fn only_a_patch_is_read_for_an_envelope(tool: &str, json: &str) {
+        assert!(headers(tool, &[json]).is_empty());
+    }
+
+    /// The count is what the header falls back to, so it has to outlive the
+    /// point where carrying the paths stops being useful.
+    #[test]
+    fn a_patch_past_the_envelope_cap_stops_naming_but_keeps_counting() {
+        const DECLARED: usize = 200;
+        let line = format!(r"*** Update File: {}.rs\n", "x".repeat(40));
+        let mut stream = BodyStream::new(PATCH).unwrap();
+        stream.absorb(r#"{"patchText": ""#);
+        let mut header = None;
+        for _ in 0..DECLARED {
+            stream.absorb(&line);
+            header = stream.header().or(header);
+        }
+
+        // The cap is checked before a character is kept, and a committed line
+        // adds its newline afterwards.
+        assert!(stream.envelope.lines.len() <= ENVELOPE_MAX_BYTES + 1);
+        assert_eq!(stream.lines(), DECLARED + 1);
+        let header = header.expect(EXPECT_NAMED);
+        assert!(header.ends_with(COUNTED_FILES), "{header}");
+        assert_ne!(header, format!("{DECLARED}{COUNTED_FILES}"));
     }
 
     /// The count is what the header shows, so it has to outlive the point

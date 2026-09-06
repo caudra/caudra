@@ -40,6 +40,10 @@ const PREVIEW_KEYS: &[(&str, &str)] = &[
 
 /// Tools that lead with a blob or an aggregate. There is nothing short to show
 /// mid-stream, and the finished header says it better, so they stay bare.
+///
+/// A patch is bare only as far as this scanner reaches. Its files are named
+/// from the envelope [`super::tool_body`] decodes, which keeps the newlines
+/// this scanner collapses into spaces.
 const NO_PREVIEW: &[&str] = &[
     "code_execution",
     "file_apply_patch",

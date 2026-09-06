@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use caudra_agent::patch;
 use caudra_agent::permissions::{
     PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
     PermissionResourceKind, PermissionRisk, filesystem_permission_resource, shell_permission_scope,
@@ -80,11 +81,6 @@ const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
 const ALLOW_WRITE: bool = true;
-const PATCH_MARKER: &str = "*** ";
-const PATCH_VERBS: &[&str] = &["Add File:", "Update File:", "Delete File:", "Move to:"];
-const PATCH_WITHOUT_FILES: &str = "file patch";
-/// Room a header spends naming files before it reports a count instead.
-const PATCH_HEADER_BUDGET: usize = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -721,7 +717,7 @@ impl WorkcellInvocation {
                 let (group, patch) = match planned {
                     Ok(planned) => planned,
                     Err(error) => {
-                        let targets = patch_paths(&input.patch_text)
+                        let targets = patch::paths(&input.patch_text)
                             .into_iter()
                             .map(|path| project.join(path))
                             .collect::<Vec<_>>();
@@ -882,7 +878,7 @@ impl ToolInvocation for WorkcellInvocation {
             Input::FileGrep(input) => search_header(&input.pattern, input.path.as_deref()),
             Input::FileWrite(input) => input.file_path.clone(),
             Input::FileEdit(input) => input.file_path.clone(),
-            Input::FileApplyPatch(input) => patch_header(&input.patch_text),
+            Input::FileApplyPatch(input) => patch::header(&input.patch_text),
             Input::Index(input) => input.path.clone(),
             Input::Websearch(input) => input.query.clone(),
             Input::Webfetch(input) => input.url.clone(),
@@ -1845,38 +1841,6 @@ fn file_edit_result(
         .with_model_output(Some(exact))
     };
     result.with_written_paths(written.into_iter().collect())
-}
-
-/// Advisory only: Workcell remains the sole parser and validator of a patch.
-/// This scan names files for a header, and for a stale-read notice on a patch
-/// that never got far enough to report its own resources.
-fn patch_paths(patch_text: &str) -> Vec<&str> {
-    patch_text
-        .lines()
-        .filter_map(|line| {
-            let rest = line.trim().strip_prefix(PATCH_MARKER)?;
-            PATCH_VERBS
-                .iter()
-                .find_map(|verb| rest.strip_prefix(verb))
-                .map(str::trim)
-        })
-        .filter(|path| !path.is_empty())
-        .collect()
-}
-
-/// Names the files the patch declares, so the row reads like an edit's
-/// instead of the same three words on every patch. The count stands in once
-/// naming them all would cost more room than it earns.
-fn patch_header(patch_text: &str) -> String {
-    let paths = patch_paths(patch_text);
-    match paths.len() {
-        0 => PATCH_WITHOUT_FILES.to_owned(),
-        1 => paths[0].to_owned(),
-        _ if paths.iter().map(|p| p.len() + 2).sum::<usize>() <= PATCH_HEADER_BUDGET => {
-            paths.join(", ")
-        }
-        n => format!("{n} files"),
-    }
 }
 
 fn patched_file(diff: &FileDiff) -> PatchedFile {
@@ -3639,24 +3603,6 @@ mod tests {
             EDIT_SEED,
             "{EXPECT_STALE_WRITE_REFUSED}"
         );
-    }
-
-    #[test_case(PATCH, "created.txt" ; "one_file_names_itself")]
-    #[test_case("*** Begin Patch\n*** Update File: a.rs\n*** Delete File: b.rs\n*** End Patch", "a.rs, b.rs" ; "a_few_files_are_all_named")]
-    #[test_case("*** Begin Patch\n*** End Patch", "file patch" ; "a_patch_naming_nothing_says_so")]
-    fn a_patch_header_names_the_files_it_touches(patch_text: &str, expected: &str) {
-        assert_eq!(patch_header(patch_text), expected);
-    }
-
-    /// Naming every file stops paying once the row cannot hold them, so the
-    /// count takes over rather than the header running off the screen.
-    #[test]
-    fn a_wide_patch_header_reports_a_count() {
-        let patch = (0..9)
-            .map(|i| format!("*** Update File: crates/some/deep/path/file_{i}.rs"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(patch_header(&patch), "9 files");
     }
 
     #[test_case(json!({"pattern": "needle"}), "needle" ; "a_rootless_search_shows_only_its_pattern")]
