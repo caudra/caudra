@@ -1222,13 +1222,6 @@ impl App {
             }
         }
 
-        // The plan form never has a plan ready and a todo list at once, so one
-        // helper covers both panels.
-        if key::PLAN_TOGGLE.matches(key) {
-            self.toggle_plan_or_todo();
-            return Some(Vec::new());
-        }
-
         None
     }
 
@@ -1754,7 +1747,7 @@ impl App {
             return actions;
         }
 
-        if is_shift_tab(key) {
+        if key::THINKING.matches(key) || is_shift_tab(key) {
             self.cycle_reasoning_effort();
             return vec![];
         }

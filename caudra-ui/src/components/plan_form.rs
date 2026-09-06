@@ -1,6 +1,6 @@
 use crate::components::form::{render_form, selected_prefix};
 use crate::components::hint_line;
-use crate::components::keybindings::key;
+use crate::components::keybindings::{key, leader};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -145,7 +145,7 @@ impl PlanForm {
         let t = theme::current();
         Some(Line::from(vec![
             Span::styled(" Plan ", Style::new().fg(t.foreground)),
-            Span::styled(key::PLAN_TOGGLE.label, t.keybind_key),
+            Span::styled(leader::PLAN_TOGGLE.label, t.keybind_key),
             Span::raw(" "),
         ]))
     }
@@ -160,10 +160,7 @@ impl PlanForm {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
-        if key::QUIT.matches(key_event)
-            || key_event.code == KeyCode::Esc
-            || key::PLAN_TOGGLE.matches(key_event)
-        {
+        if key::QUIT.matches(key_event) || key_event.code == KeyCode::Esc {
             return PlanFormAction::Hide;
         }
         if key::OPEN_EDITOR.matches(key_event) {
@@ -427,7 +424,6 @@ mod tests {
 
     #[test_case(key(KeyCode::Esc)              ; "esc")]
     #[test_case(key::QUIT.to_key_event()      ; "ctrl_c")]
-    #[test_case(key::PLAN_TOGGLE.to_key_event(); "ctrl_t")]
     fn dismiss(k: KeyEvent) {
         let mut form = PlanForm::new();
         form.on_plan_ready();

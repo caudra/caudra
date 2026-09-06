@@ -25,7 +25,7 @@ Leader chords are written as two keys below, and every one of them is reachable 
 | `Ctrl+X r` | Review the last reply |
 | `Ctrl+S` / `Ctrl+X f` | File picker |
 | `Ctrl+O` / `Ctrl+X o` | Open plan in editor |
-| `Ctrl+T` / `Ctrl+X t` | Toggle plan / todo panel |
+| `Ctrl+X t` | Toggle plan / todo panel |
 | `Ctrl+X a` | Open tasks |
 | `Ctrl+X l` | Browse sessions |
 | `Ctrl+X n` | Start a new session |
@@ -43,7 +43,7 @@ Leader chords are written as two keys below, and every one of them is reachable 
 | `Enter` | Submit prompt |
 | `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` | Newline |
 | `Tab` | Toggle BUILD/PLAN mode |
-| `Shift+Tab` | Cycle reasoning effort |
+| `Ctrl+T` / `Shift+Tab` | Cycle reasoning effort |
 | `/command` | Open command palette |
 | `Ctrl+W` / `Ctrl+Backspace` | Delete word backward |
 | `Ctrl+←` / `Ctrl+→` | Move word left / right |

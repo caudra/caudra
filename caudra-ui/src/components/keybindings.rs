@@ -4,6 +4,9 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
+/// Spelled once because three tables quote it.
+const SHIFT_TAB_LABEL: &str = "Shift+Tab";
+
 macro_rules! mod_key {
     ($suffix:expr) => {
         concat!("Ctrl+", $suffix)
@@ -205,7 +208,9 @@ pub mod key {
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
-    pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
+    /// Cycles the reasoning ladder. `t` for thinking, and the same key
+    /// opencode spends on its variant cycle, which is the same operation.
+    pub const THINKING: Bind = ctrl_bind!('t');
     pub const NEW_SESSION: Bind = ctrl_bind!('n');
     pub const RENAME_SESSION: Bind = ctrl_bind!('r');
     pub const GENERATE_TITLE: Bind = ctrl_bind!('g');
@@ -502,7 +507,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::PLAN_TOGGLE.label, leader::PLAN_TOGGLE.label),
+        label: KeyLabel::Single(leader::PLAN_TOGGLE.label),
         description: "Toggle plan / todo panel",
         context: KeybindContext::General,
         platform: Platform::All,
@@ -574,7 +579,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Shift+Tab"),
+        label: KeyLabel::Alt(key::THINKING.label, SHIFT_TAB_LABEL),
         description: "Cycle reasoning effort",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -856,7 +861,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt("Tab", "Shift+Tab"),
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
         description: "Switch model purpose",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,

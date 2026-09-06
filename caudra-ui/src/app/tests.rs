@@ -8697,25 +8697,25 @@ fn rewrite_does_not_reopen_after_dismiss() {
 }
 
 #[test]
-fn ctrl_t_toggles_plan_form_in_plan_mode() {
+fn the_plan_chord_toggles_the_plan_form_in_plan_mode() {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    press_chord(&mut app, chord::PLAN_TOGGLE);
     assert!(!app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    press_chord(&mut app, chord::PLAN_TOGGLE);
     assert!(app.plan_form.is_visible());
 }
 
 #[test]
-fn ctrl_t_noop_when_plan_not_ready() {
+fn the_plan_chord_is_a_noop_when_no_plan_is_ready() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     assert!(!app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    press_chord(&mut app, chord::PLAN_TOGGLE);
     assert!(!app.plan_form.is_visible());
 }
 
@@ -8749,6 +8749,8 @@ fn install_override_at(
 
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
+const FORM_TRAPPED: &str = "Esc must close the plan form whatever Lua bound the chord to";
+const PLAN_STOLE_THINKING: &str = "Ctrl+T cycles the reasoning ladder, it no longer moves panels";
 
 #[test]
 fn a_leader_override_answers_the_chord_and_shadows_the_builtin() {
@@ -8878,24 +8880,42 @@ fn builtin_runs_when_no_override() {
     assert!(app.help_modal.is_open());
 }
 
+/// The plan toggle is a leader chord now, and leader chords are overridable
+/// like every other one. It used to be the form's own close key, which put it
+/// ahead of an override. Carving out a single unoverridable chord would be
+/// worse than the rule it breaks, and it is safe to drop because `Esc` closes
+/// the form whatever Lua binds.
 #[test]
-fn plan_toggle_beats_override_when_open_and_after_dismiss() {
+fn an_override_takes_the_plan_chord_even_while_the_form_is_open() {
     let mut app = plan_app();
-    let probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
+    let probe = install_override_at(
+        &mut app,
+        chord::PLAN_TOGGLE.code,
+        chord::PLAN_TOGGLE.modifiers,
+        true,
+    );
     assert!(app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
-    assert!(
-        !app.plan_form.is_visible(),
-        "open plan form must consume Ctrl+T before the override"
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(app.plan_form.is_visible(), "{OVERRIDE_DISPATCHED}");
+}
+
+/// Which is only safe because a rebind cannot trap the form open.
+#[test]
+fn esc_still_closes_the_plan_form_under_an_override() {
+    let mut app = plan_app();
+    install_override_at(
+        &mut app,
+        chord::PLAN_TOGGLE.code,
+        chord::PLAN_TOGGLE.modifiers,
+        true,
     );
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
-    assert!(
-        app.plan_form.is_visible(),
-        "Ctrl+T must reopen the dismissed plan form despite the override"
-    );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.plan_form.is_visible(), "{FORM_TRAPPED}");
 }
 
 #[test]
@@ -9027,6 +9047,29 @@ fn backtab_representation_cycles_reasoning_effort() {
     )));
 
     assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
+}
+
+/// `Ctrl+T` is the mnemonic spelling, and the key opencode spends on the same
+/// operation. `Shift+Tab` stays because that is where the muscle memory is.
+#[test_case(kb::THINKING.to_key_event() ; "ctrl_t")]
+#[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT) ; "shift_tab")]
+fn both_thinking_keys_cycle_the_reasoning_effort(pressed: KeyEvent) {
+    let mut app = test_app();
+
+    app.update(Msg::Key(pressed));
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
+}
+
+/// `Ctrl+T` used to toggle the plan panel, which answers to the chord now.
+#[test]
+fn the_thinking_key_no_longer_toggles_the_plan_form() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    app.update(Msg::Key(kb::THINKING.to_key_event()));
+
+    assert!(app.plan_form.is_visible(), "{PLAN_STOLE_THINKING}");
 }
 
 #[test]

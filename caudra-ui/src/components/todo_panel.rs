@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::keybindings::key;
+use crate::components::keybindings::leader;
 use crate::components::{apply_scroll_delta, hover_style};
 use crate::theme;
 
@@ -30,8 +30,10 @@ const MAX_VISIBLE_ROWS: usize = 8;
 /// Header plus a trailing blank, matching the queue panel's grid.
 const CHROME_ROWS: u16 = 2;
 
-/// Hidden means the user dismissed it; a fresh list re-opens the panel, which
-/// is what makes the tool's progress visible without a keystroke.
+/// Hidden means the user dismissed it, and it stays hidden. Updating the list
+/// used to undo that, so a checkbox the model ticked put a panel back on
+/// screen that had been closed on purpose. [`TodoPanel::hint_line`] carries
+/// the count instead, and only a new session clears the dismissal.
 #[derive(Default)]
 pub struct TodoPanel {
     items: Vec<TodoItem>,
@@ -55,8 +57,6 @@ impl TodoPanel {
         if self.items == items {
             return false;
         }
-        // A new list is new information: undo a dismissal so the user sees it.
-        self.dismissed = false;
         self.follow_focus = true;
         self.items = items;
         true
@@ -94,8 +94,8 @@ impl TodoPanel {
         self.items.len().min(MAX_VISIBLE_ROWS) as u16 + CHROME_ROWS
     }
 
-    /// The counter shown next to `Ctrl+T` while the panel is dismissed, so the
-    /// list stays discoverable without occupying rows.
+    /// The counter shown next to the chord while the panel is dismissed, so
+    /// progress stays readable without occupying rows.
     pub fn hint_line(&self) -> Option<Line<'static>> {
         if self.items.is_empty() || !self.dismissed {
             return None;
@@ -106,7 +106,7 @@ impl TodoPanel {
                 format!(" {}/{} ", self.completed(), self.items.len()),
                 Style::new().fg(t.foreground),
             ),
-            Span::styled(key::PLAN_TOGGLE.label, t.keybind_key),
+            Span::styled(leader::PLAN_TOGGLE.label, t.keybind_key),
             Span::raw(" "),
         ]))
     }
@@ -294,6 +294,8 @@ mod tests {
     use ratatui::style::Modifier;
     use test_case::test_case;
 
+    const DISMISSAL_UNDONE: &str = "only the user or a new session may reopen a dismissed panel";
+    const HINT_STALE: &str = "the hint row must track the list while the panel is dismissed";
     const WIDE: u16 = 40;
 
     fn todo(content: &str, status: TodoStatus) -> TodoItem {
@@ -356,14 +358,47 @@ mod tests {
         assert!(!panel.is_visible());
     }
 
-    /// A dismissal must not outlive the list it was aimed at, or the next
-    /// task's progress would be invisible.
+    /// A dismissal is the user's, and the agent does not get to undo it by
+    /// ticking a box. The panel used to reopen on every update, which put a
+    /// closed panel back on screen mid-task.
     #[test]
-    fn a_new_list_undoes_a_dismissal() {
+    fn updating_the_list_leaves_a_dismissal_alone() {
         let mut panel = panel(&[TodoStatus::Pending]);
         panel.toggle();
         assert!(!panel.is_visible());
+
         panel.set_items(vec![todo("fresh", TodoStatus::InProgress)]);
+
+        assert!(!panel.is_visible(), "{DISMISSAL_UNDONE}");
+    }
+
+    /// Dismissed is not gone: the count keeps moving in the hint row, so the
+    /// panel is worth reopening and can be found again.
+    #[test]
+    fn a_dismissed_panel_still_reports_progress() {
+        let mut panel = panel(&[TodoStatus::Pending, TodoStatus::Pending]);
+        panel.toggle();
+
+        panel.set_items(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::InProgress),
+        ]);
+
+        let hint = panel.hint_line().expect(DISMISSAL_UNDONE);
+        let text: String = hint.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1/2"), "{HINT_STALE}");
+        assert!(text.contains(leader::PLAN_TOGGLE.label), "{HINT_STALE}");
+    }
+
+    /// The one thing that does clear it, so a new session starts clean.
+    #[test]
+    fn a_reset_clears_a_dismissal() {
+        let mut panel = panel(&[TodoStatus::Pending]);
+        panel.toggle();
+
+        panel.reset();
+        panel.set_items(vec![todo("fresh", TodoStatus::InProgress)]);
+
         assert!(panel.is_visible());
     }
 
