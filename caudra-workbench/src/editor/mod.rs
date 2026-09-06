@@ -48,7 +48,21 @@ pub struct Tab {
     pub conflict: bool,
     revision: u64,
     scroll: usize,
+    /// Which visual row of `scroll` sits at the top of the pane. Always zero
+    /// while the pane is unwrapped, where a line is exactly one row.
+    scroll_row: usize,
     h_scroll: usize,
+}
+
+/// One painted row: a slice of a buffer line, in display columns. Unwrapped is
+/// the one-row case, so both modes reach [`render::Row::paint`] the same way.
+#[derive(Clone, Copy)]
+pub struct VisualRow {
+    pub line: usize,
+    pub start: usize,
+    pub span: usize,
+    /// Where the row falls within its buffer line. Only row zero is numbered.
+    pub index: usize,
 }
 
 impl Tab {
@@ -68,6 +82,7 @@ impl Tab {
             conflict: false,
             revision: 0,
             scroll: 0,
+            scroll_row: 0,
             h_scroll: 0,
         }
     }
@@ -100,6 +115,7 @@ impl Tab {
             conflict: false,
             revision: 0,
             scroll: 0,
+            scroll_row: 0,
             h_scroll: 0,
         }
     }
@@ -128,6 +144,9 @@ impl Tab {
         self.scroll
     }
 
+    /// Only the wrap-aware walks read the pan now, so nothing outside the tests
+    /// asks for it on its own.
+    #[cfg(test)]
     pub fn h_scroll(&self) -> usize {
         self.h_scroll
     }
@@ -267,6 +286,7 @@ impl Tab {
         self.buffer = Buffer::new(loaded.lines);
         self.buffer.set_cursor(cursor, false);
         self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
+        self.scroll_row = 0;
         self.history = History::default();
         self.highlighter.invalidate_from(0);
         self.conflict = false;
@@ -288,27 +308,120 @@ impl Tab {
         self.history.break_group();
     }
 
+    /// The display column each visual row of `line` starts at. Unwrapped there
+    /// is one row, panned to wherever the window sits, which is what lets every
+    /// caller below walk both modes with the same arithmetic.
+    fn row_starts(&self, line: usize, columns: usize, wrap: bool) -> Vec<usize> {
+        match wrap {
+            true => render::wrap_columns(self.buffer.line(line), columns),
+            false => vec![self.h_scroll],
+        }
+    }
+
+    /// Where the pane starts painting. `scroll_row` is clamped rather than
+    /// trusted, so a row remembered under a wrap that has since been turned off,
+    /// or an edit that shortened the line, cannot skip past the top line.
+    fn scroll_top(&self, columns: usize, wrap: bool) -> (usize, usize) {
+        let count = self.row_starts(self.scroll, columns, wrap).len();
+        (self.scroll, self.scroll_row.min(count - 1))
+    }
+
+    /// The rows the pane paints, top first and at most `rows` of them.
+    pub fn visible_rows(&self, rows: usize, columns: usize, wrap: bool) -> Vec<VisualRow> {
+        let (mut line, mut index) = self.scroll_top(columns, wrap);
+        let mut visible = Vec::with_capacity(rows);
+        while visible.len() < rows && line < self.buffer.line_count() {
+            let starts = self.row_starts(line, columns, wrap);
+            while index < starts.len() && visible.len() < rows {
+                let start = starts[index];
+                let span = starts
+                    .get(index + 1)
+                    .map_or(columns, |next| (next - start).min(columns));
+                visible.push(VisualRow {
+                    line,
+                    start,
+                    span,
+                    index,
+                });
+                index += 1;
+            }
+            line += 1;
+            index = 0;
+        }
+        visible
+    }
+
+    /// The top of a pane `count` rows tall whose last row is `(line, row)`.
+    fn top_for(
+        &self,
+        line: usize,
+        row: usize,
+        count: usize,
+        columns: usize,
+        wrap: bool,
+    ) -> (usize, usize) {
+        let (mut line, mut row) = (line, row);
+        for _ in 0..count.saturating_sub(1) {
+            if row > 0 {
+                row -= 1;
+            } else if line > 0 {
+                line -= 1;
+                row = self.row_starts(line, columns, wrap).len() - 1;
+            } else {
+                break;
+            }
+        }
+        (line, row)
+    }
+
     /// Keeps the cursor inside the window vertically and horizontally.
     /// Horizontal scrolling is in display columns, so a wide glyph moves the
-    /// window by two.
-    pub fn follow_cursor(&mut self, rows: usize, columns: usize) {
+    /// window by two. A wrapped pane has nothing off to its side, so it pans
+    /// back to the left margin and stays there.
+    pub fn follow_cursor(&mut self, rows: usize, columns: usize, wrap: bool) {
         let cursor = self.buffer.cursor();
-        if cursor.line < self.scroll {
-            self.scroll = cursor.line;
-        } else if rows > 0 && cursor.line >= self.scroll + rows {
-            self.scroll = cursor.line + 1 - rows;
-        }
         let column = render::display_column(self.buffer.line(cursor.line), cursor.col);
-        if column < self.h_scroll {
+        let row = self
+            .row_starts(cursor.line, columns, wrap)
+            .iter()
+            .rposition(|start| column >= *start)
+            .unwrap_or_default();
+
+        let top = self.scroll_top(columns, wrap);
+        if (cursor.line, row) < top {
+            (self.scroll, self.scroll_row) = (cursor.line, row);
+        } else {
+            let bottom = self.top_for(cursor.line, row, rows.max(1), columns, wrap);
+            if top < bottom {
+                (self.scroll, self.scroll_row) = bottom;
+            }
+        }
+
+        if wrap {
+            self.h_scroll = 0;
+        } else if column < self.h_scroll {
             self.h_scroll = column;
         } else if columns > 0 && column >= self.h_scroll + columns {
             self.h_scroll = column + 1 - columns;
         }
     }
 
-    pub fn scroll_by(&mut self, delta: isize, rows: usize) {
-        let max = self.buffer.line_count().saturating_sub(rows.max(1));
-        self.scroll = self.scroll.saturating_add_signed(delta).min(max);
+    /// Steps the window `delta` visual rows, negative upwards, stopping where
+    /// the last row of the buffer reaches the bottom of the pane.
+    pub fn scroll_by(&mut self, delta: isize, rows: usize, columns: usize, wrap: bool) {
+        let top = self.scroll_top(columns, wrap);
+        let steps = delta.unsigned_abs() + 1;
+        let moved = match delta < 0 {
+            true => self.top_for(top.0, top.1, steps, columns, wrap),
+            false => self
+                .visible_rows(steps, columns, wrap)
+                .last()
+                .map_or(top, |row| (row.line, row.index)),
+        };
+        let last_line = self.buffer.line_count().saturating_sub(1);
+        let last_row = self.row_starts(last_line, columns, wrap).len() - 1;
+        let bottom = self.top_for(last_line, last_row, rows.max(1), columns, wrap);
+        (self.scroll, self.scroll_row) = moved.min(bottom);
     }
 
     /// Pans the window sideways, in display columns. Clamped to the widest

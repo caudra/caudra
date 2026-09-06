@@ -151,6 +151,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Editor | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | Workbench Editor | `Ctrl+A` | Select the whole buffer |
 | Workbench Editor | `Ctrl+K` | Delete to the end of the line |
+| Workbench Editor | `Alt+Z` | Wrap long lines onto more rows |
 | Workbench Editor | `Alt+Left` / `Alt+Right` | Previous / next tab |
 | Workbench Editor | `Alt+W` | Close the active tab |
 | Workbench Source Control | `Space` | Stage or unstage the file, folder, or whole section |

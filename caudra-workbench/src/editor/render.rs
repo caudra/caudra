@@ -18,6 +18,9 @@ pub const TAB_STOP: usize = 4;
 /// Stands in for a tab's expansion, for padding past the end of a line, and for
 /// a wide glyph the window cut in half.
 const BLANK: char = ' ';
+/// Where a wrapped row is allowed to end. A non-breaking space is deliberately
+/// absent: it is written precisely to stop a break happening there.
+const BREAK_AFTER: [char; 2] = [' ', '\t'];
 
 /// One terminal column. `ch` is `None` for the trailing half of a wide glyph,
 /// which the glyph itself already covers and so prints nothing of its own.
@@ -129,6 +132,40 @@ pub fn char_index(line: &str, column: usize) -> usize {
     line.chars().count()
 }
 
+/// The display column each visual row of `line` starts at, in a pane `width`
+/// columns wide. Always at least one entry, so a wrapped caller and an
+/// unwrapped one read the same shape.
+///
+/// A row ends after the last break character that fits, so a word is never
+/// split. A word too long for any row is cut at the column that fills one,
+/// because there is nowhere else for it to go. Trailing blanks overhang the
+/// right margin rather than being carried down, which is what keeps a wrapped
+/// word starting flush with the one above it.
+///
+/// This is the only description of where the editor's rows fall. The gutter,
+/// the click hit-test and the cursor all read it rather than measuring again.
+pub fn wrap_columns(line: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut starts = vec![0];
+    let mut row_start = 0;
+    let mut after_break = None;
+    let mut at = 0;
+    for ch in line.chars() {
+        let breaking = BREAK_AFTER.contains(&ch);
+        let span = char_width(ch, at);
+        if !breaking && at + span > row_start + width && at > row_start {
+            row_start = after_break.filter(|&start| start > row_start).unwrap_or(at);
+            starts.push(row_start);
+            after_break = None;
+        }
+        at += span;
+        if breaking {
+            after_break = Some(at);
+        }
+    }
+    starts
+}
+
 fn char_width(ch: char, at: usize) -> usize {
     if ch == '\t' {
         TAB_STOP - at % TAB_STOP
@@ -195,11 +232,12 @@ mod tests {
     use ratatui::style::{Color, Style};
     use test_case::test_case;
 
-    use super::{Row, StyledSegment, char_index, display_column};
+    use super::{Row, StyledSegment, char_index, display_column, wrap_columns};
 
     const WRONG_TEXT: &str = "the painted row does not read as expected";
     const WRONG_COLUMN: &str = "character and display columns do not line up";
     const WRONG_STYLE: &str = "the painted row is not styled as expected";
+    const WRONG_ROWS: &str = "the line does not wrap onto the rows it should";
 
     fn plain(text: &str) -> Row<'_> {
         Row {
@@ -381,5 +419,36 @@ mod tests {
         };
 
         assert_eq!(painted(&row, 0, 8), "abc", "{WRONG_TEXT}");
+    }
+
+    #[test_case("", 8 => vec![0]; "an empty line still has one row")]
+    #[test_case("hello", 8 => vec![0]; "a line that fits keeps one row")]
+    #[test_case("hello world", 8 => vec![0, 6]; "a row ends after the space before the word")]
+    #[test_case("abcdefghij", 8 => vec![0, 8]; "a word too long for a row is cut")]
+    #[test_case("ab cdefghijkl", 8 => vec![0, 3, 11]; "an over-long word breaks after the space first")]
+    #[test_case("\tword here", 8 => vec![0, 9]; "a tab counts its expansion rather than one column")]
+    fn wrap_columns_breaks_on_words(text: &str, width: usize) -> Vec<usize> {
+        wrap_columns(text, width)
+    }
+
+    /// The rows the render loop would paint from those columns, so the wrap and
+    /// the painting are checked against each other rather than separately.
+    #[test]
+    fn a_wrapped_row_paints_only_its_own_words() {
+        let (text, width) = ("hello world", 8);
+        let starts = wrap_columns(text, width);
+        let row = plain(text);
+        let rows: Vec<String> = starts
+            .iter()
+            .enumerate()
+            .map(|(index, &start)| {
+                let span = starts
+                    .get(index + 1)
+                    .map_or(width, |&next| (next - start).min(width));
+                painted(&row, start, span)
+            })
+            .collect();
+
+        assert_eq!(rows, ["hello ", "world"], "{WRONG_ROWS}");
     }
 }

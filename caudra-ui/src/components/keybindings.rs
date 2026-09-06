@@ -974,6 +974,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_WRAP.label),
+        description: "Wrap long lines onto more rows",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Alt(wb::PREV_TAB.label, wb::NEXT_TAB.label),
         description: "Previous / next tab",
         context: KeybindContext::WorkbenchEditor,

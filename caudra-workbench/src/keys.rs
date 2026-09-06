@@ -64,6 +64,7 @@ pub const KILL_LINE: Bind = bind!(KeyCode::Char('k'), CTRL, "Ctrl+K");
 pub const COPY: Bind = bind!(KeyCode::Char('c'), CTRL, "Ctrl+C");
 pub const CUT: Bind = bind!(KeyCode::Char('x'), CTRL, "Ctrl+X");
 pub const PASTE: Bind = bind!(KeyCode::Char('v'), CTRL, "Ctrl+V");
+pub const TOGGLE_WRAP: Bind = bind!(KeyCode::Char('z'), ALT, "Alt+Z");
 
 pub const PREV_TAB: Bind = bind!(KeyCode::Left, ALT, "Alt+Left");
 pub const NEXT_TAB: Bind = bind!(KeyCode::Right, ALT, "Alt+Right");
@@ -112,6 +113,7 @@ const GLOBAL_BINDS: &[Bind] = &[
     COPY,
     CUT,
     PASTE,
+    TOGGLE_WRAP,
     PREV_TAB,
     NEXT_TAB,
     CLOSE_TAB,

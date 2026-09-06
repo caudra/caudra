@@ -109,6 +109,8 @@ pub struct Layout {
     pub sidebar_width: u16,
     pub sidebar_collapsed: bool,
     pub show_hidden: bool,
+    /// Whether the editor breaks long lines onto more rows instead of panning.
+    pub wrap: bool,
     pub scm: ScmLayout,
 }
 
@@ -141,6 +143,7 @@ impl Default for Layout {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
             show_hidden: false,
+            wrap: false,
             scm: ScmLayout::default(),
         }
     }
@@ -265,6 +268,9 @@ pub struct Workbench {
     sidebar_width: u16,
     sidebar_collapsed: bool,
     show_hidden: bool,
+    /// Whether the editor breaks a line too long for the pane onto further rows
+    /// rather than leaving it off to the right.
+    wrap: bool,
     styles: WorkbenchStyles,
     /// Whether a pane whose content overruns it gives up a column to say so.
     /// The host owns the setting, so this mirrors `ui.scrollbar` rather than
@@ -322,6 +328,7 @@ impl Workbench {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
             show_hidden: false,
+            wrap: false,
             styles,
             scrollbars: true,
             theme_generation: 0,
@@ -453,6 +460,7 @@ impl Workbench {
             sidebar_width: self.sidebar_width,
             sidebar_collapsed: self.sidebar_collapsed,
             show_hidden: self.show_hidden,
+            wrap: self.wrap,
             scm: ScmLayout {
                 flat,
                 sections: sections
@@ -471,6 +479,7 @@ impl Workbench {
         self.sidebar_collapsed = layout.sidebar_collapsed;
         self.set_sidebar_width(layout.sidebar_width);
         self.show_hidden = layout.show_hidden;
+        self.wrap = layout.wrap;
         self.tree.set_show_hidden(self.show_hidden);
         let sections: Vec<(u16, bool)> = layout
             .scm
@@ -586,9 +595,10 @@ impl Workbench {
                 SidebarView::SourceControl => {}
             }
         } else if self.panes.text.contains(at.into()) {
-            let rows = self.panes.text.height as usize;
+            let text = self.panes.text;
+            let wrap = self.wrap;
             if let Some(tab) = self.editor.active_mut() {
-                tab.scroll_by(delta, rows);
+                tab.scroll_by(delta, text.height as usize, text.width as usize, wrap);
             }
         }
     }
@@ -598,7 +608,9 @@ impl Workbench {
     /// themselves to their width, so there is nothing off to their side.
     fn scroll_sideways(&mut self, at: (u16, u16), delta: isize) {
         let text = self.panes.text;
-        if !text.contains(at.into()) {
+        // A wrapped pane holds every column it has, so there is nothing to pan
+        // towards and a sideways wheel is nothing to answer.
+        if self.wrap || !text.contains(at.into()) {
             return;
         }
         if let Some(tab) = self.editor.active_mut() {
@@ -888,10 +900,13 @@ impl Workbench {
         let tab = self.editor.active()?;
         let row = at.1.clamp(text.y, text.bottom() - 1);
         let column = at.0.clamp(text.x, text.right() - 1);
-        let line = (tab.scroll() + (row - text.y) as usize).min(tab.buffer.line_count() - 1);
-        let reached = tab.h_scroll() + (column - text.x) as usize;
-        let col = editor::render::char_index(tab.buffer.line(line), reached);
-        Some(Cursor::new(line, col))
+        // The same walk the frame was painted from, so a press on a wrapped
+        // row cannot land on a different half of the line than it points at.
+        let rows = tab.visible_rows(text.height as usize, text.width as usize, self.wrap);
+        let visual = rows.get((row - text.y) as usize).or_else(|| rows.last())?;
+        let reached = visual.start + (column - text.x) as usize;
+        let col = editor::render::char_index(tab.buffer.line(visual.line), reached);
+        Some(Cursor::new(visual.line, col))
     }
 
     /// How far a text drag that has run off the pane wants to scroll. Zero
@@ -915,12 +930,12 @@ impl Workbench {
         if delta == 0 {
             return false;
         }
-        let rows = self.panes.text.height as usize;
+        let (text, wrap) = (self.panes.text, self.wrap);
         let Some(tab) = self.editor.active_mut() else {
             return false;
         };
         let before = tab.scroll();
-        tab.scroll_by(delta, rows);
+        tab.scroll_by(delta, text.height as usize, text.width as usize, wrap);
         if tab.scroll() == before {
             return false;
         }
@@ -987,6 +1002,13 @@ impl Workbench {
             if self.sidebar_collapsed {
                 self.focus = Focus::Editor;
             }
+            return Some(WorkbenchAction::Consumed);
+        }
+        if keys::TOGGLE_WRAP.matches(key) {
+            self.wrap = !self.wrap;
+            // The caret was measured against the old shape of the pane, so it
+            // is put back on screen before anything else reads the scroll.
+            self.follow_cursor();
             return Some(WorkbenchAction::Consumed);
         }
         if keys::TOGGLE_HIDDEN.matches(key) {
@@ -1660,8 +1682,9 @@ impl Workbench {
 
     fn follow_cursor(&mut self) {
         let (rows, columns) = (self.panes.text.height, self.panes.text.width);
+        let wrap = self.wrap;
         if let Some(tab) = self.editor.active_mut() {
-            tab.follow_cursor(rows as usize, columns as usize);
+            tab.follow_cursor(rows as usize, columns as usize, wrap);
         }
     }
 
@@ -1790,6 +1813,7 @@ mod tests {
         WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::SCROLLBAR_THUMB;
+    use crate::editor::{VisualRow, render};
     use crate::fs::tree::GitMark;
     use crate::search;
     use crate::view::{
@@ -1858,8 +1882,15 @@ mod tests {
     const NOT_PANNED: &str = "the sideways wheel did not pan the text pane";
     const PANNED_OFF: &str = "the pan ran past the widest line the pane is showing";
     const PANNED_ELSEWHERE: &str = "a sideways wheel outside the text pane still panned it";
+    const NOT_WRAPPED: &str = "the line is not laid out across the rows wrapping asks for";
+    const STILL_WRAPPED: &str = "a line is still carried down after wrapping was turned off";
+    const WRONG_GUTTER: &str = "the gutter is not numbering the rows it should";
+    const PANNED_WRAPPED: &str = "a wrapped pane must sit at the left margin and stay there";
+    const CARET_OFF_SCREEN: &str = "the caret is not on a row the pane is painting";
     /// Wide enough that no pane in these tests can show all of it at once.
     const WIDE_LINE_COLUMNS: usize = 400;
+    /// Short enough to fit any pane here, so it never wraps itself.
+    const SHORT_LINE: &str = "tail";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2470,11 +2501,16 @@ mod tests {
     }
 
     /// One line far wider than any pane here, so there is always something off
-    /// to the right to pan towards.
+    /// to the right to pan towards, over a short one, so a row a wrap carried
+    /// down can be told from the line below it.
     fn wide_file() -> (TempDir, Workbench) {
         let dir = TempDir::new().expect("a temporary directory");
         let line = "x".repeat(WIDE_LINE_COLUMNS);
-        fs::write(dir.path().join("wide.txt"), format!("{line}\n")).expect("a file");
+        fs::write(
+            dir.path().join("wide.txt"),
+            format!("{line}\n{SHORT_LINE}\n"),
+        )
+        .expect("a file");
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         workbench.handle_key(key(KeyCode::Enter));
@@ -2483,6 +2519,143 @@ mod tests {
 
     fn panned(workbench: &Workbench) -> usize {
         workbench.editor.active().expect(NO_TAB).h_scroll()
+    }
+
+    fn wrap(workbench: &mut Workbench) {
+        workbench.handle_key(alt(keys::TOGGLE_WRAP.code));
+    }
+
+    /// The line numbers beside the text pane, which is whatever the editor
+    /// column has left of it.
+    fn gutter_of(workbench: &Workbench) -> Rect {
+        let (editor, text) = (workbench.panes.editor, workbench.panes.text);
+        Rect {
+            x: editor.x,
+            width: text.x - editor.x,
+            ..text
+        }
+    }
+
+    /// One row of `rect`, as it was painted.
+    fn row_of(surface: &Surface, rect: Rect, offset: u16) -> String {
+        (rect.x..rect.right())
+            .map(|column| surface[(column, rect.y + offset)].symbol())
+            .collect()
+    }
+
+    /// The rows the pane is painting, read the same way the frame reads them.
+    fn painted_rows(workbench: &Workbench) -> Vec<VisualRow> {
+        let text = workbench.panes.text;
+        workbench.editor.active().expect(NO_TAB).visible_rows(
+            text.height as usize,
+            text.width as usize,
+            workbench.wrap,
+        )
+    }
+
+    /// Whether the caret falls on a row the pane is painting, which is what
+    /// following it is for.
+    fn caret_on_screen(workbench: &Workbench) -> bool {
+        let tab = workbench.editor.active().expect(NO_TAB);
+        let caret = tab.buffer.cursor();
+        let at = render::display_column(tab.buffer.line(caret.line), caret.col);
+        painted_rows(workbench)
+            .iter()
+            .any(|row| row.line == caret.line && (row.start..row.start + row.span).contains(&at))
+    }
+
+    #[test]
+    fn wrapping_carries_a_long_line_onto_the_next_row_and_numbers_it_once() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+
+        wrap(&mut workbench);
+        let surface = paint(&mut workbench, 60, 10);
+        let (text, gutter) = (workbench.panes.text, gutter_of(&workbench));
+
+        assert_eq!(
+            row_of(&surface, text, 1),
+            "x".repeat(text.width as usize),
+            "{NOT_WRAPPED}"
+        );
+        assert!(row_of(&surface, gutter, 0).contains('1'), "{WRONG_GUTTER}");
+        assert!(
+            row_of(&surface, gutter, 1).trim().is_empty(),
+            "{WRONG_GUTTER}"
+        );
+    }
+
+    #[test]
+    fn turning_wrap_off_puts_the_line_back_on_one_row() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+
+        wrap(&mut workbench);
+        wrap(&mut workbench);
+        let surface = paint(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+
+        assert_eq!(
+            row_of(&surface, text, 0),
+            "x".repeat(text.width as usize),
+            "{NOT_WRAPPED}"
+        );
+        assert_eq!(
+            row_of(&surface, text, 1).trim(),
+            SHORT_LINE,
+            "{STILL_WRAPPED}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_carried_row_lands_further_along_the_same_line() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+        wrap(&mut workbench);
+        draw(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x + 2, text.y + 1));
+
+        assert_eq!(
+            cursor(&workbench),
+            Cursor::new(0, text.width as usize + 2),
+            "{WRONG_CLICK}"
+        );
+    }
+
+    #[test]
+    fn wrapping_pans_back_to_the_left_margin_and_stays_there() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(wheel_right(text.x + 1, text.y + 1));
+        assert_ne!(panned(&workbench), 0, "{NOT_PANNED}");
+
+        wrap(&mut workbench);
+        assert_eq!(panned(&workbench), 0, "{PANNED_WRAPPED}");
+
+        workbench.handle_mouse(wheel_right(text.x + 1, text.y + 1));
+        assert_eq!(panned(&workbench), 0, "{PANNED_WRAPPED}");
+    }
+
+    #[test]
+    fn a_caret_below_the_fold_of_a_wrapped_line_is_scrolled_into_view() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+        wrap(&mut workbench);
+        draw(&mut workbench, 60, 10);
+
+        workbench.handle_key(key(KeyCode::End));
+
+        assert!(caret_on_screen(&workbench), "{CARET_OFF_SCREEN}");
+        let top = painted_rows(&workbench)
+            .first()
+            .copied()
+            .expect("a painted row");
+        assert_eq!(top.line, 0, "{CARET_OFF_SCREEN}");
+        assert!(top.index > 0, "{CARET_OFF_SCREEN}");
     }
 
     #[test]

@@ -74,6 +74,8 @@ Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look l
 
 `Ctrl+S` saves. `Ctrl+F` opens find in file, then `Enter` or `Down` goes to the next match and `Shift+Enter` or `Up` to the previous one. `F3` and `Shift+F3` do the same thing without the bar open, so `Esc` puts the buffer back and you can keep walking the matches. `Ctrl+G` goes to a line number.
 
+`Alt+Z` wraps long lines onto more rows instead of leaving them off to the right. A wrapped line breaks between words, keeps its number in the gutter on the first row only, and ignores the sideways pan, because the pane is already showing every column it has. The workbench remembers the setting per project.
+
 Files the editor cannot take still open. Binaries, files over 8 MiB, and files that are not valid UTF-8 open read-only, and the status row says which of the three it is.
 
 ### When the agent writes the same file

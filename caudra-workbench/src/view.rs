@@ -15,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::editor::{DiffKind, Editor, Tab, render};
+use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
 use crate::fs::tree::{GitMark, Row as TreeRow};
 use crate::scm::graph::Rail;
 use crate::scm::repo::{Change, Commit};
@@ -598,29 +598,31 @@ impl Workbench {
         let (text, bar) = scroll_column(self.scrollbars, text, lines);
         self.panes.text = text;
 
-        let first = tab.scroll();
-        let last = (first + text.height as usize).min(tab.buffer.line_count());
+        // Wrapping makes a row a slice of a line rather than a whole one, but
+        // the highlighter and the scrollbar still count in buffer lines, so
+        // both ends of the window are taken back to the lines they fall on.
+        let rows = tab.visible_rows(text.height as usize, text.width as usize, self.wrap);
+        let first = rows.first().map_or(0, |row| row.line);
+        let last = rows.last().map_or(0, |row| row.line + 1);
         tab.highlight(first, last);
         let tab = &*tab;
         let segments = tab.segments(first, last);
-        let h_scroll = tab.h_scroll();
-        for line in first..last {
-            let offset = line - first;
+        for (offset, row) in rows.iter().enumerate() {
             chrome::render_line(
                 buf,
                 line_at(numbers, offset),
-                gutter_row(tab, line, &self.styles, focused, gutter),
+                gutter_row(tab, *row, &self.styles, focused, gutter),
             );
             chrome::render_line(
                 buf,
                 line_at(text, offset),
                 text_row(
                     tab,
-                    line,
-                    segments.get(offset).map(Vec::as_slice),
+                    row.line,
+                    segments.get(row.line - first).map(Vec::as_slice),
                     &self.styles,
                     focused,
-                    (h_scroll, text.width as usize),
+                    (row.start, row.span),
                 ),
             );
         }
@@ -1256,28 +1258,30 @@ fn git_style(mark: GitMark, styles: &WorkbenchStyles) -> Style {
     }
 }
 
+/// The line number, or the blank that stands in its place where a wrapped line
+/// carries on. Both are the same width in the same style, so a continuation
+/// reads as part of the line above rather than as a line of its own.
 fn gutter_row(
     tab: &Tab,
-    line: usize,
+    row: VisualRow,
     styles: &WorkbenchStyles,
     focused: bool,
     width: u16,
 ) -> Line<'static> {
-    let style = match focused && tab.buffer.cursor().line == line {
+    let style = match focused && tab.buffer.cursor().line == row.line {
         true => styles.text,
         false => match tab.diff_kinds().is_some() {
             true => styles.diff_line_nr,
             false => styles.gutter,
         },
     };
+    let number = match row.index {
+        0 => (row.line + 1).to_string(),
+        _ => String::new(),
+    };
     let gap = GUTTER_GAP as usize;
     Line::from(Span::styled(
-        format!(
-            "{:>width$}{:gap$}",
-            line + 1,
-            "",
-            width = width as usize - gap
-        ),
+        format!("{number:>width$}{:gap$}", "", width = width as usize - gap),
         style,
     ))
 }
