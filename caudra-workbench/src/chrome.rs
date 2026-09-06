@@ -107,7 +107,9 @@ pub fn render_line(buf: &mut Buffer, area: Rect, line: Line<'_>) {
 }
 
 /// Lays a left group against a right group on one row, dropping the right group
-/// when the two would collide rather than letting it wrap.
+/// when the two would collide rather than letting it wrap. Filling the row
+/// exactly is not a collision: a caller that budgets its left group against the
+/// width of its right one lands there every time it truncates.
 pub fn status_line<'a>(
     left: Vec<Span<'a>>,
     right: Vec<Span<'a>>,
@@ -123,7 +125,7 @@ pub fn status_line<'a>(
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let mut spans = left;
-    if left_width + right_width < width as usize {
+    if left_width + right_width <= width as usize {
         spans.push(Span::styled(
             " ".repeat(width as usize - left_width - right_width),
             style,
@@ -135,13 +137,19 @@ pub fn status_line<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ELLIPSIS, fit, fit_end};
+    use super::{ELLIPSIS, fit, fit_end, status_line};
+    use ratatui::style::Style;
+    use ratatui::text::Span;
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
 
     const WITHIN_BUDGET: &str = "a fitted string must never exceed the width it was given";
     const UNTOUCHED: &str = "a string that already fits must come back unchanged";
     const KEEPS_TAIL: &str = "fit_end must keep the end of the string, which names the file";
+    const GROUP_DROPPED: &str = "a right group that fits exactly must still be laid out";
+    const GROUP_KEPT: &str = "a right group with no room left must be dropped, not wrapped";
+    const LEFT_TEXT: &str = "name";
+    const RIGHT_TEXT: &str = " M";
 
     #[test_case("short", 10 ; "shorter_than_width")]
     #[test_case("exactly-ten", 11 ; "equal_to_width")]
@@ -179,5 +187,38 @@ mod tests {
             cut.starts_with(ELLIPSIS),
             "a cut string must say it was cut"
         );
+    }
+
+    /// A row whose left group was budgeted against its right one fills the
+    /// width exactly the moment it truncates, which is the common case rather
+    /// than the corner.
+    #[test]
+    fn two_groups_that_fill_the_row_exactly_are_both_laid_out() {
+        let width = (LEFT_TEXT.len() + RIGHT_TEXT.len()) as u16;
+        let line = status_line(
+            vec![Span::raw(LEFT_TEXT)],
+            vec![Span::raw(RIGHT_TEXT)],
+            width,
+            Style::default(),
+        );
+
+        assert_eq!(
+            line.to_string(),
+            format!("{LEFT_TEXT}{RIGHT_TEXT}"),
+            "{GROUP_DROPPED}"
+        );
+    }
+
+    #[test]
+    fn a_right_group_with_no_room_is_dropped() {
+        let width = (LEFT_TEXT.len() + RIGHT_TEXT.len() - 1) as u16;
+        let line = status_line(
+            vec![Span::raw(LEFT_TEXT)],
+            vec![Span::raw(RIGHT_TEXT)],
+            width,
+            Style::default(),
+        );
+
+        assert_eq!(line.to_string(), LEFT_TEXT, "{GROUP_KEPT}");
     }
 }
