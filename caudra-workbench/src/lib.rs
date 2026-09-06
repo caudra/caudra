@@ -48,6 +48,9 @@ const MIN_EDITOR_WIDTH: u16 = 24;
 const SEPARATOR_WIDTH: u16 = 1;
 const STATUS_HEIGHT: u16 = 1;
 const SCROLL_LINES: isize = 3;
+/// How far one notch of a sideways wheel pans the text, in display columns.
+/// Wider than a vertical notch because a column is narrower than a row.
+const SCROLL_COLUMNS: isize = 4;
 /// How far one tick of a drag that has run off the buffer scrolls it.
 const EDGE_SCROLL_LINES: isize = 1;
 const SIDEBAR_STEP: i16 = 2;
@@ -514,6 +517,14 @@ impl Workbench {
         let delta = match event.kind {
             MouseEventKind::ScrollUp => -SCROLL_LINES,
             MouseEventKind::ScrollDown => SCROLL_LINES,
+            MouseEventKind::ScrollLeft => {
+                self.scroll_sideways(at, -SCROLL_COLUMNS);
+                return WorkbenchAction::Consumed;
+            }
+            MouseEventKind::ScrollRight => {
+                self.scroll_sideways(at, SCROLL_COLUMNS);
+                return WorkbenchAction::Consumed;
+            }
             MouseEventKind::Moved => {
                 self.hover = Some(at);
                 return WorkbenchAction::Consumed;
@@ -579,6 +590,19 @@ impl Workbench {
             if let Some(tab) = self.editor.active_mut() {
                 tab.scroll_by(delta, rows);
             }
+        }
+    }
+
+    /// A sideways wheel over `at`, worth `delta` display columns and negative
+    /// leftwards. Only the text pane pans: the sidebar lists already cut
+    /// themselves to their width, so there is nothing off to their side.
+    fn scroll_sideways(&mut self, at: (u16, u16), delta: isize) {
+        let text = self.panes.text;
+        if !text.contains(at.into()) {
+            return;
+        }
+        if let Some(tab) = self.editor.active_mut() {
+            tab.h_scroll_by(delta, text.height as usize, text.width as usize);
         }
     }
 
@@ -1761,9 +1785,9 @@ fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [Sectio
 mod tests {
     use super::{
         Choice, Cursor, DEFAULT_SIDEBAR_WIDTH, Drag, EDGE_SCROLL_LINES, Focus, Layout,
-        MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_LINES,
-        ScmLayout, Section, SidebarView, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys,
-        layout, layout_sections, scm,
+        MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_COLUMNS,
+        SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle, Workbench, WorkbenchAction,
+        WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::SCROLLBAR_THUMB;
     use crate::fs::tree::GitMark;
@@ -1831,6 +1855,11 @@ mod tests {
     const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
     const WRONG_BAR: &str = "the pane is not saying how much of its content is off screen";
     const WRONG_ORDER: &str = "the palette is not offering the project the way it should";
+    const NOT_PANNED: &str = "the sideways wheel did not pan the text pane";
+    const PANNED_OFF: &str = "the pan ran past the widest line the pane is showing";
+    const PANNED_ELSEWHERE: &str = "a sideways wheel outside the text pane still panned it";
+    /// Wide enough that no pane in these tests can show all of it at once.
+    const WIDE_LINE_COLUMNS: usize = 400;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1855,6 +1884,14 @@ mod tests {
 
     fn wheel(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::ScrollDown, column, row)
+    }
+
+    fn wheel_right(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::ScrollRight, column, row)
+    }
+
+    fn wheel_left(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::ScrollLeft, column, row)
     }
 
     fn moved(column: u16, row: u16) -> MouseEvent {
@@ -2430,6 +2467,67 @@ mod tests {
             step,
             "{WRONG_CLICK}"
         );
+    }
+
+    /// One line far wider than any pane here, so there is always something off
+    /// to the right to pan towards.
+    fn wide_file() -> (TempDir, Workbench) {
+        let dir = TempDir::new().expect("a temporary directory");
+        let line = "x".repeat(WIDE_LINE_COLUMNS);
+        fs::write(dir.path().join("wide.txt"), format!("{line}\n")).expect("a file");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        workbench.handle_key(key(KeyCode::Enter));
+        (dir, workbench)
+    }
+
+    fn panned(workbench: &Workbench) -> usize {
+        workbench.editor.active().expect(NO_TAB).h_scroll()
+    }
+
+    #[test]
+    fn the_sideways_wheel_pans_the_text_and_back() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+        let step = usize::try_from(SCROLL_COLUMNS).expect("a forward pan step");
+
+        workbench.handle_mouse(wheel_right(text.x + 1, text.y + 1));
+        assert_eq!(panned(&workbench), step, "{NOT_PANNED}");
+
+        workbench.handle_mouse(wheel_left(text.x + 1, text.y + 1));
+        assert_eq!(panned(&workbench), 0, "{NOT_PANNED}");
+    }
+
+    #[test]
+    fn a_pan_stops_at_the_widest_line_in_view() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 60, 10);
+        let text = workbench.panes.text;
+
+        for _ in 0..WIDE_LINE_COLUMNS {
+            workbench.handle_mouse(wheel_right(text.x + 1, text.y + 1));
+        }
+
+        assert_eq!(
+            panned(&workbench),
+            WIDE_LINE_COLUMNS - text.width as usize,
+            "{PANNED_OFF}"
+        );
+    }
+
+    #[test]
+    fn a_sideways_wheel_outside_the_text_pans_nothing() {
+        let (_dir, mut workbench) = wide_file();
+        draw(&mut workbench, 80, 10);
+        let sidebar = workbench
+            .panes
+            .sidebar
+            .expect("a wide terminal keeps the sidebar");
+
+        workbench.handle_mouse(wheel_right(sidebar.x + 1, sidebar.y + 1));
+
+        assert_eq!(panned(&workbench), 0, "{PANNED_ELSEWHERE}");
     }
 
     #[test]

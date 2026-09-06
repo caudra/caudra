@@ -310,6 +310,23 @@ impl Tab {
         let max = self.buffer.line_count().saturating_sub(rows.max(1));
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
+
+    /// Pans the window sideways, in display columns. Clamped to the widest
+    /// line in view rather than in the file, so the pane cannot be pushed
+    /// into blank space beside the longest thing it is actually showing, and
+    /// nothing has to measure a file to answer a wheel.
+    pub fn h_scroll_by(&mut self, delta: isize, rows: usize, columns: usize) {
+        let last = (self.scroll + rows).min(self.buffer.line_count());
+        let widest = (self.scroll..last)
+            .map(|line| {
+                let text = self.buffer.line(line);
+                render::display_column(text, text.chars().count())
+            })
+            .max()
+            .unwrap_or(0);
+        let max = widest.saturating_sub(columns);
+        self.h_scroll = self.h_scroll.saturating_add_signed(delta).min(max);
+    }
 }
 
 fn title_of(path: &Path) -> String {

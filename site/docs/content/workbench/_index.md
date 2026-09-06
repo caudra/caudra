@@ -48,6 +48,7 @@ The workbench takes the mouse the way an IDE does.
 | Drag a source control header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
+| Sideways wheel over the buffer | Pan the text left or right |
 
 In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. Letting go puts whatever is selected on the system clipboard, so `Ctrl+C` is a second way rather than the only one. `Ctrl+X` and `Backspace` also work on that selection.
 
