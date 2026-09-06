@@ -473,9 +473,9 @@ impl Scm {
     /// from the index. A staged change stays staged: this only undoes what has
     /// not been recorded anywhere yet.
     ///
-    /// One file at a time, deliberately. A folder-wide discard is the most
-    /// destructive thing the pane could offer and the cursor is not a careful
-    /// enough way to ask for it.
+    /// One file, armed by the first call and done by the second. Anything
+    /// wider goes through [`Scm::discard_scope`], which the caller has to ask
+    /// about first.
     pub fn discard(&mut self) -> Result<Discard, ScmError> {
         let Some(change) = self.selected_change() else {
             return Ok(Discard::Nothing);
@@ -492,6 +492,33 @@ impl Scm {
         repo.discard(&relative)?;
         self.refresh();
         Ok(Discard::Done(relative))
+    }
+
+    /// Throws away the worktree's copy of every change the cursor covers,
+    /// returning what it restored so open tabs can be brought up to date.
+    ///
+    /// No arming here. This is the most destructive thing the pane can do and
+    /// a repeated click is not a careful enough way to ask for it, so the
+    /// caller raises a dialog and only calls this once it is answered.
+    pub fn discard_scope(&mut self) -> Result<Vec<String>, ScmError> {
+        self.armed = None;
+        let paths = self.scope();
+        let Some(repo) = &self.repo else {
+            return Ok(Vec::new());
+        };
+        for relative in &paths {
+            repo.discard(relative)?;
+        }
+        if !paths.is_empty() {
+            self.refresh();
+        }
+        Ok(paths)
+    }
+
+    /// How many paths the cursor covers, which is what a question about
+    /// throwing them all away has to say out loud before it is answered.
+    pub fn scope_len(&self) -> usize {
+        self.scope().len()
     }
 
     /// Cancels an armed discard, which every other key in the pane does.

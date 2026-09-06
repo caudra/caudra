@@ -63,6 +63,7 @@ const STAGED: &str = "index";
 const WORKING: &str = "worktree";
 const SAVE_LABEL: &str = "Save";
 const DISCARD_LABEL: &str = "Don't Save";
+const REVERT_LABEL: &str = "Discard";
 const CANCEL_LABEL: &str = "Cancel";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -208,8 +209,32 @@ struct SectionRect {
     body: Rect,
 }
 
-/// One of the three answers to a tab that was asked to close while it still
-/// had unsaved edits, in the order they are painted and measured.
+/// What a modal question is about, which is what decides the answers it offers
+/// and what they do once one is picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// A tab was asked to close while it still had unsaved edits.
+    Close,
+    /// A folder or a whole section was asked to throw its working tree edits
+    /// away, which no arming on the row itself is careful enough to cover.
+    Revert,
+}
+
+impl Ask {
+    const CLOSE_ANSWERS: [Choice; 3] = [Choice::Save, Choice::Discard, Choice::Cancel];
+    const REVERT_ANSWERS: [Choice; 2] = [Choice::Discard, Choice::Cancel];
+
+    /// The answers on offer, in the order they are painted and measured.
+    fn answers(self) -> &'static [Choice] {
+        match self {
+            Ask::Close => &Self::CLOSE_ANSWERS,
+            Ask::Revert => &Self::REVERT_ANSWERS,
+        }
+    }
+}
+
+/// One answer a dialog offers. What each one means is read from the [`Ask`] it
+/// is offered against, so a discard can say what it is discarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Choice {
     Save,
@@ -218,13 +243,12 @@ enum Choice {
 }
 
 impl Choice {
-    const ALL: [Choice; 3] = [Choice::Save, Choice::Discard, Choice::Cancel];
-
-    fn label(self) -> &'static str {
-        match self {
-            Choice::Save => SAVE_LABEL,
-            Choice::Discard => DISCARD_LABEL,
-            Choice::Cancel => CANCEL_LABEL,
+    fn label(self, ask: Ask) -> &'static str {
+        match (self, ask) {
+            (Choice::Save, _) => SAVE_LABEL,
+            (Choice::Discard, Ask::Close) => DISCARD_LABEL,
+            (Choice::Discard, Ask::Revert) => REVERT_LABEL,
+            (Choice::Cancel, _) => CANCEL_LABEL,
         }
     }
 
@@ -237,13 +261,27 @@ impl Choice {
             Choice::Cancel => 'c',
         }
     }
+}
 
+/// A question the workbench is holding everything else up for, and the answer
+/// under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Confirm {
+    ask: Ask,
+    choice: Choice,
+}
+
+impl Confirm {
     /// The neighbouring answer, stopping at both ends rather than wrapping so
-    /// a held arrow key cannot walk past `Cancel` back onto `Save`.
+    /// a held arrow key cannot walk off the last one back onto the first.
     fn step(self, delta: isize) -> Self {
-        let at = Self::ALL.iter().position(|choice| *choice == self);
+        let answers = self.ask.answers();
+        let at = answers.iter().position(|choice| *choice == self.choice);
         let reached = at.unwrap_or_default().saturating_add_signed(delta);
-        Self::ALL[reached.min(Self::ALL.len() - 1)]
+        Self {
+            choice: answers[reached.min(answers.len() - 1)],
+            ..self
+        }
     }
 }
 
@@ -310,11 +348,10 @@ pub struct Workbench {
     /// cannot read the system clipboard back, so paste comes from here.
     clipboard: String,
     goto: Option<String>,
-    /// The answer under the cursor while a tab is being asked whether to close
-    /// with unsaved edits. Which tab is not kept: [`Workbench::close_at`]
-    /// selects it before asking, and the dialog is modal, so nothing can move
-    /// the active one underneath it.
-    confirm: Option<Choice>,
+    /// The question standing over everything else, if there is one. What it is
+    /// about is not kept: whatever raised it selected its target first, and the
+    /// dialog is modal, so nothing can move the cursor underneath it.
+    confirm: Option<Confirm>,
     flash: Option<String>,
 }
 
@@ -622,11 +659,11 @@ impl Workbench {
     /// tried in painting order, so the palette gets the press it is covering.
     fn press(&mut self, at: (u16, u16), clicks: u8) {
         let position = at.into();
-        if self.confirm.is_some() {
+        if let Some(confirm) = self.confirm {
             if self.panes.confirm.contains(position)
-                && let Some(choice) = view::confirm_at(at.0, self.panes.confirm.x)
+                && let Some(choice) = view::confirm_at(at.0, self.panes.confirm.x, confirm.ask)
             {
-                self.resolve_close(choice);
+                self.resolve(confirm.ask, choice);
             }
             return;
         }
@@ -767,7 +804,7 @@ impl Workbench {
     fn run_scm_control(&mut self, control: Control) {
         match control {
             Control::Stage => self.stage_selected(),
-            Control::Revert => self.discard_change(),
+            Control::Revert => self.revert_selected(),
             Control::Open => {
                 let Some(path) = self.scm.selected_change().map(|change| change.path.clone())
                 else {
@@ -885,7 +922,12 @@ impl Workbench {
     fn close_at(&mut self, index: usize) {
         self.editor.select(index);
         match self.editor.active().is_some_and(Tab::is_dirty) {
-            true => self.confirm = Some(Choice::Save),
+            true => {
+                self.confirm = Some(Confirm {
+                    ask: Ask::Close,
+                    choice: Choice::Save,
+                })
+            }
             false => {
                 self.editor.close_active();
                 self.reveal_active();
@@ -1348,20 +1390,22 @@ impl Workbench {
     /// first so `Esc` answers it rather than closing the workbench out from
     /// under the question.
     fn confirm_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
-        let choice = self.confirm?;
+        let confirm = self.confirm?;
         match key.code {
             KeyCode::Esc => self.confirm = None,
-            KeyCode::Left | KeyCode::BackTab => self.confirm = Some(choice.step(-1)),
-            KeyCode::Right | KeyCode::Tab => self.confirm = Some(choice.step(1)),
-            KeyCode::Enter => self.resolve_close(choice),
+            KeyCode::Left | KeyCode::BackTab => self.confirm = Some(confirm.step(-1)),
+            KeyCode::Right | KeyCode::Tab => self.confirm = Some(confirm.step(1)),
+            KeyCode::Enter => self.resolve(confirm.ask, confirm.choice),
             // Modifiers are ruled out so `Ctrl+C` over a live selection cannot
             // be read as the `Cancel` accelerator.
             KeyCode::Char(typed) if key.modifiers == KeyModifiers::NONE => {
-                if let Some(picked) = Choice::ALL
-                    .into_iter()
+                if let Some(picked) = confirm
+                    .ask
+                    .answers()
+                    .iter()
                     .find(|choice| choice.accelerator() == typed.to_ascii_lowercase())
                 {
-                    self.resolve_close(picked);
+                    self.resolve(confirm.ask, *picked);
                 }
             }
             _ => {}
@@ -1463,7 +1507,7 @@ impl Workbench {
 
     fn source_control_key(&mut self, key: KeyEvent) {
         if keys::DISCARD.matches(key) {
-            self.discard_change();
+            self.revert_selected();
             return;
         }
         self.scm.disarm();
@@ -1560,6 +1604,28 @@ impl Workbench {
             return;
         }
         self.apply_marks();
+    }
+
+    /// One file is armed on the row and confirmed there. A folder or a whole
+    /// section is asked about instead, because the row says how many paths it
+    /// covers but not what is in them, and git keeps no copy of what a discard
+    /// throws away.
+    fn revert_selected(&mut self) {
+        if self.scm.selected_change().is_some() {
+            self.discard_change();
+            return;
+        }
+        self.scm.disarm();
+        // Only where the row paints the control. A staged folder has an index
+        // entry standing between its files and what a discard would restore,
+        // so it offers unstaging instead.
+        if self.scm.cursor().section != Section::Unstaged || self.scm.scope_len() == 0 {
+            return;
+        }
+        self.confirm = Some(Confirm {
+            ask: Ask::Revert,
+            choice: Choice::Cancel,
+        });
     }
 
     fn discard_change(&mut self) {
@@ -1705,11 +1771,19 @@ impl Workbench {
         self.close_at(self.editor.active_index());
     }
 
-    /// Acts on the answer the dialog was given. A save that fails keeps the tab
-    /// open with the reason in the status row, because throwing the buffer away
-    /// after failing to write it is the one outcome nobody asked for.
-    fn resolve_close(&mut self, choice: Choice) {
+    /// Takes the dialog down and acts on the answer it was given.
+    fn resolve(&mut self, ask: Ask, choice: Choice) {
         self.confirm = None;
+        match ask {
+            Ask::Close => self.resolve_close(choice),
+            Ask::Revert => self.resolve_revert(choice),
+        }
+    }
+
+    /// A save that fails keeps the tab open with the reason in the status row,
+    /// because throwing the buffer away after failing to write it is the one
+    /// outcome nobody asked for.
+    fn resolve_close(&mut self, choice: Choice) {
         match choice {
             Choice::Cancel => return,
             Choice::Save if !self.save_active() => return,
@@ -1717,6 +1791,21 @@ impl Workbench {
         }
         self.editor.close_active();
         self.reveal_active();
+    }
+
+    fn resolve_revert(&mut self, choice: Choice) {
+        if choice != Choice::Discard {
+            return;
+        }
+        match self.scm.discard_scope() {
+            Ok(paths) => {
+                for relative in &paths {
+                    self.reload_tabs_for(relative);
+                }
+                self.apply_marks();
+            }
+            Err(error) => self.flash = Some(error.to_string()),
+        }
     }
 
     /// Keeps the tree on whatever the editor is showing, so the sidebar never
@@ -1937,10 +2026,10 @@ fn layout_sections(
 #[cfg(test)]
 mod tests {
     use super::{
-        Choice, Cursor, DEFAULT_SIDEBAR_WIDTH, Drag, EDGE_SCROLL_LINES, Focus, Layout,
-        MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, SCROLL_COLUMNS,
-        SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle, Workbench, WorkbenchAction,
-        WorkbenchStyles, keys, layout, layout_sections, scm,
+        Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
+        EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS,
+        MIN_SIDEBAR_WIDTH, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle,
+        Workbench, WorkbenchAction, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::SCROLLBAR_THUMB;
     use crate::editor::{VisualRow, render};
@@ -2033,6 +2122,16 @@ mod tests {
     /// What [`repository`] commits, and so what a discard has to bring back.
     const INDEXED_TEXT: &str = "one\ntwo\nthree\n";
     const REWRITTEN_TEXT: &str = "ruined\n";
+    /// What [`nested_repository`] commits.
+    const NESTED_TEXT: &str = "one\n";
+    /// Longer than what was committed: a rewrite of the same length within the
+    /// same second is racily clean, and status would call it unchanged.
+    const NESTED_REWRITE: &str = "one\ntwo\n";
+    /// The line the rewrite added, which is what a tab must stop showing once
+    /// the file it is on has been discarded.
+    const NESTED_ADDED_LINE: &str = "two";
+    const ASKED_TOO_LATE: &str = "a bulk discard ran before the question about it was answered";
+    const OVER_REACHED: &str = "the discard reached past the rows the cursor covered";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2122,10 +2221,20 @@ mod tests {
 
     /// The column an answer landed on, found the same way the pointer finds it.
     fn answer_column(workbench: &Workbench, answer: Choice) -> u16 {
+        let ask = asked(workbench).ask;
         let answers = workbench.panes.confirm;
         (answers.x..answers.right())
-            .find(|column| confirm_at(*column, answers.x) == Some(answer))
+            .find(|column| confirm_at(*column, answers.x, ask) == Some(answer))
             .expect("an answer in the dialog")
+    }
+
+    fn asked(workbench: &Workbench) -> Confirm {
+        workbench.confirm.expect(NOT_ASKED)
+    }
+
+    /// The answer under the cursor, if a question is standing at all.
+    fn answer(workbench: &Workbench) -> Option<Choice> {
+        workbench.confirm.map(|confirm| confirm.choice)
     }
 
     fn workbench() -> Workbench {
@@ -2329,7 +2438,7 @@ mod tests {
         workbench.handle_leader(press(keys::CLOSE_TAB));
 
         assert_eq!(workbench.editor.tabs().len(), 1, "{UNASKED_CLOSE}");
-        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{NOT_ASKED}");
     }
 
     #[test]
@@ -2342,8 +2451,8 @@ mod tests {
         let frame = draw(&mut workbench, 80, 24);
 
         assert!(frame.contains("a.txt has unsaved changes"), "{NOT_PAINTED}");
-        for answer in Choice::ALL {
-            assert!(frame.contains(answer.label()), "{NOT_PAINTED}");
+        for answer in Ask::Close.answers() {
+            assert!(frame.contains(answer.label(Ask::Close)), "{NOT_PAINTED}");
         }
     }
 
@@ -2442,11 +2551,11 @@ mod tests {
         workbench.handle_key(key(KeyCode::Char('X')));
         workbench.handle_leader(press(keys::CLOSE_TAB));
 
-        for _ in 0..Choice::ALL.len() + 1 {
+        for _ in 0..Ask::Close.answers().len() + 1 {
             workbench.handle_key(key(code));
         }
 
-        assert_eq!(workbench.confirm, Some(expected), "{WRONG_ANSWER}");
+        assert_eq!(answer(&workbench), Some(expected), "{WRONG_ANSWER}");
     }
 
     #[test]
@@ -3283,7 +3392,7 @@ mod tests {
         gix::init(dir.path()).expect("a repository");
         fs::create_dir(dir.path().join("src")).expect("a directory");
         for name in PATHS {
-            fs::write(dir.path().join(name), "one\n").expect("a file");
+            fs::write(dir.path().join(name), NESTED_TEXT).expect("a file");
         }
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
@@ -3292,10 +3401,8 @@ mod tests {
             workbench.scm.stage_path(name).expect("staging");
         }
         commit_all(&mut workbench);
-        // Longer than what was committed: a rewrite of the same length within
-        // the same second is racily clean, and status would call it unchanged.
         for name in PATHS {
-            fs::write(dir.path().join(name), "one\ntwo\n").expect("a file");
+            fs::write(dir.path().join(name), NESTED_REWRITE).expect("a file");
         }
         workbench.handle_key(key(keys::REFRESH.code));
         (dir, workbench)
@@ -3514,6 +3621,164 @@ mod tests {
             INDEXED_TEXT,
             "{DISCARD_UNARMED}"
         );
+    }
+
+    /// The row a section lists a folder on, since a folder and a file do not
+    /// answer a revert the same way.
+    fn folder_row(workbench: &Workbench, section: Section) -> usize {
+        workbench
+            .scm
+            .rows(section)
+            .iter()
+            .position(|row| matches!(row, scm::Row::Directory(_)))
+            .expect("a folder row")
+    }
+
+    /// Clicks the revert control of the folder the unstaged section lists,
+    /// which is the press every bulk revert test starts from.
+    fn revert_folder(workbench: &mut Workbench) {
+        draw(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let row = folder_row(workbench, Section::Unstaged);
+        let at = control_on_row(workbench, Section::Unstaged, row, Control::Revert);
+        workbench.handle_mouse(click(at.0, at.1));
+    }
+
+    fn answer_the_dialog(workbench: &mut Workbench, choice: Choice) {
+        draw(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let answers = workbench.panes.confirm;
+        workbench.handle_mouse(click(answer_column(workbench, choice), answers.y));
+    }
+
+    fn nested_content(dir: &TempDir, name: &str) -> String {
+        fs::read_to_string(dir.path().join(name)).expect("the file")
+    }
+
+    #[test]
+    fn reverting_a_folder_asks_before_it_throws_anything_away() {
+        let (dir, mut workbench) = nested_repository();
+
+        revert_folder(&mut workbench);
+
+        assert_eq!(asked(&workbench).ask, Ask::Revert, "{NOT_ASKED}");
+        assert_eq!(
+            nested_content(&dir, "src/a.txt"),
+            NESTED_REWRITE,
+            "{ASKED_TOO_LATE}"
+        );
+    }
+
+    #[test]
+    fn the_revert_dialog_says_how_many_files_it_covers() {
+        let (_dir, mut workbench) = nested_repository();
+        revert_folder(&mut workbench);
+
+        let frame = draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert!(
+            frame.contains("Discard changes to 2 files?"),
+            "{NOT_PAINTED}"
+        );
+        for offered in Ask::Revert.answers() {
+            assert!(frame.contains(offered.label(Ask::Revert)), "{NOT_PAINTED}");
+        }
+        assert!(!frame.contains(DISCARD_LABEL), "{NOT_PAINTED}");
+    }
+
+    #[test]
+    fn answering_the_revert_dialog_throws_every_file_it_covers_away() {
+        let (dir, mut workbench) = nested_repository();
+        revert_folder(&mut workbench);
+
+        answer_the_dialog(&mut workbench, Choice::Discard);
+
+        assert_eq!(
+            nested_content(&dir, "src/a.txt"),
+            NESTED_TEXT,
+            "{ANSWER_IGNORED}"
+        );
+        assert_eq!(
+            nested_content(&dir, "src/b.txt"),
+            NESTED_TEXT,
+            "{ANSWER_IGNORED}"
+        );
+        assert_eq!(
+            nested_content(&dir, "top.txt"),
+            NESTED_REWRITE,
+            "{OVER_REACHED}"
+        );
+        assert_eq!(workbench.confirm, None, "{ANSWER_IGNORED}");
+    }
+
+    #[test]
+    fn cancelling_the_revert_dialog_leaves_every_file_alone() {
+        let (dir, mut workbench) = nested_repository();
+        revert_folder(&mut workbench);
+
+        answer_the_dialog(&mut workbench, Choice::Cancel);
+
+        assert_eq!(
+            nested_content(&dir, "src/a.txt"),
+            NESTED_REWRITE,
+            "{ANSWER_IGNORED}"
+        );
+        assert_eq!(workbench.confirm, None, "{ANSWER_IGNORED}");
+    }
+
+    #[test]
+    fn a_bulk_revert_brings_every_tab_it_rewrote_up_to_date() {
+        let (dir, mut workbench) = nested_repository();
+        workbench.open_path(&dir.path().join("src/a.txt"));
+        workbench.open_path(&dir.path().join("src/b.txt"));
+        revert_folder(&mut workbench);
+
+        answer_the_dialog(&mut workbench, Choice::Discard);
+
+        for tab in workbench.editor.tabs() {
+            assert_ne!(tab.buffer.line(1), NESTED_ADDED_LINE, "{STALE_TAB}");
+        }
+    }
+
+    #[test]
+    fn reverting_a_section_asks_about_every_file_it_lists() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+        let at = control_on_header(&workbench, Section::Unstaged, Control::Revert);
+
+        workbench.handle_mouse(click(at.0, at.1));
+        let frame = draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert_eq!(asked(&workbench).ask, Ask::Revert, "{NOT_ASKED}");
+        assert!(
+            frame.contains("Discard changes to 1 file?"),
+            "{NOT_PAINTED}"
+        );
+    }
+
+    #[test]
+    fn the_discard_key_on_a_staged_folder_asks_nothing() {
+        let (_dir, mut workbench) = nested_repository();
+        for name in ["src/a.txt", "src/b.txt"] {
+            workbench.scm.stage_path(name).expect("staging");
+        }
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let row = folder_row(&workbench, Section::Staged);
+        workbench.scm.select(Section::Staged, Some(row));
+
+        workbench.handle_key(press(keys::DISCARD));
+
+        assert_eq!(workbench.confirm, None, "{STRAY_CONTROL}");
+    }
+
+    #[test]
+    fn the_discard_key_on_a_folder_asks_what_a_click_on_it_asks() {
+        let (_dir, mut workbench) = nested_repository();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let row = folder_row(&workbench, Section::Unstaged);
+        workbench.scm.select(Section::Unstaged, Some(row));
+
+        workbench.handle_key(press(keys::DISCARD));
+
+        assert_eq!(asked(&workbench).ask, Ask::Revert, "{NOT_ASKED}");
     }
 
     #[test]
@@ -4426,7 +4691,7 @@ mod tests {
         workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
 
         assert_eq!(workbench.editor.tabs().len(), 1, "{UNASKED_CLOSE}");
-        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{NOT_ASKED}");
     }
 
     #[test_case(Choice::Discard, 0 ; "a click on don't save closes the tab")]
@@ -4456,7 +4721,7 @@ mod tests {
 
         workbench.handle_mouse(click(rows.x, rows.y));
 
-        assert_eq!(workbench.confirm, Some(Choice::Save), "{MODAL_LEAKED}");
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{MODAL_LEAKED}");
         assert_eq!(workbench.focus, Focus::Editor, "{MODAL_LEAKED}");
     }
 
@@ -4481,12 +4746,12 @@ mod tests {
         draw(&mut workbench, 80, 24);
         let tabs = workbench.panes.tabs;
         workbench.handle_mouse(click(close_column(&workbench, 0), tabs.y));
-        assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{NOT_ASKED}");
 
         workbench.handle_mouse(middle_click(close_column(&workbench, 1), tabs.y));
 
         assert_eq!(workbench.editor.tabs().len(), 2, "{MODAL_LEAKED}");
-        assert_eq!(workbench.confirm, Some(Choice::Save), "{MODAL_LEAKED}");
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{MODAL_LEAKED}");
     }
 
     #[test_case(SidebarView::SourceControl ; "the second segment switches to source control")]

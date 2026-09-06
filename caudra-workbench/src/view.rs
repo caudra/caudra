@@ -24,7 +24,8 @@ use crate::scm::{Row as ScmRow, Scm, Section};
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout, layout_sections,
+    Ask, Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout,
+    layout_sections,
 };
 
 const HINT_GAP: &str = "  ";
@@ -99,6 +100,9 @@ const PALETTE_ROWS: usize = 10;
 const PALETTE_CHROME: u16 = 2;
 const HORIZONTAL: &str = "\u{2500}";
 const UNSAVED_QUESTION: &str = " has unsaved changes";
+const REVERT_QUESTION: &str = "Discard changes to ";
+const ONE_FILE: &str = " file?";
+const MANY_FILES: &str = " files?";
 /// A rule, the question, the answers, and a rule under them.
 const CONFIRM_ROWS: u16 = 4;
 /// One column of air either side of the widest row.
@@ -494,12 +498,12 @@ impl Workbench {
     /// it is a question about the buffer underneath it and nothing else may be
     /// answered until it is.
     fn render_confirm(&mut self, buf: &mut Surface, area: Rect) {
-        let Some(choice) = self.confirm else {
+        let Some(confirm) = self.confirm else {
             self.panes.confirm = Rect::default();
             return;
         };
-        let question = format!("{}{UNSAVED_QUESTION}", self.active_title());
-        let content = question.width().max(answers_width()) as u16;
+        let question = self.question(confirm.ask);
+        let content = question.width().max(answers_width(confirm.ask)) as u16;
         let width = (content + CONFIRM_PADDING * 2).min(area.width);
         let height = CONFIRM_ROWS.min(area.height);
         let panel = Rect {
@@ -543,21 +547,37 @@ impl Workbench {
         };
         let pointed = self
             .hovering(self.panes.confirm)
-            .and_then(|at| confirm_at(at.0, self.panes.confirm.x));
+            .and_then(|at| confirm_at(at.0, self.panes.confirm.x, confirm.ask));
         let mut spans = Vec::new();
-        for answer in Choice::ALL {
-            let chosen = answer == choice;
+        for answer in confirm.ask.answers() {
+            let chosen = *answer == confirm.choice;
             let mut style = match chosen {
                 true => self.styles.selected,
                 false => self.styles.dim,
             };
-            if pointed == Some(answer) && !chosen {
+            if pointed == Some(*answer) && !chosen {
                 style = style.patch(self.styles.hover);
             }
             spans.push(Span::styled(TAB_GAP, self.styles.background));
-            spans.push(Span::styled(answer.label(), style));
+            spans.push(Span::styled(answer.label(confirm.ask), style));
         }
         chrome::render_line(buf, self.panes.confirm, Line::from(spans));
+    }
+
+    /// What the dialog is asking, which is the one place either question is
+    /// spelled out.
+    fn question(&self, ask: Ask) -> String {
+        match ask {
+            Ask::Close => format!("{}{UNSAVED_QUESTION}", self.active_title()),
+            Ask::Revert => {
+                let covered = self.scm.scope_len();
+                let noun = match covered {
+                    1 => ONE_FILE,
+                    _ => MANY_FILES,
+                };
+                format!("{REVERT_QUESTION}{covered}{noun}")
+            }
+        }
     }
 
     fn render_tabs(&mut self, buf: &mut Surface, area: Rect) {
@@ -855,23 +875,26 @@ pub(crate) fn header_at(column: u16, origin: u16) -> Option<SidebarView> {
 
 /// One answer's width, which is the only description of how
 /// [`Workbench::render_confirm`] lays the row out.
-fn answer_width(answer: Choice) -> usize {
-    TAB_GAP.len() + answer.label().width()
+fn answer_width(answer: Choice, ask: Ask) -> usize {
+    TAB_GAP.len() + answer.label(ask).width()
 }
 
-fn answers_width() -> usize {
-    Choice::ALL.into_iter().map(answer_width).sum()
+fn answers_width(ask: Ask) -> usize {
+    ask.answers()
+        .iter()
+        .map(|answer| answer_width(*answer, ask))
+        .sum()
 }
 
 /// Which answer a click at `column` landed on, measured the same way
 /// [`Workbench::render_confirm`] lays them out. The gaps between them are not
 /// buttons.
-pub(crate) fn confirm_at(column: u16, origin: u16) -> Option<Choice> {
+pub(crate) fn confirm_at(column: u16, origin: u16, ask: Ask) -> Option<Choice> {
     let mut left = column.checked_sub(origin)? as usize;
-    for answer in Choice::ALL {
-        let width = answer_width(answer);
+    for answer in ask.answers() {
+        let width = answer_width(*answer, ask);
         if left < width {
-            return (left >= TAB_GAP.len()).then_some(answer);
+            return (left >= TAB_GAP.len()).then_some(*answer);
         }
         left -= width;
     }
@@ -892,17 +915,17 @@ pub(crate) enum Control {
 
 /// The controls a row offers, left to right, and the only description of them.
 /// `None` asks about the section header. A section that cannot be staged and a
-/// commit offer nothing, so nothing can be clicked on them either. Only an
-/// unstaged file has working tree edits to throw away, and only a staged one
-/// keeps the working tree copy behind its diff.
+/// commit offer nothing, so nothing can be clicked on them either. Everything
+/// unstaged has working tree edits to throw away, at whatever width the row
+/// covers, and only a staged file keeps the working tree copy behind its diff.
 pub(crate) fn scm_controls(section: Section, row: Option<ScmRow>) -> &'static [Control] {
     if !section.is_changes() {
         return &[];
     }
     match row {
         Some(ScmRow::Commit(_)) => &[],
-        Some(ScmRow::Change { .. }) if section == Section::Staged => &OPEN_AND_STAGE,
-        Some(ScmRow::Change { .. }) => &REVERT_AND_STAGE,
+        _ if section == Section::Unstaged => &REVERT_AND_STAGE,
+        Some(ScmRow::Change { .. }) => &OPEN_AND_STAGE,
         _ => &STAGE_ONLY,
     }
 }
@@ -1710,9 +1733,10 @@ mod tests {
     const CHANGE: ScmRow = ScmRow::Change { index: 0, depth: 0 };
     const FOLDER: ScmRow = ScmRow::Directory(0);
 
-    #[test_case(Section::Unstaged, None => vec![Control::Stage] ; "an unstaged header stages everything")]
+    #[test_case(Section::Unstaged, None => vec![Control::Revert, Control::Stage] ; "an unstaged header stages or reverts everything")]
     #[test_case(Section::Staged, None => vec![Control::Stage] ; "a staged header unstages everything")]
     #[test_case(Section::Unstaged, Some(CHANGE) => vec![Control::Revert, Control::Stage] ; "an unstaged file also reverts")]
+    #[test_case(Section::Unstaged, Some(FOLDER) => vec![Control::Revert, Control::Stage] ; "an unstaged folder reverts everything under it")]
     #[test_case(Section::Staged, Some(CHANGE) => vec![Control::Open, Control::Stage] ; "a staged file also opens")]
     #[test_case(Section::Staged, Some(FOLDER) => vec![Control::Stage] ; "a folder never opens, having no file to open")]
     #[test_case(Section::Graph, None => Vec::<Control>::new() ; "the graph stages nothing")]
