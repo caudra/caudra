@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::shell::parse_shell_prefix;
-use crate::components::keybindings::key;
+use crate::components::keybindings::leader;
 use crate::highlight;
 use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize_paste};
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
@@ -56,9 +56,9 @@ const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
 const ADMISSION_OPTIONS: [(&str, &str, PromptAdmission); 3] = [
     ("Enter", "next", PromptAdmission::Queue),
-    (key::STEER_PROMPT.label, "guide", PromptAdmission::Steer),
+    (leader::STEER_PROMPT.label, "guide", PromptAdmission::Steer),
     (
-        key::INTERRUPT_PROMPT.label,
+        leader::INTERRUPT_PROMPT.label,
         "replace",
         PromptAdmission::Interrupt,
     ),

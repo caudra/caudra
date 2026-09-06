@@ -61,13 +61,13 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Rich Markdown rendering
 
-**What changed:** Caudra adds source-aware [Markdown rendering](/docs/markdown/) for Unicode LaTeX, strict local Mermaid flowcharts, wide-diagram panning, and validated HTTP links. Unsupported Mermaid syntax remains a highlighted code fence. Drag selection and `Alt+C` recover the original Markdown and LaTeX rather than copying rendered terminal glyphs.
+**What changed:** Caudra adds source-aware [Markdown rendering](/docs/markdown/) for Unicode LaTeX, strict local Mermaid flowcharts, wide-diagram panning, and validated HTTP links. Unsupported Mermaid syntax remains a highlighted code fence. Drag selection and `Ctrl+X y` recover the original Markdown and LaTeX rather than copying rendered terminal glyphs.
 
 **Why:** Rich terminal output should remain readable without a browser, subprocess, or download. Source provenance prevents a table, equation, or diagram from becoming unusable when copied back into a file or prompt.
 
 ## Workbench beside the transcript
 
-**What changed:** Caudra adds a [workbench](/docs/workbench/): a tree explorer, a tabbed editor with undo and find, a source control view backed by gix, and a project-wide content search, all in one full-screen layout on `Alt+E`. It watches the project while it is open, so tabs follow what the agent writes, and `Alt+Enter` hands the current file, line, or selection to the composer as a reference.
+**What changed:** Caudra adds a [workbench](/docs/workbench/): a tree explorer, a tabbed editor with undo and find, a source control view backed by gix, and a project-wide content search, all in one full-screen layout on `Ctrl+X w`. It watches the project while it is open, so tabs follow what the agent writes, and `Ctrl+X Enter` hands the current file, line, or selection to the composer as a reference.
 
 **Why:** Reading a diff or checking a line usually meant leaving the session for an editor and losing the thread. Keeping the files in reach also makes references exact, so the agent gets `@src/lib.rs:L42-L58` instead of a description of where to look.
 

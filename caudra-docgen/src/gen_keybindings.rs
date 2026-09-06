@@ -1,4 +1,6 @@
-use caudra_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform, all_contexts};
+use caudra_ui::keybindings::{
+    ALT_SEP, KEYBINDS, KeyLabel, Keybind, KeybindContext, LEADER_PREFIX, Platform, all_contexts,
+};
 
 const FRONTMATTER: &str = "\
 +++
@@ -20,19 +22,21 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
 ];
 
 fn label_str(label: KeyLabel) -> String {
-    match label {
-        KeyLabel::Single(s) => format!("`{s}`"),
-        KeyLabel::Alt(a, b) => format!("`{a}`{ALT_SEP}`{b}`"),
-        KeyLabel::MacAlt(a, _) => format!("`{a}`"),
-        KeyLabel::Multi(keys) | KeyLabel::MacMulti(keys, _) => keys
-            .iter()
-            .map(|s| format!("`{s}`"))
-            .collect::<Vec<_>>()
-            .join(ALT_SEP),
+    label
+        .parts()
+        .map(|part| format!("`{part}`"))
+        .collect::<Vec<_>>()
+        .join(ALT_SEP)
+}
+
+fn description_str(kb: &Keybind) -> String {
+    match kb.platform {
+        Platform::All => kb.description.to_string(),
+        Platform::UnixOnly => format!("{} (Unix only)", kb.description),
     }
 }
 
-fn write_table_2col(out: &mut String, rows: &[(String, &str)]) {
+fn write_table_2col(out: &mut String, rows: &[(String, String)]) {
     out.push_str("| Key | Action |\n|-----|--------|\n");
     for (key, desc) in rows {
         out.push_str(&format!("| {key} | {desc} |\n"));
@@ -42,28 +46,31 @@ fn write_table_2col(out: &mut String, rows: &[(String, &str)]) {
 fn write_section(out: &mut String, ctx: KeybindContext) {
     out.push_str(&format!("\n## {}\n\n", ctx.label()));
 
-    let all_rows: Vec<_> = KEYBINDS.iter().filter(|kb| kb.context == ctx).collect();
-
-    let normal: Vec<_> = all_rows
+    let rows: Vec<_> = KEYBINDS
         .iter()
-        .filter(|kb| kb.platform == Platform::All)
-        .map(|kb| (label_str(kb.label), kb.description))
+        .filter(|kb| kb.context == ctx)
+        .map(|kb| (label_str(kb.label), description_str(kb)))
         .collect();
 
-    if !normal.is_empty() {
-        write_table_2col(out, &normal);
+    if !rows.is_empty() {
+        write_table_2col(out, &rows);
     }
+}
 
-    let mac_only: Vec<_> = all_rows
-        .iter()
-        .filter(|kb| kb.platform == Platform::MacOnly)
-        .map(|kb| (label_str(kb.label), kb.description))
-        .collect();
-
-    if !mac_only.is_empty() {
-        out.push_str("\n### macOS-specific\n\n");
-        write_table_2col(out, &mac_only);
-    }
+fn write_leader(out: &mut String) {
+    out.push_str(&format!(
+        "`{}` is the leader. It acts as a prefix: press it, then press the \
+         chord's second key. Nothing happens until that second key arrives, \
+         and `Esc` cancels. Hold the leader for a moment and a panel lists \
+         every chord available where you are.\n\n",
+        LEADER_PREFIX
+    ));
+    out.push_str(
+        "Leader chords are written as two keys below, and every one of them \
+         is reachable on any terminal: Caudra ships no `Alt` defaults, \
+         because macOS routes Option through the input method and never \
+         reports it as Alt.\n",
+    );
 }
 
 fn write_context_specific(out: &mut String) {
@@ -124,7 +131,7 @@ fn write_inheritance(out: &mut String) {
 pub fn generate() -> String {
     let mut out = String::from(FRONTMATTER);
     out.push_str("\n\n# Keybindings\n\n");
-    out.push_str("On macOS, some bindings use Option or Fn keys instead (run `/help` for exact keybindings).\n");
+    write_leader(&mut out);
 
     for &ctx in MAIN_CONTEXTS {
         write_section(&mut out, ctx);

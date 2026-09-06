@@ -895,9 +895,7 @@ impl QuestionForm {
 /// occupies more than one row, so the line the form counts in and the row the
 /// terminal draws in are not the same number; scrolling and click targets both
 /// need the second one.
-const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::ALT
-    .union(KeyModifiers::SHIFT)
-    .union(KeyModifiers::CONTROL);
+const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::SHIFT.union(KeyModifiers::CONTROL);
 
 /// A trailing backslash is the plain-terminal way to ask for a newline where
 /// the modifier combination never reaches the process.

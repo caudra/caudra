@@ -30,6 +30,7 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
+pub const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 250;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
@@ -619,6 +620,7 @@ pub struct UiFileConfig {
     pub math: Option<MathStyle>,
     pub mermaid: Option<MermaidStyle>,
     pub flash_duration_ms: Option<u64>,
+    pub which_key_delay_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
@@ -641,6 +643,7 @@ impl UiFileConfig {
             mermaid,
             notifications,
             flash_duration_ms,
+            which_key_delay_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
             show_thinking,
@@ -1263,6 +1266,12 @@ pub struct UiConfig {
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
+    #[config(
+        default = DEFAULT_WHICH_KEY_DELAY_MS,
+        desc = "How long Ctrl+X waits before listing the chords it can still reach (ms). 0 shows the list at once"
+    )]
+    pub which_key_delay_ms: u64,
+
     #[config(default = DEFAULT_TYPEWRITER_MS_PER_CHAR, desc = "Typewriter effect speed (ms/char)")]
     pub typewriter_ms_per_char: u64,
 
@@ -1303,6 +1312,10 @@ impl UiConfig {
         Duration::from_millis(self.flash_duration_ms)
     }
 
+    pub fn which_key_delay(&self) -> Duration {
+        Duration::from_millis(self.which_key_delay_ms)
+    }
+
     fn from_file(f: UiFileConfig) -> Self {
         Self {
             splash_animation: f.splash_animation.unwrap_or(true),
@@ -1311,6 +1324,7 @@ impl UiConfig {
             math: f.math.unwrap_or_default(),
             mermaid: f.mermaid.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
+            which_key_delay_ms: f.which_key_delay_ms.unwrap_or(DEFAULT_WHICH_KEY_DELAY_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),

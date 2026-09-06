@@ -19,13 +19,13 @@ Press `b` while the queue is focused or click its mode control to toggle Togethe
 
 ## Guide the current run
 
-Press `Alt+S` or click `guide` to send the input as guidance. Caudra waits for the current provider response and any tool calls to settle, then adds all waiting guidance before the next model request. An in-flight response is never modified.
+Press `Ctrl+X g` or click `guide` to send the input as guidance. Caudra waits for the current provider response and any tool calls to settle, then adds all waiting guidance before the next model request. An in-flight response is never modified.
 
 A late guide may arrive after the run's final boundary. It then starts before queued next-run prompts instead of being lost. If a replacement is pending, all waiting guides enter its first model request before the replacement message.
 
 ## Stop and replace
 
-Press `Alt+X` or click `replace` to cancel the active run and start the input as its replacement. Existing Up next prompts remain queued behind it. Sending another replacement before it starts updates the pending replacement, so the newest one wins.
+Press `Ctrl+X x` or click `replace` to cancel the active run and start the input as its replacement. Existing Up next prompts remain queued behind it. Sending another replacement before it starts updates the pending replacement, so the newest one wins.
 
 Deleting a pending replacement turns the operation into a plain cancellation. Caudra waits for the old run to stop before accepting another replacement, while normal Up next prompts can still be queued.
 

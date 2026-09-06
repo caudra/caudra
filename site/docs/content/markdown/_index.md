@@ -169,7 +169,7 @@ Interactive targets must use HTTP or HTTPS, include a host, and contain no contr
 ## Copying
 
 Releasing a mouse drag copies the selected Markdown source, not the glyphs on
-screen. `Alt+C` copies the latest assistant reply as Markdown. A copied table
+screen. `Ctrl+X y` copies the latest assistant reply as Markdown. A copied table
 has its pipes, a heading has its `#`, and an equation has its `$` delimiters
 and LaTeX. Pasting into a file or a chat gives back what the model wrote.
 

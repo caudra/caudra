@@ -250,11 +250,17 @@ impl InputDocument {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
         let modifiers = key.modifiers;
+        // AltGr arrives as Ctrl+Alt and is text, not a chord, so Ctrl only
+        // counts on its own.
         let control =
             modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT);
-        let alt =
-            modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
         let super_key = modifiers.contains(KeyModifiers::SUPER);
+
+        // Nothing binds bare Alt any more, and falling through would insert
+        // the chord's letter as stray text.
+        if modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL) {
+            return EditResult::Ignored;
+        }
 
         if control {
             return match key.code {
@@ -271,23 +277,6 @@ impl InputDocument {
                     EditResult::Changed
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char('a') | KeyCode::Char('e') => {
-                    self.move_with_key(key)
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
-        if alt {
-            return match key.code {
-                KeyCode::Backspace => {
-                    self.delete_word_before();
-                    EditResult::Changed
-                }
-                KeyCode::Delete | KeyCode::Char('d') => {
-                    self.delete_word_after();
-                    EditResult::Changed
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char('b') | KeyCode::Char('f') => {
                     self.move_with_key(key)
                 }
                 _ => EditResult::Ignored,
@@ -579,8 +568,6 @@ impl CursorDirection {
         match key.code {
             KeyCode::Left => Self::Left,
             KeyCode::Right => Self::Right,
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => Self::Left,
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => Self::Right,
             KeyCode::Home if key.modifiers.contains(KeyModifiers::SUPER) => Self::Left,
             KeyCode::End if key.modifiers.contains(KeyModifiers::SUPER) => Self::Right,
             _ => Self::Nearest,
@@ -735,16 +722,16 @@ mod tests {
     }
 
     #[test]
-    fn alt_word_movement_skips_token() {
+    fn word_movement_skips_token() {
         let mut document = InputDocument::new();
         let id = document.insert_paste("a\nb\nc");
         document.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
         document.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(document.focused_paste(), Some(id));
 
-        document.handle_key(key(KeyCode::Char('f'), KeyModifiers::ALT));
+        document.handle_key(key(KeyCode::Right, KeyModifiers::CONTROL));
         assert_eq!(document.cursor_offset(), "[Pasted 3 lines]".chars().count());
-        document.handle_key(key(KeyCode::Char('b'), KeyModifiers::ALT));
+        document.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL));
         assert_eq!(document.focused_paste(), Some(id));
     }
 

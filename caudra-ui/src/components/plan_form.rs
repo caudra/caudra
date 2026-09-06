@@ -184,11 +184,9 @@ impl PlanForm {
             }
             KeyCode::Enter => (MENU[self.selected].action)(),
             KeyCode::Tab => PlanFormAction::Passthrough,
-            _ if key::MODEL_PICKER.matches(key_event)
-                || key::MODEL_PICKER_FALLBACK.matches(key_event) =>
-            {
-                PlanFormAction::Passthrough
-            }
+            // The chord prefix belongs to the host, which needs it to reach the
+            // model picker and everything else from in here.
+            _ if key::LEADER.matches(key_event) => PlanFormAction::Passthrough,
             _ => PlanFormAction::Consumed,
         }
     }
@@ -467,16 +465,12 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_keys_pass_through() {
+    fn the_leader_passes_through_so_its_chords_stay_reachable() {
         let mut form = PlanForm::new();
         form.toggle();
 
         assert_eq!(
-            form.handle_key(key::MODEL_PICKER.to_key_event()),
-            PlanFormAction::Passthrough
-        );
-        assert_eq!(
-            form.handle_key(key::MODEL_PICKER_FALLBACK.to_key_event()),
+            form.handle_key(key::LEADER.to_key_event()),
             PlanFormAction::Passthrough
         );
     }

@@ -174,6 +174,15 @@ impl Cadence {
         moves: true,
     };
 
+    /// One look back after `delay`, for a component that changes on the clock
+    /// once and then holds still.
+    pub fn due(delay: Duration) -> Self {
+        Self {
+            frame: Some(delay),
+            moves: true,
+        }
+    }
+
     /// `cadence` while `applies`, else [`Cadence::IDLE`].
     pub fn when(applies: bool, cadence: Self) -> Self {
         if applies { cadence } else { Self::IDLE }

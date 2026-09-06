@@ -4,7 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{BUILTIN_COMMANDS, ParsedCommand};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
-use crate::components::keybindings::{Bind, KeybindContext, key as kb};
+use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
@@ -57,6 +57,7 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
+const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
 const OTHER_PROVIDER: &str = "openrouter";
 const LEDGER_PROVIDER: &str = "anthropic";
 const LEDGER_MODEL: &str = "claude-opus-5";
@@ -592,22 +593,22 @@ fn toggle_mode_state_machine() {
 }
 
 #[test]
-fn ctrl_m_opens_model_picker() {
+fn the_model_chord_opens_the_model_picker() {
     let mut app = test_app();
 
-    let actions = app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    let actions = press_chord(&mut app, chord::MODEL_PICKER);
 
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
 #[test]
-fn alt_m_opens_model_picker_through_visible_plan_form() {
+fn the_model_chord_reaches_through_a_visible_plan_form() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.plan_form.toggle();
 
-    let actions = app.update(Msg::Key(kb::MODEL_PICKER_FALLBACK.to_key_event()));
+    let actions = press_chord(&mut app, chord::MODEL_PICKER);
 
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
@@ -811,12 +812,12 @@ fn submit_during_streaming_queues_message() {
 }
 
 #[test]
-fn alt_s_steers_the_active_run() {
+fn the_steer_chord_steers_the_active_run() {
     let mut app = test_app();
     type_and_submit(&mut app, "first");
     app.input_box.set_input("guide this run".into());
 
-    let actions = app.update(Msg::Key(kb::STEER_PROMPT.to_key_event()));
+    let actions = press_chord(&mut app, chord::STEER_PROMPT);
 
     assert!(actions.is_empty());
     assert_eq!(
@@ -833,7 +834,7 @@ fn alt_s_steers_the_active_run() {
 }
 
 #[test]
-fn alt_x_replaces_active_run_and_preserves_pending_queue() {
+fn the_interrupt_chord_replaces_active_run_and_preserves_pending_queue() {
     let mut app = test_app();
     type_and_submit(&mut app, "first");
     let (sender, receiver) = shared_queue::queue();
@@ -842,7 +843,7 @@ fn alt_x_replaces_active_run_and_preserves_pending_queue() {
     app.queue_and_notify(queued_msg("still needed"));
     app.input_box.set_input("replace now".into());
 
-    let actions = app.update(Msg::Key(kb::INTERRUPT_PROMPT.to_key_event()));
+    let actions = press_chord(&mut app, chord::INTERRUPT_PROMPT);
 
     assert!(matches!(
         actions.as_slice(),
@@ -952,7 +953,7 @@ fn rejected_second_replacement_preserves_input() {
     app.cancelling_run = Some(1);
     app.input_box.set_input("keep this replacement".into());
 
-    let actions = app.update(Msg::Key(kb::INTERRUPT_PROMPT.to_key_event()));
+    let actions = press_chord(&mut app, chord::INTERRUPT_PROMPT);
 
     assert!(actions.is_empty());
     assert_eq!(app.input_box.buffer.value(), "keep this replacement");
@@ -1139,6 +1140,14 @@ fn app_with_queued_message() -> App {
     app.run_id = 1;
     app.queue_and_notify(queued_msg("queued"));
     app
+}
+
+/// Arms the leader and plays the chord's second key, returning what the chord
+/// itself produced. Arming never yields actions of its own.
+fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
+    let armed = app.update(Msg::Key(kb::LEADER.to_key_event()));
+    assert!(armed.is_empty(), "{ARMING_LEADER_IS_INERT_MSG}");
+    app.update(Msg::Key(chord.to_key_event()))
 }
 
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
@@ -4488,7 +4497,7 @@ fn the_view_shortcut_cycles_every_mode() {
 
     let mut seen = Vec::new();
     for _ in 0..3 {
-        app.update(Msg::Key(kb::VIEW_TOGGLE.to_key_event()));
+        press_chord(&mut app, chord::VIEW_TOGGLE);
         seen.push(app.view);
     }
 
@@ -7937,10 +7946,10 @@ fn open_editor(plan: PlanState, expect_flash: bool) {
 }
 
 #[test]
-fn alt_o_opens_editor_for_input() {
+fn the_edit_chord_opens_the_editor_for_input() {
     let mut app = test_app();
     app.input_box.buffer.insert_text("hello");
-    let actions = app.update(Msg::Key(kb::EDIT_INPUT.to_key_event()));
+    let actions = press_chord(&mut app, chord::EDIT_INPUT);
     assert!(matches!(&actions[..], [Action::EditInputInEditor]));
 }
 
@@ -8715,10 +8724,20 @@ fn install_override(
     key: KeyCode,
     modifiers: KeyModifiers,
 ) -> caudra_lua::test_support::RequestProbe {
+    install_override_at(app, key, modifiers, false)
+}
+
+fn install_override_at(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+    leader: bool,
+) -> caudra_lua::test_support::RequestProbe {
     app.keymap_reader =
         caudra_lua::test_support::keymap_reader_with(vec![caudra_lua::KeymapEntry {
             key,
             modifiers,
+            leader,
             desc: "plugin override".into(),
             plugin: Arc::from("test-plugin"),
             id: 1,
@@ -8730,6 +8749,34 @@ fn install_override(
 
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
+
+#[test]
+fn a_leader_override_answers_the_chord_and_shadows_the_builtin() {
+    let mut app = test_app();
+    let probe = install_override_at(
+        &mut app,
+        chord::MODEL_PICKER.code,
+        chord::MODEL_PICKER.modifiers,
+        true,
+    );
+
+    let actions = press_chord(&mut app, chord::MODEL_PICKER);
+
+    assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(!app.model_picker.is_open(), "{OVERRIDE_DISPATCHED}");
+}
+
+#[test]
+fn a_leader_override_leaves_the_bare_key_alone() {
+    let mut app = test_app();
+    let probe = install_override_at(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, true);
+
+    app.update(Msg::Key(key(KeyCode::Char('m'))));
+
+    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert_eq!(app.input_box.buffer.value(), "m");
+}
 
 #[test]
 fn override_shadows_builtin_ctrl_when_no_overlay_open() {
@@ -10468,17 +10515,83 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     assert!(matches!(&actions[..], [Action::RefreshModels]));
 }
 
+const CHORD_LEAKED: &str = "the key after the leader must never reach the composer";
+const LEADER_STAYS_ARMED: &str = "the panel must disarm as soon as the chord resolves";
+const UNBOUND_CHORD_IS_ANNOUNCED: &str = "an unbound chord must say so rather than act on a typo";
+
 #[test]
-fn alt_m_opens_model_picker() {
+fn arming_the_leader_shows_the_panel_and_types_nothing() {
     let mut app = test_app();
-    let key = KeyEvent {
-        code: KeyCode::Char('m'),
-        modifiers: KeyModifiers::CONTROL,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
+
+    assert!(app.update(Msg::Key(kb::LEADER.to_key_event())).is_empty());
+
+    assert!(app.which_key.is_armed());
+    assert_eq!(app.input_box.buffer.value(), "", "{CHORD_LEAKED}");
+}
+
+#[test_case(KeyCode::Esc ; "esc_backs_out")]
+#[test_case(kb::QUIT.code ; "quit_backs_out")]
+fn cancelling_a_chord_is_silent(code: KeyCode) {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::LEADER.to_key_event()));
+
+    let modifiers = match code {
+        KeyCode::Esc => KeyModifiers::NONE,
+        _ => kb::QUIT.modifiers,
     };
-    app.update(Msg::Key(key));
+    let actions = app.update(Msg::Key(KeyEvent::new(code, modifiers)));
+
+    assert!(actions.is_empty());
+    assert!(!app.which_key.is_armed(), "{LEADER_STAYS_ARMED}");
+    assert_eq!(app.input_box.buffer.value(), "", "{CHORD_LEAKED}");
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
+#[test]
+fn an_unbound_chord_flashes_and_types_nothing() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::LEADER.to_key_event()));
+
+    let actions = app.update(Msg::Key(key(KeyCode::Char('ß'))));
+
+    assert!(actions.is_empty());
+    assert!(!app.which_key.is_armed(), "{LEADER_STAYS_ARMED}");
+    assert_eq!(app.input_box.buffer.value(), "", "{CHORD_LEAKED}");
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|text| text.contains(FLASH_NO_CHORD)),
+        "{UNBOUND_CHORD_IS_ANNOUNCED}"
+    );
+}
+
+/// A layout that needs shift for the chord's letter still reports it, so the
+/// chord has to match with shift stripped.
+#[test]
+fn a_shifted_chord_key_still_resolves() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::LEADER.to_key_event()));
+
+    app.update(Msg::Key(KeyEvent::new(
+        chord::MODEL_PICKER.code,
+        KeyModifiers::SHIFT,
+    )));
+
     assert!(app.model_picker.is_open());
+}
+
+/// AltGr arrives as Ctrl+Alt, so the leader must not answer it and steal a
+/// character the user meant to type.
+#[test]
+fn alt_gr_is_text_not_the_leader() {
+    let mut app = test_app();
+
+    app.update(Msg::Key(KeyEvent::new(
+        kb::LEADER.code,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )));
+
+    assert!(!app.which_key.is_armed());
 }
 
 const PAN_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write store]\n```";
@@ -10720,12 +10833,12 @@ fn stash_list_on_an_empty_stash_opens_nothing() {
     assert!(!app.stash_picker.is_open());
 }
 
-#[test_case(kb::STASH_PUSH, "" ; "push_clears_the_composer")]
-#[test_case(kb::STASH_POP, "draft" ; "pop_is_inert_while_the_composer_is_busy")]
+#[test_case(chord::STASH_PUSH, "" ; "push_clears_the_composer")]
+#[test_case(chord::STASH_POP, "draft" ; "pop_is_inert_while_the_composer_is_busy")]
 fn stash_keybindings_reach_the_builtin(bind: Bind, expected: &str) {
     let (_tmp, mut app) = stash_app();
     app.update(Msg::Paste("draft".into()));
-    app.update(Msg::Key(KeyEvent::new(bind.code, bind.modifiers)));
+    press_chord(&mut app, bind);
     assert_eq!(app.input_box.buffer.value(), expected);
 }
 
@@ -10763,34 +10876,38 @@ fn restoring_is_refused_while_a_queued_prompt_is_being_edited() {
     assert_eq!(stash_entries(&app).len(), 1);
 }
 
-const WORKBENCH_OPENS: &str = "Alt+E must put the workbench on screen";
-const WORKBENCH_CLOSES: &str = "Alt+E must hand the screen back to the transcript";
+const WORKBENCH_OPENS: &str = "the workbench chord must put the workbench on screen";
+const WORKBENCH_CLOSES: &str = "the workbench chord must hand the screen back to the transcript";
 const SUSPEND_TRAPPED: &str =
     "Ctrl+Z must reach the workbench as undo instead of backgrounding the process";
 const QUIT_REACHABLE: &str =
     "Ctrl+C without a selection must still reach quit, or the workbench traps the session";
 const WHEEL_MISROUTED: &str =
     "the wheel must reach the open workbench, not the transcript behind it";
-
-fn alt(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::ALT)
-}
+const LEADER_TRAPPED_MSG: &str =
+    "the leader must arm over an open workbench, or its chords are unreachable";
+const OVERLAY_HIDDEN: &str = "an overlay opened over the workbench must be drawn over it";
+/// A chord description no transcript context offers, so seeing it proves the
+/// panel is both drawn and scoped to the workbench.
+const WORKBENCH_CHORD_DESC: &str = "Close the active tab";
+const PROMPT_UNANSWERABLE: &str =
+    "the prompt must answer before the workbench, or the session hangs on it";
 
 fn open_workbench() -> App {
     let mut app = test_app();
-    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    press_chord(&mut app, chord::WORKBENCH);
     app
 }
 
 #[test]
-fn alt_e_toggles_the_workbench() {
+fn the_workbench_chord_toggles_the_workbench() {
     let mut app = test_app();
     assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
 
-    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    press_chord(&mut app, chord::WORKBENCH);
     assert!(app.workbench.is_open(), "{WORKBENCH_OPENS}");
 
-    app.update(Msg::Key(alt(KeyCode::Char('e'))));
+    press_chord(&mut app, chord::WORKBENCH);
     assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
 }
 
@@ -10854,6 +10971,64 @@ fn ctrl_c_is_not_swallowed_by_an_open_workbench() {
         actions.iter().any(|a| matches!(a, Action::ManualExit)),
         "{QUIT_REACHABLE}"
     );
+}
+
+/// The workbench is a full-screen view, not a modal. It used to be rendered
+/// with an early return that skipped every overlay, so anything opened over it
+/// was invisible while it went on owning the keyboard.
+#[test]
+fn the_which_key_panel_draws_over_the_workbench() {
+    let mut app = open_workbench();
+    app.which_key = crate::components::which_key::WhichKey::new(Duration::ZERO);
+    app.update(Msg::Key(kb::LEADER.to_key_event()));
+
+    let frame = rendered(&mut app);
+
+    assert!(frame.contains(WORKBENCH_CHORD_DESC), "{OVERLAY_HIDDEN}");
+}
+
+#[test_case(chord::HELP, "Keybindings" ; "help")]
+#[test_case(chord::MODEL_PICKER, "Model" ; "model_picker")]
+fn a_chord_that_opens_a_modal_draws_it_over_the_workbench(bind: Bind, needle: &str) {
+    let mut app = open_workbench();
+    press_chord(&mut app, bind);
+
+    let frame = rendered(&mut app);
+
+    assert!(frame.contains(needle), "{OVERLAY_HIDDEN}");
+}
+
+/// The severe one: an invisible prompt that still owns the keyboard cannot be
+/// answered, so the agent waits on it forever.
+#[test]
+fn a_permission_prompt_is_visible_and_answerable_over_the_workbench() {
+    let mut app = open_workbench();
+    app.permission_prompt.open(
+        "id".into(),
+        caudra_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+
+    assert!(rendered(&mut app).contains("bash"), "{OVERLAY_HIDDEN}");
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert!(!app.permission_prompt.is_open(), "{PROMPT_UNANSWERABLE}");
+    assert!(app.workbench.is_open(), "{PROMPT_UNANSWERABLE}");
+}
+
+/// End to end for the bug that sent this design back to the drawing board:
+/// the workbench used to cut on `Ctrl+X` whenever a selection existed, so the
+/// prefix never reached the host and every workbench chord went dead.
+#[test]
+fn the_leader_arms_over_an_open_workbench() {
+    let mut app = open_workbench();
+
+    let actions = app.update(Msg::Key(kb::LEADER.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert!(app.which_key.is_armed(), "{LEADER_TRAPPED_MSG}");
 }
 
 #[test]

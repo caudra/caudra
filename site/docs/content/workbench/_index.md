@@ -9,7 +9,7 @@ group = "Guides"
 
 The workbench is a file explorer, tabbed editor, source control view, and project search, laid out the way an IDE lays them out. It takes over the terminal beside the transcript, so you can read a file, stage a change, or point the agent at an exact line without leaving Caudra.
 
-Press `Alt+E` to open it, or run `/workbench`. `Esc` or `Alt+E` goes back to the transcript. `Esc` drops a live selection in the editor first, so leaving from one takes a second press, while `Alt+E` always leaves at once. The session keeps running while the workbench is on screen.
+Press `Ctrl+X w` to open it, or run `/workbench`. `Esc` or `Ctrl+X w` goes back to the transcript. `Esc` drops a live selection in the editor first, so leaving from one takes a second press, while `Ctrl+X w` always leaves at once. The session keeps running while the workbench is on screen.
 
 ## Layout
 
@@ -22,13 +22,13 @@ A sidebar on the left, tabs and a buffer on the right, one status row along the 
 │  a.txt        M │  2  two                       │
 │  b.rs         U │  3  three                     │
 ├─────────────────┴───────────────────────────────┤
-│ a.txt          Ln 3, Col 1  LF  Alt+Enter send  │
+│ a.txt        Ln 3, Col 1  LF  Ctrl+X Enter send │
 └─────────────────────────────────────────────────┘
 ```
 
-`Ctrl+B` hides the sidebar. `Alt+-` and `Alt+=` change its width, and you can drag the divider with the mouse. On a terminal too narrow for both panes the sidebar drops out and the editor keeps the room.
+`Ctrl+B` hides the sidebar. `Ctrl+X -` and `Ctrl+X =` change its width, and you can drag the divider with the mouse. On a terminal too narrow for both panes the sidebar drops out and the editor keeps the room.
 
-`Tab` and `Shift+Tab` move between the sidebar and the editor. `Alt+1`, `Alt+2`, and `Alt+3` switch the sidebar to the explorer, source control, or search, and put the cursor there. The `FILES`, `GIT`, and `FIND` labels in the sidebar header do the same thing with the mouse.
+`Tab` and `Shift+Tab` move between the sidebar and the editor. `Ctrl+X 1`, `Ctrl+X 2`, and `Ctrl+X 3` switch the sidebar to the explorer, source control, or search, and put the cursor there. The `FILES`, `GIT`, and `FIND` labels in the sidebar header do the same thing with the mouse.
 
 ## Mouse
 
@@ -50,7 +50,7 @@ The workbench takes the mouse the way an IDE does.
 | Wheel over a pane | Scroll that pane |
 | Sideways wheel over the buffer | Pan the text left or right |
 
-In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. Letting go puts whatever is selected on the system clipboard, so `Ctrl+C` is a second way rather than the only one. `Ctrl+X` and `Backspace` also work on that selection.
+In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. Letting go puts whatever is selected on the system clipboard, so `Ctrl+C` is a second way rather than the only one. `Shift+Delete` and `Backspace` also work on that selection.
 
 Source control and search rows follow the explorer, and so do the `Ctrl+P` file picker's: one click does whatever `Enter` would have done to that row, so a folder or a section folds and everything else opens.
 
@@ -60,21 +60,23 @@ A pane whose content runs past its bottom gives up its last column to a scrollba
 
 ## Explorer
 
-Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+H` shows hidden and ignored files. One click of the [mouse](#mouse) does the same as `Enter`.
+Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file, `Left` collapses it or jumps to the parent. `Ctrl+X h` shows hidden and ignored files. One click of the [mouse](#mouse) does the same as `Enter`.
 
 Rows carry two marks. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
 
-`Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it. Before you type anything it lists your other open tabs first, most recent before the rest, so `Ctrl+P` then `Enter` goes back to the file you came from. The project is walked once and reused, and walked again after `F5`, after `Ctrl+H`, or when a file appears or disappears on disk.
+`Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it. Before you type anything it lists your other open tabs first, most recent before the rest, so `Ctrl+P` then `Enter` goes back to the file you came from. The project is walked once and reused, and walked again after `F5`, after `Ctrl+X h`, or when a file appears or disappears on disk.
 
 ## Editor
 
-Tabs sit above the buffer, each with a `×` to close it. `Alt+Left` and `Alt+Right` cycle them, `Alt+W` closes the active one. When more tabs are open than the strip can hold, it scrolls to keep the active one in view and marks the end it cut off with `‹` or `›`. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
+Tabs sit above the buffer, each with a `×` to close it. `Ctrl+PageUp` and `Ctrl+PageDown` cycle them, `Ctrl+X k` closes the active one. When more tabs are open than the strip can hold, it scrolls to keep the active one in view and marks the end it cut off with `‹` or `›`. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
 
-Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` and `Ctrl+X` copy and cut to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
+Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` copies and `Shift+Delete` cuts to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
+
+Cut is `Shift+Delete`, not `Ctrl+X`. `Ctrl+X` is Caudra's leader everywhere, including here, so that the chords above stay reachable while text is selected. `Ctrl+X x` cuts as well, for a terminal that keeps `Shift+Delete` for itself. Cut with nothing selected does nothing rather than deleting the character at the cursor.
 
 `Ctrl+S` saves. `Ctrl+F` opens find in file, then `Enter` or `Down` goes to the next match and `Shift+Enter` or `Up` to the previous one. `F3` and `Shift+F3` do the same thing without the bar open, so `Esc` puts the buffer back and you can keep walking the matches. `Ctrl+G` goes to a line number.
 
-`Alt+Z` wraps long lines onto more rows instead of leaving them off to the right. A wrapped line breaks between words, keeps its number in the gutter on the first row only, and ignores the sideways pan, because the pane is already showing every column it has. The workbench remembers the setting per project.
+`Ctrl+X z` wraps long lines onto more rows instead of leaving them off to the right. A wrapped line breaks between words, keeps its number in the gutter on the first row only, and ignores the sideways pan, because the pane is already showing every column it has. The workbench remembers the setting per project.
 
 Files the editor cannot take still open. Binaries, files over 8 MiB, and files that are not valid UTF-8 open read-only, and the status row says which of the three it is.
 
@@ -88,7 +90,7 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 
 ## Source control
 
-`Alt+2` shows three stacked sections, with the current branch in the sidebar header.
+`Ctrl+X 2` shows three stacked sections, with the current branch in the sidebar header.
 
 ```
 ┌─────────────────┐
@@ -108,7 +110,7 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 
 Each header carries a chevron, a title, and how many rows the section holds. `Space` on a header stages or unstages every path the section lists, so one press empties `CHANGES` into `STAGED CHANGES`.
 
-Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Alt+Up` and `Alt+Down` do the same from the keyboard.
+Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Ctrl+X ↑` and `Ctrl+X ↓` do the same from the keyboard.
 
 The two change sections nest paths as folders. A folder with one child is joined onto its parent, so `src/main/rust` is one row rather than three. `T` switches both sections to flat full paths, and the `TREE` or `FLAT` label on the right of the sidebar header does the same with the mouse.
 
@@ -121,7 +123,7 @@ Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first par
 | `X` | Discard changes, twice to confirm |
 | `T` | Switch the change sections between tree and flat |
 | `Left` / `Right` | Fold and unfold a folder or a section |
-| `Alt+Up` / `Alt+Down` | Resize the section the cursor is in |
+| `Ctrl+X ↑` / `Ctrl+X ↓` | Resize the section the cursor is in |
 
 Diffs and commits open as read-only tabs. Discarding is destructive, asks for a second press of the same key, and works on one file at a time even when the cursor is on a folder.
 
@@ -131,15 +133,15 @@ A directory outside a repository says so rather than failing.
 
 ## Search
 
-`Alt+3` searches file contents across the project. The pane has a query field, a comma-separated glob field for narrowing by path, and three toggles.
+`Ctrl+X 3` searches file contents across the project. The pane has a query field, a comma-separated glob field for narrowing by path, and three toggles.
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Run the search, then open the file at the match |
-| `Alt+I` | Move between the query and the glob field |
-| `Alt+C` | Match case |
-| `Alt+M` | Match whole words |
-| `Alt+R` | Read the query as a regular expression |
+| `Ctrl+X i` | Move between the query and the glob field |
+| `Ctrl+X c` | Match case |
+| `Ctrl+X w` | Match whole words |
+| `Ctrl+X r` | Read the query as a regular expression |
 
 The first `Enter` runs the search. Once results are current, `Enter` opens the selected row: a file heading opens the top of the file, a match opens that line. Editing the query or a toggle makes the results stale again, so the next `Enter` searches.
 
@@ -147,7 +149,7 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 ## Sending a reference to the agent
 
-`Alt+Enter` puts what you are looking at into the composer as a file reference, then closes the workbench so you can finish the sentence.
+`Ctrl+X Enter` puts what you are looking at into the composer as a file reference, then closes the workbench so you can finish the sentence.
 
 - From the explorer or source control: `@path/to/file`
 - From a search result: `@path/to/file:L42`

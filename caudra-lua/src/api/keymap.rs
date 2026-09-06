@@ -8,10 +8,23 @@ use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
+/// What `<leader>` spells in `caudra.keymap.set`.
+const LEADER_NOTATION: &str = "<leader>";
+
+/// One key press, and whether the leader has to precede it. Leader chords are
+/// a namespace of their own: `<leader>t` and `t` are different bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyChord {
+    pub key: KeyCode,
+    pub modifiers: KeyModifiers,
+    pub leader: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct KeymapEntry {
     pub key: KeyCode,
     pub modifiers: KeyModifiers,
+    pub leader: bool,
     pub desc: String,
     pub plugin: Arc<str>,
     pub id: u64,
@@ -64,8 +77,7 @@ impl KeymapWriter {
 
 pub(crate) struct StoredKeymap {
     pub id: u64,
-    pub key: KeyCode,
-    pub modifiers: KeyModifiers,
+    pub chord: KeyChord,
     pub callback: RegistryKey,
     pub plugin: Arc<str>,
     pub desc: String,
@@ -84,8 +96,7 @@ impl KeymapStore {
 
     pub fn set(
         &mut self,
-        key: KeyCode,
-        modifiers: KeyModifiers,
+        chord: KeyChord,
         callback: RegistryKey,
         plugin: Arc<str>,
         desc: String,
@@ -94,12 +105,11 @@ impl KeymapStore {
         let old = self
             .bindings
             .iter()
-            .position(|b| b.key == key && b.modifiers == modifiers)
+            .position(|b| b.chord == chord)
             .map(|pos| self.bindings.remove(pos).callback);
         self.bindings.push(StoredKeymap {
             id,
-            key,
-            modifiers,
+            chord,
             callback,
             plugin,
             desc,
@@ -107,10 +117,10 @@ impl KeymapStore {
         (id, old)
     }
 
-    pub fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<RegistryKey> {
+    pub fn del(&mut self, chord: KeyChord) -> Option<RegistryKey> {
         self.bindings
             .iter()
-            .position(|b| b.key == key && b.modifiers == modifiers)
+            .position(|b| b.chord == chord)
             .map(|pos| self.bindings.remove(pos).callback)
     }
 
@@ -131,8 +141,9 @@ impl KeymapStore {
         self.bindings
             .iter()
             .map(|b| KeymapEntry {
-                key: b.key,
-                modifiers: b.modifiers,
+                key: b.chord.key,
+                modifiers: b.chord.modifiers,
+                leader: b.chord.leader,
                 desc: b.desc.clone(),
                 plugin: Arc::clone(&b.plugin),
                 id: b.id,
@@ -148,23 +159,34 @@ impl KeymapStore {
     }
 }
 
-pub fn parse_key_notation(input: &str) -> Result<(KeyCode, KeyModifiers), String> {
-    let s = input.trim();
+pub fn parse_key_notation(input: &str) -> Result<KeyChord, String> {
+    let mut s = input.trim();
+    let leader = match s.len() >= LEADER_NOTATION.len()
+        && s[..LEADER_NOTATION.len()].eq_ignore_ascii_case(LEADER_NOTATION)
+    {
+        true => {
+            s = s[LEADER_NOTATION.len()..].trim_start();
+            true
+        }
+        false => false,
+    };
     if s.is_empty() {
         return Err("empty key notation".into());
     }
 
-    if s.starts_with('<') && s.ends_with('>') {
-        let inner = &s[1..s.len() - 1];
-        return parse_bracketed(inner);
-    }
+    let (key, modifiers) = if s.starts_with('<') && s.ends_with('>') {
+        parse_bracketed(&s[1..s.len() - 1])?
+    } else if s.chars().count() == 1 {
+        (KeyCode::Char(s.chars().next().unwrap()), KeyModifiers::NONE)
+    } else {
+        return Err(format!("invalid key notation: {s}"));
+    };
 
-    if s.len() == 1 {
-        let c = s.chars().next().unwrap();
-        return Ok((KeyCode::Char(c), KeyModifiers::NONE));
-    }
-
-    Err(format!("invalid key notation: {s}"))
+    Ok(KeyChord {
+        key,
+        modifiers,
+        leader,
+    })
 }
 
 fn parse_bracketed(inner: &str) -> Result<(KeyCode, KeyModifiers), String> {
@@ -257,8 +279,13 @@ fn publish_keymap_snapshot(lua: &Lua) {
 /// normal mode (`"n"`) is supported right now. If {lhs} is already
 /// mapped, the old binding is replaced and a warning is logged.
 ///
+/// Prefix {lhs} with `<leader>` to bind a two-key chord under `Ctrl+X`.
+/// Leader chords are a separate namespace, so `<leader>t` and `t` can both
+/// be bound.
+///
 /// @param mode string Mode letter. Currently only `"n"` is accepted.
-/// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
+/// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`,
+///   `"<leader>d"`.
 /// @param rhs function Called when the key is pressed.
 /// @param opts table? Options:
 ///   `desc` (string) short description shown in the keymap list.
@@ -266,6 +293,9 @@ fn publish_keymap_snapshot(lua: &Lua) {
 /// caudra.keymap.set("n", "<C-t>", function()
 ///   print("toggle!")
 /// end, { desc = "Toggle panel" })
+/// caudra.keymap.set("n", "<leader>d", function()
+///   print("Ctrl+X then d")
+/// end, { desc = "Deploy" })
 #[lua_fn]
 fn set(
     lua: &Lua,
@@ -280,7 +310,7 @@ fn set(
             "unsupported keymap mode: {mode}"
         )));
     }
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+    let chord = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     let desc = opts
         .as_ref()
         .and_then(|o| o.get::<String>("desc").ok())
@@ -289,7 +319,7 @@ fn set(
     let (_, old) = lua
         .app_data_mut::<KeymapStore>()
         .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
-        .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
+        .set(chord, registry_key, Arc::clone(&plugin), desc);
     if let Some(old_key) = old {
         tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
         let _ = lua.remove_registry_value(old_key);
@@ -308,10 +338,10 @@ fn set(
 #[lua_fn]
 fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
     let _ = (mode, &plugin);
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+    let chord = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     let old = lua
         .app_data_mut::<KeymapStore>()
-        .and_then(|mut store| store.del(key, modifiers));
+        .and_then(|mut store| store.del(chord));
     if let Some(old_key) = old {
         let _ = lua.remove_registry_value(old_key);
     }
@@ -338,6 +368,18 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
     use test_case::test_case;
+
+    const PLAIN_NOTATION_IS_NOT_A_CHORD: &str = "only <leader> asks for the leader prefix";
+    const LEADER_NOTATION_IS_A_CHORD: &str = "<leader> must bind under the leader, not bare";
+    const SEPARATE_NAMESPACES: &str = "a leader chord and the bare key are different bindings";
+
+    fn chord(key: KeyCode, modifiers: KeyModifiers) -> KeyChord {
+        KeyChord {
+            key,
+            modifiers,
+            leader: false,
+        }
+    }
 
     #[test_case("<C-t>", KeyCode::Char('t'), KeyModifiers::CONTROL ; "ctrl_t")]
     #[test_case("<C-T>", KeyCode::Char('T'), KeyModifiers::CONTROL ; "ctrl_shift_t")]
@@ -373,9 +415,40 @@ mod tests {
     #[test_case("<Return>", KeyCode::Enter, KeyModifiers::NONE ; "return_key")]
     #[test_case("<Escape>", KeyCode::Esc, KeyModifiers::NONE ; "escape_full")]
     fn parse_key_notation_cases(input: &str, code: KeyCode, mods: KeyModifiers) {
-        let (key, modifiers) = parse_key_notation(input).unwrap();
-        assert_eq!(key, code);
-        assert_eq!(modifiers, mods);
+        let chord = parse_key_notation(input).unwrap();
+        assert_eq!(chord.key, code);
+        assert_eq!(chord.modifiers, mods);
+        assert!(!chord.leader, "{PLAIN_NOTATION_IS_NOT_A_CHORD}");
+    }
+
+    #[test_case("<leader>d", KeyCode::Char('d'), KeyModifiers::NONE ; "leader_letter")]
+    #[test_case("<Leader><C-d>", KeyCode::Char('d'), KeyModifiers::CONTROL ; "leader_is_case_insensitive")]
+    #[test_case("<leader><Tab>", KeyCode::Tab, KeyModifiers::NONE ; "leader_named_key")]
+    fn leader_notation_binds_a_chord(input: &str, code: KeyCode, mods: KeyModifiers) {
+        let chord = parse_key_notation(input).unwrap();
+        assert_eq!(chord.key, code);
+        assert_eq!(chord.modifiers, mods);
+        assert!(chord.leader, "{LEADER_NOTATION_IS_A_CHORD}");
+    }
+
+    #[test]
+    fn a_leader_chord_does_not_collide_with_the_bare_key() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+
+        for lhs in ["d", "<leader>d"] {
+            let f = lua.create_function(|_, ()| Ok(())).unwrap();
+            let k = lua.create_registry_value(f).unwrap();
+            let (_, old) = store.set(
+                parse_key_notation(lhs).unwrap(),
+                k,
+                Arc::from("p"),
+                String::new(),
+            );
+            assert!(old.is_none(), "{SEPARATE_NAMESPACES}");
+        }
+
+        assert_eq!(store.bindings.len(), 2, "{SEPARATE_NAMESPACES}");
     }
 
     #[test]
@@ -385,6 +458,7 @@ mod tests {
         assert!(parse_key_notation("<F0>").is_err());
         assert!(parse_key_notation("<F13>").is_err());
         assert!(parse_key_notation("abc").is_err());
+        assert!(parse_key_notation("<leader>").is_err());
     }
 
     #[test]
@@ -395,8 +469,7 @@ mod tests {
         let f1 = lua.create_function(|_, ()| Ok(())).unwrap();
         let k1 = lua.create_registry_value(f1).unwrap();
         let (id1, old1) = store.set(
-            KeyCode::Char('t'),
-            KeyModifiers::CONTROL,
+            chord(KeyCode::Char('t'), KeyModifiers::CONTROL),
             k1,
             Arc::from("plug"),
             "toggle".into(),
@@ -406,8 +479,7 @@ mod tests {
         let f2 = lua.create_function(|_, ()| Ok(())).unwrap();
         let k2 = lua.create_registry_value(f2).unwrap();
         let (id2, old2) = store.set(
-            KeyCode::Char('t'),
-            KeyModifiers::CONTROL,
+            chord(KeyCode::Char('t'), KeyModifiers::CONTROL),
             k2,
             Arc::from("plug2"),
             "toggle v2".into(),
@@ -425,19 +497,18 @@ mod tests {
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
         let k = lua.create_registry_value(f).unwrap();
         store.set(
-            KeyCode::Char('x'),
-            KeyModifiers::ALT,
+            chord(KeyCode::Char('x'), KeyModifiers::ALT),
             k,
             Arc::from("p"),
             String::new(),
         );
         assert_eq!(store.bindings.len(), 1);
 
-        let removed = store.del(KeyCode::Char('x'), KeyModifiers::ALT);
+        let removed = store.del(chord(KeyCode::Char('x'), KeyModifiers::ALT));
         assert!(removed.is_some());
         assert!(store.bindings.is_empty());
 
-        let missing = store.del(KeyCode::Char('x'), KeyModifiers::ALT);
+        let missing = store.del(chord(KeyCode::Char('x'), KeyModifiers::ALT));
         assert!(missing.is_none());
     }
 
@@ -451,15 +522,13 @@ mod tests {
         let k1 = lua.create_registry_value(f1).unwrap();
         let k2 = lua.create_registry_value(f2).unwrap();
         store.set(
-            KeyCode::Char('t'),
-            KeyModifiers::CONTROL,
+            chord(KeyCode::Char('t'), KeyModifiers::CONTROL),
             k1,
             Arc::from("a"),
             String::new(),
         );
         store.set(
-            KeyCode::Char('x'),
-            KeyModifiers::CONTROL,
+            chord(KeyCode::Char('x'), KeyModifiers::CONTROL),
             k2,
             Arc::from("b"),
             String::new(),
@@ -479,6 +548,7 @@ mod tests {
         writer.publish(vec![KeymapEntry {
             key: KeyCode::Char('t'),
             modifiers: KeyModifiers::CONTROL,
+            leader: false,
             desc: "test".into(),
             plugin: Arc::from("p"),
             id: 1,

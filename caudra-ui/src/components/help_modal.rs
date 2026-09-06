@@ -1,7 +1,7 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::keybindings::{
-    ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
+    ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, all_contexts, key,
 };
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
@@ -29,10 +29,10 @@ pub struct HelpModal {
     scroll: ModalScroll,
 }
 
-fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static>> {
+fn key_spans(label: KeyLabel, pad: usize, prefix: &str) -> Vec<Span<'static>> {
     let theme = theme::current();
     match label {
-        ResolvedLabel::Single(s) => {
+        KeyLabel::Single(s) => {
             let w = UnicodeWidthStr::width(s);
             let trailing = pad.saturating_sub(w);
             vec![Span::styled(
@@ -40,8 +40,8 @@ fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static
                 theme.keybind_key,
             )]
         }
-        ResolvedLabel::Alt(a, b) => multi_key_spans(&[a, b], pad, prefix, &theme),
-        ResolvedLabel::Multi(keys) => multi_key_spans(keys, pad, prefix, &theme),
+        KeyLabel::Alt(a, b) => multi_key_spans(&[a, b], pad, prefix, &theme),
+        KeyLabel::Multi(keys) => multi_key_spans(keys, pad, prefix, &theme),
     }
 }
 
@@ -126,7 +126,7 @@ impl HelpModal {
         let key_col_width = KEYBINDS
             .iter()
             .filter(|kb| kb.platform.is_visible())
-            .map(|kb| kb.label.resolve().display_width())
+            .map(|kb| kb.label.display_width())
             .max()
             .unwrap_or(0)
             + KEY_COL_GAP;
@@ -150,7 +150,7 @@ impl HelpModal {
                 .iter()
                 .filter(|kb| kb.context == ctx && kb.platform.is_visible())
             {
-                let mut spans = key_spans(kb.label.resolve(), key_col_width, PREFIX_TOP);
+                let mut spans = key_spans(kb.label, key_col_width, PREFIX_TOP);
                 spans.push(Span::styled(kb.description, theme.keybind_desc));
                 lines.push(Line::from(spans));
             }
@@ -172,11 +172,7 @@ impl HelpModal {
                     theme.keybind_section,
                 )));
                 for kb in child_binds {
-                    let mut spans = key_spans(
-                        kb.label.resolve(),
-                        key_col_width - KEY_COL_GAP,
-                        PREFIX_CHILD,
-                    );
+                    let mut spans = key_spans(kb.label, key_col_width - KEY_COL_GAP, PREFIX_CHILD);
                     spans.push(Span::styled(kb.description, theme.keybind_desc));
                     lines.push(Line::from(spans));
                 }
@@ -190,7 +186,7 @@ impl HelpModal {
                 )));
                 for &(pfx, desc) in INPUT_PREFIXES {
                     let mut spans = key_spans(
-                        ResolvedLabel::Single(pfx),
+                        KeyLabel::Single(pfx),
                         key_col_width - KEY_COL_GAP,
                         PREFIX_CHILD,
                     );
@@ -241,7 +237,7 @@ mod tests {
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
     #[test_case(key::QUIT.to_key_event()    ; "ctrl_c_closes")]
-    #[test_case(key::HELP.to_key_event()    ; "ctrl_h_closes")]
+    #[test_case(key::HELP.to_key_event()    ; "f1_closes")]
     fn handle_key_closes(k: KeyEvent) {
         let mut modal = HelpModal::new();
         modal.toggle();

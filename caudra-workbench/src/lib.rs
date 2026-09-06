@@ -955,15 +955,23 @@ impl Workbench {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> WorkbenchAction {
         // Everything else here consumes, because a full-screen takeover that
-        // leaked keys to the hidden composer would type into it. Copy is the
-        // exception: with nothing selected there is nothing to copy, and the
-        // host spends the same chord on quitting.
+        // leaked keys to the hidden composer would type into it. Copy is one
+        // exception: with nothing selected there is nothing to take, and the
+        // host spends that chord on quitting.
         if keys::COPY.matches(key) && self.selected_text().is_none() {
             return WorkbenchAction::Passthrough;
         }
         self.flash = None;
+        // The close dialog is guarding unsaved work, so it answers even before
+        // the leader. It is the only thing here that does.
         if let Some(action) = self.confirm_key(key) {
             return action;
+        }
+        // The leader is otherwise unconditional. Gating it on a selection left
+        // every chord under it dead the moment one existed, and cut answers to
+        // `Shift+Delete` now, so nothing here competes for the prefix.
+        if keys::LEADER.matches(key) {
+            return WorkbenchAction::Passthrough;
         }
         if let Some(action) = self.palette_key(key) {
             return action;
@@ -1004,33 +1012,6 @@ impl Workbench {
             }
             return Some(WorkbenchAction::Consumed);
         }
-        if keys::TOGGLE_WRAP.matches(key) {
-            self.wrap = !self.wrap;
-            // The caret was measured against the old shape of the pane, so it
-            // is put back on screen before anything else reads the scroll.
-            self.follow_cursor();
-            return Some(WorkbenchAction::Consumed);
-        }
-        if keys::TOGGLE_HIDDEN.matches(key) {
-            self.show_hidden = !self.show_hidden;
-            self.tree.set_show_hidden(self.show_hidden);
-            // The walk the palette cached was taken under the old answer, so
-            // it would go on offering hidden files after they were turned off.
-            self.palette.invalidate();
-            return Some(WorkbenchAction::Consumed);
-        }
-        for (bind, view) in [
-            (keys::VIEW_EXPLORER, SidebarView::Explorer),
-            (keys::VIEW_SOURCE_CONTROL, SidebarView::SourceControl),
-            (keys::VIEW_SEARCH, SidebarView::Search),
-        ] {
-            if bind.matches(key) {
-                self.sidebar = view;
-                self.sidebar_collapsed = false;
-                self.focus = Focus::Sidebar;
-                return Some(WorkbenchAction::Consumed);
-            }
-        }
         if keys::QUICK_OPEN.matches(key) {
             self.palette.set_priority(self.other_tabs());
             self.palette.open(&self.root, self.show_hidden);
@@ -1043,12 +1024,6 @@ impl Workbench {
             self.apply_marks();
             return Some(WorkbenchAction::Consumed);
         }
-        if keys::SEND_TO_COMPOSER.matches(key) {
-            return Some(match self.reference() {
-                Some(text) => WorkbenchAction::SendToComposer(text),
-                None => WorkbenchAction::Consumed,
-            });
-        }
         if keys::SAVE.matches(key) {
             self.save_active();
             return Some(WorkbenchAction::Consumed);
@@ -1060,9 +1035,57 @@ impl Workbench {
                 return Some(WorkbenchAction::Consumed);
             }
         }
+        self.clipboard_key(key).or_else(|| self.buffer_key(key))
+    }
+
+    /// The key that followed `Ctrl+X`. The host owns the prefix and the pending
+    /// state, so this only has to answer for the second half, and hands back
+    /// `Passthrough` when the chord belongs to the transcript instead.
+    pub fn handle_leader(&mut self, key: KeyEvent) -> WorkbenchAction {
+        self.flash = None;
+        // A chord acts on the pane behind them, so they go first rather than
+        // staying on screen over a workbench that has moved on.
+        self.palette.close();
+        self.goto = None;
+        for (bind, view) in [
+            (keys::VIEW_EXPLORER, SidebarView::Explorer),
+            (keys::VIEW_SOURCE_CONTROL, SidebarView::SourceControl),
+            (keys::VIEW_SEARCH, SidebarView::Search),
+        ] {
+            if bind.matches(key) {
+                self.sidebar = view;
+                self.sidebar_collapsed = false;
+                self.focus = Focus::Sidebar;
+                return WorkbenchAction::Consumed;
+            }
+        }
+        if keys::SEND_TO_COMPOSER.matches(key) {
+            return match self.reference() {
+                Some(text) => WorkbenchAction::SendToComposer(text),
+                None => WorkbenchAction::Consumed,
+            };
+        }
+        if keys::CUT_CHORD.matches(key) {
+            return self.cut();
+        }
+        if keys::TOGGLE_HIDDEN.matches(key) {
+            self.show_hidden = !self.show_hidden;
+            self.tree.set_show_hidden(self.show_hidden);
+            // The walk the palette cached was taken under the old answer, so
+            // it would go on offering hidden files after they were turned off.
+            self.palette.invalidate();
+            return WorkbenchAction::Consumed;
+        }
         if keys::CLOSE_TAB.matches(key) {
             self.close_tab();
-            return Some(WorkbenchAction::Consumed);
+            return WorkbenchAction::Consumed;
+        }
+        if keys::TOGGLE_WRAP.matches(key) {
+            self.wrap = !self.wrap;
+            // The caret was measured against the old shape of the pane, so it
+            // is put back on screen before anything else reads the scroll.
+            self.follow_cursor();
+            return WorkbenchAction::Consumed;
         }
         for (bind, step) in [
             (keys::SHRINK_SIDEBAR, -SIDEBAR_STEP),
@@ -1070,10 +1093,66 @@ impl Workbench {
         ] {
             if bind.matches(key) {
                 self.set_sidebar_width(self.sidebar_width.saturating_add_signed(step));
-                return Some(WorkbenchAction::Consumed);
+                return WorkbenchAction::Consumed;
             }
         }
-        self.clipboard_key(key).or_else(|| self.buffer_key(key))
+        let claimed = self.focus == Focus::Sidebar
+            && match self.sidebar {
+                SidebarView::SourceControl => self.scm_leader(key),
+                SidebarView::Search => self.search_leader(key),
+                SidebarView::Explorer => false,
+            };
+        match claimed {
+            true => WorkbenchAction::Consumed,
+            false => WorkbenchAction::Passthrough,
+        }
+    }
+
+    fn scm_leader(&mut self, key: KeyEvent) -> bool {
+        let step = if keys::GROW_SECTION.matches(key) {
+            SECTION_STEP
+        } else if keys::SHRINK_SECTION.matches(key) {
+            -SECTION_STEP
+        } else {
+            return false;
+        };
+        let section = self.scm.cursor().section;
+        let height = self.scm.height(section).saturating_add_signed(step);
+        self.scm.set_height(section, height);
+        true
+    }
+
+    fn search_leader(&mut self, key: KeyEvent) -> bool {
+        for (bind, toggle) in [
+            (keys::NEXT_FIELD, Search::next_field as fn(&mut Search)),
+            (keys::TOGGLE_CASE, Search::toggle_case),
+            (keys::TOGGLE_WORD, Search::toggle_word),
+            (keys::TOGGLE_REGEX, Search::toggle_regex),
+        ] {
+            if bind.matches(key) {
+                toggle(&mut self.search);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Takes the selection out of the buffer. With nothing selected it is
+    /// inert rather than a forward delete, so a stray `Shift+Delete` never
+    /// destroys a character the user could not see was at risk.
+    fn cut(&mut self) -> WorkbenchAction {
+        let Some(text) = self.selected_text() else {
+            return WorkbenchAction::Consumed;
+        };
+        self.clipboard = text.clone();
+        if let Some(tab) = self.editor.active_mut()
+            && tab.is_editable()
+        {
+            let edit = tab.buffer.delete();
+            tab.record(edit);
+            self.follow_cursor();
+        }
+        WorkbenchAction::Copy(text)
     }
 
     fn clipboard_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
@@ -1083,15 +1162,7 @@ impl Workbench {
             return Some(WorkbenchAction::Copy(text));
         }
         if keys::CUT.matches(key) {
-            let text = self.selected_text()?;
-            self.clipboard = text.clone();
-            let tab = self.editor.active_mut()?;
-            if tab.is_editable() {
-                let edit = tab.buffer.delete();
-                tab.record(edit);
-                self.follow_cursor();
-            }
-            return Some(WorkbenchAction::Copy(text));
+            return Some(self.cut());
         }
         if keys::PASTE.matches(key) {
             let text = std::mem::take(&mut self.clipboard);
@@ -1335,16 +1406,6 @@ impl Workbench {
             self.scm.toggle_flat();
             return;
         }
-        if keys::SHRINK_SECTION.matches(key) || keys::GROW_SECTION.matches(key) {
-            let step = match keys::GROW_SECTION.matches(key) {
-                true => SECTION_STEP,
-                false => -SECTION_STEP,
-            };
-            let section = self.scm.cursor().section;
-            let height = self.scm.height(section).saturating_add_signed(step);
-            self.scm.set_height(section, height);
-            return;
-        }
         if keys::OPEN_DIFF.matches(key) {
             self.activate_scm();
             return;
@@ -1384,19 +1445,8 @@ impl Workbench {
 
     /// The search pane is a form over a list: bare characters belong to
     /// whichever field holds the caret, so navigation is arrows and every
-    /// command carries `Alt`.
+    /// command is a `Ctrl+X` chord handled in [`Workbench::handle_leader`].
     fn search_key(&mut self, key: KeyEvent) {
-        for (bind, toggle) in [
-            (keys::NEXT_FIELD, Search::next_field as fn(&mut Search)),
-            (keys::TOGGLE_CASE, Search::toggle_case),
-            (keys::TOGGLE_WORD, Search::toggle_word),
-            (keys::TOGGLE_REGEX, Search::toggle_regex),
-        ] {
-            if bind.matches(key) {
-                toggle(&mut self.search);
-                return;
-            }
-        }
         let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
         let page = self.sidebar_rows().max(1) as isize;
         match key.code {
@@ -1632,7 +1682,7 @@ impl Workbench {
         self.editor.active()?.buffer.selected_text()
     }
 
-    /// What `Alt+Enter` hands the composer: the tree's selection from the
+    /// What `Ctrl+X Enter` hands the composer: the tree's selection from the
     /// sidebar, and the cursor's line span from the editor.
     fn reference(&self) -> Option<String> {
         if self.focus == Focus::Sidebar {
@@ -1710,7 +1760,10 @@ impl Workbench {
     /// The width of what the sidebar header prints on its right, which is where
     /// the tree-or-flat button has to be measured from.
     fn head_width(&self) -> usize {
-        self.scm.head().map(UnicodeWidthStr::width).unwrap_or_default()
+        self.scm
+            .head()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or_default()
     }
 
     /// The layout clamps again against the room a frame actually has, so this
@@ -1759,7 +1812,10 @@ fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
 /// except the last one, which takes whatever is left: that leaves exactly one
 /// section absorbing a terminal resize, so the others keep the size they were
 /// dragged to.
-fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [SectionRect; Section::COUNT] {
+fn layout_sections(
+    area: Rect,
+    wanted: [(u16, bool); Section::COUNT],
+) -> [SectionRect; Section::COUNT] {
     let mut rects = [SectionRect::default(); Section::COUNT];
     let headers = SECTION_HEADER_ROWS * Section::COUNT as u16;
     let mut room = area.height.saturating_sub(headers);
@@ -1797,7 +1853,11 @@ fn layout_sections(area: Rect, wanted: [(u16, bool); Section::COUNT]) -> [Sectio
             ),
         }
         .min(room);
-        rects[index].body = Rect { y, height: body, ..area };
+        rects[index].body = Rect {
+            y,
+            height: body,
+            ..area
+        };
         y += body;
         room -= body;
     }
@@ -1841,6 +1901,9 @@ mod tests {
     const STATUS_RESERVED: &str = "the status row must always be carved";
     const SIDEBAR_CLAMPED: &str = "the sidebar must never squeeze the editor below its minimum";
     const NO_TAB: &str = "the file under the cursor must have opened as a tab";
+    const LEADER_TRAPPED: &str =
+        "the workbench must hand Ctrl+X back, or every chord under it goes dead";
+    const BLIND_CUT: &str = "cut with nothing selected must not eat the character at the cursor";
     const WRONG_REFERENCE: &str = "the composer reference does not point where the cursor is";
     const NOT_PAINTED: &str = "a frame is missing something it must always show";
     const WRONG_PANE: &str = "the sidebar is not showing what it was asked for";
@@ -1896,8 +1959,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn alt(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::ALT)
+    /// A key event for `bind`. For a leader bind that is only its second half,
+    /// which is what [`Workbench::handle_leader`] expects.
+    fn press(bind: keys::Bind) -> KeyEvent {
+        KeyEvent::new(bind.code, bind.modifiers)
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2064,7 +2129,7 @@ mod tests {
     #[test_case(keys::VIEW_SEARCH.code, SidebarView::Search ; "search")]
     fn a_view_key_switches_the_sidebar(code: KeyCode, expected: SidebarView) {
         let mut workbench = workbench();
-        workbench.handle_key(KeyEvent::new(code, KeyModifiers::ALT));
+        workbench.handle_leader(KeyEvent::new(code, KeyModifiers::NONE));
         assert_eq!(workbench.sidebar_view(), expected);
         assert_eq!(
             workbench.focus(),
@@ -2090,7 +2155,11 @@ mod tests {
         workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
         workbench.focus = focus;
 
-        assert_eq!(workbench.handle_key(key(KeyCode::Esc)), expected, "{ESC_LEFT}");
+        assert_eq!(
+            workbench.handle_key(key(KeyCode::Esc)),
+            expected,
+            "{ESC_LEFT}"
+        );
         assert_eq!(
             workbench
                 .editor
@@ -2133,7 +2202,7 @@ mod tests {
         assert_eq!(workbench.focus(), Focus::Editor);
         workbench.handle_key(key(KeyCode::Tab));
         assert_eq!(workbench.focus(), Focus::Editor);
-        workbench.handle_key(KeyEvent::new(keys::VIEW_EXPLORER.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::VIEW_EXPLORER));
         assert_eq!(workbench.focus(), Focus::Sidebar);
     }
 
@@ -2178,7 +2247,7 @@ mod tests {
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
 
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         assert_eq!(workbench.editor.tabs().len(), 1, "{UNASKED_CLOSE}");
         assert_eq!(workbench.confirm, Some(Choice::Save), "{NOT_ASKED}");
@@ -2189,7 +2258,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         let frame = draw(&mut workbench, 80, 24);
 
@@ -2204,7 +2273,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
 
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         assert!(workbench.editor.tabs().is_empty(), "{POINTLESS_QUESTION}");
         assert_eq!(workbench.confirm, None, "{POINTLESS_QUESTION}");
@@ -2215,7 +2284,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         workbench.handle_key(key(KeyCode::Enter));
 
@@ -2233,7 +2302,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
 
@@ -2251,7 +2320,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         let action = workbench.handle_key(answer);
 
@@ -2269,7 +2338,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
         // Nothing can be written over a directory, whichever way the save goes
         // about it.
         let path = dir.path().join("a.txt");
@@ -2292,7 +2361,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('X')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
 
         for _ in 0..Choice::ALL.len() + 1 {
             workbench.handle_key(key(code));
@@ -2392,13 +2461,59 @@ mod tests {
         assert_eq!(action, WorkbenchAction::Passthrough);
     }
 
+    /// The leader has to reach the host from every workbench state, or a whole
+    /// pane's chords go dead. A live selection used to eat it as a cut.
+    #[test_case(false ; "with an idle buffer")]
+    #[test_case(true  ; "with a live selection")]
+    fn the_leader_always_reaches_the_host(select: bool) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        if select {
+            workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
+        }
+
+        let action = workbench.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+        assert_eq!(action, WorkbenchAction::Passthrough, "{LEADER_TRAPPED}");
+    }
+
+    #[test]
+    fn the_cut_chord_matches_shift_delete() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
+
+        let cut = workbench.handle_leader(press(keys::CUT_CHORD));
+
+        assert!(matches!(cut, WorkbenchAction::Copy(text) if text.starts_with("one")));
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).buffer.line_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cut_without_a_selection_deletes_nothing() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        let before = workbench.editor.active().expect(NO_TAB).buffer.text();
+
+        workbench.handle_key(press(keys::CUT));
+
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).buffer.text(),
+            before,
+            "{BLIND_CUT}"
+        );
+    }
+
     #[test]
     fn cut_and_paste_move_the_selection() {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(KeyEvent::new(keys::SELECT_ALL.code, KeyModifiers::CONTROL));
 
-        let cut = workbench.handle_key(KeyEvent::new(keys::CUT.code, KeyModifiers::CONTROL));
+        let cut = workbench.handle_key(press(keys::CUT));
         assert!(matches!(cut, WorkbenchAction::Copy(text) if text.starts_with("one")));
         assert_eq!(
             workbench.editor.active().expect(NO_TAB).buffer.line_count(),
@@ -2415,14 +2530,14 @@ mod tests {
 
     #[test_case(Focus::Sidebar, "@a.txt" ; "the sidebar sends the selected path")]
     #[test_case(Focus::Editor, "@a.txt:L1" ; "the editor sends the cursor line")]
-    fn alt_enter_hands_a_reference_to_the_composer(focus: Focus, expected: &str) {
+    fn the_send_chord_hands_a_reference_to_the_composer(focus: Focus, expected: &str) {
         let (dir, mut workbench) = project();
         match focus {
             Focus::Sidebar => select_file(&dir, &mut workbench),
             Focus::Editor => open_file(&dir, &mut workbench),
         }
 
-        let action = workbench.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        let action = workbench.handle_leader(press(keys::SEND_TO_COMPOSER));
 
         assert_eq!(
             action,
@@ -2522,7 +2637,7 @@ mod tests {
     }
 
     fn wrap(workbench: &mut Workbench) {
-        workbench.handle_key(alt(keys::TOGGLE_WRAP.code));
+        workbench.handle_leader(press(keys::TOGGLE_WRAP));
     }
 
     /// The line numbers beside the text pane, which is whatever the editor
@@ -2750,18 +2865,22 @@ mod tests {
         );
     }
 
-    #[test_case(keys::REFRESH.code, KeyModifiers::NONE ; "refresh rewalks")]
-    #[test_case(keys::TOGGLE_HIDDEN.code, KeyModifiers::CONTROL ; "so does changing what counts")]
-    fn the_palette_rewalks_when_the_project_is_said_to_have_moved(
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) {
+    #[test_case(false ; "refresh rewalks")]
+    #[test_case(true  ; "so does changing what counts")]
+    fn the_palette_rewalks_when_the_project_is_said_to_have_moved(toggle_hidden: bool) {
         let (dir, mut workbench) = project();
         workbench.handle_key(KeyEvent::new(keys::QUICK_OPEN.code, KeyModifiers::CONTROL));
         workbench.handle_key(key(KeyCode::Esc));
         fs::write(dir.path().join("late.txt"), "").expect("a file");
 
-        workbench.handle_key(KeyEvent::new(code, modifiers));
+        match toggle_hidden {
+            true => {
+                workbench.handle_leader(press(keys::TOGGLE_HIDDEN));
+            }
+            false => {
+                workbench.handle_key(press(keys::REFRESH));
+            }
+        }
         workbench.handle_key(KeyEvent::new(keys::QUICK_OPEN.code, KeyModifiers::CONTROL));
 
         assert!(
@@ -2793,10 +2912,7 @@ mod tests {
                 .any(|row| row.name == ".secret")
         );
 
-        workbench.handle_key(KeyEvent::new(
-            keys::TOGGLE_HIDDEN.code,
-            KeyModifiers::CONTROL,
-        ));
+        workbench.handle_leader(press(keys::TOGGLE_HIDDEN));
 
         assert!(
             workbench
@@ -2843,7 +2959,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("a file");
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
-        workbench.handle_key(alt(KeyCode::Char('2')));
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
         (dir, workbench)
     }
 
@@ -2866,10 +2982,11 @@ mod tests {
         let mut folders: BTreeMap<BString, Vec<Staged>> = BTreeMap::new();
         for (path, mode, id) in entries {
             match path.iter().position(|byte| *byte == b'/') {
-                Some(cut) => folders
-                    .entry(path[..cut].into())
-                    .or_default()
-                    .push((path[cut + 1..].into(), *mode, *id)),
+                Some(cut) => folders.entry(path[..cut].into()).or_default().push((
+                    path[cut + 1..].into(),
+                    *mode,
+                    *id,
+                )),
                 None => tree.entries.push(gix::objs::tree::Entry {
                     mode: *mode,
                     filename: path.clone(),
@@ -2950,7 +3067,11 @@ mod tests {
         workbench.handle_key(key(keys::STAGE_TOGGLE.code));
 
         assert_eq!(workbench.scm.count(Section::Staged), 1, "{CHANGE_MISSING}");
-        assert_eq!(workbench.scm.count(Section::Unstaged), 0, "{CHANGE_MISSING}");
+        assert_eq!(
+            workbench.scm.count(Section::Unstaged),
+            0,
+            "{CHANGE_MISSING}"
+        );
         // The cursor stays where it was, so a run of presses stages a run of
         // files instead of chasing each one up into the staged section.
         assert_eq!(
@@ -2969,7 +3090,11 @@ mod tests {
         workbench.handle_key(key(keys::STAGE_TOGGLE.code));
 
         assert_eq!(workbench.scm.count(Section::Staged), 0, "{CHANGE_MISSING}");
-        assert_eq!(workbench.scm.count(Section::Unstaged), 1, "{CHANGE_MISSING}");
+        assert_eq!(
+            workbench.scm.count(Section::Unstaged),
+            1,
+            "{CHANGE_MISSING}"
+        );
     }
 
     #[test]
@@ -2977,13 +3102,21 @@ mod tests {
         let (dir, mut workbench) = repository();
         fs::write(dir.path().join("b.txt"), "second\n").expect("write");
         workbench.handle_key(key(keys::REFRESH.code));
-        assert_eq!(workbench.scm.count(Section::Unstaged), 2, "{CHANGE_MISSING}");
+        assert_eq!(
+            workbench.scm.count(Section::Unstaged),
+            2,
+            "{CHANGE_MISSING}"
+        );
 
         workbench.scm.select(Section::Unstaged, None);
         workbench.handle_key(key(keys::STAGE_TOGGLE.code));
 
         assert_eq!(workbench.scm.count(Section::Staged), 2, "{CHANGE_MISSING}");
-        assert_eq!(workbench.scm.count(Section::Unstaged), 0, "{CHANGE_MISSING}");
+        assert_eq!(
+            workbench.scm.count(Section::Unstaged),
+            0,
+            "{CHANGE_MISSING}"
+        );
     }
 
     #[test]
@@ -3075,7 +3208,7 @@ mod tests {
         }
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
-        workbench.handle_key(alt(KeyCode::Char('2')));
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
         for name in PATHS {
             workbench.scm.stage_path(name).expect("staging");
         }
@@ -3143,7 +3276,10 @@ mod tests {
 
     #[test]
     fn a_section_asking_for_more_than_there_is_leaves_the_ones_below_a_row() {
-        let rects = layout_sections(Rect::new(0, 0, 20, 8), [(40, false), (4, false), (4, false)]);
+        let rects = layout_sections(
+            Rect::new(0, 0, 20, 8),
+            [(40, false), (4, false), (4, false)],
+        );
 
         assert_eq!(rects[0].body.height, 3, "{WRONG_GEOMETRY}");
         assert_eq!(rects[1].body.height, MIN_SECTION_ROWS, "{WRONG_GEOMETRY}");
@@ -3196,7 +3332,10 @@ mod tests {
         workbench.handle_mouse(drag(header.x + 2, header.y + 3));
         workbench.handle_mouse(release(header.x + 2, header.y + 3));
 
-        assert!(!workbench.scm.is_collapsed(Section::Unstaged), "{WRONG_ROW}");
+        assert!(
+            !workbench.scm.is_collapsed(Section::Unstaged),
+            "{WRONG_ROW}"
+        );
         assert_eq!(
             workbench.scm.height(Section::Staged),
             before + 3,
@@ -3338,7 +3477,7 @@ mod tests {
     #[test]
     fn a_reference_from_source_control_names_the_changed_file() {
         let (_dir, mut workbench) = repository();
-        let action = workbench.handle_key(alt(KeyCode::Enter));
+        let action = workbench.handle_leader(press(keys::SEND_TO_COMPOSER));
         assert_eq!(
             action,
             WorkbenchAction::SendToComposer("@a.txt".to_owned()),
@@ -3356,7 +3495,7 @@ mod tests {
     /// Runs the search and drains the worker until it is done, so the assertions
     /// see the whole result set rather than whatever arrived first.
     fn search_for(workbench: &mut Workbench, text: &str) {
-        workbench.handle_key(alt(KeyCode::Char('3')));
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
         type_query(workbench, text);
         workbench.handle_key(key(KeyCode::Enter));
         while workbench.is_busy() {
@@ -3392,9 +3531,9 @@ mod tests {
     #[test]
     fn an_include_glob_narrows_what_the_pane_lists() {
         let (_dir, mut workbench) = project();
-        workbench.handle_key(alt(KeyCode::Char('3')));
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
         type_query(&mut workbench, "e");
-        workbench.handle_key(alt(KeyCode::Char('i')));
+        workbench.handle_leader(press(keys::NEXT_FIELD));
         type_query(&mut workbench, "*.md");
         workbench.handle_key(key(KeyCode::Enter));
         while workbench.is_busy() {
@@ -3410,15 +3549,15 @@ mod tests {
         search_for(&mut workbench, "two");
         assert!(!workbench.search.is_stale(), "{STALE_RESULTS}");
 
-        workbench.handle_key(alt(KeyCode::Char('r')));
+        workbench.handle_leader(press(keys::TOGGLE_REGEX));
         assert!(workbench.search.is_stale(), "{STALE_RESULTS}");
     }
 
     #[test]
     fn a_broken_pattern_reaches_the_status_bar() {
         let (_dir, mut workbench) = project();
-        workbench.handle_key(alt(KeyCode::Char('3')));
-        workbench.handle_key(alt(KeyCode::Char('r')));
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
+        workbench.handle_leader(press(keys::TOGGLE_REGEX));
         type_query(&mut workbench, "a(");
         workbench.handle_key(key(KeyCode::Enter));
 
@@ -3434,7 +3573,7 @@ mod tests {
         workbench.handle_key(key(KeyCode::Down));
 
         assert_eq!(
-            workbench.handle_key(alt(KeyCode::Enter)),
+            workbench.handle_leader(press(keys::SEND_TO_COMPOSER)),
             WorkbenchAction::SendToComposer("@a.txt:L3".to_owned()),
             "{WRONG_REFERENCE}"
         );
@@ -3443,7 +3582,7 @@ mod tests {
     #[test]
     fn a_directory_outside_a_repository_says_so_rather_than_failing() {
         let (_dir, mut workbench) = project();
-        workbench.handle_key(alt(KeyCode::Char('2')));
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
         assert!(!workbench.scm.is_repository(), "{WRONG_PANE}");
         assert!(
             draw(&mut workbench, 100, 20).contains(NOT_A_REPOSITORY),
@@ -3517,7 +3656,7 @@ mod tests {
     fn a_resize_key_moves_the_sidebar_edge(code: KeyCode, direction: i16) {
         let mut workbench = workbench();
         let before = workbench.sidebar_width;
-        workbench.handle_key(alt(code));
+        workbench.handle_leader(KeyEvent::new(code, KeyModifiers::NONE));
         let moved = i32::from(workbench.sidebar_width) - i32::from(before);
         assert_eq!(moved.signum(), i32::from(direction), "{WRONG_WIDTH}");
     }
@@ -3526,12 +3665,12 @@ mod tests {
     fn the_sidebar_never_resizes_past_its_bounds() {
         let mut workbench = workbench();
         for _ in 0..MAX_SIDEBAR_WIDTH {
-            workbench.handle_key(alt(keys::GROW_SIDEBAR.code));
+            workbench.handle_leader(press(keys::GROW_SIDEBAR));
         }
         assert_eq!(workbench.sidebar_width, MAX_SIDEBAR_WIDTH, "{WRONG_WIDTH}");
 
         for _ in 0..MAX_SIDEBAR_WIDTH {
-            workbench.handle_key(alt(keys::SHRINK_SIDEBAR.code));
+            workbench.handle_leader(press(keys::SHRINK_SIDEBAR));
         }
         assert_eq!(workbench.sidebar_width, MIN_SIDEBAR_WIDTH, "{WRONG_WIDTH}");
     }
@@ -3552,8 +3691,8 @@ mod tests {
     fn a_layout_round_trips_through_a_fresh_workbench() {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
-        workbench.handle_key(alt(keys::VIEW_SEARCH.code));
-        workbench.handle_key(alt(keys::GROW_SIDEBAR.code));
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
+        workbench.handle_leader(press(keys::GROW_SIDEBAR));
         let saved = workbench.layout();
 
         let mut restored = Workbench::new(WorkbenchStyles::default());
@@ -3866,7 +4005,7 @@ mod tests {
         }
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
-        workbench.handle_key(alt(keys::VIEW_SOURCE_CONTROL.code));
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
 
         assert!(
             draw(&mut workbench, 80, 24).contains(SCROLLBAR_THUMB),
@@ -3910,7 +4049,7 @@ mod tests {
                 draw(&mut workbench, 80, 24).contains(&title),
                 "{TAB_OFF_STRIP}"
             );
-            workbench.handle_key(alt(keys::NEXT_TAB.code));
+            workbench.handle_key(press(keys::NEXT_TAB));
         }
     }
 
@@ -3953,7 +4092,7 @@ mod tests {
         assert!(painted.contains(MORE_LEFT), "{NO_OVERFLOW_MARK}");
         assert!(!painted.contains(MORE_RIGHT), "{NO_OVERFLOW_MARK}");
 
-        workbench.handle_key(alt(keys::NEXT_TAB.code));
+        workbench.handle_key(press(keys::NEXT_TAB));
 
         let painted = draw(&mut workbench, 80, 24);
         assert!(!painted.contains(MORE_LEFT), "{NO_OVERFLOW_MARK}");
@@ -4002,7 +4141,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('x')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
         draw(&mut workbench, 80, 24);
         let answers = workbench.panes.confirm;
 
@@ -4017,7 +4156,7 @@ mod tests {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
         workbench.handle_key(key(KeyCode::Char('x')));
-        workbench.handle_key(KeyEvent::new(keys::CLOSE_TAB.code, KeyModifiers::ALT));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
         draw(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
 
@@ -4057,7 +4196,7 @@ mod tests {
     #[test]
     fn a_click_on_a_search_toggle_turns_it_on() {
         let (_dir, mut workbench) = project();
-        workbench.handle_key(alt(keys::VIEW_SEARCH.code));
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
         draw(&mut workbench, 80, 24);
         let toggles = workbench.panes.toggles;
         let column = (toggles.x..toggles.right())

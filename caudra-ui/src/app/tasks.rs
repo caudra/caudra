@@ -13,7 +13,7 @@ use crate::app::App;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::components::keybindings::key;
+use crate::components::keybindings::leader;
 use crate::components::task_picker::TaskPickerAction;
 use crate::components::{Action, DisplayRole};
 use crate::repaint::Dirty;
@@ -182,7 +182,7 @@ impl App {
         let noun = if count == 1 { "task" } else { "tasks" };
         Some(Line::from(vec![
             Span::styled(format!(" {count} {noun} "), Style::new().fg(t.foreground)),
-            Span::styled(key::TASK_PICKER.label, t.keybind_key),
+            Span::styled(leader::TASKS.label, t.keybind_key),
             Span::raw(" "),
         ]))
     }

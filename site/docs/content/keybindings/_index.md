@@ -7,7 +7,9 @@ group = "Reference"
 
 # Keybindings
 
-On macOS, some bindings use Option or Fn keys instead (run `/help` for exact keybindings).
+`Ctrl+X` is the leader. It acts as a prefix: press it, then press the chord's second key. Nothing happens until that second key arrives, and `Esc` cancels. Hold the leader for a moment and a panel lists every chord available where you are.
+
+Leader chords are written as two keys below, and every one of them is reachable on any terminal: Caudra ships no `Alt` defaults, because macOS routes Option through the input method and never reports it as Alt.
 
 ## General
 
@@ -16,32 +18,37 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+C` | Quit / clear input |
 | `Ctrl+D Ctrl+D` | Exit |
 | `Ctrl+P` | Command palette |
-| `Ctrl+H` | Show keybindings |
+| `Ctrl+X` | Leader: lists the chords below, then runs the one you press |
+| `F1` / `Ctrl+X ?` | Show keybindings |
 | `Ctrl+F` | Search messages |
-| `Alt+C` | Copy last reply as markdown |
-| `Alt+A` | Review the last reply |
-| `Ctrl+S` | File picker |
-| `Ctrl+O` | Open plan in editor |
-| `Ctrl+T` | Toggle plan / todo panel |
-| `Ctrl+X` | Open tasks |
-| `Alt+P` | Browse sessions |
-| `Alt+V` | Toggle compact / expanded transcript |
-| `Alt+T` | Stash the current prompt |
-| `Alt+R` | Restore the newest stashed prompt |
-| `Ctrl+M` / `Alt+M` | Model picker |
-| `Alt+E` | Open the workbench |
+| `Ctrl+X y` | Copy last reply as markdown |
+| `Ctrl+X r` | Review the last reply |
+| `Ctrl+S` / `Ctrl+X f` | File picker |
+| `Ctrl+O` / `Ctrl+X o` | Open plan in editor |
+| `Ctrl+T` / `Ctrl+X t` | Toggle plan / todo panel |
+| `Ctrl+X a` | Open tasks |
+| `Ctrl+X l` | Browse sessions |
+| `Ctrl+X n` | Start a new session |
+| `Ctrl+X v` | Toggle compact / expanded transcript |
+| `Ctrl+X s` | Stash the current prompt |
+| `Ctrl+X p` | Restore the newest stashed prompt |
+| `Ctrl+X m` | Model picker |
+| `Ctrl+Z` | Suspend process (Unix only) |
+| `Ctrl+X w` | Open the workbench |
 
 ## Editing
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt |
-| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` | Newline |
 | `Tab` | Toggle BUILD/PLAN mode |
 | `Shift+Tab` | Cycle reasoning effort |
 | `/command` | Open command palette |
-| `Ctrl+W` | Delete word backward |
-| `Alt+←` / `Alt+→` | Move word left / right |
+| `Ctrl+W` / `Ctrl+Backspace` | Delete word backward |
+| `Ctrl+←` / `Ctrl+→` | Move word left / right |
+| `Ctrl+Del` | Delete word forward |
+| `Ctrl+K` | Delete to end of line |
 | `Ctrl+A` | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
 | `Ctrl+U` / `PageUp` | Scroll half page up |
@@ -50,16 +57,9 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` / `Ctrl+Home` | Scroll to top |
 | `Ctrl+B` / `Ctrl+End` | Scroll to bottom |
-| `Ctrl+Q` | Pop queue |
+| `Ctrl+Q` / `Ctrl+X q` | Pop queue |
 | `Esc Esc` | Rewind |
-| `Alt+O` | Edit input in external editor |
-
-### macOS-specific
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+Del` / `⌥Del` | Delete word forward |
-| `Ctrl+K` | Delete to end of line |
+| `Ctrl+X e` | Edit input in external editor |
 
 ## Pasted Text
 
@@ -87,8 +87,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `↑` / `↓` | Navigate input history |
 | `Esc Esc` | Cancel agent |
 | `Enter` | Send prompt next |
-| `Alt+S` | Guide current run |
-| `Alt+X` | Stop and replace current run |
+| `Ctrl+X g` | Guide current run |
+| `Ctrl+X x` | Stop and replace current run |
 
 ## Form
 
@@ -113,14 +113,14 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Esc` / `Alt+E` | Back to the transcript |
+| `Esc` / `Ctrl+X w` | Back to the transcript |
 | `Ctrl+B` | Show or hide the sidebar |
-| `Alt+-` / `Alt+=` | Narrow / widen the sidebar |
-| `Alt+1` / `Alt+2` / `Alt+3` | Explorer / source control / search |
+| `Ctrl+X -` / `Ctrl+X =` | Narrow / widen the sidebar |
+| `Ctrl+X 1` / `Ctrl+X 2` / `Ctrl+X 3` | Explorer / source control / search |
 | `Tab` / `Shift+Tab` | Leave the sidebar for the editor |
 | `Ctrl+P` | Open a file by name |
 | `F5` | Reread the tree and the repository |
-| `Alt+Enter` | Send the file or selection to the composer |
+| `Ctrl+X Enter` | Send the file or selection to the composer |
 
 ## Context-Specific
 
@@ -142,28 +142,29 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Name session with a small model |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
-| Workbench Explorer | `Ctrl+H` | Show hidden and ignored files |
+| Workbench Explorer | `Ctrl+X h` | Show hidden and ignored files |
 | Workbench Editor | `Ctrl+S` | Save the active file |
 | Workbench Editor | `Ctrl+R` | Discard edits and take what is on disk |
 | Workbench Editor | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | Workbench Editor | `Ctrl+F` / `Ctrl+G` | Find in file / go to line |
 | Workbench Editor | `F3` / `Shift+F3` | Next / previous match, with or without the find bar |
-| Workbench Editor | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
+| Workbench Editor | `Ctrl+C` / `Ctrl+V` | Copy / paste |
+| Workbench Editor | `Shift+Delete` / `Ctrl+X x` | Cut the selection |
 | Workbench Editor | `Ctrl+A` | Select the whole buffer |
 | Workbench Editor | `Ctrl+K` | Delete to the end of the line |
-| Workbench Editor | `Alt+Z` | Wrap long lines onto more rows |
-| Workbench Editor | `Alt+Left` / `Alt+Right` | Previous / next tab |
-| Workbench Editor | `Alt+W` | Close the active tab |
+| Workbench Editor | `Ctrl+X z` | Wrap long lines onto more rows |
+| Workbench Editor | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next tab |
+| Workbench Editor | `Ctrl+X k` | Close the active tab |
 | Workbench Source Control | `Space` | Stage or unstage the file, folder, or whole section |
 | Workbench Source Control | `D` | Open the diff, or the commit under the cursor |
 | Workbench Source Control | `X` | Discard changes (press twice) |
 | Workbench Source Control | `T` | Switch the change sections between tree and flat |
-| Workbench Source Control | `Alt+Up` / `Alt+Down` | Shrink / grow the section the cursor is in |
+| Workbench Source Control | `Ctrl+X ↑` / `Ctrl+X ↓` | Shrink / grow the section the cursor is in |
 | Workbench Search | `Enter` | Run the search, then open the file at the match |
-| Workbench Search | `Alt+I` | Move between the query and the file globs |
-| Workbench Search | `Alt+C` | Match case |
-| Workbench Search | `Alt+M` | Match whole words |
-| Workbench Search | `Alt+R` | Read the query as a regular expression |
+| Workbench Search | `Ctrl+X i` | Move between the query and the file globs |
+| Workbench Search | `Ctrl+X c` | Match case |
+| Workbench Search | `Ctrl+X w` | Match whole words |
+| Workbench Search | `Ctrl+X r` | Read the query as a regular expression |
 
 ## Context Inheritance
 

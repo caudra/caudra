@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
 use crate::components::input::{self, Placeholder};
+use crate::components::keybindings;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -19,7 +20,7 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use super::{App, Mode, Status};
 
@@ -55,7 +56,7 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
+        let mut overlay_rect = self.render_picker_overlays(frame, layout.msg_area);
         self.render_status_bar(frame, layout.status_area, render_chat);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
@@ -65,6 +66,10 @@ impl App {
     /// The workbench replaces the transcript outright. Caudra's own status bar
     /// stays, so the model and the token budget never leave the screen, and
     /// there are no message zones behind it to register or select.
+    ///
+    /// It is a view, not a modal, so every overlay still draws on top of it.
+    /// Skipping them left a permission prompt invisible while it went on
+    /// owning the keyboard, which hangs the session outright.
     fn render_workbench(&mut self, frame: &mut Frame) {
         let render_chat = self.active_chat;
         let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
@@ -74,6 +79,42 @@ impl App {
         self.render_background(frame);
         self.workbench.view(frame, body);
         self.render_status_bar(frame, status, render_chat);
+
+        let prompt = self.render_workbench_prompt(frame, body);
+        let mut overlay_rect = self.render_picker_overlays(frame, body);
+        overlay_rect = self.render_top_modals(frame, overlay_rect);
+        for rect in [prompt, overlay_rect] {
+            if rect.width > 0 {
+                self.zones.push_overlay(rect);
+            }
+        }
+    }
+
+    /// The docked prompts take the foot of the workbench the way they take the
+    /// foot of the transcript, so an answer is asked for in the same place
+    /// wherever the user happens to be.
+    fn render_workbench_prompt(&mut self, frame: &mut Frame, body: Rect) -> Rect {
+        let height = if self.permission_prompt.is_open() {
+            self.permission_prompt.height(body.width)
+        } else if self.question_form.is_open() {
+            self.question_form.height(body.width, body.height)
+        } else {
+            return Rect::default();
+        };
+
+        let height = height.min(body.height);
+        let area = Rect {
+            y: body.y + body.height - height,
+            height,
+            ..body
+        };
+        frame.render_widget(Clear, area);
+        if self.permission_prompt.is_open() {
+            self.permission_prompt.view(frame, area);
+        } else {
+            self.question_form.view(frame, area);
+        }
+        area
     }
 
     pub(crate) fn apply_terminal_links(&self, buffer: &mut Buffer) {
@@ -348,12 +389,12 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
+    fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect) -> Rect {
         let mut overlay_rect = Rect::default();
         let full = frame.area();
 
         if self.search_modal.is_open() {
-            overlay_rect = self.search_modal.view(frame, layout.msg_area);
+            overlay_rect = self.search_modal.view(frame, msg_area);
         }
 
         if self.file_picker.is_open() {
@@ -426,6 +467,12 @@ impl App {
             overlay_rect = r;
         }
         let r = self.paste_editor.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        // Last, so a pending chord's list sits over whatever it was armed on.
+        let chords = keybindings::leader_chords(&self.leader_contexts());
+        let r = self.which_key.view(frame, full, &chords);
         if r.width > 0 {
             overlay_rect = r;
         }

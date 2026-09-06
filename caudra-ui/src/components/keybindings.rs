@@ -10,6 +10,25 @@ macro_rules! mod_key {
     };
 }
 
+macro_rules! leader_label {
+    ($suffix:expr) => {
+        concat!(mod_key!("X"), " ", $suffix)
+    };
+}
+
+/// The second key of a leader chord. It carries no modifiers because the
+/// prefix already did, and its label spells the whole chord so the help modal
+/// and the generated docs quote one string.
+macro_rules! leader_bind {
+    ($char:tt) => {
+        Bind {
+            code: KeyCode::Char($char),
+            modifiers: KeyModifiers::NONE,
+            label: leader_label!($char),
+        }
+    };
+}
+
 macro_rules! upper {
     ('a') => {
         "A"
@@ -128,9 +147,19 @@ pub mod key {
     use super::Bind;
     use crossterm::event::{KeyCode, KeyModifiers};
 
+    /// Prefix of every two-key chord. `Ctrl+X` carries no control code of its
+    /// own, and both emacs and opencode already spend it this way.
+    pub const LEADER: Bind = ctrl_bind!('x');
+
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const EXIT: Bind = ctrl_bind!('d');
-    pub const HELP: Bind = ctrl_bind!('h');
+    /// `Ctrl+H` is byte 0x08, which no terminal can tell apart from Backspace,
+    /// so help answers to a function key and to `Ctrl+X ?`.
+    pub const HELP: Bind = Bind {
+        code: KeyCode::F(1),
+        modifiers: KeyModifiers::NONE,
+        label: "F1",
+    };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_UP_ALT: Bind = Bind {
@@ -177,72 +206,64 @@ pub mod key {
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const TASK_PICKER: Bind = ctrl_bind!('x');
-    pub const SESSION_PICKER: Bind = Bind {
-        code: KeyCode::Char('p'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+P",
-    };
     pub const NEW_SESSION: Bind = ctrl_bind!('n');
     pub const RENAME_SESSION: Bind = ctrl_bind!('r');
     pub const GENERATE_TITLE: Bind = ctrl_bind!('g');
-    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
-    pub const MODEL_PICKER_FALLBACK: Bind = Bind {
-        code: KeyCode::Char('m'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+M",
-    };
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
     pub const LINE_START: Bind = ctrl_bind!('a');
     pub const LINE_END: Bind = ctrl_bind!('e');
-    pub const EDIT_INPUT: Bind = Bind {
-        code: KeyCode::Char('o'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+O",
-    };
-    pub const COPY_MESSAGE: Bind = Bind {
-        code: KeyCode::Char('c'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+C",
-    };
-    pub const REVIEW: Bind = Bind {
-        code: KeyCode::Char('a'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+A",
-    };
-    pub const STEER_PROMPT: Bind = Bind {
-        code: KeyCode::Char('s'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+S",
-    };
-    pub const INTERRUPT_PROMPT: Bind = Bind {
-        code: KeyCode::Char('x'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+X",
-    };
-    pub const VIEW_TOGGLE: Bind = Bind {
-        code: KeyCode::Char('v'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+V",
-    };
-    pub const STASH_PUSH: Bind = Bind {
-        code: KeyCode::Char('t'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+T",
-    };
-    pub const STASH_POP: Bind = Bind {
-        code: KeyCode::Char('r'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+R",
-    };
-    pub const WORKBENCH: Bind = Bind {
-        code: KeyCode::Char('e'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+E",
-    };
+}
+
+/// Second keys of the `Ctrl+X` chords. They are a namespace of their own:
+/// nothing here is ever matched against a bare key event, only against the one
+/// that follows the leader, so a letter may repeat a direct chord's letter.
+pub mod leader {
+    use super::Bind;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    pub const TASKS: Bind = leader_bind!('a');
+    pub const EDIT_INPUT: Bind = leader_bind!('e');
+    pub const FILE_PICKER: Bind = leader_bind!('f');
+    pub const STEER_PROMPT: Bind = leader_bind!('g');
+    pub const SESSION_PICKER: Bind = leader_bind!('l');
+    pub const MODEL_PICKER: Bind = leader_bind!('m');
+    pub const NEW_SESSION: Bind = leader_bind!('n');
+    pub const PLAN_EDITOR: Bind = leader_bind!('o');
+    pub const STASH_POP: Bind = leader_bind!('p');
+    pub const POP_QUEUE: Bind = leader_bind!('q');
+    pub const REVIEW: Bind = leader_bind!('r');
+    pub const STASH_PUSH: Bind = leader_bind!('s');
+    pub const PLAN_TOGGLE: Bind = leader_bind!('t');
+    pub const VIEW_TOGGLE: Bind = leader_bind!('v');
+    pub const WORKBENCH: Bind = leader_bind!('w');
+    pub const INTERRUPT_PROMPT: Bind = leader_bind!('x');
+    pub const COPY_MESSAGE: Bind = leader_bind!('y');
+    pub const HELP: Bind = leader_bind!('?');
+
+    /// Every global chord, in the order the which-key panel lists them.
+    pub const ALL: &[Bind] = &[
+        TASKS,
+        EDIT_INPUT,
+        FILE_PICKER,
+        STEER_PROMPT,
+        SESSION_PICKER,
+        MODEL_PICKER,
+        NEW_SESSION,
+        PLAN_EDITOR,
+        STASH_POP,
+        POP_QUEUE,
+        REVIEW,
+        STASH_PUSH,
+        PLAN_TOGGLE,
+        VIEW_TOGGLE,
+        WORKBENCH,
+        INTERRUPT_PROMPT,
+        COPY_MESSAGE,
+        HELP,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -320,7 +341,6 @@ impl KeybindContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     All,
-    MacOnly,
     UnixOnly,
 }
 
@@ -328,82 +348,89 @@ impl Platform {
     pub const fn is_visible(self) -> bool {
         match self {
             Self::All => true,
-            Self::MacOnly => cfg!(target_os = "macos"),
             Self::UnixOnly => cfg!(unix),
         }
     }
 }
+
+pub const ALT_SEP: &str = " / ";
 
 #[derive(Debug, Clone, Copy)]
 pub enum KeyLabel {
     Single(&'static str),
     Alt(&'static str, &'static str),
     Multi(&'static [&'static str]),
-    /// Alt on Mac, Single (first) on other platforms
-    MacAlt(&'static str, &'static str),
-    /// Multi on Mac, Multi (first slice) on other platforms
-    MacMulti(&'static [&'static str], &'static [&'static str]),
-}
-
-pub const ALT_SEP: &str = " / ";
-
-#[derive(Debug, Clone, Copy)]
-pub enum ResolvedLabel {
-    Single(&'static str),
-    Alt(&'static str, &'static str),
-    Multi(&'static [&'static str]),
-}
-
-impl ResolvedLabel {
-    pub fn display_width(self) -> usize {
-        match self {
-            Self::Single(s) => UnicodeWidthStr::width(s),
-            Self::Alt(a, b) => {
-                let sep_w = UnicodeWidthStr::width(ALT_SEP);
-                UnicodeWidthStr::width(a) + sep_w + UnicodeWidthStr::width(b)
-            }
-            Self::Multi(keys) => {
-                let sep_w = UnicodeWidthStr::width(ALT_SEP);
-                keys.iter()
-                    .map(|k| UnicodeWidthStr::width(*k))
-                    .sum::<usize>()
-                    + sep_w * keys.len().saturating_sub(1)
-            }
-        }
-    }
 }
 
 impl KeyLabel {
-    pub fn resolve(self) -> ResolvedLabel {
-        match self {
-            Self::Single(s) => ResolvedLabel::Single(s),
-            Self::Alt(a, b) => ResolvedLabel::Alt(a, b),
-            Self::Multi(keys) => ResolvedLabel::Multi(keys),
-            Self::MacAlt(a, b) => {
-                if cfg!(target_os = "macos") {
-                    ResolvedLabel::Alt(a, b)
-                } else {
-                    ResolvedLabel::Single(a)
-                }
-            }
-            Self::MacMulti(normal, mac) => {
-                if cfg!(target_os = "macos") {
-                    ResolvedLabel::Multi(mac)
-                } else {
-                    ResolvedLabel::Multi(normal)
-                }
-            }
-        }
+    pub fn display_width(self) -> usize {
+        let sep_w = UnicodeWidthStr::width(ALT_SEP);
+        let parts = self.parts();
+        parts
+            .clone()
+            .map(UnicodeWidthStr::width)
+            .sum::<usize>()
+            .saturating_add(sep_w * parts.count().saturating_sub(1))
+    }
+
+    /// The individual chords a label spells, whatever shape it came in.
+    pub fn parts(self) -> impl Iterator<Item = &'static str> + Clone {
+        let (pair, multi): ([Option<&'static str>; 2], &'static [&'static str]) = match self {
+            Self::Single(s) => ([Some(s), None], &[]),
+            Self::Alt(a, b) => ([Some(a), Some(b)], &[]),
+            Self::Multi(keys) => ([None, None], keys),
+        };
+        pair.into_iter().flatten().chain(multi.iter().copied())
     }
 
     #[cfg(test)]
     fn flat_str(&self) -> String {
-        match self.resolve() {
-            ResolvedLabel::Single(s) => s.to_string(),
-            ResolvedLabel::Alt(a, b) => format!("{a}/{b}"),
-            ResolvedLabel::Multi(keys) => keys.join("/"),
-        }
+        self.parts().collect::<Vec<_>>().join("/")
     }
+}
+
+/// How every leader chord label starts.
+pub const LEADER_PREFIX: &str = mod_key!("X");
+
+/// One row of the which-key panel: the key still to press, and what it does.
+pub struct LeaderChord {
+    pub key: &'static str,
+    pub description: &'static str,
+}
+
+fn leader_suffix(label: &'static str) -> Option<&'static str> {
+    label
+        .strip_prefix(LEADER_PREFIX)?
+        .strip_prefix(' ')
+        .filter(|suffix| !suffix.is_empty())
+}
+
+/// Every chord the leader still reaches from `contexts`, read back out of
+/// [`KEYBINDS`] so the panel, the help modal and the generated docs cannot
+/// describe the same key differently.
+pub fn leader_chords(contexts: &[KeybindContext]) -> Vec<LeaderChord> {
+    KEYBINDS
+        .iter()
+        .filter(|kb| kb.platform.is_visible() && contexts.contains(&kb.context))
+        .filter_map(|kb| {
+            let key = kb.label.parts().find_map(leader_suffix)?;
+            Some(LeaderChord {
+                key,
+                description: kb.description,
+            })
+        })
+        .collect()
+}
+
+/// Strips the shift a terminal reports alongside a printable character, so the
+/// second half of a chord matches whether or not the layout needed shift to
+/// produce it.
+pub fn normalize_leader_key(key: KeyEvent) -> KeyEvent {
+    let mut key = key;
+    if matches!(key.code, KeyCode::Char(_)) {
+        key.modifiers -= KeyModifiers::SHIFT;
+    }
+    key
 }
 
 pub struct Keybind {
@@ -433,7 +460,13 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::HELP.label),
+        label: KeyLabel::Single(key::LEADER.label),
+        description: "Leader: lists the chords below, then runs the one you press",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::HELP.label, leader::HELP.label),
         description: "Show keybindings",
         context: KeybindContext::General,
         platform: Platform::All,
@@ -445,67 +478,73 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::COPY_MESSAGE.label),
+        label: KeyLabel::Single(leader::COPY_MESSAGE.label),
         description: "Copy last reply as markdown",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::REVIEW.label),
+        label: KeyLabel::Single(leader::REVIEW.label),
         description: "Review the last reply",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::FILE_PICKER.label),
+        label: KeyLabel::Alt(key::FILE_PICKER.label, leader::FILE_PICKER.label),
         description: "File picker",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::OPEN_EDITOR.label),
+        label: KeyLabel::Alt(key::OPEN_EDITOR.label, leader::PLAN_EDITOR.label),
         description: "Open plan in editor",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::PLAN_TOGGLE.label),
+        label: KeyLabel::Alt(key::PLAN_TOGGLE.label, leader::PLAN_TOGGLE.label),
         description: "Toggle plan / todo panel",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::TASK_PICKER.label),
+        label: KeyLabel::Single(leader::TASKS.label),
         description: "Open tasks",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::SESSION_PICKER.label),
+        label: KeyLabel::Single(leader::SESSION_PICKER.label),
         description: "Browse sessions",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::VIEW_TOGGLE.label),
+        label: KeyLabel::Single(leader::NEW_SESSION.label),
+        description: "Start a new session",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(leader::VIEW_TOGGLE.label),
         description: "Toggle compact / expanded transcript",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::STASH_PUSH.label),
+        label: KeyLabel::Single(leader::STASH_PUSH.label),
         description: "Stash the current prompt",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::STASH_POP.label),
+        label: KeyLabel::Single(leader::STASH_POP.label),
         description: "Restore the newest stashed prompt",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::MODEL_PICKER.label, key::MODEL_PICKER_FALLBACK.label),
+        label: KeyLabel::Single(leader::MODEL_PICKER.label),
         description: "Model picker",
         context: KeybindContext::General,
         platform: Platform::All,
@@ -523,10 +562,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacMulti(
-            &["Shift+Enter", "Ctrl+Enter", "Ctrl+J", "Alt+Enter"],
-            &["⇧↵", "⌃↵", "⌃J", "⌥↵"],
-        ),
+        label: KeyLabel::Multi(&["Shift+Enter", "Ctrl+Enter", "Ctrl+J"]),
         description: "Newline",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -550,28 +586,28 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacAlt(key::DELETE_WORD.label, "⌥⌫"),
+        label: KeyLabel::Alt(key::DELETE_WORD.label, mod_key!("Backspace")),
         description: "Delete word backward",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
+        label: KeyLabel::Multi(&[mod_key!("←"), mod_key!("→")]),
         description: "Move word left / right",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(mod_key!("Del"), "⌥Del"),
+        label: KeyLabel::Single(mod_key!("Del")),
         description: "Delete word forward",
         context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::KILL_LINE.label),
         description: "Delete to end of line",
         context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::LINE_START.label),
@@ -622,7 +658,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::POP_QUEUE.label),
+        label: KeyLabel::Alt(key::POP_QUEUE.label, leader::POP_QUEUE.label),
         description: "Pop queue",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -634,7 +670,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::EDIT_INPUT.label),
+        label: KeyLabel::Single(leader::EDIT_INPUT.label),
         description: "Edit input in external editor",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -712,13 +748,13 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::STEER_PROMPT.label),
+        label: KeyLabel::Single(leader::STEER_PROMPT.label),
         description: "Guide current run",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::INTERRUPT_PROMPT.label),
+        label: KeyLabel::Single(leader::INTERRUPT_PROMPT.label),
         description: "Stop and replace current run",
         context: KeybindContext::Streaming,
         platform: Platform::All,
@@ -862,13 +898,13 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::WORKBENCH.label),
+        label: KeyLabel::Single(leader::WORKBENCH.label),
         description: "Open the workbench",
         context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(wb::CLOSE.label, key::WORKBENCH.label),
+        label: KeyLabel::Alt(wb::CLOSE.label, leader::WORKBENCH.label),
         description: "Back to the transcript",
         context: KeybindContext::Workbench,
         platform: Platform::All,
@@ -956,8 +992,14 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[wb::COPY.label, wb::CUT.label, wb::PASTE.label]),
-        description: "Copy / cut / paste",
+        label: KeyLabel::Multi(&[wb::COPY.label, wb::PASTE.label]),
+        description: "Copy / paste",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::CUT.label, wb::CUT_CHORD.label),
+        description: "Cut the selection",
         context: KeybindContext::WorkbenchEditor,
         platform: Platform::All,
     },
@@ -1106,6 +1148,13 @@ mod tests {
     use crossterm::event::KeyEvent;
     use test_case::test_case;
 
+    const ALT_LABEL: &str = "Alt+";
+    const ALT_IS_UNREACHABLE: &str = "macOS never reports Option as Alt, so no default may need it";
+    const AMBIGUOUS_CONTROL_CODE: &str =
+        "this chord is the same byte as Backspace, Tab or Enter and would steal it";
+    const CHORD_COLLISION: &str = "two leader chords in one context answer the same second key";
+    const LEADER_DRIFT: &str = "the workbench and the host must spend the same key on the prefix";
+
     #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
     #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]
     #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), "shift+tab")]
@@ -1144,6 +1193,69 @@ mod tests {
                 "context {:?} has no keybinds and no parent with keybinds",
                 ctx,
             );
+        }
+    }
+
+    /// macOS routes Option through the input method, so an `Alt` default is
+    /// unreachable for a whole platform. Chords are how Caudra spends that
+    /// keyspace instead.
+    #[test]
+    fn no_default_depends_on_alt() {
+        for kb in KEYBINDS {
+            for part in kb.label.parts() {
+                assert!(
+                    !part.contains(ALT_LABEL),
+                    "{ALT_IS_UNREACHABLE}: {part} ({})",
+                    kb.description
+                );
+            }
+        }
+    }
+
+    /// A terminal sends the same byte for `Ctrl+H` and Backspace, `Ctrl+M` and
+    /// Enter, `Ctrl+I` and Tab, so binding one of them steals the other.
+    #[test_case(mod_key!("H") ; "backspace")]
+    #[test_case(mod_key!("I") ; "tab")]
+    #[test_case(mod_key!("M") ; "enter")]
+    fn no_default_binds_an_ambiguous_control_code(ambiguous: &str) {
+        for kb in KEYBINDS {
+            for part in kb.label.parts() {
+                assert_ne!(
+                    part, ambiguous,
+                    "{AMBIGUOUS_CONTROL_CODE}: {}",
+                    kb.description
+                );
+            }
+        }
+    }
+
+    /// The workbench spells its labels from its own copy of the prefix and
+    /// hands the key back by its own `Bind`. If the two drifted, every
+    /// workbench chord would be documented under a prefix that no longer
+    /// reaches it.
+    #[test]
+    fn the_workbench_agrees_with_the_host_about_the_leader() {
+        assert_eq!(wb::LEADER.code, key::LEADER.code, "{LEADER_DRIFT}");
+        assert_eq!(
+            wb::LEADER.modifiers,
+            key::LEADER.modifiers,
+            "{LEADER_DRIFT}"
+        );
+        assert_eq!(wb::LEADER_LABEL, LEADER_PREFIX, "{LEADER_DRIFT}");
+    }
+
+    #[test]
+    fn no_two_chords_in_one_context_share_a_second_key() {
+        for ctx in all_contexts() {
+            let mut seen: Vec<&str> = Vec::new();
+            for chord in leader_chords(&[ctx]) {
+                assert!(
+                    !seen.contains(&chord.key),
+                    "{CHORD_COLLISION}: {LEADER_PREFIX} {} in {ctx:?}",
+                    chord.key
+                );
+                seen.push(chord.key);
+            }
         }
     }
 

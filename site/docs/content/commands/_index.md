@@ -52,7 +52,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 ## Stash
 
-A prompt you are not ready to send does not have to block the composer. `/stash` (`Alt+T`) moves the draft out of the way, `/stash-pop` (`Alt+R`) brings the newest one back, and `/stash-list` opens the full list.
+A prompt you are not ready to send does not have to block the composer. `/stash` (`Ctrl+X s`) moves the draft out of the way, `/stash-pop` (`Ctrl+X p`) brings the newest one back, and `/stash-list` opens the full list.
 
 The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in the `input.stash` row of Caudra's SQLite state database, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
 
@@ -62,7 +62,7 @@ Stashing is for drafts you do not want to send yet. To line up prompts Caudra sh
 
 ## Tasks
 
-Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X`, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
+Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 

@@ -2,15 +2,25 @@
 //!
 //! `caudra-ui` dispatches overlays before its own global binds, so these chords
 //! are free to look like an editor's even where the transcript spends the same
-//! key on something else. Two exceptions are deliberate and live in
-//! [`crate::Workbench::handle_key`]: `Ctrl+C` without a selection and `Ctrl+W`
-//! inside a buffer both pass through, so quitting and deleting a word never
-//! disappear behind an open workbench.
+//! key on something else. Three exceptions are deliberate and live in
+//! [`crate::Workbench::handle_key`]: [`LEADER`] always, `Ctrl+C` without a
+//! selection, and `Ctrl+W` inside a buffer, all pass through, so the leader
+//! prefix, quitting and deleting a word never disappear behind an open
+//! workbench.
+//!
+//! [`LEADER_BINDS`] are the second halves of `Ctrl+X` chords, matched by
+//! [`crate::Workbench::handle_leader`] against the key that follows the prefix.
+//! They carry no modifiers of their own and never meet a bare key event, which
+//! is why a letter here may repeat one used by a direct chord.
 //!
 //! `caudra-ui`'s `KEYBINDS` table quotes the `label` fields below, so the help
 //! modal and the generated docs cannot drift from what is dispatched here.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Spelled out here because a `concat!` label needs a literal. `caudra-ui` owns
+/// the prefix and asserts the two agree.
+pub const LEADER_LABEL: &str = "Ctrl+X";
 
 macro_rules! bind {
     ($code:expr, $modifiers:expr, $label:literal) => {
@@ -18,6 +28,16 @@ macro_rules! bind {
             code: $code,
             modifiers: $modifiers,
             label: $label,
+        }
+    };
+}
+
+macro_rules! leader {
+    ($code:expr, $key:literal) => {
+        Bind {
+            code: $code,
+            modifiers: NONE,
+            label: concat!("Ctrl+X ", $key),
         }
     };
 }
@@ -36,20 +56,28 @@ impl Bind {
 }
 
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
-const ALT: KeyModifiers = KeyModifiers::ALT;
 const NONE: KeyModifiers = KeyModifiers::NONE;
+
+/// The prefix itself. The workbench binds nothing to it and always hands it
+/// back, so every chord under it stays reachable from every pane and every
+/// selection state.
+pub const LEADER: Bind = Bind {
+    code: KeyCode::Char('x'),
+    modifiers: CTRL,
+    label: LEADER_LABEL,
+};
 
 pub const CLOSE: Bind = bind!(KeyCode::Esc, NONE, "Esc");
 pub const TOGGLE_SIDEBAR: Bind = bind!(KeyCode::Char('b'), CTRL, "Ctrl+B");
-pub const TOGGLE_HIDDEN: Bind = bind!(KeyCode::Char('h'), CTRL, "Ctrl+H");
-pub const VIEW_EXPLORER: Bind = bind!(KeyCode::Char('1'), ALT, "Alt+1");
-pub const VIEW_SOURCE_CONTROL: Bind = bind!(KeyCode::Char('2'), ALT, "Alt+2");
-pub const VIEW_SEARCH: Bind = bind!(KeyCode::Char('3'), ALT, "Alt+3");
 pub const FOCUS_NEXT: Bind = bind!(KeyCode::Tab, NONE, "Tab");
 pub const FOCUS_PREV: Bind = bind!(KeyCode::BackTab, KeyModifiers::SHIFT, "Shift+Tab");
 pub const QUICK_OPEN: Bind = bind!(KeyCode::Char('p'), CTRL, "Ctrl+P");
 pub const REFRESH: Bind = bind!(KeyCode::F(5), NONE, "F5");
-pub const SEND_TO_COMPOSER: Bind = bind!(KeyCode::Enter, ALT, "Alt+Enter");
+
+/// The editor convention, and reachable on every terminal, so tab stepping
+/// needs no chord.
+pub const PREV_TAB: Bind = bind!(KeyCode::PageUp, CTRL, "Ctrl+PageUp");
+pub const NEXT_TAB: Bind = bind!(KeyCode::PageDown, CTRL, "Ctrl+PageDown");
 
 pub const SAVE: Bind = bind!(KeyCode::Char('s'), CTRL, "Ctrl+S");
 pub const REVERT: Bind = bind!(KeyCode::Char('r'), CTRL, "Ctrl+R");
@@ -62,44 +90,51 @@ pub const GOTO_LINE: Bind = bind!(KeyCode::Char('g'), CTRL, "Ctrl+G");
 pub const SELECT_ALL: Bind = bind!(KeyCode::Char('a'), CTRL, "Ctrl+A");
 pub const KILL_LINE: Bind = bind!(KeyCode::Char('k'), CTRL, "Ctrl+K");
 pub const COPY: Bind = bind!(KeyCode::Char('c'), CTRL, "Ctrl+C");
-pub const CUT: Bind = bind!(KeyCode::Char('x'), CTRL, "Ctrl+X");
+/// `Ctrl+X` is the leader in every Caudra surface, so cut takes CUA's other
+/// standard. `Shift+Delete` predates `Ctrl+X`, carries no control byte, and
+/// arrives as an unambiguous `CSI 3;2~` without the kitty protocol.
+pub const CUT: Bind = bind!(KeyCode::Delete, KeyModifiers::SHIFT, "Shift+Delete");
 pub const PASTE: Bind = bind!(KeyCode::Char('v'), CTRL, "Ctrl+V");
-pub const TOGGLE_WRAP: Bind = bind!(KeyCode::Char('z'), ALT, "Alt+Z");
-
-pub const PREV_TAB: Bind = bind!(KeyCode::Left, ALT, "Alt+Left");
-pub const NEXT_TAB: Bind = bind!(KeyCode::Right, ALT, "Alt+Right");
-pub const CLOSE_TAB: Bind = bind!(KeyCode::Char('w'), ALT, "Alt+W");
-pub const SHRINK_SIDEBAR: Bind = bind!(KeyCode::Char('-'), ALT, "Alt+-");
-pub const GROW_SIDEBAR: Bind = bind!(KeyCode::Char('='), ALT, "Alt+=");
 
 pub const STAGE_TOGGLE: Bind = bind!(KeyCode::Char(' '), NONE, "Space");
 pub const OPEN_DIFF: Bind = bind!(KeyCode::Char('d'), NONE, "D");
 pub const DISCARD: Bind = bind!(KeyCode::Char('x'), NONE, "X");
 pub const TOGGLE_TREE: Bind = bind!(KeyCode::Char('t'), NONE, "T");
-pub const SHRINK_SECTION: Bind = bind!(KeyCode::Up, ALT, "Alt+Up");
-pub const GROW_SECTION: Bind = bind!(KeyCode::Down, ALT, "Alt+Down");
 
-pub const NEXT_FIELD: Bind = bind!(KeyCode::Char('i'), ALT, "Alt+I");
-pub const TOGGLE_CASE: Bind = bind!(KeyCode::Char('c'), ALT, "Alt+C");
-pub const TOGGLE_WORD: Bind = bind!(KeyCode::Char('m'), ALT, "Alt+M");
-pub const TOGGLE_REGEX: Bind = bind!(KeyCode::Char('r'), ALT, "Alt+R");
+/// `Ctrl+H` is byte 0x08, indistinguishable from Backspace, so the toggle
+/// lives under the leader instead.
+pub const TOGGLE_HIDDEN: Bind = leader!(KeyCode::Char('h'), "h");
+/// Cut's chord form, for a terminal that spends `Shift+Delete` itself.
+pub const CUT_CHORD: Bind = leader!(KeyCode::Char('x'), "x");
+pub const VIEW_EXPLORER: Bind = leader!(KeyCode::Char('1'), "1");
+pub const VIEW_SOURCE_CONTROL: Bind = leader!(KeyCode::Char('2'), "2");
+pub const VIEW_SEARCH: Bind = leader!(KeyCode::Char('3'), "3");
+pub const SEND_TO_COMPOSER: Bind = leader!(KeyCode::Enter, "Enter");
+/// `k` for emacs' kill-buffer, which leaves `w` to the search pane.
+pub const CLOSE_TAB: Bind = leader!(KeyCode::Char('k'), "k");
+pub const TOGGLE_WRAP: Bind = leader!(KeyCode::Char('z'), "z");
+pub const SHRINK_SIDEBAR: Bind = leader!(KeyCode::Char('-'), "-");
+pub const GROW_SIDEBAR: Bind = leader!(KeyCode::Char('='), "=");
+pub const SHRINK_SECTION: Bind = leader!(KeyCode::Up, "↑");
+pub const GROW_SECTION: Bind = leader!(KeyCode::Down, "↓");
+pub const NEXT_FIELD: Bind = leader!(KeyCode::Char('i'), "i");
+pub const TOGGLE_CASE: Bind = leader!(KeyCode::Char('c'), "c");
+pub const TOGGLE_WORD: Bind = leader!(KeyCode::Char('w'), "w");
+pub const TOGGLE_REGEX: Bind = leader!(KeyCode::Char('r'), "r");
 
-/// Binds that must not collide, checked as a set rather than by eye. Panes
-/// scope the rest: `Space` only reaches source control, and plain characters
-/// only reach a pane with no text field.
+/// Direct chords that must not collide, checked as a set rather than by eye.
+/// Panes scope the rest: `Space` only reaches source control, and plain
+/// characters only reach a pane with no text field.
 #[cfg(test)]
 const GLOBAL_BINDS: &[Bind] = &[
     CLOSE,
     TOGGLE_SIDEBAR,
-    TOGGLE_HIDDEN,
-    VIEW_EXPLORER,
-    VIEW_SOURCE_CONTROL,
-    VIEW_SEARCH,
     FOCUS_NEXT,
     FOCUS_PREV,
     QUICK_OPEN,
     REFRESH,
-    SEND_TO_COMPOSER,
+    PREV_TAB,
+    NEXT_TAB,
     SAVE,
     REVERT,
     UNDO,
@@ -113,55 +148,66 @@ const GLOBAL_BINDS: &[Bind] = &[
     COPY,
     CUT,
     PASTE,
-    TOGGLE_WRAP,
-    PREV_TAB,
-    NEXT_TAB,
-    CLOSE_TAB,
-    SHRINK_SIDEBAR,
-    GROW_SIDEBAR,
 ];
 
 /// Binds that only reach the source control pane. They are bare characters, so
 /// they are checked against the global set too: a collision there would take
 /// the key away from every other pane.
 #[cfg(test)]
-const SOURCE_CONTROL_BINDS: &[Bind] = &[
-    STAGE_TOGGLE,
-    OPEN_DIFF,
-    DISCARD,
-    TOGGLE_TREE,
+const SOURCE_CONTROL_BINDS: &[Bind] = &[STAGE_TOGGLE, OPEN_DIFF, DISCARD, TOGGLE_TREE];
+
+/// Second keys of the `Ctrl+X` chords. Checked among themselves only: the
+/// prefix keeps them clear of every direct chord, whichever pane is up.
+pub const LEADER_BINDS: &[Bind] = &[
+    TOGGLE_HIDDEN,
+    CUT_CHORD,
+    VIEW_EXPLORER,
+    VIEW_SOURCE_CONTROL,
+    VIEW_SEARCH,
+    SEND_TO_COMPOSER,
+    CLOSE_TAB,
+    TOGGLE_WRAP,
+    SHRINK_SIDEBAR,
+    GROW_SIDEBAR,
     SHRINK_SECTION,
     GROW_SECTION,
+    NEXT_FIELD,
+    TOGGLE_CASE,
+    TOGGLE_WORD,
+    TOGGLE_REGEX,
 ];
-
-/// Binds that only reach the search pane. Its fields swallow bare characters,
-/// so these carry `Alt` and are checked against everything else.
-#[cfg(test)]
-const SEARCH_BINDS: &[Bind] = &[NEXT_FIELD, TOGGLE_CASE, TOGGLE_WORD, TOGGLE_REGEX];
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Bind, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, NONE, SEARCH_BINDS,
+        Bind, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS, LEADER_LABEL, NONE,
         SOURCE_CONTROL_BINDS, STAGE_TOGGLE,
     };
 
     const DUPLICATE: &str = "two workbench binds must not answer to the same chord";
     const LABEL_EMPTY: &str = "every bind must carry a label for the help modal";
     const MODIFIER_EXACT: &str = "a bind must not answer to a chord carrying extra modifiers";
+    const LEADER_BARE: &str = "a leader bind carries no modifiers: the prefix already did";
+    const LEADER_PREFIXED: &str = "a leader bind's label must spell the whole chord";
+    const NO_ALT: &str = "Alt is dead on a default macOS terminal, so no default may depend on it";
 
-    fn every_bind() -> Vec<Bind> {
+    fn direct_binds() -> Vec<Bind> {
         GLOBAL_BINDS
             .iter()
             .chain(SOURCE_CONTROL_BINDS)
-            .chain(SEARCH_BINDS)
             .copied()
             .collect()
     }
 
-    #[test]
-    fn no_two_binds_share_a_chord() {
-        let binds = every_bind();
+    fn every_bind() -> Vec<Bind> {
+        direct_binds().into_iter().chain(leader_binds()).collect()
+    }
+
+    fn leader_binds() -> Vec<Bind> {
+        LEADER_BINDS.to_vec()
+    }
+
+    fn assert_no_shared_chord(binds: &[Bind]) {
         for (i, a) in binds.iter().enumerate() {
             for b in &binds[i + 1..] {
                 assert!(
@@ -171,6 +217,39 @@ mod tests {
                     b.label
                 );
             }
+        }
+    }
+
+    #[test]
+    fn no_two_direct_binds_share_a_chord() {
+        assert_no_shared_chord(&direct_binds());
+    }
+
+    #[test]
+    fn no_two_leader_binds_share_a_second_key() {
+        assert_no_shared_chord(&leader_binds());
+    }
+
+    #[test]
+    fn a_leader_bind_is_a_bare_key_labelled_with_its_prefix() {
+        for bind in leader_binds() {
+            assert_eq!(bind.modifiers, NONE, "{LEADER_BARE}: {}", bind.label);
+            assert!(
+                bind.label.starts_with(LEADER_LABEL),
+                "{LEADER_PREFIXED}: {}",
+                bind.label
+            );
+        }
+    }
+
+    #[test]
+    fn no_bind_depends_on_alt() {
+        for bind in every_bind() {
+            assert!(
+                !bind.modifiers.contains(KeyModifiers::ALT),
+                "{NO_ALT}: {}",
+                bind.label
+            );
         }
     }
 

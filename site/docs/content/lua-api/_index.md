@@ -2553,10 +2553,17 @@ Bind a key to a Lua function, just like `vim.keymap.set`. Only
 normal mode (`"n"`) is supported right now. If {lhs} is already
 mapped, the old binding is replaced and a warning is logged.
 
+Prefix {lhs} with `<leader>` to bind a two-key chord under `Ctrl+X`.
+Leader chords are a separate namespace, so `<leader>t` and `t` can both
+be bound.
+
 **Parameters:**
 
 - `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
-- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
+- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`,
+
+  `"<leader>d"`.
+
 - `{rhs}` (`function`) Called when the key is pressed.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
@@ -2567,6 +2574,9 @@ mapped, the old binding is replaced and a warning is logged.
 caudra.keymap.set("n", "<C-t>", function()
   print("toggle!")
 end, { desc = "Toggle panel" })
+caudra.keymap.set("n", "<leader>d", function()
+  print("Ctrl+X then d")
+end, { desc = "Deploy" })
 ```
 
 ---

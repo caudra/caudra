@@ -15,7 +15,7 @@ For approving tool calls before they run, see [Permissions](/docs/permissions/).
 
 Three ways in:
 
-- `Alt+A` opens the last assistant reply.
+- `Ctrl+X r` opens the last assistant reply.
 - `/review` does the same from the command palette.
 - Right-click or long-press any message, then pick **Review passages**. This reaches thinking blocks, tool results, and your own earlier messages.
 

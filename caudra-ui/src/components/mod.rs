@@ -39,6 +39,7 @@ pub(crate) mod theme_picker;
 pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
+pub(crate) mod which_key;
 pub(crate) mod workbench;
 
 use std::process::ExitCode;

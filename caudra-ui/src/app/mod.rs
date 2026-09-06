@@ -39,7 +39,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{AdmissionHit, InputAction, InputBox, Submission};
-use crate::components::keybindings::key;
+use crate::components::keybindings::{self, KeybindContext, key, leader};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
@@ -64,6 +64,7 @@ use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
+use crate::components::which_key::WhichKey;
 use crate::components::workbench::styles as workbench_styles;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
@@ -121,6 +122,7 @@ pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
+const FLASH_NO_CHORD: &str = "is not a chord";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
@@ -260,6 +262,7 @@ pub struct App {
     pub(super) message_actions: MessageActions,
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
+    pub(super) which_key: WhichKey,
     pub(super) usage_modal: UsageModal,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -428,6 +431,7 @@ impl App {
             message_actions: MessageActions::new(),
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
+            which_key: WhichKey::new(ui_config.which_key_delay()),
             usage_modal: UsageModal::new(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
@@ -974,18 +978,6 @@ impl App {
         if key::POP_QUEUE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::PopQueue));
         }
-        if key::STASH_PUSH.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::StashPush));
-        }
-        if key::STASH_POP.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::StashPop));
-        }
-        if key::VIEW_TOGGLE.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::ViewToggle));
-        }
-        if key::WORKBENCH.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::Workbench));
-        }
         if self.scroll_transcript(key) {
             return Some(vec![]);
         }
@@ -1020,18 +1012,6 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
-        if self.workbench.is_open() {
-            // `Alt+E` toggles from either side, so it never reaches the
-            // workbench's own keymap.
-            if key::WORKBENCH.matches(key) {
-                self.workbench.close();
-                return Some(vec![]);
-            }
-            match self.workbench.handle_key(key) {
-                WorkbenchAction::Passthrough => {}
-                action => return Some(self.handle_workbench_action(action)),
-            }
-        }
         if self.paste_editor.is_open() {
             match self.paste_editor.handle_key(key) {
                 PasteEditorAction::Consumed => {}
@@ -1231,31 +1211,22 @@ impl App {
             return Some(self.handle_memory_picker_action(action));
         }
 
-        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
-            return Some(self.run_builtin(BuiltinAction::PlanToggle));
+        // Last of the overlays. The workbench is a full-screen view, not a
+        // modal: anything above it draws over it and answers first, or it owns
+        // the keyboard from behind an opaque screen and a permission prompt
+        // becomes unanswerable.
+        if self.workbench.is_open() {
+            match self.workbench.handle_key(key) {
+                WorkbenchAction::Passthrough => {}
+                action => return Some(self.handle_workbench_action(action)),
+            }
         }
 
-        // Shares Ctrl+T with the plan form, which never has a plan ready and a
-        // todo list at once: the plan branch above already claimed the key if
-        // it wanted it.
-        if key::PLAN_TOGGLE.matches(key) && self.todo_panel.toggle() {
+        // The plan form never has a plan ready and a todo list at once, so one
+        // helper covers both panels.
+        if key::PLAN_TOGGLE.matches(key) {
+            self.toggle_plan_or_todo();
             return Some(Vec::new());
-        }
-
-        if key::TASK_PICKER.matches(key) {
-            return Some(self.tasks_browse());
-        }
-
-        if key::SESSION_PICKER.matches(key) {
-            return Some(self.sessions_browse());
-        }
-
-        if key::COPY_MESSAGE.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::CopyMessage));
-        }
-
-        if key::REVIEW.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::Review));
         }
 
         None
@@ -1425,7 +1396,7 @@ impl App {
                     self.flash(format!(
                         "{pending} review note{} pending. {} to resume.",
                         if pending == 1 { "" } else { "s" },
-                        key::REVIEW.label
+                        leader::REVIEW.label
                     ));
                 }
             }
@@ -1753,13 +1724,27 @@ impl App {
             return vec![Action::Suspend];
         }
 
+        // Ahead of the overlays: a pending chord owns the next key outright, so
+        // it can never leak into the composer or a picker behind the panel.
+        if self.which_key.is_armed() {
+            self.which_key.disarm();
+            return self.resolve_leader(keybindings::normalize_leader_key(key));
+        }
+
         if let Some(actions) = self.dispatch_overlay(key) {
             self.last_exit = None;
             return actions;
         }
 
+        // After the overlays, so the workbench editor keeps `Ctrl+X` for a cut
+        // whenever there is a selection to cut.
+        if key::LEADER.matches(key) {
+            self.which_key.arm();
+            return vec![];
+        }
+
         if !(self.status == Status::Streaming && is_streaming_stop_key(key))
-            && self.dispatch_override(key)
+            && self.dispatch_override(key, false)
         {
             self.last_exit = None;
             return vec![];
@@ -1772,10 +1757,6 @@ impl App {
         if is_shift_tab(key) {
             self.cycle_reasoning_effort();
             return vec![];
-        }
-
-        if key::MODEL_PICKER.matches(key) || key::MODEL_PICKER_FALLBACK.matches(key) {
-            return self.run_builtin(BuiltinAction::ModelPicker);
         }
 
         if !self.is_main_chat() {
@@ -1804,6 +1785,105 @@ impl App {
         }
 
         self.handle_main_chat_key(key)
+    }
+
+    /// The key the leader was waiting for. `Esc` and `Ctrl+C` back out
+    /// quietly; anything unbound says so rather than acting on a typo.
+    fn resolve_leader(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key.code == KeyCode::Esc || key::QUIT.matches(key) {
+            return vec![];
+        }
+
+        // The workbench answers first so a pane can claim a letter the
+        // transcript spends elsewhere, and passes back what it does not want.
+        if self.workbench.is_open() {
+            match self.workbench.handle_leader(key) {
+                WorkbenchAction::Passthrough => {}
+                action => return self.handle_workbench_action(action),
+            }
+        }
+
+        if self.dispatch_override(key, true) {
+            return vec![];
+        }
+
+        for (bind, builtin) in [
+            (leader::COPY_MESSAGE, BuiltinAction::CopyMessage),
+            (leader::EDIT_INPUT, BuiltinAction::EditInput),
+            (leader::FILE_PICKER, BuiltinAction::FilePicker),
+            (leader::HELP, BuiltinAction::Help),
+            (leader::MODEL_PICKER, BuiltinAction::ModelPicker),
+            (leader::PLAN_EDITOR, BuiltinAction::PlanEditor),
+            (leader::POP_QUEUE, BuiltinAction::PopQueue),
+            (leader::REVIEW, BuiltinAction::Review),
+            (leader::STASH_POP, BuiltinAction::StashPop),
+            (leader::STASH_PUSH, BuiltinAction::StashPush),
+            (leader::VIEW_TOGGLE, BuiltinAction::ViewToggle),
+            (leader::WORKBENCH, BuiltinAction::Workbench),
+        ] {
+            if bind.matches(key) {
+                return self.run_builtin(builtin);
+            }
+        }
+
+        if leader::TASKS.matches(key) {
+            return self.tasks_browse();
+        }
+        if leader::SESSION_PICKER.matches(key) {
+            return self.sessions_browse();
+        }
+        if leader::NEW_SESSION.matches(key) {
+            return vec![Action::RequestNewSession];
+        }
+        if leader::PLAN_TOGGLE.matches(key) {
+            self.toggle_plan_or_todo();
+            return vec![];
+        }
+        if self.status == Status::Streaming {
+            for (bind, admission) in [
+                (leader::STEER_PROMPT, caudra_agent::PromptAdmission::Steer),
+                (
+                    leader::INTERRUPT_PROMPT,
+                    caudra_agent::PromptAdmission::Interrupt,
+                ),
+            ] {
+                if bind.matches(key) {
+                    return self.handle_streaming_admission(admission);
+                }
+            }
+        }
+
+        let pressed = keybindings::key_event_to_string(&key);
+        self.flash(format!("{} {pressed} {FLASH_NO_CHORD}", key::LEADER.label));
+        vec![]
+    }
+
+    /// `Ctrl+T` and `Ctrl+X t` both mean "show me the plan", and which panel
+    /// that is depends on whether a plan is ready or a todo list is live.
+    fn toggle_plan_or_todo(&mut self) {
+        if self.plan_toggle_ready() {
+            self.run_builtin(BuiltinAction::PlanToggle);
+            return;
+        }
+        self.todo_panel.toggle();
+    }
+
+    /// Which chords the panel offers, which is the transcript's set unless the
+    /// workbench has taken the screen.
+    pub(super) fn leader_contexts(&self) -> Vec<KeybindContext> {
+        if self.workbench.is_open() {
+            return vec![
+                KeybindContext::Workbench,
+                KeybindContext::WorkbenchEditor,
+                KeybindContext::WorkbenchSourceControl,
+                KeybindContext::WorkbenchSearch,
+            ];
+        }
+        let mut contexts = vec![KeybindContext::General, KeybindContext::Editing];
+        if self.status == Status::Streaming {
+            contexts.push(KeybindContext::Streaming);
+        }
+        contexts
     }
 
     fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1900,10 +1980,11 @@ impl App {
         }
     }
 
-    fn dispatch_override(&self, key: KeyEvent) -> bool {
+    fn dispatch_override(&self, key: KeyEvent, leader: bool) -> bool {
         let snap = self.keymap_reader.load();
         for entry in &snap.entries {
-            if entry.key == key.code
+            if entry.leader == leader
+                && entry.key == key.code
                 && entry.modifiers == key.modifiers
                 && self.lua_event_handle.run_keybind_callback(entry.id)
             {
@@ -1914,9 +1995,6 @@ impl App {
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        if key::EDIT_INPUT.matches(key) {
-            return self.run_builtin(BuiltinAction::EditInput);
-        }
         if is_ctrl(&key) {
             if key::OPEN_EDITOR.matches(key) {
                 return self.run_builtin(BuiltinAction::PlanEditor);
@@ -1957,19 +2035,6 @@ impl App {
             self.command_palette.close();
             self.flash(SHELL_PASTE_EXPANDED_MSG.into());
             return vec![];
-        }
-
-        if self.status == Status::Streaming {
-            let admission = if key::STEER_PROMPT.matches(key) {
-                Some(caudra_agent::PromptAdmission::Steer)
-            } else if key::INTERRUPT_PROMPT.matches(key) {
-                Some(caudra_agent::PromptAdmission::Interrupt)
-            } else {
-                None
-            };
-            if let Some(admission) = admission {
-                return self.handle_streaming_admission(admission);
-            }
         }
 
         let streaming = self.status == Status::Streaming;
@@ -3497,6 +3562,7 @@ impl App {
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
+            self.which_key.cadence(),
         ])
     }
 

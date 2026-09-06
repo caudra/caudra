@@ -4,11 +4,9 @@ use crate::highlight::TAB_SPACES;
 
 pub fn is_newline_key(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
-        && key.modifiers.intersects(
-            KeyModifiers::SHIFT
-                .union(KeyModifiers::CONTROL)
-                .union(KeyModifiers::ALT),
-        ))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT.union(KeyModifiers::CONTROL)))
         || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
 }
 
@@ -319,9 +317,16 @@ impl TextBuffer {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
         let m = key.modifiers;
+        // AltGr arrives as Ctrl+Alt and is text, not a chord, so Ctrl only
+        // counts on its own.
         let ctrl = m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT);
-        let alt = m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL);
         let sup = m.contains(KeyModifiers::SUPER);
+
+        // Nothing binds bare Alt any more, and falling through would insert
+        // the chord's letter as stray text.
+        if m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL) {
+            return EditResult::Ignored;
+        }
 
         if ctrl {
             return match key.code {
@@ -352,28 +357,6 @@ impl TextBuffer {
                 KeyCode::Char('e') => {
                     self.move_end();
                     EditResult::Moved
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
-        if alt {
-            return match key.code {
-                KeyCode::Left | KeyCode::Char('b') => {
-                    self.move_word_left();
-                    EditResult::Moved
-                }
-                KeyCode::Right | KeyCode::Char('f') => {
-                    self.move_word_right();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace => {
-                    self.remove_word_before_cursor();
-                    EditResult::Changed
-                }
-                KeyCode::Delete | KeyCode::Char('d') => {
-                    self.delete_word_after_cursor();
-                    EditResult::Changed
                 }
                 _ => EditResult::Ignored,
             };
@@ -678,6 +661,10 @@ mod tests {
         key(code, KeyModifiers::ALT)
     }
 
+    fn alt_gr(code: KeyCode) -> KeyEvent {
+        key(code, KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
     fn super_key(code: KeyCode) -> KeyEvent {
         key(code, KeyModifiers::SUPER)
     }
@@ -689,9 +676,10 @@ mod tests {
     #[test_case(ctrl(KeyCode::Char('k')),        EditResult::Changed ; "ctrl_changed")]
     #[test_case(ctrl(KeyCode::Char('a')),        EditResult::Moved   ; "ctrl_moved")]
     #[test_case(ctrl(KeyCode::Char('z')),        EditResult::Ignored ; "ctrl_ignored")]
-    #[test_case(alt(KeyCode::Backspace),         EditResult::Changed ; "alt_changed")]
-    #[test_case(alt(KeyCode::Left),              EditResult::Moved   ; "alt_moved")]
-    #[test_case(alt(KeyCode::Char('z')),         EditResult::Ignored ; "alt_ignored")]
+    #[test_case(alt(KeyCode::Backspace),         EditResult::Ignored ; "alt_backspace_ignored")]
+    #[test_case(alt(KeyCode::Left),              EditResult::Ignored ; "alt_arrow_ignored")]
+    #[test_case(alt(KeyCode::Char('z')),         EditResult::Ignored ; "alt_char_is_never_inserted")]
+    #[test_case(alt_gr(KeyCode::Char('z')),      EditResult::Changed ; "alt_gr_is_text")]
     #[test_case(super_key(KeyCode::Backspace),   EditResult::Changed ; "super_changed")]
     #[test_case(super_key(KeyCode::Left),        EditResult::Moved   ; "super_moved")]
     #[test_case(super_key(KeyCode::Char('z')),   EditResult::Ignored ; "super_ignored")]
