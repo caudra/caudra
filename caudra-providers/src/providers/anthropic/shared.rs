@@ -926,11 +926,7 @@ mod tests {
     #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW, false ; "sonnet_4_5_stays_narrow")]
     #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW,  false ; "haiku_4_5_stays_narrow")]
     #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW,    false ; "suffix_still_opts_into_the_ceiling")]
-    fn context_window_matches_the_declared_tier(
-        spec: &str,
-        expected: u32,
-        excludes_output: bool,
-    ) {
+    fn context_window_matches_the_declared_tier(spec: &str, expected: u32, excludes_output: bool) {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.context_window, expected);
         assert_eq!(model.window_excludes_output, excludes_output);

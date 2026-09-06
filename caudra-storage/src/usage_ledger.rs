@@ -273,7 +273,8 @@ mod tests {
     const EPHEMERAL_PERSISTS: &str = "an ephemeral run spends real money and must record it";
     const NO_VOLATILE_LEDGER: &str = "the ledger belongs to the persistent root";
     const UNPRICED_COUNTED: &str = "an unpriced turn must be counted, not dropped";
-    const PURPOSE_SEPARATES: &str = "spend Caudra makes on its own must stay tellable from the chat";
+    const PURPOSE_SEPARATES: &str =
+        "spend Caudra makes on its own must stay tellable from the chat";
 
     fn turn(model: &str, cost: Option<f64>) -> TurnUsage {
         TurnUsage {

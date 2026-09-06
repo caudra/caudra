@@ -187,14 +187,13 @@ impl Highlighter {
                 buffer.push('\n');
             }
             out.push(match self.parse_state.parse_line(&buffer, set) {
-                Ok(ops) => HighlightIterator::new(
-                    &mut self.highlight_state,
-                    &ops,
-                    &buffer,
-                    &syn_hl,
-                )
-                .map(|(style, text)| StyledSegment::from_syntect(style, normalize_text(text)))
-                .collect(),
+                Ok(ops) => {
+                    HighlightIterator::new(&mut self.highlight_state, &ops, &buffer, &syn_hl)
+                        .map(|(style, text)| {
+                            StyledSegment::from_syntect(style, normalize_text(text))
+                        })
+                        .collect()
+                }
                 Err(_) => vec![StyledSegment::fallback(normalize_text(&buffer))],
             });
         }

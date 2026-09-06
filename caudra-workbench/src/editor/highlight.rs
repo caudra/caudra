@@ -186,7 +186,9 @@ impl ViewportHighlighter {
                 self.maybe_checkpoint(cursor, highlighter);
             }
             let stop = next_stride(cursor).min(last);
-            rows.append(&mut highlighter.highlight_lines(lines[cursor..stop].iter().map(String::as_str)));
+            rows.append(
+                &mut highlighter.highlight_lines(lines[cursor..stop].iter().map(String::as_str)),
+            );
             cursor = stop;
         }
         rows
@@ -455,11 +457,19 @@ mod tests {
         let lines = source(4000);
         let mut hl = ViewportHighlighter::new("main.rs", 0);
         view(&mut hl, &lines, 3000, 3040);
-        assert_eq!(hl.band_range(), Some((3000 - MAX_LOOKBACK, 3040)), "{WRONG_BAND}");
+        assert_eq!(
+            hl.band_range(),
+            Some((3000 - MAX_LOOKBACK, 3040)),
+            "{WRONG_BAND}"
+        );
 
         view(&mut hl, &lines, 2400, 2440);
 
-        assert_eq!(hl.band_range(), Some((2400 - MAX_LOOKBACK, 2440)), "{WRONG_BAND}");
+        assert_eq!(
+            hl.band_range(),
+            Some((2400 - MAX_LOOKBACK, 2440)),
+            "{WRONG_BAND}"
+        );
     }
 
     #[test]
@@ -469,7 +479,11 @@ mod tests {
 
         view(&mut hl, &lines, 3000, 3040);
 
-        assert_eq!(hl.band_range(), Some((3000 - MAX_LOOKBACK, 3040)), "{NOT_BOUNDED}");
+        assert_eq!(
+            hl.band_range(),
+            Some((3000 - MAX_LOOKBACK, 3040)),
+            "{NOT_BOUNDED}"
+        );
         assert!(hl.checkpoint_lines().is_empty(), "{NOT_BOUNDED}");
     }
 

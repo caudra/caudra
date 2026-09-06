@@ -32,7 +32,11 @@ struct Rows {
 ///
 /// Flat mode is a plain sorted list, and tree mode nests it under folders that
 /// carry their own fold state.
-pub fn rows(paths: &[(usize, &str)], flat: bool, collapsed: &HashSet<String>) -> (Vec<Row>, Vec<Dir>) {
+pub fn rows(
+    paths: &[(usize, &str)],
+    flat: bool,
+    collapsed: &HashSet<String>,
+) -> (Vec<Row>, Vec<Dir>) {
     let mut sorted = paths.to_vec();
     sorted.sort_by(|a, b| a.1.cmp(b.1));
     if flat {

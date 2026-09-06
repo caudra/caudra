@@ -693,9 +693,7 @@ impl Scm {
 
     fn identity(&self, section: Section, row: usize) -> Option<String> {
         match self.row_at(section, row)? {
-            Row::Change { index, .. } => {
-                Some(self.changes.get(index)?.relative.clone())
-            }
+            Row::Change { index, .. } => Some(self.changes.get(index)?.relative.clone()),
             Row::Directory(index) => Some(self.dir(section, index)?.path.clone()),
             Row::Commit(index) => Some(self.log.get(index)?.id.clone()),
         }
@@ -856,7 +854,8 @@ mod tests {
         scm.select(Section::Unstaged, Some(1));
 
         let previous = scm.anchor();
-        scm.changes.insert(0, change("new.rs", false, GitMark::Added));
+        scm.changes
+            .insert(0, change("new.rs", false, GitMark::Added));
         scm.rebuild(previous);
 
         assert_eq!(
@@ -1025,7 +1024,11 @@ mod tests {
 
     #[test]
     fn the_scroll_follows_the_cursor_into_the_section_it_is_in() {
-        let mut scm = pane((0..10).map(|n| change(&format!("f{n}.rs"), false, GitMark::Modified)).collect());
+        let mut scm = pane(
+            (0..10)
+                .map(|n| change(&format!("f{n}.rs"), false, GitMark::Modified))
+                .collect(),
+        );
         scm.select(Section::Unstaged, Some(9));
 
         scm.clamp_scroll(Section::Unstaged, 4);
@@ -1035,7 +1038,11 @@ mod tests {
 
     #[test]
     fn the_scroll_of_another_section_is_left_alone_by_the_cursor() {
-        let mut scm = pane((0..10).map(|n| change(&format!("f{n}.rs"), true, GitMark::Added)).collect());
+        let mut scm = pane(
+            (0..10)
+                .map(|n| change(&format!("f{n}.rs"), true, GitMark::Added))
+                .collect(),
+        );
         scm.select(Section::Staged, Some(9));
 
         scm.clamp_scroll(Section::Unstaged, 4);

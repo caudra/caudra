@@ -24,8 +24,8 @@ use crate::tools::{
     BoxFuture, DescriptionContext, ToolAudience, ToolContext, relative_path, resolve_path,
 };
 use crate::types::ToolOutput;
-use caudra_providers::openai_images::{ImageQuality, ImageRequest, generate};
 use caudra_providers::ImageSource;
+use caudra_providers::openai_images::{ImageQuality, ImageRequest, generate};
 use caudra_storage::StateDir;
 
 pub const DESCRIPTION: &str = "Generate a raster image from a text prompt and save it as a PNG. Use for AI-created bitmap visuals: illustrations, textures, sprites, photos, and mockups. Requires a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan, not API credits.
@@ -407,8 +407,11 @@ mod tests {
 
     #[test]
     fn out_accepts_the_path_alias() {
-        let parsed = validate(&SCHEMA, serde_json::json!({"prompt": PROMPT, "path": "a.png"}))
-            .expect("alias should resolve");
+        let parsed = validate(
+            &SCHEMA,
+            serde_json::json!({"prompt": PROMPT, "path": "a.png"}),
+        )
+        .expect("alias should resolve");
         assert_eq!(parsed["out"], serde_json::json!("a.png"));
     }
 

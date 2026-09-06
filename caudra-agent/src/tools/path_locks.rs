@@ -25,12 +25,16 @@ pub struct PathLocks(Mutex<LockMap>);
 
 enum PathGuard {
     Read(#[expect(dead_code, reason = "held to release the lock on drop")] RwLockReadGuardArc<()>),
-    Write(#[expect(dead_code, reason = "held to release the lock on drop")] RwLockWriteGuardArc<()>),
+    Write(
+        #[expect(dead_code, reason = "held to release the lock on drop")] RwLockWriteGuardArc<()>,
+    ),
 }
 
 /// Held for the whole of a tool's execution and released on drop, including
 /// when the tool panics or its future is cancelled.
-pub struct PathGuards(#[expect(dead_code, reason = "held to release the locks on drop")] Vec<PathGuard>);
+pub struct PathGuards(
+    #[expect(dead_code, reason = "held to release the locks on drop")] Vec<PathGuard>,
+);
 
 impl PathLocks {
     pub fn fresh() -> Arc<Self> {

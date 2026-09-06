@@ -159,7 +159,10 @@ impl Workbench {
             let pointed = self
                 .hovering(header)
                 .is_some_and(|at| mode_at(at.0, header, context.width()));
-            right.push(Span::styled(mode, emphasized(self.styles.dim, pointed, &self.styles)));
+            right.push(Span::styled(
+                mode,
+                emphasized(self.styles.dim, pointed, &self.styles),
+            ));
             right.push(Span::styled(TAB_GAP, self.styles.background));
         }
         right.push(Span::styled(context, self.styles.dim));
@@ -1037,8 +1040,7 @@ fn directory_row(dir: &Dir, selected: bool, styles: &WorkbenchStyles, width: u16
         dir.label,
         indent = dir.depth * DEPTH_INDENT
     );
-    Line::from(Span::styled(chrome::fit(&label, width as usize), style))
-        .style(styles.background)
+    Line::from(Span::styled(chrome::fit(&label, width as usize), style)).style(styles.background)
 }
 
 /// The path, and its git letter on the right. Tree mode indents and shows only
@@ -1074,7 +1076,11 @@ fn change_row(
                 .unwrap_or(&change.relative);
             vec![Span::styled(
                 chrome::fit(
-                    &format!("{:indent$}{LEAF_INDENT}{name}", "", indent = depth * DEPTH_INDENT),
+                    &format!(
+                        "{:indent$}{LEAF_INDENT}{name}",
+                        "",
+                        indent = depth * DEPTH_INDENT
+                    ),
                     budget,
                 ),
                 style,

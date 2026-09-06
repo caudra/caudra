@@ -3157,8 +3157,7 @@ mod tests {
     const CONTENT_FILE: &str = "readable.txt";
     const EXPECT_NO_DOUBLE_GUARD: &str =
         "a mutation target is never also a read target, or the call would block on itself";
-    const EXPECT_READ_GUARD: &str =
-        "a whole-file read is guarded, so a concurrent write cannot land between the \
+    const EXPECT_READ_GUARD: &str = "a whole-file read is guarded, so a concurrent write cannot land between the \
          content and the mtime recorded for it";
     const EXPECT_NO_COARSE_GUARD: &str =
         "a search names no file up front, so it declares nothing to guard";

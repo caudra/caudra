@@ -117,7 +117,10 @@ pub(super) fn prepare(path: &str) -> Result<PreparedImage, String> {
     }
 
     Ok(PreparedImage {
-        source: source(media_type(out_format).unwrap_or(ImageMediaType::Png), &encoded),
+        source: source(
+            media_type(out_format).unwrap_or(ImageMediaType::Png),
+            &encoded,
+        ),
         width: decoded.width(),
         height: decoded.height(),
         bytes: encoded.len() as u64,
@@ -196,11 +199,7 @@ pub(super) mod test_support {
         encode(&DynamicImage::new_rgb8(width, height), ImageFormat::Png).unwrap()
     }
 
-    pub(in crate::tools) fn write(
-        dir: &tempfile::TempDir,
-        name: &str,
-        bytes: &[u8],
-    ) -> String {
+    pub(in crate::tools) fn write(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         path.to_string_lossy().into_owned()
@@ -234,7 +233,11 @@ mod tests {
         let path = write(&dir, "big.png", &png(MAX_EDGE + 400, 10));
         let prepared = prepare(&path).unwrap();
         assert_eq!(prepared.width, MAX_EDGE);
-        assert!(prepared.note.contains("downscaled from"), "{}", prepared.note);
+        assert!(
+            prepared.note.contains("downscaled from"),
+            "{}",
+            prepared.note
+        );
     }
 
     #[test]

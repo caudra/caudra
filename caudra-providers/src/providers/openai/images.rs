@@ -331,7 +331,11 @@ mod tests {
 
     #[test]
     fn size_is_omitted_rather_than_sent_as_null_when_unset() {
-        assert!(build_body(&request(&[], None))["tools"][0].get("size").is_none());
+        assert!(
+            build_body(&request(&[], None))["tools"][0]
+                .get("size")
+                .is_none()
+        );
         assert_eq!(
             build_body(&request(&[], Some("1024x1536")))["tools"][0]["size"],
             "1024x1536"
