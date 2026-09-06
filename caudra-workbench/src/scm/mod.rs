@@ -63,7 +63,7 @@ impl Section {
 
     /// Whether the section lists paths that can be staged, which is what tells
     /// the two change sections from the graph without matching twice.
-    const fn is_changes(self) -> bool {
+    pub(crate) const fn is_changes(self) -> bool {
         matches!(self, Self::Staged | Self::Unstaged)
     }
 }

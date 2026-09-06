@@ -39,7 +39,7 @@ use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
 use search::Search;
-use view::{TabHit, Toggle};
+use view::{Control, TabHit, Toggle};
 
 const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 const MIN_SIDEBAR_WIDTH: u16 = 16;
@@ -690,8 +690,13 @@ impl Workbench {
     /// on a section, so the caller can go on trying the other panes.
     fn press_scm(&mut self, at: (u16, u16)) -> bool {
         if let Some(index) = self.header_under(at) {
+            let section = Section::ALL[index];
             self.focus = Focus::Sidebar;
-            self.scm.select(Section::ALL[index], None);
+            self.scm.select(section, None);
+            if let Some(control) = self.header_control(at, section, index) {
+                self.run_scm_control(control);
+                return true;
+            }
             // Armed rather than acted on: the same press starts a resize, and
             // only the release can tell the two apart.
             self.drag = Drag::Section(index);
@@ -702,13 +707,63 @@ impl Workbench {
         };
         self.focus = Focus::Sidebar;
         let row = self.scm.scroll(section) + (at.1 - body.y) as usize;
+        let control = self.row_control(at, section, body, row);
         self.scm.select(section, Some(row));
+        if let Some(control) = control {
+            self.run_scm_control(control);
+            return true;
+        }
         let cursor = self.scm.cursor();
         if cursor.section != section || cursor.row != Some(row) {
             return true;
         }
         self.activate_scm();
         true
+    }
+
+    /// The control a press on a section header landed on, measured against the
+    /// rect the last frame recorded so it answers to what was painted.
+    fn header_control(&self, at: (u16, u16), section: Section, index: usize) -> Option<Control> {
+        view::control_at(
+            at.0,
+            self.panes.sections[index].header,
+            view::header_trailing(self.scm.count(section)),
+            view::scm_controls(section, None),
+        )
+    }
+
+    /// The control a press on a body row landed on. `body` is the rect
+    /// [`Workbench::render_section`] reported, so a scrollbar has already been
+    /// taken out of it and a press on the bar reaches no control.
+    fn row_control(
+        &self,
+        at: (u16, u16),
+        section: Section,
+        body: Rect,
+        row: usize,
+    ) -> Option<Control> {
+        let listed = *self.scm.rows(section).get(row)?;
+        view::control_at(
+            at.0,
+            body,
+            view::row_trailing(listed),
+            view::scm_controls(section, Some(listed)),
+        )
+    }
+
+    /// Runs a control against whatever the pane's cursor now points at, which
+    /// the press has already moved onto the row that was clicked.
+    fn run_scm_control(&mut self, control: Control) {
+        match control {
+            Control::Stage => self.stage_selected(),
+            Control::Open => {
+                let Some(path) = self.scm.selected_change().map(|change| change.path.clone())
+                else {
+                    return;
+                };
+                self.open_path(&path);
+            }
+        }
     }
 
     /// The section header the pointer is on, by index into [`Section::ALL`].
@@ -1877,8 +1932,8 @@ mod tests {
     use crate::fs::tree::GitMark;
     use crate::search;
     use crate::view::{
-        MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, TabHit, confirm_at, header_at, mode_at, tab_at,
-        toggle_at, visible_range,
+        Control, MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, OPEN_MARK, STAGE_MARK, TabHit,
+        UNSTAGE_MARK, confirm_at, header_at, mode_at, tab_at, toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1942,6 +1997,12 @@ mod tests {
     const NO_OVERFLOW_MARK: &str = "the strip does not say which end it cut tabs off";
     const WRONG_BAR: &str = "the pane is not saying how much of its content is off screen";
     const WRONG_ORDER: &str = "the palette is not offering the project the way it should";
+    const NO_CONTROL: &str = "the hovered row is not offering the control it should";
+    const STRAY_CONTROL: &str = "the row is offering a control it has no business offering";
+    const CONTROL_IGNORED: &str = "clicking the control did not do what it says";
+    /// Wide and tall enough to keep the sidebar and every section on screen.
+    const TERMINAL_WIDTH: u16 = 80;
+    const TERMINAL_HEIGHT: u16 = 24;
     const NOT_PANNED: &str = "the sideways wheel did not pan the text pane";
     const PANNED_OFF: &str = "the pan ran past the widest line the pane is showing";
     const PANNED_ELSEWHERE: &str = "a sideways wheel outside the text pane still panned it";
@@ -3238,6 +3299,148 @@ mod tests {
             .position(|candidate| *candidate == section)
             .expect("a section");
         workbench.panes.sections[index].header
+    }
+
+    fn section_index(section: Section) -> usize {
+        Section::ALL
+            .iter()
+            .position(|candidate| *candidate == section)
+            .expect("a section")
+    }
+
+    /// Where a control landed on a body row, found the way the pointer finds
+    /// it rather than by counting columns here.
+    fn control_on_row(
+        workbench: &Workbench,
+        section: Section,
+        row: usize,
+        wanted: Control,
+    ) -> (u16, u16) {
+        let body = body_of(workbench, section);
+        let y = body.y + (row - workbench.scm.scroll(section)) as u16;
+        let x = (body.x..body.right())
+            .find(|column| workbench.row_control((*column, y), section, body, row) == Some(wanted))
+            .expect("a control on the row");
+        (x, y)
+    }
+
+    fn control_on_header(workbench: &Workbench, section: Section, wanted: Control) -> (u16, u16) {
+        let header = header_of(workbench, section);
+        let index = section_index(section);
+        let x = (header.x..header.right())
+            .find(|column| {
+                workbench.header_control((*column, header.y), section, index) == Some(wanted)
+            })
+            .expect("a control on the header");
+        (x, header.y)
+    }
+
+    /// The painted row, with the pointer resting on it so its controls show.
+    fn hovered_row(workbench: &mut Workbench, section: Section, row: usize) -> String {
+        let body = body_of(workbench, section);
+        let y = body.y + (row - workbench.scm.scroll(section)) as u16;
+        workbench.handle_mouse(moved(body.x, y));
+        let surface = paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        (body.x..body.right())
+            .map(|column| surface[(column, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn an_unstaged_row_offers_to_stage_what_it_lists() {
+        let (_dir, mut workbench) = repository();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let painted = hovered_row(&mut workbench, Section::Unstaged, 0);
+
+        assert!(painted.contains(STAGE_MARK), "{NO_CONTROL}: {painted:?}");
+        assert!(!painted.contains(OPEN_MARK), "{STRAY_CONTROL}: {painted:?}");
+    }
+
+    #[test]
+    fn a_staged_file_offers_to_open_it_as_well_as_unstage_it() {
+        let (_dir, mut workbench) = nested_repository();
+        workbench.scm.stage_path("top.txt").expect("staging");
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let painted = hovered_row(&mut workbench, Section::Staged, 0);
+
+        assert!(painted.contains(OPEN_MARK), "{NO_CONTROL}: {painted:?}");
+        assert!(painted.contains(UNSTAGE_MARK), "{NO_CONTROL}: {painted:?}");
+    }
+
+    #[test]
+    fn a_row_the_pointer_left_paints_no_controls() {
+        let (_dir, mut workbench) = repository();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let body = body_of(&workbench, Section::Unstaged);
+
+        workbench.handle_mouse(moved(body.x, body.y));
+        workbench.handle_mouse(moved(0, 0));
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let painted: String = (body.x..body.right())
+            .map(|column| surface[(column, body.y)].symbol())
+            .collect();
+
+        assert!(
+            !painted.contains(STAGE_MARK),
+            "{STRAY_CONTROL}: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_stage_control_moves_the_file_between_sections() {
+        let (_dir, mut workbench) = repository();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let at = control_on_row(&workbench, Section::Unstaged, 0, Control::Stage);
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(workbench.scm.count(Section::Staged), 1, "{CONTROL_IGNORED}");
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let at = control_on_row(&workbench, Section::Staged, 0, Control::Stage);
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(workbench.scm.count(Section::Staged), 0, "{CONTROL_IGNORED}");
+    }
+
+    #[test]
+    fn clicking_a_header_control_stages_every_path_the_section_lists() {
+        let (_dir, mut workbench) = nested_repository();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let listed = workbench.scm.count(Section::Unstaged);
+        assert!(listed > 1, "{CONTROL_IGNORED}: the fixture lists one path");
+
+        let at = control_on_header(&workbench, Section::Unstaged, Control::Stage);
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(
+            workbench.scm.count(Section::Staged),
+            listed,
+            "{CONTROL_IGNORED}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_open_control_opens_the_file_rather_than_its_diff() {
+        let (_dir, mut workbench) = nested_repository();
+        workbench.scm.stage_path("top.txt").expect("staging");
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let at = control_on_row(&workbench, Section::Staged, 0, Control::Open);
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(workbench.active_title(), "top.txt", "{CONTROL_IGNORED}");
+        assert!(
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .diff_kinds()
+                .is_none(),
+            "{CONTROL_IGNORED}: a diff opened instead of the file"
+        );
     }
 
     #[test]

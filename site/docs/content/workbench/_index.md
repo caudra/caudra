@@ -45,6 +45,8 @@ The workbench takes the mouse the way an IDE does.
 | Click `TREE` or `FLAT` | Switch how source control lists paths |
 | Click `Aa`, `ab`, or `.*` | Turn that search toggle on or off |
 | Click a source control header | Fold or unfold that section |
+| Click `+` or `-` on a source control row | Stage or unstage that path |
+| Click `↗` on a staged file | Open the file instead of its diff |
 | Drag a source control header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
@@ -109,6 +111,8 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 ```
 
 Each header carries a chevron, a title, and how many rows the section holds. `Space` on a header stages or unstages every path the section lists, so one press empties `CHANGES` into `STAGED CHANGES`.
+
+Resting the pointer on a row brings up what it can do, to the left of the git letter. A row under `CHANGES` offers `+` to stage it, and one under `STAGED CHANGES` offers `-` to unstage it. Both work on a folder as well as a file, and on the header, where they cover the whole section. A staged file also offers `↗`, which opens the file itself rather than the diff a plain click gives you.
 
 Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Ctrl+X ↑` and `Ctrl+X ↓` do the same from the keyboard.
 

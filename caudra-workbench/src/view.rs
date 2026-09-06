@@ -68,6 +68,18 @@ const TAB_GAP: &str = " ";
 const CLOSE_MARK: &str = "\u{d7}";
 pub(crate) const MORE_LEFT: &str = "\u{2039}";
 pub(crate) const MORE_RIGHT: &str = "\u{203a}";
+pub(crate) const STAGE_MARK: &str = "+";
+pub(crate) const UNSTAGE_MARK: &str = "-";
+pub(crate) const OPEN_MARK: &str = "\u{2197}";
+const CONTROL_GAP: &str = " ";
+/// One control and the gap in front of it, which is the step both the painted
+/// strip and [`control_at`] take.
+const CONTROL_WIDTH: u16 = CONTROL_GAP.len() as u16 + 1;
+/// The column a change row keeps for its git letter, plus the gap that holds
+/// the name off it.
+const CHANGE_TRAILING: u16 = 2;
+const STAGE_ONLY: [Control; 1] = [Control::Stage];
+const OPEN_AND_STAGE: [Control; 2] = [Control::Open, Control::Stage];
 const SCROLLBAR_WIDTH: u16 = 1;
 /// Narrower than this and the bar would be all there is left of the pane.
 const SCROLLBAR_MIN_WIDTH: u16 = 2;
@@ -282,11 +294,16 @@ impl Workbench {
             let rects = self.panes.sections[index];
             let chosen = focused && cursor.section == section && cursor.row.is_none();
             let pointed = self.hovering(rects.header).is_some();
+            let controls = match pointed {
+                true => scm_controls(section, None),
+                false => &[],
+            };
             let line = section_header(
                 section,
                 self.scm.count(section),
                 self.scm.is_collapsed(section),
                 chosen,
+                controls,
                 &self.styles,
                 rects.header.width,
             );
@@ -330,7 +347,19 @@ impl Workbench {
             let row = self.scm.rows(section)[scroll + offset];
             let chosen =
                 focused && cursor.section == section && cursor.row == Some(scroll + offset);
-            let line = scm_row(&self.scm, section, row, chosen, &self.styles, rows.width);
+            let controls = match pointed == Some(offset) {
+                true => scm_controls(section, Some(row)),
+                false => &[],
+            };
+            let line = scm_row(
+                &self.scm,
+                section,
+                row,
+                chosen,
+                controls,
+                &self.styles,
+                rows.width,
+            );
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(rows, offset), line);
         }
@@ -847,6 +876,91 @@ pub(crate) fn confirm_at(column: u16, origin: u16) -> Option<Choice> {
     None
 }
 
+/// A control a source control row offers while the pointer is resting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Control {
+    /// Opens the working tree file rather than the diff.
+    Open,
+    /// Stages or unstages, which is one action read from where the row sits.
+    Stage,
+}
+
+/// The controls a row offers, left to right, and the only description of them.
+/// `None` asks about the section header. A section that cannot be staged and a
+/// commit offer nothing, so nothing can be clicked on them either.
+pub(crate) fn scm_controls(section: Section, row: Option<ScmRow>) -> &'static [Control] {
+    if !section.is_changes() {
+        return &[];
+    }
+    match row {
+        Some(ScmRow::Commit(_)) => &[],
+        Some(ScmRow::Change { .. }) if section == Section::Staged => &OPEN_AND_STAGE,
+        _ => &STAGE_ONLY,
+    }
+}
+
+/// Which control a click at `column` landed on, measured over the same strip
+/// [`scm_controls`] describes: right aligned in `rect`, left of the `trailing`
+/// columns the row already keeps for its mark or its count.
+pub(crate) fn control_at(
+    column: u16,
+    rect: Rect,
+    trailing: u16,
+    controls: &[Control],
+) -> Option<Control> {
+    let strip = CONTROL_WIDTH * controls.len() as u16;
+    let origin = rect.right().checked_sub(trailing + strip)?;
+    let mut left = column.checked_sub(origin)? as usize;
+    for control in controls {
+        if left < CONTROL_WIDTH as usize {
+            return (left >= CONTROL_GAP.len()).then_some(*control);
+        }
+        left -= CONTROL_WIDTH as usize;
+    }
+    None
+}
+
+/// The count a section header keeps on its right, which the controls sit left
+/// of. Both the painter and [`control_at`]'s caller read it here, so the two
+/// cannot disagree about where the strip ends.
+fn header_count(count: usize) -> String {
+    format!("{count}{COUNT_GAP}")
+}
+
+pub(crate) fn header_trailing(count: usize) -> u16 {
+    header_count(count).width() as u16
+}
+
+/// The columns a body row keeps on its right before the strip begins. Only a
+/// change carries a git letter, so a folder's controls reach the margin.
+pub(crate) fn row_trailing(row: ScmRow) -> u16 {
+    match row {
+        ScmRow::Change { .. } => CHANGE_TRAILING,
+        _ => 0,
+    }
+}
+
+/// The painted strip, in the order [`control_at`] measures it.
+fn control_spans(staged: bool, controls: &[Control], style: Style) -> Vec<Span<'static>> {
+    controls
+        .iter()
+        .map(|control| {
+            let mark = match control {
+                Control::Open => OPEN_MARK,
+                Control::Stage if staged => UNSTAGE_MARK,
+                Control::Stage => STAGE_MARK,
+            };
+            Span::styled(format!("{CONTROL_GAP}{mark}"), style)
+        })
+        .collect()
+}
+
+/// The columns a strip of `controls` takes, which is what the row has to keep
+/// clear of its own text.
+fn control_reserve(controls: &[Control]) -> usize {
+    CONTROL_WIDTH as usize * controls.len()
+}
+
 /// Which search button a click at `column` landed on, measured the same way
 /// [`toggle_row`] lays them out.
 pub(crate) fn toggle_at(column: u16, origin: u16) -> Option<Toggle> {
@@ -980,6 +1094,7 @@ fn section_header(
     count: usize,
     collapsed: bool,
     selected: bool,
+    controls: &[Control],
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
@@ -992,12 +1107,14 @@ fn section_header(
         false => styles.title,
     };
     let label = format!("{marker}{}", section.title());
-    let count = format!("{count}{COUNT_GAP}");
+    let count = header_count(count);
+    let reserved = count.width() + control_reserve(controls);
     let left = vec![Span::styled(
-        chrome::fit(&label, (width as usize).saturating_sub(count.width())),
+        chrome::fit(&label, (width as usize).saturating_sub(reserved)),
         style,
     )];
-    let right = vec![Span::styled(count, styles.dim)];
+    let mut right = control_spans(section == Section::Staged, controls, styles.dim);
+    right.push(Span::styled(count, styles.dim));
     chrome::status_line(left, right, width, styles.background)
 }
 
@@ -1006,16 +1123,32 @@ fn scm_row(
     section: Section,
     row: ScmRow,
     selected: bool,
+    controls: &[Control],
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
     match row {
         ScmRow::Directory(index) => match scm.dir(section, index) {
-            Some(dir) => directory_row(dir, selected, styles, width),
+            Some(dir) => directory_row(
+                dir,
+                selected,
+                section == Section::Staged,
+                controls,
+                styles,
+                width,
+            ),
             None => Line::default(),
         },
         ScmRow::Change { index, depth } => match scm.change(index) {
-            Some(change) => change_row(change, depth, scm.is_flat(), selected, styles, width),
+            Some(change) => change_row(
+                change,
+                depth,
+                scm.is_flat(),
+                selected,
+                controls,
+                styles,
+                width,
+            ),
             None => Line::default(),
         },
         ScmRow::Commit(index) => match (scm.commit(index), scm.rail(index)) {
@@ -1025,7 +1158,14 @@ fn scm_row(
     }
 }
 
-fn directory_row(dir: &Dir, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
+fn directory_row(
+    dir: &Dir,
+    selected: bool,
+    staged: bool,
+    controls: &[Control],
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
     let marker = match dir.expanded {
         true => EXPANDED_MARK,
         false => COLLAPSED_MARK,
@@ -1040,7 +1180,14 @@ fn directory_row(dir: &Dir, selected: bool, styles: &WorkbenchStyles, width: u16
         dir.label,
         indent = dir.depth * DEPTH_INDENT
     );
-    Line::from(Span::styled(chrome::fit(&label, width as usize), style)).style(styles.background)
+    if controls.is_empty() {
+        return Line::from(Span::styled(chrome::fit(&label, width as usize), style))
+            .style(styles.background);
+    }
+    let budget = (width as usize).saturating_sub(control_reserve(controls));
+    let left = vec![Span::styled(chrome::fit(&label, budget), style)];
+    let right = control_spans(staged, controls, styles.dim);
+    chrome::status_line(left, right, width, styles.background)
 }
 
 /// The path, and its git letter on the right. Tree mode indents and shows only
@@ -1051,6 +1198,7 @@ fn change_row(
     depth: usize,
     flat: bool,
     selected: bool,
+    controls: &[Control],
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
@@ -1058,11 +1206,13 @@ fn change_row(
         true => styles.selected,
         false => styles.text,
     };
-    let right = vec![Span::styled(
+    let mut right = control_spans(change.staged, controls, styles.dim);
+    right.push(Span::styled(
         change.mark.letter(),
         git_style(change.mark, styles),
-    )];
-    let budget = (width as usize).saturating_sub(2);
+    ));
+    let budget =
+        (width as usize).saturating_sub(CHANGE_TRAILING as usize + control_reserve(controls));
     let left = match flat {
         true => vec![Span::styled(
             chrome::fit_end(&format!("{LEAF_INDENT}{}", change.relative), budget),
@@ -1382,11 +1532,13 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        Editor, Focus, SidebarView, Tab, TabHit, Toggle, Workbench, WorkbenchStyles, header_at,
-        keys, scroll_column, tab_at, toggle_at, visible_range,
+        CHANGE_TRAILING, Control, Editor, Focus, ScmRow, Section, SidebarView, Tab, TabHit, Toggle,
+        Workbench, WorkbenchStyles, control_at, header_at, keys, scm_controls, scroll_column,
+        tab_at, toggle_at, visible_range,
     };
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
+    const WRONG_CONTROL: &str = "the column does not fall on the control the row painted there";
     const WRONG_STRIP: &str = "the strip is not showing the tabs it has room for";
     const WRONG_BAR: &str = "the pane gave up the wrong amount of room to its scrollbar";
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
@@ -1544,5 +1696,52 @@ mod tests {
     #[test_case(9, None ; "past the last label is nothing")]
     fn a_column_falls_on_the_button_the_row_painted(column: u16, expected: Option<Toggle>) {
         assert_eq!(toggle_at(column, 0), expected, "{WRONG_TOGGLE}");
+    }
+
+    const CHANGE: ScmRow = ScmRow::Change { index: 0, depth: 0 };
+    const FOLDER: ScmRow = ScmRow::Directory(0);
+
+    #[test_case(Section::Unstaged, None => vec![Control::Stage] ; "an unstaged header stages everything")]
+    #[test_case(Section::Staged, None => vec![Control::Stage] ; "a staged header unstages everything")]
+    #[test_case(Section::Unstaged, Some(CHANGE) => vec![Control::Stage] ; "an unstaged file only stages")]
+    #[test_case(Section::Staged, Some(CHANGE) => vec![Control::Open, Control::Stage] ; "a staged file also opens")]
+    #[test_case(Section::Staged, Some(FOLDER) => vec![Control::Stage] ; "a folder never opens, having no file to open")]
+    #[test_case(Section::Graph, None => Vec::<Control>::new() ; "the graph stages nothing")]
+    #[test_case(Section::Graph, Some(ScmRow::Commit(0)) => Vec::<Control>::new() ; "a commit stages nothing")]
+    fn a_row_offers_the_controls_it_can_act_on(
+        section: Section,
+        row: Option<ScmRow>,
+    ) -> Vec<Control> {
+        scm_controls(section, row).to_vec()
+    }
+
+    /// A ten column row keeping two columns for its git letter, so the strip
+    /// runs from column four to column seven.
+    fn change_strip(column: u16) -> Option<Control> {
+        let controls = scm_controls(Section::Staged, Some(CHANGE));
+        control_at(column, Rect::new(0, 0, 10, 1), CHANGE_TRAILING, controls)
+    }
+
+    #[test_case(3 => None ; "the name reaches up to the strip")]
+    #[test_case(4 => None ; "the gap in front of a control is not it")]
+    #[test_case(5 => Some(Control::Open) ; "the first control opens the file")]
+    #[test_case(6 => None ; "the gap between the two is not either of them")]
+    #[test_case(7 => Some(Control::Stage) ; "the second control unstages it")]
+    #[test_case(8 => None ; "the git letter is not a control")]
+    fn a_column_falls_on_the_control_the_row_painted(column: u16) -> Option<Control> {
+        change_strip(column)
+    }
+
+    #[test]
+    fn a_row_too_narrow_for_a_strip_answers_nothing() {
+        let controls = scm_controls(Section::Staged, Some(CHANGE));
+        let narrow = Rect::new(0, 0, 3, 1);
+        for column in 0..narrow.width {
+            assert_eq!(
+                control_at(column, narrow, CHANGE_TRAILING, controls),
+                None,
+                "{WRONG_CONTROL}"
+            );
+        }
     }
 }
