@@ -2031,7 +2031,7 @@ mod tests {
         MIN_SIDEBAR_WIDTH, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle,
         Workbench, WorkbenchAction, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
-    use crate::chrome::SCROLLBAR_THUMB;
+    use crate::chrome::{ELLIPSIS, SCROLLBAR_THUMB};
     use crate::editor::{VisualRow, render};
     use crate::fs::tree::GitMark;
     use crate::search;
@@ -2104,6 +2104,8 @@ mod tests {
     const NO_CONTROL: &str = "the hovered row is not offering the control it should";
     const STRAY_CONTROL: &str = "the row is offering a control it has no business offering";
     const CONTROL_IGNORED: &str = "clicking the control did not do what it says";
+    const CONTROL_MISPLACED: &str = "the hit test is not where the row painted the control";
+    const CONTROL_UNLIT: &str = "the control under the pointer looks like the ones beside it";
     /// Wide and tall enough to keep the sidebar and every section on screen.
     const TERMINAL_WIDTH: u16 = 80;
     const TERMINAL_HEIGHT: u16 = 24;
@@ -3479,7 +3481,6 @@ mod tests {
         let painted = hovered_row(&mut workbench, Section::Unstaged, 0);
 
         assert!(painted.contains(STAGE_MARK), "{NO_CONTROL}: {painted:?}");
-        assert!(!painted.contains(OPEN_MARK), "{STRAY_CONTROL}: {painted:?}");
     }
 
     #[test]
@@ -3587,6 +3588,120 @@ mod tests {
         let painted = hovered_row(&mut workbench, Section::Unstaged, 0);
 
         assert!(painted.contains(REVERT_MARK), "{NO_CONTROL}: {painted:?}");
+    }
+
+    /// The column a mark landed on with the pointer resting on its row, which
+    /// is what the hit test has to agree with. Asking the hit test where its
+    /// own buttons are cannot catch the two drifting apart.
+    fn painted_column(workbench: &mut Workbench, rect: Rect, y: u16, mark: &str) -> u16 {
+        workbench.handle_mouse(moved(rect.x, y));
+        let surface = paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        (rect.x..rect.right())
+            .find(|column| surface[(*column, y)].symbol() == mark)
+            .expect("a painted mark")
+    }
+
+    #[test_case(STAGE_MARK, Control::Stage ; "the stage mark")]
+    #[test_case(REVERT_MARK, Control::Revert ; "the revert mark")]
+    #[test_case(OPEN_MARK, Control::Open ; "the open mark")]
+    fn a_mark_and_the_air_around_it_press_that_control(mark: &str, expected: Control) {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+        let body = body_of(&workbench, Section::Unstaged);
+
+        let column = painted_column(&mut workbench, body, body.y, mark);
+
+        for at in [column - 1, column, column + 1] {
+            assert_eq!(
+                workbench.row_control((at, body.y), Section::Unstaged, body, 0),
+                Some(expected),
+                "{CONTROL_MISPLACED}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_mark_the_header_painted_presses_that_control() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+        let header = header_of(&workbench, Section::Unstaged);
+        let index = section_index(Section::Unstaged);
+
+        let column = painted_column(&mut workbench, header, header.y, STAGE_MARK);
+
+        assert_eq!(
+            workbench.header_control((column, header.y), Section::Unstaged, index),
+            Some(Control::Stage),
+            "{CONTROL_MISPLACED}"
+        );
+    }
+
+    #[test]
+    fn the_control_under_the_pointer_is_lit_apart_from_its_neighbours() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+        let body = body_of(&workbench, Section::Unstaged);
+        let stage = painted_column(&mut workbench, body, body.y, STAGE_MARK);
+        let revert = painted_column(&mut workbench, body, body.y, REVERT_MARK);
+
+        workbench.handle_mouse(moved(stage, body.y));
+
+        assert_ne!(
+            cell_style(&mut workbench, (stage, body.y)),
+            cell_style(&mut workbench, (revert, body.y)),
+            "{CONTROL_UNLIT}"
+        );
+    }
+
+    #[test]
+    fn an_unstaged_file_offers_to_open_it_as_well() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+
+        let painted = hovered_row(&mut workbench, Section::Unstaged, 0);
+
+        assert!(painted.contains(OPEN_MARK), "{NO_CONTROL}: {painted:?}");
+    }
+
+    #[test]
+    fn clicking_the_open_control_on_an_unstaged_file_opens_the_file() {
+        let (_dir, mut workbench) = repository();
+        rewritten(&mut workbench);
+
+        let at = control_on_row(&workbench, Section::Unstaged, 0, Control::Open);
+        workbench.handle_mouse(click(at.0, at.1));
+
+        assert_eq!(workbench.active_title(), "a.txt", "{CONTROL_IGNORED}");
+        assert!(
+            workbench
+                .editor
+                .active()
+                .expect(NO_TAB)
+                .diff_kinds()
+                .is_none(),
+            "{CONTROL_IGNORED}: a diff opened instead of the file"
+        );
+    }
+
+    #[test]
+    fn a_name_too_long_for_its_row_still_shows_the_controls() {
+        let (dir, mut workbench) = nested_repository();
+        let long = format!("src/{}.txt", "n".repeat(MIN_SIDEBAR_WIDTH as usize));
+        fs::write(dir.path().join(&long), NESTED_TEXT).expect("a file");
+        workbench.scm.stage_path(&long).expect("staging");
+        fs::write(dir.path().join(&long), NESTED_REWRITE).expect("a file");
+        workbench.handle_key(key(keys::REFRESH.code));
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let painted: Vec<String> = (0..workbench.scm.rows(Section::Unstaged).len())
+            .map(|row| hovered_row(&mut workbench, Section::Unstaged, row))
+            .collect();
+
+        let cut = painted
+            .iter()
+            .find(|row| row.contains(ELLIPSIS))
+            .expect("a row too long for the sidebar");
+        assert!(cut.contains(STAGE_MARK), "{NO_CONTROL}: {cut:?}");
     }
 
     #[test]
