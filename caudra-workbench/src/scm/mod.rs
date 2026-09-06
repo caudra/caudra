@@ -557,6 +557,18 @@ impl Scm {
         }
     }
 
+    /// What a closed folder says about everything under it. The loudest mark
+    /// wins, so a folder hiding a conflict never reads as merely modified.
+    pub fn folder_marks(&self) -> impl Fn(&Path) -> Option<GitMark> + '_ {
+        move |path: &Path| {
+            self.changes
+                .iter()
+                .filter(|change| change.path.starts_with(path))
+                .max_by_key(|change| change.mark.rank())
+                .map(|change| change.mark)
+        }
+    }
+
     /// What the host stores between runs, per section and in stacking order.
     pub fn saved(&self) -> (bool, Vec<(u16, bool)>) {
         let sections = self
@@ -1089,5 +1101,16 @@ mod tests {
             Some(GitMark::Modified),
             "{MARK_WRONG}"
         );
+    }
+
+    #[test_case("/repo/src" => Some(GitMark::Conflicted) ; "the loudest change under a folder is the one it wears")]
+    #[test_case("/repo/src/new.rs" => Some(GitMark::Untracked) ; "a file still answers for itself alone")]
+    #[test_case("/repo/docs" => None ; "a folder with nothing under it stays quiet")]
+    fn a_folder_answers_for_everything_under_it(path: &str) -> Option<GitMark> {
+        let scm = pane(vec![
+            change("src/new.rs", false, GitMark::Untracked),
+            change("src/deep/merge.rs", false, GitMark::Conflicted),
+        ]);
+        scm.folder_marks()(&PathBuf::from(path))
     }
 }

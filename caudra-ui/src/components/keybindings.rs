@@ -962,7 +962,13 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_HIDDEN.label),
-        description: "Show hidden and ignored files",
+        description: "Show hidden files",
+        context: KeybindContext::WorkbenchExplorer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::COLLAPSE_ALL.label),
+        description: "Fold the tree back to its top level",
         context: KeybindContext::WorkbenchExplorer,
         platform: Platform::All,
     },

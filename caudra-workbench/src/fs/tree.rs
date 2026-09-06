@@ -7,9 +7,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 
 pub(crate) const GIT_DIR: &str = ".git";
+/// What joins the names of folders drawn on one row. A label rather than a
+/// path, so it reads the same wherever it is drawn.
+const CHAIN: char = '/';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -38,6 +41,19 @@ impl GitMark {
             Self::Conflicted => "!",
         }
     }
+
+    /// How loudly a mark speaks for the folder holding it. A closed folder
+    /// wears the loudest mark under it, so one that hides a conflict never
+    /// reads as merely modified.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Untracked => 0,
+            Self::Added => 1,
+            Self::Modified => 2,
+            Self::Deleted => 3,
+            Self::Conflicted => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +65,9 @@ pub struct Row {
     pub expanded: bool,
     pub git: Option<GitMark>,
     pub agent_touched: bool,
+    /// Whether the repository ignores this path or something above it. Listed
+    /// all the same, and drawn back so it reads as scenery.
+    pub ignored: bool,
 }
 
 impl Row {
@@ -62,6 +81,7 @@ struct Node {
     path: PathBuf,
     name: String,
     kind: EntryKind,
+    ignored: bool,
     children: Option<Vec<Node>>,
 }
 
@@ -190,6 +210,24 @@ impl Tree {
         true
     }
 
+    /// Folds the tree back to its top level. The cursor rides up to the
+    /// nearest ancestor still listed, so it stays on the branch it was in
+    /// rather than landing wherever the shorter list happens to reach.
+    pub fn collapse_all(&mut self) {
+        let selected = self.selected().map(|row| row.path.clone());
+        self.expanded.clear();
+        self.rebuild_rows();
+        let Some(path) = selected else {
+            return;
+        };
+        let showing = path
+            .ancestors()
+            .find(|ancestor| self.rows.iter().any(|row| row.path == *ancestor));
+        if let Some(ancestor) = showing {
+            self.select_path(ancestor);
+        }
+    }
+
     /// Collapses the selected directory, or jumps to the parent of a file. The
     /// left arrow means "out of here" either way.
     pub fn collapse_or_parent(&mut self) {
@@ -208,9 +246,20 @@ impl Tree {
         }
     }
 
-    pub fn apply_git(&mut self, marks: &dyn Fn(&Path) -> Option<GitMark>) {
+    /// Marks every row: a file with its own standing, a closed folder with
+    /// whatever `under` finds below it, and an open folder with nothing at
+    /// all, since the rows it just revealed already say it.
+    pub fn apply_git(
+        &mut self,
+        marks: &dyn Fn(&Path) -> Option<GitMark>,
+        under: &dyn Fn(&Path) -> Option<GitMark>,
+    ) {
         for row in &mut self.rows {
-            row.git = marks(&row.path);
+            row.git = match (row.is_dir(), row.expanded) {
+                (true, true) => None,
+                (true, false) => under(&row.path),
+                (false, _) => marks(&row.path),
+            };
         }
     }
 
@@ -264,15 +313,25 @@ impl Tree {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::with_capacity(self.rows.len().max(16));
-        flatten(&self.nodes, 0, &self.expanded, &mut rows);
+        flatten(&self.nodes, 0, false, &self.expanded, &mut rows);
         self.rows = rows;
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 }
 
-fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<Row>) {
+/// `ignored` says whether an ancestor was ignored, which everything below it
+/// inherits: git stops at the folder it was told to ignore and says nothing
+/// about the contents, so the tree has to carry that down itself.
+fn flatten(
+    nodes: &[Node],
+    depth: usize,
+    ignored: bool,
+    expanded: &HashSet<PathBuf>,
+    out: &mut Vec<Row>,
+) {
     for node in nodes {
         let is_expanded = expanded.contains(&node.path);
+        let ignored = ignored || node.ignored;
         out.push(Row {
             path: node.path.clone(),
             name: node.name.clone(),
@@ -281,9 +340,10 @@ fn flatten(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, out: &mut 
             expanded: is_expanded,
             git: None,
             agent_touched: false,
+            ignored,
         });
         if is_expanded && let Some(children) = &node.children {
-            flatten(children, depth + 1, expanded, out);
+            flatten(children, depth + 1, ignored, expanded, out);
         }
     }
 }
@@ -303,29 +363,85 @@ fn find_node_mut<'a>(nodes: &'a mut [Node], path: &Path) -> Option<&'a mut Node>
     None
 }
 
-/// One level only. `.git` is always hidden: it is not source, and walking into
-/// it turns the tree into a list of loose objects.
-fn read_dir(dir: &Path, show_hidden: bool) -> Vec<Node> {
-    let mut nodes: Vec<Node> = WalkBuilder::new(dir)
+/// The entries of `dir` alone, with `.git` always left out: it is not source,
+/// and walking into it turns the tree into a list of loose objects. `git` asks
+/// for the repository's ignore rules to be applied.
+fn walk(dir: &Path, show_hidden: bool, git: bool) -> impl Iterator<Item = DirEntry> {
+    let dir = dir.to_path_buf();
+    WalkBuilder::new(&dir)
         .max_depth(Some(1))
         .hidden(!show_hidden)
-        .git_ignore(!show_hidden)
-        .git_global(!show_hidden)
-        .git_exclude(!show_hidden)
-        .parents(!show_hidden)
+        .git_ignore(git)
+        .git_global(git)
+        .git_exclude(git)
+        .parents(git)
         .filter_entry(|entry| entry.file_name() != GIT_DIR)
         .build()
         .filter_map(Result::ok)
-        .filter(|entry| entry.path() != dir)
-        .map(|entry| Node {
-            path: entry.path().to_path_buf(),
-            name: entry.file_name().to_string_lossy().into_owned(),
-            kind: if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                EntryKind::Directory
-            } else {
-                EntryKind::File
-            },
-            children: None,
+        .filter(move |entry| entry.path() != dir)
+}
+
+fn node_of(entry: &DirEntry, ignored: bool) -> Node {
+    Node {
+        ignored,
+        path: entry.path().to_path_buf(),
+        name: entry.file_name().to_string_lossy().into_owned(),
+        kind: match entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            true => EntryKind::Directory,
+            false => EntryKind::File,
+        },
+        children: None,
+    }
+}
+
+/// A folder holding nothing but one folder is drawn as a single row carrying
+/// both names, the way VS Code lists `src/main/java`. The row stands for the
+/// end of the chain, since that is the folder it opens, and it is ignored if
+/// any step of the chain was.
+fn compact(node: Node, show_hidden: bool) -> Node {
+    if node.kind != EntryKind::Directory {
+        return node;
+    }
+    let Some(only) = only_child(&node.path, show_hidden) else {
+        return node;
+    };
+    if only.kind != EntryKind::Directory {
+        return node;
+    }
+    let deeper = compact(only, show_hidden);
+    Node {
+        name: format!("{}{CHAIN}{}", node.name, deeper.name),
+        ignored: node.ignored || deeper.ignored,
+        ..deeper
+    }
+}
+
+/// The one entry `dir` holds, if it holds exactly one. Two entries are all it
+/// takes to answer that, so the walk stops there rather than reading a folder
+/// out just to count it.
+fn only_child(dir: &Path, show_hidden: bool) -> Option<Node> {
+    let mut entries = walk(dir, show_hidden, false);
+    let entry = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    let ignored = walk(dir, show_hidden, true).next().is_none();
+    Some(node_of(&entry, ignored))
+}
+
+/// One level only. An ignored path is listed like any other and marked rather
+/// than left out: a build directory nobody tracks is still somewhere you look,
+/// and a tree that silently drops it cannot say why it is not there.
+fn read_dir(dir: &Path, show_hidden: bool) -> Vec<Node> {
+    let tracked: HashSet<PathBuf> = walk(dir, show_hidden, true)
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    let mut nodes: Vec<Node> = walk(dir, show_hidden, false)
+        .map(|entry| {
+            compact(
+                node_of(&entry, !tracked.contains(entry.path())),
+                show_hidden,
+            )
         })
         .collect();
     nodes.sort_by(|a, b| {
@@ -340,18 +456,36 @@ fn read_dir(dir: &Path, show_hidden: bool) -> Vec<Node> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, GitMark, Tree};
+    use super::{EntryKind, GitMark, Row, Tree};
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const DIRS_FIRST: &str = "directories must sort above files so the tree reads like a tree";
     const LAZY: &str = "a collapsed directory's children must not appear in the rows";
-    const IGNORED_HIDDEN: &str = "an ignored file must stay out of the tree until asked for";
+    const IGNORED_UNMARKED: &str = "the tree disagrees with git about what is ignored";
+    const DOTFILE_SHOWN: &str = "a dotfile must wait for hidden files to be asked for";
     const GIT_NEVER: &str = "the .git directory is not source and must never be listed";
     const REVEALED: &str = "revealing a path must expand its ancestors and land on it";
     const MARK_MISPLACED: &str = "a mark must land on the row whose path it names, and on no other";
+    const FOLDER_MUTE: &str = "a closed folder must say that something under it changed";
+    const FOLDER_SHOUTS: &str = "an open folder must leave the marks to the rows it revealed";
+    const RANK_TIED: &str = "two marks would fight over the same folder";
+    const STILL_UNFOLDED: &str = "folding the tree must leave nothing but its top level";
+    const CHAIN_SPLIT: &str = "folders holding nothing but one another must share a row";
+    const CHAIN_SHUT: &str = "opening a shared row must open the last folder on it";
+    const CHAIN_GREEDY: &str = "a folder with more than one way on must keep its own row";
+    const CURSOR_ADRIFT: &str = "the cursor must ride up to the folder that held its row";
+    const LETTER_TIED: &str = "two marks would be indistinguishable";
+    const MARKS: [GitMark; 5] = [
+        GitMark::Modified,
+        GitMark::Added,
+        GitMark::Deleted,
+        GitMark::Untracked,
+        GitMark::Conflicted,
+    ];
 
     fn fixture() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -361,6 +495,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
         fs::write(root.join(".gitignore"), "target\n").unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/build.log"), "log\n").unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join("src/nested/deep.rs"), "// deep\n").unwrap();
         tmp
@@ -420,17 +555,44 @@ mod tests {
         assert!(!names(&tree).contains(&"main.rs".to_owned()), "{LAZY}");
     }
 
-    #[test]
-    fn an_ignored_directory_appears_only_when_hidden_files_are_shown() {
+    fn row<'a>(tree: &'a Tree, name: &str) -> &'a Row {
+        tree.rows()
+            .iter()
+            .find(|row| row.name == name)
+            .expect("a row the fixture created")
+    }
+
+    #[test_case("target", true ; "the directory the gitignore names")]
+    #[test_case("src", false ; "a directory it does not")]
+    #[test_case("Cargo.toml", false ; "a tracked file")]
+    fn a_row_says_whether_git_ignores_it(name: &str, expected: bool) {
         let tmp = fixture();
         let tree = Tree::new(tmp.path(), false);
-        assert!(
-            !names(&tree).contains(&"target".to_owned()),
-            "{IGNORED_HIDDEN}"
-        );
 
-        let tree = Tree::new(tmp.path(), true);
-        assert!(names(&tree).contains(&"target".to_owned()));
+        assert_eq!(row(&tree, name).ignored, expected, "{IGNORED_UNMARKED}");
+    }
+
+    /// Git names the folder and says nothing about its contents, so the tree
+    /// carries the answer down itself.
+    #[test]
+    fn everything_under_an_ignored_directory_is_ignored_too() {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path(), false);
+        let target = tree.rows().iter().position(|r| r.name == "target").unwrap();
+        tree.select_index(target);
+        tree.toggle_selected();
+
+        assert!(row(&tree, "build.log").ignored, "{IGNORED_UNMARKED}");
+    }
+
+    #[test]
+    fn a_dotfile_still_waits_to_be_asked_for() {
+        let tmp = fixture();
+        assert!(
+            !names(&Tree::new(tmp.path(), false)).contains(&".gitignore".to_owned()),
+            "{DOTFILE_SHOWN}"
+        );
+        assert!(names(&Tree::new(tmp.path(), true)).contains(&".gitignore".to_owned()));
     }
 
     #[test]
@@ -506,7 +668,10 @@ mod tests {
         let target = tmp.path().join("Cargo.toml");
         let mut tree = Tree::new(tmp.path(), false);
 
-        tree.apply_git(&|path| (path == target).then_some(GitMark::Modified));
+        tree.apply_git(
+            &|path| (path == target).then_some(GitMark::Modified),
+            &|_| None,
+        );
 
         let marked: Vec<&str> = tree
             .rows()
@@ -518,19 +683,90 @@ mod tests {
     }
 
     #[test]
-    fn every_git_mark_has_its_own_letter() {
-        let letters: HashSet<&str> = [
-            GitMark::Modified,
-            GitMark::Added,
-            GitMark::Deleted,
-            GitMark::Untracked,
-            GitMark::Conflicted,
-        ]
-        .iter()
-        .map(|mark| mark.letter())
-        .collect();
+    fn folders_holding_nothing_but_one_another_share_a_row() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/main/java")).unwrap();
+        fs::write(tmp.path().join("src/main/java/App.java"), "class App {}\n").unwrap();
+        let mut tree = Tree::new(tmp.path(), false);
 
-        assert_eq!(letters.len(), 5, "two marks would be indistinguishable");
+        assert_eq!(names(&tree), vec!["src/main/java"], "{CHAIN_SPLIT}");
+
+        tree.toggle_selected();
+
+        assert_eq!(
+            names(&tree),
+            vec!["src/main/java", "App.java"],
+            "{CHAIN_SHUT}"
+        );
+    }
+
+    #[test]
+    fn a_folder_with_more_than_one_way_on_keeps_its_own_row() {
+        let tmp = fixture();
+        let tree = Tree::new(tmp.path(), false);
+
+        assert!(names(&tree).contains(&"src".to_owned()), "{CHAIN_GREEDY}");
+    }
+
+    #[test]
+    fn folding_the_tree_leaves_the_cursor_on_what_held_the_row() {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path(), false);
+        tree.reveal(&tmp.path().join("src/nested/deep.rs"));
+
+        tree.collapse_all();
+
+        assert!(
+            tree.rows().iter().all(|row| row.depth == 0),
+            "{STILL_UNFOLDED}"
+        );
+        assert_eq!(
+            tree.selected().map(|row| row.name.as_str()),
+            Some("src"),
+            "{CURSOR_ADRIFT}"
+        );
+    }
+
+    /// A closed folder is the only place a change under it can be shown, and
+    /// opening it hands that job to the rows it reveals.
+    #[test]
+    fn a_closed_folder_wears_what_is_hidden_under_it() {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path(), false);
+        let mark = |_: &Path| None;
+        let under = |_: &Path| Some(GitMark::Modified);
+
+        tree.apply_git(&mark, &under);
+        assert_eq!(
+            row(&tree, "src").git,
+            Some(GitMark::Modified),
+            "{FOLDER_MUTE}"
+        );
+
+        let src = tree
+            .rows()
+            .iter()
+            .position(|row| row.name == "src")
+            .unwrap();
+        tree.select_index(src);
+        tree.toggle_selected();
+        tree.apply_git(&mark, &under);
+
+        assert_eq!(row(&tree, "src").git, None, "{FOLDER_SHOUTS}");
+    }
+
+    #[test]
+    fn every_git_mark_speaks_at_its_own_volume() {
+        let ranks: HashSet<u8> = MARKS.iter().map(|mark| mark.rank()).collect();
+
+        assert_eq!(ranks.len(), MARKS.len(), "{RANK_TIED}");
+    }
+
+    #[test]
+    fn every_git_mark_has_its_own_letter() {
+        let letters: HashSet<&str> = MARKS.iter().map(|mark| mark.letter()).collect();
+
+        assert_eq!(letters.len(), MARKS.len(), "{LETTER_TIED}");
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub struct Tab {
     /// The file changed underneath an edited buffer. Neither copy can be thrown
     /// away without being asked, so the tab says so and waits.
     pub conflict: bool,
+    /// A tab one click put up, which the next one takes over. Asking for the
+    /// file again or typing in it pins the tab for good.
+    pub preview: bool,
     revision: u64,
     scroll: usize,
     /// Which visual row of `scroll` sits at the top of the pane. Always zero
@@ -80,6 +83,7 @@ impl Tab {
             diff_kinds: None,
             modified: loaded.modified,
             conflict: false,
+            preview: false,
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -113,6 +117,7 @@ impl Tab {
             diff_kinds: Some(kinds),
             modified: None,
             conflict: false,
+            preview: false,
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -481,10 +486,34 @@ impl Editor {
     pub fn open(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = index;
+            self.tabs[index].preview = false;
             return Ok(());
         }
         self.tabs.push(Tab::open(path, theme_generation)?);
         self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    /// Opens `path` in the preview slot: the tab one click puts up, which the
+    /// next one takes over rather than stacking beside it. A file already open
+    /// is raised as it stands, so a tab that was pinned stays pinned.
+    pub fn preview(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.active = index;
+            return Ok(());
+        }
+        let mut tab = Tab::open(path, theme_generation)?;
+        tab.preview = true;
+        self.active = match self.tabs.iter().position(|tab| tab.preview) {
+            Some(index) => {
+                self.tabs[index] = tab;
+                index
+            }
+            None => {
+                self.tabs.push(tab);
+                self.tabs.len() - 1
+            }
+        };
         Ok(())
     }
 

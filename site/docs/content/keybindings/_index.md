@@ -142,7 +142,8 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Name session with a small model |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
-| Workbench Explorer | `Ctrl+X h` | Show hidden and ignored files |
+| Workbench Explorer | `Ctrl+X h` | Show hidden files |
+| Workbench Explorer | `C` | Fold the tree back to its top level |
 | Workbench Editor | `Ctrl+S` | Save the active file |
 | Workbench Editor | `Ctrl+R` | Discard edits and take what is on disk |
 | Workbench Editor | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |

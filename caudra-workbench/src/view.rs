@@ -11,7 +11,7 @@ use caudra_highlight::StyledSegment;
 use ratatui::Frame;
 use ratatui::buffer::Buffer as Surface;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -50,6 +50,7 @@ const RAIL_MERGE: &str = "\u{25c9} ";
 const RAIL_SIDE: &str = "\u{2502}\u{25cb}";
 const TREE_LABEL: &str = "TREE";
 const FLAT_LABEL: &str = "FLAT";
+const FOLD_LABEL: &str = "FOLD";
 const TREE_HINT: &str = "tree";
 const FLAT_HINT: &str = "flat";
 const COUNT_GAP: &str = " ";
@@ -60,6 +61,9 @@ const EXPANDED_MARK: &str = "\u{25be} ";
 const COLLAPSED_MARK: &str = "\u{25b8} ";
 const LEAF_INDENT: &str = "  ";
 const DEPTH_INDENT: usize = 2;
+/// One nesting level of the explorer, drawn as a rule rather than as air so a
+/// deep row says which folder it belongs to.
+const GUIDE: &str = "\u{2502} ";
 const GUTTER_GAP: u16 = 1;
 const CONFLICT_NOTICE: &str = "Changed on disk since it was opened";
 const FIND_PROMPT: &str = "Find: ";
@@ -143,14 +147,7 @@ impl Workbench {
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         self.panes.header = header;
         let focused = self.focus == Focus::Sidebar;
-        let context = match self.sidebar {
-            SidebarView::SourceControl => self.scm.head().unwrap_or_default().to_owned(),
-            _ => self
-                .root
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        };
+        let context = self.header_context();
         let pointed = self
             .hovering(header)
             .and_then(|at| header_at(at.0, header.x));
@@ -173,16 +170,12 @@ impl Workbench {
             })
             .collect();
         let mut right = Vec::new();
-        if self.sidebar == SidebarView::SourceControl {
-            let mode = match self.scm.is_flat() {
-                true => FLAT_LABEL,
-                false => TREE_LABEL,
-            };
+        if let Some(label) = self.header_button() {
             let pointed = self
                 .hovering(header)
-                .is_some_and(|at| mode_at(at.0, header, context.width()));
+                .is_some_and(|at| button_at(at.0, header, context.width(), label));
             right.push(Span::styled(
-                mode,
+                label,
                 emphasized(self.styles.dim, pointed, &self.styles),
             ));
             right.push(Span::styled(TAB_GAP, self.styles.background));
@@ -198,6 +191,34 @@ impl Workbench {
             SidebarView::Explorer => self.render_tree(buf, body, focused),
             SidebarView::SourceControl => self.render_scm(buf, body, focused),
             SidebarView::Search => self.render_search(buf, body, focused),
+        }
+    }
+
+    /// What the sidebar header prints on its right: the branch for source
+    /// control, the project's own name for the rest. The header's button is
+    /// measured against it, so the hit test asks for it too.
+    pub(crate) fn header_context(&self) -> String {
+        match self.sidebar {
+            SidebarView::SourceControl => self.scm.head().unwrap_or_default().to_owned(),
+            _ => self
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The one button the header offers for the view that is up. The explorer
+    /// folds its tree back, source control swaps how it lists paths, and
+    /// search has nothing to put there.
+    pub(crate) fn header_button(&self) -> Option<&'static str> {
+        match self.sidebar {
+            SidebarView::Explorer => Some(FOLD_LABEL),
+            SidebarView::SourceControl => Some(match self.scm.is_flat() {
+                true => FLAT_LABEL,
+                false => TREE_LABEL,
+            }),
+            SidebarView::Search => None,
         }
     }
 
@@ -617,6 +638,9 @@ impl Workbench {
             } else {
                 self.styles.tab_inactive
             };
+            if tab.preview {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
             if under.is_some() && index != active {
                 style = style.patch(self.styles.hover);
             }
@@ -1040,15 +1064,16 @@ pub(crate) fn toggle_at(column: u16, origin: u16) -> Option<Toggle> {
     None
 }
 
-/// Whether `column` is on the sidebar header's tree-or-flat button, which sits
-/// at the right edge ahead of `context`, the branch name. Measured from the
-/// right the same way [`chrome::status_line`] lays that group out.
-pub(crate) fn mode_at(column: u16, header: Rect, context: usize) -> bool {
-    let trailing = (context + TAB_GAP.len() + TREE_LABEL.len()) as u16;
+/// Whether `column` is on the sidebar header's button, which sits at the right
+/// edge ahead of `context`. Measured from the right the same way
+/// [`chrome::status_line`] lays that group out.
+pub(crate) fn button_at(column: u16, header: Rect, context: usize, label: &str) -> bool {
+    let width = label.width() as u16;
+    let trailing = context as u16 + TAB_GAP.len() as u16 + width;
     let Some(start) = header.right().checked_sub(trailing) else {
         return false;
     };
-    (start..start + TREE_LABEL.len() as u16).contains(&column)
+    (start..start + width).contains(&column)
 }
 
 /// The hover highlight as a style rather than a whole line, for the header
@@ -1125,31 +1150,54 @@ fn tree_row(row: &TreeRow, selected: bool, styles: &WorkbenchStyles, width: u16)
         (true, false) => COLLAPSED_MARK,
         (false, _) => LEAF_INDENT,
     };
-    let style = match (selected, row.is_dir()) {
-        (true, _) => styles.selected,
-        (false, true) => styles.directory,
-        (false, false) => styles.text,
-    };
+    let style = tree_style(row, selected, styles);
 
     let mut right = Vec::new();
     if row.agent_touched {
-        right.push(Span::styled(AGENT_MARK, styles.agent_touched));
+        right.push(Span::styled(
+            format!("{TAB_GAP}{AGENT_MARK}"),
+            styles.agent_touched,
+        ));
     }
     if let Some(mark) = row.git {
-        right.push(Span::styled(mark.letter(), git_style(mark, styles)));
+        right.push(Span::styled(
+            format!("{TAB_GAP}{}", mark.letter()),
+            git_style(mark, styles),
+        ));
     }
-    let reserved = right.len() + usize::from(!right.is_empty());
-    let label = format!(
-        "{:indent$}{marker}{}",
-        "",
-        row.name,
-        indent = row.depth * DEPTH_INDENT
-    );
-    let left = vec![Span::styled(
-        chrome::fit(&label, (width as usize).saturating_sub(reserved)),
-        style,
-    )];
+    let reserved: usize = right.iter().map(|span| span.content.width()).sum();
+    let guides = indent_guides(row.depth);
+    let label = format!("{marker}{}", row.name);
+    let budget = (width as usize).saturating_sub(reserved + guides.width());
+    let left = vec![
+        Span::styled(guides, styles.border),
+        Span::styled(chrome::fit(&label, budget), style),
+    ];
     chrome::status_line(left, right, width, styles.background)
+}
+
+/// A faint rule down every level the row sits under, so a name three folders
+/// deep says which one it belongs to without counting spaces.
+fn indent_guides(depth: usize) -> String {
+    GUIDE.repeat(depth)
+}
+
+/// What a row's name is painted in. An ignored path is drawn back before
+/// anything else is said about it, because git says nothing about a path it
+/// was told to skip, and the cursor still wins so the row it is on stays
+/// legible.
+fn tree_style(row: &TreeRow, selected: bool, styles: &WorkbenchStyles) -> Style {
+    if selected {
+        return styles.selected;
+    }
+    if row.ignored {
+        return styles.dim;
+    }
+    match (row.git, row.is_dir()) {
+        (Some(mark), _) => git_style(mark, styles),
+        (None, true) => styles.directory,
+        (None, false) => styles.text,
+    }
 }
 
 /// A section's pinned title: the fold marker, the name, and how many paths or
@@ -1590,10 +1638,11 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        CHANGE_TRAILING, Control, Editor, Focus, ScmRow, Section, SidebarView, Tab, TabHit, Toggle,
-        Workbench, WorkbenchStyles, control_at, header_at, keys, scm_controls, scroll_column,
-        tab_at, toggle_at, visible_range,
+        CHANGE_TRAILING, Control, Editor, Focus, GitMark, ScmRow, Section, SidebarView, Style, Tab,
+        TabHit, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, header_at, keys,
+        scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
     };
+    use crate::fs::tree::EntryKind;
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
     const WRONG_CONTROL: &str = "the column does not fall on the control the row painted there";
@@ -1602,6 +1651,10 @@ mod tests {
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
     const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
+    const WRONG_PAINT: &str = "the row is not painted the way its standing asks for";
+    const WRONG_GUIDES: &str = "the rules down the indent are not drawn as chrome";
+    const TREE_NAME: &str = "a.rs";
+    const TREE_WIDTH: u16 = 40;
 
     /// Wide enough for every tab the cases open, so only the ones that ask for
     /// a narrow strip have to say so.
@@ -1803,5 +1856,74 @@ mod tests {
                 "{WRONG_CONTROL}"
             );
         }
+    }
+
+    /// One entry of the explorer, so a case only has to say what it changes.
+    fn entry(kind: EntryKind, depth: usize) -> TreeRow {
+        TreeRow {
+            path: Path::new(TREE_NAME).to_path_buf(),
+            name: TREE_NAME.to_owned(),
+            depth,
+            kind,
+            expanded: false,
+            git: None,
+            agent_touched: false,
+            ignored: false,
+        }
+    }
+
+    #[test_case(None, false, false => WorkbenchStyles::default().text ; "a file nobody has changed is plain")]
+    #[test_case(Some(GitMark::Modified), false, false => WorkbenchStyles::default().git_modified ; "a changed file wears its mark's colour")]
+    #[test_case(None, true, false => WorkbenchStyles::default().dim ; "an ignored file is drawn back")]
+    #[test_case(Some(GitMark::Untracked), true, false => WorkbenchStyles::default().dim ; "ignored beats whatever git says about it")]
+    #[test_case(Some(GitMark::Modified), true, true => WorkbenchStyles::default().selected ; "the cursor beats both")]
+    fn a_file_is_painted_by_what_it_is(
+        git: Option<GitMark>,
+        ignored: bool,
+        selected: bool,
+    ) -> Style {
+        let row = TreeRow {
+            git,
+            ignored,
+            ..entry(EntryKind::File, 0)
+        };
+        tree_style(&row, selected, &WorkbenchStyles::default())
+    }
+
+    #[test_case(false => WorkbenchStyles::default().directory ; "a directory has a colour of its own")]
+    #[test_case(true => WorkbenchStyles::default().dim ; "one git skips is drawn back like everything under it")]
+    fn a_directory_is_painted_by_whether_git_looks_at_it(ignored: bool) -> Style {
+        let row = TreeRow {
+            ignored,
+            ..entry(EntryKind::Directory, 0)
+        };
+        tree_style(&row, false, &WorkbenchStyles::default())
+    }
+
+    /// What a row reads as once painted, without the filler that pads it out.
+    fn painted(row: &TreeRow) -> String {
+        tree_row(row, false, &WorkbenchStyles::default(), TREE_WIDTH)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test_case(0 => format!("  {TREE_NAME}") ; "a row at the root has no folder to point at")]
+    #[test_case(1 => format!("\u{2502}   {TREE_NAME}") ; "one level in stands under one rule")]
+    #[test_case(3 => format!("\u{2502} \u{2502} \u{2502}   {TREE_NAME}") ; "and every level after it adds another")]
+    fn a_nested_row_stands_under_a_rule_for_each_level(depth: usize) -> String {
+        painted(&entry(EntryKind::File, depth))
+    }
+
+    #[test]
+    fn the_rules_are_faint_so_the_name_is_still_what_the_row_says() {
+        let styles = WorkbenchStyles::default();
+        let line = tree_row(&entry(EntryKind::File, 2), false, &styles, TREE_WIDTH);
+
+        assert_eq!(line.spans[0].style, styles.border, "{WRONG_GUIDES}");
+        assert_eq!(line.spans[1].style, styles.text, "{WRONG_PAINT}");
     }
 }

@@ -101,6 +101,8 @@ pub const OPEN_DIFF: Bind = bind!(KeyCode::Char('d'), NONE, "D");
 pub const DISCARD: Bind = bind!(KeyCode::Char('x'), NONE, "X");
 pub const TOGGLE_TREE: Bind = bind!(KeyCode::Char('t'), NONE, "T");
 
+pub const COLLAPSE_ALL: Bind = bind!(KeyCode::Char('c'), NONE, "C");
+
 /// `Ctrl+H` is byte 0x08, indistinguishable from Backspace, so the toggle
 /// lives under the leader instead.
 pub const TOGGLE_HIDDEN: Bind = leader!(KeyCode::Char('h'), "h");
@@ -156,6 +158,11 @@ const GLOBAL_BINDS: &[Bind] = &[
 #[cfg(test)]
 const SOURCE_CONTROL_BINDS: &[Bind] = &[STAGE_TOGGLE, OPEN_DIFF, DISCARD, TOGGLE_TREE];
 
+/// Binds that only reach the explorer, checked the same way and for the same
+/// reason as the source control set.
+#[cfg(test)]
+const EXPLORER_BINDS: &[Bind] = &[COLLAPSE_ALL];
+
 /// Second keys of the `Ctrl+X` chords. Checked among themselves only: the
 /// prefix keeps them clear of every direct chord, whichever pane is up.
 pub const LEADER_BINDS: &[Bind] = &[
@@ -180,8 +187,8 @@ pub const LEADER_BINDS: &[Bind] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        Bind, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS, LEADER_LABEL, NONE,
-        SOURCE_CONTROL_BINDS, STAGE_TOGGLE,
+        Bind, EXPLORER_BINDS, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS,
+        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE,
     };
 
     const DUPLICATE: &str = "two workbench binds must not answer to the same chord";
@@ -195,6 +202,7 @@ mod tests {
         GLOBAL_BINDS
             .iter()
             .chain(SOURCE_CONTROL_BINDS)
+            .chain(EXPLORER_BINDS)
             .copied()
             .collect()
     }

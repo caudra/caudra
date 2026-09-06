@@ -692,11 +692,16 @@ impl Workbench {
             if let Some(view) = view::header_at(at.0, self.panes.header.x) {
                 self.focus = Focus::Sidebar;
                 self.sidebar = view;
-            } else if self.sidebar == SidebarView::SourceControl
-                && view::mode_at(at.0, self.panes.header, self.head_width())
-            {
+            } else if self.header_button().is_some_and(|label| {
+                view::button_at(
+                    at.0,
+                    self.panes.header,
+                    self.header_context().width(),
+                    label,
+                )
+            }) {
                 self.focus = Focus::Sidebar;
-                self.scm.toggle_flat();
+                self.press_header_button();
             }
             return;
         }
@@ -715,7 +720,7 @@ impl Workbench {
             return;
         }
         if self.panes.rows.contains(position) {
-            self.press_row((at.1 - self.panes.rows.y) as usize);
+            self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
             return;
         }
         if self.panes.text.contains(position) {
@@ -833,8 +838,10 @@ impl Workbench {
     }
 
     /// A press on the sidebar's list, which does whatever `Enter` would have
-    /// done to the row under it.
-    fn press_row(&mut self, offset: usize) {
+    /// done to the row under it. One click on a file only previews it: the
+    /// tab stays until the next single click takes it over, so walking a tree
+    /// leaves no trail of tabs behind. Two clicks keep it.
+    fn press_row(&mut self, offset: usize, clicks: u8) {
         self.focus = Focus::Sidebar;
         match self.sidebar {
             SidebarView::Explorer => {
@@ -848,6 +855,7 @@ impl Workbench {
                 }
                 match self.tree.selected().is_some_and(fs::tree::Row::is_dir) {
                     true => drop(self.tree.toggle_selected()),
+                    false if clicks == 1 => self.preview_selected(),
                     false => self.open_selected(),
                 }
             }
@@ -1491,6 +1499,10 @@ impl Workbench {
     }
 
     fn explorer_key(&mut self, key: KeyEvent) {
+        if keys::COLLAPSE_ALL.matches(key) {
+            self.tree.collapse_all();
+            return;
+        }
         let page = self.sidebar_rows().max(1) as isize;
         match key.code {
             KeyCode::Up => self.tree.move_selection(-1),
@@ -1722,7 +1734,8 @@ impl Workbench {
 
     fn apply_marks(&mut self) {
         let marks = self.scm.marks();
-        self.tree.apply_git(&marks);
+        let under = self.scm.folder_marks();
+        self.tree.apply_git(&marks, &under);
         self.tree.set_agent_touched(&self.touched);
     }
 
@@ -1741,8 +1754,11 @@ impl Workbench {
         };
         let before = tab.revision();
         if tab.edit_key(key, rows) {
-            if tab.revision() != before && tab.find.is_open() {
-                tab.refresh_find();
+            if tab.revision() != before {
+                tab.preview = false;
+                if tab.find.is_open() {
+                    tab.refresh_find();
+                }
             }
             self.follow_cursor();
         }
@@ -1754,6 +1770,19 @@ impl Workbench {
             return;
         };
         self.open_path(&path);
+    }
+
+    /// Puts the selected file up without leaving the tree, which is what one
+    /// click does. The cursor stays in the sidebar so the next arrow key walks
+    /// on from where it was.
+    fn preview_selected(&mut self) {
+        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
+            return;
+        };
+        match self.editor.preview(&path, self.theme_generation) {
+            Ok(()) => self.follow_cursor(),
+            Err(error) => self.flash = Some(error.to_string()),
+        }
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -1916,13 +1945,13 @@ impl Workbench {
         self.panes.sections[index].body.height as usize
     }
 
-    /// The width of what the sidebar header prints on its right, which is where
-    /// the tree-or-flat button has to be measured from.
-    fn head_width(&self) -> usize {
-        self.scm
-            .head()
-            .map(UnicodeWidthStr::width)
-            .unwrap_or_default()
+    /// What the sidebar header's button does for the view that painted it.
+    fn press_header_button(&mut self) {
+        match self.sidebar {
+            SidebarView::Explorer => self.tree.collapse_all(),
+            SidebarView::SourceControl => self.scm.toggle_flat(),
+            SidebarView::Search => {}
+        }
     }
 
     /// The layout clamps again against the room a frame actually has, so this
@@ -2037,7 +2066,7 @@ mod tests {
     use crate::search;
     use crate::view::{
         Control, MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, OPEN_MARK, REVERT_MARK, STAGE_MARK,
-        TabHit, UNSTAGE_MARK, confirm_at, header_at, mode_at, tab_at, toggle_at, visible_range,
+        TabHit, UNSTAGE_MARK, button_at, confirm_at, header_at, tab_at, toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2053,6 +2082,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
 
     const CLOSED_START: &str = "a fresh workbench must not be on screen";
     const NARROW_DROPS_SIDEBAR: &str =
@@ -2066,6 +2096,9 @@ mod tests {
     const WRONG_REFERENCE: &str = "the composer reference does not point where the cursor is";
     const NOT_PAINTED: &str = "a frame is missing something it must always show";
     const WRONG_PANE: &str = "the sidebar is not showing what it was asked for";
+    const STILL_UNFOLDED: &str = "folding the tree must leave nothing but its top level";
+    const PREVIEW_STACKED: &str = "a preview must take over the tab the last one borrowed";
+    const PREVIEW_TOOK_OVER: &str = "a tab that was kept must survive the next preview";
     const CHANGE_MISSING: &str = "the change the test made is not under the cursor";
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
@@ -2394,6 +2427,52 @@ mod tests {
         assert_eq!(workbench.focus(), Focus::Editor);
         workbench.handle_leader(press(keys::VIEW_EXPLORER));
         assert_eq!(workbench.focus(), Focus::Sidebar);
+    }
+
+    /// One click puts a file up without keeping it: the tab it borrowed is the
+    /// one the next click takes over, so walking a tree leaves no trail.
+    #[test]
+    fn one_click_previews_a_file_and_the_next_takes_its_tab() {
+        let (_dir, mut workbench) = project();
+        paint(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        workbench.handle_mouse(click(rows.x, rows.y));
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        assert_eq!(workbench.active_title(), "b.txt", "{NO_TAB}");
+
+        workbench.handle_mouse(click(rows.x, rows.y + 2));
+
+        assert_eq!(workbench.editor.tabs().len(), 1, "{PREVIEW_STACKED}");
+        assert_eq!(workbench.active_title(), "a.txt", "{NO_TAB}");
+    }
+
+    #[test]
+    fn a_second_click_keeps_the_tab_the_first_borrowed() {
+        let (_dir, mut workbench) = project();
+        paint(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+
+        workbench.handle_mouse(click(rows.x, rows.y));
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+
+        assert_eq!(workbench.editor.tabs().len(), 2, "{PREVIEW_TOOK_OVER}");
+    }
+
+    #[test]
+    fn typing_in_a_preview_keeps_the_tab_it_was_shown_in() {
+        let (_dir, mut workbench) = project();
+        paint(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        workbench.handle_key(key(KeyCode::Tab));
+        workbench.handle_key(key(KeyCode::Char('x')));
+
+        workbench.handle_mouse(click(rows.x, rows.y));
+        workbench.handle_mouse(click(rows.x, rows.y + 1));
+
+        assert_eq!(workbench.editor.tabs().len(), 2, "{PREVIEW_TOOK_OVER}");
     }
 
     #[test]
@@ -4072,16 +4151,45 @@ mod tests {
         );
     }
 
+    /// The column the header's button landed on, found the same way the
+    /// pointer finds it.
+    fn header_button_column(workbench: &Workbench) -> u16 {
+        let header = workbench.panes.header;
+        let label = workbench.header_button().expect("a button in the header");
+        (header.x..header.right())
+            .find(|column| button_at(*column, header, workbench.header_context().width(), label))
+            .expect("the button the header painted")
+    }
+
+    #[test_case(false ; "the button in the header")]
+    #[test_case(true ; "and the key that does the same")]
+    fn the_explorer_folds_back_to_its_top_level(by_key: bool) {
+        let (_dir, mut workbench) = project();
+        workbench.handle_key(key(KeyCode::Enter));
+        paint(&mut workbench, 80, 24);
+        assert!(workbench.tree.rows().iter().any(|row| row.depth > 0));
+
+        match by_key {
+            true => drop(workbench.handle_key(press(keys::COLLAPSE_ALL))),
+            false => {
+                let column = header_button_column(&workbench);
+                workbench.handle_mouse(click(column, workbench.panes.header.y));
+            }
+        }
+
+        assert!(
+            workbench.tree.rows().iter().all(|row| row.depth == 0),
+            "{STILL_UNFOLDED}"
+        );
+    }
+
     #[test]
     fn the_header_button_switches_between_tree_and_flat() {
         let (_dir, mut workbench) = nested_repository();
         paint(&mut workbench, 80, 24);
-        let header = workbench.panes.header;
-        let column = (header.x..header.right())
-            .find(|column| mode_at(*column, header, workbench.head_width()))
-            .expect("a tree or flat button");
+        let column = header_button_column(&workbench);
 
-        workbench.handle_mouse(click(column, header.y));
+        workbench.handle_mouse(click(column, workbench.panes.header.y));
 
         assert!(workbench.scm.is_flat(), "{WRONG_PANE}");
     }
