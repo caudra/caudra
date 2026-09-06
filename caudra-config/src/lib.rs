@@ -1535,7 +1535,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Require re-reading a file that changed on disk before editing it"
+        desc = "Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change"
     )]
     pub stale_read_check: bool,
 

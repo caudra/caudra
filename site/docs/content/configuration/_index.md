@@ -141,7 +141,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with a small model |
-| `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 

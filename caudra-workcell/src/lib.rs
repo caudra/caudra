@@ -704,7 +704,7 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let patch_input = input.clone();
-                let (group, patch) = self
+                let planned = self
                     .host
                     .run(ctx, move |token| async move {
                         let groups = host.project_groups(cwd).await?;
@@ -715,7 +715,19 @@ impl WorkcellInvocation {
                             .map_err(|e| e.to_string())?;
                         Ok::<_, String>((groups.files, patch))
                     })
-                    .await??;
+                    .await?;
+                // Planning is where Workcell matches context, so a patch built
+                // against a stale copy fails here rather than in execution.
+                let (group, patch) = match planned {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        let targets = patch_paths(&input.patch_text)
+                            .into_iter()
+                            .map(|path| project.join(path))
+                            .collect::<Vec<_>>();
+                        return Err(with_stale_notice(error, stale_notice(ctx, &targets)));
+                    }
+                };
                 let resources = patch.resources().to_vec();
                 file_patch_prepared(resources, &project, group, patch)
             }
@@ -990,7 +1002,7 @@ impl WorkcellInvocation {
                 Input::FileWrite(original),
                 PreparedExecution::File(group, Input::FileWrite(input)),
             ) => {
-                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
+                if let Some(error) = stale_notice(ctx, &prepared.mutation_targets) {
                     return Err(error).into();
                 }
                 let content = original.content.clone();
@@ -1012,9 +1024,10 @@ impl WorkcellInvocation {
                 }
             }
             (Input::FileEdit(original), PreparedExecution::File(group, Input::FileEdit(input))) => {
-                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
-                    return Err(error).into();
-                }
+                // Captured before the edit runs: a successful write moves the
+                // mtime itself, so checking afterwards would report staleness
+                // this call caused.
+                let stale = stale_notice(ctx, &prepared.mutation_targets);
                 let old_string = original.old_string.clone();
                 let new_string = original.new_string.clone();
                 let replace_all = original.replace_all.unwrap_or(false);
@@ -1031,14 +1044,14 @@ impl WorkcellInvocation {
                         }
                         file_edit_result(output, old_string, new_string, replace_all)
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Ok(Err(error)) => Err(with_stale_notice(error.to_string(), stale)).into(),
                     Err(error) => Err(error).into(),
                 }
             }
+            // No stale check: the patch only reaches execution once Workcell has
+            // matched every context line at plan time, so a stale copy of the
+            // file has already failed in `prepare`.
             (Input::FileApplyPatch(_), PreparedExecution::FilePatch(group, patch)) => {
-                if let Err(error) = check_stale(ctx, &prepared.mutation_targets) {
-                    return Err(error).into();
-                }
                 let result = self
                     .host
                     .run(ctx, move |token| async move {
@@ -1179,14 +1192,20 @@ impl WorkcellInvocation {
     }
 }
 
-fn check_stale(ctx: &ToolContext, paths: &[PathBuf]) -> Result<(), String> {
+fn stale_notice(ctx: &ToolContext, paths: &[PathBuf]) -> Option<String> {
     if !ctx.config.stale_read_check {
-        return Ok(());
+        return None;
     }
-    for path in paths {
-        ctx.file_tracker.check_before_edit(path)?;
+    paths
+        .iter()
+        .find_map(|path| ctx.file_tracker.check_before_edit(path).err())
+}
+
+fn with_stale_notice(error: String, notice: Option<String>) -> String {
+    match notice {
+        Some(notice) => format!("{error}\n\n{notice}"),
+        None => error,
     }
-    Ok(())
 }
 
 async fn confined_traversal_group(
@@ -1828,11 +1847,11 @@ fn file_edit_result(
     result.with_written_paths(written.into_iter().collect())
 }
 
-/// Names the files the patch declares, so the row reads like an edit's
-/// instead of the same three words on every patch. The count stands in once
-/// naming them all would cost more room than it earns.
-fn patch_header(patch_text: &str) -> String {
-    let paths: Vec<&str> = patch_text
+/// Advisory only: Workcell remains the sole parser and validator of a patch.
+/// This scan names files for a header, and for a stale-read notice on a patch
+/// that never got far enough to report its own resources.
+fn patch_paths(patch_text: &str) -> Vec<&str> {
+    patch_text
         .lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix(PATCH_MARKER)?;
@@ -1842,7 +1861,14 @@ fn patch_header(patch_text: &str) -> String {
                 .map(str::trim)
         })
         .filter(|path| !path.is_empty())
-        .collect();
+        .collect()
+}
+
+/// Names the files the patch declares, so the row reads like an edit's
+/// instead of the same three words on every patch. The count stands in once
+/// naming them all would cost more room than it earns.
+fn patch_header(patch_text: &str) -> String {
+    let paths = patch_paths(patch_text);
     match paths.len() {
         0 => PATCH_WITHOUT_FILES.to_owned(),
         1 => paths[0].to_owned(),
@@ -2096,7 +2122,7 @@ mod tests {
     use caudra_agent::permissions::{
         PermissionManager, PermissionResourceAccess, PermissionResourceKind,
     };
-    use caudra_agent::tools::{FileReadTracker, interpreter_ctx};
+    use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
     use caudra_agent::{AgentMode, Envelope, EventSender};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use serde_json::json;
@@ -2162,6 +2188,35 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         host.register(&registry).expect("Workcell registration");
         (host, registry)
+    }
+
+    /// A future mtime stands in for another process touching the file, without
+    /// racing the filesystem's timestamp resolution.
+    fn bump_mtime(path: &Path) {
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("opening the file to move its mtime")
+            .set_modified(future)
+            .expect("moving the mtime forward");
+    }
+
+    /// The shared context disables the stale check, so every test that means to
+    /// exercise it has to opt back in and record the read it is invalidating.
+    fn tracking_context(
+        root: &Path,
+        registry: Arc<ToolRegistry>,
+        read: &Path,
+        stale: bool,
+    ) -> ToolContext {
+        let mut ctx = context(root, registry, CancelToken::none());
+        ctx.config.stale_read_check = true;
+        ctx.file_tracker.record_read(read);
+        if stale {
+            bump_mtime(read);
+        }
+        ctx
     }
 
     #[test_case("git status > /tmp/status", true; "output_redirect")]
@@ -2749,13 +2804,7 @@ mod tests {
         assert_eq!(skeleton, result.model_output.unwrap());
         assert_eq!(lines[0].semantic, AgentIndexLineSemantic::Section);
 
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(future)
-            .unwrap();
+        bump_mtime(&path);
         assert!(ctx.file_tracker.check_before_edit(&path).is_err());
     }
 
@@ -3387,6 +3436,209 @@ mod tests {
         assert_eq!(files.len(), 1, "{PATCH_STRUCTURED_MSG}");
         assert_eq!(files[0].path, "created.txt", "{PATCH_STRUCTURED_MSG}");
         assert_eq!((files[0].additions, files[0].deletions), (1, 0));
+    }
+
+    const EDIT_FILE: &str = "editable.txt";
+    const EDIT_SEED: &str = "alpha\nbeta\n";
+    const EDIT_APPLIED: &str = "alpha\ngamma\n";
+    const EDIT_MISS_MSG: &str = "Could not find oldString in the file";
+    const PATCH_MISS_MSG: &str = "Failed to find expected lines in";
+    const EXPECT_STALE_EDIT_APPLIES: &str =
+        "an edit whose oldString still matches applies, however old the model's copy is";
+    const EXPECT_STALE_PATCH_APPLIES: &str =
+        "a patch whose context Workcell still matches applies, however old the model's copy is";
+    const EXPECT_STALE_NOTICE: &str =
+        "a failed edit or patch says the file moved, so the retry starts from a re-read";
+    const EXPECT_CAUSE_KEPT: &str =
+        "the stale notice adds to Workcell's diagnosis, never replaces it";
+    const EXPECT_NO_STALE_NOTICE: &str =
+        "an unchanged file has no staleness to report, so the failure stands on its own";
+    const EXPECT_STALE_WRITE_REFUSED: &str =
+        "a blind write cannot detect the conflict itself, so it is still refused up front";
+
+    fn edit_invocation(registry: &ToolRegistry, path: &Path, old: &str) -> Box<dyn ToolInvocation> {
+        registry
+            .get("file_edit")
+            .expect("registered file_edit")
+            .tool
+            .parse(&json!({ "filePath": path, "oldString": old, "newString": "gamma" }))
+            .expect("valid edit input")
+    }
+
+    fn update_patch(old: &str) -> String {
+        format!("*** Begin Patch\n*** Update File: {EDIT_FILE}\n@@\n-{old}\n+gamma\n*** End Patch")
+    }
+
+    fn patch_invocation(registry: &ToolRegistry, patch_text: &str) -> Box<dyn ToolInvocation> {
+        registry
+            .get("file_apply_patch")
+            .expect("registered file_apply_patch")
+            .tool
+            .parse(&json!({ "patchText": patch_text }))
+            .expect("valid patch input")
+    }
+
+    fn seeded(root: &Path) -> PathBuf {
+        let path = root.join(EDIT_FILE);
+        std::fs::write(&path, EDIT_SEED).expect("seeding the edited file");
+        path
+    }
+
+    /// The stale check used to reject the call before Workcell ever looked at
+    /// the file, so an edit that would have applied cleanly cost a re-read.
+    #[test]
+    fn stale_edit_that_still_matches_applies() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, true);
+        let invocation = edit_invocation(&registry, &path, "beta");
+        smol::block_on(invocation.preflight(&ctx)).expect("edit preflight");
+
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert!(!result.is_error, "{EXPECT_STALE_EDIT_APPLIES}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("edited file"),
+            EDIT_APPLIED
+        );
+    }
+
+    #[test]
+    fn stale_edit_that_fails_names_the_stale_read() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, true);
+        let invocation = edit_invocation(&registry, &path, "absent");
+        smol::block_on(invocation.preflight(&ctx)).expect("edit preflight");
+
+        let error = smol::block_on(invocation.execute(&ctx))
+            .output
+            .expect_err("a missing oldString fails");
+
+        assert!(
+            error.contains(EDIT_MISS_MSG),
+            "{EXPECT_CAUSE_KEPT}: {error}"
+        );
+        assert!(
+            error.contains(STALE_READ_MSG),
+            "{EXPECT_STALE_NOTICE}: {error}"
+        );
+    }
+
+    #[test]
+    fn fresh_edit_failure_omits_the_stale_notice() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, false);
+        let invocation = edit_invocation(&registry, &path, "absent");
+        smol::block_on(invocation.preflight(&ctx)).expect("edit preflight");
+
+        let error = smol::block_on(invocation.execute(&ctx))
+            .output
+            .expect_err("a missing oldString fails");
+
+        assert!(
+            error.contains(EDIT_MISS_MSG),
+            "{EXPECT_CAUSE_KEPT}: {error}"
+        );
+        assert!(
+            !error.contains(STALE_READ_MSG),
+            "{EXPECT_NO_STALE_NOTICE}: {error}"
+        );
+    }
+
+    #[test]
+    fn stale_patch_that_still_matches_applies() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, true);
+        let invocation = patch_invocation(&registry, &update_patch("beta"));
+        smol::block_on(invocation.preflight(&ctx)).expect(EXPECT_STALE_PATCH_APPLIES);
+
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        assert!(!result.is_error, "{EXPECT_STALE_PATCH_APPLIES}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("patched file"),
+            EDIT_APPLIED
+        );
+    }
+
+    /// A patch matches its context while planning, so its failure surfaces from
+    /// preflight and the notice has to be attached there.
+    #[test]
+    fn stale_patch_that_fails_names_the_stale_read() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, true);
+        let invocation = patch_invocation(&registry, &update_patch("absent"));
+
+        let error =
+            smol::block_on(invocation.preflight(&ctx)).expect_err("unmatched context fails");
+
+        assert!(
+            error.contains(PATCH_MISS_MSG),
+            "{EXPECT_CAUSE_KEPT}: {error}"
+        );
+        assert!(
+            error.contains(STALE_READ_MSG),
+            "{EXPECT_STALE_NOTICE}: {error}"
+        );
+    }
+
+    #[test]
+    fn fresh_patch_failure_omits_the_stale_notice() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, false);
+        let invocation = patch_invocation(&registry, &update_patch("absent"));
+
+        let error =
+            smol::block_on(invocation.preflight(&ctx)).expect_err("unmatched context fails");
+
+        assert!(
+            error.contains(PATCH_MISS_MSG),
+            "{EXPECT_CAUSE_KEPT}: {error}"
+        );
+        assert!(
+            !error.contains(STALE_READ_MSG),
+            "{EXPECT_NO_STALE_NOTICE}: {error}"
+        );
+    }
+
+    #[test]
+    fn stale_write_is_still_refused() {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = tracking_context(root.path(), Arc::clone(&registry), &path, true);
+        let invocation = registry
+            .get("file_write")
+            .expect("registered file_write")
+            .tool
+            .parse(&json!({ "filePath": &path, "content": "clobbered" }))
+            .expect("valid write input");
+        smol::block_on(invocation.preflight(&ctx)).expect("write preflight");
+
+        let error = smol::block_on(invocation.execute(&ctx))
+            .output
+            .expect_err(EXPECT_STALE_WRITE_REFUSED);
+
+        assert!(
+            error.contains(STALE_READ_MSG),
+            "{EXPECT_STALE_WRITE_REFUSED}: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("untouched file"),
+            EDIT_SEED,
+            "{EXPECT_STALE_WRITE_REFUSED}"
+        );
     }
 
     #[test_case(PATCH, "created.txt" ; "one_file_names_itself")]
