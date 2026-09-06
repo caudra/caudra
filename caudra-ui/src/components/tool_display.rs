@@ -22,7 +22,8 @@ use crate::markdown::{
 };
 use caudra_agent::{
     BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
-    SpanStyle, SubagentProgress, ToolInput, ToolOutput, tools::humanize_duration,
+    SpanStyle, SubagentProgress, ToolInput, ToolOutput,
+    tools::{FILE_WRITE_TOOL_NAME, humanize_duration},
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -53,6 +54,26 @@ impl RenderCtx<'_> {
             .cloned()
             .unwrap_or_default();
         RenderLimits::new(full, budget, views, *self.tool_output_lines).with_progress(progress)
+    }
+
+    /// The rows a card rests at, `usize::MAX` for a call with no useful
+    /// abridgement.
+    ///
+    /// A whole-file write is the only tool whose body *is* its result rather
+    /// than a report of one. Seven lines of a file say nothing its header did
+    /// not, and the notice offering the rest is on every write, so abridging
+    /// it buys a click and costs the thing the card is for. An edit and a
+    /// patch keep the budget they share with it: a diff is already only the
+    /// part that changed.
+    ///
+    /// A batch child is deliberately not asked: it rests at its own tool's
+    /// budget so that a batch reads as the list of what it ran, and several
+    /// whole files would bury that list.
+    fn resting_budget(&self, tool: &str) -> usize {
+        match tool == FILE_WRITE_TOOL_NAME {
+            true => usize::MAX,
+            false => self.tool_output_lines.get(tool),
+        }
     }
 }
 
@@ -974,8 +995,7 @@ impl ToolLineBuilder {
     /// belongs to has no output yet and its arguments are the only record of
     /// what it is about to do.
     fn push_live_body(&mut self, body: &str) {
-        let (lines, truncation) = code_view::render_live_body(body, self.limits.budget);
-        self.truncation |= truncation;
+        let lines = code_view::render_live_body(body);
         let start = self.lines.len();
         for mut line in lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
@@ -1268,7 +1288,7 @@ pub fn build_tool_lines(
         rctx.limits_for(
             msg.role.tool_id(),
             expanded.full,
-            rctx.tool_output_lines.get(tool_name),
+            rctx.resting_budget(tool_name),
         ),
     );
     b.apply_output_format(msg.tool_output.as_deref());

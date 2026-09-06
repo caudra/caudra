@@ -661,19 +661,26 @@ fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
     lines
 }
 
-/// The file a write is still spelling out, drawn the way the finished call
-/// will draw it and bounded the way the finished call is bounded, so the card
-/// does not reflow when the tool starts.
+/// The file a write is still spelling out, drawn whole.
+///
+/// Deliberately unbounded: the finished card draws every line, so clipping
+/// the live view would only make the card jump when the tool starts, and a
+/// write's card is the file. What makes that affordable is that this runs
+/// once per frame rather than once per fragment — see
+/// `MessagesPanel::flush_live_bodies`. Rendering it per token cost the file's
+/// length squared, which is what a long write used to feel like as lag.
+///
+/// `render_code` is told the window is the whole of what it is drawing, so it
+/// reports nothing hidden: the rest of the file has not arrived yet, and
+/// there is nothing a click could reveal.
 ///
 /// Nothing here is highlighted. A file cut off mid-token leaves the parser in
 /// a state the rest of the file has not justified yet, which is the same
 /// reason a patch hunk is never highlighted either.
-///
-/// Only the rows it can show are materialised, because this runs once per
-/// fragment and copying the file each time would cost its length squared.
-pub(crate) fn render_live_body(body: &str, max_lines: usize) -> (Vec<Line<'static>>, bool) {
-    let shown: Vec<String> = body.lines().take(max_lines).map(String::from).collect();
-    render_code(None, 1, &shown, body.lines().count(), max_lines)
+pub(crate) fn render_live_body(body: &str) -> Vec<Line<'static>> {
+    let shown: Vec<String> = body.lines().map(String::from).collect();
+    let (lines, _) = render_code(None, 1, &shown, shown.len(), usize::MAX);
+    lines
 }
 
 /// How many rows the full rendering would take. Counted rather than rendered,

@@ -706,6 +706,11 @@ pub struct MessagesPanel {
     prompt_progress: Option<PromptProgress>,
     hover: Option<HoverTarget>,
     terminal_links: Vec<TerminalLink>,
+    /// Cards whose still-arriving file body has grown since the last frame.
+    /// The body is drawn whole, so redrawing it once per fragment costs the
+    /// file's length squared; the frame is the natural rate for something
+    /// nobody can read faster than.
+    live_body_dirty: HashSet<String>,
 }
 
 impl MessagesPanel {
@@ -763,6 +768,7 @@ impl MessagesPanel {
             prompt_progress: None,
             hover: None,
             terminal_links: Vec::new(),
+            live_body_dirty: HashSet::new(),
         }
     }
 
@@ -1057,6 +1063,10 @@ impl MessagesPanel {
 
     /// The file a still-streaming write is spelling out. `ToolStart` drops it
     /// for the call's real output, so it only ever fills the wait.
+    ///
+    /// Only the text is kept here. The card is drawn from it once per frame
+    /// by [`Self::flush_live_bodies`], because the body is drawn whole and a
+    /// fragment arrives per token.
     pub fn tool_input_body(&mut self, tool_id: &str, body: Option<String>) {
         let Some(body) = body else {
             return;
@@ -1065,10 +1075,22 @@ impl MessagesPanel {
             return;
         };
         msg.live_body.get_or_insert_default().push_str(&body);
-        self.rebuild_tool_segment(tool_id);
+        self.live_body_dirty.insert(tool_id.to_owned());
+    }
+
+    /// Redraws the cards whose file grew since the last frame. Called from
+    /// `view`, so a write costs its length once a frame however fast the
+    /// fragments arrive.
+    fn flush_live_bodies(&mut self) {
+        for tool_id in mem::take(&mut self.live_body_dirty) {
+            self.rebuild_tool_segment(&tool_id);
+        }
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
+        // The call's real output lands here, so whatever the arguments drew
+        // has nothing left to say.
+        self.live_body_dirty.remove(&event.id);
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
@@ -2254,6 +2276,7 @@ impl MessagesPanel {
         }
         self.follow_latest();
         self.rebuild_line_cache();
+        self.flush_live_bodies();
         if let Some(seg_idx) = self.pending_scroll_segment.take() {
             self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
         }

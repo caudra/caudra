@@ -5860,3 +5860,96 @@ fn a_write_still_ignores_the_view(tool: &'static str) {
         "{WRITE_STAYS_OPEN_MSG}"
     );
 }
+
+const WRITE_WHOLE_MSG: &str = "a whole-file write is the file: abridging it to seven rows behind a \
+    notice buys a click and hides what the card is for";
+const EDIT_BUDGETED_MSG: &str = "a diff is already only the part that changed, so it keeps its \
+    tool's row budget";
+/// Comfortably past the `write` budget, so a card drawing every row can only
+/// be one that spends no budget at all.
+const WRITTEN_FILE_LINES: usize = 40;
+
+/// A write draws its file whole, an edit rests at its budget. Both are checked
+/// together because they share the one `write` budget in the config, so the
+/// rule cannot be the budget itself.
+#[test_case(FILE_WRITE_TOOL_NAME, false ; "a_write_draws_the_whole_file")]
+#[test_case(FILE_EDIT_TOOL_NAME, true ; "an_edit_rests_at_its_budget")]
+fn a_writes_body_is_not_abridged(tool: &'static str, expect_notice: bool) {
+    let mut panel = panel_with_tools(&[("t1", tool)]);
+    panel.tool_done(long_done("t1", WRITTEN_FILE_LINES));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    let message = if expect_notice {
+        EDIT_BUDGETED_MSG
+    } else {
+        WRITE_WHOLE_MSG
+    };
+    assert_eq!(
+        text.contains(crate::markdown::EXPAND_AFFORDANCE),
+        expect_notice,
+        "{message}: {text:?}"
+    );
+    assert_eq!(
+        text.contains(&format!("line {}", WRITTEN_FILE_LINES - 1)),
+        !expect_notice,
+        "{message}: {text:?}"
+    );
+}
+
+const LIVE_WHOLE_MSG: &str = "a still-arriving file is drawn whole, so the card does not jump \
+    when the tool starts";
+const NO_LIVE_NOTICE_MSG: &str = "nothing is hidden behind a click while the rest of the file has \
+    not arrived";
+const PER_FRAME_MSG: &str = "the body is drawn whole, so it must be rebuilt once a frame rather \
+    than once a fragment: per fragment costs the file's length squared";
+
+/// The live body matches what the finished card will draw, first line to last.
+#[test]
+fn a_streaming_write_is_drawn_whole() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let body: String = (0..WRITTEN_FILE_LINES)
+        .map(|i| format!("line {i}\n"))
+        .collect();
+    streaming_write(&mut panel, &[&body]);
+
+    let shown = buffer_text(&render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8));
+    for line in [0, WRITTEN_FILE_LINES - 1] {
+        assert!(
+            shown.contains(&format!("line {line}")),
+            "{LIVE_WHOLE_MSG}: {shown}"
+        );
+    }
+    assert!(
+        !shown.contains(crate::markdown::EXPAND_AFFORDANCE),
+        "{NO_LIVE_NOTICE_MSG}: {shown}"
+    );
+}
+
+/// The cost of a write is what made this deferred, so the rate is the point,
+/// not an implementation detail: fragments accumulate text and the frame draws
+/// it. Without this the card is rebuilt once per token.
+#[test]
+fn a_streaming_write_redraws_once_a_frame_not_once_a_fragment() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), FILE_WRITE_TOOL_NAME);
+    render(&mut panel, 80, 24);
+
+    let rows = |panel: &MessagesPanel| {
+        panel
+            .cache
+            .segments()
+            .iter()
+            .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+            .map_or(0, |segment| segment.lines().len())
+    };
+    let settled = rows(&panel);
+
+    for i in 0..WRITTEN_FILE_LINES {
+        panel.tool_input_body(TOOL_ID, Some(format!("line {i}\n")));
+    }
+    assert_eq!(rows(&panel), settled, "{PER_FRAME_MSG}");
+
+    render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8);
+    assert!(rows(&panel) > settled, "{LIVE_WHOLE_MSG}");
+}
