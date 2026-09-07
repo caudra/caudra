@@ -4487,9 +4487,122 @@ fn queue_boundary_clamps() {
     app.queue.set_focus_at(0);
     app.update(Msg::Key(key(KeyCode::Up)));
     assert_eq!(app.queue.focus(), Some(0), "up at top clamps");
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )));
+    assert_eq!(app.queue.focus(), Some(0), "modified down is ignored");
+    assert_eq!(app.queue.panel_entries()[0].text, "queued");
     app.queue.set_focus_at(1);
     app.update(Msg::Key(key(KeyCode::Down)));
     assert_eq!(app.queue.focus(), Some(1), "down at bottom clamps");
+}
+
+#[test]
+fn shift_arrows_reorder_main_lane_and_preserve_selection_and_delivery_order() {
+    let mut app = test_app();
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    assert!(app.queue_with_admission(
+        queued_msg("first next"),
+        caudra_agent::PromptAdmission::Queue,
+    ));
+    assert!(app.queue_with_admission(queued_msg("guide"), caudra_agent::PromptAdmission::Steer,));
+    assert!(app.queue_with_admission(
+        queued_msg("second next"),
+        caudra_agent::PromptAdmission::Queue,
+    ));
+    let entries = app.queue.panel_entries();
+    let first = entries
+        .iter()
+        .find(|entry| entry.text == "first next")
+        .unwrap()
+        .id;
+    let guide = entries
+        .iter()
+        .find(|entry| entry.text == "guide")
+        .unwrap()
+        .id;
+    let second = entries
+        .iter()
+        .find(|entry| entry.text == "second next")
+        .unwrap()
+        .id;
+    app.queue.select(second);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+
+    assert_eq!(app.queue.focus(), Some(1));
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["guide", "second next", "first next"]
+    );
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)));
+    assert_eq!(app.queue.focus(), Some(2));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+    assert_eq!(receiver.claim_idle(0)[0].0, guide);
+    assert_eq!(receiver.claim_idle(0)[0].0, second);
+    assert_eq!(receiver.claim_idle(0)[0].0, first);
+}
+
+#[test]
+fn main_queue_movement_stops_at_lane_and_compact_boundaries() {
+    let mut app = app_with_queued_message();
+    app.queue_with_admission(
+        queued_msg("guide before"),
+        caudra_agent::PromptAdmission::Steer,
+    );
+    app.queue_compact();
+    app.queue_and_notify(queued_msg("after compact"));
+    app.queue_with_admission(
+        queued_msg("guide after"),
+        caudra_agent::PromptAdmission::Steer,
+    );
+    let entries = app.queue.panel_entries();
+    let first_next = entries.iter().find(|entry| entry.text == "queued").unwrap();
+    let second_next = entries
+        .iter()
+        .find(|entry| entry.text == "after compact")
+        .unwrap();
+    let guides = entries
+        .iter()
+        .filter(|entry| entry.admission == Some(caudra_agent::PromptAdmission::Steer))
+        .collect::<Vec<_>>();
+
+    assert!(guides.iter().all(|entry| !entry.can_move_up));
+    assert!(guides.iter().all(|entry| !entry.can_move_down));
+    assert!(!first_next.can_move_up);
+    assert!(!first_next.can_move_down);
+    assert!(!second_next.can_move_up);
+    assert!(!second_next.can_move_down);
+    app.queue.select(first_next.id);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+    assert_eq!(app.queue.panel_entries()[0].text, "guide before");
+}
+
+#[test]
+fn reordered_item_stays_visible_in_long_main_queue() {
+    let mut app = app_with_queued_message();
+    for index in 1..6 {
+        app.queue_and_notify(queued_msg(&format!("queued {index}")));
+    }
+    let id = app.queue.panel_entries()[5].id;
+    app.queue.select(id);
+    assert_eq!(app.queue.viewport(), 2);
+
+    for _ in 0..5 {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+    }
+
+    assert_eq!(app.queue.focus(), Some(0));
+    assert_eq!(app.queue.viewport(), 0);
+    assert_eq!(app.queue.panel_entries()[0].id, id);
 }
 
 #[test]
@@ -4683,6 +4796,25 @@ fn mouse_delete_is_explicit_and_atomic() {
 }
 
 #[test]
+fn mouse_arrows_reorder_selected_queue_item() {
+    let mut app = app_with_queued_message();
+    app.queue_and_notify(queued_msg("second"));
+    click_queue_action(&mut app, QueueAction::Select);
+
+    click_queue_action(&mut app, QueueAction::MoveDown);
+
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["second", "queued"]
+    );
+    assert_eq!(app.queue.focus(), Some(1));
+}
+
+#[test]
 fn hovering_queue_row_tracks_exact_target() {
     let mut app = app_with_queued_message();
     let _ = rendered(&mut app);
@@ -4851,6 +4983,53 @@ fn subagent_queue_edit_updates_the_real_interrupt_queue() {
 }
 
 #[test]
+fn live_subagent_reorder_updates_real_queue_and_ui_mirror() {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    for text in ["first", "second"] {
+        app.subagent_input_box.set_input(text.into());
+        app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+    app.focus_active_queue();
+    app.move_active_queue_focus(1);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+
+    assert_eq!(app.active_queue_focus(), Some(0));
+    assert_eq!(
+        steer_queue
+            .entries()
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+    assert_eq!(
+        app.pending_subagent_steers[TASK_ID]
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+    let claimed = steer_queue.remove(steer_queue.entries()[0].id).unwrap();
+    assert_eq!(claimed.message, "second");
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)));
+    assert_eq!(app.active_queue_focus(), Some(0));
+    assert_eq!(app.pending_subagent_steers[TASK_ID][0].text, "second");
+}
+
+#[test]
 fn subagent_together_delivery_is_scoped_to_that_task() {
     let mut app = test_app();
     app.run_id = 1;
@@ -4903,6 +5082,53 @@ fn finished_task_mouse_action_moves_unsent_item_to_main() {
 
     assert!(!app.unsent_subagent_steers.contains_key(TASK_ID));
     assert_eq!(app.queue.panel_entries()[0].text, STEER);
+}
+
+#[test]
+fn finished_task_reorders_unsent_items() {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, _receiver) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue);
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    for text in ["first", "second"] {
+        app.subagent_input_box.set_input(text.into());
+        app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+    close_subagent_transcript(&mut app, TASK_ID);
+    app.focus_active_queue();
+    app.move_active_queue_focus(1);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+
+    assert_eq!(app.active_queue_focus(), Some(0));
+    assert_eq!(
+        app.unsent_subagent_steers[TASK_ID]
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+    app.checkpoint();
+    let stored = app.state.session.meta.unsent_subagent_messages.clone();
+    let mut restored = test_app();
+    restored.state.session_mut().meta.unsent_subagent_messages = stored;
+    restored.restore_display();
+    assert_eq!(
+        restored.unsent_subagent_steers[TASK_ID]
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
 }
 
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]

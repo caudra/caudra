@@ -12,7 +12,7 @@ use super::{Action, App, PendingRun, Status, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::input::{InputAction, InputState, Submission};
-use crate::components::queue_panel::QueueEntry;
+use crate::components::queue_panel::{QueueEntry, set_movement_flags};
 use crate::input_document::InputDraft;
 use crate::theme;
 
@@ -148,6 +148,20 @@ impl MessageQueue {
             .is_some_and(|shared| shared.set_admission(id, admission))
     }
 
+    pub(crate) fn move_item(&mut self, id: QueueItemId, up: bool) -> bool {
+        let moved = self.shared.as_ref().is_some_and(|shared| {
+            if up {
+                shared.move_up(id)
+            } else {
+                shared.move_down(id)
+            }
+        });
+        if moved {
+            self.select(id);
+        }
+        moved
+    }
+
     pub(crate) fn delivery(&self) -> QueueDelivery {
         self.shared
             .as_ref()
@@ -232,7 +246,7 @@ impl App {
         let Some(task_id) = self.active_subagent_id() else {
             return Vec::new();
         };
-        let mut entries = self
+        let mut pending = self
             .pending_subagent_steers
             .get(task_id)
             .into_iter()
@@ -243,24 +257,33 @@ impl App {
                 color: theme::current().foreground,
                 editable: true,
                 movable: false,
+                can_move_up: false,
+                can_move_down: false,
                 admission: Some(PromptAdmission::Steer),
             })
             .collect::<Vec<_>>();
-        entries.extend(
-            self.unsent_subagent_steers
-                .get(task_id)
-                .into_iter()
-                .flatten()
-                .map(|item| QueueEntry {
-                    id: item.id,
-                    text: Cow::Owned(item.text.clone()),
-                    color: theme::current().foreground,
-                    editable: true,
-                    movable: true,
-                    admission: Some(PromptAdmission::Steer),
-                }),
-        );
-        entries
+        if self.subagent_steers.contains_key(task_id) {
+            set_movement_flags(&mut pending);
+        }
+        let mut unsent = self
+            .unsent_subagent_steers
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|item| QueueEntry {
+                id: item.id,
+                text: Cow::Owned(item.text.clone()),
+                color: theme::current().foreground,
+                editable: true,
+                movable: true,
+                can_move_up: false,
+                can_move_down: false,
+                admission: Some(PromptAdmission::Steer),
+            })
+            .collect::<Vec<_>>();
+        set_movement_flags(&mut unsent);
+        pending.extend(unsent);
+        pending
     }
 
     pub(super) fn active_queue_title(&self) -> String {
@@ -394,6 +417,77 @@ impl App {
             .min(entries.len().saturating_sub(1));
         if let Some(entry) = entries.get(next) {
             self.select_active_queue_item(entry.id);
+        }
+    }
+
+    pub(super) fn move_active_queue_item(&mut self, id: QueueItemId, up: bool) -> bool {
+        let allowed = self.active_queue_entries().iter().any(|entry| {
+            entry.id == id
+                && if up {
+                    entry.can_move_up
+                } else {
+                    entry.can_move_down
+                }
+        });
+        if !allowed {
+            return false;
+        }
+        let moved = if self.is_main_chat() {
+            self.queue.move_item(id, up)
+        } else {
+            let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
+                return false;
+            };
+            if self
+                .pending_subagent_steers
+                .get(&task_id)
+                .is_some_and(|items| items.iter().any(|item| item.id == id))
+            {
+                let queue = self.subagent_steers.get(&task_id);
+                let queue_moved = queue.is_some_and(|queue| {
+                    if up {
+                        queue.move_up(id)
+                    } else {
+                        queue.move_down(id)
+                    }
+                });
+                let mirror_moved = queue_moved
+                    && self
+                        .pending_subagent_steers
+                        .get_mut(&task_id)
+                        .is_some_and(|items| swap_pending(items, id, up));
+                if queue_moved
+                    && !mirror_moved
+                    && let Some(queue) = queue
+                {
+                    if up {
+                        queue.move_down(id);
+                    } else {
+                        queue.move_up(id);
+                    }
+                }
+                mirror_moved
+            } else {
+                self.unsent_subagent_steers
+                    .get_mut(&task_id)
+                    .is_some_and(|items| swap_pending(items, id, up))
+            }
+        };
+        if moved {
+            self.select_active_queue_item(id);
+        } else {
+            self.clamp_active_queue_focus();
+        }
+        moved
+    }
+
+    pub(super) fn move_focused_queue_item(&mut self, up: bool) {
+        if let Some(id) = self
+            .active_queue_entries()
+            .get(self.active_queue_focus().unwrap_or(0))
+            .map(|entry| entry.id)
+        {
+            self.move_active_queue_item(id, up);
         }
     }
 
@@ -1089,6 +1183,26 @@ impl App {
         }
         vec![Action::SendMessage(Box::new(pending.input))]
     }
+}
+
+fn swap_pending(
+    items: &mut std::collections::VecDeque<super::PendingSteer>,
+    id: QueueItemId,
+    up: bool,
+) -> bool {
+    let Some(index) = items.iter().position(|item| item.id == id) else {
+        return false;
+    };
+    let neighbor = if up {
+        index.checked_sub(1)
+    } else {
+        (index + 1 < items.len()).then_some(index + 1)
+    };
+    let Some(neighbor) = neighbor else {
+        return false;
+    };
+    items.swap(index, neighbor);
+    true
 }
 
 fn remove_pending(

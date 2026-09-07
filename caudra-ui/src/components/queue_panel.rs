@@ -18,8 +18,10 @@ const EDIT_LABEL: &str = "[Edit]";
 const EDIT_LABEL_COMPACT: &str = "[E]";
 const ELLIPSIS: &str = "...";
 const MAX_VISIBLE_ROWS: usize = 4;
+const MOVE_DOWN_LABEL: &str = "[↓]";
 const MOVE_MAIN_LABEL: &str = "[Main]";
 const MOVE_MAIN_LABEL_COMPACT: &str = "[M]";
+const MOVE_UP_LABEL: &str = "[↑]";
 const SEPARATE_LABEL: &str = "[Mode: Separate]";
 const TOGETHER_LABEL: &str = "[Mode: Together]";
 
@@ -29,12 +31,16 @@ pub struct QueueEntry<'a> {
     pub color: ratatui::style::Color,
     pub editable: bool,
     pub movable: bool,
+    pub can_move_up: bool,
+    pub can_move_down: bool,
     pub admission: Option<PromptAdmission>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueAction {
     Select,
+    MoveUp,
+    MoveDown,
     Edit,
     Delete,
     MoveMain,
@@ -248,7 +254,13 @@ pub fn view(
 }
 
 fn actions(entry: &QueueEntry<'_>, compact: bool) -> Vec<(&'static str, QueueAction)> {
-    let mut actions = Vec::with_capacity(3);
+    let mut actions = Vec::with_capacity(5);
+    if entry.can_move_up {
+        actions.push((MOVE_UP_LABEL, QueueAction::MoveUp));
+    }
+    if entry.can_move_down {
+        actions.push((MOVE_DOWN_LABEL, QueueAction::MoveDown));
+    }
     if entry.editable {
         actions.push((
             if compact {
@@ -278,6 +290,22 @@ fn actions(entry: &QueueEntry<'_>, compact: bool) -> Vec<(&'static str, QueueAct
         QueueAction::Delete,
     ));
     actions
+}
+
+pub(crate) fn set_movement_flags(entries: &mut [QueueEntry<'_>]) {
+    let mut previous: [Option<usize>; 3] = [None; 3];
+    for index in 0..entries.len() {
+        let Some(admission) = entries[index].admission else {
+            previous = [None; 3];
+            continue;
+        };
+        let lane = admission_group(Some(admission)) as usize;
+        if let Some(previous_index) = previous[lane] {
+            entries[index].can_move_up = true;
+            entries[previous_index].can_move_down = true;
+        }
+        previous[lane] = Some(index);
+    }
 }
 
 fn entry_prefix(entries: &[QueueEntry<'_>], index: usize) -> String {
@@ -361,6 +389,8 @@ mod tests {
             color: theme::current().foreground,
             editable: true,
             movable: false,
+            can_move_up: false,
+            can_move_down: false,
             admission: Some(PromptAdmission::Queue),
         }];
         let backend = TestBackend::new(60, 3);
@@ -408,11 +438,13 @@ mod tests {
             color: theme::current().foreground,
             editable: true,
             movable: false,
+            can_move_up: true,
+            can_move_down: false,
             admission: Some(PromptAdmission::Queue),
         }];
         let target = QueueHitTarget::Item {
             id,
-            action: QueueAction::Edit,
+            action: QueueAction::MoveUp,
         };
         let backend = TestBackend::new(60, 3);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -454,6 +486,38 @@ mod tests {
     }
 
     #[test]
+    fn movement_actions_follow_lane_bounds_and_precede_existing_actions() {
+        let mut entries = ["first", "second", "third"].map(|text| QueueEntry {
+            id: QueueItemId::new(),
+            text: Cow::Borrowed(text),
+            color: theme::current().foreground,
+            editable: true,
+            movable: false,
+            can_move_up: false,
+            can_move_down: false,
+            admission: Some(PromptAdmission::Queue),
+        });
+
+        set_movement_flags(&mut entries);
+
+        assert!(!entries[0].can_move_up);
+        assert!(entries[0].can_move_down);
+        assert!(entries[1].can_move_up);
+        assert!(entries[1].can_move_down);
+        assert!(entries[2].can_move_up);
+        assert!(!entries[2].can_move_down);
+        assert_eq!(
+            actions(&entries[1], false),
+            [
+                (MOVE_UP_LABEL, QueueAction::MoveUp),
+                (MOVE_DOWN_LABEL, QueueAction::MoveDown),
+                (EDIT_LABEL, QueueAction::Edit),
+                (DELETE_LABEL, QueueAction::Delete),
+            ]
+        );
+    }
+
+    #[test]
     fn narrow_queue_drops_actions_that_cannot_match_their_hit_area() {
         let id = QueueItemId::new();
         let entries = [QueueEntry {
@@ -462,6 +526,8 @@ mod tests {
             color: theme::current().foreground,
             editable: true,
             movable: false,
+            can_move_up: true,
+            can_move_down: true,
             admission: Some(PromptAdmission::Queue),
         }];
         let backend = TestBackend::new(16, 3);
@@ -486,7 +552,18 @@ mod tests {
             .map(|x| buffer.cell((x, 1)).unwrap().symbol())
             .collect::<String>();
 
+        assert!(!row.contains(MOVE_UP_LABEL));
+        assert!(!row.contains(MOVE_DOWN_LABEL));
         assert!(!row.contains(EDIT_LABEL_COMPACT));
+        assert!(!hits.iter().any(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::MoveUp | QueueAction::MoveDown,
+                    ..
+                }
+            )
+        }));
         let delete = hits
             .iter()
             .find(|hit| {

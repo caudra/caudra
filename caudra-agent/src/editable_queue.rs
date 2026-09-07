@@ -97,6 +97,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn compatible_neighbor<T, K: Eq>(
+    items: &VecDeque<Item<T>>,
+    candidates: impl Iterator<Item = usize>,
+    target_lane: &K,
+    lane: &impl Fn(&T) -> Option<K>,
+) -> Option<usize> {
+    for candidate in candidates {
+        let candidate_lane = lane(&items[candidate].value)?;
+        if candidate_lane == *target_lane {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 impl<T> EditableQueue<T> {
     pub fn push(&self, value: T) -> QueueItemId {
         let id = QueueItemId::new();
@@ -201,6 +216,14 @@ impl<T> EditableQueue<T> {
         self.finish_edit(id, |_| {})
     }
 
+    pub fn move_up_by<K: Eq>(&self, id: QueueItemId, lane: impl Fn(&T) -> Option<K>) -> bool {
+        self.move_by(id, true, lane)
+    }
+
+    pub fn move_down_by<K: Eq>(&self, id: QueueItemId, lane: impl Fn(&T) -> Option<K>) -> bool {
+        self.move_by(id, false, lane)
+    }
+
     pub fn entries<R>(&self, mut map: impl FnMut(QueueItemId, &T, bool) -> R) -> Vec<R> {
         lock(&self.state)
             .items
@@ -267,6 +290,37 @@ impl<T> EditableQueue<T> {
 
     fn notify(&self) {
         let _ = self.notify_tx.try_send(());
+    }
+
+    fn move_by<K: Eq>(&self, id: QueueItemId, up: bool, lane: impl Fn(&T) -> Option<K>) -> bool {
+        let mut state = lock(&self.state);
+        let Some(index) = state.items.iter().position(|item| item.id == id) else {
+            return false;
+        };
+        if state.items[index].editing {
+            return false;
+        }
+        let Some(target_lane) = lane(&state.items[index].value) else {
+            return false;
+        };
+        let neighbor = if up {
+            compatible_neighbor(&state.items, (0..index).rev(), &target_lane, &lane)
+        } else {
+            compatible_neighbor(
+                &state.items,
+                index + 1..state.items.len(),
+                &target_lane,
+                &lane,
+            )
+        };
+        let Some(neighbor) = neighbor else {
+            return false;
+        };
+        if state.items[neighbor].editing {
+            return false;
+        }
+        state.items.swap(index, neighbor);
+        true
     }
 }
 
@@ -424,6 +478,14 @@ impl SteeringQueue {
 
     pub fn cancel_edit(&self, id: QueueItemId) -> bool {
         self.queue.cancel_edit(id)
+    }
+
+    pub fn move_up(&self, id: QueueItemId) -> bool {
+        self.queue.move_up_by(id, |_| Some(()))
+    }
+
+    pub fn move_down(&self, id: QueueItemId) -> bool {
+        self.queue.move_down_by(id, |_| Some(()))
     }
 
     pub fn drain(&self) -> Vec<(QueueItemId, AgentInput)> {
@@ -603,5 +665,60 @@ mod tests {
         receiver.claim_all_matching(|admission| *admission == PromptAdmission::Steer);
 
         assert_eq!(queue.delivery(), QueueDelivery::Separate);
+    }
+
+    #[test]
+    fn moves_items_in_both_directions_and_changes_claim_order() {
+        let (queue, receiver) = editable_queue();
+        let first = queue.push("first");
+        let second = queue.push("second");
+        let third = queue.push("third");
+
+        assert!(queue.move_up_by(third, |_| Some(())));
+        assert!(queue.move_down_by(first, |_| Some(())));
+        queue.set_delivery(QueueDelivery::TogetherNextTurn);
+        assert_eq!(
+            receiver.claim(|_| true),
+            [(third, "third"), (first, "first"), (second, "second")]
+        );
+    }
+
+    #[test]
+    fn movement_rejects_bounds_stale_ids_and_editing_items() {
+        let (queue, receiver) = editable_queue();
+        let first = queue.push("first");
+        let second = queue.push("second");
+
+        assert!(!queue.move_up_by(first, |_| Some(())));
+        assert!(!queue.move_down_by(second, |_| Some(())));
+        assert!(!queue.move_up_by(QueueItemId::new(), |_| Some(())));
+        assert_eq!(queue.begin_edit(second, |_| Some(())), Some(()));
+        assert!(!queue.move_up_by(second, |_| Some(())));
+        assert!(!queue.move_down_by(first, |_| Some(())));
+        assert!(queue.cancel_edit(second));
+        assert_eq!(receiver.pop(), Some((first, "first")));
+        assert_eq!(receiver.pop(), Some((second, "second")));
+    }
+
+    #[test]
+    fn movement_skips_other_lanes_but_stops_at_barriers() {
+        let (queue, receiver) = editable_queue();
+        let first = queue.push(Some((1, "first")));
+        let other = queue.push(Some((2, "other")));
+        let second = queue.push(Some((1, "second")));
+        queue.push(None);
+        let third = queue.push(Some((1, "third")));
+
+        assert!(queue.move_up_by(second, |item| item.map(|(lane, _)| lane)));
+        assert!(!queue.move_up_by(third, |item| item.map(|(lane, _)| lane)));
+        assert_eq!(
+            receiver.claim_all_matching(|item| item.is_some_and(|(lane, _)| lane == 1)),
+            [
+                (second, Some((1, "second"))),
+                (first, Some((1, "first"))),
+                (third, Some((1, "third"))),
+            ]
+        );
+        assert_eq!(receiver.pop(), Some((other, Some((2, "other")))));
     }
 }

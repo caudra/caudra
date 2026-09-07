@@ -705,6 +705,12 @@ impl App {
             QueueHitTarget::Item { .. } if self.queue_editor_active() => {}
             QueueHitTarget::Item { id, action } => match action {
                 QueueAction::Select => self.select_active_queue_item(id),
+                QueueAction::MoveUp => {
+                    self.move_active_queue_item(id, true);
+                }
+                QueueAction::MoveDown => {
+                    self.move_active_queue_item(id, false);
+                }
                 QueueAction::Edit => {
                     self.select_active_queue_item(id);
                     self.begin_queue_edit(id);

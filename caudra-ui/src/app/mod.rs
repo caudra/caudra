@@ -1199,8 +1199,14 @@ impl App {
 
         if self.active_queue_is_focused() {
             match key.code {
-                KeyCode::Up => self.move_active_queue_focus(-1),
-                KeyCode::Down => self.move_active_queue_focus(1),
+                KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+                    self.move_focused_queue_item(true);
+                }
+                KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+                    self.move_focused_queue_item(false);
+                }
+                KeyCode::Up if key.modifiers.is_empty() => self.move_active_queue_focus(-1),
+                KeyCode::Down if key.modifiers.is_empty() => self.move_active_queue_focus(1),
                 KeyCode::Enter => {
                     if let Some(id) = self
                         .active_queue_entries()

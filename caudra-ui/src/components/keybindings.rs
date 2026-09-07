@@ -819,6 +819,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt("Shift+Up", "Shift+Down"),
+        description: "Move item up / down",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Edit item",
         context: KeybindContext::QueueFocus,

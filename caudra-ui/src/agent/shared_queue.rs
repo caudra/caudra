@@ -78,6 +78,12 @@ pub(crate) enum QueueItem {
     },
 }
 
+#[derive(PartialEq, Eq)]
+enum MovementLane {
+    Visible(PromptAdmission),
+    Hidden,
+}
+
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
@@ -98,6 +104,20 @@ impl QueueItem {
         }
     }
 
+    fn movement_lane(&self) -> Option<MovementLane> {
+        match self {
+            Self::Message {
+                admission,
+                displayed: false,
+                ..
+            } => Some(MovementLane::Visible(*admission)),
+            Self::Message {
+                displayed: true, ..
+            } => Some(MovementLane::Hidden),
+            Self::Compact { .. } => None,
+        }
+    }
+
     fn as_queue_entry(&self, id: QueueItemId) -> QueueEntry<'static> {
         match self {
             Self::Message {
@@ -108,6 +128,8 @@ impl QueueItem {
                 color: theme::current().foreground,
                 editable: true,
                 movable: false,
+                can_move_up: false,
+                can_move_down: false,
                 admission: Some(*admission),
             },
             Self::Compact { .. } => QueueEntry {
@@ -119,6 +141,8 @@ impl QueueItem {
                     .unwrap_or(theme::current().foreground),
                 editable: false,
                 movable: false,
+                can_move_up: false,
+                can_move_down: false,
                 admission: None,
             },
         }
@@ -271,6 +295,14 @@ impl QueueSender {
         )
     }
 
+    pub(crate) fn move_up(&self, id: QueueItemId) -> bool {
+        self.queue.move_up_by(id, QueueItem::movement_lane)
+    }
+
+    pub(crate) fn move_down(&self, id: QueueItemId) -> bool {
+        self.queue.move_down_by(id, QueueItem::movement_lane)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
@@ -408,6 +440,7 @@ impl QueueSender {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        crate::components::queue_panel::set_movement_flags(&mut entries);
         entries.sort_by_key(|entry| match entry.admission {
             Some(PromptAdmission::Interrupt) => 0,
             Some(PromptAdmission::Steer) => 1,

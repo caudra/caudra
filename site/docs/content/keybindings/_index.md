@@ -128,6 +128,7 @@ Some pickers add extra bindings on top of the defaults:
 
 | Context | Key | Action |
 |---------|-----|--------|
+| Queue | `Shift+Up` / `Shift+Down` | Move item up / down |
 | Queue | `Enter` | Edit item |
 | Queue | `d` / `Delete` | Delete item |
 | Queue | `m` | Move unsent item to Main |

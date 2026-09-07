@@ -13,7 +13,7 @@ The input stays active while Caudra works. Each prompt can wait for another run,
 
 Press `Enter` or click `next` while Caudra is working. The prompt stays in the queue until the current run returns control, then starts as the next run. This is the default because it cannot change work already in progress.
 
-Queued prompts appear above the input. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click. You can then edit or delete the item before Caudra claims it. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
+Queued prompts appear above the input. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click. You can then edit or delete the item before Caudra claims it. Use `Shift+Up` and `Shift+Down`, or click the arrow controls on the selected row, to change delivery order. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
 
 Press `b` while the queue is focused or click its mode control to toggle Together. Together sends the pending next-run prompts as separate user messages in one model turn. The setting resets after that batch is claimed.
 
