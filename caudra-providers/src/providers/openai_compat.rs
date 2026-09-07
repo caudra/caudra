@@ -188,7 +188,20 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        let response = self.client.send_async(request).await?;
+        // `connect_timeout` only covers the socket, which always succeeds
+        // against a local server, and `low_speed_timeout` never starts until
+        // bytes flow. Neither bounds a server that accepts the request and
+        // then never answers, so the header wait gets the stream budget too.
+        let response = futures_lite::future::or(
+            async { self.client.send_async(request).await.map_err(AgentError::from) },
+            async {
+                smol::Timer::after(self.stream_timeout).await;
+                Err(AgentError::Timeout {
+                    secs: self.stream_timeout.as_secs(),
+                })
+            },
+        )
+        .await?;
         let status = response.status().as_u16();
 
         if status == 200 {

@@ -2,7 +2,15 @@
 //! Retryable: 429, 5xx, IO, HTTP transport. Non-retryable: other 4xx, JSON parse, config,
 //! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
 
-use isahc::AsyncReadResponseExt;
+use std::time::Duration;
+
+use futures_lite::io::AsyncReadExt;
+
+/// Enough of an error body to diagnose one, and no more: a non-200 can be an
+/// endless stream, and nothing downstream reads past the first screenful.
+const ERROR_BODY_CAP: u64 = 64 * 1024;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const UNREADABLE_ERROR_BODY: &str = "unable to read error body";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -119,12 +127,9 @@ impl AgentError {
         }
     }
 
-    pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
+    pub async fn from_response(response: isahc::Response<isahc::AsyncBody>) -> Self {
         let status = response.status().as_u16();
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unable to read error body".into());
+        let message = read_error_body(response.into_body()).await;
         Self::Api { status, message }
     }
 
@@ -138,6 +143,25 @@ impl AgentError {
             _ => self.to_string(),
         }
     }
+}
+
+/// A non-200 body is untrusted input on a connection that has already
+/// misbehaved, so it gets both a size cap and its own deadline. Without them a
+/// server that accepts the request and then dribbles forever parks the agent
+/// task with no stream timeout covering it.
+async fn read_error_body(body: isahc::AsyncBody) -> String {
+    let read = async {
+        let mut buf = Vec::new();
+        match body.take(ERROR_BODY_CAP).read_to_end(&mut buf).await {
+            Ok(_) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(_) => UNREADABLE_ERROR_BODY.to_owned(),
+        }
+    };
+    futures_lite::future::or(read, async {
+        smol::Timer::after(ERROR_BODY_TIMEOUT).await;
+        UNREADABLE_ERROR_BODY.to_owned()
+    })
+    .await
 }
 
 impl<T> From<flume::SendError<T>> for AgentError {

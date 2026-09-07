@@ -170,10 +170,20 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
         },
     )
     .await;
-    if let Ok(Some(_)) = &result {
+    // Only payload renews the budget. A blank separator and a `:` comment
+    // keep-alive both arrive on a stream that is producing nothing, and
+    // renewing on those lets a wedged server hold the request open forever.
+    if let Ok(Some(line)) = &result
+        && !is_sse_filler(line)
+    {
         *deadline = Instant::now() + stream_timeout;
     }
     result
+}
+
+fn is_sse_filler(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
+    line.is_empty() || line.starts_with(':')
 }
 
 pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
@@ -308,6 +318,8 @@ mod tests {
     const BUFFERED_SSE_LINES: usize = 8;
     const EXPECT_INTERLEAVED: &str =
         "a reader with buffered lines must let another task on its thread run";
+    const EXPECT_NO_RENEWAL: &str = "a blank or comment line must not renew the stream deadline";
+    const EXPECT_RENEWAL: &str = "a data line must renew the stream deadline";
 
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
@@ -348,6 +360,29 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, AgentError::Timeout { .. }));
+        })
+    }
+
+    /// Keep-alives must not buy a wedged server another whole timeout.
+    #[test_case("" ; "blank_separator")]
+    #[test_case(": ping" ; "comment_keepalive")]
+    #[test_case("\r" ; "blank_with_carriage_return")]
+    fn sse_filler_does_not_extend_the_deadline(line: &str) {
+        smol::block_on(async {
+            let body = format!("{line}\ndata: {{}}\n");
+            let mut lines = futures_lite::io::Cursor::new(body).lines();
+            let started = Instant::now();
+            let mut deadline = started + STREAM_TIMEOUT;
+
+            next_sse_line(&mut lines, &mut deadline, STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(deadline, started + STREAM_TIMEOUT, "{EXPECT_NO_RENEWAL}");
+
+            next_sse_line(&mut lines, &mut deadline, STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert!(deadline > started + STREAM_TIMEOUT, "{EXPECT_RENEWAL}");
         })
     }
 
