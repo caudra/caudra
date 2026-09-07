@@ -15,7 +15,6 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -307,9 +306,11 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
-            }
+            // `reasoning_effort`, not Anthropic's `thinking`: a strict
+            // OpenAI-compatible server 400s on an unknown top-level key, and
+            // this is the only knob that reaches the levels declared under
+            // `reasoning_options` in `providers.toml`.
+            opts.thinking.apply_reasoning_effort(&mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -333,6 +334,10 @@ impl Provider for CustomOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ThinkingConfig;
+
+    const ANTHROPIC_KEY_LEAKED: &str =
+        "an OpenAI-compatible body must never carry Anthropic's `thinking` key";
 
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
@@ -385,6 +390,38 @@ mod tests {
         let model = model_from_def(&def, ProviderKind::OpenAi, slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    /// A strict OpenAI-compatible server 400s on `thinking`, so the effort has
+    /// to travel as `reasoning_effort` or not at all. `none` only goes out
+    /// when the model declared it; a model with no reasoning options must get
+    /// a body with neither key.
+    #[test_case::test_case(
+        r#"[{"type":"effort","values":["none","low","xhigh"]}]"#,
+        ThinkingConfig::Off => Some("none".to_string()) ; "declared_none_is_how_off_is_spelled"
+    )]
+    #[test_case::test_case(
+        r#"[{"type":"effort","values":["none","low","xhigh"]}]"#,
+        ThinkingConfig::Effort("xhigh".into()) => Some("xhigh".to_string()) ; "declared_level"
+    )]
+    #[test_case::test_case("[]", ThinkingConfig::Off => None ; "no_reasoning_options_sends_nothing")]
+    fn custom_openai_body_carries_effort_never_anthropic_thinking(
+        reasoning_options: &str,
+        thinking: ThinkingConfig,
+    ) -> Option<String> {
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"openai","models":[{{"id":"m","reasoning_options":{reasoning_options}}}]}}"#
+        ))
+        .unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "effort-body-test", "m");
+        let provider = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
+
+        let mut body = provider.build_body(&model, &[], "", &Value::Null);
+        thinking.apply_reasoning_effort(&mut body, &model);
+
+        assert!(body.get("thinking").is_none(), "{ANTHROPIC_KEY_LEAKED}");
+        body.get("reasoning_effort")
+            .map(|level| level.as_str().unwrap().to_string())
     }
 
     #[test]
