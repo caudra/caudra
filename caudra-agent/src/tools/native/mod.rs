@@ -67,7 +67,7 @@ fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
         ),
         entry(
             skill::SkillTool::default(),
-            ToolEffect::Mutating,
+            ToolEffect::ReadOnly,
             skill::DESCRIPTION,
         ),
         entry(task::TaskTool, ToolEffect::Orchestrator, task::DESCRIPTION),

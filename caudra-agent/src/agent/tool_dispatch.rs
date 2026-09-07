@@ -189,12 +189,14 @@ async fn run_inner(
     }
 
     if ctx.policy().is_read_only() {
-        let allowed = if let Some(local) = local {
-            local.effect.is_safe_in_read_only()
-        } else if let Some(entry) = &entry {
-            entry.is_safe_in_read_only()
-        } else {
-            !mcp.is_some_and(|mcp| name == TOOL_SEARCH_TOOL_NAME || mcp.has_tool(mcp_lookup))
+        // A registry entry is gated once its input parses, so a tool whose
+        // commands differ in effect is judged per call, not per registration.
+        let allowed = match (local, &entry) {
+            (Some(local), _) => local.effect.is_safe_in_read_only(),
+            (None, Some(_)) => true,
+            (None, None) => {
+                !mcp.is_some_and(|mcp| name == TOOL_SEARCH_TOOL_NAME || mcp.has_tool(mcp_lookup))
+            }
         };
         if !allowed {
             warn!(tool = %name, "blocked tool in strict read-only mode");
@@ -229,6 +231,12 @@ async fn run_inner(
             }
         };
 
+        let call_effect = entry.effect_for(invocation.as_ref());
+        if ctx.policy().is_read_only() && !entry.is_safe_in_read_only_with(call_effect) {
+            warn!(tool = %name, effect = call_effect.as_str(), "blocked tool in strict read-only mode");
+            return done_error(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"));
+        }
+
         let prepared_intent = match invocation.preflight(ctx).await {
             Ok(intent) => intent,
             Err(error) => return done_error(error),
@@ -241,14 +249,14 @@ async fn run_inner(
 
         let mutation_targets = invocation.mutation_targets(ctx);
         if ctx.mode.plan_path().is_some()
-            && !entry.effect.is_safe_in_read_only()
+            && !call_effect.is_safe_in_read_only()
             && !entry.source.is_trusted()
         {
             warn!(tool = %name, "blocked untrusted effect in plan mode");
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
         if ctx.mode.plan_path().is_some()
-            && !entry.effect.is_safe_in_read_only()
+            && !call_effect.is_safe_in_read_only()
             && mutation_targets.is_empty()
         {
             warn!(tool = %name, "blocked unscoped effect in plan mode");
@@ -293,7 +301,7 @@ async fn run_inner(
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
-            effect: entry.effect,
+            effect: call_effect,
             summary: header_result.text(),
             render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
@@ -1634,6 +1642,156 @@ mod tests {
                 rich_result: self.rich_result,
             }))
         }
+    }
+
+    const EFFECT_PROBE_NAME: &str = "effect_probe";
+    const PLAN_PATH: &str = "/tmp/plan.md";
+
+    /// Registered mutating while each call declares its own effect, the way
+    /// `memory` browses and writes through a single registration.
+    struct EffectProbe {
+        call_effect: ToolEffect,
+        executed: Arc<AtomicBool>,
+    }
+
+    struct EffectProbeInvocation {
+        call_effect: ToolEffect,
+        executed: Arc<AtomicBool>,
+    }
+
+    impl ToolInvocation for EffectProbeInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("effect probe".into()))
+        }
+
+        fn call_effect(&self, _registered: ToolEffect) -> ToolEffect {
+            self.call_effect
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            self.executed.store(true, Ordering::SeqCst);
+            Box::pin(async {
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl Tool for EffectProbe {
+        fn name(&self) -> &str {
+            EFFECT_PROBE_NAME
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "effect probe".into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn has_read_only_calls(&self) -> bool {
+            true
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(EffectProbeInvocation {
+                call_effect: self.call_effect,
+                executed: Arc::clone(&self.executed),
+            }))
+        }
+    }
+
+    fn trusted_native_source() -> ToolSource {
+        ToolSource::Native {
+            owner: "caudra".into(),
+            contract: "effect-probe/v1".into(),
+            trusted: true,
+        }
+    }
+
+    /// Reports the outcome alongside whether the call reached `execute`.
+    async fn run_effect_probe(
+        mode: &AgentMode,
+        call_effect: ToolEffect,
+        source: ToolSource,
+    ) -> (ToolDoneEvent, bool) {
+        let executed = Arc::new(AtomicBool::new(false));
+        let registry = ToolRegistry::new();
+        registry
+            .register_audited(
+                Arc::new(EffectProbe {
+                    call_effect,
+                    executed: Arc::clone(&executed),
+                }),
+                source,
+                ToolEffect::Mutating,
+            )
+            .unwrap();
+        let done = run(
+            &registry,
+            None,
+            EFFECT_PROBE_NAME.into(),
+            EFFECT_PROBE_NAME,
+            &serde_json::json!({}),
+            &crate::tools::test_support::stub_ctx(mode),
+            Emit::Silent,
+        )
+        .await;
+        (done, executed.load(Ordering::SeqCst))
+    }
+
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()) ; "plan_mode")]
+    #[test_case(AgentMode::ReadOnly ; "read_only_mode")]
+    fn a_read_only_call_of_a_mutating_tool_runs(mode: AgentMode) {
+        smol::block_on(async {
+            let (done, executed) =
+                run_effect_probe(&mode, ToolEffect::ReadOnly, trusted_native_source()).await;
+
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(executed);
+        });
+    }
+
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), crate::tools::PLAN_WRITE_RESTRICTED ; "plan_mode")]
+    #[test_case(AgentMode::ReadOnly, READ_ONLY_TOOL_RESTRICTED ; "read_only_mode")]
+    fn a_mutating_call_of_the_same_tool_is_refused(mode: AgentMode, expected: &str) {
+        smol::block_on(async {
+            let (done, executed) =
+                run_effect_probe(&mode, ToolEffect::Mutating, trusted_native_source()).await;
+
+            assert!(done.is_error);
+            assert!(
+                done.output.as_text().starts_with(expected),
+                "{}",
+                done.output.as_text()
+            );
+            assert!(!executed);
+        });
+    }
+
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), crate::tools::PLAN_WRITE_RESTRICTED ; "plan_mode")]
+    #[test_case(AgentMode::ReadOnly, READ_ONLY_TOOL_RESTRICTED ; "read_only_mode")]
+    fn an_unbundled_plugin_cannot_downgrade_its_own_call_effect(mode: AgentMode, expected: &str) {
+        smol::block_on(async {
+            let (done, executed) = run_effect_probe(
+                &mode,
+                ToolEffect::ReadOnly,
+                ToolSource::Lua {
+                    plugin: "external".into(),
+                    contract: "effect-probe/v1".into(),
+                    bundled: false,
+                },
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(
+                done.output.as_text().starts_with(expected),
+                "{}",
+                done.output.as_text()
+            );
+            assert!(!executed);
+        });
     }
 
     #[test]

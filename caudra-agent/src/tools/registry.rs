@@ -350,6 +350,12 @@ pub trait ToolInvocation: Send + Sync {
     fn blocked_in_plan_mode(&self) -> bool {
         false
     }
+    /// Effect of this one call. A tool whose commands do not share an effect
+    /// registers its worst case and narrows here, so plan and read-only gating
+    /// judges the call instead of the registration.
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        registered
+    }
     /// Performs non-effectful native inspection before plan and boundary
     /// checks. Legacy tools leave this unset and retain the existing
     /// permission lifecycle.
@@ -392,6 +398,12 @@ pub trait Tool: Any + Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    /// Whether some call shape is read-only despite a mutating registration.
+    /// A read-only audience still gets the definition; dispatch refuses the
+    /// calls that are not read-only.
+    fn has_read_only_calls(&self) -> bool {
+        false
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 
@@ -418,11 +430,34 @@ impl RegisteredTool {
     }
 
     pub fn is_safe_in_read_only(&self) -> bool {
-        self.effect.is_safe_in_read_only()
-            && matches!(
-                self.source,
-                ToolSource::Native { trusted: true, .. } | ToolSource::Lua { bundled: true, .. }
-            )
+        self.is_safe_in_read_only_with(self.effect)
+    }
+
+    pub fn is_safe_in_read_only_with(&self, effect: ToolEffect) -> bool {
+        effect.is_safe_in_read_only() && self.is_audited_host()
+    }
+
+    /// Effect of one call. A narrower effect counts only from a host we
+    /// audited; an MCP server or an external plugin is held to what it
+    /// registered, so it cannot talk its way past a mode gate.
+    pub fn effect_for(&self, invocation: &dyn ToolInvocation) -> ToolEffect {
+        if self.is_audited_host() {
+            invocation.call_effect(self.effect)
+        } else {
+            self.effect
+        }
+    }
+
+    pub fn is_visible_in_read_only(&self) -> bool {
+        (self.effect.is_safe_in_read_only() || self.tool.has_read_only_calls())
+            && self.is_audited_host()
+    }
+
+    fn is_audited_host(&self) -> bool {
+        matches!(
+            self.source,
+            ToolSource::Native { trusted: true, .. } | ToolSource::Lua { bundled: true, .. }
+        )
     }
 }
 
@@ -664,7 +699,7 @@ impl ToolRegistry {
             if !entry.tool.audience().contains(ctx.audience) {
                 continue;
             }
-            if ctx.policy().is_read_only() && !entry.is_safe_in_read_only() {
+            if ctx.policy().is_read_only() && !entry.is_visible_in_read_only() {
                 continue;
             }
             if !ctx.filter.matches(entry.name()) {
@@ -736,6 +771,7 @@ mod tests {
     struct MockTool {
         name: String,
         audience: ToolAudience,
+        read_only_calls: bool,
     }
 
     struct MockInvocation;
@@ -762,6 +798,9 @@ mod tests {
         fn audience(&self) -> ToolAudience {
             self.audience
         }
+        fn has_read_only_calls(&self) -> bool {
+            self.read_only_calls
+        }
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(MockInvocation))
         }
@@ -775,6 +814,17 @@ mod tests {
         Arc::new(MockTool {
             name: name.to_owned(),
             audience,
+            read_only_calls: false,
+        })
+    }
+
+    /// A mutating registration that can still be called read-only, as `memory`
+    /// is for `list` and `read`.
+    fn mock_with_read_only_calls(name: &str) -> Arc<dyn Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience: ToolAudience::all(),
+            read_only_calls: true,
         })
     }
 
@@ -1069,6 +1119,19 @@ mod tests {
             ToolEffect::ReadOnly,
         )
         .unwrap();
+        let (_, source) = trusted_native("native_mutating_with_reads");
+        reg.register_audited(
+            mock_with_read_only_calls("native_mutating_with_reads"),
+            source,
+            ToolEffect::Mutating,
+        )
+        .unwrap();
+        reg.register_audited(
+            mock_with_read_only_calls("untrusted_mutating_with_reads"),
+            lua_source("external"),
+            ToolEffect::Mutating,
+        )
+        .unwrap();
 
         let filter = crate::tools::ToolFilter::All.for_mode(&crate::AgentMode::ReadOnly);
         let ctx = DescriptionContext {
@@ -1090,7 +1153,8 @@ mod tests {
                 "native_read",
                 "native_isolated",
                 "native_orchestrator",
-                "lua_bundled"
+                "lua_bundled",
+                "native_mutating_with_reads"
             ]
         );
     }

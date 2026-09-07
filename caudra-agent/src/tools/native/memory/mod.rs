@@ -18,8 +18,8 @@ use caudra_providers::token_label;
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
-    ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolEffect,
+    ToolExecResult, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolContext};
@@ -148,6 +148,10 @@ impl Tool for MemoryTool {
 
     fn schema(&self) -> Value {
         to_json_schema(&SCHEMA)
+    }
+
+    fn has_read_only_calls(&self) -> bool {
+        true
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -538,6 +542,15 @@ impl ToolInvocation for MemoryCall {
         })
     }
 
+    /// Browsing a scratchpad is a read; only the two commands that touch a
+    /// note carry the registered mutating effect.
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        match self.command {
+            Command::List | Command::Read => ToolEffect::ReadOnly,
+            Command::Write | Command::Delete => registered,
+        }
+    }
+
     fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
         match (self.command, &self.dir, self.path.as_deref()) {
             (Command::Write | Command::Delete, Some(dir), Some(path)) => {
@@ -575,6 +588,8 @@ mod tests {
     use crate::tools::test_support::stub_ctx;
     use serde_json::json;
     use test_case::test_case;
+
+    const REGISTERED_EFFECT: ToolEffect = ToolEffect::Mutating;
 
     fn call(input: Value) -> Box<dyn ToolInvocation> {
         MemoryTool.parse(&input).expect("valid input")
@@ -926,6 +941,17 @@ mod tests {
         assert_eq!(write.mutation_targets(&ctx), vec![temp.path().join("a.md")]);
         let list = call_in(json!({ "command": "list" }), temp.path());
         assert!(list.mutation_targets(&ctx).is_empty());
+    }
+
+    /// The registration is mutating so a write is gated; browsing has to
+    /// report itself as the read it is or plan mode refuses it.
+    #[test_case("list", ToolEffect::ReadOnly ; "list_is_a_read")]
+    #[test_case("read", ToolEffect::ReadOnly ; "read_is_a_read")]
+    #[test_case("write", REGISTERED_EFFECT ; "write_keeps_the_registered_effect")]
+    #[test_case("delete", REGISTERED_EFFECT ; "delete_keeps_the_registered_effect")]
+    fn the_call_effect_follows_the_command(command: &str, expected: ToolEffect) {
+        let parsed = call(json!({ "command": command, "path": "a.md", "content": "x" }));
+        assert_eq!(parsed.call_effect(REGISTERED_EFFECT), expected);
     }
 
     #[test]
