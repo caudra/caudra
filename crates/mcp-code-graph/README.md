@@ -47,26 +47,37 @@ estimated.
 
 ## Benchmarks
 
-`examples/code_map_bench.rs` times one `code_map` call over a real tree:
+`examples/code_map_bench.rs` times one `code_map` call over a real tree, and
+`evals/compare-ripwire.sh` runs it beside the upstream binary:
 
 ```bash
-cargo run --release --example code_map_bench -- <root> 5
+cargo build --release --example code_map_bench -p workcell-mcp-code-graph
+crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
 ```
 
-It reports cold and warm separately, because the upstream `ripwire` binary this group was ported from
-keeps an on-disk cache and comparing our cold against its warm measures the cache and not the
-pipeline. Medians on a 32-core Linux host against `ripwire 0.4.0`, its cache cleared for cold runs
-and retained for warm ones:
+The upstream `ripwire` binary keeps an **on-disk cache** under `/tmp/ripwire-<uid>`, so its second run
+over a tree is largely a cache hit. This crate has no persistent cache: its fact cache lives in the
+process and dies with it.
 
-| Tree | ripwire cold | this cold | ripwire warm | this warm |
+The benchmark is therefore deliberately unfair to us, and that is the point. It measures ripwire
+**with** its cache warmed against this pipeline with **no** cache, so the number in the first column
+is a standing target rather than a like-for-like result. The harness builds a fresh group per run and
+leaves the per-file hashing in, because the production ingest is the cached one and a cold run is all
+misses.
+
+Medians of seven runs on a 32-core Linux host against `ripwire 0.4.0`:
+
+| Tree | ripwire, cache warm | this, no cache | gap to close | ripwire, cache cleared |
 | --- | --- | --- | --- | --- |
-| ripwire's own C++ source, 153 files / 8.6 MB | 590 ms | **380 ms** | 118 ms | **89 ms** |
-| this workspace's Rust crates, 357 files | 430 ms | **167 ms** | 55 ms | 92 ms |
+| ripwire's own C++ source, 153 files / 8.6 MB | **117 ms** | 377 ms | 3.2x | 596 ms |
+| this workspace's Rust crates, 359 files | **55 ms** | 135 ms | 2.5x | 438 ms |
+| ripwire's test corpus, 1154 small files | **103 ms** | 331 ms | 3.2x | 533 ms |
 
-Cold is the honest comparison of the pipeline and we win it on both trees. Warm is a comparison of
-caches: ours retains extraction facts in process by content digest and still re-reads and re-hashes
-the tree on every call, which is why a tree of many small files can favour an on-disk cache that does
-not. That is a deliberate trade — a stat-triple cache would be faster warm and would answer from
-metadata rather than content.
+Read it two ways. Against a cache we do not have, we are 2.5–3.2x behind, and closing that is what a
+persistent cache would have to buy. Against the same pipeline doing the same work — the last column,
+ripwire's cache cleared before every run — we are 1.6–3.2x ahead, so the gap is the cache and not the
+ranking.
 
-Numbers from one host are not a portability claim. Re-run the harness before quoting them.
+Numbers from one host are not a portability claim, and the last column moves with page-cache state.
+Re-run the harness before quoting any of them, and clear `/tmp/ripwire-<uid>` between cold runs or
+that column silently becomes the first one.

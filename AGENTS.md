@@ -149,9 +149,11 @@ real snippet through an optimized binary copied away from any adjacent worker. T
 embedded fallback works rather than accidentally resolving the development worker.
 
 For code-graph changes that could affect cost, re-run `cargo run --release --example code_map_bench`
-over a real tree. Compare cold against cold: the upstream `ripwire` binary keeps an on-disk cache, so
-its second run measures that cache and not its pipeline. `crates/mcp-code-graph/README.md` records
-the current numbers and the host they came from.
+over a real tree. The standing target is the upstream `ripwire` binary with its on-disk cache warm,
+measured against this pipeline with no cache at all. That comparison is deliberately unfair to us: we
+have no persistent cache, so the target is what one would have to buy. Keep it that way rather than
+crediting the in-process fact cache, which does not survive a process and is not the same capability.
+`crates/mcp-code-graph/README.md` records the current numbers and the host they came from.
 
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
 test against the resulting process. Use `make docker-smoke` as the minimum image check.
