@@ -65,6 +65,7 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
+const SNAPSHOT_ERR: &str = "snapshot store lock is poisoned";
 const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
 const OTHER_PROVIDER: &str = "openrouter";
 const LEDGER_PROVIDER: &str = "anthropic";
@@ -214,6 +215,29 @@ pub(crate) fn test_app() -> App {
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
+}
+
+/// Runs the deferred pre-run capture the way the event loop does, so a test
+/// can go from a submit straight to the `SendMessage` it produces. Real
+/// captures against the test workspace, so snapshot assertions still hold.
+fn settle_snapshot(app: &mut App, actions: Vec<Action>) -> Vec<Action> {
+    let mut settled = Vec::new();
+    for action in actions {
+        match action {
+            Action::SnapshotWorkspace {
+                run_id,
+                store,
+                cwd,
+                head,
+            } => {
+                let result =
+                    crate::app::capture_history_head(&store, &cwd, head).map_err(|e| e.to_string());
+                settled.extend(app.on_workspace_snapshot(run_id, result));
+            }
+            other => settled.push(other),
+        }
+    }
+    settled
 }
 
 /// A `test_app` past its idle splash, whose drifting starfield would mask
@@ -445,6 +469,7 @@ fn typing_and_submit() {
     app.update(Msg::Key(key(KeyCode::Char('i'))));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
     assert_eq!(app.status, Status::Streaming);
     // Regression check: the bubble has to be on screen the same frame we
@@ -456,10 +481,81 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
+/// The freeze this defers: the capture walks and hashes the whole working
+/// tree under a machine-global lock, so the submit must not wait on it.
+#[test]
+fn submit_defers_the_workspace_snapshot_off_the_ui_thread() {
+    let mut app = test_app();
+    let actions = type_and_submit_unsettled(&mut app, "hi");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::SnapshotWorkspace { .. }]
+    ));
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.main_chat().last_message_text(), "");
+
+    let settled = settle_snapshot(&mut app, actions);
+
+    assert!(matches!(
+        settled.as_slice(),
+        [Action::SendMessage(input)] if input.message == "hi"
+    ));
+    assert_eq!(app.main_chat().last_message_text(), "hi");
+}
+
+#[test]
+fn a_failed_submit_snapshot_starts_no_run() {
+    let mut app = test_app();
+    let actions = type_and_submit_unsettled(&mut app, "hi");
+    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
+        panic!("submit must defer its snapshot");
+    };
+
+    let settled = app.on_workspace_snapshot(*run_id, Err(SNAPSHOT_ERR.into()));
+
+    assert!(settled.is_empty());
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.main_chat().last_message_text(), "");
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(&*format!("Failed to snapshot workspace: {SNAPSHOT_ERR}"))
+    );
+}
+
+/// A snapshot that lands after its run was superseded must not start it.
+#[test]
+fn a_stale_submit_snapshot_is_dropped() {
+    let mut app = test_app();
+    let actions = type_and_submit_unsettled(&mut app, "hi");
+    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
+        panic!("submit must defer its snapshot");
+    };
+    let stale = *run_id;
+    cancel_app(&mut app);
+
+    assert!(app.on_workspace_snapshot(stale, Ok(())).is_empty());
+    assert_eq!(app.status, Status::Idle);
+}
+
+/// Cancelling before the snapshot lands leaves no agent-side run to await, so
+/// the status must not stay stuck in `Streaming`.
+#[test]
+fn cancelling_a_pending_snapshot_needs_no_agent_round_trip() {
+    let mut app = test_app();
+    type_and_submit_unsettled(&mut app, "hi");
+
+    cancel_app(&mut app);
+
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.cancelling_run, None);
+}
+
 #[test]
 fn mailbox_wake_starts_without_an_empty_user_bubble() {
     let mut app = test_app();
     let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+    let actions = settle_snapshot(&mut app, actions);
 
     assert!(matches!(
         &actions[..],
@@ -796,6 +892,7 @@ fn hidden_paste_cannot_trigger_exit() {
     app.update(Msg::Paste("exit\n\n".into()));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
     assert_eq!(app.exit_request, ExitRequest::None);
 }
@@ -865,6 +962,7 @@ fn submit_during_streaming_queues_message() {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(&actions[0], Action::SendMessage(_)));
     assert_eq!(app.status, Status::Streaming);
 
@@ -1151,6 +1249,7 @@ fn submit_prompt_never_interprets_text(text: &str) {
     let mut app = test_app();
     match app.submit_prompt(queued_msg(text)) {
         SubmitOutcome::Started(actions) => {
+            let actions = settle_snapshot(&mut app, actions);
             assert!(matches!(&actions[0], Action::SendMessage(_)))
         }
         _ => panic!("raw prompt must start the agent"),
@@ -1218,6 +1317,13 @@ fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
 }
 
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
+    let actions = type_and_submit_unsettled(app, text);
+    settle_snapshot(app, actions)
+}
+
+/// Stops at the deferred capture, for the tests that are about the deferral
+/// itself rather than the run it eventually starts.
+fn type_and_submit_unsettled(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -2301,6 +2407,7 @@ fn custom_command_falls_back_to_main_when_the_task_cannot_be_steered() {
     app.subagent_steers.remove(TASK_ID);
 
     let actions = app.execute_command(cmd("/project:audit"), 0);
+    let actions = settle_snapshot(&mut app, actions);
 
     assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
 }
@@ -5718,6 +5825,7 @@ fn usage_command_toggles_modal() {
 fn goal_command_sets_condition_and_starts_work() {
     let mut app = test_app();
     let actions = app.run_cmdline("/goal all focused tests pass", 0).unwrap();
+    let actions = settle_snapshot(&mut app, actions);
 
     assert_eq!(
         app.state.goal.snapshot().unwrap().condition.as_ref(),
@@ -5939,6 +6047,7 @@ fn deferred_goal_builds_an_automatic_checkin() {
 
     assert!(app.goal_checkin_due());
     let actions = app.start_goal_checkin();
+    let actions = settle_snapshot(&mut app, actions);
     let input = actions
         .iter()
         .find_map(|action| match action {
@@ -6723,6 +6832,7 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
         images: Vec::new(),
         paste_ranges: Vec::new(),
     });
+    let actions = settle_snapshot(&mut app, actions);
 
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
     assert!(app.snapshot_store.has_session_start());
@@ -9307,6 +9417,7 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = settle_snapshot(&mut app, actions);
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
@@ -9332,6 +9443,7 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let actions = settle_snapshot(&mut app, actions);
     let expected_msg = implement_msg(!PlanForm::new().parallel());
     assert!(
         actions

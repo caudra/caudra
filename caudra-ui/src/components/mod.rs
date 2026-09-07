@@ -424,6 +424,17 @@ use std::path::PathBuf;
 
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    /// Capture the workspace before a run starts. Runs off the UI thread: a
+    /// capture walks and hashes the whole working tree under a machine-global
+    /// lock, so waiting for it inline freezes the terminal. `SendMessage` is
+    /// only dispatched once this lands, so the agent still never touches a
+    /// file the run cannot be reverted past.
+    SnapshotWorkspace {
+        run_id: u64,
+        store: Arc<caudra_agent::snapshots::SnapshotStore>,
+        cwd: PathBuf,
+        head: Option<caudra_storage::id::CaudraId>,
+    },
     ManualExit,
     ShellCommand {
         id: String,

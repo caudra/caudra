@@ -327,6 +327,8 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
+    snapshot_tx: flume::Sender<WorkspaceSnapshotDone>,
+    snapshot_rx: flume::Receiver<WorkspaceSnapshotDone>,
     last_status: SessionStatus,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
@@ -655,12 +657,15 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let (snapshot_tx, snapshot_rx) = flume::unbounded::<WorkspaceSnapshotDone>();
         Ok(SessionRuntime {
             app,
             lease,
             handles,
             shell_tx,
             shell_rx,
+            snapshot_tx,
+            snapshot_rx,
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
@@ -775,8 +780,16 @@ enum Wake {
     Ui(UiAction),
     Agent(usize, Box<caudra_agent::Envelope>),
     Shell(usize, ShellEvent),
+    Snapshot(usize, WorkspaceSnapshotDone),
     Warn(String),
     Title(GeneratedTitle),
+}
+
+/// A pre-run workspace capture that finished. The error is carried as text
+/// because the only consumer flashes it.
+struct WorkspaceSnapshotDone {
+    run_id: u64,
+    result: Result<(), String>,
 }
 
 /// What a model-written title came back as, for the session that asked. The
@@ -1101,6 +1114,9 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
+            sel = sel.recv(&rt.snapshot_rx, move |res| {
+                res.ok().map(|ev| Wake::Snapshot(i, ev))
+            });
         }
         sel.wait_timeout(timeout).ok().flatten()
     }
@@ -1112,6 +1128,12 @@ impl<'t> EventLoop<'t> {
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            Wake::Snapshot(i, done) => {
+                let actions = self.sessions[i]
+                    .app
+                    .on_workspace_snapshot(done.run_id, done.result);
+                self.dispatch(i, actions);
+            }
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
         }
@@ -2431,6 +2453,23 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].handles.send_mcp(McpCommand::Reject {
                     server: server_name,
                 });
+            }
+            Action::SnapshotWorkspace {
+                run_id,
+                store,
+                cwd,
+                head,
+            } => {
+                let tx = self.sessions[idx].snapshot_tx.clone();
+                smol::spawn(async move {
+                    let result = smol::unblock(move || {
+                        crate::app::capture_history_head(&store, &cwd, head)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await;
+                    let _ = tx.send(WorkspaceSnapshotDone { run_id, result });
+                })
+                .detach();
             }
             Action::ShellCommand {
                 id,

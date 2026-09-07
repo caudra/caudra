@@ -20,7 +20,7 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -94,6 +94,7 @@ use caudra_providers::{
     ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, TokenUsage, add_cost,
 };
 use caudra_storage::StateDir;
+use caudra_storage::id::CaudraId;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
@@ -334,6 +335,7 @@ pub struct App {
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(crate) cancelling_run: Option<u64>,
+    pub(super) pending_run: Option<PendingRun>,
     replacement_item: Option<QueueItemId>,
     pub(super) retry_info: Option<RetryInfo>,
     goal_deferred: bool,
@@ -382,6 +384,29 @@ struct PendingSteer {
 pub(super) struct MessageMouseDown {
     pub source: DisplaySource,
     pub since: Instant,
+}
+
+/// A run held between its workspace snapshot being dispatched and that
+/// snapshot landing. `run_id` is what makes a snapshot from a superseded run
+/// stale, so a cancel that bumps `run_id` also drops the reply.
+pub(super) struct PendingRun {
+    run_id: u64,
+    input: AgentInput,
+    display: String,
+}
+
+/// Session start plus the current head, the pair a revert needs to bracket a
+/// run. Free of `App` so the submit path can run it on a blocking thread.
+pub(crate) fn capture_history_head(
+    store: &SnapshotStore,
+    cwd: &Path,
+    head: Option<CaudraId>,
+) -> Result<(), SnapshotError> {
+    store.snapshot_session_start(cwd)?;
+    if let Some(head) = head {
+        store.snapshot(cwd, head)?;
+    }
+    Ok(())
 }
 
 impl App {
@@ -501,6 +526,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             cancelling_run: None,
+            pending_run: None,
             replacement_item: None,
             retry_info: None,
             goal_deferred: false,
@@ -572,18 +598,23 @@ impl App {
         self.snapshot_store.discard_unrevert()
     }
 
-    pub(super) fn snapshot_history_head(&mut self) -> Result<(), SnapshotError> {
-        let head = self
-            .shared_history
+    pub(super) fn history_head(&self) -> Option<CaudraId> {
+        self.shared_history
             .as_ref()
             .and_then(|history| history.load().messages.last().map(|item| item.id))
-            .or_else(|| crate::session_history_head(&self.state.session));
-        let cwd = std::path::Path::new(&self.state.session.cwd);
-        self.snapshot_store.snapshot_session_start(cwd)?;
-        if let Some(head) = head {
-            self.snapshot_store.snapshot(cwd, head)?;
-        }
-        Ok(())
+            .or_else(|| crate::session_history_head(&self.state.session))
+    }
+
+    /// Inline capture, for the shutdown and respawn paths that have nowhere to
+    /// resume to. The submit path uses [`Action::SnapshotWorkspace`] instead,
+    /// because this walks and hashes the whole working tree under a
+    /// machine-global lock and can take tens of seconds.
+    pub(super) fn snapshot_history_head(&self) -> Result<(), SnapshotError> {
+        capture_history_head(
+            &self.snapshot_store,
+            std::path::Path::new(&self.state.session.cwd),
+            self.history_head(),
+        )
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -2313,7 +2344,13 @@ impl App {
         if self.cancelling_run.is_some() {
             return Vec::new();
         }
+        let had_pending = self.pending_run.is_some();
         let cancelled_run = self.begin_main_cancel(false, true);
+        // A run still waiting on its snapshot never reached the agent, so
+        // there is nothing there to cancel.
+        if had_pending {
+            return Vec::new();
+        }
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
@@ -2323,7 +2360,14 @@ impl App {
         self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
-        self.cancelling_run = await_terminal.then_some(cancelled_run);
+        // Dropping the pending run makes its in-flight snapshot stale. The
+        // agent never saw it, so no terminal envelope is coming and nothing
+        // else would move the status off `Streaming`.
+        let had_pending = self.pending_run.take().is_some();
+        if had_pending {
+            self.status = Status::Idle;
+        }
+        self.cancelling_run = (await_terminal && !had_pending).then_some(cancelled_run);
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
