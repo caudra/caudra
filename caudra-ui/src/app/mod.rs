@@ -2773,7 +2773,7 @@ impl App {
                 self.record_goal_usage(&model, usage, cost);
                 if applied && verdict == GoalVerdict::NotMet {
                     self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Assistant,
+                        DisplayRole::Notice,
                         format!("Goal not yet met (#{evaluation}): {reason}"),
                     ));
                 }
@@ -2797,7 +2797,7 @@ impl App {
             } => {
                 self.goal_deferred = true;
                 self.main_chat().push(DisplayMessage::new(
-                    DisplayRole::Assistant,
+                    DisplayRole::Notice,
                     format!(
                         "Goal evaluation deferred while {active_background_tasks} background task(s) run."
                     ),

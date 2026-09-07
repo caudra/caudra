@@ -79,6 +79,7 @@ impl RenderCtx<'_> {
 
 pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
+pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
@@ -489,6 +490,16 @@ pub fn error_style() -> RoleStyle {
         prefix: "",
         text_style: theme::current().error,
         prefix_style: theme::current().tool_error,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn notice_style() -> RoleStyle {
+    RoleStyle {
+        prefix: NOTICE_PREFIX,
+        text_style: theme::current().status_dim.add_modifier(Modifier::ITALIC),
+        prefix_style: theme::current().status_dim,
         use_markdown: false,
         max_line_bytes: None,
     }

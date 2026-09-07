@@ -12,7 +12,7 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    thinking_style, truncate_to_header, user_style,
+    notice_style, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -3537,7 +3537,8 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
         (DisplayRole::Tool(left), DisplayRole::Tool(right)) => left.id == right.id,
         (DisplayRole::User, DisplayRole::User)
         | (DisplayRole::Assistant, DisplayRole::Assistant)
-        | (DisplayRole::Thinking, DisplayRole::Thinking) => left.text == right.text,
+        | (DisplayRole::Thinking, DisplayRole::Thinking)
+        | (DisplayRole::Notice, DisplayRole::Notice) => left.text == right.text,
         _ => false,
     }
 }
@@ -3600,6 +3601,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
+        DisplayRole::Notice => SegmentKind::Assistant,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
 }
@@ -3644,6 +3646,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
+        DisplayRole::Notice => notice_style(),
         DisplayRole::Tool(_) => unreachable!(),
     };
     let prefix = if msg.plan_path.is_some() {

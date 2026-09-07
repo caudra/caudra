@@ -270,10 +270,8 @@ impl Chat {
             AgentEvent::Nudge => {
                 self.messages_panel.flush();
                 if self.messages_panel.last_message_text() != NUDGE_TEXT {
-                    self.messages_panel.push(DisplayMessage::new(
-                        DisplayRole::Assistant,
-                        NUDGE_TEXT.into(),
-                    ));
+                    self.messages_panel
+                        .push(DisplayMessage::new(DisplayRole::Notice, NUDGE_TEXT.into()));
                 }
             }
             AgentEvent::SubagentHistory { .. } => {}
@@ -1655,6 +1653,26 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    /// A nudge is the harness acting on the user's behalf, so it must not
+    /// arrive wearing the assistant's role: `last_reply_source` reads that
+    /// role to decide what a copy or a review is about.
+    #[test]
+    fn a_nudge_is_a_notice_and_repeats_as_one_bubble() {
+        let mut chat = chat();
+        text_delta(&mut chat, REPLY_TEXT);
+
+        chat.handle_event(AgentEvent::Nudge, None);
+        chat.handle_event(AgentEvent::Nudge, None);
+
+        assert_eq!(chat.last_message_text(), NUDGE_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Notice));
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(
+            chat.message_at(0).map(|m| &m.role),
+            Some(&DisplayRole::Assistant)
+        );
     }
 
     /// The transcript keeps growing after the ending, since the subagent chat

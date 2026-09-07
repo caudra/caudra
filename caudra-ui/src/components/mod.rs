@@ -759,6 +759,9 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// Harness chatter: what the run did on the user's behalf, never
+    /// something a model or a person said.
+    Notice,
 }
 
 impl DisplayRole {

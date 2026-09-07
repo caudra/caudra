@@ -2,6 +2,7 @@ use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
+use crate::components::tool_display::NOTICE_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{
@@ -21,6 +22,7 @@ use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::time::Duration;
 use test_case::test_case;
+use unicode_width::UnicodeWidthStr;
 
 const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 const TOOL_ID: &str = "t1";
@@ -3930,8 +3932,9 @@ fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
         let row: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
             .collect();
-        if let Some(col) = row.find(text) {
-            return buf.cell((col as u16, y)).unwrap().style();
+        if let Some(byte) = row.find(text) {
+            let col = UnicodeWidthStr::width(&row[..byte]) as u16;
+            return buf.cell((col, y)).unwrap().style();
         }
     }
     panic!("{text} was never rendered");
@@ -3986,6 +3989,64 @@ fn replace_past_the_end_is_a_noop() {
     let text = buffer_text(&render(&mut panel, 80, 10));
     assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
     assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
+}
+
+const NOTICE_TEXT: &str = "Model ended turn without a response, nudging...";
+const NOTICE_MARKDOWN: &str = "**not bold** notice";
+const PROSE_MSG: &str = "a notice must not be styled like something the model said";
+
+/// The harness speaking about the run, not the model speaking to the user.
+/// A notice that paints like assistant prose is indistinguishable from a
+/// reply, which is what the dedicated role exists to prevent.
+#[test]
+fn a_notice_renders_as_dim_italic_chrome() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        FIRST_TEXT.into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into()));
+
+    let rendered = render(&mut panel, 80, 24);
+    let text = buffer_text(&rendered);
+    let notice = style_of(&rendered, NOTICE_TEXT);
+
+    assert!(text.contains(NOTICE_PREFIX), "got: {text}");
+    assert!(
+        notice.add_modifier.contains(Modifier::ITALIC),
+        "got: {notice:?}"
+    );
+    assert_ne!(notice, style_of(&rendered, FIRST_TEXT), "{PROSE_MSG}");
+}
+
+/// Notice text is composed by the host, so markdown in it is incidental and
+/// must stay literal rather than restyle a line the user cannot edit.
+#[test]
+fn a_notice_never_parses_its_text_as_markdown() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Notice,
+        NOTICE_MARKDOWN.into(),
+    ));
+
+    let text = buffer_text(&render(&mut panel, 80, 24));
+
+    assert!(text.contains(NOTICE_MARKDOWN), "got: {text}");
+}
+
+/// Pins the bug the role was added for: a nudge landing after the reply used
+/// to be the newest `Assistant` message, so copying the last reply returned
+/// the harness notice instead of what the model wrote.
+#[test]
+fn a_notice_is_never_the_last_reply() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        FIRST_TEXT.into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into()));
+
+    assert_eq!(panel.last_reply_source().as_deref(), Some(FIRST_TEXT));
 }
 
 const WIDE_CHART: &str = "```mermaid\nflowchart LR\n  A[Ingest events] --> B[Normalise schema] --> C[Enrich metadata] --> D[Write to store]\n```";
