@@ -34,7 +34,7 @@ use caudra_providers::{
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::permission_state::PermissionRuleRecord;
-use caudra_storage::sessions::{SessionError, SessionLease, StoredRule};
+use caudra_storage::sessions::{SessionError, SessionLease};
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::{StateDir, StorageError};
 use color_eyre::Result;
@@ -575,7 +575,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_lease,
         expected_write_version,
         initial_history,
-        session_rules,
         structured_permission_rules,
         session_yolo,
         stored_system_prompt_profile,
@@ -665,7 +664,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         expected_write_version,
         initial_history,
         yolo: requested_permission_mode == PermissionMode::BypassPermissions,
-        session_rules,
         structured_permission_rules,
         session_yolo,
         system_prompt_override,
@@ -830,7 +828,6 @@ struct ResolvedSession {
     session_lease: Arc<SessionLease>,
     expected_write_version: Option<i64>,
     initial_history: Vec<HistoryItem>,
-    session_rules: Vec<StoredRule>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
     session_yolo: Option<bool>,
     stored_system_prompt_profile: Option<String>,
@@ -839,12 +836,11 @@ struct ResolvedSession {
 fn session_permissions(
     session: &StoredSession,
     fork: bool,
-) -> (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>) {
+) -> (Vec<PermissionRuleRecord>, Option<bool>) {
     if fork {
-        (Vec::new(), Vec::new(), None)
+        (Vec::new(), None)
     } else {
         (
-            session.meta.session_rules.clone(),
             session.meta.structured_permission_rules.clone(),
             session.meta.yolo,
         )
@@ -890,8 +886,7 @@ fn resolve_session(
                 configured_profile,
                 raw_prompt_override,
             )?;
-            let (session_rules, structured_permission_rules, session_yolo) =
-                session_permissions(&session, true);
+            let (structured_permission_rules, session_yolo) = session_permissions(&session, true);
             let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
             if target.id() == session_ref.id() {
                 return Err(eyre!(
@@ -964,7 +959,6 @@ fn resolve_session(
                 session_lease,
                 expected_write_version: Some(0),
                 initial_history: history,
-                session_rules,
                 structured_permission_rules,
                 session_yolo,
                 stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
@@ -979,14 +973,12 @@ fn resolve_session(
                 "--session-id cannot replace the resumed session ID without --fork-session"
             ));
         }
-        let (session_rules, structured_permission_rules, session_yolo) =
-            session_permissions(&session, false);
+        let (structured_permission_rules, session_yolo) = session_permissions(&session, false);
         return Ok(ResolvedSession {
             session_id: session_ref,
             session_lease: source_lease.expect("non-fork resume has a lease"),
             expected_write_version: session.persisted_write_version(),
             initial_history: history,
-            session_rules,
             structured_permission_rules,
             session_yolo,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
@@ -1000,14 +992,12 @@ fn resolve_session(
         let session_lease = Arc::new(SessionLease::acquire(&storage, summary.id)?);
         let session = crate::setup::load_session(summary.id, &storage)?;
         let history = crate::setup::active_session_history(&session)?;
-        let (session_rules, structured_permission_rules, session_yolo) =
-            session_permissions(&session, false);
+        let (structured_permission_rules, session_yolo) = session_permissions(&session, false);
         return Ok(ResolvedSession {
             session_id: session_ref,
             session_lease,
             expected_write_version: session.persisted_write_version(),
             initial_history: history,
-            session_rules,
             structured_permission_rules,
             session_yolo,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
@@ -1021,7 +1011,6 @@ fn resolve_session(
         session_lease,
         expected_write_version: None,
         initial_history: Vec::new(),
-        session_rules: Vec::new(),
         structured_permission_rules: Vec::new(),
         session_yolo: None,
         stored_system_prompt_profile: None,
@@ -1915,11 +1904,9 @@ mod tests {
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
     use caudra_providers::{ContentBlock, Message, Role};
-    use caudra_storage::sessions::{StoredEffect, StoredRule};
     use tempfile::TempDir;
     use test_case::test_case;
 
-    const SESSION_PERMISSION_SCOPE: &str = "cargo *";
     const CAUDRA_REQUEST_ID: &str = "caudra-permission-1";
     const SECOND_CAUDRA_REQUEST_ID: &str = "caudra-permission-2";
 
@@ -2031,14 +2018,6 @@ mod tests {
                 ..Default::default()
             },
         ]
-    }
-
-    fn stored_session_rule() -> StoredRule {
-        StoredRule {
-            tool: "bash".into(),
-            scope: Some(SESSION_PERMISSION_SCOPE.into()),
-            effect: StoredEffect::Allow,
-        }
     }
 
     fn stored_structured_rule() -> PermissionRuleRecord {
@@ -2220,7 +2199,6 @@ mod tests {
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let mut source = StoredSession::new("provider/model", "/repo");
         source.meta.system_prompt_profile = Some("review".into());
-        source.meta.session_rules = vec![stored_session_rule()];
         source.meta.structured_permission_rules = vec![stored_structured_rule()];
         source.meta.yolo = Some(true);
         let target = SessionRef::generate();
@@ -2261,7 +2239,6 @@ mod tests {
         assert_eq!(loaded.messages(), history);
         assert_eq!(loaded.subagent_messages()["task-1"].as_ref(), &subagent);
         assert!(loaded.tool_outputs().contains_key("batch-call"));
-        assert!(loaded.meta.session_rules.is_empty());
         assert!(loaded.meta.structured_permission_rules.is_empty());
         assert_eq!(loaded.meta.yolo, None);
         assert_eq!(loaded.meta.system_prompt_profile.as_deref(), Some("review"));
@@ -2334,7 +2311,6 @@ mod tests {
     #[test]
     fn sdk_resume_restores_permissions_while_fork_starts_clean() {
         let mut session = StoredSession::new("provider/model", "/repo");
-        session.meta.session_rules = vec![stored_session_rule()];
         session.meta.structured_permission_rules = vec![stored_structured_rule()];
         session.meta.yolo = Some(true);
 
@@ -2343,13 +2319,9 @@ mod tests {
 
         assert_eq!(
             resumed,
-            (
-                session.meta.session_rules.clone(),
-                session.meta.structured_permission_rules.clone(),
-                Some(true)
-            )
+            (session.meta.structured_permission_rules.clone(), Some(true))
         );
-        assert_eq!(forked, (Vec::new(), Vec::new(), None));
+        assert_eq!(forked, (Vec::new(), None));
     }
 
     #[test]

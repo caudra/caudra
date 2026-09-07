@@ -3,9 +3,7 @@ use caudra_agent::permissions::{
     PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
     StructuredPermissionEffect,
 };
-use caudra_config::{
-    Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
-};
+use caudra_config::{Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -21,7 +19,6 @@ pub(crate) enum PermissionsPickerAction {
     Consumed,
     Close,
     Revoke(String),
-    RemoveLegacy(PermissionRule),
     TrustProjectConfig,
     RevokeProjectConfigTrust,
 }
@@ -37,8 +34,7 @@ struct PermissionEntry {
     id: Option<String>,
     tool: String,
     detail: String,
-    legacy_rule: Option<PermissionRule>,
-    read_only: bool,
+    legacy_policy: bool,
     project_config_action: Option<ProjectConfigAction>,
 }
 
@@ -56,7 +52,6 @@ pub(crate) struct PermissionsPicker {
     picker: ListPicker<PermissionEntry>,
     entries: Vec<PermissionEntry>,
     pending_revoke: Option<String>,
-    pending_legacy_removal: Option<PermissionRule>,
     pending_project_config_action: Option<ProjectConfigAction>,
 }
 
@@ -69,7 +64,6 @@ impl PermissionsPicker {
             picker,
             entries: Vec::new(),
             pending_revoke: None,
-            pending_legacy_removal: None,
             pending_project_config_action: None,
         }
     }
@@ -94,7 +88,6 @@ impl PermissionsPicker {
             .chain(effective_policy.iter().map(policy_entry))
             .collect();
         self.pending_revoke = None;
-        self.pending_legacy_removal = None;
         self.pending_project_config_action = None;
         self.picker.set_info_text(None);
         self.picker
@@ -130,20 +123,6 @@ impl PermissionsPicker {
                 _ => PermissionsPickerAction::Consumed,
             };
         }
-        if let Some(rule) = self.pending_legacy_removal.clone() {
-            return match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    self.pending_legacy_removal = None;
-                    PermissionsPickerAction::RemoveLegacy(rule)
-                }
-                KeyCode::Esc => {
-                    self.pending_legacy_removal = None;
-                    self.picker.set_info_text(None);
-                    PermissionsPickerAction::Consumed
-                }
-                _ => PermissionsPickerAction::Consumed,
-            };
-        }
         if let Some(id) = self.pending_revoke.clone() {
             return match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
@@ -164,13 +143,8 @@ impl PermissionsPicker {
                     self.confirm_project_config_action(action);
                 } else if let Some(id) = entry.id.clone() {
                     self.confirm_revoke(id);
-                } else if let Some(rule) = entry.legacy_rule.clone()
-                    && !entry.read_only
-                {
-                    self.confirm_legacy_removal(rule);
                 } else {
-                    let has_legacy_rule = entry.legacy_rule.is_some();
-                    self.show_read_only(has_legacy_rule);
+                    self.show_read_only(entry.legacy_policy);
                 }
             }
             return PermissionsPickerAction::Consumed;
@@ -219,14 +193,8 @@ impl PermissionsPicker {
                     self.confirm_project_config_action(action);
                 } else if let Some(id) = entry.id {
                     self.confirm_revoke(id);
-                } else if let Some(rule) = entry.legacy_rule
-                    && !entry.read_only
-                {
-                    self.confirm_legacy_removal(rule);
                 } else {
-                    self.picker.set_info_text(Some(
-                        "This policy is read-only here. Edit its configuration or plugin source to change it.".into(),
-                    ));
+                    self.show_read_only(entry.legacy_policy);
                 }
                 PermissionsPickerAction::Consumed
             }
@@ -254,16 +222,8 @@ impl PermissionsPicker {
         ));
     }
 
-    fn confirm_legacy_removal(&mut self, rule: PermissionRule) {
-        self.pending_legacy_removal = Some(rule);
-        self.picker.set_info_text(Some(
-            "Remove this legacy conversation rule? Press Enter/y to confirm or Esc to cancel."
-                .into(),
-        ));
-    }
-
-    fn show_read_only(&mut self, has_legacy_rule: bool) {
-        let message = if has_legacy_rule {
+    fn show_read_only(&mut self, legacy_policy: bool) {
+        let message = if legacy_policy {
             "This policy is read-only here. Edit its configuration or plugin source to change it."
         } else {
             "This legacy allow is inactive. Re-approve the next exact request or remove the old config entry."
@@ -272,9 +232,7 @@ impl PermissionsPicker {
     }
 
     fn has_pending_confirmation(&self) -> bool {
-        self.pending_revoke.is_some()
-            || self.pending_legacy_removal.is_some()
-            || self.pending_project_config_action.is_some()
+        self.pending_revoke.is_some() || self.pending_project_config_action.is_some()
     }
 }
 
@@ -285,7 +243,6 @@ impl Overlay for PermissionsPicker {
 
     fn close(&mut self) {
         self.pending_revoke = None;
-        self.pending_legacy_removal = None;
         self.pending_project_config_action = None;
         self.picker.close();
     }
@@ -302,8 +259,7 @@ fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
             "shell allow patterns are inactive · no authority has been granted"
         }
         .into(),
-        legacy_rule: None,
-        read_only: false,
+        legacy_policy: false,
         project_config_action: Some(action),
     }
 }
@@ -358,8 +314,7 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         id: Some(record.id),
         tool: escape_terminal_controls(&tool),
         detail,
-        legacy_rule: None,
-        read_only: false,
+        legacy_policy: false,
         project_config_action: None,
     }
 }
@@ -387,15 +342,7 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
             "[needs review] inactive {kind} · {source} · scope {}",
             escape_terminal_controls(scope)
         ),
-        legacy_rule: (candidate.source == PermissionSource::Conversation).then(|| PermissionRule {
-            tool: candidate
-                .tool
-                .clone()
-                .unwrap_or(caudra_config::ToolKey::Wildcard),
-            scope: candidate.scope.clone(),
-            effect: Effect::Allow,
-        }),
-        read_only: candidate.source != PermissionSource::Conversation,
+        legacy_policy: false,
         project_config_action: None,
     }
 }
@@ -406,7 +353,7 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
         id: None,
         tool: escape_terminal_controls(&entry.rule.tool.to_string()),
         detail: format!(
-            "[legacy] {} · {} · scope {}{}",
+            "[legacy] {} · {} · scope {} · read-only",
             match entry.rule.effect {
                 Effect::Allow => "allow",
                 Effect::Ask => "ask",
@@ -414,14 +361,8 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
             },
             entry.source,
             escape_terminal_controls(scope),
-            if entry.removable {
-                " · removable"
-            } else {
-                " · read-only"
-            },
         ),
-        legacy_rule: Some(entry.rule.clone()),
-        read_only: !entry.removable,
+        legacy_policy: true,
         project_config_action: None,
     }
 }

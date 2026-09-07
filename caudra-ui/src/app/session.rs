@@ -32,7 +32,7 @@ use ratatui::layout::Rect;
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
 
-use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
+use super::session_state::SessionState;
 use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
 /// The shortest gap between two writes that carry only UI state.
@@ -246,7 +246,6 @@ impl App {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
-            session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             structured_permission_rules: self.permissions.structured_conversation_rules_snapshot(),
             context_size: state.context_size,
             turns: state.turns,
@@ -713,8 +712,6 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions
-            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
         self.permissions.load_structured_conversation_rules(
             self.state.session.meta.structured_permission_rules.clone(),
         );
@@ -791,7 +788,6 @@ impl App {
         self.state.goal.reset();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
-        self.permissions.load_session_rules(Vec::new());
         self.permissions
             .load_structured_conversation_rules(Vec::new());
         self.permissions.set_session_yolo(None);
@@ -1530,8 +1526,6 @@ impl App {
         recover_pending_workspace_restore(&mut session, &snapshot_store, &self.storage_writer)?;
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
-        self.permissions
-            .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.permissions
             .load_structured_conversation_rules(session.meta.structured_permission_rules.clone());
         self.apply_stored_yolo(&session.meta);

@@ -45,7 +45,6 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
-use crate::app::session_state::stored_to_rules;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{
@@ -603,7 +602,6 @@ impl SpawnCtx {
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
         let permissions = Arc::new(self.permissions.fork());
-        permissions.load_session_rules(stored_to_rules(&session.meta.session_rules));
         permissions.set_session_yolo(session.meta.yolo);
         let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         let subagent_history = crate::agent::stored_subagent_history(&session);

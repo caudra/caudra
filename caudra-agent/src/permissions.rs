@@ -319,8 +319,6 @@ impl PluginRuleStore {
 
 pub struct PermissionManager {
     id: u64,
-    session_rules: Mutex<Vec<PermissionRule>>,
-    inactive_session_allows: Mutex<Vec<PermissionRule>>,
     structured_conversation_rules: Mutex<Vec<PermissionRuleRecord>>,
     conversation_policy_error: Mutex<Option<String>>,
     broker: Arc<PermissionBroker>,
@@ -394,7 +392,6 @@ pub enum RevokedRuleScope {
 pub struct EffectivePermissionRule {
     pub source: &'static str,
     pub rule: PermissionRule,
-    pub removable: bool,
 }
 
 #[derive(Debug, Error)]
@@ -726,8 +723,6 @@ impl PermissionManager {
 
         Self {
             id: NEXT_PERMISSION_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
-            session_rules: Mutex::new(Vec::new()),
-            inactive_session_allows: Mutex::new(Vec::new()),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
             broker: policy
@@ -827,8 +822,6 @@ impl PermissionManager {
         let configured = self.configured().clone();
         Self {
             id: NEXT_PERMISSION_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
-            session_rules: Mutex::new(Vec::new()),
-            inactive_session_allows: Mutex::new(Vec::new()),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
             broker: Arc::clone(&self.broker),
@@ -840,13 +833,6 @@ impl PermissionManager {
             policy: self.policy.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
         }
-    }
-
-    fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
-        self.session_rules.lock().unwrap_or_else(|e| {
-            warn!("permission mutex was poisoned, recovering");
-            e.into_inner()
-        })
     }
 
     fn structured_conversation_rules(
@@ -1093,7 +1079,6 @@ impl PermissionManager {
         include_builtin_allows: bool,
         include_config_shell_policy: bool,
     ) -> Vec<ScopeRuleDecision> {
-        let session = self.session_rules().clone();
         let config = self.active_config_rules();
         let builtin = self.project().builtin_rules.clone();
         let plugin = self.plugin_rules.snapshot();
@@ -1103,9 +1088,9 @@ impl PermissionManager {
             .iter()
             .map(|scope| {
                 let mut decision = ScopeRuleDecision::default();
-                for rule in session
+                for rule in config
                     .iter()
-                    .chain(config.iter().filter(|_| !shell_tool))
+                    .filter(|_| !shell_tool)
                     .chain(builtin.iter().filter(|_| include_builtin_allows))
                     .chain(&plugin)
                 {
@@ -1262,20 +1247,6 @@ impl PermissionManager {
         self.check_inner(tool, scopes, force_prompt, plan_path, true, true)
     }
 
-    pub fn add_session_rule(&self, rule: PermissionRule) {
-        if rule.effect == Effect::Ask {
-            warn!(tool = %rule.tool, "session ask rules are not supported");
-            return;
-        }
-        let mut rules = self.session_rules();
-        let exists = rules
-            .iter()
-            .any(|r| r.tool == rule.tool && r.scope == rule.scope && r.effect == rule.effect);
-        if !exists {
-            rules.push(rule);
-        }
-    }
-
     /// The explicit toggle, so it also claims the session's intent: `/yolo` off
     /// under `--yolo` genuinely turns the session off and is remembered.
     pub fn toggle_yolo(&self) -> bool {
@@ -1318,37 +1289,6 @@ impl PermissionManager {
                 path.display()
             )),
         }
-    }
-
-    pub fn session_rules_snapshot(&self) -> Vec<PermissionRule> {
-        let mut rules = self.session_rules().clone();
-        rules.extend(
-            self.inactive_session_allows
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .cloned(),
-        );
-        rules
-    }
-
-    pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
-        let (inactive_allows, active_denies): (Vec<_>, Vec<_>) = rules
-            .into_iter()
-            .filter(|rule| {
-                if rule.effect == Effect::Ask {
-                    warn!(tool = %rule.tool, "restored session ask rules are not supported");
-                    false
-                } else {
-                    true
-                }
-            })
-            .partition(|rule| rule.effect == Effect::Allow);
-        *self.session_rules() = active_denies;
-        *self
-            .inactive_session_allows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = inactive_allows;
     }
 
     pub fn structured_conversation_rules_snapshot(&self) -> Vec<PermissionRuleRecord> {
@@ -1506,40 +1446,19 @@ impl PermissionManager {
                     })
             });
         }
-        candidates.extend(
-            self.inactive_session_allows
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .map(|rule| PermissionReviewCandidate {
-                    source: caudra_config::PermissionSource::Conversation,
-                    kind: caudra_config::PermissionReviewKind::Rule,
-                    tool: Some(rule.tool.clone()),
-                    scope: rule.scope.clone(),
-                }),
-        );
         candidates
     }
 
     pub fn effective_legacy_policy(&self) -> Vec<EffectivePermissionRule> {
         let builtin_rules = self.project().builtin_rules.clone();
         let mut entries: Vec<_> = self
-            .session_rules()
-            .iter()
-            .cloned()
+            .active_config_rules()
+            .into_iter()
             .map(|rule| EffectivePermissionRule {
-                source: "conversation",
-                rule,
-                removable: true,
-            })
-            .collect();
-        entries.extend(self.active_config_rules().into_iter().map(|rule| {
-            EffectivePermissionRule {
                 source: "configuration",
                 rule,
-                removable: false,
-            }
-        }));
+            })
+            .collect();
         entries.extend(
             builtin_rules
                 .iter()
@@ -1547,51 +1466,18 @@ impl PermissionManager {
                 .map(|rule| EffectivePermissionRule {
                     source: "builtin",
                     rule,
-                    removable: false,
                 }),
         );
-        entries.extend(self.plugin_rules.snapshot().into_iter().map(|rule| {
-            EffectivePermissionRule {
-                source: "trusted plugin",
-                rule,
-                removable: false,
-            }
-        }));
+        entries.extend(
+            self.plugin_rules
+                .snapshot()
+                .into_iter()
+                .map(|rule| EffectivePermissionRule {
+                    source: "trusted plugin",
+                    rule,
+                }),
+        );
         entries
-    }
-
-    pub fn remove_conversation_legacy_rule(
-        &self,
-        tool: &ToolKey,
-        scope: Option<&str>,
-        effect: Effect,
-    ) -> bool {
-        fn remove(
-            rules: &mut Vec<PermissionRule>,
-            tool: &ToolKey,
-            scope: Option<&str>,
-            effect: Effect,
-        ) -> bool {
-            let before = rules.len();
-            rules.retain(|rule| {
-                rule.tool != *tool || rule.scope.as_deref() != scope || rule.effect != effect
-            });
-            rules.len() != before
-        }
-
-        if effect == Effect::Allow {
-            remove(
-                &mut self
-                    .inactive_session_allows
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()),
-                tool,
-                scope,
-                effect,
-            )
-        } else {
-            remove(&mut self.session_rules(), tool, scope, effect)
-        }
     }
 
     pub fn revoke_structured_rule(
@@ -1776,70 +1662,6 @@ impl PermissionManager {
             .insert_with_review(project, rule, review)
             .map_err(|error| PermissionPolicyError(error.to_string()))?;
         Ok(reusable_allow)
-    }
-
-    pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
-        let resolved = if tool.is_mcp() {
-            scopes
-                .iter()
-                .map(|scope| canonical_mcp_scope(scope))
-                .collect()
-        } else {
-            scopes.to_vec()
-        };
-
-        match answer {
-            PermissionAnswer::AllowOnce
-            | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => {}
-            PermissionAnswer::AllowOption { lifetime, .. } => match lifetime {
-                PermissionLifetime::Once => {}
-                PermissionLifetime::Conversation => {
-                    for s in &resolved {
-                        self.add_session_rule(PermissionRule {
-                            tool: tool.clone(),
-                            scope: Some(s.clone()),
-                            effect: Effect::Allow,
-                        });
-                    }
-                }
-                PermissionLifetime::Project | PermissionLifetime::Global => {
-                    for s in &resolved {
-                        self.add_session_rule(PermissionRule {
-                            tool: tool.clone(),
-                            scope: Some(s.clone()),
-                            effect: Effect::Allow,
-                        });
-                    }
-                }
-            },
-            PermissionAnswer::AllowSession => {
-                for s in &resolved {
-                    self.add_session_rule(PermissionRule {
-                        tool: tool.clone(),
-                        scope: Some(s.clone()),
-                        effect: Effect::Allow,
-                    });
-                }
-            }
-            PermissionAnswer::AllowAlwaysLocal
-            | PermissionAnswer::AllowAlwaysGlobal
-            | PermissionAnswer::DenyAlwaysLocal
-            | PermissionAnswer::DenyAlwaysGlobal => {
-                let effect = if answer.is_allow() {
-                    Effect::Allow
-                } else {
-                    Effect::Deny
-                };
-                for s in &resolved {
-                    self.add_session_rule(PermissionRule {
-                        tool: tool.clone(),
-                        scope: Some(s.clone()),
-                        effect,
-                    });
-                }
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3656,19 +3478,6 @@ mod tests {
     }
 
     #[test]
-    fn session_rule_overrides_config() {
-        let mgr = mgr_with(
-            make_config(vec![allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
-        );
-        mgr.add_session_rule(deny_rule("cargo *"));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
-        ));
-    }
-
-    #[test]
     fn deny_overrides_default_allow() {
         let mgr = mgr_with(
             PermissionsConfig {
@@ -3681,42 +3490,6 @@ mod tests {
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
-        ));
-    }
-
-    #[test]
-    fn allow_decision_is_exact() {
-        let mgr = default_mgr();
-        mgr.apply_decision(
-            &ToolKey::native("bash"),
-            &["cargo test --all".into()],
-            &PermissionAnswer::AllowSession,
-        );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test --all", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo build", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn deny_decision_uses_exact() {
-        let mgr = default_mgr();
-        mgr.apply_decision(
-            &ToolKey::native("bash"),
-            &["cargo test".into()],
-            &PermissionAnswer::DenyAlwaysLocal,
-        );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo build", None),
-            PermissionCheck::NeedsPrompt { .. }
         ));
     }
 
@@ -3881,66 +3654,6 @@ mod tests {
             }
             other => panic!("expected NeedsPrompt, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn apply_decision_multi_scope_keeps_each_exact() {
-        let mgr = default_mgr();
-        mgr.apply_decision(
-            &ToolKey::native("bash"),
-            &["cargo test".into(), "git status".into()],
-            &PermissionAnswer::AllowSession,
-        );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "git status", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "git push", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn mcp_remembered_allow_reuses_only_exact_canonical_input() {
-        let mgr = default_mgr();
-        let approved = canonical_json(&serde_json::json!({
-            "url": "https://a",
-            "options": {"format": "json", "limit": 10}
-        }));
-        mgr.apply_decision(
-            &ToolKey::parse("myfetch.search").unwrap(),
-            &[approved],
-            &PermissionAnswer::AllowSession,
-        );
-        assert!(matches!(
-            mgr.check(
-                &ToolKey::parse("myfetch.search").unwrap(),
-                r#"{"options":{"limit":10,"format":"json"},"url":"https://a"}"#,
-                None
-            ),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(
-                &ToolKey::parse("myfetch.search").unwrap(),
-                r#"{"url":"https://b","options":{"format":"json","limit":10}}"#,
-                None
-            ),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-        assert!(matches!(
-            mgr.check(
-                &ToolKey::parse("myfetch.exec").unwrap(),
-                "{\"cmd\":\"ls\"}",
-                None
-            ),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
     }
 
     #[test]
@@ -4355,28 +4068,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_remembered_deny_is_exact_without_a_broad_option() {
-        let mgr = mgr_with(make_config(vec![]), PathBuf::from("/tmp"));
-        let tool = ToolKey::McpTool {
-            server: "deepwiki".into(),
-            tool: "search".into(),
-        };
-        mgr.apply_decision(
-            &tool,
-            &["{\"q\":\"dangerous\"}".into()],
-            &PermissionAnswer::DenyAlwaysLocal,
-        );
-        assert!(matches!(
-            mgr.check(&tool, "{\"q\":\"dangerous\"}", None),
-            PermissionCheck::Denied
-        ));
-        assert!(matches!(
-            mgr.check(&tool, "{\"q\":\"safe\"}", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
     fn yolo_mode_allows_but_deny_still_blocks() {
         let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         mgr.toggle_yolo();
@@ -4438,69 +4129,6 @@ mod tests {
         let mgr = seeded_mgr(seed);
         assert_eq!(mgr.toggle_yolo(), !seed);
         yolo_state(&mgr)
-    }
-
-    #[test]
-    fn add_session_rule_is_idempotent() {
-        let mgr = default_mgr();
-        let rule = allow_rule("cargo *");
-        mgr.add_session_rule(rule.clone());
-        mgr.add_session_rule(rule.clone());
-        mgr.add_session_rule(rule);
-        assert_eq!(mgr.session_rules_snapshot().len(), 1);
-        mgr.add_session_rule(PermissionRule {
-            tool: ToolKey::native("bash"),
-            scope: Some("git push *".into()),
-            effect: Effect::Ask,
-        });
-        assert_eq!(mgr.session_rules_snapshot().len(), 1);
-    }
-
-    #[test]
-    fn restored_legacy_allows_are_inactive_review_candidates() {
-        let mgr = default_mgr();
-        mgr.load_session_rules(vec![
-            allow_rule("cargo *"),
-            deny_rule("rm *"),
-            PermissionRule {
-                tool: ToolKey::native("bash"),
-                scope: Some("git push *".into()),
-                effect: Effect::Ask,
-            },
-        ]);
-
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "rm -rf /tmp/x", None),
-            PermissionCheck::Denied
-        ));
-        assert_eq!(mgr.session_rules_snapshot().len(), 2);
-        assert!(mgr.review_candidates().iter().any(|candidate| {
-            candidate.source == caudra_config::PermissionSource::Conversation
-                && candidate.scope.as_deref() == Some("cargo *")
-        }));
-        assert!(mgr.remove_conversation_legacy_rule(
-            &ToolKey::native("bash"),
-            Some("cargo *"),
-            Effect::Allow,
-        ));
-        assert!(mgr.remove_conversation_legacy_rule(
-            &ToolKey::native("bash"),
-            Some("rm *"),
-            Effect::Deny,
-        ));
-        assert!(mgr.session_rules_snapshot().is_empty());
-    }
-
-    #[test_case(PermissionAnswer::AllowOnce ; "allow_once")]
-    #[test_case(PermissionAnswer::Deny ; "deny_once")]
-    fn once_decisions_add_no_session_rules(answer: PermissionAnswer) {
-        let mgr = default_mgr();
-        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
-        assert!(mgr.session_rules_snapshot().is_empty());
     }
 
     #[test]

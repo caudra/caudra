@@ -104,7 +104,6 @@ const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
-const SESSION_PERMISSION_SCOPE: &str = "cargo *";
 const CONVERSATION_PERMISSION_PATTERN: &str = "just *";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
@@ -5880,42 +5879,6 @@ fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
     assert_eq!(app.state.session.meta.yolo, Some(false));
 }
 
-fn session_allow_rule() -> PermissionRule {
-    PermissionRule {
-        tool: ToolKey::native("bash"),
-        scope: Some(SESSION_PERMISSION_SCOPE.into()),
-        effect: Effect::Allow,
-    }
-}
-
-#[test]
-fn checkpoint_and_resume_restore_session_rules() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    crate::push_history_message(
-        app.state.session_mut(),
-        Message::user(RESUMED_PROMPT.into()),
-    );
-    let rule = session_allow_rule();
-    app.permissions.load_session_rules(vec![rule.clone()]);
-    app.checkpoint();
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    let stored = AppSession::load(id, &dir).unwrap();
-    assert_eq!(stored.meta.session_rules.len(), 1);
-    let resumed_writer = Arc::new(test_writer(dir.clone()));
-    let mut resumed = build_app(dir, Arc::clone(&resumed_writer));
-    resumed.state.session = Arc::new(stored);
-    resumed.restore_resumed_session();
-
-    let restored_rules = resumed.permissions.session_rules_snapshot();
-    assert_eq!(restored_rules.len(), 1);
-    assert_eq!(restored_rules[0].tool, rule.tool);
-    assert_eq!(restored_rules[0].scope, rule.scope);
-    assert_eq!(restored_rules[0].effect, rule.effect);
-    drain_writer(resumed, resumed_writer);
-}
-
 fn conversation_permission_record() -> caudra_agent::permissions::PermissionRuleRecord {
     use caudra_agent::permissions::{
         PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
@@ -5946,8 +5909,7 @@ fn conversation_permission_record() -> caudra_agent::permissions::PermissionRule
     .unwrap()
 }
 
-/// The legacy `session_rules` path has coverage and is unused in practice.
-/// This is the one that carries real grants, so a dropped restore call has to
+/// Conversation rules carry the real grants, so a dropped restore call has to
 /// fail here rather than silently re-prompting for everything next session.
 #[test]
 fn checkpoint_and_resume_restore_structured_conversation_rules() {
@@ -6065,13 +6027,23 @@ fn resetting_the_session_falls_back_to_the_yolo_seed(seed: bool) -> (bool, Optio
 fn resetting_the_session_clears_conversation_rules() {
     let mut app = test_app();
     app.permissions
-        .load_session_rules(vec![session_allow_rule()]);
+        .load_structured_conversation_rules(vec![conversation_permission_record()]);
 
     app.reset_session();
     app.checkpoint();
 
-    assert!(app.permissions.session_rules_snapshot().is_empty());
-    assert!(app.state.session.meta.session_rules.is_empty());
+    assert!(
+        app.permissions
+            .structured_conversation_rules_snapshot()
+            .is_empty()
+    );
+    assert!(
+        app.state
+            .session
+            .meta
+            .structured_permission_rules
+            .is_empty()
+    );
 }
 
 #[test]
@@ -8263,11 +8235,8 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.fast = true;
     app.state.workflow = true;
     app.state.system_prompt_profile_name = "review".into();
-    app.permissions.load_session_rules(vec![PermissionRule {
-        tool: ToolKey::parse("bash").unwrap(),
-        scope: Some("cargo test".into()),
-        effect: Effect::Allow,
-    }]);
+    app.permissions
+        .load_structured_conversation_rules(vec![conversation_permission_record()]);
     app.permissions.set_session_yolo(Some(true));
     app.state.token_usage.input = 42;
     app.state.session_mut().meta.input_draft = Some("old draft".into());
@@ -8296,7 +8265,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.fast);
     assert!(child.meta.workflow);
     assert_eq!(child.meta.system_prompt_profile.as_deref(), Some("review"));
-    assert!(child.meta.session_rules.is_empty());
+    assert!(child.meta.structured_permission_rules.is_empty());
     assert_eq!(child.meta.yolo, None);
     assert_eq!(child.token_usage, TokenUsage::default());
     assert!(child.usage_by_model().is_empty());
@@ -8728,11 +8697,8 @@ fn mcp_toggle_dispatches_action() {
 #[test]
 fn permissions_command_lists_current_conversation_rules() {
     let mut app = test_app();
-    app.permissions.load_session_rules(vec![PermissionRule {
-        tool: ToolKey::native("bash"),
-        scope: Some("cargo check -p caudra-ui".into()),
-        effect: Effect::Allow,
-    }]);
+    app.permissions
+        .load_structured_conversation_rules(vec![conversation_permission_record()]);
 
     app.execute_command(cmd("/permissions"), 0);
 

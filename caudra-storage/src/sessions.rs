@@ -257,8 +257,6 @@ pub struct SessionMeta {
     pub plan_path: Option<String>,
     #[serde(default)]
     pub plan_written: bool,
-    #[serde(default)]
-    pub session_rules: Vec<StoredRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
     #[serde(default)]
@@ -483,13 +481,6 @@ pub struct SessionSummary {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StoredEffect {
-    Allow,
-    Deny,
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StoredMode {
@@ -568,14 +559,6 @@ impl StoredSubagentTaskSpec {
 
 fn default_subagent_profile_name() -> String {
     DEFAULT_SUBAGENT_PROFILE_NAME.to_owned()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredRule {
-    pub tool: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-    pub effect: StoredEffect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_lock::Mutex;
-use caudra_config::{Effect, ModelPolicy, PermissionRule, ToolKey};
+use caudra_config::ModelPolicy;
+#[cfg(test)]
+use caudra_config::ToolKey;
 use caudra_providers::Timeouts;
 use caudra_providers::model::Model;
 use caudra_providers::provider::{self, Provider};
@@ -17,8 +19,7 @@ use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
-    SessionCursor, SessionDatabase, SessionLease, StoredEffect, StoredRule, StoredSubagent,
-    StoredSubagentOutcome,
+    SessionCursor, SessionDatabase, SessionLease, StoredSubagent, StoredSubagentOutcome,
 };
 use flume::Receiver;
 use serde_json::Value;
@@ -218,7 +219,6 @@ impl SessionStore {
     }
 
     fn sync_permissions(&mut self, permissions: &PermissionManager) {
-        self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
         self.session.meta.structured_permission_rules =
             permissions.structured_conversation_rules_snapshot();
         self.session.meta.yolo = permissions.persisted_yolo();
@@ -580,45 +580,6 @@ fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
     }
 }
 
-fn rules_to_stored(rules: &[PermissionRule]) -> Vec<StoredRule> {
-    rules
-        .iter()
-        .filter_map(|rule| {
-            let effect = match rule.effect {
-                Effect::Allow => StoredEffect::Allow,
-                Effect::Deny => StoredEffect::Deny,
-                Effect::Ask => return None,
-            };
-            Some(StoredRule {
-                tool: rule.tool.to_string(),
-                scope: rule.scope.clone(),
-                effect,
-            })
-        })
-        .collect()
-}
-
-fn stored_to_rules(rules: &[StoredRule]) -> Vec<PermissionRule> {
-    rules
-        .iter()
-        .filter_map(|rule| {
-            let tool = ToolKey::parse(&rule.tool)
-                .map_err(|error| {
-                    warn!(tool = %rule.tool, %error, "skipping malformed stored permission rule")
-                })
-                .ok()?;
-            Some(PermissionRule {
-                tool,
-                scope: rule.scope.clone(),
-                effect: match rule.effect {
-                    StoredEffect::Allow => Effect::Allow,
-                    StoredEffect::Deny => Effect::Deny,
-                },
-            })
-        })
-        .collect()
-}
-
 pub struct HeadlessParams {
     pub model: Model,
     pub config: AgentConfig,
@@ -898,7 +859,6 @@ pub struct InteractiveParams {
     pub expected_write_version: Option<i64>,
     pub initial_history: Vec<HistoryItem>,
     pub yolo: bool,
-    pub session_rules: Vec<StoredRule>,
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
     pub session_yolo: Option<bool>,
     pub system_prompt_override: Option<String>,
@@ -1032,7 +992,6 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
         params.initial_wd,
         Arc::clone(&params.plugin_rules),
     ));
-    permissions.load_session_rules(stored_to_rules(&params.session_rules));
     permissions.load_structured_conversation_rules(params.structured_permission_rules);
     permissions.set_session_yolo(params.session_yolo);
 
@@ -1290,7 +1249,6 @@ mod tests {
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
-    const SESSION_SCOPE: &str = "cargo *";
 
     fn session_id() -> CaudraId {
         SESSION_ID.parse().unwrap()
@@ -1750,12 +1708,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
         let permissions = permission_manager();
-        let rule = PermissionRule {
-            tool: ToolKey::native("bash"),
-            scope: Some(SESSION_SCOPE.into()),
-            effect: Effect::Allow,
-        };
-        permissions.load_session_rules(vec![rule.clone()]);
         let request = crate::permissions::PermissionRequest::from_legacy(
             "request".into(),
             ToolKey::native("bash"),
@@ -1781,22 +1733,15 @@ mod tests {
             .unwrap();
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.meta.session_rules.len(), 1);
         assert_eq!(
             loaded.meta.structured_permission_rules,
             vec![structured.clone()]
         );
         assert_eq!(loaded.meta.yolo, Some(true));
         let restored = permission_manager();
-        restored.load_session_rules(stored_to_rules(&loaded.meta.session_rules));
         restored
             .load_structured_conversation_rules(loaded.meta.structured_permission_rules.clone());
         restored.set_session_yolo(loaded.meta.yolo);
-        let restored_rules = restored.session_rules_snapshot();
-        assert_eq!(restored_rules.len(), 1);
-        assert_eq!(restored_rules[0].tool, rule.tool);
-        assert_eq!(restored_rules[0].scope, rule.scope);
-        assert_eq!(restored_rules[0].effect, rule.effect);
         assert_eq!(
             restored.structured_conversation_rules_snapshot(),
             vec![structured]

@@ -1655,17 +1655,6 @@ impl App {
                     }
                 }
             }
-            PermissionsPickerAction::RemoveLegacy(rule) => {
-                if self.permissions.remove_conversation_legacy_rule(
-                    &rule.tool,
-                    rule.scope.as_deref(),
-                    rule.effect,
-                ) {
-                    self.checkpoint_now();
-                    let _ = self.open_permissions_picker();
-                    self.flash("Legacy conversation rule removed".into());
-                }
-            }
             PermissionsPickerAction::Revoke(id) => {
                 match self.permissions.revoke_structured_rule(&id) {
                     Ok(Some(scope)) => {

@@ -38,7 +38,7 @@ use caudra_providers::{Message, expand_message};
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_state::PermissionRuleRecord;
-use caudra_storage::sessions::{SessionError, SessionLease, StoredRule, StoredTokenUsage};
+use caudra_storage::sessions::{SessionError, SessionLease, StoredTokenUsage};
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
 use serde::Serialize;
@@ -285,7 +285,7 @@ async fn new_session(
             session_lease,
             expected_write_version: None,
             history: Vec::new(),
-            permissions: (Vec::new(), Vec::new(), None),
+            permissions: (Vec::new(), None),
             profile: (profile_name, profile),
         },
     )
@@ -347,7 +347,6 @@ async fn load_session(
             expected_write_version: restored.write_version,
             history: history.into_items(),
             permissions: (
-                std::mem::take(&mut restored.session_rules),
                 std::mem::take(&mut restored.structured_permission_rules),
                 restored.yolo,
             ),
@@ -388,7 +387,7 @@ struct SessionStart {
     session_lease: Arc<SessionLease>,
     expected_write_version: Option<i64>,
     history: Vec<HistoryItem>,
-    permissions: (Vec<StoredRule>, Vec<PermissionRuleRecord>, Option<bool>),
+    permissions: (Vec<PermissionRuleRecord>, Option<bool>),
     profile: (String, Option<Arc<SystemPromptProfile>>),
 }
 
@@ -408,7 +407,7 @@ async fn prepare_session(
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
-    let (session_rules, structured_permission_rules, session_yolo) = start.permissions;
+    let (structured_permission_rules, session_yolo) = start.permissions;
     let (system_prompt_profile_name, system_prompt_profile) = start.profile;
     let prepared = headless::prepare_interactive(InteractiveParams {
         model: params.model.clone(),
@@ -428,7 +427,6 @@ async fn prepare_session(
         expected_write_version: start.expected_write_version,
         initial_history: start.history,
         yolo: params.yolo,
-        session_rules,
         structured_permission_rules,
         session_yolo,
         system_prompt_override: None,
@@ -683,7 +681,6 @@ struct Restored {
     usage: TokenUsage,
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
-    session_rules: Vec<StoredRule>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
     yolo: Option<bool>,
     system_prompt_profile: Option<String>,
@@ -723,7 +720,6 @@ fn load_history_from(
         usage: session.token_usage,
         by_model: session.usage_by_model().clone(),
         model: session.model.clone(),
-        session_rules: session.meta.session_rules.clone(),
         structured_permission_rules: session.meta.structured_permission_rules.clone(),
         yolo: session.meta.yolo,
         system_prompt_profile: session.meta.system_prompt_profile.clone(),
@@ -1121,7 +1117,6 @@ mod tests {
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
-    const SESSION_PERMISSION_SCOPE: &str = "cargo *";
 
     fn history_items(messages: &[Message]) -> Vec<HistoryItem> {
         let mut items = Vec::new();
@@ -1558,11 +1553,6 @@ mod tests {
             output: 200,
             ..Default::default()
         };
-        session.meta.session_rules = vec![StoredRule {
-            tool: "bash".into(),
-            scope: Some(SESSION_PERMISSION_SCOPE.into()),
-            effect: caudra_storage::sessions::StoredEffect::Allow,
-        }];
         let request = PermissionRequest::from_legacy(
             "stored-structured".into(),
             caudra_config::ToolKey::native("bash"),
@@ -1592,7 +1582,6 @@ mod tests {
         assert_eq!(restored.history, items);
         assert_eq!(restored.cwd, Some(PathBuf::from("/project")));
         assert_eq!(restored.usage, session.token_usage);
-        assert_eq!(restored.session_rules, session.meta.session_rules);
         assert_eq!(
             restored.structured_permission_rules,
             session.meta.structured_permission_rules
