@@ -8,7 +8,7 @@ use tracing::warn;
 use caudra_config::{MIN_PER_TOOL_OUTPUT_BYTES, MIN_PER_TOOL_OUTPUT_LINES};
 
 use crate::tools::ToolContext;
-use crate::{TextOutput, ToolDoneEvent, ToolOutput, ToolOutputLimits};
+use crate::{IndexOutput, TextOutput, ToolDoneEvent, ToolOutput, ToolOutputLimits};
 
 const PERSIST_THRESHOLD_BYTES: usize = 8 * 1024;
 const READ_LIMIT: usize = 200;
@@ -242,6 +242,13 @@ fn marker(output_ref: Option<&ToolOutputRef>) -> String {
     }
 }
 
+/// Bounds a presentation in place; it never replaces one. Only a variant whose
+/// text is the model's copy rather than the card's source can be cut here:
+/// `Index` keeps its semantic lines, `Batch` its roster, and a variant drawn
+/// entirely from structured fields is left whole. The reader is already held to
+/// `ui.tool_output_lines` with an expand control and the model reads the
+/// bounded `model_output`, so collapsing the variant to `Plain` bought no bytes
+/// either of them was spending and cost the card the shape it is drawn from.
 fn bound_presentation(
     output: &mut ToolOutput,
     marker: &str,
@@ -254,30 +261,29 @@ fn bound_presentation(
         return;
     }
 
-    if let ToolOutput::Index(index) = output {
-        let preview = preview_body(&rendered, marker, "", max_lines, max_bytes);
-        match index {
-            crate::IndexOutput::File { skeleton, .. } => *skeleton = preview,
-            crate::IndexOutput::Directory { listing, .. } => *listing = preview,
+    match output {
+        ToolOutput::Index(IndexOutput::File { skeleton, .. }) => {
+            *skeleton = preview_body(&rendered, marker, "", max_lines, max_bytes);
         }
-        return;
-    }
-
-    if let Some(text) = text_output_mut(output) {
-        let source = text.text.clone();
-        let trailer = rendered.strip_prefix(&source).unwrap_or_default();
-        let ending = format!("{marker}{trailer}");
-        if fits(&ending, max_lines, max_bytes) {
-            text.text = preview_body(&source, marker, trailer, max_lines, max_bytes);
-            return;
+        ToolOutput::Index(IndexOutput::Directory { listing, .. }) => {
+            *listing = preview_body(&rendered, marker, "", max_lines, max_bytes);
         }
-
-        text.text = preview_body(&rendered, marker, "", max_lines, max_bytes);
-        text.instructions = None;
-        return;
+        ToolOutput::Batch { text, .. } => {
+            *text = preview_body(&rendered, marker, "", max_lines, max_bytes);
+        }
+        ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text) => {
+            let source = text.text.clone();
+            let trailer = rendered.strip_prefix(&source).unwrap_or_default();
+            let ending = format!("{marker}{trailer}");
+            if fits(&ending, max_lines, max_bytes) {
+                text.text = preview_body(&source, marker, trailer, max_lines, max_bytes);
+            } else {
+                text.text = preview_body(&rendered, marker, "", max_lines, max_bytes);
+                text.instructions = None;
+            }
+        }
+        _ => {}
     }
-
-    *output = ToolOutput::Plain(preview_body(&rendered, marker, "", max_lines, max_bytes).into());
 }
 
 fn text_output_mut(output: &mut ToolOutput) -> Option<&mut TextOutput> {
@@ -393,8 +399,15 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::InstructionBlock;
+    use crate::tools::ToolEffect;
+    use crate::{
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepLine, GrepMatchGroup, PatchedFile,
+    };
+    use std::mem::discriminant;
 
     const LARGE_BYTE_LIMIT: usize = 100_000;
+    const ROSTER_LOST: &str = "an oversized batch must keep the roster its card is drawn from";
+    const SHAPE_LOST: &str = "an oversized result must keep the variant its card is drawn from";
 
     #[test_case("", 0 ; "empty")]
     #[test_case("x", 1 ; "unterminated")]
@@ -791,6 +804,110 @@ mod tests {
         assert!(skeleton.contains("Tool output truncated"));
         assert_eq!(lines.len(), 1);
         assert_eq!(retained_state, Some(state));
+    }
+
+    /// The reported bug: a batch big enough to be bounded came back as `Plain`,
+    /// so the card lost `entries` and drew the flattened `## tool` dump the
+    /// model was handed, abridged to the three lines `other` allows.
+    #[test]
+    fn batch_presentation_is_bounded_without_losing_its_roster() {
+        let mut done = done(String::new(), false);
+        done.output = ToolOutput::Batch {
+            entries: vec![BatchToolEntry {
+                tool: "file_read".into(),
+                effect: ToolEffect::ReadOnly,
+                summary: "README.md".into(),
+                status: BatchToolStatus::Success,
+                input: None,
+                raw_input: None,
+                output: Some(ToolOutput::Plain("child body".into())),
+                annotation: None,
+            }],
+            text: (0..400)
+                .map(|line| format!("{line}: <p align=\"center\">"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let ctx = context(8, 360);
+
+        smol::block_on(limit(&mut done, &ctx));
+
+        let ToolOutput::Batch { entries, text } = done.output else {
+            panic!("{ROSTER_LOST}");
+        };
+        assert_eq!(entries.len(), 1, "{ROSTER_LOST}");
+        assert_eq!(entries[0].tool, "file_read", "{ROSTER_LOST}");
+        assert!(fits(
+            &text,
+            ctx.config.max_output_lines,
+            ctx.config.max_output_bytes
+        ));
+        assert!(text.contains("Tool output truncated"));
+    }
+
+    fn big_read_code() -> ToolOutput {
+        ToolOutput::ReadCode {
+            path: "README.md".into(),
+            start_line: 1,
+            lines: (0..400).map(|line| format!("line-{line}")).collect(),
+            total_lines: 400,
+            instructions: None,
+        }
+    }
+
+    fn big_grep_result() -> ToolOutput {
+        ToolOutput::GrepResult {
+            entries: (0..40)
+                .map(|file| GrepFileEntry {
+                    path: format!("src/file-{file}.rs"),
+                    groups: vec![GrepMatchGroup {
+                        lines: vec![GrepLine {
+                            line_nr: 1,
+                            text: "fn main() {}".into(),
+                            is_match: true,
+                        }],
+                    }],
+                })
+                .collect(),
+            capped: None,
+        }
+    }
+
+    fn big_patch() -> ToolOutput {
+        ToolOutput::Patch {
+            files: (0..40)
+                .map(|file| PatchedFile {
+                    path: format!("src/file-{file}.rs"),
+                    patch: "@@ -1 +1 @@\n-before\n+after".into(),
+                    additions: 1,
+                    deletions: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// The same defect one variant over: a result drawn from structured fields
+    /// has no text to cut, and replacing it cost the code view, the match list
+    /// and the diff the model never read anyway.
+    #[test_case(big_read_code() ; "read_code")]
+    #[test_case(big_grep_result() ; "grep_result")]
+    #[test_case(big_patch() ; "patch")]
+    fn structured_presentations_keep_their_shape_when_bounded(output: ToolOutput) {
+        let shape = discriminant(&output);
+        let mut done = done(String::new(), false);
+        done.output = output;
+        let ctx = context(8, 360);
+
+        smol::block_on(limit(&mut done, &ctx));
+
+        assert_eq!(discriminant(&done.output), shape, "{SHAPE_LOST}");
+        let model_output = done.model_output.expect("bounded model output");
+        assert!(fits(
+            &model_output,
+            ctx.config.max_output_lines,
+            ctx.config.max_output_bytes
+        ));
+        assert!(model_output.contains("Tool output truncated"));
     }
 
     #[test]
