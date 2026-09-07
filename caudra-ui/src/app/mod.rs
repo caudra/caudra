@@ -708,6 +708,13 @@ impl App {
     }
 
     pub(crate) fn update_model(&mut self, model: &Model) {
+        // A level chosen for the model being switched to outranks whatever the
+        // previous model was on; a level is only meaningful against the ladder
+        // that declared it. Without a choice of its own the current level
+        // carries over and is snapped per request, as before.
+        if let Some(stored) = caudra_storage::thinking::read(&self.storage, &model.spec()) {
+            self.state.thinking = stored.into();
+        }
         self.state.update_model(model);
         self.chats[0].context_window = model.context_window;
         persist_model(&self.storage, &self.state.session.model);
@@ -719,7 +726,11 @@ impl App {
     /// the user asked for on a model that could honor it.
     fn apply_thinking(&mut self, thinking: ThinkingConfig) {
         self.state.thinking = thinking;
-        caudra_storage::thinking::persist(&self.storage, &self.state.thinking.clone().into());
+        caudra_storage::thinking::persist(
+            &self.storage,
+            &self.state.model.spec(),
+            &self.state.thinking.clone().into(),
+        );
     }
 
     /// Takes the spelling both `/thinking` and `caudra.model.set` accept; a

@@ -9,6 +9,7 @@
 //! Lives in the storage crate, the leaf both the config and provider layers
 //! depend on, so neither needs the other to parse or validate a setting.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -21,8 +22,20 @@ use crate::{StateClass, StateDir};
 /// Floor for every token budget sent to a provider; some APIs reject smaller values.
 pub const MIN_THINKING_BUDGET: u32 = 1024;
 
-/// The level last chosen interactively, so a restart reopens on it. Global
-/// rather than per project, matching the selected model.
+/// The level last chosen interactively for each model, so a restart reopens on
+/// it. Keyed by model spec because a level is only meaningful against the
+/// ladder that declared it: carrying one model's `max` onto a model that never
+/// declared it means sending a level the endpoint rejects, or silently snapping
+/// to something the user did not choose. Global rather than per project,
+/// matching the selected model.
+const SELECTED_BY_MODEL: StateKey = StateKey {
+    name: "thinking.selected_by_model",
+    class: StateClass::Persistent,
+};
+
+/// The single level chosen before the setting became per model. Read as the
+/// fallback for a model with no choice of its own, so upgrading keeps the level
+/// already in use instead of silently resetting it.
 const SELECTED: StateKey = StateKey {
     name: "thinking.selected",
     class: StateClass::Persistent,
@@ -295,19 +308,37 @@ impl FromStr for StoredThinking {
     }
 }
 
-pub fn persist(dir: &StateDir, thinking: &StoredThinking) {
-    if let Err(error) = state::set(dir, SCOPE_GLOBAL, SELECTED, thinking) {
-        warn!(%error, "failed to persist thinking level");
+pub fn persist(dir: &StateDir, model_spec: &str, thinking: &StoredThinking) {
+    let stored = state::update(
+        dir,
+        SCOPE_GLOBAL,
+        SELECTED_BY_MODEL,
+        |by_model: &mut HashMap<String, StoredThinking>| {
+            by_model.insert(model_spec.to_owned(), thinking.clone());
+        },
+    );
+    if let Err(error) = stored {
+        warn!(%error, model = %model_spec, "failed to persist thinking level");
     }
 }
 
-/// `None` when nothing was stored or the row no longer deserializes, which
-/// leaves the caller's own default standing.
-pub fn read(dir: &StateDir) -> Option<StoredThinking> {
-    state::get(dir, SCOPE_GLOBAL, SELECTED).unwrap_or_else(|error| {
-        warn!(%error, "failed to read thinking level");
-        None
-    })
+/// The level last chosen for `model_spec`, falling back to the pre-per-model
+/// setting. `None` when neither was stored or the row no longer deserializes,
+/// which leaves the caller's own default standing.
+pub fn read(dir: &StateDir, model_spec: &str) -> Option<StoredThinking> {
+    let by_model: Option<HashMap<String, StoredThinking>> =
+        state::get(dir, SCOPE_GLOBAL, SELECTED_BY_MODEL).unwrap_or_else(|error| {
+            warn!(%error, "failed to read thinking levels");
+            None
+        });
+    by_model
+        .and_then(|mut by_model| by_model.remove(model_spec))
+        .or_else(|| {
+            state::get(dir, SCOPE_GLOBAL, SELECTED).unwrap_or_else(|error| {
+                warn!(%error, "failed to read thinking level");
+                None
+            })
+        })
 }
 
 #[cfg(test)]
@@ -317,11 +348,16 @@ mod tests {
 
     use super::{
         BUDGET_LADDER, EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
-        StateDir, StoredThinking, ThinkingParseError, effort_rank,
+        SCOPE_GLOBAL, StateDir, StoredThinking, ThinkingParseError, effort_rank, state,
     };
 
     const ROUND_TRIP: &str = "a stored level must read back as written";
     const UNSET: &str = "an unwritten level must leave the caller's default alone";
+    const PER_MODEL: &str = "a level belongs to the model it was chosen for";
+    const LEGACY_CARRIES: &str =
+        "a model with no choice of its own must inherit the pre-upgrade level";
+    const MODEL_A: &str = "anthropic/claude-opus-5";
+    const MODEL_B: &str = "ninfer-4090/qwen3.8-27b-lora";
     const SENTINEL_IS_NOT_A_BOUND: &str =
         "a negative bound means the model decides, not a token count to clamp against";
     /// The window the session title request used to ask for. Half of it is
@@ -540,8 +576,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        super::persist(&dir, &thinking);
-        assert_eq!(super::read(&dir), Some(thinking), "{ROUND_TRIP}");
+        super::persist(&dir, MODEL_A, &thinking);
+        assert_eq!(super::read(&dir, MODEL_A), Some(thinking), "{ROUND_TRIP}");
     }
 
     #[test]
@@ -549,7 +585,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        assert_eq!(super::read(&dir), None, "{UNSET}");
+        assert_eq!(super::read(&dir, MODEL_A), None, "{UNSET}");
     }
 
     #[test]
@@ -557,8 +593,74 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        super::persist(&dir, &StoredThinking::Adaptive);
-        super::persist(&dir, &StoredThinking::Off);
-        assert_eq!(super::read(&dir), Some(StoredThinking::Off), "{ROUND_TRIP}");
+        super::persist(&dir, MODEL_A, &StoredThinking::Adaptive);
+        super::persist(&dir, MODEL_A, &StoredThinking::Off);
+        assert_eq!(
+            super::read(&dir, MODEL_A),
+            Some(StoredThinking::Off),
+            "{ROUND_TRIP}"
+        );
+    }
+
+    /// The whole point: `max` chosen on a model that declares it must not
+    /// follow the user onto one that never did.
+    #[test]
+    fn a_level_chosen_for_one_model_does_not_reach_another() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        super::persist(
+            &dir,
+            MODEL_A,
+            &StoredThinking::Effort {
+                level: "max".into(),
+            },
+        );
+        super::persist(&dir, MODEL_B, &StoredThinking::Off);
+
+        assert_eq!(
+            super::read(&dir, MODEL_A),
+            Some(StoredThinking::Effort {
+                level: "max".into()
+            }),
+            "{PER_MODEL}"
+        );
+        assert_eq!(
+            super::read(&dir, MODEL_B),
+            Some(StoredThinking::Off),
+            "{PER_MODEL}"
+        );
+    }
+
+    /// Upgrading must not silently reset a level the user already set.
+    #[test]
+    fn a_model_with_no_choice_inherits_the_pre_upgrade_level() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        state::set(
+            &dir,
+            SCOPE_GLOBAL,
+            super::SELECTED,
+            &StoredThinking::Adaptive,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::read(&dir, MODEL_A),
+            Some(StoredThinking::Adaptive),
+            "{LEGACY_CARRIES}"
+        );
+
+        super::persist(&dir, MODEL_A, &StoredThinking::Off);
+        assert_eq!(
+            super::read(&dir, MODEL_A),
+            Some(StoredThinking::Off),
+            "{PER_MODEL}"
+        );
+        assert_eq!(
+            super::read(&dir, MODEL_B),
+            Some(StoredThinking::Adaptive),
+            "{LEGACY_CARRIES}"
+        );
     }
 }

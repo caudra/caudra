@@ -130,7 +130,7 @@ impl SessionState {
                 .meta
                 .thinking
                 .clone()
-                .or_else(|| caudra_storage::thinking::read(storage))
+                .or_else(|| caudra_storage::thinking::read(storage, &model.spec()))
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
@@ -465,12 +465,16 @@ mod tests {
     }
 
     /// `/thinking` has to outlive the session it was typed in, so a session
-    /// that never set a level takes the one last chosen anywhere.
+    /// that never set a level takes the one last chosen for its model.
     #[test]
     fn a_session_without_a_level_takes_the_one_last_chosen() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+        caudra_storage::thinking::persist(
+            &storage,
+            &test_model().spec(),
+            &StoredThinking::Adaptive,
+        );
 
         let state = SessionState::from_session(
             AppSession::new("test-model", "/tmp"),
@@ -488,7 +492,11 @@ mod tests {
     fn a_stored_level_beats_the_remembered_one() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+        caudra_storage::thinking::persist(
+            &storage,
+            &test_model().spec(),
+            &StoredThinking::Adaptive,
+        );
         let mut session = AppSession::new("test-model", "/tmp");
         session.meta.thinking = Some(StoredThinking::Off);
 
@@ -498,13 +506,17 @@ mod tests {
         assert_eq!(state.thinking, ThinkingConfig::Off, "{STORED_LEVEL_LOST}");
     }
 
-    /// The remembered level is global, so it outlives the model it was chosen
-    /// on and reaches models that cannot reason at all.
+    /// The remembered level outlives the session it was chosen in, so it can
+    /// still reach a model that cannot reason at all.
     #[test]
     fn a_remembered_level_a_model_cannot_honor_is_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+        caudra_storage::thinking::persist(
+            &storage,
+            &test_model().spec(),
+            &StoredThinking::Adaptive,
+        );
         let model = Model {
             thinking_override: Some(ThinkingSupport::No),
             ..test_model()

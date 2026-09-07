@@ -720,6 +720,8 @@ const TURNS_UNSAVED: &str =
     "the exit summary reads the counter off the session, so it must be saved";
 const LEVEL_UNSET: &str = "no level has been chosen yet";
 const LEVEL_UNSAVED: &str = "the chosen level must reach disk to survive a restart";
+const LEVEL_LEAKED: &str = "one model's depth must not follow the user onto another";
+const LEVEL_LOST_ON_RETURN: &str = "returning to a model must restore the level chosen there";
 
 /// Compaction discards the history a count could be derived from, so the
 /// exit summary reads a stored counter instead. A deferred goal keeps the
@@ -9857,11 +9859,16 @@ fn shift_tab_cycles_explicit_reasoning_efforts() {
 #[test]
 fn a_chosen_reasoning_effort_reaches_the_next_session() {
     let (_tmp, dir, _writer, mut app) = tempdir_app();
-    assert_eq!(caudra_storage::thinking::read(&dir), None, "{LEVEL_UNSET}");
+    let spec = app.state.model.spec();
+    assert_eq!(
+        caudra_storage::thinking::read(&dir, &spec),
+        None,
+        "{LEVEL_UNSET}"
+    );
 
     app.set_thinking("high").unwrap();
     assert_eq!(
-        caudra_storage::thinking::read(&dir),
+        caudra_storage::thinking::read(&dir, &spec),
         Some(StoredThinking::Effort {
             level: "high".into()
         }),
@@ -9870,9 +9877,34 @@ fn a_chosen_reasoning_effort_reaches_the_next_session() {
 
     app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
     assert_eq!(
-        caudra_storage::thinking::read(&dir),
+        caudra_storage::thinking::read(&dir, &spec),
         Some(app.state.thinking.clone().into()),
         "{LEVEL_UNSAVED}"
+    );
+}
+
+/// A level is only meaningful against the ladder that declared it, so switching
+/// models must restore what was chosen there rather than carrying one model's
+/// depth onto another.
+#[test]
+fn switching_models_restores_the_level_chosen_for_that_model() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let first = app.state.model.clone();
+    let second = Model {
+        id: "other-model".into(),
+        ..first.clone()
+    };
+    caudra_storage::thinking::persist(&dir, &second.spec(), &StoredThinking::Off);
+
+    app.set_thinking("high").unwrap();
+    app.update_model(&second);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off, "{LEVEL_LEAKED}");
+
+    app.update_model(&first);
+    assert_eq!(
+        app.state.thinking,
+        ThinkingConfig::Effort("high".into()),
+        "{LEVEL_LOST_ON_RETURN}"
     );
 }
 
