@@ -4656,28 +4656,42 @@ fn an_unknown_tool_falls_back_to_its_registered_name() {
 }
 
 #[test]
-fn a_compact_row_lists_the_inputs_its_header_omits() {
+fn a_read_replaces_its_requested_window_with_the_returned_range() {
+    const PATH: &str = "src/main.rs";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Compact);
     let mut event = start("t1", FILE_READ_TOOL_NAME);
-    event.summary = "src/main.rs".into();
+    event.summary = PATH.into();
     event.raw_input = Some(serde_json::json!({
-        "filePath": "src/main.rs",
-        "offset": 1,
-        "limit": 260,
+        "filePath": PATH,
+        "offset": 190,
+        "limit": 140,
     }));
     panel.tool_start(event);
-    finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
     // Key order follows serde_json's map, which the workspace flips to
     // insertion order via `preserve_order`; only membership is stable.
-    let line = first_line_text(&panel, 0);
-    assert!(line.contains("offset=1"), "{line}");
-    assert!(line.contains("limit=260"), "{line}");
-    assert!(
-        !line.contains("filePath"),
-        "the header already shows the path: {line}"
+    let pending = first_line_text(&panel, 0);
+    assert!(pending.contains("offset=190"), "{pending}");
+    assert!(pending.contains("limit=140"), "{pending}");
+    assert!(!pending.contains("filePath"), "{pending}");
+
+    let mut event = done("t1");
+    event.tool = FILE_READ_TOOL_NAME.into();
+    event.output = ToolOutput::ReadCode {
+        path: PATH.into(),
+        start_line: 190,
+        lines: vec!["x".into(); 140],
+        total_lines: 668,
+        instructions: None,
+    };
+    panel.tool_done(event);
+    rebuild(&mut panel);
+
+    assert_eq!(
+        first_line_text(&panel, 0),
+        "→ Read src/main.rs (lines 190–329 of 668)"
     );
 }
 
@@ -5895,6 +5909,40 @@ fn a_batch_child_lists_the_inputs_its_header_omits() {
         !text.contains("file_path="),
         "the header already shows the path: {text:?}"
     );
+}
+
+#[test]
+fn a_completed_batch_read_replaces_its_request_with_the_returned_range() {
+    const PATH: &str = "caudra-storage/src/lib.rs";
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut child = batch_child(FILE_READ_TOOL_NAME, "a");
+    child.summary = PATH.into();
+    child.raw_input = Some(serde_json::json!({
+        "file_path": PATH,
+        "offset": 190,
+        "limit": 140,
+    }));
+    child.output = Some(ToolOutput::ReadCode {
+        path: PATH.into(),
+        start_line: 190,
+        lines: vec!["x".into(); 140],
+        total_lines: 668,
+        instructions: None,
+    });
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("lines 190–329 of 668"), "{text:?}");
+    assert!(!text.contains("offset="), "{text:?}");
+    assert!(!text.contains("limit="), "{text:?}");
 }
 
 const SHELL_COLLAPSE_MSG: &str = "a shell card must obey the view like any other read";

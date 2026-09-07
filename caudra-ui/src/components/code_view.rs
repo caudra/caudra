@@ -478,8 +478,12 @@ fn render_batch(
             Style::default(),
             entry.raw_input.as_ref(),
         ));
-        if let Some(args) = compact_args_for(&entry.tool, &entry.summary, entry.raw_input.as_ref())
-        {
+        if let Some(args) = compact_args_for(
+            &entry.tool,
+            &entry.summary,
+            entry.raw_input.as_ref(),
+            entry.output.as_ref(),
+        ) {
             spans.push(Span::styled(args, t.tool_dim));
         }
         if let Some(annotation) = child_annotation(entry) {

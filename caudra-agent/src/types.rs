@@ -505,14 +505,25 @@ impl ToolOutput {
     pub fn annotation(&self) -> Option<String> {
         match self {
             Self::ReadCode {
-                lines, total_lines, ..
+                start_line,
+                lines,
+                total_lines,
+                ..
             } => {
                 let shown = lines.len();
-                if *total_lines > shown {
-                    Some(format!("{shown} of {total_lines} lines"))
-                } else {
-                    Some(format!("{shown} lines"))
-                }
+                Some(
+                    if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
+                        format!("{shown} lines")
+                    } else if shown == 0 {
+                        format!("0 of {total_lines} lines")
+                    } else {
+                        let end = start_line
+                            .saturating_add(shown)
+                            .saturating_sub(1)
+                            .min(*total_lines);
+                        format!("lines {start_line}–{end} of {total_lines}")
+                    },
+                )
             }
             Self::WriteCode {
                 byte_count, lines, ..
@@ -1733,7 +1744,12 @@ mod tests {
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 1–5 of 100") ; "read_code_first_window")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 10–14 of 100") ; "read_code_middle_window")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 96, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 96–100 of 100") ; "read_code_window_reaches_eof")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 101, lines: vec![], total_lines: 100, instructions: None }, Some("0 of 100 lines") ; "read_code_offset_past_eof")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }, Some("0 lines") ; "read_code_empty_file")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 0, instructions: None }, Some("5 lines") ; "read_code_old_session_without_total")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec!["x".into(); 3] }, Some("3 lines") ; "write_code_lines")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_falls_back_for_old_sessions")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some("0 lines") ; "write_code_empty_file")]

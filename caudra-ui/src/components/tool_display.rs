@@ -23,7 +23,7 @@ use crate::markdown::{
 use caudra_agent::{
     BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
     SpanStyle, SubagentProgress, ToolInput, ToolOutput,
-    tools::{FILE_WRITE_TOOL_NAME, humanize_duration},
+    tools::{FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, humanize_duration},
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -95,6 +95,7 @@ const COMPACT_ARG_LIMIT: usize = 3;
 const COMPACT_ARG_MAX_CHARS: usize = 40;
 const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
+const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
 /// The tools whose header is built from a pattern the model wrote.
 const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
 const QUERY_KEY: &str = "pattern";
@@ -326,6 +327,7 @@ pub(super) fn compact_args_for(
     tool: &str,
     header: &str,
     raw_input: Option<&serde_json::Value>,
+    output: Option<&ToolOutput>,
 ) -> Option<String> {
     let row = compact_row(tool);
     compact_args(
@@ -333,6 +335,7 @@ pub(super) fn compact_args_for(
         header,
         row.map(|(tool, _)| tool),
         row.map_or(&[], |(_, entry)| entry.header_keys),
+        output,
     )
 }
 
@@ -351,11 +354,13 @@ fn duration_millis(tool: Option<&str>, key: &str, value: &serde_json::Number) ->
 /// way opencode does: `[offset=1, limit=260]`.
 ///
 /// `header_keys` names what a known tool folded into its header, and also the
-/// inputs too big to belong on one row at all. The header itself is the
-/// backstop for the rest: a tool the table has never heard of would otherwise
-/// print its whole header back as `[k=v]`. Only strings are checked against
-/// it, because a number is what the brackets exist to carry and `offset=1`
-/// must survive a header that happens to contain a `1`.
+/// inputs too big to belong on one row at all. A completed structured read
+/// folds its pagination keys into the output range for the same reason. The
+/// header itself is the backstop for the rest: a tool the table has never heard
+/// of would otherwise print its whole header back as `[k=v]`. Only strings are
+/// checked against it, because a number is what the brackets exist to carry
+/// while a call has no result yet, and `offset=1` must survive a header that
+/// happens to contain a `1`.
 ///
 /// `tool` is the name the row is tabled under, which is what says whether a
 /// number is a count or a duration. Every string is bounded on the way in, so
@@ -365,14 +370,21 @@ fn compact_args(
     header: &str,
     tool: Option<&str>,
     header_keys: &[&str],
+    output: Option<&ToolOutput>,
 ) -> Option<String> {
     let fields = raw_input?.as_object()?;
+    let result_keys = match (tool, output) {
+        (Some(FILE_READ_TOOL_NAME), Some(ToolOutput::ReadCode { .. })) => READ_RESULT_KEYS,
+        _ => &[],
+    };
     let mut rendered = String::new();
     let mut shown = 0;
-    for (key, value) in fields
-        .iter()
-        .filter(|(key, _)| !header_keys.iter().any(|folded| same_key(folded, key)))
-    {
+    for (key, value) in fields.iter().filter(|(key, _)| {
+        !header_keys
+            .iter()
+            .chain(result_keys)
+            .any(|folded| same_key(folded, key))
+    }) {
         let scalar = match value {
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
             serde_json::Value::String(text) => one_line(text),
@@ -842,6 +854,7 @@ impl ToolLineBuilder {
         header: &str,
         annotation: Option<&str>,
         raw_input: Option<&serde_json::Value>,
+        output: Option<&ToolOutput>,
     ) {
         let row = compact_row(tool_name);
         let label = row.map_or(tool_name, |(_, entry)| entry.label(self.indicator.into()));
@@ -862,6 +875,7 @@ impl ToolLineBuilder {
             header,
             row.map(|(tool, _)| tool),
             row.map_or(&[], |(_, entry)| entry.header_keys),
+            output,
         ) {
             copy.push_str(&args);
             spans.push(Span::styled(args, theme::current().tool_dim));
@@ -1298,6 +1312,7 @@ pub fn build_tool_lines(
             header,
             msg.annotation.as_deref(),
             msg.tool_raw_input.as_deref(),
+            msg.tool_output.as_deref(),
         );
         b.prepend_compact_sigil(tool_name, rctx.started_at);
     } else {
@@ -3232,8 +3247,52 @@ mod tests {
         expected: Option<&str>,
     ) {
         assert_eq!(
-            sorted_args(compact_args_for(tool, header, Some(&raw_input))).as_deref(),
+            sorted_args(compact_args_for(tool, header, Some(&raw_input), None)).as_deref(),
             expected,
+            "{ARGS_MSG}"
+        );
+    }
+
+    fn read_code_output() -> ToolOutput {
+        ToolOutput::ReadCode {
+            path: READ_PATH.into(),
+            start_line: 190,
+            lines: vec!["x".into(); 140],
+            total_lines: 668,
+            instructions: None,
+        }
+    }
+
+    #[test]
+    fn a_pending_read_keeps_its_requested_window() {
+        let input = serde_json::json!({ "filePath": READ_PATH, "offset": 190, "limit": 140 });
+        assert_eq!(
+            sorted_args(compact_args_for(READ_TOOL, READ_PATH, Some(&input), None)).as_deref(),
+            Some(" [limit=140, offset=190]"),
+            "{ARGS_MSG}"
+        );
+    }
+
+    #[test_case(READ_TOOL ; "the_tabled_name")]
+    #[test_case("mcp_File_read" ; "a_qualified_name")]
+    fn a_completed_read_folds_pagination_into_its_result(tool: &str) {
+        let input = serde_json::json!({ "filePath": READ_PATH, "offset": 190, "limit": 140 });
+        assert_eq!(
+            compact_args_for(tool, READ_PATH, Some(&input), Some(&read_code_output())),
+            None,
+            "{ARGS_MSG}"
+        );
+    }
+
+    #[test_case(READ_TOOL, ToolOutput::ReadDir("entry".into()) ; "a_directory_result")]
+    #[test_case(READ_TOOL, ToolOutput::Plain("legacy".into()) ; "a_legacy_result")]
+    #[test_case("srv.unknown", read_code_output() ; "an_unknown_tool")]
+    #[test_case("websearch", read_code_output() ; "a_non_read_tool")]
+    fn only_a_structured_file_read_subsumes_pagination(tool: &str, output: ToolOutput) {
+        let input = serde_json::json!({ "offset": 190, "limit": 140 });
+        assert_eq!(
+            sorted_args(compact_args_for(tool, "", Some(&input), Some(&output))).as_deref(),
+            Some(" [limit=140, offset=190]"),
             "{ARGS_MSG}"
         );
     }
@@ -3256,6 +3315,7 @@ mod tests {
                     "content": NOTE_BODY,
                     "tags": ["ui"],
                 })),
+                None,
             ),
             None,
             "{BLOB_MSG}"
@@ -3271,6 +3331,7 @@ mod tests {
             "srv.unknown",
             "",
             Some(&serde_json::json!({ "note": NOTE_BODY.repeat(4) })),
+            None,
         )
         .expect(BLOB_MSG);
         assert!(!rendered.contains('\n'), "{BLOB_MSG}");
@@ -3288,8 +3349,13 @@ mod tests {
     #[test]
     fn a_value_that_fits_is_left_as_it_came() {
         assert_eq!(
-            compact_args_for("srv.unknown", "", Some(&serde_json::json!({ "q": "a b" })))
-                .as_deref(),
+            compact_args_for(
+                "srv.unknown",
+                "",
+                Some(&serde_json::json!({ "q": "a b" })),
+                None,
+            )
+            .as_deref(),
             Some(" [q=a b]"),
             "{BLOB_MSG}"
         );
@@ -3303,7 +3369,8 @@ mod tests {
             compact_args_for(
                 "srv.unknown",
                 "src/v1/mod.rs",
-                Some(&serde_json::json!({ "offset": 1 }))
+                Some(&serde_json::json!({ "offset": 1 })),
+                None,
             )
             .as_deref(),
             Some(" [offset=1]"),
@@ -3351,7 +3418,7 @@ mod tests {
         expected: Option<&str>,
     ) {
         assert_eq!(
-            compact_args_for(tool, "", Some(&raw_input)).as_deref(),
+            compact_args_for(tool, "", Some(&raw_input), None).as_deref(),
             expected,
             "{DURATION_MSG}"
         );
