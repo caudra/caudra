@@ -24,6 +24,7 @@ pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub use mailbox::{MailboxError, SessionMailbox};
 pub mod command;
+pub mod context;
 pub mod diff;
 pub mod editable_queue;
 pub mod patch;

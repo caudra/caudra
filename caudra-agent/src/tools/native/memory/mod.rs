@@ -10,6 +10,7 @@ pub mod paths;
 
 use std::borrow::Cow;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -66,6 +67,8 @@ pub fn permission_rules(cwd: &Path) -> Vec<caudra_config::PermissionRule> {
 
 const COMMANDS: &[&str] = &["list", "read", "write", "delete"];
 const DIR_PREFIX: &str = "dir: ";
+const PROMPT_TAG_PREFIX: &str =
+    "\n\nMemory tags (`memory` with `command=\"read\"` and `tags=[...]`): ";
 const STATE_DIR_UNRESOLVED: &str = "cannot resolve state dir";
 
 static COMMAND_PARAM: ParamSchema = ParamSchema::Enum {
@@ -200,6 +203,41 @@ pub struct BrowseEntry {
     pub tag_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNoteInventory {
+    pub name: String,
+    pub on_load_tokens: u32,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInventory {
+    pub directory: PathBuf,
+    pub notes: Vec<MemoryNoteInventory>,
+    pub unreadable_files: usize,
+}
+
+pub fn inventory(cwd: &Path) -> Option<MemoryInventory> {
+    let directory = paths::state_dir(cwd)?;
+    Some(inventory_dir(&directory, &TAG_CACHE))
+}
+
+fn inventory_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> MemoryInventory {
+    let (notes, warnings) = scan(dir, cache);
+    MemoryInventory {
+        directory: dir.to_path_buf(),
+        notes: notes
+            .into_iter()
+            .map(|note| MemoryNoteInventory {
+                name: note.name,
+                on_load_tokens: note.tokens,
+                tags: note.tags,
+            })
+            .collect(),
+        unreadable_files: warnings.len(),
+    }
+}
+
 /// What the `/memory` picker needs, without exposing the note internals.
 /// `None` when the notes directory cannot be resolved at all, which is a
 /// different failure from having no notes.
@@ -268,9 +306,14 @@ fn prompt_tag_line(cwd: &Path, cache: &Mutex<notes::TagCache>) -> Option<String>
         }
         line.push_str(&format!("(unreadable: {})", warnings.len()));
     }
-    Some(format!(
-        "\n\nMemory tags (`memory` with `command=\"read\"` and `tags=[...]`): {line}\n"
-    ))
+    Some(format!("{PROMPT_TAG_PREFIX}{line}\n"))
+}
+
+pub(crate) fn prompt_tag_line_range(system: &str) -> Option<Range<usize>> {
+    let start = system.rfind(PROMPT_TAG_PREFIX)?;
+    let content_start = start + PROMPT_TAG_PREFIX.len();
+    let end = content_start + system[content_start..].find('\n')? + 1;
+    Some(start..end)
 }
 
 fn scan(dir: &Path, cache: &Mutex<notes::TagCache>) -> (Vec<notes::Note>, Vec<String>) {
@@ -969,6 +1012,29 @@ mod tests {
     fn browsing_an_empty_directory_yields_no_entries() {
         let temp = tempfile::tempdir().unwrap();
         assert!(browse_in(temp.path()).0.is_empty());
+    }
+
+    #[test]
+    fn memory_inventory_lists_each_file_once_with_on_load_body_tokens() {
+        const BODY: &str = "remember this exact convention";
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("project.md"),
+            format!("---\ntags: [project, rust]\n---\n{BODY}"),
+        )
+        .unwrap();
+        let found = inventory_dir(temp.path(), &Mutex::new(notes::TagCache::default()));
+
+        assert_eq!(found.directory, temp.path());
+        assert_eq!(found.unreadable_files, 0);
+        assert_eq!(found.notes.len(), 1);
+        assert_eq!(found.notes[0].name, "project.md");
+        assert_eq!(found.notes[0].tags, vec!["project", "rust"]);
+        assert_eq!(
+            found.notes[0].on_load_tokens,
+            caudra_providers::estimate_tokens(BODY)
+        );
     }
 
     #[test]

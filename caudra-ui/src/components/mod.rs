@@ -2,6 +2,7 @@ pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
+pub(crate) mod context_modal;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod goal_modal;
@@ -304,6 +305,7 @@ pub(crate) struct ModalScroll {
     max_offset: u16,
     viewport_h: u16,
     auto_scroll: bool,
+    default_auto_scroll: bool,
 }
 
 impl ModalScroll {
@@ -313,20 +315,23 @@ impl ModalScroll {
             max_offset: 0,
             viewport_h: 0,
             auto_scroll: true,
+            default_auto_scroll: true,
         }
     }
 
     pub fn new_top() -> Self {
         Self {
             auto_scroll: false,
+            default_auto_scroll: false,
             ..Self::new()
         }
     }
 
     pub fn reset(&mut self) {
-        let auto_scroll = self.auto_scroll;
-        *self = Self::new();
-        self.auto_scroll = auto_scroll;
+        self.offset = 0;
+        self.max_offset = 0;
+        self.viewport_h = 0;
+        self.auto_scroll = self.default_auto_scroll;
     }
 
     pub fn offset(&self) -> u16 {
@@ -340,16 +345,15 @@ impl ModalScroll {
             self.offset = self.max_offset;
         } else {
             self.clamp();
-            if self.offset >= self.max_offset {
-                self.auto_scroll = true;
-            }
         }
     }
 
     pub fn scroll(&mut self, delta: i32) {
         self.offset = apply_scroll_delta(self.offset, delta);
         self.clamp();
-        self.auto_scroll = self.offset >= self.max_offset;
+        if self.max_offset > 0 {
+            self.auto_scroll = self.offset >= self.max_offset;
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -941,5 +945,45 @@ mod tests {
 
         assert!(scroll.handle_key(key_event));
         assert_eq!(scroll.offset(), expected);
+    }
+
+    #[test]
+    fn modal_scroll_top_default_survives_content_changes_and_reset() {
+        let mut scroll = ModalScroll::new_top();
+        scroll.update_dimensions(MODAL_VIEWPORT, MODAL_VIEWPORT);
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), 0);
+
+        assert!(scroll.handle_key(keybindings::key::SCROLL_BOTTOM_ALT.to_key_event()));
+        assert_eq!(scroll.offset(), MODAL_MAX_OFFSET);
+        scroll.reset();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), 0);
+    }
+
+    #[test]
+    fn modal_scroll_bottom_default_survives_content_changes_and_reset() {
+        let mut scroll = ModalScroll::new();
+        scroll.update_dimensions(MODAL_VIEWPORT, MODAL_VIEWPORT);
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), MODAL_MAX_OFFSET);
+
+        assert!(scroll.handle_key(keybindings::key::SCROLL_TOP_ALT.to_key_event()));
+        assert_eq!(scroll.offset(), 0);
+        scroll.reset();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), MODAL_MAX_OFFSET);
+    }
+
+    #[test]
+    fn modal_scroll_resize_clamping_does_not_enable_auto_scroll() {
+        let mut scroll = ModalScroll::new_top();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        scroll.scroll(-i32::from(MODAL_HALF_PAGE));
+        assert_eq!(scroll.offset(), MODAL_HALF_PAGE);
+
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_TOTAL);
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), 0);
     }
 }

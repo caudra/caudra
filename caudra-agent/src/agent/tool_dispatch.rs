@@ -699,21 +699,13 @@ async fn execute_mcp_tool(
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 pub(super) async fn process_tool_calls(
-    response: caudra_providers::StreamResponse,
+    tool_uses: Vec<(String, String, Value)>,
     recent_calls: &mut RecentCalls,
     mcp: Option<&McpSession>,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
 ) -> Result<(), AgentError> {
-    let tool_uses: Vec<(String, String, Value)> = response
-        .message
-        .tool_uses()
-        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-        .collect();
-
-    history.push(response.message);
-
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
@@ -1222,7 +1214,7 @@ mod tests {
             assert!(done.output.as_text().contains("srv__fetch_issue"));
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.request_snapshot().extend_tools(&mut tools);
             assert!(
                 crate::mcp::tool_names(&tools).contains(&"srv__fetch_issue"),
                 "searched tool must join the next request"
@@ -1298,7 +1290,7 @@ mod tests {
             assert_eq!(done.tool.as_ref(), "srv.fetch_issue", "must route to MCP");
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.request_snapshot().extend_tools(&mut tools);
             assert_eq!(
                 crate::mcp::tool_names(&tools),
                 vec!["srv__fetch_issue"],
@@ -1348,7 +1340,7 @@ mod tests {
             );
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.request_snapshot().extend_tools(&mut tools);
             assert_eq!(
                 crate::mcp::tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],

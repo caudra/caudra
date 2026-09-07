@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,10 @@ use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpSession;
+use crate::context::{
+    ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
+};
+use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::{
@@ -39,6 +43,20 @@ use caudra_storage::usage_ledger::LedgerPurpose;
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const AUTH_RELOAD_POLL_MIN_MS: u64 = 250;
 const AUTH_RELOAD_POLL_MAX_MS: u64 = 1_000;
+const USER_MESSAGE_FRAMING: &str = r#"{"role":"user","content":[]}"#;
+const ASSISTANT_MESSAGE_FRAMING: &str = r#"{"role":"assistant","content":[]}"#;
+const TEXT_BLOCK_FRAMING: &str = r#"{"type":"text","text":""}"#;
+const THINKING_BLOCK_FRAMING: &str = r#"{"type":"thinking","thinking":""}"#;
+const THINKING_SIGNATURE_FRAMING: &str = r#"{"signature":""}"#;
+const RESPONSES_REASONING_FRAMING: &str = r#"{"item_id":""}"#;
+const RESPONSES_ENCRYPTED_CONTENT_FRAMING: &str = r#"{"encrypted_content":""}"#;
+const REDACTED_THINKING_BLOCK_FRAMING: &str = r#"{"type":"redacted_thinking","data":""}"#;
+const TOOL_USE_BLOCK_FRAMING: &str = r#"{"type":"tool_use","id":"","name":"","input":null}"#;
+const TOOL_USE_SIGNATURE_FRAMING: &str = r#"{"thought_signature":""}"#;
+const TOOL_RESULT_BLOCK_FRAMING: &str = r#"{"type":"tool_result","tool_use_id":"","content":""}"#;
+const TOOL_RESULT_ERROR_FRAMING: &str = r#"{"is_error":true}"#;
+const IMAGE_BLOCK_FRAMING: &str =
+    r#"{"type":"image","source":{"type":"base64","media_type":"","data":""}}"#;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -87,12 +105,14 @@ pub struct AgentParams {
     pub session_id: Option<SessionRef>,
     pub root_tool_use_id: Option<String>,
     pub mailbox: Option<SessionMailbox>,
+    pub context_publisher: Option<ContextPublisher>,
     pub timeouts: caudra_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub path_locks: Arc<PathLocks>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
-    pub system_prompt_profile_name: Arc<str>,
+    pub default_task_prompt_profile_name: Arc<str>,
+    pub active_prompt_profile_name: Option<Arc<str>>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<crate::tools::ToolRegistry>,
@@ -135,12 +155,14 @@ pub struct Agent<'h> {
     session_id: Option<SessionRef>,
     root_tool_use_id: Option<String>,
     mailbox: Option<SessionMailbox>,
+    context_publisher: Option<ContextPublisher>,
     timeouts: caudra_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     path_locks: Arc<PathLocks>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
-    system_prompt_profile_name: Arc<str>,
+    default_task_prompt_profile_name: Arc<str>,
+    active_prompt_profile_name: Option<Arc<str>>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     subagent_history: SubagentHistoryStore,
     registry: Arc<crate::tools::ToolRegistry>,
@@ -187,11 +209,13 @@ impl<'h> Agent<'h> {
             session_id: params.session_id,
             root_tool_use_id: params.root_tool_use_id,
             mailbox: params.mailbox,
+            context_publisher: params.context_publisher,
             file_tracker: params.file_tracker,
             path_locks: params.path_locks,
             prompt_slots: params.prompt_slots,
             prompt_profiles: params.prompt_profiles,
-            system_prompt_profile_name: params.system_prompt_profile_name,
+            default_task_prompt_profile_name: params.default_task_prompt_profile_name,
+            active_prompt_profile_name: params.active_prompt_profile_name,
             subagent_cancels: params.subagent_cancels,
             subagent_history: params.subagent_history,
             registry: params.registry,
@@ -321,6 +345,7 @@ impl<'h> Agent<'h> {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
+                self.publish_prepared_context();
                 DoneReason::Cancelled
             }
             Err(e) => {
@@ -459,42 +484,110 @@ impl<'h> Agent<'h> {
     /// `self.tools` holds base tools only; the MCP part is recomputed here
     /// every turn so `tool_search` loads and late-connecting servers take
     /// effect on the next request.
-    fn request_tools(&self) -> Cow<'_, Value> {
-        match &self.mcp {
-            Some(mcp) => {
-                let mut tools = self.tools.clone();
-                mcp.extend_tools(&mut tools);
-                Cow::Owned(tools)
-            }
-            None => Cow::Borrowed(&self.tools),
+    fn request_tools(&self) -> (Cow<'_, Value>, Option<McpRequestSnapshot>) {
+        let Some(mcp) = &self.mcp else {
+            return (Cow::Borrowed(&self.tools), None);
+        };
+        let snapshot = mcp.request_snapshot();
+        let mut tools = self.tools.clone();
+        snapshot.extend_tools(&mut tools);
+        (Cow::Owned(tools), Some(snapshot))
+    }
+
+    fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
+        repair_tool_pairs(provider_projection::project_for_target(
+            self.history.as_slice(),
+            tools,
+            &self.model,
+            self.provider.reasoning_transport(&self.model),
+        ))
+    }
+
+    fn publish_context(
+        &self,
+        readiness: ContextReadiness,
+        full_tools: &Value,
+        projected_messages: &[Message],
+        mcp: Option<&McpRequestSnapshot>,
+    ) {
+        let Some(publisher) = &self.context_publisher else {
+            return;
+        };
+        let options = self.opts.clamped(&self.model);
+        let task_profiles = self.prompt_profiles.bind_for_tasks(
+            &self.model,
+            &options.thinking,
+            &self.model_policy,
+            self.timeouts,
+        );
+        let cwd = env::current_dir().unwrap_or_else(|_| self.permissions.project_cwd());
+        let inventory = ContextInventory::collect(
+            &cwd,
+            &self.registry,
+            &self.prompt_profiles,
+            &task_profiles,
+            self.active_prompt_profile_name.as_deref(),
+            mcp,
+        );
+        publisher.publish(ContextSnapshot::capture(ContextCapture {
+            readiness,
+            model: &self.model,
+            auto_compact: self.auto_compact,
+            compaction_buffer: self.config.compaction_buffer,
+            system: &self.system,
+            base_tools: &self.tools,
+            full_tools,
+            projected_messages,
+            inventory,
+        }));
+    }
+
+    fn publish_prepared_context(&self) {
+        if self.context_publisher.is_none() {
+            return;
         }
+        let (tools, mcp) = self.request_tools();
+        let provider_history = self.projected_history(tools.as_ref());
+        self.publish_context(
+            ContextReadiness::PreparedNextRequest,
+            tools.as_ref(),
+            provider_history.as_ref(),
+            mcp.as_ref(),
+        );
+    }
+
+    fn push_assistant_message(&mut self, message: Message) {
+        self.history.push(message);
+        self.publish_prepared_context();
     }
 
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = self.request_tools();
-        let provider_history = provider_projection::project_for_target(
-            self.history.as_slice(),
-            tools.as_ref(),
-            &self.model,
-            self.provider.reasoning_transport(&self.model),
-        );
-        let provider_history = repair_tool_pairs(provider_history);
-        let mut response = match stream_with_retry(
-            &*self.provider,
-            &self.model,
-            provider_history.as_ref(),
-            &self.system,
-            tools.as_ref(),
-            &self.event_tx,
-            &self.cancel,
-            self.opts.clone(),
-            self.session_id.as_ref(),
-        )
-        .await
-        {
+        let stream_result = {
+            let (tools, mcp) = self.request_tools();
+            let provider_history = self.projected_history(tools.as_ref());
+            self.publish_context(
+                ContextReadiness::CapturedCurrentRequest,
+                tools.as_ref(),
+                provider_history.as_ref(),
+                mcp.as_ref(),
+            );
+            stream_with_retry(
+                &*self.provider,
+                &self.model,
+                provider_history.as_ref(),
+                &self.system,
+                tools.as_ref(),
+                &self.event_tx,
+                &self.cancel,
+                self.opts.clone(),
+                self.session_id.as_ref(),
+            )
+            .await
+        };
+        let mut response = match stream_result {
             Ok(r) => {
                 self.reauth_attempts = 0;
                 r
@@ -573,8 +666,9 @@ impl<'h> Agent<'h> {
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.context_size = self.context_size.saturating_add(estimate_message_tokens(
+                &self.history.as_slice()[history_len_before..],
+            ));
         } else {
             let has_reasoning = response.message.content.iter().any(|block| {
                 matches!(
@@ -583,16 +677,18 @@ impl<'h> Agent<'h> {
                 )
             });
             if response.message.first_text_content().is_some() {
-                self.history.push(response.message);
+                self.push_assistant_message(response.message);
             } else if has_reasoning {
                 response.message.content.push(ContentBlock::Text {
                     text: EMPTY_RESPONSE_MARKER.into(),
                 });
-                self.history.push(response.message);
+                self.push_assistant_message(response.message);
                 if stop_reason != Some(StopReason::MaxTokens) && self.recover_stalled_turn(false)? {
+                    self.publish_prepared_context();
                     return Ok(TurnOutcome::Continue);
                 }
             } else if self.recover_stalled_turn(true)? {
+                self.publish_prepared_context();
                 return Ok(TurnOutcome::Continue);
             }
 
@@ -607,14 +703,20 @@ impl<'h> Agent<'h> {
             }
         }
 
-        if self.handle_queued_command().await? || self.try_auto_compact().await? {
+        if self.handle_queued_command().await? {
+            self.publish_prepared_context();
+            return Ok(TurnOutcome::Continue);
+        }
+        if self.try_auto_compact().await? {
             return Ok(TurnOutcome::Continue);
         }
 
         if has_tools {
             Ok(TurnOutcome::Continue)
         } else {
-            self.goal_completion(stop_reason.into()).await
+            let outcome = self.goal_completion(stop_reason.into()).await?;
+            self.publish_prepared_context();
+            Ok(outcome)
         }
     }
 
@@ -877,7 +979,7 @@ impl<'h> Agent<'h> {
         let nudges = self.history.recent_nudges();
         let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         if pad_empty_response {
-            self.history.push(Message::empty_marker());
+            self.push_assistant_message(Message::empty_marker());
         }
         if !nudge {
             return Ok(false);
@@ -893,19 +995,29 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+        let tool_uses = response
+            .message
+            .tool_uses()
+            .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+            .collect();
         let ctx = ToolContext {
             tool_name_aliases: response.tool_name_aliases.clone(),
             ..self.tool_context()
         };
-        tool_dispatch::process_tool_calls(
-            response,
+        self.push_assistant_message(response.message);
+        let result = tool_dispatch::process_tool_calls(
+            tool_uses,
             &mut self.recent_calls,
             self.mcp.as_ref(),
             self.history,
             &self.event_tx,
             &ctx,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            self.publish_prepared_context();
+        }
+        result
     }
 
     fn tool_context(&self) -> ToolContext {
@@ -915,6 +1027,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            context_publisher: self.context_publisher.clone(),
             tool_output_store: crate::tool_output::default_store(),
             tool_use_id: None,
             root_tool_use_id: self.root_tool_use_id.clone(),
@@ -931,7 +1044,7 @@ impl<'h> Agent<'h> {
             path_locks: Arc::clone(&self.path_locks),
             prompt_slots: Arc::clone(&self.prompt_slots),
             prompt_profiles: Arc::clone(&self.prompt_profiles),
-            system_prompt_profile_name: Arc::clone(&self.system_prompt_profile_name),
+            default_task_prompt_profile_name: Arc::clone(&self.default_task_prompt_profile_name),
             opts: self.opts.clone(),
             subagent_cancels: Arc::clone(&self.subagent_cancels),
             subagent_history: self.subagent_history.clone(),
@@ -990,6 +1103,7 @@ impl<'h> Agent<'h> {
             .push(Message::synthetic(compaction::continue_message(
                 &self.config,
             )));
+        self.publish_prepared_context();
         Ok(())
     }
 
@@ -1040,38 +1154,109 @@ fn queued_message(display: &str) -> String {
     )
 }
 
-/// Counts message content only. The system prompt and the tool schemas, a five
-/// figure baseline on a full tool set, stay invisible here, so never let this
-/// replace a context size the provider measured.
+/// Counts provider-visible message content and replay framing. The system
+/// prompt and tool schemas stay invisible here, so never let this replace a
+/// context size the provider measured.
 ///
 /// Counts rather than estimates from byte length. The ratio a byte heuristic
 /// assumes holds for prose and breaks on everything a tool returns: dense JSON
 /// costs about twice what its length suggests, so a heuristic hid the growth on
 /// exactly the turns that overflow.
 pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
-    messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .map(block_tokens)
-        .sum()
+    messages.iter().fold(0, |total, message| {
+        let framing = match message.role {
+            Role::User => USER_MESSAGE_FRAMING,
+            Role::Assistant => ASSISTANT_MESSAGE_FRAMING,
+        };
+        message.content.iter().fold(
+            total.saturating_add(estimate_tokens_cached(framing)),
+            |total, block| total.saturating_add(message_block_tokens(block)),
+        )
+    })
 }
 
-fn block_tokens(block: &ContentBlock) -> u32 {
+fn message_block_tokens(block: &ContentBlock) -> u32 {
     match block {
-        ContentBlock::Text { text } => estimate_tokens_cached(text),
-        ContentBlock::ToolResult { content, .. } => estimate_tokens_cached(content),
-        ContentBlock::ToolUse { input, .. } => estimate_tokens_cached(&input.to_string()),
-        ContentBlock::Thinking { thinking, .. } => estimate_tokens_cached(thinking),
-        // Vision input is not free, and treating it as free let a screenshot
-        // enter the window costing nothing against the compaction trigger.
-        ContentBlock::Image { source } => crate::tools::image_bytes::token_estimate(source),
-        ContentBlock::RedactedThinking { data } => estimate_tokens_cached(data),
+        ContentBlock::Text { text } => framed_tokens(TEXT_BLOCK_FRAMING, [text.as_str()]),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+            responses,
+            ..
+        } => {
+            let mut tokens = framed_tokens(THINKING_BLOCK_FRAMING, [thinking.as_str()]);
+            if let Some(signature) = signature {
+                add_estimated_tokens(&mut tokens, THINKING_SIGNATURE_FRAMING);
+                add_estimated_tokens(&mut tokens, signature);
+            }
+            if let Some(responses) = responses {
+                add_estimated_tokens(&mut tokens, RESPONSES_REASONING_FRAMING);
+                add_estimated_tokens(&mut tokens, &responses.item_id);
+                if let Some(encrypted_content) = &responses.encrypted_content {
+                    add_estimated_tokens(&mut tokens, RESPONSES_ENCRYPTED_CONTENT_FRAMING);
+                    add_estimated_tokens(&mut tokens, encrypted_content);
+                }
+            }
+            tokens
+        }
+        ContentBlock::RedactedThinking { data } => {
+            framed_tokens(REDACTED_THINKING_BLOCK_FRAMING, [data.as_str()])
+        }
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            thought_signature,
+        } => {
+            let mut tokens = framed_tokens(TOOL_USE_BLOCK_FRAMING, [id.as_str(), name.as_str()]);
+            add_estimated_tokens(&mut tokens, &input.to_string());
+            if let Some(thought_signature) = thought_signature {
+                add_estimated_tokens(&mut tokens, TOOL_USE_SIGNATURE_FRAMING);
+                add_estimated_tokens(&mut tokens, thought_signature);
+            }
+            tokens
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } => {
+            let mut tokens = framed_tokens(
+                TOOL_RESULT_BLOCK_FRAMING,
+                [tool_use_id.as_str(), content.as_str()],
+            );
+            if *is_error {
+                add_estimated_tokens(&mut tokens, TOOL_RESULT_ERROR_FRAMING);
+            }
+            tokens
+        }
+        ContentBlock::Image { source } => {
+            let mut tokens = framed_tokens(IMAGE_BLOCK_FRAMING, [source.media_type.mime()]);
+            tokens = tokens.saturating_add(crate::tools::image_bytes::token_estimate(source));
+            tokens
+        }
     }
+}
+
+/// Empty values price fixed wire structure separately from payloads. Keeping
+/// the parts additive avoids serializing large tool results and lets callers
+/// move loaded bodies between exclusive accounting categories.
+fn framed_tokens<const N: usize>(framing: &str, fields: [&str; N]) -> u32 {
+    fields
+        .into_iter()
+        .fold(estimate_tokens_cached(framing), |total, field| {
+            total.saturating_add(estimate_tokens_cached(field))
+        })
+}
+
+fn add_estimated_tokens(total: &mut u32, text: &str) {
+    *total = total.saturating_add(estimate_tokens_cached(text));
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1084,6 +1269,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::context::{ContextKey, ContextStore};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::{Envelope, QueueItemId};
@@ -1092,6 +1278,17 @@ mod tests {
     const AUTH_ERROR_MESSAGE: &str = "expired";
     const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
     const ADJUSTED_CONTEXT_WINDOW: u32 = 1;
+    const PUBLISHED_CONTEXT_WINDOW: u32 = 123_456;
+    const CAPTURED_CONTEXT_MISSING: &str = "current request must publish before provider dispatch";
+    const PREPARED_CONTEXT_MISSING: &str = "completed turn must publish its next request";
+    const BLOCKING_TOOL_NAME: &str = "blocking_context_tool";
+    const BLOCKING_TOOL_RESULT: &str = "The blocking tool completed and returned this deliberately long result so the actual tool-result snapshot is distinguishable from the temporary unavailable-result projection used while execution is pending.";
+    const BLOCKING_TOOL_CONTEXT_MISSING: &str =
+        "assistant tool-use history must publish before tool execution completes";
+    const COMPLETED_TOOL_CONTEXT_MISSING: &str =
+        "actual tool-result history must publish after insertion";
+    const GOAL_CONTEXT_MISSING: &str =
+        "assistant history must publish before goal evaluation completes";
     const PARTIAL_RESPONSE: &str = "partial";
     const TITLE_PROMPT: &str = "add refresh token support";
     const MODEL_TITLE: &str = "Refresh token support";
@@ -1155,6 +1352,39 @@ mod tests {
             &self,
         ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
+        }
+    }
+
+    struct ContextObservingProvider {
+        store: ContextStore,
+        captured: Arc<Mutex<Option<Arc<ContextSnapshot>>>>,
+    }
+
+    impl Provider for ContextObservingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                *self.captured.lock().unwrap() = self.store.latest(&ContextKey::Main);
+                Ok(text_response(StopReason::EndTurn))
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+
+        fn adjust_model(&self, model: &mut Model) {
+            model.context_window = PUBLISHED_CONTEXT_WINDOW;
         }
     }
 
@@ -1388,12 +1618,18 @@ mod tests {
                 session_id: None,
                 root_tool_use_id: None,
                 mailbox: None,
+                context_publisher: None,
                 timeouts: caudra_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 path_locks: PathLocks::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
-                system_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),
+                default_task_prompt_profile_name: Arc::from(
+                    crate::prompt::profile::BUILTIN_PROFILE_NAME,
+                ),
+                active_prompt_profile_name: Some(Arc::from(
+                    crate::prompt::profile::BUILTIN_PROFILE_NAME,
+                )),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 subagent_history: SubagentHistoryStore::default(),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
@@ -1422,6 +1658,140 @@ mod tests {
             workflow: false,
             prompt: None,
         }
+    }
+
+    #[test]
+    fn turn_publishes_current_request_before_dispatch_and_prepared_request_after_history() {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let captured = Arc::new(Mutex::new(None));
+            let provider = ContextObservingProvider {
+                store: store.clone(),
+                captured: Arc::clone(&captured),
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            agent.context_publisher = Some(store.publisher(ContextKey::Main));
+            assert!(agent.tool_context().context_publisher.is_some());
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+
+            let captured = captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect(CAPTURED_CONTEXT_MISSING);
+            let prepared = store
+                .latest(&ContextKey::Main)
+                .expect(PREPARED_CONTEXT_MISSING);
+            assert_eq!(captured.readiness, ContextReadiness::CapturedCurrentRequest);
+            assert_eq!(prepared.readiness, ContextReadiness::PreparedNextRequest);
+            assert_eq!(captured.window.tokens, PUBLISHED_CONTEXT_WINDOW);
+            assert_eq!(prepared.window.tokens, PUBLISHED_CONTEXT_WINDOW);
+            assert!(prepared.usage.messages > captured.usage.messages);
+        });
+    }
+
+    #[test]
+    fn blocking_tool_publishes_assistant_and_result_history_boundaries() {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let local_tools = HashMap::from([(
+                BLOCKING_TOOL_NAME.to_owned(),
+                crate::tools::local_tool(move |_, _| {
+                    let started_tx = started_tx.clone();
+                    let release_rx = release_rx.clone();
+                    Box::pin(async move {
+                        started_tx
+                            .send_async(())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        release_rx
+                            .recv_async()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(BLOCKING_TOOL_RESULT.into())
+                    })
+                }),
+            )]);
+            let mut history = History::new(vec![Message::user("hello".into())]);
+            let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent.with_local_tools(Arc::new(local_tools));
+            agent.context_publisher = Some(store.publisher(ContextKey::Main));
+
+            let inspect_pending_context = async {
+                started_rx.recv_async().await.unwrap();
+                let snapshot = store
+                    .latest(&ContextKey::Main)
+                    .expect(BLOCKING_TOOL_CONTEXT_MISSING);
+                assert_eq!(snapshot.readiness, ContextReadiness::PreparedNextRequest);
+                release_tx.send_async(()).await.unwrap();
+                snapshot
+            };
+            let (result, pending) = futures_lite::future::zip(
+                agent.process_tool_calls(tool_use_response(
+                    BLOCKING_TOOL_NAME,
+                    serde_json::json!({}),
+                )),
+                inspect_pending_context,
+            )
+            .await;
+            result.unwrap();
+
+            let completed = store
+                .latest(&ContextKey::Main)
+                .expect(COMPLETED_TOOL_CONTEXT_MISSING);
+            assert_eq!(completed.readiness, ContextReadiness::PreparedNextRequest);
+            assert!(completed.usage.messages > pending.usage.messages);
+            assert_eq!(
+                completed.usage.messages,
+                estimate_message_tokens(agent.history.as_slice())
+            );
+        });
+    }
+
+    #[test]
+    fn blocking_goal_evaluator_observes_published_main_history_only() {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (response_tx, response_rx) = flume::bounded(1);
+            let provider = ControlledEvaluatorProvider {
+                calls: AtomicUsize::new(0),
+                evaluator_started: started_tx,
+                evaluator_response: response_rx,
+            };
+            let goal = GoalHandle::default();
+            goal.set("tests pass").unwrap();
+            let expected_messages = estimate_message_tokens(&[
+                Message::user("hello".into()),
+                text_response(StopReason::EndTurn).message,
+            ]);
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal);
+            agent.context_publisher = Some(store.publisher(ContextKey::Main));
+
+            let inspect_context = async {
+                started_rx.recv_async().await.unwrap();
+                let snapshot = store.latest(&ContextKey::Main).expect(GOAL_CONTEXT_MISSING);
+                assert_eq!(snapshot.readiness, ContextReadiness::PreparedNextRequest);
+                assert_eq!(snapshot.usage.messages, expected_messages);
+                response_tx
+                    .send_async(goal_response(true, false, "verified"))
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) =
+                futures_lite::future::zip(agent.run(default_input()), inspect_context).await;
+
+            assert_eq!(result.unwrap(), DoneReason::EndTurn);
+        });
     }
 
     fn auth_error() -> AgentError {
@@ -2304,13 +2674,22 @@ mod tests {
     fn do_compact_appends_post_instructions_to_continue_message() {
         smol::block_on(async {
             const POST: &str = "Re-read plan.md";
+            let context_store = ContextStore::new();
             let mut history = History::new(vec![Message::user("go".into())]);
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
                 &mut history,
             );
+            agent.context_publisher = Some(context_store.publisher(ContextKey::Main));
             agent.config.post_compaction_instructions = Some(POST.into());
             agent.do_compact().await.unwrap();
+            assert_eq!(
+                context_store
+                    .latest(&ContextKey::Main)
+                    .expect(PREPARED_CONTEXT_MISSING)
+                    .readiness,
+                ContextReadiness::PreparedNextRequest
+            );
             drop(agent);
 
             let last = history.as_slice().last().unwrap();
@@ -2327,13 +2706,22 @@ mod tests {
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
+            let context_store = ContextStore::new();
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
             let mut agent = agent.with_cancel(cancel);
+            agent.context_publisher = Some(context_store.publisher(ContextKey::Main));
 
             assert_eq!(
                 agent.run(default_input()).await.unwrap(),
                 DoneReason::Cancelled
+            );
+            assert_eq!(
+                context_store
+                    .latest(&ContextKey::Main)
+                    .expect(PREPARED_CONTEXT_MISSING)
+                    .readiness,
+                ContextReadiness::PreparedNextRequest
             );
             drop(agent);
             assert_ends_with_cancel_marker(&history);

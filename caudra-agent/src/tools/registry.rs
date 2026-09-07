@@ -1,6 +1,7 @@
 //! Single source of truth for native, Lua, and MCP tools. One registry, one lookup path, no
 //! parallel lists that can drift.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -378,7 +379,7 @@ pub trait ToolInvocation: Send + Sync {
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a>;
 }
 
-pub trait Tool: Send + Sync + 'static {
+pub trait Tool: Any + Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
     fn schema(&self) -> Value;
@@ -409,6 +410,11 @@ impl RegisteredTool {
     /// Parse without naming `ParseError`, handy for crates outside `caudra-agent`.
     pub fn try_parse(&self, input: &serde_json::Value) -> Option<Box<dyn ToolInvocation>> {
         self.tool.parse(input).ok()
+    }
+
+    pub(crate) fn downcast_ref<T: Tool>(&self) -> Option<&T> {
+        let tool: &dyn Any = self.tool.as_ref();
+        tool.downcast_ref()
     }
 
     pub fn is_safe_in_read_only(&self) -> bool {

@@ -35,6 +35,7 @@ use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
+use crate::components::context_modal::ContextModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
@@ -75,6 +76,7 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionManager, PermissionPolicyError, RevokedRuleScope,
 };
@@ -123,6 +125,7 @@ const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const FLASH_NO_CHORD: &str = "is not a chord";
+const CONTEXT_USAGE: &str = "Usage: /context [all]";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
@@ -264,6 +267,8 @@ pub struct App {
     pub(super) help_modal: HelpModal,
     pub(super) which_key: WhichKey,
     pub(super) usage_modal: UsageModal,
+    pub(super) context_modal: ContextModal,
+    context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
     pub(super) lifetime_usage: Option<LifetimeUsage>,
@@ -342,6 +347,7 @@ pub struct App {
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
+    pub(crate) context_store: Option<ContextStore>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
@@ -438,6 +444,8 @@ impl App {
             help_modal: HelpModal::new(),
             which_key: WhichKey::new(ui_config.which_key_delay()),
             usage_modal: UsageModal::new(),
+            context_modal: ContextModal::new(),
+            context_snapshot: Watch::default(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
             btw_modal: BtwModal::new(typewriter),
@@ -505,6 +513,7 @@ impl App {
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_prompt: None,
+            context_store: None,
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
@@ -531,6 +540,7 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
+        app.chats[0].context_window = app.state.model.context_window;
         app
     }
 
@@ -590,6 +600,18 @@ impl App {
             .map(|id| id.as_ref())
     }
 
+    pub(super) fn active_context_snapshot(&self) -> Option<Arc<ContextSnapshot>> {
+        let store = self.context_store.as_ref()?;
+        if let Some(task_id) = self.active_subagent_id() {
+            return store.latest(&ContextKey::task(task_id));
+        }
+
+        let snapshot = store.latest(&ContextKey::Main)?;
+        (snapshot.model.spec == self.state.model.spec()
+            && snapshot.window.tokens == self.state.model.context_window)
+            .then_some(snapshot)
+    }
+
     fn active_subagent_can_steer(&self) -> bool {
         self.active_subagent_id()
             .is_some_and(|id| self.subagent_steers.contains_key(id))
@@ -639,6 +661,7 @@ impl App {
 
     pub(crate) fn update_model(&mut self, model: &Model) {
         self.state.update_model(model);
+        self.chats[0].context_window = model.context_window;
         persist_model(&self.storage, &self.state.session.model);
     }
 
@@ -882,6 +905,10 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        if self.context_modal.is_open() {
+            self.context_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1066,6 +1093,11 @@ impl App {
             }
             self.usage_modal.handle_key(key);
             self.load_lifetime_usage();
+            return Some(vec![]);
+        }
+
+        if self.context_modal.is_open() {
+            self.context_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -1913,6 +1945,9 @@ impl App {
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
+        if self.intercept_context_submission(&sub.text) {
+            return vec![];
+        }
         if sub.images.is_empty() && sub.text.trim() == "/queue" {
             self.focus_active_queue();
             return vec![];
@@ -1948,6 +1983,28 @@ impl App {
             .or_default()
             .push_back(PendingSteer { id, text, draft });
         vec![]
+    }
+
+    fn intercept_context_submission(&mut self, text: &str) -> bool {
+        let (token, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if !token.eq_ignore_ascii_case("/context") {
+            return false;
+        }
+        self.execute_context(args);
+        true
+    }
+
+    fn execute_context(&mut self, args: &str) {
+        let expanded = match args.trim() {
+            "" => false,
+            arg if arg.eq_ignore_ascii_case("all") => true,
+            _ => {
+                self.flash(CONTEXT_USAGE.into());
+                return;
+            }
+        };
+        self.context_snapshot = Watch::seeded(self.active_context_snapshot());
+        self.context_modal.open(expanded);
     }
 
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
@@ -2150,6 +2207,9 @@ impl App {
             PendingInput::None => {}
         }
         if sub.is_empty() {
+            return vec![];
+        }
+        if self.intercept_context_submission(&sub.text) {
             return vec![];
         }
         if sub.draft.paste_ranges.is_empty() && sub.text.trim() == "exit" {
@@ -2534,6 +2594,9 @@ impl App {
             self.record_model_usage(&tc.provider, &tc.model, tc.purpose, tc.usage, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
+            if matches!(tc.purpose, LedgerPurpose::Chat) {
+                self.chats[chat_idx].context_window = tc.context_window;
+            }
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
             }
@@ -2706,6 +2769,7 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest(request) = result {
+            self.context_modal.close();
             if self.permissions_picker.is_open() {
                 self.permissions_picker.close();
                 self.permission_config_trust_deferred =
@@ -2930,6 +2994,10 @@ impl App {
                 } else {
                     vec![]
                 }
+            }
+            "/context" => {
+                self.execute_context(&cmd.args);
+                vec![]
             }
             "/btw" => {
                 let question = cmd.args.trim().to_string();
@@ -3226,11 +3294,12 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 25] {
+    fn overlays(&self) -> [&dyn Overlay; 26] {
         [
             &self.workbench,
             &self.help_modal,
             &self.usage_modal,
+            &self.context_modal,
             &self.goal_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -3256,11 +3325,12 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 25] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 26] {
         [
             &mut self.workbench,
             &mut self.help_modal,
             &mut self.usage_modal,
+            &mut self.context_modal,
             &mut self.goal_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
@@ -3408,12 +3478,21 @@ impl App {
             | self.tick_permission_config_trust()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
+            | self.poll_context_snapshot()
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
             | self.tick_workbench()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn poll_context_snapshot(&mut self) -> Dirty {
+        if !self.context_modal.is_open() {
+            return Dirty::NO;
+        }
+        let snapshot = self.active_context_snapshot();
+        self.context_snapshot.poll(snapshot)
     }
 
     fn tick_workbench(&mut self) -> Dirty {

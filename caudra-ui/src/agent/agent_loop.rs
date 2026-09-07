@@ -1,7 +1,10 @@
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
+use caudra_agent::context::{
+    ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
+};
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::{McpHandle, McpSession};
 use caudra_agent::permissions::PermissionManager;
@@ -41,6 +44,9 @@ pub(super) struct AgentLoop {
     history: History,
     history_restore_error: Option<String>,
     btw_prompt: SharedBtwPrompt,
+    context_publisher: ContextPublisher,
+    context_system: String,
+    context_options: RequestOptions,
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
@@ -71,6 +77,7 @@ impl AgentLoop {
         initial_history: Vec<HistoryItem>,
         shared_history: SharedHistory,
         btw_prompt: SharedBtwPrompt,
+        context_publisher: ContextPublisher,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
@@ -112,6 +119,9 @@ impl AgentLoop {
             history,
             history_restore_error,
             btw_prompt,
+            context_publisher,
+            context_system: String::new(),
+            context_options: RequestOptions::default(),
             cancel_map,
             init_cancel,
             permissions,
@@ -302,10 +312,11 @@ impl AgentLoop {
             &caudra_providers::ThinkingConfig::default(),
             false,
         );
-        self.publish_btw_prompt(
+        self.context_system = self.publish_btw_prompt(
             &caudra_agent::prompt::ResolvedSlots::default(),
             RequestOptions::default(),
         );
+        self.publish_prepared_context(&slot);
         !self.init_cancel.is_cancelled()
     }
 
@@ -327,6 +338,7 @@ impl AgentLoop {
         .await?;
         self.goal
             .record_external_usage(usage, model.billed_cost(&usage, false));
+        self.publish_prepared_context(&slot);
         Ok(())
     }
 
@@ -416,11 +428,19 @@ impl AgentLoop {
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );
-        self.publish_btw_prompt(&prompt_slots, opts);
+        self.context_system.clone_from(&system);
+        self.context_options = opts.clone();
+        self.publish_btw_prompt(&prompt_slots, opts.clone());
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
+
+        let active_prompt_profile_name: Arc<str> = Arc::from(
+            self.system_prompt_profile
+                .as_ref()
+                .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
+        );
 
         let mut agent = Agent::new(
             AgentParams {
@@ -432,16 +452,14 @@ impl AgentLoop {
                 session_id: self.session_id.clone(),
                 root_tool_use_id: None,
                 mailbox: self.mailbox.clone(),
+                context_publisher: Some(self.context_publisher.clone()),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 path_locks: Arc::clone(&self.path_locks),
                 prompt_slots: Arc::new(prompt_slots),
                 prompt_profiles: Arc::clone(&self.prompt_profiles),
-                system_prompt_profile_name: Arc::from(
-                    self.system_prompt_profile
-                        .as_ref()
-                        .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
-                ),
+                default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+                active_prompt_profile_name: Some(active_prompt_profile_name),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(caudra_agent::tools::ToolRegistry::global_arc()),
@@ -533,7 +551,7 @@ impl AgentLoop {
         &self,
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
         opts: RequestOptions,
-    ) {
+    ) -> String {
         let slot = self.model_slot.load();
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
@@ -546,10 +564,57 @@ impl AgentLoop {
             self.system_prompt_profile.as_deref(),
         );
         self.btw_prompt.store(Arc::new(BtwPrompt {
-            system,
+            system: system.clone(),
             tools: self.tools.clone(),
             opts,
         }));
+        system
+    }
+
+    fn publish_prepared_context(&self, slot: &ModelSlot) {
+        let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
+        let mut tools = self.tools.clone();
+        if let Some(mcp) = &mcp {
+            mcp.extend_tools(&mut tools);
+        }
+        let messages = agent::project_for_target(
+            self.history.as_slice(),
+            &tools,
+            &slot.model,
+            slot.provider.reasoning_transport(&slot.model),
+        );
+        let options = self.context_options.clamped(&slot.model);
+        let task_profiles = self.prompt_profiles.bind_for_tasks(
+            &slot.model,
+            &options.thinking,
+            &self.model_policy,
+            self.timeouts,
+        );
+        let cwd = env::current_dir().unwrap_or_else(|_| self.permissions.project_cwd());
+        let inventory = ContextInventory::collect(
+            &cwd,
+            ToolRegistry::global(),
+            &self.prompt_profiles,
+            &task_profiles,
+            Some(
+                self.system_prompt_profile
+                    .as_deref()
+                    .map_or(BUILTIN_PROFILE_NAME, SystemPromptProfile::name),
+            ),
+            mcp.as_ref(),
+        );
+        self.context_publisher
+            .publish(ContextSnapshot::capture(ContextCapture {
+                readiness: ContextReadiness::PreparedNextRequest,
+                model: &slot.model,
+                auto_compact: agent::auto_compact_enabled(),
+                compaction_buffer: self.config.compaction_buffer,
+                system: &self.context_system,
+                base_tools: &self.tools,
+                full_tools: &tools,
+                projected_messages: messages.as_ref(),
+                inventory,
+            }));
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {

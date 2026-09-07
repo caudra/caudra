@@ -9,6 +9,23 @@ group = "Concepts"
 
 Everything the model knows about your project passes through one context window, and every token in it costs money and attention. This page covers what Caudra puts there, when, and where you should put things so they land well.
 
+## Inspect the active window
+
+`/context` shows a compact snapshot of the context Caudra would send for the transcript currently open. Main has one context. Each task has its own system prompt, tool set, and transcript, so opening a task and running `/context` reports that task alone. Return to Main to inspect Main. A task restored after restart has no request snapshot until the task is continued.
+
+The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. `/context all` adds item-level MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
+
+Every token count in the report is an estimate. Caudra uses local estimates for text and images. Provider tokenizers and wire formats vary, so the input total reported after a completed call can differ.
+
+`/context` shows current capacity. `/usage` shows cumulative spend:
+
+| Command | Scope | Numbers |
+|---------|-------|---------|
+| `/context` | One snapshot of the active Main or task window | Local estimates for the next projected request |
+| `/usage` | Completed calls accumulated across the current session | Provider-reported tokens and priced spend, with a global view for lifetime spend |
+
+Repeated requests increase `/usage` even when the current `/context` total stays flat. See [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
+
 ## What loads when
 
 ```
@@ -22,6 +39,8 @@ skill names + descriptions           MCP tool defs   tool_search
 ```
 
 The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memories one list of tags, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
+
+The `/context` views report what currently contributes without loading deferred material to size it. Large MCP installations contribute a compact `tool_search` catalog until the agent selects full definitions. Memory contributes its tag index and skills contribute their names and descriptions. A memory or skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
 
 ## Instruction files
 
@@ -71,11 +90,11 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 Caudra can replace old successful tool-result text with output-ID markers before sending a request to the provider. Only results retained for later retrieval are eligible. This reduces repeated context while keeping the result available through `tool_output_read` and `tool_output_grep`.
 
-The replacement exists only in the provider request. Canonical session history stays intact. Compaction is separate and can rewrite the live log as described below.
+The `/context` report uses this provider projection rather than counting the raw transcript. Its message total can therefore be smaller than the on-disk log, and changing the active model or provider can change the projection. The replacement exists only in the provider request. Canonical session history stays intact. Compaction is separate and can rewrite the live log as described below.
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Caudra reserves a slice of the window (`agent.compaction_buffer`) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.
+Long sessions eventually approach the model's context limit. Caudra reserves a slice of the window (`agent.compaction_buffer`) and before running out it summarizes the older turns and continues from the summary. `/context` shows this compaction reserve separately from occupied context. The reserve is held capacity rather than content or spend. `/compact` triggers compaction early, and `agent.compaction_instructions` steers what the summary keeps.
 
 The default reserve is 20%, because for most models the context window is the total the prompt and the response share, so the slice has to fit a whole reply. Where the window is an input budget instead and the output allowance sits on top of it, as with the wide Claude windows and the OpenAI Coding Plan models, the reserve only absorbs estimation drift and drops to 10%. Setting `agent.compaction_buffer` yourself overrides both.
 

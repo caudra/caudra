@@ -407,7 +407,8 @@ struct Resolved {
     mcp_enabled: bool,
     task_id: String,
     history_lease: SubagentHistoryLease,
-    profile_name: Arc<str>,
+    default_task_prompt_profile_name: Arc<str>,
+    active_prompt_profile_name: Option<Arc<str>>,
 }
 
 /// A `task` call: model, prompt, tools, and mode all come from the profile,
@@ -441,7 +442,7 @@ pub struct GenericOptions {
 pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent, String> {
     let ids = Identity::derive(ctx, opts.task_id.as_deref());
     let default_spec = SubagentTaskSpec {
-        profile_name: ctx.system_prompt_profile_name.to_string(),
+        profile_name: ctx.default_task_prompt_profile_name.to_string(),
         mode: SubagentTaskMode::Plan,
         ..SubagentTaskSpec::default()
     };
@@ -554,6 +555,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .as_array_mut()
         .expect("definitions return an array")
         .extend(opts.local_definitions);
+    let profile_name: Arc<str> = Arc::from(spec.profile_name.as_str());
 
     build(
         ctx,
@@ -569,7 +571,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             mcp_enabled: spec.mode == SubagentTaskMode::Build,
             task_id,
             history_lease,
-            profile_name: Arc::from(spec.profile_name.as_str()),
+            default_task_prompt_profile_name: Arc::clone(&profile_name),
+            active_prompt_profile_name: Some(profile_name),
         },
         opts.local_tools,
         ctx.opts.fast,
@@ -607,7 +610,8 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
             mcp_enabled: opts.mcp.unwrap_or(true),
             task_id,
             history_lease,
-            profile_name: Arc::clone(&ctx.system_prompt_profile_name),
+            default_task_prompt_profile_name: Arc::clone(&ctx.default_task_prompt_profile_name),
+            active_prompt_profile_name: None,
         },
         opts.local_tools,
         opts.fast.unwrap_or(ctx.opts.fast),
@@ -750,6 +754,10 @@ fn build(
         .insert(resolved.task_id.clone(), child_trigger);
 
     info!(name = %name, model = %resolved.model.id, "subagent session opened");
+    let context_publisher = ctx
+        .context_publisher
+        .as_ref()
+        .map(|publisher| publisher.for_task(resolved.task_id.clone()));
 
     Ok(Subagent {
         params: AgentParams {
@@ -761,6 +769,7 @@ fn build(
             session_id: ctx.session_id.clone(),
             root_tool_use_id: Some(ids.root_tool_use_id.clone()),
             mailbox: None,
+            context_publisher,
             timeouts: ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             // Shared, not fresh: a subagent tracks its own reads but must not
@@ -768,7 +777,8 @@ fn build(
             path_locks: Arc::clone(&ctx.path_locks),
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             prompt_profiles: Arc::clone(&ctx.prompt_profiles),
-            system_prompt_profile_name: resolved.profile_name,
+            default_task_prompt_profile_name: resolved.default_task_prompt_profile_name,
+            active_prompt_profile_name: resolved.active_prompt_profile_name,
             subagent_cancels: Arc::new(CancelMap::new()),
             subagent_history: ctx.subagent_history.clone(),
             registry: Arc::clone(ToolRegistry::global_arc()),
@@ -824,12 +834,20 @@ mod tests {
 
     use super::*;
     use crate::TurnCompleteEvent;
+    use crate::context::{
+        ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
+        ContextUsage, ContextWindow,
+    };
     use caudra_providers::Message;
     use caudra_storage::usage_ledger::LedgerPurpose;
 
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
     const TOOL_ID: &str = "toolu_01";
+    const COLLIDING_SUBAGENT_NAME: &str = "collision";
+    const INHERITED_PROFILE: &str = "parent-default";
+    const SUBAGENT_SYSTEM: &str = "system";
+    const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
     /// Spelt out rather than read back off the activity, so a rename in
@@ -845,6 +863,104 @@ mod tests {
             cache_creation: 0,
             cache_read: 0,
         }
+    }
+
+    fn context_snapshot(model: &Model) -> ContextSnapshot {
+        ContextSnapshot {
+            readiness: ContextReadiness::PreparedNextRequest,
+            model: model.into(),
+            window: ContextWindow::new(model, false, None),
+            usage: ContextUsage::default(),
+            inventory: ContextInventory::default(),
+        }
+    }
+
+    fn generic_options() -> GenericOptions {
+        GenericOptions {
+            name: COLLIDING_SUBAGENT_NAME.into(),
+            task_id: None,
+            model_spec: None,
+            system: SUBAGENT_SYSTEM.into(),
+            tools: json!([]),
+            audience: None,
+            thinking: None,
+            fast: None,
+            mcp: Some(false),
+            local_tools: LocalTools::default(),
+        }
+    }
+
+    #[test]
+    fn context_publisher_uses_actual_reserved_task_id_after_collision() {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+            ctx.context_publisher = Some(store.publisher(ContextKey::Main));
+            let _occupied = ctx.subagent_history.reserve(PARENT_ID).unwrap();
+            let mut subagent = open_generic(&ctx, generic_options()).await.unwrap();
+            let actual_task_id = subagent.id().to_owned();
+            assert_ne!(actual_task_id, PARENT_ID);
+
+            subagent
+                .params
+                .context_publisher
+                .as_ref()
+                .expect(PUBLISHER_MISSING)
+                .publish(context_snapshot(&subagent.params.model));
+
+            assert!(store.latest(&ContextKey::task(actual_task_id)).is_some());
+            assert!(store.latest(&ContextKey::task(PARENT_ID)).is_none());
+            assert!(store.latest(&ContextKey::Main).is_none());
+            subagent.close();
+        });
+    }
+
+    #[test]
+    fn generic_subagent_inherits_task_default_without_an_active_profile() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.default_task_prompt_profile_name = Arc::from(INHERITED_PROFILE);
+
+            let mut subagent = open_generic(&ctx, generic_options()).await.unwrap();
+
+            assert_eq!(
+                subagent.params.default_task_prompt_profile_name.as_ref(),
+                INHERITED_PROFILE
+            );
+            assert!(subagent.params.active_prompt_profile_name.is_none());
+            subagent.close();
+        });
+    }
+
+    #[test]
+    fn task_subagent_marks_its_resolved_profile_active() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut subagent = open_task(
+                &ctx,
+                TaskOptions {
+                    name: COLLIDING_SUBAGENT_NAME.into(),
+                    task_id: None,
+                    profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
+                    mode: Some(SubagentTaskMode::Plan),
+                    local_definitions: Vec::new(),
+                    local_tools: LocalTools::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                subagent.params.default_task_prompt_profile_name.as_ref(),
+                crate::prompt::profile::BUILTIN_PROFILE_NAME
+            );
+            assert_eq!(
+                subagent.params.active_prompt_profile_name.as_deref(),
+                Some(crate::prompt::profile::BUILTIN_PROFILE_NAME)
+            );
+            subagent.close();
+        });
     }
 
     fn envelope(event: AgentEvent) -> Envelope {

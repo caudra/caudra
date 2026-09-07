@@ -29,6 +29,16 @@ end
 
 Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`caudra.api.run_command`](/docs/lua-api/#caudra-api-run_command) for matching and error handling, or [`caudra.ui.action`](/docs/lua-api/#caudra-ui-action) to bind a key instead of a name."#;
 
+const CONTEXT: &str = r#"## Context window
+
+`/context` opens a compact summary of the active context window. Main and each task have separate prompts, tools, and transcripts. The command reports Main when Main is open, or the selected task when its transcript is open. It never adds those windows together. A task restored after restart has no request snapshot until the task is continued.
+
+The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
+
+Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
+
+`/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger."#;
+
 const GOALS: &str = r#"## Completion goals
 
 `/goal <condition>` asks Caudra to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
@@ -122,6 +132,9 @@ pub fn generate() -> String {
 
     writeln!(out).unwrap();
     writeln!(out, "{GOALS}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{CONTEXT}").unwrap();
     writeln!(out).unwrap();
 
     writeln!(out, "## Modes and toggles").unwrap();

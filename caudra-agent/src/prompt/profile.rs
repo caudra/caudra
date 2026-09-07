@@ -140,6 +140,10 @@ impl TaskProfileBindings {
         )
     }
 
+    pub fn available(&self) -> impl Iterator<Item = &SystemPromptProfile> {
+        self.available.values().map(AsRef::as_ref)
+    }
+
     pub fn disabled(&self) -> impl Iterator<Item = (&str, &str)> {
         self.disabled
             .iter()
@@ -669,6 +673,13 @@ mod tests {
             Err(PromptProfileSelectionError::Unavailable { .. })
         ));
         assert!(catalog.get("blocked").is_some());
+        assert_eq!(
+            bindings
+                .available()
+                .map(SystemPromptProfile::name)
+                .collect::<Vec<_>>(),
+            vec!["plain"]
+        );
         let summary = bindings.task_tool_summary("Built in");
         assert!(summary.contains("`plain`"));
         assert!(!summary.contains("`blocked`"));

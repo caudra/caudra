@@ -80,6 +80,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/context",
+        description: "Inspect active context window usage",
+        max_args: 1,
+    },
+    BuiltinCommand {
         name: "/queue",
         description: "Inspect and edit queued prompts",
         max_args: 0,

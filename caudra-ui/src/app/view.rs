@@ -461,6 +461,13 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.context_modal.is_open() {
+            let snapshot = self.context_snapshot.get();
+            let r = self.context_modal.view(frame, full, snapshot);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.goal_modal.is_open() {
             let status = self.state.goal.status();
             let evaluator = caudra_providers::model_registry::goal_evaluator_target();
@@ -518,7 +525,11 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
-                context_window: self.state.model.context_window,
+                context_window: if chat.context_window > 0 {
+                    chat.context_window
+                } else {
+                    self.state.model.context_window
+                },
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),

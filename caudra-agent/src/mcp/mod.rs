@@ -293,6 +293,7 @@ pub struct McpSnapshot {
 }
 
 /// How one MCP tool would reach the model on the next request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolStatus {
     pub qualified_name: String,
     pub wire_name: String,
@@ -365,7 +366,7 @@ pub struct McpHandle {
 /// this session loaded. Loads are per session, so a subagent's searches
 /// never bloat the parent's context.
 ///
-/// `extend_tools` output must never be stored: recompute it every request
+/// `McpRequestSnapshot::extend_tools` output must never be stored: recompute it every request
 /// or the `tool_search` catalog goes stale.
 #[derive(Clone)]
 pub struct McpSession {
@@ -375,6 +376,14 @@ pub struct McpSession {
     /// than in `ToolFilter` because MCP definitions are appended after the
     /// registry filter has already run.
     disabled: Arc<[String]>,
+}
+
+/// Immutable MCP state used to assemble and account for one model request.
+pub struct McpRequestSnapshot {
+    index: Arc<ToolIndex>,
+    loaded: HashSet<Arc<str>>,
+    disabled: Arc<[String]>,
+    defer_tools: usize,
 }
 
 impl std::ops::Deref for McpSession {
@@ -418,47 +427,21 @@ impl McpSession {
     }
 
     pub fn is_disabled(&self, qualified_name: &str) -> bool {
-        self.disabled
-            .iter()
-            .any(|pattern| caudra_config::tool_pattern_matches(pattern, qualified_name))
+        is_disabled(&self.disabled, qualified_name)
     }
 
-    /// Measured against the enabled tools only: turning tools off must be able
-    /// to bring a server back under the threshold.
-    fn deferring(&self, idx: &ToolIndex) -> bool {
-        idx.descriptors
-            .iter()
-            .filter(|d| !d.always_load && !self.is_disabled(&d.qualified_name))
-            .count()
-            > self.handle.defer_tools
-    }
-
-    /// Every MCP tool this session knows of and how it would reach the model.
-    /// `extend_tools` stays the request path; this one is for reporting.
-    pub fn tool_inventory(&self) -> Vec<McpToolStatus> {
-        let idx = self.handle.index.load();
-        let defer = self.deferring(&idx);
-        let loaded = self.lock_loaded();
-        idx.descriptors
-            .iter()
-            .map(|d| {
-                let disabled = self.is_disabled(&d.qualified_name);
-                let (server, _) = d
-                    .qualified_name
-                    .split_once(SEPARATOR)
-                    .unwrap_or((UNKNOWN_MCP, &d.qualified_name));
-                McpToolStatus {
-                    server: server.to_owned(),
-                    wire_name: d.wire_name().to_owned(),
-                    deferred: !disabled
-                        && defer
-                        && !d.always_load
-                        && !loaded.contains(&*d.qualified_name),
-                    qualified_name: d.qualified_name.to_string(),
-                    disabled,
-                }
-            })
-            .collect()
+    /// Captures the published tool generation while the session's loaded set is stable.
+    pub fn request_snapshot(&self) -> McpRequestSnapshot {
+        let (index, loaded) = {
+            let loaded = self.lock_loaded();
+            (self.handle.index.load_full(), loaded.clone())
+        };
+        McpRequestSnapshot {
+            index,
+            loaded,
+            disabled: Arc::clone(&self.disabled),
+            defer_tools: self.handle.defer_tools,
+        }
     }
 
     /// A view over the same handle with no loads, for a new (sub)session.
@@ -467,54 +450,6 @@ impl McpSession {
             handle: self.handle.clone(),
             loaded: Arc::new(Mutex::new(HashSet::new())),
             disabled: Arc::clone(&self.disabled),
-        }
-    }
-
-    /// Append this request's MCP definitions: loaded and `always_load`
-    /// tools in full, the rest as names inside one `tool_search` catalog.
-    /// Names already in the array are skipped.
-    ///
-    /// The `defer_tools` threshold is measured against the full index, not
-    /// what's left deferred, so loading tools mid-session can never flip
-    /// the remainder into the context.
-    pub fn extend_tools(&self, tools: &mut Value) {
-        let Some(arr) = tools.as_array_mut() else {
-            debug_assert!(false, "tools must be a JSON array");
-            return;
-        };
-        let existing: HashSet<String> = arr
-            .iter()
-            .filter_map(|t| t["name"].as_str().map(String::from))
-            .collect();
-        let idx = self.handle.index.load();
-        let enabled = || {
-            idx.descriptors
-                .iter()
-                .filter(|d| !self.is_disabled(&d.qualified_name))
-        };
-        let defer = self.deferring(&idx);
-        let loaded = self.lock_loaded();
-        let mut deferred: Vec<&ToolDescriptor> = Vec::new();
-        for d in enabled() {
-            if existing.contains(d.wire_name()) {
-                continue;
-            }
-            if !defer || d.always_load || loaded.contains(&*d.qualified_name) {
-                arr.push(d.definition.clone());
-            } else {
-                deferred.push(d);
-            }
-        }
-        drop(loaded);
-        if !deferred.is_empty() {
-            if existing.contains(TOOL_SEARCH_TOOL_NAME) {
-                warn!(
-                    deferred = deferred.len(),
-                    "a tool named {TOOL_SEARCH_TOOL_NAME} already exists; deferred MCP tools stay hidden"
-                );
-            } else {
-                arr.push(tool_search_definition(&deferred));
-            }
         }
     }
 
@@ -611,6 +546,102 @@ impl McpSession {
     fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
         self.loaded.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+impl McpRequestSnapshot {
+    fn is_disabled(&self, qualified_name: &str) -> bool {
+        is_disabled(&self.disabled, qualified_name)
+    }
+
+    fn deferring(&self) -> bool {
+        self.index
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                !descriptor.always_load && !self.is_disabled(&descriptor.qualified_name)
+            })
+            .count()
+            > self.defer_tools
+    }
+
+    /// Every MCP tool in this request snapshot and how it reaches the model.
+    pub fn tool_inventory(&self) -> Vec<McpToolStatus> {
+        let defer = self.deferring();
+        self.index
+            .descriptors
+            .iter()
+            .map(|descriptor| {
+                let disabled = self.is_disabled(&descriptor.qualified_name);
+                let (server, _) = descriptor
+                    .qualified_name
+                    .split_once(SEPARATOR)
+                    .unwrap_or((UNKNOWN_MCP, &descriptor.qualified_name));
+                McpToolStatus {
+                    server: server.to_owned(),
+                    wire_name: descriptor.wire_name().to_owned(),
+                    deferred: !disabled
+                        && defer
+                        && !descriptor.always_load
+                        && !self.loaded.contains(&descriptor.qualified_name),
+                    qualified_name: descriptor.qualified_name.to_string(),
+                    disabled,
+                }
+            })
+            .collect()
+    }
+
+    /// Append this request's MCP definitions: loaded and `always_load`
+    /// tools in full, the rest as names inside one `tool_search` catalog.
+    /// Names already in the array are skipped.
+    ///
+    /// The `defer_tools` threshold is measured against the full index, not
+    /// what's left deferred, so loading tools mid-session can never flip
+    /// the remainder into the context.
+    pub fn extend_tools(&self, tools: &mut Value) {
+        let Some(arr) = tools.as_array_mut() else {
+            debug_assert!(false, "tools must be a JSON array");
+            return;
+        };
+        let existing: HashSet<String> = arr
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        let enabled = || {
+            self.index
+                .descriptors
+                .iter()
+                .filter(|descriptor| !self.is_disabled(&descriptor.qualified_name))
+        };
+        let defer = self.deferring();
+        let mut deferred: Vec<&ToolDescriptor> = Vec::new();
+        for descriptor in enabled() {
+            if existing.contains(descriptor.wire_name()) {
+                continue;
+            }
+            if !defer || descriptor.always_load || self.loaded.contains(&descriptor.qualified_name)
+            {
+                arr.push(descriptor.definition.clone());
+            } else {
+                deferred.push(descriptor);
+            }
+        }
+        if !deferred.is_empty() {
+            if existing.contains(TOOL_SEARCH_TOOL_NAME) {
+                warn!(
+                    deferred = deferred.len(),
+                    "a tool named {TOOL_SEARCH_TOOL_NAME} already exists; deferred MCP tools stay hidden"
+                );
+            } else {
+                arr.push(tool_search_definition(&deferred));
+            }
+        }
+    }
+}
+
+fn is_disabled(patterns: &[String], qualified_name: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| caudra_config::tool_pattern_matches(pattern, qualified_name))
 }
 
 impl McpHandle {
@@ -1708,7 +1739,7 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
-    use caudra_providers::Role;
+    use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
@@ -1717,8 +1748,17 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    use crate::context::{
+        ContextCapture, ContextInventory, ContextMcpInventory, ContextReadiness, ContextSnapshot,
+    };
+
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
+    const ORIGINAL_DESCRIPTION: &str = "original contract";
+    const REPLACEMENT_CATALOG_ENTRY: &str = "srv: replacement";
+    const REPLACEMENT_DESCRIPTION: &str = "replacement contract";
+    const REPLACEMENT_TOOL_NAME: &str = "srv.replacement";
+    const TEST_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -1935,6 +1975,81 @@ mod tests {
         assert!(Arc::ptr_eq(&current.tool.transport, &replacement_transport));
         assert_ne!(reviewed_subject, *current.subject());
         assert_ne!(binding.generation(), current.generation());
+    }
+
+    #[test]
+    fn request_snapshot_survives_generation_replacement_with_attributable_definitions() {
+        let original = entry_with_tools(
+            "srv",
+            vec![tool_def("srv", "tool", ORIGINAL_DESCRIPTION, json!({}))],
+        );
+        let (mut inner, session) = setup(vec![original]);
+        session.mark_loaded(TOOL_NAME);
+        let request = session.request_snapshot();
+        assert!(session.loaded.try_lock().is_ok());
+
+        inner.entries[0] = entry_with_tools(
+            "srv",
+            vec![tool_def(
+                "srv",
+                "replacement",
+                REPLACEMENT_DESCRIPTION,
+                json!({}),
+            )],
+        );
+        inner.generation += 1;
+        publish(
+            &inner,
+            session.handle.index.as_ref(),
+            session.handle.snapshot.as_ref(),
+        );
+
+        let base_tools = json!([]);
+        let mut full_tools = base_tools.clone();
+        request.extend_tools(&mut full_tools);
+        assert_eq!(tool_names(&full_tools), [WIRE_TOOL_NAME]);
+        assert_eq!(full_tools[0]["description"], ORIGINAL_DESCRIPTION);
+        assert_eq!(request.index.tools[TOOL_NAME].generation, 0);
+
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let captured = ContextSnapshot::capture(ContextCapture {
+            readiness: ContextReadiness::CapturedCurrentRequest,
+            model: &model,
+            auto_compact: false,
+            compaction_buffer: None,
+            system: "",
+            base_tools: &base_tools,
+            full_tools: &full_tools,
+            projected_messages: &[],
+            inventory: ContextInventory {
+                mcp: ContextMcpInventory::from_statuses(request.tool_inventory()),
+                ..ContextInventory::default()
+            },
+        });
+        assert_eq!(captured.inventory.mcp.unattributed_tokens, 0);
+        assert_eq!(captured.inventory.mcp.tools[0].wire_name, WIRE_TOOL_NAME);
+        assert_eq!(
+            captured.inventory.mcp.tools[0].request_tokens,
+            captured.usage.mcp_tools
+        );
+
+        let current = session.request_snapshot();
+        let mut current_tools = json!([]);
+        current.extend_tools(&mut current_tools);
+        assert_eq!(tool_names(&current_tools), [TOOL_SEARCH_TOOL_NAME]);
+        assert_eq!(
+            current.tool_inventory()[0].qualified_name,
+            REPLACEMENT_TOOL_NAME
+        );
+        assert_eq!(
+            current.index.tools[REPLACEMENT_TOOL_NAME].generation,
+            inner.generation
+        );
+        assert!(
+            current_tools[0]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains(REPLACEMENT_CATALOG_ENTRY))
+        );
     }
 
     #[test]
@@ -2222,7 +2337,7 @@ mod tests {
     fn extend_tools_skips_deferral_at_or_below_threshold() {
         let (_inner, handle) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
     }
 
@@ -2233,6 +2348,7 @@ mod tests {
         let mut tools = json!([]);
         session
             .with_disabled_tools(disabled)
+            .request_snapshot()
             .extend_tools(&mut tools);
         assert!(tool_names(&tools).is_empty());
     }
@@ -2247,7 +2363,7 @@ mod tests {
         ]);
         let session = session.with_disabled_tools(&["srv.*".to_owned()]);
         let mut tools = json!([]);
-        session.extend_tools(&mut tools);
+        session.request_snapshot().extend_tools(&mut tools);
 
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
         let catalog = tools[0]["description"].as_str().unwrap();
@@ -2274,6 +2390,7 @@ mod tests {
         let mut tools = json!([]);
         session
             .with_disabled_tools(&["srv.*".to_owned()])
+            .request_snapshot()
             .extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec!["other__tool"]);
     }
@@ -2288,7 +2405,7 @@ mod tests {
             1,
         );
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec!["eager__tool", "lazy__tool"]);
     }
 
@@ -2296,7 +2413,7 @@ mod tests {
     fn extend_tools_defers_behind_tool_search_by_default() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
         let catalog = tools[0]["description"].as_str().unwrap();
         assert!(catalog.contains("srv: tool"), "catalog groups by server");
@@ -2310,7 +2427,7 @@ mod tests {
             fake_entry("lazy", FakeTransport::new()),
         ]);
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         let names = tool_names(&tools);
         assert!(names.contains(&"eager__tool"));
         assert!(names.contains(&TOOL_SEARCH_TOOL_NAME));
@@ -2324,7 +2441,7 @@ mod tests {
         assert!(result.contains(WIRE_TOOL_NAME), "got: {result}");
 
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
     }
 
@@ -2334,7 +2451,7 @@ mod tests {
         let result = handle.search_tools("nonexistent-capability").unwrap();
         assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
     }
 
@@ -2363,7 +2480,7 @@ mod tests {
             "overflow must list names: {result}"
         );
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         // Loaded cap plus the search tool for the remaining deferred ones.
         assert_eq!(tools.as_array().unwrap().len(), MAX_SEARCH_LOADS + 1);
     }
@@ -2449,8 +2566,8 @@ mod tests {
     fn extend_tools_never_duplicates_existing_names() {
         let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(tool_names(&tools), vec!["eager__tool"]);
     }
 
@@ -2470,7 +2587,7 @@ mod tests {
         }];
         let restored = McpSession::new(session.handle.clone(), &history);
         let mut tools = json!([]);
-        restored.extend_tools(&mut tools);
+        restored.request_snapshot().extend_tools(&mut tools);
         assert_eq!(
             tool_names(&tools),
             vec![WIRE_TOOL_NAME],
@@ -2489,7 +2606,7 @@ mod tests {
         handle.mark_loaded("srv.alpha");
         handle.mark_loaded("srv.beta");
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         let names = tool_names(&tools);
         assert!(names.contains(&"srv__alpha") && names.contains(&"srv__beta"));
         assert!(
@@ -2511,7 +2628,7 @@ mod tests {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         handle.mark_loaded(TOOL_NAME);
         let mut tools = json!([]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(
             tool_names(&tools),
             vec![WIRE_TOOL_NAME],
@@ -2527,7 +2644,7 @@ mod tests {
         ];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", defs)]);
         let mut tools = json!([{ "name": "srv__alpha" }]);
-        handle.extend_tools(&mut tools);
+        handle.request_snapshot().extend_tools(&mut tools);
         assert_eq!(
             tool_names(&tools),
             vec!["srv__alpha", TOOL_SEARCH_TOOL_NAME],
@@ -2550,7 +2667,7 @@ mod tests {
         }];
         let restored = McpSession::new(session.handle.clone(), &history);
         let mut tools = json!([]);
-        restored.extend_tools(&mut tools);
+        restored.request_snapshot().extend_tools(&mut tools);
         assert_eq!(
             tool_names(&tools),
             vec!["srv__do__thing"],
@@ -2575,11 +2692,11 @@ mod tests {
         session_a.search_tools("tool").unwrap();
 
         let mut tools_a = json!([]);
-        session_a.extend_tools(&mut tools_a);
+        session_a.request_snapshot().extend_tools(&mut tools_a);
         assert_eq!(tool_names(&tools_a), vec![WIRE_TOOL_NAME]);
 
         let mut tools_b = json!([]);
-        session_b.extend_tools(&mut tools_b);
+        session_b.request_snapshot().extend_tools(&mut tools_b);
         assert_eq!(tool_names(&tools_b), vec![TOOL_SEARCH_TOOL_NAME]);
     }
 
@@ -2659,7 +2776,7 @@ mod tests {
 
             assert!(handle.has_tool(TOOL_NAME));
             let mut tools = json!([]);
-            handle.extend_tools(&mut tools);
+            handle.request_snapshot().extend_tools(&mut tools);
             assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
 
             handle_toggle(&mut inner, "srv", false).await;
@@ -2672,7 +2789,7 @@ mod tests {
             assert_eq!(entry.status, McpServerStatus::Disabled);
             assert!(!handle.has_tool(TOOL_NAME));
             let mut tools = json!([]);
-            handle.extend_tools(&mut tools);
+            handle.request_snapshot().extend_tools(&mut tools);
             assert!(tools.as_array().unwrap().is_empty());
         });
     }

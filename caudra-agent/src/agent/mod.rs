@@ -11,7 +11,8 @@ mod tool_body;
 pub mod tool_dispatch;
 mod tool_preview;
 
-pub use compaction::compact;
+pub(crate) use compaction::compaction_reserve;
+pub use compaction::{auto_compact_enabled, compact};
 pub use goal::{
     GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict, MAX_GOAL_CHARS,
     goal_checkin_message, goal_kickoff_message,

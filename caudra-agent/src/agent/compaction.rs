@@ -197,12 +197,14 @@ pub async fn compact(
 
 /// A window that excludes output only needs the reserve to absorb estimation
 /// drift, so it holds back less than one that has to fit a response as well.
-fn resolve_buffer(model: &Model, configured: Option<CompactionBuffer>) -> CompactionBuffer {
-    configured.unwrap_or(if model.window_excludes_output {
-        DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER
-    } else {
-        DEFAULT_COMPACTION_BUFFER
-    })
+pub(crate) fn compaction_reserve(model: &Model, configured: Option<CompactionBuffer>) -> u32 {
+    configured
+        .unwrap_or(if model.window_excludes_output {
+            DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER
+        } else {
+            DEFAULT_COMPACTION_BUFFER
+        })
+        .resolve(model.context_window)
 }
 
 pub(super) fn is_overflow(
@@ -212,7 +214,7 @@ pub(super) fn is_overflow(
 ) -> bool {
     let usable = model
         .context_window
-        .saturating_sub(resolve_buffer(model, buffer).resolve(model.context_window));
+        .saturating_sub(compaction_reserve(model, buffer));
     usage.context_tokens() >= usable
 }
 
@@ -335,7 +337,7 @@ fn truncate_oldest_round(messages: &mut Vec<Message>) {
     }
 }
 
-pub(super) fn auto_compact_enabled() -> bool {
+pub fn auto_compact_enabled() -> bool {
     env::var("CAUDRA_DISABLE_AUTOCOMPACT")
         .map(|v| v != "1" && v != "true")
         .unwrap_or(true)

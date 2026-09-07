@@ -15,10 +15,10 @@ use serde_json::Value;
 
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
-    ToolInvocation,
+    ToolInvocation, ToolRegistry,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
-use crate::tools::{BoxFuture, DescriptionContext, ToolContext, relative_path};
+use crate::tools::{BoxFuture, DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
 use crate::types::ToolOutput;
 
 pub const DESCRIPTION: &str =
@@ -83,33 +83,75 @@ struct Skill {
     location: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInventoryEntry {
+    pub name: String,
+    pub description: String,
+}
+
+struct SkillCatalog {
+    description: String,
+    entries: Vec<SkillInventoryEntry>,
+}
+
 pub struct SkillTool {
     dirs: Vec<PathBuf>,
     /// Built on first use, not at registration: tools register before the
     /// config that decides whether the builtin skill exists. Memoized so the
     /// list the model was given cannot change under it mid-session.
-    listing: OnceLock<String>,
+    catalog: OnceLock<SkillCatalog>,
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
         Self {
             dirs: skill_dirs(),
-            listing: OnceLock::new(),
+            catalog: OnceLock::new(),
         }
     }
 }
 
+impl SkillTool {
+    fn catalog(&self) -> &SkillCatalog {
+        self.catalog.get_or_init(|| {
+            let builtin = installed_builtin();
+            let found = discover(&self.dirs, builtin.as_deref());
+            SkillCatalog {
+                description: format!("{DESCRIPTION}{}", skill_list(&found)),
+                entries: found
+                    .values()
+                    .map(|skill| SkillInventoryEntry {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                    })
+                    .collect(),
+            }
+        })
+    }
+
+    pub fn inventory(&self) -> &[SkillInventoryEntry] {
+        &self.catalog().entries
+    }
+}
+
+pub fn inventory(registry: &ToolRegistry) -> Vec<SkillInventoryEntry> {
+    registry
+        .get(SKILL_TOOL_NAME)
+        .and_then(|registered| {
+            registered
+                .downcast_ref::<SkillTool>()
+                .map(|tool| tool.inventory().to_vec())
+        })
+        .unwrap_or_default()
+}
+
 impl Tool for SkillTool {
     fn name(&self) -> &str {
-        "skill"
+        SKILL_TOOL_NAME
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(self.listing.get_or_init(|| {
-            let found = discover(&self.dirs, installed_builtin().as_deref());
-            format!("{DESCRIPTION}{}", skill_list(&found))
-        }))
+        Cow::Borrowed(&self.catalog().description)
     }
 
     fn schema(&self) -> Value {
@@ -453,6 +495,30 @@ mod tests {
         let mike = listing.find("mike").unwrap();
         let zulu = listing.find("zulu").unwrap();
         assert!(alpha < mike && mike < zulu, "{listing}");
+    }
+
+    #[test]
+    fn structured_inventory_is_the_same_memoized_catalog_the_model_sees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = skill_dir(
+            &temp,
+            "deploy",
+            "---\ndescription: ship safely\n---\nbody\n",
+        );
+        let tool = SkillTool {
+            dirs: vec![root],
+            catalog: OnceLock::new(),
+        };
+
+        let first = tool.inventory().to_vec();
+        skill_dir(&temp, "later", "---\ndescription: added later\n---\nbody\n");
+
+        assert_eq!(tool.inventory(), first);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "deploy");
+        assert_eq!(first[0].description, "ship safely");
+        assert!(tool.catalog().description.contains("- deploy: ship safely"));
+        assert!(!tool.catalog().description.contains("later"));
     }
 
     #[test]

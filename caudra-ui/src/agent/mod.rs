@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::SystemPromptProfile;
@@ -69,6 +70,7 @@ pub(crate) struct AgentHandles {
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedHistory,
     pub(crate) btw_prompt: SharedBtwPrompt,
+    pub(crate) context_store: ContextStore,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -136,6 +138,7 @@ impl AgentHandles {
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
+        app.context_store = Some(self.context_store.clone());
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
             match app.state.goal.status() {
@@ -305,6 +308,8 @@ fn spawn_agent_internal(
         initial_history.clone(),
     )));
     let btw_prompt: SharedBtwPrompt = Arc::new(ArcSwap::from_pointee(BtwPrompt::default()));
+    let context_store = ContextStore::new();
+    let context_publisher = context_store.publisher(ContextKey::Main);
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
@@ -325,6 +330,7 @@ fn spawn_agent_internal(
         initial_history,
         Arc::clone(&shared_history),
         Arc::clone(&btw_prompt),
+        context_publisher,
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -356,6 +362,7 @@ fn spawn_agent_internal(
         answer_tx,
         history: shared_history,
         btw_prompt,
+        context_store,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,

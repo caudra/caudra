@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use caudra_providers::estimate_tokens_cached;
 use caudra_providers::{
     ContentBlock, Message, Model, ReasoningTransport, ResponsesReasoning, Role,
 };
-use caudra_providers::estimate_tokens_cached;
 use serde_json::Value;
 
 use crate::tools::{TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME};
@@ -310,12 +310,7 @@ mod tests {
             tool_use("candidate", "bash"),
             result("candidate", candidate_size, false, true),
             tool_use("retained", "bash"),
-            result(
-                "retained",
-                PROTECTED_OLD_RESULT_TOKENS,
-                false,
-                true,
-            ),
+            result("retained", PROTECTED_OLD_RESULT_TOKENS, false, true),
             Message::user("recent request one".into()),
             Message::user("recent request two".into()),
         ]
@@ -603,12 +598,7 @@ mod tests {
         let history = vec![
             Message::user("old request".into()),
             tool_use("huge", "bash"),
-            result(
-                "huge",
-                PROTECTED_OLD_RESULT_TOKENS + 1,
-                false,
-                true,
-            ),
+            result("huge", PROTECTED_OLD_RESULT_TOKENS + 1, false, true),
             Message::user("recent request one".into()),
             Message::user("recent request two".into()),
         ];
@@ -623,19 +613,9 @@ mod tests {
         let history = vec![
             Message::user("old request".into()),
             tool_use("older", "bash"),
-            result(
-                "older",
-                PRUNE_TRIGGER_TOKENS + 1,
-                false,
-                true,
-            ),
+            result("older", PRUNE_TRIGGER_TOKENS + 1, false, true),
             tool_use("oversized", "bash"),
-            result(
-                "oversized",
-                PROTECTED_OLD_RESULT_TOKENS + 1,
-                false,
-                true,
-            ),
+            result("oversized", PROTECTED_OLD_RESULT_TOKENS + 1, false, true),
             tool_use("newer", "bash"),
             result("newer", 1, false, true),
             Message::user("recent request one".into()),
@@ -674,12 +654,7 @@ mod tests {
                 ..Default::default()
             },
             tool_use("retained", "bash"),
-            result(
-                "retained",
-                PROTECTED_OLD_RESULT_TOKENS,
-                false,
-                true,
-            ),
+            result("retained", PROTECTED_OLD_RESULT_TOKENS, false, true),
             Message::user("recent request one".into()),
             Message::user("recent request two".into()),
         ];

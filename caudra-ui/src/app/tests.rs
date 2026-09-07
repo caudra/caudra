@@ -3,6 +3,9 @@ use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{BUILTIN_COMMANDS, ParsedCommand};
+use crate::components::context_modal::{
+    EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
+};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
@@ -13,6 +16,9 @@ use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, k
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
+use caudra_agent::context::{
+    ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
+};
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
 use caudra_agent::permissions::{PermissionManager, PermissionRequest};
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
@@ -113,6 +119,22 @@ const CONFLICT_CONTENT: &str = "conflict";
 const CONTINUED_CONTENT: &str = "continued after revert";
 const GOAL_CONDITION: &str = "all focused tests pass";
 const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
+const CONTEXT_COMMAND: &str = "/context";
+const CONTEXT_UPPERCASE_COMMAND: &str = "/CONTEXT";
+const CONTEXT_TRAILING_COMMAND: &str = "/context   ";
+const CONTEXT_ALL_COMMAND: &str = "/context all";
+const CONTEXT_ALL_UPPERCASE_COMMAND: &str = "/context ALL";
+const CONTEXT_ALL_TRAILING_COMMAND: &str = "/context all   ";
+const CONTEXT_INVALID_COMMAND: &str = "/context everything";
+const CONTEXT_EXCESS_ARGS_COMMAND: &str = "/context all extra";
+const CONTEXTUAL_PROMPT: &str = "/contextual";
+const CONTEXT_EXISTING_MESSAGE: &str = "existing conversation";
+const MAIN_CONTEXT_SPEC: &str = "test/main-context";
+const TASK_CONTEXT_SPEC: &str = "test/task-context";
+const INITIAL_CONTEXT_PROVIDER: &str = "Initial context provider";
+const UPDATED_CONTEXT_PROVIDER: &str = "Updated context provider";
+const CHAT_CONTEXT_WINDOW: u32 = 128_000;
+const COMPACTION_CONTEXT_WINDOW: u32 = 1_000_000;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -364,7 +386,7 @@ fn tool_start(id: &str, tool: &str) -> AgentEvent {
 }
 
 fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEvent {
-    turn_complete_from(TEST_PROVIDER, usage, model, cost, LedgerPurpose::Chat)
+    turn_complete_from(TEST_PROVIDER, usage, model, cost, LedgerPurpose::Chat, 0)
 }
 
 fn turn_complete_from(
@@ -373,6 +395,7 @@ fn turn_complete_from(
     model: &str,
     cost: Option<f64>,
     purpose: LedgerPurpose,
+    context_window: u32,
 ) -> AgentEvent {
     AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: Default::default(),
@@ -382,8 +405,28 @@ fn turn_complete_from(
         purpose,
         cost,
         context_size: None,
-        context_window: 0,
+        context_window,
     }))
+}
+
+fn context_snapshot(spec: &str, window: u32) -> ContextSnapshot {
+    ContextSnapshot {
+        readiness: ContextReadiness::PreparedNextRequest,
+        model: ContextModel {
+            spec: spec.to_owned(),
+            provider_display_name: TEST_PROVIDER.to_owned(),
+        },
+        window: ContextWindow {
+            tokens: window,
+            reserve: ContextReserve::Disabled,
+        },
+        usage: ContextUsage::default(),
+        inventory: ContextInventory::default(),
+    }
+}
+
+fn current_context_snapshot(app: &App) -> ContextSnapshot {
+    context_snapshot(&app.state.model.spec(), app.state.model.context_window)
 }
 
 fn tool_results_submitted() -> AgentEvent {
@@ -1444,6 +1487,75 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
     assert_eq!(app.state.token_usage.output, 125);
     assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
+}
+
+#[test]
+fn active_context_snapshot_uses_current_main_then_unfiltered_active_task() {
+    let mut app = app_with_subagent();
+    let main_spec = app.state.model.spec();
+    let store = ContextStore::new();
+    let main = store.publisher(ContextKey::Main);
+    main.publish(current_context_snapshot(&app));
+    main.for_task(TASK_ID)
+        .publish(context_snapshot(TASK_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    app.context_store = Some(store);
+
+    let snapshot = app.active_context_snapshot().unwrap();
+    assert_eq!(snapshot.model.spec, main_spec);
+
+    app.run_builtin(BuiltinAction::NextChat);
+    let snapshot = app.active_context_snapshot().unwrap();
+    assert_eq!(snapshot.model.spec, TASK_CONTEXT_SPEC);
+    assert_eq!(snapshot.window.tokens, CHAT_CONTEXT_WINDOW);
+}
+
+#[test]
+fn active_context_snapshot_rejects_stale_main_model() {
+    let mut app = test_app();
+    let mut snapshot = current_context_snapshot(&app);
+    snapshot.model.spec = MAIN_CONTEXT_SPEC.into();
+    let store = ContextStore::new();
+    store.publisher(ContextKey::Main).publish(snapshot);
+    app.context_store = Some(store);
+
+    assert!(app.active_context_snapshot().is_none());
+}
+
+#[test]
+fn active_context_snapshot_rejects_stale_main_window() {
+    let mut app = test_app();
+    let mut snapshot = current_context_snapshot(&app);
+    snapshot.window.tokens = CHAT_CONTEXT_WINDOW;
+    let store = ContextStore::new();
+    store.publisher(ContextKey::Main).publish(snapshot);
+    app.context_store = Some(store);
+
+    assert!(app.active_context_snapshot().is_none());
+}
+
+#[test]
+fn compaction_turn_does_not_replace_the_chat_context_window() {
+    let mut app = streaming_app();
+    app.update(agent_msg(turn_complete_from(
+        TEST_PROVIDER,
+        TokenUsage::default(),
+        MAIN_MODEL,
+        None,
+        LedgerPurpose::Chat,
+        CHAT_CONTEXT_WINDOW,
+    )));
+    assert_eq!(app.chats[0].context_window, CHAT_CONTEXT_WINDOW);
+
+    app.update(agent_msg(turn_complete_from(
+        OTHER_PROVIDER,
+        TokenUsage::default(),
+        LEDGER_MODEL,
+        None,
+        LedgerPurpose::Compaction,
+        COMPACTION_CONTEXT_WINDOW,
+    )));
+
+    assert_eq!(app.chats[0].context_window, CHAT_CONTEXT_WINDOW);
 }
 
 const SUBAGENT_NAME: &str = "research";
@@ -3114,6 +3226,57 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
 
+#[test]
+fn open_context_modal_repaints_once_and_renders_the_watched_snapshot() {
+    let mut app = app_without_splash();
+    let store = ContextStore::new();
+    let publisher = store.publisher(ContextKey::Main);
+    let mut initial = current_context_snapshot(&app);
+    initial.model.provider_display_name = INITIAL_CONTEXT_PROVIDER.into();
+    publisher.publish(initial);
+    app.context_store = Some(store);
+    app.execute_command(cmd(CONTEXT_COMMAND), 0);
+
+    let initial_frame = rendered(&mut app);
+    assert!(initial_frame.contains(INITIAL_CONTEXT_PROVIDER));
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+
+    let mut updated = current_context_snapshot(&app);
+    updated.model.provider_display_name = UPDATED_CONTEXT_PROVIDER.into();
+    publisher.publish(updated);
+
+    let before_poll = rendered(&mut app);
+    assert!(before_poll.contains(INITIAL_CONTEXT_PROVIDER));
+    assert!(!before_poll.contains(UPDATED_CONTEXT_PROVIDER));
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+
+    let after_poll = rendered(&mut app);
+    assert!(!after_poll.contains(INITIAL_CONTEXT_PROVIDER));
+    assert!(after_poll.contains(UPDATED_CONTEXT_PROVIDER));
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
+#[test]
+fn hidden_context_modal_does_not_repaint_for_publications() {
+    let mut app = app_without_splash();
+    let store = ContextStore::new();
+    let publisher = store.publisher(ContextKey::Main);
+    publisher.publish(current_context_snapshot(&app));
+    app.context_store = Some(store);
+    app.execute_command(cmd(CONTEXT_COMMAND), 0);
+    app.context_modal.close();
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+
+    let mut updated = current_context_snapshot(&app);
+    updated.model.provider_display_name = UPDATED_CONTEXT_PROVIDER.into();
+    publisher.publish(updated);
+
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+    app.execute_command(cmd(CONTEXT_COMMAND), 0);
+    assert!(rendered(&mut app).contains(UPDATED_CONTEXT_PROVIDER));
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
 fn rendered(app: &mut App) -> String {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -4571,6 +4734,19 @@ fn command_palette_lists_builtin_and_plugin_commands() {
 }
 
 #[test]
+fn context_command_is_discoverable_with_an_argument() {
+    let mut app = test_app();
+    let command = app
+        .command_palette
+        .rows()
+        .into_iter()
+        .find(|row| row.name == CONTEXT_COMMAND)
+        .unwrap();
+
+    assert!(command.takes_args());
+}
+
+#[test]
 fn the_view_shortcut_cycles_every_mode() {
     let mut app = test_app();
     assert_eq!(app.view, ViewMode::Auto, "{VIEW_DEFAULT_MSG}");
@@ -5359,6 +5535,7 @@ fn compaction_is_billed_to_its_own_provider_and_purpose() {
         LEDGER_MODEL,
         Some(GOAL_COST),
         LedgerPurpose::Compaction,
+        0,
     )));
     drain_writer(app, writer);
 
@@ -5753,6 +5930,138 @@ fn typed_slash_command_executes() {
     let actions = type_and_submit(&mut app, "/help");
     assert!(actions.is_empty());
     assert!(app.help_modal.is_open());
+}
+
+#[test_case(CONTEXT_COMMAND, Some(false), None ; "summary")]
+#[test_case(CONTEXT_UPPERCASE_COMMAND, Some(false), None ; "uppercase_command")]
+#[test_case(CONTEXT_TRAILING_COMMAND, Some(false), None ; "summary_trailing_whitespace")]
+#[test_case(CONTEXT_ALL_COMMAND, Some(true), None ; "all")]
+#[test_case(CONTEXT_ALL_UPPERCASE_COMMAND, Some(true), None ; "case_insensitive_all")]
+#[test_case(CONTEXT_ALL_TRAILING_COMMAND, Some(true), None ; "all_trailing_whitespace")]
+#[test_case(CONTEXT_INVALID_COMMAND, None, Some(CONTEXT_USAGE) ; "invalid_args")]
+#[test_case(CONTEXT_EXCESS_ARGS_COMMAND, None, Some(CONTEXT_USAGE) ; "excess_args")]
+fn context_command_is_local_and_does_not_mutate_the_chat(
+    command: &str,
+    expected_expanded: Option<bool>,
+    expected_flash: Option<&str>,
+) {
+    let mut app = test_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(CONTEXT_EXISTING_MESSAGE.into()),
+    );
+    app.restore_display();
+    let history_before = app.state.session.messages().to_vec();
+    let display_count_before = app.main_chat().message_count();
+    let display_text_before = app.main_chat().last_message_text().to_owned();
+
+    let actions = type_and_submit(&mut app, command);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.state.session.messages(), history_before.as_slice());
+    assert_eq!(app.main_chat().message_count(), display_count_before);
+    assert_eq!(app.main_chat().last_message_text(), display_text_before);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
+    let Some(expanded) = expected_expanded else {
+        assert!(!app.context_modal.is_open());
+        return;
+    };
+    assert!(app.context_modal.is_open());
+    let frame = rendered(&mut app);
+    let expected_title = if expanded {
+        CONTEXT_EXPANDED_TITLE
+    } else {
+        CONTEXT_TITLE
+    };
+    assert!(frame.contains(expected_title.trim()), "frame={frame:?}");
+    assert_eq!(
+        frame.contains(CONTEXT_EXPANDED_TITLE.trim()),
+        expanded,
+        "frame={frame:?}"
+    );
+}
+
+#[test_case(CONTEXT_COMMAND, true, None ; "summary")]
+#[test_case(CONTEXT_UPPERCASE_COMMAND, true, None ; "uppercase_command")]
+#[test_case(CONTEXT_ALL_TRAILING_COMMAND, true, None ; "all_trailing_whitespace")]
+#[test_case(CONTEXT_EXCESS_ARGS_COMMAND, false, Some(CONTEXT_USAGE) ; "excess_args")]
+fn focused_task_context_command_is_local(
+    command: &str,
+    expected_open: bool,
+    expected_flash: Option<&str>,
+) {
+    let mut app = steerable_task_app();
+
+    let actions = type_and_submit(&mut app, command);
+
+    assert!(actions.is_empty());
+    assert!(app.subagent_steers[TASK_ID].entries().is_empty());
+    assert_eq!(app.context_modal.is_open(), expected_open);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
+}
+
+#[test]
+fn contextual_is_not_intercepted_as_the_context_command() {
+    let mut main = test_app();
+    let actions = type_and_submit(&mut main, CONTEXTUAL_PROMPT);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::SendMessage(input)] if input.message == CONTEXTUAL_PROMPT
+    ));
+    assert!(!main.context_modal.is_open());
+
+    let mut task = steerable_task_app();
+    let actions = type_and_submit(&mut task, CONTEXTUAL_PROMPT);
+    assert!(actions.is_empty());
+    let steers = task.subagent_steers[TASK_ID].entries();
+    assert_eq!(steers.len(), 1);
+    assert_eq!(steers[0].text, CONTEXTUAL_PROMPT);
+    assert!(!task.context_modal.is_open());
+}
+
+#[test]
+fn permission_request_closes_context_modal_before_taking_input() {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, CONTEXT_COMMAND);
+    assert!(actions.is_empty());
+    assert!(app.context_modal.is_open());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(permission_event("request", "cargo check")));
+
+    assert!(!app.context_modal.is_open());
+    assert!(app.permission_prompt.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test]
+fn context_footer_click_switches_views() {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, CONTEXT_COMMAND);
+    assert!(actions.is_empty());
+    let _ = rendered(&mut app);
+    let hit = app.context_modal.footer_hit();
+    assert!(!hit.is_empty());
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.x, hit.y));
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+
+    let frame = rendered(&mut app);
+    assert!(
+        frame.contains(CONTEXT_EXPANDED_TITLE.trim()),
+        "frame={frame:?}"
+    );
 }
 
 const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";

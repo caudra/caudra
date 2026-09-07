@@ -848,6 +848,7 @@ fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<To
         return Vec::new();
     };
     let mut rows: Vec<ToolRow> = mcp
+        .request_snapshot()
         .tool_inventory()
         .into_iter()
         .map(|tool| {
@@ -944,7 +945,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
             model.supports_tool_examples(),
         );
         if let Some(mcp) = &mcp {
-            mcp.extend_tools(&mut defs);
+            mcp.request_snapshot().extend_tools(&mut defs);
         }
         println!("{}", serde_json::to_string_pretty(&defs)?);
         return Ok(());

@@ -17,6 +17,7 @@ Type `/` in the input box to open the command palette.
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
+| `/context` | Inspect active context window usage |
 | `/queue` | Inspect and edit queued prompts |
 | `/stash` | Park the current prompt draft for later |
 | `/stash-pop` | Restore the most recently stashed prompt |
@@ -95,6 +96,16 @@ caudra --print '/goal tests pass and cargo clippy is clean'
 ```
 
 Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result.
+
+## Context window
+
+`/context` opens a compact summary of the active context window. Main and each task have separate prompts, tools, and transcripts. The command reports Main when Main is open, or the selected task when its transcript is open. It never adds those windows together. A task restored after restart has no request snapshot until the task is continued.
+
+The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
+
+Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
+
+`/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
 
 ## Modes and toggles
 

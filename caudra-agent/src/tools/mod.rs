@@ -38,6 +38,7 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{
@@ -295,6 +296,7 @@ pub const INDEX_TOOL_NAME: &str = "index";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";
+pub const SKILL_TOOL_NAME: &str = "skill";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_GREP_TOOL_NAME: &str = "tool_output_grep";
@@ -425,6 +427,7 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `caudra index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub context_publisher: Option<ContextPublisher>,
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_use_id: Option<String>,
     pub root_tool_use_id: Option<String>,
@@ -444,7 +447,7 @@ pub struct ToolContext {
     pub path_locks: Arc<PathLocks>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
-    pub system_prompt_profile_name: Arc<str>,
+    pub default_task_prompt_profile_name: Arc<str>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub subagent_history: SubagentHistoryStore,
@@ -669,6 +672,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        context_publisher: None,
         tool_output_store: None,
         tool_use_id: None,
         root_tool_use_id: None,
@@ -686,7 +690,7 @@ pub fn interpreter_ctx(
         path_locks: PathLocks::fresh(),
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
-        system_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),
+        default_task_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         subagent_history: SubagentHistoryStore::default(),

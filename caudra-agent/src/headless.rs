@@ -722,7 +722,7 @@ fn tool_definitions(
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
     let mut probe = tools.clone();
     if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe);
+        mcp.request_snapshot().extend_tools(&mut probe);
     }
     extract_tool_names(&probe)
 }
@@ -777,7 +777,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
     let fast = params.fast;
     let workflow = params.workflow;
     let goal = params.goal.clone();
-    let system_prompt_profile_name: Arc<str> = Arc::from(
+    let active_prompt_profile_name: Arc<str> = Arc::from(
         params
             .system_prompt_profile
             .as_ref()
@@ -816,12 +816,14 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     session_id: Some(session_ref_clone.clone()),
                     root_tool_use_id: None,
                     mailbox: Some(mailbox.clone()),
+                    context_publisher: None,
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     path_locks: PathLocks::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     prompt_profiles: Arc::clone(&params.prompt_profiles),
-                    system_prompt_profile_name,
+                    default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+                    active_prompt_profile_name: Some(active_prompt_profile_name),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     subagent_history: SubagentHistoryStore::default(),
                     registry: Arc::clone(ToolRegistry::global_arc()),
@@ -1157,6 +1159,13 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
+                let active_prompt_profile_name: Arc<str> = Arc::from(
+                    params
+                        .system_prompt_profile_name
+                        .as_deref()
+                        .unwrap_or(BUILTIN_PROFILE_NAME),
+                );
+
                 let mut agent = Agent::new(
                     AgentParams {
                         provider: Arc::clone(&provider),
@@ -1167,17 +1176,14 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                         session_id: Some(session_ref_clone.clone()),
                         root_tool_use_id: None,
                         mailbox: Some(mailbox.clone()),
+                        context_publisher: None,
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         path_locks: Arc::clone(&path_locks),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         prompt_profiles: Arc::clone(&params.prompt_profiles),
-                        system_prompt_profile_name: Arc::from(
-                            params
-                                .system_prompt_profile_name
-                                .as_deref()
-                                .unwrap_or(BUILTIN_PROFILE_NAME),
-                        ),
+                        default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+                        active_prompt_profile_name: Some(active_prompt_profile_name),
                         subagent_cancels: Arc::new(CancelMap::new()),
                         subagent_history: subagent_history.clone(),
                         registry: Arc::clone(ToolRegistry::global_arc()),
