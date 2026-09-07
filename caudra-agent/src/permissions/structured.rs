@@ -45,6 +45,20 @@ const NORMALIZED_COMMAND_ATTRIBUTE: &str = super::NORMALIZED_COMMAND_ATTRIBUTE;
 const FILE_READ_TOOLS: &[&str] = &["file_read", "index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
+const GIT_METADATA_DIR: &str = ".git";
+const INERT_GIT_METADATA: &[&str] = &[
+    "COMMIT_EDITMSG",
+    "FETCH_HEAD",
+    "HEAD",
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "ORIG_HEAD",
+    "index",
+    "logs",
+    "objects",
+    "packed-refs",
+    "refs",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1276,7 +1290,7 @@ fn filesystem_resource(
     access: PermissionResourceAccess,
     cwd: &Path,
 ) -> PermissionResource {
-    let (protected, requires_prompt) = filesystem_resource_flags(value, cwd);
+    let (protected, requires_prompt) = filesystem_resource_flags(value, &access, cwd);
     PermissionResource {
         kind,
         value: value.to_owned(),
@@ -1296,19 +1310,54 @@ pub fn filesystem_permission_resource(
     filesystem_resource(kind, &path.to_string_lossy(), access, cwd)
 }
 
-fn filesystem_resource_flags(value: &str, cwd: &Path) -> (bool, bool) {
+fn filesystem_resource_flags(
+    value: &str,
+    access: &PermissionResourceAccess,
+    cwd: &Path,
+) -> (bool, bool) {
     let Some(value) = normalized_filesystem_path(value) else {
         return (true, true);
     };
-    let outside_project = normalized_filesystem_path(&cwd.to_string_lossy())
-        .is_none_or(|cwd| value != cwd && !value.starts_with(cwd));
+    let project = normalized_filesystem_path(&cwd.to_string_lossy());
+    if matches!(
+        access,
+        PermissionResourceAccess::Read | PermissionResourceAccess::Search
+    ) && project
+        .as_deref()
+        .is_some_and(|project| is_inert_git_metadata(&value, project))
+    {
+        return (false, false);
+    }
+    let outside_project = project
+        .as_deref()
+        .is_none_or(|project| value != project && !value.starts_with(project));
     let protected = value.components().any(|component| {
         let component = component.as_os_str().to_string_lossy();
-        matches!(component.as_ref(), ".git" | ".ssh" | ".aws")
+        matches!(component.as_ref(), GIT_METADATA_DIR | ".ssh" | ".aws")
             || component == ".env"
             || component.starts_with(".env.")
     });
     (protected, protected || outside_project)
+}
+
+/// Reports whether a path is the project's own inert git bookkeeping.
+///
+/// Reading these reveals no secret and changes no state, so they are exempt
+/// from the `.git` guard that otherwise forces a prompt on every path holding a
+/// credential-bearing component. `config` and `hooks` are deliberately absent:
+/// remote URLs in `config` embed tokens, and hooks are executable. Anything
+/// unrecognized stays protected, so a new git file is guarded until reviewed.
+fn is_inert_git_metadata(path: &Path, project: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(project) else {
+        return false;
+    };
+    let mut components = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned());
+    components.next().as_deref() == Some(GIT_METADATA_DIR)
+        && components
+            .next()
+            .is_some_and(|entry| INERT_GIT_METADATA.contains(&entry.as_str()))
 }
 
 fn exact_resource_constraints(
@@ -3151,7 +3200,7 @@ mod tests {
     const SUBTREE_OPTION: &str = "allow_filesystem_subtree";
     const PROJECT_OPTION: &str = "allow_project_files";
 
-    const PROTECTED_PATH: &str = "/project/.git/HEAD";
+    const PROTECTED_PATH: &str = "/project/.env";
     const FIRST_READ_OFFSET: u32 = 1;
     const LATER_READ_OFFSET: u32 = 500;
 
@@ -3232,6 +3281,52 @@ mod tests {
 
         assert_ne!(granted.input_digest, repeat.input_digest);
         assert!(permission_rule_covers_request(&rule, &repeat));
+    }
+
+    const PROJECT_ROOT: &str = "/project";
+
+    fn flags_in_project(path: &str, access: PermissionResourceAccess) -> (bool, bool) {
+        filesystem_resource_flags(path, &access, Path::new(PROJECT_ROOT))
+    }
+
+    /// Inert git bookkeeping is the repository describing itself: reading it
+    /// leaks nothing and mutates nothing, so it must not force a prompt. The
+    /// guard has to survive for `config` and `hooks`, which carry remote
+    /// credentials and executable content, and for every write.
+    #[test_case("/project/.git/HEAD", PermissionResourceAccess::Read => (false, false) ; "head_read")]
+    #[test_case("/project/.git/refs/heads/main", PermissionResourceAccess::Read => (false, false) ; "refs_read")]
+    #[test_case("/project/.git/logs/HEAD", PermissionResourceAccess::Read => (false, false) ; "reflog_read")]
+    #[test_case("/project/.git/objects/ab/cdef", PermissionResourceAccess::Search => (false, false) ; "objects_search")]
+    #[test_case("/project/.git/config", PermissionResourceAccess::Read => (true, true) ; "config_stays_guarded")]
+    #[test_case("/project/.git/hooks/pre-commit", PermissionResourceAccess::Read => (true, true) ; "hooks_stay_guarded")]
+    #[test_case("/project/.git/refs/../config", PermissionResourceAccess::Read => (true, true) ; "traversal_into_config_stays_guarded")]
+    #[test_case("/project/.git", PermissionResourceAccess::Read => (true, true) ; "the_directory_itself_stays_guarded")]
+    #[test_case("/project/vendor/dep/.git/HEAD", PermissionResourceAccess::Read => (true, true) ; "a_nested_checkout_is_not_the_projects_own_git")]
+    #[test_case("/project/.git/HEAD", PermissionResourceAccess::Write => (true, true) ; "writes_stay_guarded")]
+    #[test_case("/elsewhere/.git/HEAD", PermissionResourceAccess::Read => (true, true) ; "outside_the_project_stays_guarded")]
+    #[test_case("/project/.ssh/id_rsa", PermissionResourceAccess::Read => (true, true) ; "ssh_is_untouched")]
+    #[test_case("/project/.env.local", PermissionResourceAccess::Read => (true, true) ; "dotenv_is_untouched")]
+    #[test_case("/project/src/main.rs", PermissionResourceAccess::Read => (false, false) ; "ordinary_project_file")]
+    #[test_case("/elsewhere/notes.md", PermissionResourceAccess::Read => (false, true) ; "ordinary_file_outside_the_project")]
+    fn filesystem_flags_exempt_only_inert_git_reads(
+        path: &str,
+        access: PermissionResourceAccess,
+    ) -> (bool, bool) {
+        flags_in_project(path, access)
+    }
+
+    /// The exemption is anchored to the working directory, not to the enclosing
+    /// repository, so running from a subdirectory must not silently widen it.
+    #[test]
+    fn the_git_exemption_does_not_reach_above_the_working_directory() {
+        assert_eq!(
+            filesystem_resource_flags(
+                "/project/.git/HEAD",
+                &PermissionResourceAccess::Read,
+                Path::new("/project/src"),
+            ),
+            (true, true)
+        );
     }
 
     const READ_CONTRACT: &str = "file.read.v1";

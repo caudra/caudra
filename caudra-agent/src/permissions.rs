@@ -2679,6 +2679,45 @@ mod tests {
         assert_eq!(prompt_required, vec![true]);
     }
 
+    const GIT_HEAD: &str = ".git/HEAD";
+    const GIT_CONFIG: &str = ".git/config";
+
+    fn project_read_request(cwd: &Path, relative: &str) -> PermissionRequest {
+        let path = cwd.join(relative);
+        let intent = crate::tools::PermissionIntent::new(
+            crate::tools::PermissionScopes::single(path.to_string_lossy().into_owned()),
+            vec![filesystem_permission_resource(
+                PermissionResourceKind::File,
+                &path,
+                PermissionResourceAccess::Read,
+                cwd,
+            )],
+            PermissionRisk::Low,
+        );
+        PermissionRequest::from_intent(
+            "read".into(),
+            ToolKey::native("file_read"),
+            &intent,
+            serde_json::json!({"filePath": path.to_string_lossy()}),
+            cwd,
+        )
+    }
+
+    /// The builtin project-read allow already matched `.git/HEAD`; the resource
+    /// flag vetoed it, so every session re-prompted for the repository reading
+    /// its own state. `config` holds remote credentials and must keep prompting.
+    #[test_case(GIT_HEAD => true ; "inert_git_metadata_needs_no_prompt")]
+    #[test_case(GIT_CONFIG => false ; "git_config_still_prompts")]
+    fn project_reads_of_git_metadata(relative: &str) -> bool {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
+        let manager = mgr_with(PermissionsConfig::default(), cwd.clone());
+        let request = project_read_request(&cwd, relative);
+
+        let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
+        covered.iter().all(|covered| *covered) && !must_prompt
+    }
+
     #[test]
     fn explicit_allow_overrides_the_builtin_ask_fallback() {
         let manager = mgr_with(
