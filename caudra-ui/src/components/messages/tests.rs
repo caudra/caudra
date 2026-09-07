@@ -128,6 +128,157 @@ fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
     }
 }
 
+#[test]
+fn message_action_handles_map_every_source_kind() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let ids = std::array::from_fn::<_, 5, _>(|_| caudra_storage::id::CaudraId::generate());
+    let sources = [
+        DisplaySource::User(ids[0]),
+        DisplaySource::AssistantText(ids[1]),
+        DisplaySource::Reasoning(ids[2]),
+        DisplaySource::ToolCall {
+            id: ids[3],
+            result_id: Some(ids[4]),
+        },
+        DisplaySource::ToolResult(ids[4]),
+    ];
+    for (index, source) in sources.into_iter().enumerate() {
+        let role = match source {
+            DisplaySource::User(_) => DisplayRole::User,
+            DisplaySource::Reasoning(_) => DisplayRole::Thinking,
+            DisplaySource::ToolCall { .. } => DisplayRole::Tool(Box::new(ToolRole {
+                id: "tool-row".into(),
+                effect: ToolEffect::Unknown,
+                status: ToolStatus::Success,
+                name: "read".into(),
+            })),
+            DisplaySource::AssistantText(_) | DisplaySource::ToolResult(_) => {
+                DisplayRole::Assistant
+            }
+        };
+        let mut message = DisplayMessage::new(role, format!("message {index}"));
+        message.source = Some(source);
+        panel.push(message);
+    }
+
+    let terminal = render_actions(&mut panel, 80, 24);
+    let area = terminal.backend().buffer().area;
+    assert!(panel.message_action_at(0, 0).is_none());
+    assert!(panel.message_action_at(1, 0).is_some());
+    assert!(panel.message_action_at(1, 1).is_some());
+    assert!(panel.message_action_at(1, 2).is_some());
+    assert!(panel.message_action_at(1, 3).is_none());
+    for source in sources {
+        assert!((area.y..area.bottom()).any(|row| {
+            (area.x..area.right()).any(|col| {
+                panel
+                    .message_action_at(row, col)
+                    .is_some_and(|target| target.source() == source)
+            })
+        }));
+    }
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == render::MESSAGE_ACTION_GLYPH)
+            .count(),
+        sources.len()
+    );
+}
+
+#[test]
+fn message_action_handles_are_disabled_without_main_chat_access() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut message = DisplayMessage::new(DisplayRole::Assistant, "reply".into());
+    message.source = Some(DisplaySource::AssistantText(
+        caudra_storage::id::CaudraId::generate(),
+    ));
+    panel.push(message);
+
+    let terminal = render(&mut panel, 80, 24);
+    let area = terminal.backend().buffer().area;
+
+    assert!(!(area.y..area.bottom()).any(|row| {
+        (area.x..area.right()).any(|col| panel.message_action_at(row, col).is_some())
+    }));
+    assert!(!buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
+}
+
+#[test]
+fn message_action_hover_reverses_only_the_glyph() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut message = DisplayMessage::new(DisplayRole::Assistant, "reply".into());
+    message.source = Some(DisplaySource::AssistantText(
+        caudra_storage::id::CaudraId::generate(),
+    ));
+    panel.push(message);
+    let terminal = render_actions(&mut panel, 80, 24);
+    let area = terminal.backend().buffer().area;
+    let (row, col) = (area.y..area.bottom())
+        .find_map(|row| {
+            (area.x..area.right())
+                .find(|&col| panel.message_action_at(row, col).is_some())
+                .map(|col| (row, col))
+        })
+        .unwrap();
+
+    panel.update_hover(row, col, area, false);
+    let terminal = render_actions(&mut panel, 80, 24);
+    let glyph = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == render::MESSAGE_ACTION_GLYPH)
+        .unwrap();
+
+    assert!(glyph.modifier.contains(Modifier::REVERSED));
+    assert!(
+        !style_of(&terminal, "reply")
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn source_less_and_streaming_messages_have_no_action_handle() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "cached".into()));
+    panel.text_delta("streaming");
+
+    let terminal = render_actions(&mut panel, 80, 24);
+    let area = terminal.backend().buffer().area;
+
+    assert!(!(area.y..area.bottom()).any(|row| {
+        (area.x..area.right()).any(|col| panel.message_action_at(row, col).is_some())
+    }));
+    assert!(!buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
+}
+
+#[test]
+fn clipped_message_keeps_its_action_handle_visible() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut message = DisplayMessage::new(DisplayRole::Assistant, "line\n".repeat(20));
+    message.source = Some(DisplaySource::AssistantText(
+        caudra_storage::id::CaudraId::generate(),
+    ));
+    panel.push(message);
+    render_actions(&mut panel, 40, 5);
+    panel.set_scroll_top(5);
+
+    let terminal = render_actions(&mut panel, 40, 5);
+    let area = terminal.backend().buffer().area;
+
+    assert_eq!(
+        terminal.backend().buffer().cell((1, 0)).unwrap().symbol(),
+        render::MESSAGE_ACTION_GLYPH
+    );
+    assert!(panel.message_action_at(area.y, area.x).is_some());
+}
+
 fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
@@ -426,8 +577,21 @@ fn render_sel(
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            panel.view(f, f.area(), has_selection);
+            panel.view(f, f.area(), has_selection, false);
         })
+        .unwrap();
+    terminal
+}
+
+fn render_actions(
+    panel: &mut MessagesPanel,
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<TestBackend> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| panel.view(frame, frame.area(), false, true))
         .unwrap();
     terminal
 }
@@ -2506,7 +2670,7 @@ fn segment_has_top_margin(panel: &MessagesPanel, tool_id: &str) -> bool {
 }
 
 #[test]
-fn instruction_segment_has_margin_before_it() {
+fn instruction_segment_has_margin_but_no_own_action_handle() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Expanded);
     panel.tool_start(start("t1", "read"));
@@ -2528,6 +2692,22 @@ fn instruction_segment_has_margin_before_it() {
 
     let inst_id = segment::instruction_id("t1");
     assert!(segment_has_top_margin(&panel, &inst_id));
+
+    panel.messages[0].source = Some(DisplaySource::ToolCall {
+        id: caudra_storage::id::CaudraId::generate(),
+        result_id: None,
+    });
+    let terminal = render_actions(&mut panel, 80, 24);
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == render::MESSAGE_ACTION_GLYPH)
+            .count(),
+        1
+    );
 }
 
 fn seg_line_count(panel: &MessagesPanel, tool_id: &str) -> usize {

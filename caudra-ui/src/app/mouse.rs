@@ -11,12 +11,11 @@ use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
+use super::App;
 use super::tasks::MAIN_TASK_ID;
-use super::{App, MessageMouseDown};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
-pub(super) const MESSAGE_LONG_CLICK: Duration = Duration::from_millis(500);
 const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
 
 impl App {
@@ -243,7 +242,7 @@ impl App {
                 self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
-                self.message_mouse_down = None;
+                self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
@@ -256,6 +255,15 @@ impl App {
                 }
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
+                        return Vec::new();
+                    }
+                    if zone.zone == SelectionZone::Messages
+                        && self.is_main_chat()
+                        && !self.has_modal_overlay()
+                        && let Some(target) =
+                            self.chats[0].message_action_at(event.row, event.column)
+                    {
+                        self.message_action_mouse_down = Some(target);
                         return Vec::new();
                     }
                     // Move the cursor to the click position in the input area.
@@ -283,16 +291,6 @@ impl App {
                             self.msg_area(),
                         );
                     }
-                    if zone.zone == SelectionZone::Messages
-                        && self.is_main_chat()
-                        && !self.has_modal_overlay()
-                        && let Some(source) = self.chats[0].source_at(event.row, self.msg_area())
-                    {
-                        self.message_mouse_down = Some(MessageMouseDown {
-                            source,
-                            since: Instant::now(),
-                        });
-                    }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
                         sel: Selection::start(
@@ -313,7 +311,7 @@ impl App {
                 self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
-                self.message_mouse_down = None;
+                self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
@@ -324,7 +322,7 @@ impl App {
                 {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
-                    self.message_mouse_down = None;
+                    self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
                     self.task_hint_mouse_down = false;
                     return self.handle_streaming_admission(pressed.admission);
@@ -335,9 +333,25 @@ impl App {
                 {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
-                    self.message_mouse_down = None;
+                    self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
                     return self.tasks_browse();
+                }
+                if !self.has_modal_overlay()
+                    && self
+                        .zone_at(event.row, event.column)
+                        .is_some_and(|zone| zone.zone == SelectionZone::Messages)
+                    && let Some(pressed) = self.message_action_mouse_down.take()
+                    && self.chats[0].message_action_at(event.row, event.column) == Some(pressed)
+                {
+                    self.queue_mouse_down = None;
+                    self.status_mouse_down = None;
+                    self.link_mouse_down = None;
+                    self.message_actions.open(
+                        pressed.source(),
+                        self.state.session.meta.pending_revert.is_some(),
+                    );
+                    return Vec::new();
                 }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
                     if !sel.is_empty() {
@@ -358,26 +372,12 @@ impl App {
                                 .as_deref()
                                 == Some(target.as_ref())
                         {
-                            self.message_mouse_down = None;
+                            self.message_action_mouse_down = None;
                             self.queue_mouse_down = None;
                             self.status_mouse_down = None;
                             return vec![crate::components::Action::OpenUrl(target.to_string())];
                         }
-                        if zone == SelectionZone::Messages
-                            && self.is_main_chat()
-                            && let Some(pressed) = self.message_mouse_down.take()
-                            && pressed.since.elapsed() >= MESSAGE_LONG_CLICK
-                            && self.chats[0].source_at(event.row, self.msg_area())
-                                == Some(pressed.source)
-                        {
-                            self.queue_mouse_down = None;
-                            self.message_actions.open(
-                                pressed.source,
-                                self.state.session.meta.pending_revert.is_some(),
-                            );
-                            return Vec::new();
-                        }
-                        self.message_mouse_down = None;
+                        self.message_action_mouse_down = None;
                         if !self.has_modal_overlay()
                             && let Some(pressed) = self.status_mouse_down.take()
                             && self.status_hit_at(event.row, event.column) == Some(pressed)
@@ -408,7 +408,7 @@ impl App {
                 self.task_hint_mouse_down = false;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
-                self.message_mouse_down = None;
+                self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
             }
             MouseEventKind::Moved => {
@@ -804,6 +804,13 @@ impl App {
     }
 
     fn update_transcript_hover(&mut self, row: u16, col: u16) {
+        if !self
+            .zone_at(row, col)
+            .is_some_and(|zone| zone.zone == SelectionZone::Messages)
+        {
+            self.chats[self.active_chat].clear_hover();
+            return;
+        }
         let area = self.msg_area();
         let known_task_target = self.active_chat == 0
             && self.task_id_at(row, area).is_some_and(|task_id| {

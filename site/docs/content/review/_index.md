@@ -17,7 +17,7 @@ Three ways in:
 
 - `Ctrl+X r` opens the last assistant reply.
 - `/review` does the same from the command palette.
-- Right-click or long-press any message, then pick **Review passages**. This reaches thinking blocks, tool results, and your own earlier messages.
+- Click `⋮` beside any message, then pick **Review passages**. Right-clicking the message is an optional shortcut when the terminal forwards it. This reaches thinking blocks, tool results, and your own earlier messages.
 
 ## Marking a passage
 

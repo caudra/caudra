@@ -52,7 +52,7 @@ use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 use caudra_storage::view::ViewMode;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::repaint::{Cadence, Dirty};
 use ratatui::style::{Color, Style};
@@ -145,10 +145,29 @@ const MATH_BRACKET_OPEN: &str = "\\[";
 #[derive(Debug, PartialEq, Eq)]
 enum HoverTarget {
     Link(Arc<str>),
+    MessageAction(usize),
     CachedThinking(usize),
     StreamingThinking,
     Tool { id: String, feedback: HoverFeedback },
     Diagram(DiagramKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MessageActionTarget {
+    source: DisplaySource,
+    segment_index: usize,
+}
+
+impl MessageActionTarget {
+    pub(crate) fn source(self) -> DisplaySource {
+        self.source
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MessageActionHit {
+    area: Rect,
+    target: MessageActionTarget,
 }
 
 /// Identifies one drawn diagram across rebuilds. The message index is the
@@ -784,6 +803,7 @@ pub struct MessagesPanel {
     prompt_progress: Option<PromptProgress>,
     prompt_rate: PromptRate,
     hover: Option<HoverTarget>,
+    message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose still-arriving file body has grown since the last frame.
     /// The body is drawn whole, so redrawing it once per fragment costs the
@@ -848,6 +868,7 @@ impl MessagesPanel {
             prompt_progress: None,
             prompt_rate: PromptRate::default(),
             hover: None,
+            message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             live_body_dirty: HashSet::new(),
         }
@@ -1776,8 +1797,27 @@ impl MessagesPanel {
         })
     }
 
+    fn message_action_source(&self, segment: &Segment) -> Option<DisplaySource> {
+        if segment
+            .tool_id
+            .as_deref()
+            .is_some_and(segment::is_instruction_segment)
+        {
+            return None;
+        }
+        self.segment_source(segment)
+    }
+
     pub(crate) fn update_hover(&mut self, row: u16, col: u16, area: Rect, known_task_target: bool) {
         self.hover = self.hover_target_at(row, col, area, known_task_target);
+    }
+
+    pub(crate) fn message_action_at(&self, row: u16, col: u16) -> Option<MessageActionTarget> {
+        let position = Position::new(col, row);
+        self.message_action_hits
+            .iter()
+            .find(|hit| hit.area.contains(position))
+            .map(|hit| hit.target)
     }
 
     pub(crate) fn clear_hover(&mut self) {
@@ -1821,6 +1861,9 @@ impl MessagesPanel {
         area: Rect,
         known_task_target: bool,
     ) -> Option<HoverTarget> {
+        if let Some(target) = self.message_action_at(row, col) {
+            return Some(HoverTarget::MessageAction(target.segment_index));
+        }
         if area.height == 0
             || row < area.y
             || row >= area.bottom()
@@ -1909,6 +1952,7 @@ impl MessagesPanel {
                 Some(*feedback)
             }
             Some(HoverTarget::CachedThinking(_))
+            | Some(HoverTarget::MessageAction(_))
             | Some(HoverTarget::Link(_))
             | Some(HoverTarget::StreamingThinking)
             | Some(HoverTarget::Tool { .. })
@@ -2320,8 +2364,15 @@ impl MessagesPanel {
             && self.streaming_text.is_empty()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        message_actions_enabled: bool,
+    ) {
         self.terminal_links.clear();
+        self.message_action_hits.clear();
         if self.viewport_area != area {
             self.clear_hover();
             self.viewport_area = area;
@@ -2451,6 +2502,7 @@ impl MessagesPanel {
 
         let accent = self.accent.resolve();
         let compact = self.compact();
+        let mut message_action_hits = Vec::new();
         for (i, seg) in self.cache.segments().iter().enumerate() {
             if cursor.past_bottom() {
                 break;
@@ -2459,15 +2511,38 @@ impl MessagesPanel {
             let hover = self
                 .hover_feedback_for_segment(seg)
                 .map(|feedback| (feedback, accent));
-            cursor.render(
+            let source = message_actions_enabled
+                .then(|| self.message_action_source(seg))
+                .flatten();
+            let message_action = source.map(|_| {
+                (
+                    matches!(self.hover, Some(HoverTarget::MessageAction(index)) if index == i),
+                    accent,
+                )
+            });
+            let action_area = cursor.render(
                 (seg.lines(), Some(seg.links())),
                 seg.height(width),
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent, compact),
-                RenderFeedback { highlight, hover },
+                RenderFeedback {
+                    highlight,
+                    hover,
+                    message_action,
+                },
                 frame,
             );
+            if let (Some(area), Some(source)) = (action_area, source) {
+                message_action_hits.push(MessageActionHit {
+                    area,
+                    target: MessageActionTarget {
+                        source,
+                        segment_index: i,
+                    },
+                });
+            }
         }
+        self.message_action_hits = message_action_hits;
 
         let mut height_idx = 0usize;
         let streamed: [(&StreamingContent, bool, SegmentKind); 2] = [
@@ -2485,7 +2560,7 @@ impl MessagesPanel {
             if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                cursor.render(
+                let _ = cursor.render(
                     (&spacer_lines, None),
                     h,
                     SegmentChrome::for_kind(SegmentKind::Assistant, width, 0),
@@ -2500,7 +2575,7 @@ impl MessagesPanel {
                 if collapsed {
                     let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
                         .then_some((HoverFeedback::Chrome, accent));
-                    cursor.render(
+                    let _ = cursor.render(
                         (&collapsed_thinking_lines, None),
                         h,
                         SegmentChrome::for_kind(kind, width, 0),
@@ -2514,7 +2589,7 @@ impl MessagesPanel {
                 } else {
                     if kind == SegmentKind::Thinking {
                         let (lines, links) = expanded_thinking.as_ref().unwrap();
-                        cursor.render(
+                        let _ = cursor.render(
                             (lines, Some(links)),
                             h,
                             SegmentChrome::for_kind(kind, width, 0),
@@ -2523,7 +2598,7 @@ impl MessagesPanel {
                             frame,
                         );
                     } else {
-                        cursor.render(
+                        let _ = cursor.render(
                             (sc.cached_lines(), Some(sc.links())),
                             h,
                             SegmentChrome::for_kind(kind, width, 0),

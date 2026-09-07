@@ -46,6 +46,7 @@ use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_picker::MemoryPicker;
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
+use crate::components::messages::MessageActionTarget;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt};
@@ -318,7 +319,7 @@ pub struct App {
     pub(super) task_hint_hit: Rect,
     pub(super) task_hint_mouse_down: bool,
     pub(super) task_hint_hover: bool,
-    pub(super) message_mouse_down: Option<MessageMouseDown>,
+    pub(super) message_action_mouse_down: Option<MessageActionTarget>,
     pub(super) link_mouse_down: Option<Arc<str>>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -378,12 +379,6 @@ struct PendingSteer {
     id: QueueItemId,
     text: String,
     draft: InputDraft,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct MessageMouseDown {
-    pub source: DisplaySource,
-    pub since: Instant,
 }
 
 /// A run held between its workspace snapshot being dispatched and that
@@ -509,7 +504,7 @@ impl App {
             task_hint_hit: Rect::ZERO,
             task_hint_mouse_down: false,
             task_hint_hover: false,
-            message_mouse_down: None,
+            message_action_mouse_down: None,
             link_mouse_down: None,
             status: Status::Idle,
             state,

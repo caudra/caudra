@@ -350,8 +350,15 @@ impl Chat {
         self.messages_panel.cadence()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
-        self.messages_panel.view(frame, area, has_selection);
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        message_actions_enabled: bool,
+    ) {
+        self.messages_panel
+            .view(frame, area, has_selection, message_actions_enabled);
     }
 
     pub fn scroll_top(&self) -> u16 {
@@ -397,6 +404,14 @@ impl Chat {
 
     pub(crate) fn link_at(&self, row: u16, col: u16, area: Rect) -> Option<Arc<str>> {
         self.messages_panel.link_at(row, col, area)
+    }
+
+    pub(crate) fn message_action_at(
+        &self,
+        row: u16,
+        col: u16,
+    ) -> Option<crate::components::messages::MessageActionTarget> {
+        self.messages_panel.message_action_at(row, col)
     }
 
     pub(crate) fn pan_hovered_diagram(&mut self, delta: i32) -> bool {

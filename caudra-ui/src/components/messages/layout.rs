@@ -56,6 +56,10 @@ impl SegmentChrome {
     pub fn content_start(self) -> u16 {
         self.margin_top.saturating_add(self.top)
     }
+
+    pub fn action_offset(self) -> Option<u16> {
+        (self.left > 0).then_some(self.left / 2)
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +88,21 @@ mod tests {
         assert_eq!(user.left, 2);
         assert_eq!(assistant.left, 2);
         assert_eq!((user.right, user.top, user.bottom), (0, 0, 0));
+    }
+
+    #[test]
+    fn action_handle_stays_inside_the_existing_gutter() {
+        assert_eq!(
+            SegmentChrome::for_kind(SegmentKind::Assistant, 80, 0).action_offset(),
+            Some(1)
+        );
+        assert_eq!(
+            SegmentChrome::for_kind(SegmentKind::Assistant, 20, 0).action_offset(),
+            Some(1)
+        );
+        assert_eq!(
+            SegmentChrome::for_kind(SegmentKind::Assistant, 10, 0).action_offset(),
+            Some(0)
+        );
     }
 }

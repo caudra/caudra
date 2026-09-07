@@ -41,7 +41,7 @@ Choose which model writes titles under the Title purpose in `/model`, described 
 
 ## Message actions
 
-Right-click a message, or hold the left mouse button for half a second, to open Message Actions. Normal left clicks still select text, expand reasoning, and interact with tool output.
+Click `⋮` in the gutter beside a message to open Message Actions. Right-clicking the message also works when the terminal forwards it. Clicks in the message body still select text, expand reasoning, and interact with tool output.
 
 The menu offers:
 

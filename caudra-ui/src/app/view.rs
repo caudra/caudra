@@ -276,7 +276,12 @@ impl App {
         // which are created mid-session, inherit the current mode.
         self.chats[render_chat].set_view(self.view);
         self.chats[render_chat].set_accent(accent);
-        self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
+        self.chats[render_chat].view(
+            frame,
+            layout.msg_area,
+            self.selection_state.is_some(),
+            render_chat == 0,
+        );
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {

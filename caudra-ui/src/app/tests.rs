@@ -2895,7 +2895,9 @@ fn transcript_scroll_keys_reach_every_chat(build: fn() -> App) {
     let backend = ratatui::backend::TestBackend::new(TRANSCRIPT_AREA.width, TRANSCRIPT_AREA.height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, TRANSCRIPT_AREA, false))
+        .draw(|frame| {
+            app.active_chat().view(frame, TRANSCRIPT_AREA, false, false);
+        })
         .unwrap();
     let half = app.active_chat().half_page() as u16;
 
@@ -3113,19 +3115,20 @@ fn right_click_opens_message_actions_without_changing_selection() {
     let items = crate::history_items(&[Message::user("hello".into())]);
     app.state.session_mut().replace_messages(items);
     app.restore_display();
-    let _ = rendered(&mut app);
+    let (column, row) = message_action_position(&mut app);
     let area = app.msg_area();
+    let body_column = area.x + 3;
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        body_column,
+        row,
     ));
     let before = *app.selection_state.as_ref().unwrap().sel();
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Right),
-        area.x + 2,
-        area.y,
+        column,
+        row,
     ));
 
     assert!(app.message_actions.is_open());
@@ -3158,13 +3161,13 @@ fn left_click_keeps_existing_message_interaction_path() {
     let items = crate::history_items(&[Message::user("hello".into())]);
     app.state.session_mut().replace_messages(items);
     app.restore_display();
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
+    let (_, row) = message_action_position(&mut app);
+    let body_column = app.msg_area().x + 3;
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        body_column,
+        row,
     ));
 
     assert!(matches!(
@@ -3175,49 +3178,106 @@ fn left_click_keeps_existing_message_interaction_path() {
 }
 
 #[test]
-fn long_left_click_opens_message_actions() {
+fn left_click_message_action_handle_opens_message_actions() {
     let mut app = test_app();
     let items = crate::history_items(&[Message::user("hello".into())]);
     app.state.session_mut().replace_messages(items);
     app.restore_display();
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
+    let (column, row) = message_action_position(&mut app);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        app.msg_area().x + 3,
+        row,
+    ));
+    let before = *app.selection_state.as_ref().unwrap().sel();
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        column,
+        row,
     ));
-    app.message_mouse_down.as_mut().unwrap().since =
-        Instant::now() - super::mouse::MESSAGE_LONG_CLICK;
     app.update(mouse_event(
         MouseEventKind::Up(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        column,
+        row,
     ));
 
     assert!(app.message_actions.is_open());
-    assert!(app.selection_state.is_none());
+    let after = app.selection_state.as_ref().unwrap().sel();
+    assert_eq!(after.normalized(), before.normalized());
+    assert_eq!(after.area, before.area);
+    assert_eq!(after.zone, before.zone);
 }
 
 #[test]
-fn short_left_click_does_not_open_message_actions() {
+fn message_action_handle_requires_matching_press_and_release() {
     let mut app = test_app();
     let items = crate::history_items(&[Message::user("hello".into())]);
     app.state.session_mut().replace_messages(items);
     app.restore_display();
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
+    let (column, row) = message_action_position(&mut app);
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        column,
+        row,
     ));
     app.update(mouse_event(
         MouseEventKind::Up(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        column + 3,
+        row,
+    ));
+
+    assert!(!app.message_actions.is_open());
+    assert!(app.message_action_mouse_down.is_none());
+}
+
+#[test]
+fn overlay_zone_wins_over_a_message_action_handle() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let (column, row) = message_action_position(&mut app);
+    set_zone(
+        &mut app,
+        SelectionZone::Overlay,
+        Rect::new(column, row, 1, 1),
+    );
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.message_actions.is_open());
+    assert!(app.message_action_mouse_down.is_none());
+}
+
+#[test]
+fn left_click_message_body_does_not_open_message_actions() {
+    let mut app = test_app();
+    let items = crate::history_items(&[Message::user("hello".into())]);
+    app.state.session_mut().replace_messages(items);
+    app.restore_display();
+    let (_, row) = message_action_position(&mut app);
+    let body_column = app.msg_area().x + 3;
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        body_column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        body_column,
+        row,
     ));
 
     assert!(!app.message_actions.is_open());
@@ -3282,34 +3342,31 @@ fn matching_link_click_uses_the_local_fallback_only_when_available() {
 }
 
 #[test]
-fn dragging_cancels_message_long_click() {
+fn dragging_cancels_message_action_handle() {
     let mut app = test_app();
     let items = crate::history_items(&[Message::user("hello".into())]);
     app.state.session_mut().replace_messages(items);
     app.restore_display();
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
+    let (column, row) = message_action_position(&mut app);
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        area.y,
+        column,
+        row,
     ));
-    app.message_mouse_down.as_mut().unwrap().since =
-        Instant::now() - super::mouse::MESSAGE_LONG_CLICK;
     app.update(mouse_event(
         MouseEventKind::Drag(MouseButton::Left),
-        area.x + 8,
-        area.y,
+        column + 8,
+        row,
     ));
     app.update(mouse_event(
         MouseEventKind::Up(MouseButton::Left),
-        area.x + 8,
-        area.y,
+        column + 8,
+        row,
     ));
 
     assert!(!app.message_actions.is_open());
-    assert!(app.message_mouse_down.is_none());
+    assert!(app.message_action_mouse_down.is_none());
 }
 
 #[test]
@@ -3628,6 +3685,15 @@ fn rendered(app: &mut App) -> String {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     buffer_text(terminal.backend().buffer())
+}
+
+fn message_action_position(app: &mut App) -> (u16, u16) {
+    let _ = rendered(app);
+    let area = app.msg_area();
+    (area.y..area.bottom())
+        .flat_map(|row| (area.x..area.right()).map(move |column| (column, row)))
+        .find(|&(column, row)| app.chats[0].message_action_at(row, column).is_some())
+        .expect("message action handle was not rendered")
 }
 
 fn click_queue_action(app: &mut App, action: QueueAction) {
@@ -4171,7 +4237,7 @@ fn clicking_completed_task_in_main_chat_focuses_its_stable_chat() {
     let backend = ratatui::backend::TestBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.chats[0].view(frame, area, false))
+        .draw(|frame| app.chats[0].view(frame, area, false, false))
         .unwrap();
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 0));
@@ -4313,7 +4379,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            app.active_chat().view(frame, area, false);
+            app.active_chat().view(frame, area, false, false);
         })
         .unwrap();
 

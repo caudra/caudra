@@ -7,10 +7,13 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use crate::components::hover_style;
 use crate::components::tool_display::{FILTERED_AFFORDANCE, RAW_AFFORDANCE};
 use crate::markdown::{LinkMap, TerminalLink};
+use crate::theme;
 
 use super::layout::SegmentChrome;
 
 pub(super) use crate::markdown::EXPAND_AFFORDANCE;
+
+pub(super) const MESSAGE_ACTION_GLYPH: &str = "⋮";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HoverFeedback {
@@ -38,6 +41,7 @@ impl HoverFeedback {
 pub(super) struct RenderFeedback {
     pub highlight: bool,
     pub hover: Option<(HoverFeedback, Color)>,
+    pub message_action: Option<(bool, Color)>,
 }
 
 pub(super) struct RenderCursor {
@@ -75,14 +79,14 @@ impl RenderCursor {
         styles: (Option<Style>, Option<Style>),
         feedback: RenderFeedback,
         frame: &mut Frame,
-    ) {
+    ) -> Option<Rect> {
         let (lines, links) = content;
         if self.skip >= h {
             self.skip -= h;
-            return;
+            return None;
         }
         if self.y >= self.bottom {
-            return;
+            return None;
         }
         let (style, rail_style) = styles;
         let skipped = self.skip;
@@ -109,8 +113,8 @@ impl RenderCursor {
                 frame.render_widget(Block::default().style(base), card_area);
             }
             if chrome.rail {
-                let rail = match feedback.hover {
-                    Some((HoverFeedback::Chrome, accent)) => {
+                let rail = match (feedback.hover, feedback.message_action) {
+                    (Some((HoverFeedback::Chrome, accent)), _) | (_, Some((true, accent))) => {
                         rail_style.unwrap_or_default().fg(accent)
                     }
                     _ => rail_style.unwrap_or_default(),
@@ -128,6 +132,7 @@ impl RenderCursor {
         let content_end = h.saturating_sub(chrome.bottom);
         let content_visible_start = skipped.max(content_start);
         let content_visible_end = skipped.saturating_add(visible_h).min(content_end);
+        let mut message_action_hit = None;
         if content_visible_start < content_visible_end {
             let content_area = Rect::new(
                 seg_area.x.saturating_add(chrome.left),
@@ -149,9 +154,23 @@ impl RenderCursor {
                     &mut self.terminal_links,
                 );
             }
+            if let (Some((hovered, _)), Some(offset)) =
+                (feedback.message_action, chrome.action_offset())
+            {
+                let area = Rect::new(seg_area.x, content_area.y, chrome.left, content_area.height);
+                if let Some(cell) = frame
+                    .buffer_mut()
+                    .cell_mut((area.x.saturating_add(offset), area.y))
+                {
+                    cell.set_symbol(MESSAGE_ACTION_GLYPH)
+                        .set_style(hover_style(theme::current().tool_dim, hovered));
+                    message_action_hit = Some(area);
+                }
+            }
         }
         self.skip = 0;
         self.y += visible_h;
+        message_action_hit
     }
 }
 

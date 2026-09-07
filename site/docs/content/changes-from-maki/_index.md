@@ -73,7 +73,7 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Mouse controls across the TUI
 
-**What changed:** Building on Maki's wheel scrolling and drag selection, Caudra routes pointer input to native pickers, queue actions, delivery modes, footer controls, paste tokens, task cards, links, review passages, and message actions. Right-click or a half-second left hold opens actions for a message. A control activates only when press and release reach the same target, while dragging cancels activation and preserves text selection.
+**What changed:** Building on Maki's wheel scrolling and drag selection, Caudra routes pointer input to native pickers, queue actions, delivery modes, footer controls, paste tokens, task cards, links, review passages, and message actions. Clicking `⋮` in a message gutter opens its actions. Right-clicking the message remains an optional shortcut. A control activates only when press and release reach the same target, while dragging cancels activation and preserves text selection.
 
 **Why:** Pointer support needs to behave consistently across the complete interface. Semantic hit targets and overlay-aware routing make controls usable with a mouse without turning an attempted text selection into an accidental action.
 
