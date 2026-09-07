@@ -1,0 +1,213 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.code-graph.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": { "name": "workcell-code-graph", "version": "0.1.0" },
+  "provenance": [
+    "rust/crates/mcp-code-graph/src/catalog.rs",
+    "rust/crates/mcp-code-graph/src/group.rs",
+    "rust/crates/mcp-code-graph/src/dispatch.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "code_map",
+        "title": "Rank symbols in a tree",
+        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent means the whole configured root.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation": "code.map.v1",
+          "ai.workcell/contract": "code.map.v1"
+        }
+      },
+      {
+        "name": "code_context",
+        "title": "Find code for a task",
+        "description": "Return the symbols worth reading before making a specific change. Describe the change in your own words.\n\n- `task` is prose: \"where do we invalidate the cache after a write\" works better than a bare identifier.\n- A router classifies the task as identifier-shaped or prose-shaped and reports which, and why.\n- Results fuse a lexical match against symbol names, paths and doc comments with the graph ranking. Only symbols that actually matched participate, so an unrelated task returns nothing rather than the repository's busiest utility.\n- `confidence` is derived from how far the top result separates from the rest. It is a measure of separation, never a claim of correctness, and a single result is always low.\n- Counts are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The change you are about to make, in your own words."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation": "code.map.v1",
+          "ai.workcell/contract": "code.context.v1"
+        }
+      },
+      {
+        "name": "code_refs",
+        "title": "List references to a symbol",
+        "description": "List the symbols that reference a given symbol, or the symbols it references.\n\n- `direction` is `callers` (default) or `callees`. The two do not measure the same thing and the result names its own unit.\n- `symbol` may be a bare name or `path::name` to disambiguate. A name matching several definitions returns their union and says so, rather than silently picking one.\n- An unknown symbol is REFUSED with did-you-mean candidates, not answered with zero. A symbol that exists and has no callers returns zero.\n- Counts are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "callers",
+                "callees"
+              ],
+              "default": "callers",
+              "description": "`callers` lists symbols referencing this one; `callees` lists the ones it references."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation": "code.map.v1",
+          "ai.workcell/contract": "code.refs.v1"
+        }
+      },
+      {
+        "name": "code_impact",
+        "title": "Show change blast radius",
+        "description": "Show what a change to a symbol could reach, and which tests already cover it.\n\n- Walks call edges backwards from the symbol, up to `depth` hops (default 3, host-capped).\n- Rows report their hop distance, shortest-path first, so the near blast radius is distinguishable from the far one.\n- `testsReaching` is the subset sitting in test scope, determined syntactically from the enclosing constructs rather than from the file path.\n- Reach is a FLOOR. A symbol invoked only through dynamic dispatch will not appear, so an empty result is not evidence that a change is safe.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 3,
+              "description": "Hops to walk backwards along call edges. Beyond a few hops a reachability set describes the repository rather than a blast radius."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation": "code.impact.v1",
+          "ai.workcell/contract": "code.impact.v1"
+        }
+      },
+      {
+        "name": "code_expand",
+        "title": "Expand one symbol",
+        "description": "Return one symbol's source together with its immediate callers and callees.\n\n- `symbol` may be a bare name or `path::name`. When several definitions match, the highest-ranked one is expanded.\n- When the symbol occupies most of a small file, the whole file is returned instead and the result says why: the bundle would cost more than the file it was assembled from.\n- Neighbour lists are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation": "code.expand.v1",
+          "ai.workcell/contract": "code.expand.v1"
+        }
+      }
+    ]
+  }
+}
