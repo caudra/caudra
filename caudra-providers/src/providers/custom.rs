@@ -209,6 +209,21 @@ fn apply_declared_effort(thinking: &ThinkingConfig, body: &mut Value, model: &Mo
     }
 }
 
+fn build_responses_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: &ThinkingConfig,
+) -> Value {
+    let mut body = responses::build_body(model, messages, system, tools);
+    responses::apply_responses_reasoning(&mut body, thinking, model);
+    if let Some(max_output_tokens) = model.max_output_tokens {
+        body["max_output_tokens"] = Value::from(max_output_tokens);
+    }
+    body
+}
+
 /// Specs declared statically in `providers.toml` (no HTTP).
 pub fn declared_model_specs() -> Vec<String> {
     declared_specs_from(&ProvidersConfig::load())
@@ -338,8 +353,7 @@ impl Provider for CustomOpenAiProvider {
             let auth = self.auth.lock().unwrap().clone();
 
             if self.protocol == Protocol::OpenaiResponses {
-                let body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                let body = build_responses_body(model, messages, system, tools, &opts.thinking);
                 return responses::do_stream(
                     self.compat.client(),
                     model,
@@ -468,6 +482,54 @@ mod tests {
         assert!(body.get("thinking").is_none(), "{ANTHROPIC_KEY_LEAKED}");
         body.get("reasoning_effort")
             .map(|level| level.as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn custom_chat_body_keeps_chat_completions_shape() {
+        let model = model_from_def(
+            &openai_def("m"),
+            ProviderKind::OpenAi,
+            "chat-body-test",
+            "m",
+        );
+        let provider = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
+
+        let body = provider.build_body(
+            &model,
+            &[Message::user("hello".into())],
+            "system",
+            &Value::Null,
+        );
+
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+        assert!(body.get("input").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn custom_responses_body_carries_declared_options_and_full_history() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai-responses","models":[{"id":"m","max_output_tokens":8192,"reasoning_options":[{"type":"effort","values":["none","xhigh"]}]}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "responses-body-test", "m");
+        let messages = [Message::user("hello".into())];
+
+        let body = build_responses_body(
+            &model,
+            &messages,
+            "system",
+            &Value::Null,
+            &ThinkingConfig::Effort("xhigh".into()),
+        );
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 8192);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]

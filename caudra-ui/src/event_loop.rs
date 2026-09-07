@@ -70,11 +70,6 @@ use crate::terminal;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-/// The pre-run snapshot takes a machine-global lock, so a second caudra mid
-/// checkpoint can hold it for seconds. Without a bound the reply never arrives
-/// and the run stays pending forever behind a spinner.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
-const SNAPSHOT_TIMEOUT_ERR: &str = "timed out waiting for the workspace lock";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
@@ -2467,13 +2462,9 @@ impl<'t> EventLoop<'t> {
             } => {
                 let tx = self.sessions[idx].snapshot_tx.clone();
                 smol::spawn(async move {
-                    let capture = smol::unblock(move || {
+                    let result = smol::unblock(move || {
                         crate::app::capture_history_head(&store, &cwd, head)
                             .map_err(|error| error.to_string())
-                    });
-                    let result = futures_lite::future::or(capture, async {
-                        smol::Timer::after(SNAPSHOT_TIMEOUT).await;
-                        Err(SNAPSHOT_TIMEOUT_ERR.to_owned())
                     })
                     .await;
                     // The run is parked until this lands, so a lost reply is a

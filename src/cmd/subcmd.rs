@@ -12,7 +12,7 @@ use caudra_agent::tools::{
     capability_exclusions, credential_exclusions, is_tool_enabled,
 };
 use caudra_config::providers::{
-    ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
+    Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use caudra_config::{
@@ -338,6 +338,16 @@ fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result
     Ok(())
 }
 
+fn custom_protocol(input: &str) -> Option<Protocol> {
+    match input.trim() {
+        "1" | "openai" => Some(Protocol::Openai),
+        "2" | "openai-responses" => Some(Protocol::OpenaiResponses),
+        "3" | "anthropic" => Some(Protocol::Anthropic),
+        "4" | "google" => Some(Protocol::Google),
+        _ => None,
+    }
+}
+
 fn login_custom(storage: &StateDir) -> Result<()> {
     print!("  Provider name: ");
     io::stdout().flush()?;
@@ -349,19 +359,16 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     }
 
     println!("  Protocol:");
-    println!("    1. openai   (OpenAI-compatible chat completions)");
-    println!("    2. anthropic (Anthropic messages API)");
-    println!("    3. google   (Google Gemini API)");
-    print!("  Select [1-3]: ");
+    println!("    1. openai           (OpenAI Chat Completions)");
+    println!("    2. openai-responses (OpenAI Responses API)");
+    println!("    3. anthropic        (Anthropic messages API)");
+    println!("    4. google           (Google Gemini API)");
+    print!("  Select [1-4]: ");
     io::stdout().flush()?;
     let mut proto_input = String::new();
     io::stdin().read_line(&mut proto_input)?;
-    let protocol = match proto_input.trim() {
-        "1" | "openai" => "openai",
-        "2" | "anthropic" => "anthropic",
-        "3" | "google" => "google",
-        _ => bail!("invalid protocol selection"),
-    };
+    let protocol = custom_protocol(&proto_input)
+        .ok_or_else(|| color_eyre::eyre::eyre!("invalid protocol selection"))?;
 
     print!("  Base URL: ");
     io::stdout().flush()?;
@@ -384,11 +391,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     let mut config = ProvidersConfig::load();
     let provider_def = ProviderDef {
         display_name: Some(display_name),
-        protocol: Some(
-            protocol
-                .parse()
-                .map_err(|e: String| color_eyre::eyre::eyre!("{e}"))?,
-        ),
+        protocol: Some(protocol),
         base_url: Some(base_url.clone()),
         api_key_env: Some(api_key_env.clone()),
         discover_models: true,
@@ -1138,6 +1141,15 @@ mod auth_tests {
     #[test]
     fn oauth_method_rejects_non_subscription_provider() {
         assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    }
+
+    #[test_case("1", Some(Protocol::Openai) ; "chat_by_number")]
+    #[test_case("openai", Some(Protocol::Openai) ; "chat_by_name")]
+    #[test_case("2", Some(Protocol::OpenaiResponses) ; "responses_by_number")]
+    #[test_case("openai-responses", Some(Protocol::OpenaiResponses) ; "responses_by_name")]
+    #[test_case("unknown", None ; "unknown_protocol")]
+    fn custom_protocol_choices(input: &str, expected: Option<Protocol>) {
+        assert_eq!(custom_protocol(input), expected);
     }
 }
 

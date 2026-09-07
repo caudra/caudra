@@ -22,7 +22,8 @@ const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
 
 const PROTOCOLS: &[(&str, &str)] = &[
-    ("openai", "OpenAI-compatible"),
+    ("openai", "OpenAI Chat Completions"),
+    ("openai-responses", "OpenAI Responses API"),
     ("anthropic", "Anthropic"),
     ("google", "Google Gemini"),
 ];
@@ -1061,6 +1062,29 @@ mod tests {
                 provider: SubscriptionProvider::Anthropic,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn custom_provider_can_select_openai_responses() {
+        let mut picker = LoginPicker::new();
+        assert!(matches!(
+            picker.transition(StepAction::GoCustomProtocol {
+                slug: "custom".into(),
+            }),
+            LoginPickerAction::Consumed
+        ));
+
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            picker.step,
+            Step::CustomUrl {
+                ref slug,
+                ref protocol,
+                ..
+            } if slug == "custom" && protocol == "openai-responses"
         ));
     }
 
