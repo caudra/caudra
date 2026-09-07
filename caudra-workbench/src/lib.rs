@@ -42,7 +42,7 @@ use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
 use search::Search;
-use view::{Control, TabHit, Toggle};
+use view::{Control, TabHit, TabPart, Toggle};
 
 const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 const MIN_SIDEBAR_WIDTH: u16 = 16;
@@ -770,7 +770,7 @@ impl Workbench {
         if self.panes.tabs.contains(position) {
             self.focus = Focus::Editor;
             if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) {
-                self.hit_tab(hit);
+                self.hit_tab(hit, at);
             }
             return WorkbenchAction::Consumed;
         }
@@ -1270,13 +1270,19 @@ impl Workbench {
         }
     }
 
-    fn hit_tab(&mut self, hit: TabHit) {
-        if hit.close {
-            self.close_at(hit.index);
-            return;
+    /// A press on the strip, told the cell it landed on because the menu is
+    /// anchored where it was asked for.
+    fn hit_tab(&mut self, hit: TabHit, at: (u16, u16)) {
+        match hit.part {
+            TabPart::Close => self.close_at(hit.index),
+            // Opened for the tab under the pointer, which stays where it is:
+            // reading a menu is not a reason to leave the file on screen.
+            TabPart::Menu => self.open_menu_at(at),
+            TabPart::Body => {
+                self.editor.select(hit.index);
+                self.reveal_active();
+            }
         }
-        self.editor.select(hit.index);
-        self.reveal_active();
     }
 
     /// Held to the same modal rule as a left press: a question about one tab
@@ -2528,9 +2534,9 @@ mod tests {
     use crate::menu::Item as MenuItem;
     use crate::search;
     use crate::view::{
-        CARET, Control, MENU_HINTS, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY, OPEN_MARK,
-        REVERT_MARK, STAGE_MARK, TabHit, UNSTAGE_MARK, button_at, confirm_at, header_at, tab_at,
-        toggle_at, visible_range,
+        CARET, Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
+        OPEN_MARK, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at,
+        header_at, tab_at, toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2796,15 +2802,17 @@ mod tests {
         paint(workbench, 80, 24)[at].style()
     }
 
-    /// The column a tab's close mark landed on, found the same way the pointer
-    /// finds it.
-    fn close_column(workbench: &Workbench, index: usize) -> u16 {
+    /// The column one of a tab's marks landed on, found the same way the
+    /// pointer finds it.
+    fn mark_column(workbench: &Workbench, index: usize, part: TabPart) -> u16 {
         let tabs = workbench.panes.tabs;
         (tabs.x..tabs.right())
-            .find(|column| {
-                tab_at(&workbench.editor, *column, tabs) == Some(TabHit { index, close: true })
-            })
-            .expect("a close mark on the tab")
+            .find(|column| tab_at(&workbench.editor, *column, tabs) == Some(TabHit { index, part }))
+            .expect("a mark on the tab")
+    }
+
+    fn close_column(workbench: &Workbench, index: usize) -> u16 {
+        mark_column(workbench, index, TabPart::Close)
     }
 
     /// The column an answer landed on, found the same way the pointer finds it.
@@ -5395,8 +5403,9 @@ mod tests {
         let tabs = workbench.panes.tabs;
         let shown = visible_range(&workbench.editor, tabs.width);
         assert!(shown.start > 0, "{TAB_OFF_STRIP}");
+        let body = mark_column(&workbench, shown.start, TabPart::Body);
 
-        workbench.handle_mouse(click(tabs.x + 1, tabs.y));
+        workbench.handle_mouse(click(body, tabs.y));
 
         assert_eq!(
             workbench.editor.active_index(),
@@ -5415,6 +5424,23 @@ mod tests {
         workbench.handle_mouse(click(close_column(&workbench, last), tabs.y));
 
         assert_eq!(workbench.editor.tabs().len(), last, "{WRONG_CLICK}");
+    }
+
+    /// The mark the strip paints and the mark the pointer finds have to be
+    /// the same column, or the strip is offering a menu that is not there.
+    #[test]
+    fn the_tab_mark_is_painted_where_the_pointer_finds_it() {
+        let (_dir, mut workbench) = many_tabs(2);
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let tabs = workbench.panes.tabs;
+
+        let column = painted_column(&mut workbench, tabs, tabs.y, MENU_MARK);
+
+        assert_eq!(
+            tab_at(&workbench.editor, column, tabs).map(|hit| hit.part),
+            Some(TabPart::Menu),
+            "{CONTROL_MISPLACED}"
+        );
     }
 
     /// The strip opens on its last tab, so what it cut off is all to the left.
@@ -5628,6 +5654,24 @@ mod tests {
             &Target::Row(dir.path().join(NESTED_DIR)),
             "{WRONG_TARGET}"
         );
+    }
+
+    /// The mark is the only thing on the strip saying a menu is there, so a
+    /// plain click has to reach it, and reading a menu about a tab is not a
+    /// reason to leave the file that is on screen.
+    #[test]
+    fn a_click_on_a_tab_mark_opens_its_menu_and_leaves_the_tab_alone() {
+        let (_dir, mut workbench) = many_tabs(2);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let active = workbench.editor.active_index();
+        let other = active - 1;
+        let column = mark_column(&workbench, other, TabPart::Menu);
+
+        workbench.handle_mouse(click(column, workbench.panes.tabs.y));
+
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        assert_eq!(menu.target(), &Target::Tab(other), "{WRONG_TARGET}");
+        assert_eq!(workbench.editor.active_index(), active, "{WRONG_CLICK}");
     }
 
     #[test]

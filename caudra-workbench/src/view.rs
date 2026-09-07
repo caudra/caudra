@@ -72,6 +72,10 @@ const GOTO_PROMPT: &str = "Go to line: ";
 const NO_MATCHES: &str = "No results";
 const TAB_GAP: &str = " ";
 const CLOSE_MARK: &str = "\u{d7}";
+/// The handle on the context menu, kept at the left of every tree row and
+/// every tab so the menu is something to reach for rather than something to
+/// know about.
+pub(crate) const MENU_MARK: &str = "\u{22ee}";
 pub(crate) const MORE_LEFT: &str = "\u{2039}";
 pub(crate) const MORE_RIGHT: &str = "\u{203a}";
 pub(crate) const STAGE_MARK: &str = "+";
@@ -733,10 +737,12 @@ impl Workbench {
             if under.is_some() && index != active {
                 style = style.patch(self.styles.hover);
             }
-            let close = match under.is_some_and(|hit| hit.close) {
-                true => self.styles.accent.patch(self.styles.hover),
-                false => self.styles.dim,
-            };
+            let close = self.mark_style(under, TabPart::Close);
+            spans.push(Span::styled(TAB_GAP, self.styles.background));
+            spans.push(Span::styled(
+                MENU_MARK,
+                self.mark_style(under, TabPart::Menu),
+            ));
             spans.push(Span::styled(TAB_GAP, self.styles.background));
             if tab.is_dirty() {
                 spans.push(Span::styled(DIRTY_MARK, self.styles.accent));
@@ -755,6 +761,16 @@ impl Workbench {
         if shown.end < self.editor.tabs().len() {
             let last = area.right().saturating_sub(1);
             overwrite(buf, (last, area.y), MORE_RIGHT, self.styles.dim);
+        }
+    }
+
+    /// How one of a tab's marks is painted: lit while the pointer is on it,
+    /// and drawn back the rest of the time so the title stays what the tab
+    /// says.
+    fn mark_style(&self, under: Option<TabHit>, part: TabPart) -> Style {
+        match under.is_some_and(|hit| hit.part == part) {
+            true => self.styles.accent.patch(self.styles.hover),
+            false => self.styles.dim,
         }
     }
 
@@ -947,18 +963,28 @@ impl Workbench {
     }
 }
 
-/// Where a click on the tab strip landed. The close mark is its own target, so
-/// reaching for it never selects the tab instead.
+/// Where a click on the tab strip landed. A mark is its own target, so
+/// reaching for one never selects the tab instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TabHit {
     pub(crate) index: usize,
-    pub(crate) close: bool,
+    pub(crate) part: TabPart,
+}
+
+/// Which of a tab's three targets a column falls on. One answer rather than a
+/// flag each, so a hit cannot claim to be two of them at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabPart {
+    Body,
+    Menu,
+    Close,
 }
 
 /// One tab's width, which is the only description of how
 /// [`Workbench::render_tabs`] lays a tab out.
 fn tab_width(tab: &Tab) -> usize {
-    TAB_GAP.len() * 3
+    TAB_GAP.len() * 4
+        + MENU_MARK.chars().count()
         + usize::from(tab.is_dirty())
         + tab.title.chars().count()
         + CLOSE_MARK.chars().count()
@@ -999,8 +1025,16 @@ pub(crate) fn tab_at(editor: &Editor, column: u16, strip: Rect) -> Option<TabHit
     for index in shown {
         let width = tab_width(&editor.tabs()[index]);
         if left < width {
-            let close = left == width - TAB_GAP.len() - CLOSE_MARK.chars().count();
-            return Some(TabHit { index, close });
+            // The leading gap goes to the mark. It would otherwise select the
+            // tab, which the title already does, so it widens the smaller
+            // target for nothing.
+            let menu = TAB_GAP.len() + MENU_MARK.chars().count();
+            let part = match left {
+                _ if left < menu => TabPart::Menu,
+                _ if left == width - TAB_GAP.len() - CLOSE_MARK.chars().count() => TabPart::Close,
+                _ => TabPart::Body,
+            };
+            return Some(TabHit { index, part });
         }
         left -= width;
     }
@@ -1762,7 +1796,7 @@ mod tests {
     use super::menu_panel;
     use super::{
         CHANGE_TRAILING, Control, Editor, Focus, GitMark, ScmRow, Section, SidebarView, Style, Tab,
-        TabHit, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, header_at, keys,
+        TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, header_at, keys,
         scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
     };
     use crate::fs::tree::EntryKind;
@@ -1818,13 +1852,19 @@ mod tests {
         editor
     }
 
-    #[test_case(0, Some(TabHit { index: 0, close: false }) ; "the gap in front of a tab still selects it")]
-    #[test_case(1, Some(TabHit { index: 0, close: false }) ; "the title selects its tab")]
-    #[test_case(4, Some(TabHit { index: 0, close: true }) ; "the close mark is its own target")]
-    #[test_case(5, Some(TabHit { index: 0, close: false }) ; "the gap after the close mark is not it")]
-    #[test_case(6, Some(TabHit { index: 1, close: false }) ; "the next tab starts where the last ended")]
-    #[test_case(10, Some(TabHit { index: 1, close: true }) ; "every tab has its own close mark")]
-    #[test_case(12, None ; "past the last tab is nothing")]
+    fn hit(index: usize, part: TabPart) -> Option<TabHit> {
+        Some(TabHit { index, part })
+    }
+
+    #[test_case(0, hit(0, TabPart::Menu) ; "the gap in front of a tab reaches its mark")]
+    #[test_case(1, hit(0, TabPart::Menu) ; "and so does the mark itself")]
+    #[test_case(2, hit(0, TabPart::Body) ; "the gap after the mark selects the tab")]
+    #[test_case(3, hit(0, TabPart::Body) ; "and so does the title")]
+    #[test_case(6, hit(0, TabPart::Close) ; "the close mark is its own target")]
+    #[test_case(7, hit(0, TabPart::Body) ; "the gap after the close mark is not it")]
+    #[test_case(8, hit(1, TabPart::Menu) ; "the next tab starts where the last ended")]
+    #[test_case(14, hit(1, TabPart::Close) ; "every tab has its own close mark")]
+    #[test_case(16, None ; "past the last tab is nothing")]
     fn a_column_falls_on_the_tab_the_strip_painted(column: u16, expected: Option<TabHit>) {
         assert_eq!(
             tab_at(&editor(false), column, strip(0)),
@@ -1836,11 +1876,8 @@ mod tests {
     #[test]
     fn a_dirty_mark_shifts_the_close_mark_along_with_the_title() {
         assert_eq!(
-            tab_at(&editor(true), 5, strip(0)),
-            Some(TabHit {
-                index: 0,
-                close: true
-            }),
+            tab_at(&editor(true), 7, strip(0)),
+            hit(0, TabPart::Close),
             "{WRONG_TAB}"
         );
     }
@@ -1850,21 +1887,21 @@ mod tests {
         let editor = editor(false);
 
         assert_eq!(
-            tab_at(&editor, 9, strip(0)),
-            tab_at(&editor, 12, strip(3)),
+            tab_at(&editor, 11, strip(0)),
+            tab_at(&editor, 14, strip(3)),
             "{WRONG_TAB}"
         );
         assert_eq!(tab_at(&editor, 2, strip(3)), None, "{WRONG_TAB}");
     }
 
-    /// Both tabs span six columns, so a strip eleven wide has room for one and
-    /// the second is the one the cursor is on.
+    /// Both tabs span eight columns, so a strip fifteen wide has room for one
+    /// and the second is the one the cursor is on.
     #[test]
     fn a_strip_too_narrow_for_both_shows_the_active_one() {
         let editor = editor(false);
 
-        assert_eq!(visible_range(&editor, 12), 0..2, "{WRONG_STRIP}");
-        assert_eq!(visible_range(&editor, 11), 1..2, "{WRONG_STRIP}");
+        assert_eq!(visible_range(&editor, 16), 0..2, "{WRONG_STRIP}");
+        assert_eq!(visible_range(&editor, 15), 1..2, "{WRONG_STRIP}");
     }
 
     /// The strip is measured from the tab it is showing, so the first column
@@ -1874,11 +1911,8 @@ mod tests {
         let editor = editor(false);
 
         assert_eq!(
-            tab_at(&editor, 1, Rect::new(0, 0, 11, 1)),
-            Some(TabHit {
-                index: 1,
-                close: false
-            }),
+            tab_at(&editor, 3, Rect::new(0, 0, 15, 1)),
+            hit(1, TabPart::Body),
             "{WRONG_TAB}"
         );
     }
