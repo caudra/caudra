@@ -9,21 +9,25 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SubagentHistoryError {
-    #[error("unknown subagent task ID `{task_id}`")]
+    #[error("unknown subagent task ID `{task_id}`; omit task_id to start a fresh subagent")]
     Unknown { task_id: String },
-    #[error("subagent task `{task_id}` is already active")]
+    #[error(
+        "subagent task `{task_id}` is already running; wait for it to finish before continuing it"
+    )]
     AlreadyActive { task_id: String },
     #[error("subagent task `{task_id}` already has completed history")]
     AlreadyCompleted { task_id: String },
     #[error(
-        "subagent task `{task_id}` uses profile `{stored}`, not requested profile `{requested}`"
+        "subagent task `{task_id}` uses profile `{stored}`, not requested profile `{requested}`; omit profile to keep the stored one"
     )]
     ProfileMismatch {
         task_id: String,
         stored: String,
         requested: String,
     },
-    #[error("subagent task `{task_id}` uses {stored:?} mode, not requested {requested:?} mode")]
+    #[error(
+        "subagent task `{task_id}` uses `{stored}` mode, not requested `{requested}` mode; omit mode to keep the stored one"
+    )]
     ModeMismatch {
         task_id: String,
         stored: SubagentTaskMode,

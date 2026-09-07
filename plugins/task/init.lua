@@ -47,8 +47,9 @@ Available system prompt profiles:
 Notes:
 1. Launch multiple tasks concurrently when possible.
 2. The agent's result is not visible to the user. Summarize it in your response.
-3. The result includes a task_id. Pass it to a later task call to continue the same subagent history.
-4. Tell it to return concise summaries with file:line refs, not full file contents.
+3. A fresh call gives the subagent no context beyond your prompt, so make the prompt self-contained and state exactly what to report back.
+4. Every result, success or failure, carries a task_id. Pass it back to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode and profile when continuing; they stay locked to the original run.
+5. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
 
 local opts = caudra.api.register_options({
@@ -71,7 +72,7 @@ local schema = {
     },
     task_id = {
       type = "string",
-      description = "A task_id returned by an earlier task call. Continue that subagent's existing history instead of starting fresh.",
+      description = "Set this only to resume. Continues the subagent from an earlier task_id with its existing history instead of starting fresh.",
     },
     mode = {
       type = "string",

@@ -5447,6 +5447,8 @@ fn session_task_id_reopens_completed_history() {
     assert!(out.starts_with("session-"), "got: {out}");
 }
 
+const MODE_MISMATCH_ERR: &str = "uses `plan` mode, not requested `build` mode";
+
 #[test]
 fn task_session_defaults_to_plan_and_locks_continuation_identity() {
     let reg = fresh_registry();
@@ -5482,7 +5484,7 @@ fn task_session_defaults_to_plan_and_locks_continuation_identity() {
     let output = result.as_display_text();
     let (task_id, error) = output.split_once('\n').unwrap();
 
-    assert!(error.contains("uses Plan mode, not requested Build mode"));
+    assert!(error.contains(MODE_MISMATCH_ERR), "got: {error}");
     let snapshot = history.snapshot();
     let spec = snapshot.records()[task_id].spec().unwrap();
     assert_eq!(spec.profile_name, "builtin");

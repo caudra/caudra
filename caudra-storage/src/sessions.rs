@@ -5,6 +5,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -488,6 +489,15 @@ pub enum StoredMode {
     #[default]
     Build,
     Plan,
+}
+
+impl fmt::Display for StoredMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build => f.write_str("build"),
+            Self::Plan => f.write_str("plan"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
